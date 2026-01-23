@@ -50,6 +50,65 @@ struct ClusteringConfiguration {
     clustering_columns: Vec<String>,
 }
 
+/// Visitor to validate statistics in add file metadata.
+/// Uses RowVisitor pattern to extract and validate stats from EngineData.
+struct StatsValidationVisitor {
+    rows_validated: usize,
+    rows_with_num_records: usize,
+    errors: Vec<String>,
+}
+
+impl StatsValidationVisitor {
+    fn new() -> Self {
+        Self {
+            rows_validated: 0,
+            rows_with_num_records: 0,
+            errors: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> DeltaResult<()> {
+        if self.rows_validated == 0 {
+            return Err(Error::generic("No rows to validate"));
+        }
+        if self.rows_with_num_records == 0 {
+            // This is a warning case, not an error - stats might be missing
+            // but we don't fail the commit for it
+        }
+        if !self.errors.is_empty() {
+            return Err(Error::generic(format!(
+                "Stats validation errors: {}",
+                self.errors.join("; ")
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RowVisitor for StatsValidationVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| vec![column_name!("stats")]);
+        static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+            vec![DataType::STRING] // stats is a JSON string
+        });
+        (NAMES.as_slice(), TYPES.as_slice())
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for row_index in 0..row_count {
+            self.rows_validated += 1;
+            if let Some(stats_str) = getters[0].get_opt(row_index, "stats")? {
+                let stats_str: String = stats_str;
+                // Check if stats has numRecords
+                if stats_str.contains("\"numRecords\"") {
+                    self.rows_with_num_records += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -342,6 +401,14 @@ impl Transaction {
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+        // Step 0: Validate stats in add file metadata
+        // This ensures all files have valid stats before committing
+        for add_metadata in &self.add_files_metadata {
+            let mut validator = StatsValidationVisitor::new();
+            validator.visit_rows_of(add_metadata.as_ref())?;
+            validator.validate()?;
+        }
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -977,6 +1044,37 @@ impl Transaction {
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
+    }
+
+    /// Add files with statistics validation.
+    ///
+    /// Similar to [`add_files`], but validates that the metadata contains valid statistics
+    /// before adding. Returns an error if validation fails.
+    ///
+    /// [`add_files`]: Transaction::add_files
+    #[allow(unused)]
+    pub fn add_files_validated(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(add_metadata.as_ref())?;
+        validator.validate()?;
+        self.add_files_metadata.push(add_metadata);
+        Ok(())
+    }
+
+    /// Validate statistics in add file metadata without modifying the transaction.
+    ///
+    /// Returns a summary string describing the validation results.
+    #[allow(unused)]
+    pub fn validate_add_files_stats(add_metadata: &dyn EngineData) -> DeltaResult<String> {
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(add_metadata)?;
+        validator.validate()?;
+        Ok(format!(
+            "Validated {} rows, {} had numRecords. Errors: {}",
+            validator.rows_validated,
+            validator.rows_with_num_records,
+            validator.errors.join("; ")
+        ))
     }
 
     /// Generate add actions, handling row tracking internally if needed

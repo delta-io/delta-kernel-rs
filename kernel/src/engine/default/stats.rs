@@ -1050,3 +1050,182 @@ mod tests {
         assert_eq!(value_null_count.value(0), 1);
     }
 }
+
+/// Verifies that collected statistics match the expected schema.
+/// Used for debugging and testing stats collection.
+pub(crate) struct StatsVerifier;
+
+impl StatsVerifier {
+    /// Verify stats and return a structured result.
+    #[allow(unused)]
+    pub(crate) fn verify(
+        stats: &StructArray,
+        expected_columns: &[String],
+    ) -> DeltaResult<StatsVerificationResult> {
+        use crate::arrow::array::Array;
+
+        let fields = stats.fields();
+        let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+
+        // Check numRecords
+        let num_records = if field_names.contains(&"numRecords") {
+            let num_records_idx = fields
+                .iter()
+                .position(|f| f.name() == "numRecords")
+                .unwrap();
+            let num_records_array = stats.column(num_records_idx);
+            if let Some(int_array) = num_records_array.as_any().downcast_ref::<Int64Array>() {
+                int_array.value(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Check tightBounds
+        let tight_bounds = if field_names.contains(&"tightBounds") {
+            let idx = fields
+                .iter()
+                .position(|f| f.name() == "tightBounds")
+                .unwrap();
+            let array = stats.column(idx);
+            if let Some(bool_array) = array.as_any().downcast_ref::<BooleanArray>() {
+                bool_array.value(0)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Check nullCount columns
+        let mut present_null_count = Vec::new();
+        let mut missing_null_count = Vec::new();
+
+        if let Some(idx) = fields.iter().position(|f| f.name() == "nullCount") {
+            let null_count_array = stats.column(idx);
+            if let Some(null_struct) = null_count_array.as_any().downcast_ref::<StructArray>() {
+                let null_fields: Vec<&str> = null_struct
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                for col in expected_columns {
+                    if null_fields.contains(&col.as_str()) {
+                        present_null_count.push(col.clone());
+                    } else {
+                        missing_null_count.push(col.clone());
+                    }
+                }
+            }
+        }
+
+        // Get min/max columns
+        let mut min_max_columns = Vec::new();
+        if let Some(idx) = fields.iter().position(|f| f.name() == "minValues") {
+            let min_array = stats.column(idx);
+            if let Some(min_struct) = min_array.as_any().downcast_ref::<StructArray>() {
+                for field in min_struct.fields() {
+                    min_max_columns.push(field.name().clone());
+                }
+            }
+        }
+
+        Ok(StatsVerificationResult {
+            num_records,
+            tight_bounds,
+            present_null_count_columns: present_null_count,
+            missing_null_count_columns: missing_null_count,
+            min_max_columns,
+        })
+    }
+
+    /// Verify stats and return a detailed human-readable string.
+    #[allow(unused)]
+    pub(crate) fn verify_detailed(
+        stats: &StructArray,
+        expected_columns: &[String],
+    ) -> DeltaResult<String> {
+        let result = Self::verify(stats, expected_columns)?;
+        Ok(format!(
+            "Stats: numRecords={}, tightBounds={}, nullCount=[{}], minMax=[{}]",
+            result.num_records,
+            result.tight_bounds,
+            result.present_null_count_columns.join(", "),
+            result.min_max_columns.join(", ")
+        ))
+    }
+}
+
+/// Result of stats verification.
+#[allow(unused)]
+pub(crate) struct StatsVerificationResult {
+    pub num_records: i64,
+    pub tight_bounds: bool,
+    pub present_null_count_columns: Vec<String>,
+    pub missing_null_count_columns: Vec<String>,
+    pub min_max_columns: Vec<String>,
+}
+
+impl StatsVerificationResult {
+    /// Returns true if all expected columns have nullCount stats.
+    pub fn has_all_null_counts(&self) -> bool {
+        self.missing_null_count_columns.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod verifier_tests {
+    use super::*;
+    use crate::arrow::datatypes::Schema;
+
+    #[test]
+    fn test_stats_verifier_valid_stats() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            ],
+        )
+        .unwrap();
+
+        let mut collector =
+            StatisticsCollector::new(schema, &["id".to_string(), "value".to_string()]);
+        collector.update(&batch, None).unwrap();
+        let stats = collector.finalize().unwrap();
+
+        let result =
+            StatsVerifier::verify(&stats, &["id".to_string(), "value".to_string()]).unwrap();
+
+        assert_eq!(result.num_records, 3);
+        assert!(result.tight_bounds);
+        assert!(result.has_all_null_counts());
+        assert_eq!(result.present_null_count_columns.len(), 2);
+    }
+
+    #[test]
+    fn test_stats_verifier_detailed_output() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let mut collector = StatisticsCollector::new(schema, &["id".to_string()]);
+        collector.update(&batch, None).unwrap();
+        let stats = collector.finalize().unwrap();
+
+        let detailed = StatsVerifier::verify_detailed(&stats, &["id".to_string()]).unwrap();
+        assert!(detailed.contains("numRecords=3"));
+        assert!(detailed.contains("tightBounds=true"));
+    }
+}
