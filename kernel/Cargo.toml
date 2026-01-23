@@ -95,6 +95,8 @@ optional = true
 default = []
 # internal-api will make everything marked #[internal_api] public
 internal-api = []
+# test-utils exposes test-only constructors for downstream crate tests
+test-utils = []
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
