@@ -217,7 +217,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
         self.parquet
-            .write_parquet_file(write_context.target_dir(), physical_data, partition_values)
+            .write_parquet_file(
+                write_context.target_dir(),
+                physical_data,
+                partition_values,
+                write_context.stats_columns(),
+            )
             .await
     }
 }

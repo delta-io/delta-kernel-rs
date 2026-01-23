@@ -7,7 +7,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
@@ -23,9 +23,10 @@ use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use super::stats::StatisticsCollector;
 use super::UrlExt;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
@@ -54,6 +55,8 @@ pub struct DataFileMetadata {
     file_meta: FileMeta,
     // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
     num_records: usize,
+    /// Collected statistics for this file (optional).
+    stats: Option<StructArray>,
 }
 
 impl DataFileMetadata {
@@ -61,7 +64,14 @@ impl DataFileMetadata {
         Self {
             file_meta,
             num_records,
+            stats: None,
         }
+    }
+
+    /// Set the collected statistics for this file.
+    pub fn with_stats(mut self, stats: StructArray) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
@@ -81,6 +91,7 @@ impl DataFileMetadata {
                     size,
                 },
             num_records,
+            stats,
         } = self;
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -104,20 +115,53 @@ impl DataFileMetadata {
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let stats = Arc::new(StructArray::try_new_with_length(
-            vec![Field::new("numRecords", DataType::Int64, true)].into(),
-            vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
-            None,
-            1,
-        )?);
+
+        // Use full stats if available, otherwise just numRecords
+        let stats_array: Arc<StructArray> = if let Some(full_stats) = stats {
+            Arc::new(full_stats.clone())
+        } else {
+            Arc::new(StructArray::try_new_with_length(
+                vec![Field::new("numRecords", DataType::Int64, true)].into(),
+                vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
+                None,
+                1,
+            )?)
+        };
+
+        // Build schema dynamically based on stats
+        let stats_field = Field::new("stats", stats_array.data_type().clone(), true);
+        let schema = crate::arrow::datatypes::Schema::new(vec![
+            Field::new("path", crate::arrow::datatypes::DataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                crate::arrow::datatypes::DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        crate::arrow::datatypes::DataType::Struct(
+                            vec![
+                                Field::new("key", crate::arrow::datatypes::DataType::Utf8, false),
+                                Field::new("value", crate::arrow::datatypes::DataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", crate::arrow::datatypes::DataType::Int64, false),
+            Field::new(
+                "modificationTime",
+                crate::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            stats_field,
+        ]);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(
-                crate::transaction::BASE_ADD_FILES_SCHEMA
-                    .as_ref()
-                    .try_into_arrow()?,
-            ),
-            vec![path, partitions, size, modification_time, stats],
+            Arc::new(schema),
+            vec![path, partitions, size, modification_time, stats_array],
         )?)))
     }
 }
@@ -201,8 +245,22 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
+        stats_columns: &[String],
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self.write_parquet(path, data).await?;
+        // Collect statistics from the data during write
+        let record_batch = extract_record_batch(data.as_ref())?;
+
+        // Initialize stats collector and update with this batch
+        let mut stats_collector = StatisticsCollector::new(record_batch.schema(), stats_columns);
+        stats_collector.update(record_batch, None)?; // No mask for new file writes
+        let stats = stats_collector.finalize()?;
+
+        // Write the parquet file
+        let mut parquet_metadata = self.write_parquet(path, data).await?;
+
+        // Attach the collected statistics
+        parquet_metadata = parquet_metadata.with_stats(stats);
+
         parquet_metadata.as_record_batch(&partition_values)
     }
 }
@@ -683,6 +741,7 @@ mod tests {
                     size,
                 },
             num_records,
+            ..
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 
