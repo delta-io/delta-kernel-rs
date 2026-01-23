@@ -21,6 +21,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
+use crate::utils::require;
 use crate::LogCompactionWriter;
 use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
@@ -376,12 +377,78 @@ impl Snapshot {
         }
     }
 
+    /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
+    ///
+    /// This method takes a pre-commit snapshot (i.e. the read_snapshot) and incorporates a newly
+    /// committed transaction to produce a post-commit snapshot at the committed version. This
+    /// allows immediate use of the new and latest table state without re-reading metadata from
+    /// storage.
+    ///
+    /// TODO: Take in ICT.
+    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
+    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
+    #[allow(unused)]
+    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+        require!(
+            commit.is_commit(),
+            Error::internal_error(format!(
+                "Cannot create post-commit Snapshot. Log file is not a commit file. \
+                Path: {}, Type: {:?}.",
+                commit.location.location, commit.file_type
+            ))
+        );
+        require!(
+            commit.version == self.version() + 1,
+            Error::internal_error(format!(
+                "Cannot create post-commit Snapshot. Log file version ({}) does not \
+                equal Snapshot version ({}) + 1.",
+                commit.version,
+                self.version()
+            ))
+        );
+
+        let new_table_configuration =
+            TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
+
+        let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
+
+        Ok(Snapshot {
+            table_configuration: new_table_configuration,
+            log_segment: new_log_segment,
+        })
+    }
+
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
     pub fn create_checkpoint_writer(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
         CheckpointWriter::try_new(self)
+    }
+
+    /// Performs a complete checkpoint of this snapshot using the provided engine.
+    ///
+    /// Writes a checkpoint parquet file and the `_last_checkpoint` file.
+    ///
+    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
+    /// (e.g., `SyncEngine`).
+    ///
+    /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
+    pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
+        let writer = self.create_checkpoint_writer()?;
+        let checkpoint_path = writer.checkpoint_path()?;
+        let data_iter = writer.checkpoint_data(engine)?;
+        let state = data_iter.state();
+        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+
+        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+
+        // Finalize the checkpoint (writes `_last_checkpoint` file).
+        writer.finalize(engine, &file_meta, &state)
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -1752,5 +1819,23 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_new_post_commit_simple() {
+        // GIVEN
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let base_snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
+        let next_version = base_snapshot.version() + 1;
+
+        // WHEN
+        let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
+        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+
+        // THEN
+        assert_eq!(post_commit_snapshot.version(), next_version);
+        assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }
 }

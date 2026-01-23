@@ -1077,6 +1077,7 @@ pub(crate) fn parse_json_impl(
 
     let mut decoder = ReaderBuilder::new(schema.clone())
         .with_batch_size(json_strings.len())
+        .with_coerce_primitive(true)
         .build_decoder()?;
 
     for (json, row_number) in json_strings.iter().zip(1..) {

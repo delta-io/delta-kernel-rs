@@ -20,11 +20,27 @@ use crate::{
 /// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included.
 /// - all fields are made nullable.
 ///
-/// For the `nullCount` schema, we consider the whole base schema and convert all leaf fields
-/// to data type LONG. Maps, arrays, and variant are considered leaf fields in this case.
+/// The `nullCount` struct field is a nested structure mirroring the table's column hierarchy.
+/// It tracks the count of null values for each column. All leaf fields from the base schema
+/// are converted to LONG type (since null counts are always integers). Maps, arrays, and
+/// variants are considered leaf fields. Unlike `minValues`/`maxValues`, `nullCount` includes
+/// all columns from the base schema regardless of data type - every column can have nulls counted.
 ///
-/// For the min / max schemas, we non-eligible leaf fields from the base schema.
-/// Field eligibility is determined by the fields data type via [`is_skipping_eligeble_datatype`].
+/// Note: `nullCount` still respects the column limit from `dataSkippingNumIndexedCols` or
+/// `dataSkippingStatsColumns` (via the base schema). The difference from `minValues`/`maxValues`
+/// is only that `nullCount` does not filter by data type eligibility.
+///
+/// The `minValues`/`maxValues` struct fields are also nested structures mirroring the table's
+/// column hierarchy. They additionally filter out leaf fields with non-eligible data types
+/// (e.g., Boolean, Binary) via [`is_skipping_eligible_datatype`].
+///
+/// The `tightBounds` field is a boolean indicating whether the min/max statistics are "tight"
+/// (accurate) or "wide" (potentially outdated). When `tightBounds` is `true`, the statistics
+/// accurately reflect the data in the file. When `false`, the file may have deletion vectors
+/// and the statistics haven't been recomputed to exclude deleted rows.
+///
+/// See the Delta protocol for more details on statistics:
+/// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
 ///
 /// The overall schema is then:
 /// ```ignored
@@ -33,6 +49,7 @@ use crate::{
 ///    nullCount: <derived null count schema>,
 ///    minValues: <derived min/max schema>,
 ///    maxValues: <derived min/max schema>,
+///    tightBounds: boolean,
 /// }
 /// ```
 ///
@@ -73,6 +90,7 @@ use crate::{
 ///       age: integer,
 ///     },
 ///   },
+///   tightBounds: boolean,
 /// }
 /// ```
 #[allow(unused)]
@@ -80,7 +98,7 @@ pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
 ) -> DeltaResult<Schema> {
-    let mut fields = Vec::with_capacity(4);
+    let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable("numRecords", DataType::LONG));
 
     // generate the base stats schema:
@@ -108,39 +126,49 @@ pub(crate) fn expected_stats_schema(
         }
     }
 
+    // tightBounds indicates whether min/max statistics are accurate (true) or potentially
+    // outdated due to deletion vectors (false)
+    fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
+
     StructType::try_new(fields)
 }
 
-// Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
+/// Transforms a schema to make all fields nullable.
+/// Used for stats schemas where stats may not be available for all columns.
+pub(crate) struct NullableStatsTransform;
+impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) if field.is_nullable() => Borrowed(field),
+            data_type => Owned(StructField {
+                name: field.name.clone(),
+                data_type: data_type.into_owned(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
+}
+
+/// Converts a stats schema into a nullCount schema where all leaf fields become LONG.
+///
+/// The nullCount struct field tracks the number of null values for each column.
+/// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
+/// since null counts are always integers, while struct fields are recursed into
+/// to preserve the nested structure.
 #[allow(unused)]
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
-    fn transform_primitive(&mut self, _ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        Some(Cow::Owned(PrimitiveType::Long))
-    }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-
-        if matches!(
-            &field.data_type,
-            DataType::Array(_) | DataType::Map(_) | DataType::Variant(_)
-        ) {
-            return Some(Cow::Owned(StructField {
-                name: field.name.clone(),
-                data_type: DataType::LONG,
-                nullable: true,
-                metadata: Default::default(),
-            }));
-        }
-
-        match self.transform(&field.data_type)? {
-            Borrowed(_) => Some(Borrowed(field)),
-            dt => Some(Owned(StructField {
-                name: field.name.clone(),
-                data_type: dt.into_owned(),
-                nullable: true,
-                metadata: Default::default(),
-            })),
+        // Only recurse into struct fields; convert all other types (leaf fields) to LONG
+        match &field.data_type {
+            DataType::Struct(_) => self.recurse_into_struct_field(field),
+            _ => Some(Cow::Owned(StructField::nullable(
+                &field.name,
+                DataType::LONG,
+            ))),
         }
     }
 }
@@ -169,22 +197,21 @@ struct BaseStatsTransform {
 impl BaseStatsTransform {
     #[allow(unused)]
     fn new(props: &TableProperties) -> Self {
-        // if data_skipping_stats_columns is specified, it takes precedence
-        // over data_skipping_num_indexed_cols, even if that is also specified
-        if let Some(columns_names) = &props.data_skipping_stats_columns {
+        // If data_skipping_stats_columns is specified, it takes precedence
+        // over data_skipping_num_indexed_cols, even if that is also specified.
+        if let Some(column_names) = &props.data_skipping_stats_columns {
             Self {
                 n_columns: None,
                 added_columns: 0,
-                column_names: Some(columns_names.clone()),
+                column_names: Some(column_names.clone()),
                 path: Vec::new(),
             }
         } else {
+            let n_cols = props
+                .data_skipping_num_indexed_cols
+                .unwrap_or(DataSkippingNumIndexedCols::NumColumns(32));
             Self {
-                n_columns: Some(
-                    props
-                        .data_skipping_num_indexed_cols
-                        .unwrap_or(DataSkippingNumIndexedCols::NumColumns(32)),
-                ),
+                n_columns: Some(n_cols),
                 added_columns: 0,
                 column_names: None,
                 path: Vec::new(),
@@ -207,26 +234,23 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 
         self.path.push(field.name.clone());
         let data_type = field.data_type();
-        let is_struct = matches!(data_type, DataType::Struct(_));
 
-        // keep the field if it:
-        // - is a struct field and we need to traverse its children
-        // - OR it is referenced by the column names
-        // - OR it is a primitive type / leaf field
-        let should_include = is_struct
-            || self
+        // We always traverse struct fields (they don't count against the column limit),
+        // but we only include leaf fields if they qualify based on column_names config.
+        // When column_names is None, all leaf fields are included (up to n_columns limit).
+        if !matches!(data_type, DataType::Struct(_)) {
+            let should_include = self
                 .column_names
                 .as_ref()
                 .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
                 .unwrap_or(true);
 
-        if !should_include {
-            self.path.pop();
-            return None;
-        }
+            if !should_include {
+                self.path.pop();
+                return None;
+            }
 
-        // increment count only for leaf columns.
-        if !is_struct {
+            // Increment count only for leaf columns
             self.added_columns += 1;
         }
 
@@ -270,11 +294,7 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if is_skipping_eligible_datatype(ptype) {
-            Some(Cow::Borrowed(ptype))
-        } else {
-            None
-        }
+        is_skipping_eligible_datatype(ptype).then_some(Cow::Borrowed(ptype))
     }
 }
 
@@ -291,7 +311,11 @@ fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) 
 }
 
 /// Checks if a data type is eligible for min/max file skipping.
-/// https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61
+///
+/// Note: Boolean and Binary are intentionally excluded as min/max statistics provide minimal
+/// skipping benefit for low-cardinality or opaque data types.
+///
+/// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
 #[allow(unused)]
 fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
@@ -306,7 +330,6 @@ fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::Timestamp
             | &PrimitiveType::TimestampNtz
             | &PrimitiveType::String
-            // | &PrimitiveType::Boolean
             | PrimitiveType::Decimal(_)
     )
 }
@@ -316,26 +339,6 @@ mod tests {
     use crate::schema::ArrayType;
 
     use super::*;
-
-    pub(crate) struct NullableStatsTransform;
-    impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-        fn transform_struct_field(
-            &mut self,
-            field: &'a StructField,
-        ) -> Option<Cow<'a, StructField>> {
-            use Cow::*;
-            let field = match self.transform(&field.data_type)? {
-                Borrowed(_) if field.is_nullable() => Borrowed(field),
-                data_type => Owned(StructField {
-                    name: field.name.clone(),
-                    data_type: data_type.into_owned(),
-                    nullable: true,
-                    metadata: field.metadata.clone(),
-                }),
-            };
-            Some(field)
-        }
-    }
 
     #[test]
     fn test_should_include_column() {
@@ -366,6 +369,7 @@ mod tests {
             StructField::nullable("nullCount", file_schema.clone()),
             StructField::nullable("minValues", file_schema.clone()),
             StructField::nullable("maxValues", file_schema),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -401,6 +405,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -458,6 +463,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -498,6 +504,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -530,6 +537,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -567,6 +575,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -620,6 +629,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -654,6 +664,7 @@ mod tests {
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
             // No minValues or maxValues fields since no primitive fields are eligible
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
