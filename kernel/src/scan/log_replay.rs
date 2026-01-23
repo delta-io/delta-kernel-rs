@@ -560,7 +560,7 @@ mod tests {
 
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
+    use crate::expressions::{BinaryExpressionOp, Scalar};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
@@ -761,17 +761,14 @@ mod tests {
                 assert!(row_id_transform.is_replace);
                 assert_eq!(row_id_transform.exprs.len(), 1);
                 let expr = &row_id_transform.exprs[0];
-                let expeceted_expr = Arc::new(Expr::variadic(
-                    VariadicExpressionOp::Coalesce,
-                    vec![
-                        Expr::column(["row_id_col"]),
-                        Expr::binary(
-                            BinaryExpressionOp::Plus,
-                            Expr::literal(42i64),
-                            Expr::column(["row_indexes_for_row_id_0"]),
-                        ),
-                    ],
-                ));
+                let expeceted_expr = Arc::new(Expr::coalesce([
+                    Expr::column(["row_id_col"]),
+                    Expr::binary(
+                        BinaryExpressionOp::Plus,
+                        Expr::literal(42i64),
+                        Expr::column(["row_indexes_for_row_id_0"]),
+                    ),
+                ]));
                 assert_eq!(expr, &expeceted_expr);
             } else {
                 panic!("Should have been a transform expression");

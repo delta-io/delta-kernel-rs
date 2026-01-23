@@ -1185,13 +1185,10 @@ mod tests {
         // Create coalesce expression with column that has no nulls, followed by
         // a reference to a non-existent column. If short-circuit works, the
         // non-existent column is never evaluated and no error occurs.
-        let expr = Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![
-                Expression::column(["a"]),
-                Expression::column(["nonexistent"]), // Would fail if evaluated
-            ],
-        );
+        let expr = Expression::coalesce([
+            Expression::column(["a"]),
+            Expression::column(["nonexistent"]), // Would fail if evaluated
+        ]);
 
         // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1216,14 +1213,11 @@ mod tests {
 
         // Create coalesce expression: a has nulls, b has none, c doesn't exist.
         // Short-circuit should stop after evaluating b.
-        let expr = Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![
-                Expression::column(["a"]),
-                Expression::column(["b"]),
-                Expression::column(["nonexistent"]), // Would fail if evaluated
-            ],
-        );
+        let expr = Expression::coalesce([
+            Expression::column(["a"]),
+            Expression::column(["b"]),
+            Expression::column(["nonexistent"]), // Would fail if evaluated
+        ]);
 
         // Should coalesce a and b, never evaluate "nonexistent"
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1242,10 +1236,7 @@ mod tests {
         let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
 
-        let expr = Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![Expression::column(["a"])],
-        );
+        let expr = Expression::coalesce([Expression::column(["a"])]);
 
         // Request STRING type but array is INT32 - should fail even with short-circuit
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
