@@ -155,17 +155,37 @@ impl TableConfiguration {
 
     /// Generates the expected schema for file statistics.
     ///
-    /// Engines can decide to provide statistics for files written to the delta table,
-    /// which enables data skipping and other optimizations. While it is not required to
-    /// provide statistics, it is strongly recommended. This method generates the expected
-    /// schema for statistics based on the table configuration. Often times the consfigration
-    /// is based on operator experience or automates systems as to what statistics are most
-    /// useful for a given table.
+    /// Engines can provide statistics for files written to the delta table, enabling
+    /// data skipping and other optimizations. This method generates the expected schema
+    /// for structured statistics based on the table configuration.
+    ///
+    /// The returned schema uses physical column names (respecting column mapping mode) and
+    /// is structured as:
+    /// ```text
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { <physical columns with LONG type> },
+    ///   minValues: { <physical columns with original types> },
+    ///   maxValues: { <physical columns with original types> },
+    /// }
+    /// ```
+    ///
+    /// The schema is affected by:
+    /// - **Column mapping mode**: Field names use physical names from column mapping metadata.
+    /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
+    /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
+    ///   (default 32).
+    ///
+    /// See the Delta protocol for more details on per-file statistics:
+    /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
         let partition_columns = self.metadata().partition_columns();
         let column_mapping_mode = self.column_mapping_mode();
+        // Partition columns are excluded because statistics are only collected for data columns
+        // that are physically stored in the parquet files. Partition values are stored in the
+        // file path, not in the file content, so they don't have file-level statistics.
         let physical_schema = StructType::try_new(
             self.schema()
                 .fields()
