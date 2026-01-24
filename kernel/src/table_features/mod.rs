@@ -24,6 +24,15 @@ pub const TABLE_FEATURES_MIN_READER_VERSION: i32 = 3;
 /// When set to 7, the protocol requires an explicit `writerFeatures` array.
 pub const TABLE_FEATURES_MIN_WRITER_VERSION: i32 = 7;
 
+/// Prefix for table feature override properties.
+/// Properties with this prefix (e.g., `delta.feature.deletionVectors`) are used to
+/// explicitly turn on support for the feature in the protocol.
+pub const SET_TABLE_FEATURE_SUPPORTED_PREFIX: &str = "delta.feature.";
+
+/// Value to add support for a table feature when used with [`SET_TABLE_FEATURE_SUPPORTED_PREFIX`].
+/// Example: `"delta.feature.deletionVectors" -> "supported"`
+pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
+
 /// Table features represent protocol capabilities required to correctly read or write a given table.
 /// - Readers must implement all features required for correct table reads.
 /// - Writers must implement all features required for correct table writes.

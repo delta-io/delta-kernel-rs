@@ -23,6 +23,9 @@ use strum::EnumString;
 mod deserialize;
 pub use deserialize::ParseIntervalError;
 
+/// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
+pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
+
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
 ///
