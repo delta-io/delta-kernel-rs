@@ -649,8 +649,9 @@ impl Transaction {
     }
     /// Validate that user domains don't conflict with system domains or each other.
     fn validate_user_domain_operations(&self) -> DeltaResult<()> {
-        let mut seen_domains =
-            HashSet::with_capacity(self.domain_metadata_additions.len() + self.domain_removals.len());
+        let mut seen_domains = HashSet::with_capacity(
+            self.domain_metadata_additions.len() + self.domain_removals.len(),
+        );
 
         // Validate domain additions
         for dm in &self.domain_metadata_additions {
