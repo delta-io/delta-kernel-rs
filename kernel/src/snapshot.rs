@@ -398,7 +398,7 @@ impl Snapshot {
             ))
         );
         require!(
-            commit.version == self.version() + 1,
+            commit.version == self.version().wrapping_add(1),
             Error::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file version ({}) does not \
                 equal Snapshot version ({}) + 1.",
