@@ -16,6 +16,14 @@ pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
 
+/// Minimum reader version for tables that use table features.
+/// When set to 3, the protocol requires an explicit `readerFeatures` array.
+pub const TABLE_FEATURES_MIN_READER_VERSION: i32 = 3;
+
+/// Minimum writer version for tables that use table features.
+/// When set to 7, the protocol requires an explicit `writerFeatures` array.
+pub const TABLE_FEATURES_MIN_WRITER_VERSION: i32 = 7;
+
 /// Table features represent protocol capabilities required to correctly read or write a given table.
 /// - Readers must implement all features required for correct table reads.
 /// - Writers must implement all features required for correct table writes.
