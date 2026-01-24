@@ -175,6 +175,11 @@ pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+
+/// Sentinel version indicating a pre-commit state (table does not exist yet).
+/// Used for create-table transactions before the first commit.
+pub const PRE_COMMIT_VERSION: Version = u64::MAX;
+
 pub type FileSize = u64;
 pub type FileIndex = u64;
 
