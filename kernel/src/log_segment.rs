@@ -364,7 +364,7 @@ impl LogSegment {
             ))
         );
         require!(
-            tail_commit_file.version == self.end_version + 1,
+            tail_commit_file.version == self.end_version.wrapping_add(1),
             Error::internal_error(format!(
                 "Cannot extend and create new LogSegment. Tail commit file version ({}) does not \
                 equal LogSegment end_version ({}) + 1.",
