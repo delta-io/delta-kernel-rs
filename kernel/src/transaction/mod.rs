@@ -384,7 +384,7 @@ impl Transaction {
         // step 2 to fail early on duplicate transaction appIds
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
-        let mut app_ids = HashSet::new();
+        let mut app_ids = HashSet::with_capacity(self.set_transactions.len());
         if let Some(dup) = self
             .set_transactions
             .iter()
@@ -649,7 +649,8 @@ impl Transaction {
     }
     /// Validate that user domains don't conflict with system domains or each other.
     fn validate_user_domain_operations(&self) -> DeltaResult<()> {
-        let mut seen_domains = HashSet::new();
+        let mut seen_domains =
+            HashSet::with_capacity(self.domain_metadata_additions.len() + self.domain_removals.len());
 
         // Validate domain additions
         for dm in &self.domain_metadata_additions {
@@ -1402,10 +1403,11 @@ impl<'a> DvMatchVisitor<'a> {
     /// Creates a new DvMatchVisitor that will match file paths against the provided DV updates map.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
+        let capacity_hint = dv_updates.len();
         Self {
             dv_updates,
-            new_dv_entries: Vec::new(),
-            matched_file_indexes: Vec::new(),
+            new_dv_entries: Vec::with_capacity(capacity_hint),
+            matched_file_indexes: Vec::with_capacity(capacity_hint),
         }
     }
 }
