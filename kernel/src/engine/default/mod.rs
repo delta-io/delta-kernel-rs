@@ -33,6 +33,7 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+mod stats;
 pub mod storage;
 
 /// Converts a Stream-producing future to a synchronous iterator.
