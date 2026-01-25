@@ -396,7 +396,7 @@ impl LogSegment {
                 self.max_published_version
                     .map_or(true, |v| file.version > v)
             })
-            .map(|file| CatalogCommit::new(&self.log_root, file))
+            .map(|file| CatalogCommit::try_new(&self.log_root, file))
             .collect()
     }
 
