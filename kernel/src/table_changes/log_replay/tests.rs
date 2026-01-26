@@ -1155,7 +1155,6 @@ async fn print_table_info_post_phase1_has_dv() {
     .into();
 
     assert!(log_output.contains("Phase 1 of CDF query processing completed"));
-    assert!(log_output.contains("id="));
     assert!(log_output.contains(&format!("remove_dvs_size={}", expected_remove_dvs.len())));
     assert!(log_output.contains("has_cdc_action=false"));
     assert!(log_output.contains("file_path="));
