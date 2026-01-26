@@ -1,6 +1,7 @@
 //! This module contains logic to compute the expected schema for file statistics
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::{
     schema::{
@@ -10,6 +11,97 @@ use crate::{
     table_properties::{DataSkippingNumIndexedCols, TableProperties},
     DeltaResult,
 };
+
+/// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
+/// is not specified.
+const DEFAULT_NUM_INDEXED_COLS: u64 = 32;
+
+/// A trie (prefix tree) for efficient column path matching.
+///
+/// Used to quickly determine if a column path is equal to or a descendant of any
+/// user-specified column. This provides O(path_length) lookup instead of
+/// O(num_specified_columns * path_length).
+///
+/// The `Default` implementation creates an empty trie node with no children and
+/// `is_terminal = false`. This is used both for creating a new root trie and for
+/// creating intermediate nodes during insertion (via `or_default()`).
+#[derive(Debug, Default)]
+struct ColumnTrie {
+    children: HashMap<String, ColumnTrie>,
+    /// True if this node represents the end of a specified column path.
+    /// Intermediate nodes have `is_terminal = false`; only the final node of
+    /// an inserted column path has `is_terminal = true`.
+    is_terminal: bool,
+}
+
+impl ColumnTrie {
+    /// Creates an empty trie.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a trie from a list of column names.
+    ///
+    /// For example, `from_columns(&[column_name!("a.b"), column_name!("a.c")])` creates:
+    /// ```text
+    /// root (is_terminal=false)
+    /// └── "a" (is_terminal=false)
+    ///     ├── "b" (is_terminal=true)
+    ///     └── "c" (is_terminal=true)
+    /// ```
+    fn from_columns(columns: &[ColumnName]) -> Self {
+        let mut trie = Self::new();
+        for column in columns {
+            trie.insert(column);
+        }
+        trie
+    }
+
+    /// Inserts a column path into the trie.
+    ///
+    /// Walks down the trie for each path component, creating nodes as needed via `or_default()`
+    /// (which initializes `is_terminal = false`). After the loop, only the final node is marked
+    /// as terminal.
+    ///
+    /// For example, inserting `a.b.c` creates:
+    /// ```text
+    /// root (is_terminal=false)
+    /// └── "a" (is_terminal=false)
+    ///     └── "b" (is_terminal=false)
+    ///         └── "c" (is_terminal=true)
+    /// ```
+    fn insert(&mut self, column: &ColumnName) {
+        let mut node = self;
+        for part in column.iter() {
+            node = node.children.entry(part.clone()).or_default();
+        }
+        node.is_terminal = true;
+    }
+
+    /// Returns true if `path` equals or is a descendant of any inserted column.
+    ///
+    /// For example, if the trie contains `["a", "b"]`:
+    /// - `["a", "b"]` → true (exact match)
+    /// - `["a", "b", "c"]` → true (descendant)
+    /// - `["a"]` → false (ancestor, not descendant)
+    /// - `["a", "x"]` → false (divergent path)
+    fn contains_prefix_of(&self, path: &[String]) -> bool {
+        let mut node = self;
+        for part in path {
+            if node.is_terminal {
+                // We've matched a complete specified column, and path continues.
+                // So path is a descendant of this specified column.
+                return true;
+            }
+            match node.children.get(part) {
+                Some(child) => node = child,
+                None => return false, // Path diverges from all specified columns
+            }
+        }
+        // We've consumed the entire path. Match only if we're at a terminal.
+        node.is_terminal
+    }
+}
 
 /// Generates the expected schema for file statistics.
 ///
@@ -22,13 +114,12 @@ use crate::{
 ///
 /// The `nullCount` struct field is a nested structure mirroring the table's column hierarchy.
 /// It tracks the count of null values for each column. All leaf fields from the base schema
-/// are converted to LONG type (since null counts are always integers). Maps, arrays, and
-/// variants are considered leaf fields. Unlike `minValues`/`maxValues`, `nullCount` includes
-/// all columns from the base schema regardless of data type - every column can have nulls counted.
+/// are converted to LONG type (since null counts are always integers).
 ///
-/// Note: `nullCount` still respects the column limit from `dataSkippingNumIndexedCols` or
-/// `dataSkippingStatsColumns` (via the base schema). The difference from `minValues`/`maxValues`
-/// is only that `nullCount` does not filter by data type eligibility.
+/// Note: Map, Array, and Variant types are excluded from statistics entirely (including
+/// `nullCount`) as they are not eligible for data skipping. The `nullCount` schema includes
+/// primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null counts
+/// are still meaningful for those types.
 ///
 /// The `minValues`/`maxValues` struct fields are also nested structures mirroring the table's
 /// column hierarchy. They additionally filter out leaf fields with non-eligible data types
@@ -156,7 +247,8 @@ pub(crate) fn stats_column_names(
 struct StatsColumnFilter {
     n_columns: Option<DataSkippingNumIndexedCols>,
     added_columns: u64,
-    column_names: Option<Vec<ColumnName>>,
+    /// Trie built from user-specified columns for O(path_length) prefix matching.
+    column_trie: Option<ColumnTrie>,
     path: Vec<String>,
 }
 
@@ -168,17 +260,17 @@ impl StatsColumnFilter {
             Self {
                 n_columns: None,
                 added_columns: 0,
-                column_names: Some(column_names.clone()),
+                column_trie: Some(ColumnTrie::from_columns(column_names)),
                 path: Vec::new(),
             }
         } else {
-            let n_cols = props
-                .data_skipping_num_indexed_cols
-                .unwrap_or(DataSkippingNumIndexedCols::NumColumns(32));
+            let n_cols = props.data_skipping_num_indexed_cols.unwrap_or(
+                DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEXED_COLS),
+            );
             Self {
                 n_columns: Some(n_cols),
                 added_columns: 0,
-                column_names: None,
+                column_trie: None,
                 path: Vec::new(),
             }
         }
@@ -204,6 +296,9 @@ impl StatsColumnFilter {
                     self.collect_field(child, result);
                 }
             }
+            // Map, Array, and Variant types are not eligible for statistics collection.
+            // We skip them entirely so they don't count against the column limit.
+            DataType::Map(_) | DataType::Array(_) | DataType::Variant(_) => {}
             _ => {
                 if self.should_include_current() {
                     result.push(ColumnName::new(&self.path));
@@ -223,11 +318,11 @@ impl StatsColumnFilter {
         )
     }
 
-    /// Returns true if the current path should be included based on column_names config.
+    /// Returns true if the current path should be included based on column_trie config.
     fn should_include_current(&self) -> bool {
-        self.column_names
+        self.column_trie
             .as_ref()
-            .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
+            .map(|trie| trie.contains_prefix_of(&self.path))
             .unwrap_or(true)
     }
 
@@ -320,9 +415,18 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
         self.filter.enter_field(field.name());
         let data_type = field.data_type();
 
+        // Map, Array, and Variant types are not eligible for statistics - skip entirely.
+        if matches!(
+            data_type,
+            DataType::Map(_) | DataType::Array(_) | DataType::Variant(_)
+        ) {
+            self.filter.exit_field();
+            return None;
+        }
+
         // We always traverse struct fields (they don't count against the column limit),
-        // but we only include leaf fields if they qualify based on column_names config.
-        // When column_names is None, all leaf fields are included (up to n_columns limit).
+        // but we only include leaf fields if they qualify based on column_trie config.
+        // When column_trie is None, all leaf fields are included (up to n_columns limit).
         if !matches!(data_type, DataType::Struct(_)) {
             if !self.filter.should_include_current() {
                 self.filter.exit_field();
@@ -359,7 +463,9 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
-    // array and map and variant fields are not eligible for data skipping, so filter them out.
+    // Array, Map, and Variant fields are filtered out by BaseStatsTransform, so these methods
+    // are typically not called. They're kept as a safety net in case the transform is used
+    // independently or the filtering logic changes.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
     }
@@ -373,18 +479,6 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         is_skipping_eligible_datatype(ptype).then_some(Cow::Borrowed(ptype))
     }
-}
-
-// Checks if a column should be included or traversed into.
-//
-// Returns true if the column name is included in the list of column names
-// or if the column name is a prefix of any column name in the list
-// or if the column name is a child of any column name in the list
-#[allow(unused)]
-fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) -> bool {
-    column_names.iter().any(|name| {
-        name.as_ref().starts_with(column_name) || column_name.as_ref().starts_with(name)
-    })
 }
 
 /// Checks if a data type is eligible for min/max file skipping.
@@ -418,21 +512,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_include_column() {
-        let full_name = vec![ColumnName::new(["lvl1", "lvl2", "lvl3", "lvl4"])];
-        let parent = ColumnName::new(["lvl1", "lvl2", "lvl3"]);
-        assert!(should_include_column(&parent, &full_name));
-        assert!(should_include_column(&full_name[0], &full_name));
-        // child fields should also be included
-        assert!(should_include_column(&full_name[0], &[parent]));
+    fn test_column_trie() {
+        // Build trie with specified column ["a", "b"]
+        let trie = ColumnTrie::from_columns(&[ColumnName::new(["a", "b"])]);
 
-        let not_parent = ColumnName::new(["lvl1", "lvl2", "lvl3", "lvl5"]);
-        assert!(!should_include_column(&not_parent, &full_name));
-        let not_parent = ColumnName::new(["lvl1", "lvl3", "lvl4"]);
-        assert!(!should_include_column(&not_parent, &full_name));
+        // Exact match: path = ["a", "b"] → include
+        assert!(trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
 
-        let not_parent = ColumnName::new(["lvl1", "lvl2", "lvl4"]);
-        assert!(!should_include_column(&not_parent, &full_name));
+        // Descendant of specified: path = ["a", "b", "c"] → include
+        assert!(trie.contains_prefix_of(&["a".to_string(), "b".to_string(), "c".to_string()]));
+
+        // Ancestor of specified: path = ["a"] → NOT include
+        assert!(!trie.contains_prefix_of(&["a".to_string()]));
+
+        // Unrelated paths → NOT include
+        assert!(!trie.contains_prefix_of(&["a".to_string(), "c".to_string()]));
+        assert!(!trie.contains_prefix_of(&["x".to_string(), "y".to_string()]));
+
+        // Non-existent nested path: trie has ["a", "b", "c", "d"], path = ["a", "b"]
+        // User asked for a.b.c.d but a.b is a leaf → NOT include
+        let deep_trie = ColumnTrie::from_columns(&[ColumnName::new(["a", "b", "c", "d"])]);
+        assert!(!deep_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
+
+        // Multiple specified columns
+        let multi_trie = ColumnTrie::from_columns(&[
+            ColumnName::new(["a", "b"]),
+            ColumnName::new(["x", "y", "z"]),
+        ]);
+        assert!(multi_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
+        assert!(multi_trie.contains_prefix_of(&[
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string()
+        ]));
+        assert!(multi_trie.contains_prefix_of(&[
+            "x".to_string(),
+            "y".to_string(),
+            "z".to_string()
+        ]));
+        assert!(!multi_trie.contains_prefix_of(&["x".to_string(), "y".to_string()])); // ancestor
+        assert!(!multi_trie.contains_prefix_of(&["a".to_string(), "c".to_string()]));
+        // divergent
     }
 
     #[test]
@@ -516,9 +636,9 @@ mod tests {
 
         let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
 
+        // nullCount excludes array fields (tags) - only eligible primitive types
         let expected_null_nested = StructType::new_unchecked([
             StructField::nullable("name", DataType::LONG),
-            StructField::nullable("tags", DataType::LONG),
             StructField::nullable("score", DataType::LONG),
         ]);
         let expected_null = StructType::new_unchecked([
@@ -728,19 +848,73 @@ mod tests {
 
         let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
 
-        // Expected nullCount schema: all fields converted to LONG
+        // nullCount includes boolean and binary (primitives) but excludes array
         let expected_null_count = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
-            StructField::nullable("tags", DataType::LONG),
         ]);
 
-        // Expected minValues/maxValues schema: empty since no fields are eligible
-        // Since there are no eligible fields, minValues and maxValues should not be present
+        // minValues/maxValues: no fields are eligible (boolean/binary excluded)
         let expected = StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
-            // No minValues or maxValues fields since no primitive fields are eligible
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_map_array_dont_count_against_limit() {
+        // Test that Map and Array fields don't count against the column limit.
+        // With a limit of 2, if we have: array, map, col1, col2, col3
+        // We should get stats for col1 and col2 (the first 2 eligible columns),
+        // not be limited by the array and map fields.
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "2".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            ),
+            StructField::nullable(
+                "metadata",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ),
+            StructField::nullable("col1", DataType::LONG),
+            StructField::nullable("col2", DataType::STRING),
+            StructField::nullable("col3", DataType::INTEGER), // Should be excluded by limit
+        ]);
+
+        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+
+        // nullCount has only eligible primitive columns (col1 and col2).
+        // Map/Array/Variant are excluded from all stats.
+        let expected_null_count = StructType::new_unchecked([
+            StructField::nullable("col1", DataType::LONG),
+            StructField::nullable("col2", DataType::LONG),
+        ]);
+
+        // minValues/maxValues only have eligible primitive types (col1 and col2).
+        // Map/Array are filtered out by MinMaxStatsTransform.
+        let expected_min_max = StructType::new_unchecked([
+            StructField::nullable("col1", DataType::LONG),
+            StructField::nullable("col2", DataType::STRING),
+        ]);
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
             StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 

@@ -191,8 +191,8 @@ impl TableConfiguration {
 
     /// Returns the list of column names that should have statistics collected.
     ///
-    /// This returns the leaf column paths as a flat list of column names
-    /// (e.g., `["id", "nested.field"]`).
+    /// Returns leaf column paths as [`ColumnName`] objects, which store path components
+    /// separately and handle escaping of special characters (dots, spaces) via backticks.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn stats_column_names(&self) -> Vec<ColumnName> {

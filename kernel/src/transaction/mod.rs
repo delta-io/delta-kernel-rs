@@ -947,8 +947,13 @@ impl Transaction {
 
     /// Returns the list of column names that should have statistics collected.
     ///
-    /// This returns the leaf column paths as a flat list of column names
-    /// (e.g., `["id", "nested.field"]`).
+    /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
+    /// stores path components separately (e.g., `ColumnName::new(["nested", "field"])`).
+    ///
+    /// When converted to strings via `to_string()`, field names containing special
+    /// characters (dots, spaces, etc.) are escaped with backticks:
+    /// - `["a", "b"]` → `"a.b"`
+    /// - `["a", "b.c"]` → ``"a.`b.c`"`` (field literally named "b.c")
     ///
     /// Engines can use this to determine which columns need stats during writes.
     #[allow(unused)]
@@ -1010,11 +1015,7 @@ impl Transaction {
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
-        let stats_columns = self
-            .stats_columns()
-            .into_iter()
-            .map(|c| c.to_string())
-            .collect();
+        let stats_columns = self.stats_columns();
 
         WriteContext::new(
             target_dir.clone(),
@@ -1521,7 +1522,7 @@ pub struct WriteContext {
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
     /// Column names that should have statistics collected during writes.
-    stats_columns: Vec<String>,
+    stats_columns: Vec<ColumnName>,
 }
 
 impl WriteContext {
@@ -1530,7 +1531,7 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
-        stats_columns: Vec<String>,
+        stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
             target_dir,
@@ -1560,7 +1561,7 @@ impl WriteContext {
     /// Returns the column names that should have statistics collected during writes.
     ///
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
-    pub fn stats_columns(&self) -> &[String] {
+    pub fn stats_columns(&self) -> &[ColumnName] {
         &self.stats_columns
     }
 
