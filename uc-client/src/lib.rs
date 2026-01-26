@@ -34,6 +34,9 @@ pub use commits_client::{UCCommitsClient, UCCommitsRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 
+#[cfg(any(test, feature = "test-utils"))]
+pub use commits_client::InMemoryCommitsClient;
+
 #[doc(hidden)]
 pub mod prelude {
     pub use crate::client::UCClient;

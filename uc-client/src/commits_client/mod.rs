@@ -7,6 +7,12 @@ use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
 use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
 
+#[cfg(any(test, feature = "test-utils"))]
+mod in_memory;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use in_memory::InMemoryCommitsClient;
+
 /// Trait for UC commits API operations.
 ///
 /// Implementations of this trait are responsible for performing any necessary retries on transient
