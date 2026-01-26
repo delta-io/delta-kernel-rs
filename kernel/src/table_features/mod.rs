@@ -315,10 +315,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
-            "Feature 'inCommitTimestamp' is not supported for CDF",
-        )),
+        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
     }),
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
