@@ -12,8 +12,11 @@ use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
-use crate::log_replay::deduplicator::Deduplicator;
-use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::{
+    ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
+    ParallelLogReplayProcessor,
+};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
@@ -210,8 +213,8 @@ impl ScanLogReplayProcessor {
         state: SerializableScanState,
     ) -> DeltaResult<Arc<Self>> {
         // Deserialize internal state from json
-        let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
-            .map_err(|e| Error::generic(format!("Failed to deserialize internal state: {}", e)))?;
+        let internal_state: InternalScanState =
+            serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
@@ -493,9 +496,63 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     EXPR.clone()
 }
 
+impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
+    type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
+
+    // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
+    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
+    // performed to this function probably also need to be applied to the other copy of the
+    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
+    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
+    // cannot easily be unified.
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = actions_batch;
+        require!(
+            !is_log_batch,
+            Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
+        );
+
+        // Build an initial selection vector for the batch which has had the data skipping filter
+        // applied. The selection vector is further updated by the deduplication visitor to remove
+        // rows that are not valid adds.
+        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        assert_eq!(selection_vector.len(), actions.len());
+
+        let deduplicator = CheckpointDeduplicator::try_new(
+            &self.seen_file_keys,
+            Self::ADD_PATH_INDEX,
+            Self::ADD_DV_START_INDEX,
+        )?;
+        let mut visitor = AddRemoveDedupVisitor::new(
+            deduplicator,
+            selection_vector,
+            self.state_info.clone(),
+            self.partition_filter.clone(),
+        );
+        visitor.visit_rows_of(actions.as_ref())?;
+
+        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
+        let result = self.add_transform.evaluate(actions.as_ref())?;
+        ScanMetadata::try_new(
+            result,
+            visitor.selection_vector,
+            visitor.row_transform_exprs,
+        )
+    }
+}
+
 impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
+    // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
+    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
+    // performed to this function probably also need to be applied to the other copy of the
+    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
+    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
+    // cannot easily be unified.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,

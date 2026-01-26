@@ -398,7 +398,7 @@ impl Snapshot {
             ))
         );
         require!(
-            commit.version == self.version() + 1,
+            commit.version == self.version().wrapping_add(1),
             Error::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file version ({}) does not \
                 equal Snapshot version ({}) + 1.",
@@ -510,7 +510,7 @@ impl Snapshot {
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
     pub fn transaction(self: Arc<Self>, committer: Box<dyn Committer>) -> DeltaResult<Transaction> {
-        Transaction::try_new(self, committer)
+        Transaction::try_new_existing_table(self, committer)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated

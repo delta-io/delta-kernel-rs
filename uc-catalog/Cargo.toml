@@ -26,4 +26,6 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed"] }
+delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed", "test-utils"] }
+object_store = "0.12"
+tempfile = "3"
