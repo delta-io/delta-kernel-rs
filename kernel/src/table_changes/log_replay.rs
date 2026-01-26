@@ -256,26 +256,22 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
 
-        let mut action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&commit_file.location),
-            InCommitTimestampVisitor::schema(),
-            None,
-        )?;
-
         let mut timestamp = commit_file.location.last_modified;
-        let mut in_commit_timestamp = None;
-
-        if let Some(actions) = action_iter.next() {
-            let actions = actions?;
-            let mut visitor = InCommitTimestampVisitor::default();
-            visitor.visit_rows_of(actions.as_ref())?;
-            in_commit_timestamp = visitor.in_commit_timestamp;
-        }
 
         // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
         if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp) {
-            if let Some(in_commit_timestamp) = in_commit_timestamp {
-                timestamp = in_commit_timestamp;
+            let mut action_iter = engine.json_handler().read_json_files(
+                slice::from_ref(&commit_file.location),
+                InCommitTimestampVisitor::schema(),
+                None,
+            )?;
+            if let Some(actions) = action_iter.next() {
+                let actions = actions?;
+                let mut visitor = InCommitTimestampVisitor::default();
+                visitor.visit_rows_of(actions.as_ref())?;
+                if let Some(in_commit_timestamp) = visitor.in_commit_timestamp {
+                    timestamp = in_commit_timestamp;
+                }
             }
         }
 
