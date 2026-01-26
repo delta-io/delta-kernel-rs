@@ -22,3 +22,9 @@ tempfile = "3"
 url = "2.5.4"
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
+# only for structured logging
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "env-filter",
+  "fmt",
+] }
