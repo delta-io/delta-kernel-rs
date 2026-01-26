@@ -2940,7 +2940,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     };
 
     // Do 10 inserts and verify post_commit_snapshot for each
-    for i in 0..10 {
+    for i in 1..11 {
         let base_version = current_snapshot.version();
 
         let txn = current_snapshot
