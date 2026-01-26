@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use crate::actions::get_commit_schema;
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
+use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
@@ -101,7 +101,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         let commit_phase = Some(CommitReader::try_new(
             engine.as_ref(),
             log_segment,
-            get_commit_schema().clone(),
+            COMMIT_READ_SCHEMA.clone(),
         )?);
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
