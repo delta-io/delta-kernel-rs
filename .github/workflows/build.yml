@@ -210,10 +210,11 @@ jobs:
           rustup toolchain install nightly --component miri
           rustup override set nightly
           cargo miri setup
+      - uses: taiki-e/install-action@nextest
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls
 
   coverage:
     runs-on: ubuntu-latest
