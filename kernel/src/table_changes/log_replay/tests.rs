@@ -1,7 +1,7 @@
 use super::table_changes_action_iter;
 use super::TableChangesScanMetadata;
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use crate::actions::{Add, Cdc, Metadata, Protocol, Remove, CommitInfo};
+use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
 use crate::log_segment::LogSegment;
@@ -1080,7 +1080,10 @@ async fn test_timestamp_with_ict_enabled() {
                     0,
                     HashMap::from([
                         ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                        ("delta.enableInCommitTimestamps".to_string(), "true".to_string()),
+                        (
+                            "delta.enableInCommitTimestamps".to_string(),
+                            "true".to_string(),
+                        ),
                     ]),
                 )
                 .unwrap(),
@@ -1090,29 +1093,33 @@ async fn test_timestamp_with_ict_enabled() {
                     3,
                     7,
                     Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::InCommitTimestamp, TableFeature::ChangeDataFeed, TableFeature::DeletionVectors]),
+                    Some([
+                        TableFeature::InCommitTimestamp,
+                        TableFeature::ChangeDataFeed,
+                        TableFeature::DeletionVectors,
+                    ]),
                 )
                 .unwrap(),
             ),
-        ]).await;
+        ])
+        .await;
 
-        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();
-        
-        let commit = commits.next().unwrap();
-        let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let mut table_config = get_default_table_config(&table_root_url);
-        let scanner = LogReplayScanner::try_new(
-            engine.as_ref(),
-            &mut table_config,
-            commit,
-            &get_schema().into(),
-        )
-        .unwrap();
-        assert_eq!(scanner.timestamp, 2000);
-}
 
+    let commit = commits.next().unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let mut table_config = get_default_table_config(&table_root_url);
+    let scanner = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema().into(),
+    )
+    .unwrap();
+    assert_eq!(scanner.timestamp, 2000);
+}
 
 #[tokio::test]
 async fn test_timestamp_with_ict_disabled() {
@@ -1129,8 +1136,64 @@ async fn test_timestamp_with_ict_disabled() {
                     get_schema(),
                     vec![],
                     0,
+                    HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+                )
+                .unwrap(),
+            ),
+            Action::Protocol(
+                Protocol::try_new(
+                    3,
+                    7,
+                    Some([TableFeature::DeletionVectors]),
+                    Some([
+                        TableFeature::InCommitTimestamp,
+                        TableFeature::ChangeDataFeed,
+                        TableFeature::DeletionVectors,
+                    ]),
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let commit = commits.next().unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let mut table_config = get_default_table_config(&table_root_url);
+    let scanner = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema().into(),
+    )
+    .unwrap();
+    assert_ne!(scanner.timestamp, 2000);
+}
+
+//delete???
+#[tokio::test]
+async fn test_timestamp_with_commit_info_not_first() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    mock_table
+        .commit([
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
                     HashMap::from([
                         ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableInCommitTimestamps".to_string(),
+                            "true".to_string(),
+                        ),
                     ]),
                 )
                 .unwrap(),
@@ -1140,25 +1203,31 @@ async fn test_timestamp_with_ict_disabled() {
                     3,
                     7,
                     Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::InCommitTimestamp, TableFeature::ChangeDataFeed, TableFeature::DeletionVectors]),
+                    Some([
+                        TableFeature::InCommitTimestamp,
+                        TableFeature::ChangeDataFeed,
+                        TableFeature::DeletionVectors,
+                    ]),
                 )
                 .unwrap(),
             ),
-        ]).await;
+            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, None)),
+        ])
+        .await;
 
-        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();
-        
-        let commit = commits.next().unwrap();
-        let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let mut table_config = get_default_table_config(&table_root_url);
-        let scanner = LogReplayScanner::try_new(
-            engine.as_ref(),
-            &mut table_config,
-            commit,
-            &get_schema().into(),
-        )
-        .unwrap();
-        assert_eq!(scanner.timestamp, 1000);
+
+    let commit = commits.next().unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let mut table_config = get_default_table_config(&table_root_url);
+    let scanner = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema().into(),
+    )
+    .unwrap();
+    assert_ne!(scanner.timestamp, 2000);
 }

@@ -6,6 +6,7 @@ use std::slice;
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::visit_deletion_vector_at;
+use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
     PROTOCOL_NAME, REMOVE_NAME,
@@ -176,6 +177,7 @@ impl LogReplayScanner {
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
+
         for actions in action_iter {
             let actions = actions?;
 
@@ -254,10 +256,25 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
 
-        // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
+        let mut action_iter = engine.json_handler().read_json_files(
+            slice::from_ref(&commit_file.location),
+            InCommitTimestampVisitor::schema(),
+            None,
+        )?;
+
         let mut timestamp = commit_file.location.last_modified;
+        let mut in_commit_timestamp = None;
+
+        if let Some(actions) = action_iter.next() {
+            let actions = actions?;
+            let mut visitor = InCommitTimestampVisitor::default();
+            visitor.visit_rows_of(actions.as_ref())?;
+            in_commit_timestamp = visitor.in_commit_timestamp;
+        }
+
+        // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
         if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp) {
-            if let Ok(in_commit_timestamp) = commit_file.read_in_commit_timestamp(engine) {
+            if let Some(in_commit_timestamp) = in_commit_timestamp {
                 timestamp = in_commit_timestamp;
             }
         }
