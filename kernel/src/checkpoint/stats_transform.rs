@@ -5,7 +5,7 @@
 //! based on the table configuration. Statistics can be stored in two formats as fields on
 //! the `Add` action:
 //! - `stats`: JSON string format, controlled by `delta.checkpoint.writeStatsAsJson` (default: true)
-//! - `stats_parsed`: Native struct format, controlled by `delta.checkpoint.writeStatsAsStruct` (default: true)
+//! - `stats_parsed`: Native struct format, controlled by `delta.checkpoint.writeStatsAsStruct` (default: false)
 //!
 //! This module provides transforms to populate these fields using COALESCE expressions,
 //! ensuring that stats are preserved regardless of the source format (commits vs checkpoints).
@@ -32,7 +32,7 @@ impl StatsTransformConfig {
     pub(super) fn from_table_properties(properties: &TableProperties) -> Self {
         Self {
             write_stats_as_json: properties.checkpoint_write_stats_as_json.unwrap_or(true),
-            write_stats_as_struct: properties.checkpoint_write_stats_as_struct.unwrap_or(true),
+            write_stats_as_struct: properties.checkpoint_write_stats_as_struct.unwrap_or(false),
         }
     }
 }
@@ -280,11 +280,11 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        // Default: writeStatsAsJson=true, writeStatsAsStruct=true
+        // Default: writeStatsAsJson=true, writeStatsAsStruct=false (per protocol)
         let props = TableProperties::default();
         let config = StatsTransformConfig::from_table_properties(&props);
         assert!(config.write_stats_as_json);
-        assert!(config.write_stats_as_struct);
+        assert!(!config.write_stats_as_struct);
     }
 
     #[test]
@@ -298,10 +298,68 @@ mod tests {
         assert!(config.write_stats_as_struct);
     }
 
+    /// Helper to extract the outer and inner transforms from a stats transform expression.
+    /// Returns (outer_transform, inner_transform).
+    fn extract_transforms(expr: &Expression) -> (&Transform, &Transform) {
+        let Expression::Transform(outer) = expr else {
+            panic!("Expected outer Transform expression");
+        };
+
+        // Outer should be top-level (no input path)
+        assert!(
+            outer.input_path.is_none(),
+            "Outer transform should be top-level"
+        );
+
+        // Outer should replace "add" field
+        let add_field_transform = outer
+            .field_transforms
+            .get(ADD_NAME)
+            .expect("Outer transform should have 'add' field transform");
+        assert!(add_field_transform.is_replace, "Should replace 'add' field");
+        assert_eq!(
+            add_field_transform.exprs.len(),
+            1,
+            "Should have exactly one replacement expression"
+        );
+
+        // Extract inner transform
+        let Expression::Transform(inner) = add_field_transform.exprs[0].as_ref() else {
+            panic!("Expected inner Transform expression for 'add' field");
+        };
+
+        // Inner should target "add" path
+        assert_eq!(
+            inner.input_path.as_ref().map(|p| p.to_string()),
+            Some("add".to_string()),
+            "Inner transform should target 'add' path"
+        );
+
+        (outer, inner)
+    }
+
+    /// Helper to check if a field transform is a drop (replace with nothing).
+    fn is_drop(transform: &Transform, field: &str) -> bool {
+        transform
+            .field_transforms
+            .get(field)
+            .map(|ft| ft.is_replace && ft.exprs.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Helper to check if a field transform is a replacement with an expression.
+    fn is_replacement(transform: &Transform, field: &str) -> bool {
+        transform
+            .field_transforms
+            .get(field)
+            .map(|ft| ft.is_replace && ft.exprs.len() == 1)
+            .unwrap_or(false)
+    }
+
     #[test]
     fn test_build_transform_with_json_only() {
         // writeStatsAsJson=true, writeStatsAsStruct=false (default)
-        // Should produce a transform expression that replaces stats with COALESCE and drops stats_parsed
+        // Inner transform: stats=COALESCE, stats_parsed=drop
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: false,
@@ -309,16 +367,25 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_stats_transform(&config, stats_schema);
 
-        // Verify we get a Transform expression
-        let Expression::Transform(_) = transform_expr.as_ref() else {
-            panic!("Expected Transform expression");
-        };
+        let (_, inner) = extract_transforms(&transform_expr);
+
+        // stats should be replaced with COALESCE expression
+        assert!(
+            is_replacement(inner, STATS_FIELD),
+            "stats should be replaced"
+        );
+
+        // stats_parsed should be dropped
+        assert!(
+            is_drop(inner, STATS_PARSED_FIELD),
+            "stats_parsed should be dropped"
+        );
     }
 
     #[test]
     fn test_build_transform_drops_both_when_false() {
         // writeStatsAsJson=false, writeStatsAsStruct=false
-        // Should produce a transform expression that drops both stats and stats_parsed
+        // Inner transform: stats=drop, stats_parsed=drop
         let config = StatsTransformConfig {
             write_stats_as_json: false,
             write_stats_as_struct: false,
@@ -326,16 +393,20 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_stats_transform(&config, stats_schema);
 
-        // Verify we get a Transform expression
-        let Expression::Transform(_) = transform_expr.as_ref() else {
-            panic!("Expected Transform expression");
-        };
+        let (_, inner) = extract_transforms(&transform_expr);
+
+        // Both fields should be dropped
+        assert!(is_drop(inner, STATS_FIELD), "stats should be dropped");
+        assert!(
+            is_drop(inner, STATS_PARSED_FIELD),
+            "stats_parsed should be dropped"
+        );
     }
 
     #[test]
     fn test_build_transform_with_both_enabled() {
         // writeStatsAsJson=true, writeStatsAsStruct=true
-        // Should produce a transform expression that populates both stats and stats_parsed
+        // Inner transform: stats=COALESCE, stats_parsed=COALESCE
         let config = StatsTransformConfig {
             write_stats_as_json: true,
             write_stats_as_struct: true,
@@ -343,16 +414,23 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_stats_transform(&config, stats_schema);
 
-        // Verify we get a Transform expression
-        let Expression::Transform(_) = transform_expr.as_ref() else {
-            panic!("Expected Transform expression");
-        };
+        let (_, inner) = extract_transforms(&transform_expr);
+
+        // Both fields should be replaced with COALESCE expressions
+        assert!(
+            is_replacement(inner, STATS_FIELD),
+            "stats should be replaced"
+        );
+        assert!(
+            is_replacement(inner, STATS_PARSED_FIELD),
+            "stats_parsed should be replaced"
+        );
     }
 
     #[test]
     fn test_build_transform_struct_only() {
         // writeStatsAsJson=false, writeStatsAsStruct=true
-        // Should produce a transform expression that drops stats and populates stats_parsed
+        // Inner transform: stats=drop, stats_parsed=COALESCE
         let config = StatsTransformConfig {
             write_stats_as_json: false,
             write_stats_as_struct: true,
@@ -360,10 +438,16 @@ mod tests {
         let stats_schema = Arc::new(StructType::new_unchecked([]));
         let transform_expr = build_stats_transform(&config, stats_schema);
 
-        // Verify we get a Transform expression
-        let Expression::Transform(_) = transform_expr.as_ref() else {
-            panic!("Expected Transform expression");
-        };
+        let (_, inner) = extract_transforms(&transform_expr);
+
+        // stats should be dropped
+        assert!(is_drop(inner, STATS_FIELD), "stats should be dropped");
+
+        // stats_parsed should be replaced with COALESCE expression
+        assert!(
+            is_replacement(inner, STATS_PARSED_FIELD),
+            "stats_parsed should be replaced"
+        );
     }
 
     #[test]
