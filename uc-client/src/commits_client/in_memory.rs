@@ -1,5 +1,6 @@
 //! In-memory implementation of [`UCCommitsClient`] for testing.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -21,7 +22,7 @@ struct TableData {
 }
 
 impl TableData {
-    const MAX_UNPUBLISHED_COMMITS: u16 = 50;
+    const MAX_UNPUBLISHED_COMMITS: usize = 50;
 
     /// Creates a new `TableData` representing a UC Delta table that has just been created.
     /// The table starts with no commits and version 0.
@@ -67,9 +68,9 @@ impl TableData {
             )));
         }
 
-        if self.catalog_commits.len() as u16 >= Self::MAX_UNPUBLISHED_COMMITS {
+        if self.catalog_commits.len() >= Self::MAX_UNPUBLISHED_COMMITS {
             return Err(Error::MaxUnpublishedCommitsExceeded(
-                Self::MAX_UNPUBLISHED_COMMITS,
+                Self::MAX_UNPUBLISHED_COMMITS as u16,
             ));
         }
 
@@ -110,13 +111,14 @@ impl InMemoryCommitsClient {
     pub fn create_table(&self, table_id: impl Into<String>) -> Result<()> {
         let mut tables = self.tables.write().unwrap();
         match tables.entry(table_id.into()) {
-            std::collections::hash_map::Entry::Vacant(e) => {
+            Entry::Vacant(e) => {
                 e.insert(TableData::new_post_table_create());
                 Ok(())
             }
-            std::collections::hash_map::Entry::Occupied(e) => Err(Error::UnsupportedOperation(
-                format!("Table {} already exists", e.key()),
-            )),
+            Entry::Occupied(e) => Err(Error::UnsupportedOperation(format!(
+                "Table {} already exists",
+                e.key()
+            ))),
         }
     }
 }
