@@ -3,7 +3,6 @@ use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use test_log::test;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -973,39 +972,37 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 
-#[test]
-fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
+#[test_log::test(rstest::rstest)]
+#[case::simple_path(
+    "example.parquet",
+    "file:///var/_delta_log/_sidecars/example.parquet"
+)]
+#[case::full_path(
+    "file:///var/_delta_log/_sidecars/example.parquet",
+    "file:///var/_delta_log/_sidecars/example.parquet"
+)]
+#[case::nested_path(
+    "test/test/example.parquet",
+    "file:///var/_delta_log/_sidecars/test/test/example.parquet"
+)]
+fn test_sidecar_to_filemeta_valid_paths(
+    #[case] input_path: &str,
+    #[case] expected_url: &str,
+) -> DeltaResult<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
-    let test_cases = [
-        (
-            "example.parquet",
-            "file:///var/_delta_log/_sidecars/example.parquet",
-        ),
-        (
-            "file:///var/_delta_log/_sidecars/example.parquet",
-            "file:///var/_delta_log/_sidecars/example.parquet",
-        ),
-        (
-            "test/test/example.parquet",
-            "file:///var/_delta_log/_sidecars/test/test/example.parquet",
-        ),
-    ];
+    let sidecar = Sidecar {
+        path: expected_url.to_string(),
+        modification_time: 0,
+        size_in_bytes: 1000,
+        tags: None,
+    };
 
-    for (input_path, expected_url) in test_cases.into_iter() {
-        let sidecar = Sidecar {
-            path: expected_url.to_string(),
-            modification_time: 0,
-            size_in_bytes: 1000,
-            tags: None,
-        };
-
-        let filemeta = sidecar.to_filemeta(&log_root)?;
-        assert_eq!(
-            filemeta.location.as_str(),
-            expected_url,
-            "Mismatch for input path: {input_path}"
-        );
-    }
+    let filemeta = sidecar.to_filemeta(&log_root)?;
+    assert_eq!(
+        filemeta.location.as_str(),
+        expected_url,
+        "Mismatch for input path: {input_path}"
+    );
     Ok(())
 }
 

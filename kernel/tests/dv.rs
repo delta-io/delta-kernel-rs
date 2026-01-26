@@ -20,7 +20,6 @@ use test_utils::{
 };
 
 use itertools::Itertools;
-use test_log::test;
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
@@ -52,9 +51,14 @@ fn count_total_scan_rows(
         .fold_ok(0, Add::add)
 }
 
-#[test]
-fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
+#[test_log::test(rstest::rstest)]
+#[case::with_dv("./tests/data/table-with-dv-small/", 8)]
+#[case::without_dv("./tests/data/table-without-dv-small/", 10)]
+fn test_table_scan(
+    #[case] table_path: &str,
+    #[case] expected_rows: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from(table_path))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = test_utils::create_default_engine(&url)?;
 
@@ -63,22 +67,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream = scan.execute(engine)?;
     let total_rows = count_total_scan_rows(stream)?;
-    assert_eq!(total_rows, 8);
-    Ok(())
-}
-
-#[test]
-fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = test_utils::create_default_engine(&url)?;
-
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
-    let scan = snapshot.scan_builder().build()?;
-
-    let stream = scan.execute(engine)?;
-    let total_rows = count_total_scan_rows(stream)?;
-    assert_eq!(total_rows, 10);
+    assert_eq!(total_rows, expected_rows);
     Ok(())
 }
 
