@@ -394,7 +394,7 @@ impl LogSegment {
             .filter(|file| file.file_type == LogPathFileType::StagedCommit)
             .filter(|file| {
                 self.max_published_version
-                    .map_or(true, |v| file.version > v)
+                    .is_none_or(|v| file.version > v)
             })
             .map(|file| CatalogCommit::try_new(&self.log_root, file))
             .collect()

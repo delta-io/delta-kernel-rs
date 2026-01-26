@@ -603,7 +603,8 @@ impl Snapshot {
             )
         );
 
-        let publish_metadata = PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
+        let publish_metadata =
+            PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
         committer.publish(engine, publish_metadata)?;
         Ok(())
     }
