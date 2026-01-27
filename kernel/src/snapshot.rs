@@ -441,11 +441,9 @@ impl Snapshot {
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine.parquet_handler().write_parquet_file(
-            checkpoint_path.clone(),
-            Box::new(lazy_data),
-            None,
-        )?;
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
