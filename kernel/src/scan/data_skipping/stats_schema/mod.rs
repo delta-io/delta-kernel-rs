@@ -685,4 +685,113 @@ mod tests {
 
         assert_eq!(&expected, &stats_schema);
     }
+
+    // ==================== stats_column_names tests ====================
+
+    #[test]
+    fn test_stats_column_names_default() {
+        let properties: TableProperties = [("key", "value")].into();
+
+        let user_struct = StructType::new_unchecked([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+        ]);
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+        ]);
+
+        let columns = stats_column_names(&file_schema, &properties);
+
+        // With default settings, all leaf columns should be included
+        assert_eq!(
+            columns,
+            vec![
+                ColumnName::new(["id"]),
+                ColumnName::new(["user", "name"]),
+                ColumnName::new(["user", "age"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_with_num_indexed_cols() {
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "2".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+            StructField::nullable("c", DataType::INTEGER),
+            StructField::nullable("d", DataType::DOUBLE),
+        ]);
+
+        let columns = stats_column_names(&file_schema, &properties);
+
+        // Only first 2 columns should be included
+        assert_eq!(
+            columns,
+            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_with_stats_columns() {
+        let properties: TableProperties = [(
+            "delta.dataSkippingStatsColumns".to_string(),
+            "id,user.age".to_string(),
+        )]
+        .into();
+
+        let user_struct = StructType::new_unchecked([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+        ]);
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("extra", DataType::STRING),
+        ]);
+
+        let columns = stats_column_names(&file_schema, &properties);
+
+        // Only specified columns should be included (user.name and extra excluded)
+        assert_eq!(
+            columns,
+            vec![ColumnName::new(["id"]), ColumnName::new(["user", "age"]),]
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_skips_non_eligible_types() {
+        let properties: TableProperties = [("key", "value")].into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            ),
+            StructField::nullable(
+                "metadata",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        let columns = stats_column_names(&file_schema, &properties);
+
+        // Array and Map types should be excluded
+        assert_eq!(
+            columns,
+            vec![ColumnName::new(["id"]), ColumnName::new(["name"]),]
+        );
+    }
 }
