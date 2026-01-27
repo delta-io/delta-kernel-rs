@@ -16,7 +16,6 @@ use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
-#[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     sidecar_visitor: SidecarVisitor,
@@ -35,7 +34,6 @@ impl CheckpointManifestReader {
     /// - `manifest_file`: The checkpoint manifest file to process
     /// - `log_root`: Root URL for resolving sidecar paths
     /// - `engine`: Engine for reading files
-    #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,
@@ -79,7 +77,6 @@ impl CheckpointManifestReader {
 
     /// Extract the sidecars from the manifest file if there were any.
     /// NOTE: The iterator must be completely exhausted before calling this
-    #[allow(unused)]
     pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
         require!(
             self.is_complete,

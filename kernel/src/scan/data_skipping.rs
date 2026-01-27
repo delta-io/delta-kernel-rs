@@ -52,7 +52,7 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
-pub(crate) struct DataSkippingFilter {
+pub struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
