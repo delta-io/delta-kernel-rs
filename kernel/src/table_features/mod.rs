@@ -230,6 +230,12 @@ pub(crate) struct FeatureInfo {
     /// Requirements this feature has (features + custom validations)
     pub feature_requirements: &'static [FeatureRequirement],
     /// Rust kernel's support for this feature (may vary by Operation type)
+    ///
+    /// Note: `kernel_support` validation depends on `feature_type`:
+    /// - Writer features: Only checked during `Operation::Write`
+    /// - ReaderWriter features: Checked during all operations (Scan/Write/CDF)
+    /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
+    /// Writer-only features is never invoked for Scan/CDF regardless of the custom check logic.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
