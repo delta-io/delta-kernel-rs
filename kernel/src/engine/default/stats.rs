@@ -11,8 +11,8 @@ use crate::arrow::array::{
 };
 use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
 use crate::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Date32Type, Date64Type, Field, Float32Type, Float64Type,
-    Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit, TimestampMicrosecondType,
+    ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
+    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
@@ -39,16 +39,6 @@ fn truncate_string(s: &str) -> String {
     s.chars().take(STRING_PREFIX_LENGTH).collect()
 }
 
-/// Downcast helper with descriptive error message.
-fn downcast<T: 'static>(column: &ArrayRef) -> DeltaResult<&T> {
-    column.as_any().downcast_ref::<T>().ok_or_else(|| {
-        Error::generic(format!(
-            "Failed to downcast column to {}",
-            std::any::type_name::<T>(),
-        ))
-    })
-}
-
 /// Compute aggregation for a primitive array.
 fn agg_primitive<T>(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>>
 where
@@ -56,7 +46,12 @@ where
     T::Native: PartialOrd,
     PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
 {
-    let array = downcast::<PrimitiveArray<T>>(column)?;
+    let array = column.as_primitive_opt::<T>().ok_or_else(|| {
+        Error::generic(format!(
+            "Failed to downcast column to PrimitiveArray<{}>",
+            std::any::type_name::<T>()
+        ))
+    })?;
     let result = match agg {
         Agg::Min => min(array),
         Agg::Max => max(array),
@@ -74,7 +69,12 @@ where
     T: crate::arrow::datatypes::ArrowTimestampType,
     PrimitiveArray<T>: From<Vec<Option<i64>>>,
 {
-    let array = downcast::<PrimitiveArray<T>>(column)?;
+    let array = column.as_primitive_opt::<T>().ok_or_else(|| {
+        Error::generic(format!(
+            "Failed to downcast column to PrimitiveArray<{}>",
+            std::any::type_name::<T>()
+        ))
+    })?;
     let result = match agg {
         Agg::Min => min(array),
         Agg::Max => max(array),
@@ -91,7 +91,9 @@ fn agg_decimal(
     scale: i8,
     agg: Agg,
 ) -> DeltaResult<Option<ArrayRef>> {
-    let array = downcast::<Decimal128Array>(column)?;
+    let array = column
+        .as_primitive_opt::<Decimal128Type>()
+        .ok_or_else(|| Error::generic("Failed to downcast column to Decimal128Array"))?;
     let result = match agg {
         Agg::Min => min(array),
         Agg::Max => max(array),
@@ -108,7 +110,9 @@ fn agg_decimal(
 
 /// Compute aggregation for a string array with truncation.
 fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
-    let array = downcast::<StringArray>(column)?;
+    let array = column
+        .as_string_opt::<i32>()
+        .ok_or_else(|| Error::generic("Failed to downcast column to StringArray"))?;
     let result = match agg {
         Agg::Min => min_string(array),
         Agg::Max => max_string(array),
@@ -117,8 +121,14 @@ fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
 }
 
 /// Compute aggregation for a large string array with truncation.
+///
+/// Unlike StringArray, Arrow's compute kernels don't provide min/max for LargeStringArray,
+/// so we iterate manually. `iter()` yields `Option<&str>` per element (None for nulls),
+/// and `flatten()` filters out nulls so we only compare non-null values.
 fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
-    let array = downcast::<LargeStringArray>(column)?;
+    let array = column
+        .as_string_opt::<i64>()
+        .ok_or_else(|| Error::generic("Failed to downcast column to LargeStringArray"))?;
     let result = match agg {
         Agg::Min => array.iter().flatten().min(),
         Agg::Max => array.iter().flatten().max(),
@@ -130,8 +140,13 @@ fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
 }
 
 /// Compute aggregation for a string view array with truncation.
+///
+/// Like LargeStringArray, Arrow's compute kernels don't provide min/max for StringViewArray.
+/// See `agg_large_string` for explanation of `iter().flatten()`.
 fn agg_string_view(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
-    let array = downcast::<StringViewArray>(column)?;
+    let array = column
+        .as_string_view_opt()
+        .ok_or_else(|| Error::generic("Failed to downcast column to StringViewArray"))?;
     let result: Option<&str> = match agg {
         Agg::Min => array.iter().flatten().min(),
         Agg::Max => array.iter().flatten().max(),
