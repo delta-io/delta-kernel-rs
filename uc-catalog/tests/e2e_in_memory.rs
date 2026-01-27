@@ -127,7 +127,7 @@ async fn test_insert_and_publish() -> Result<(), TestError> {
         let committer = UCCommitter::new(commits_client.clone(), TABLE_ID);
         snapshot.publish(&engine, &committer)?;
 
-        // TODO: Have Snapshot::publish return a new Snapshot with the published state.
+        // TODO(#1688): Have Snapshot::publish return a new Snapshot with the published state.
         //       For now, we reload the snapshot to get updated max_published_version
         snapshot = catalog
             .load_snapshot(TABLE_ID, table_uri.as_str(), &engine)

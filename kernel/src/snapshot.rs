@@ -571,7 +571,7 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
-    // TODO: Return a new Snapshot reflecting the published state
+    // TODO(#1688): Return a new Snapshot reflecting the published state
     pub fn publish(&self, engine: &dyn Engine, committer: &dyn Committer) -> DeltaResult<()> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
