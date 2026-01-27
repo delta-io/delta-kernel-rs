@@ -79,6 +79,7 @@ impl ParquetHandler for SyncParquetHandler {
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
+    /// - `stats_columns` - Column names for which statistics should be collected.
     ///
     /// # Returns
     ///
@@ -87,6 +88,7 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         location: Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn crate::EngineData>>> + Send>,
+        _stats_columns: &[String],
     ) -> DeltaResult<()> {
         // Convert URL to file path
         let path = location
@@ -115,6 +117,7 @@ impl ParquetHandler for SyncParquetHandler {
 
         writer.close()?; // writer must be closed to write footer
 
+        // TODO: Implement stats collection for SyncEngine
         Ok(())
     }
 
@@ -174,7 +177,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter, &[])
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -295,7 +300,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter, &[])
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -370,7 +377,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
-        handler.write_parquet_file(url.clone(), data_iter1).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter1, &[])
+            .unwrap();
         assert!(file_path.exists());
 
         // Create second data set with different data
@@ -386,7 +395,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data2)));
 
         // Overwrite with second file (overwrite=true)
-        handler.write_parquet_file(url.clone(), data_iter2).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter2, &[])
+            .unwrap();
 
         // Read back and verify it contains the second data set
         let file = File::open(&file_path).unwrap();
@@ -445,7 +456,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
-        handler.write_parquet_file(url.clone(), data_iter1).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter1, &[])
+            .unwrap();
         assert!(file_path.exists());
 
         // Create second data set
@@ -461,7 +474,9 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data2)));
 
         // Write again - should overwrite successfully (new behavior always overwrites)
-        handler.write_parquet_file(url.clone(), data_iter2).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter2, &[])
+            .unwrap();
 
         // Verify the file was overwritten with the new data
         let file = File::open(&file_path).unwrap();
@@ -537,7 +552,9 @@ mod tests {
         > = Box::new(batches.into_iter());
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), data_iter, &[])
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
