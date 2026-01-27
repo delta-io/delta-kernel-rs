@@ -275,7 +275,7 @@ where
 ///   filtered by the **selection vector** to determine which rows are included in the final checkpoint.
 ///
 /// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
-pub(crate) trait LogReplayProcessor: Sized {
+pub trait LogReplayProcessor: Sized {
     /// The type of results produced by this processor must implement the
     /// [`HasSelectionVector`] trait to allow filtering out batches with no selected rows.
     type Output: HasSelectionVector;
@@ -348,7 +348,7 @@ pub(crate) trait LogReplayProcessor: Sized {
 
 /// This trait is used to determine if a processor's output contains any selected rows.
 /// This is used to filter out batches with no selected rows from the log replay results.
-pub(crate) trait HasSelectionVector {
+pub trait HasSelectionVector {
     /// Check if the selection vector contains at least one selected row
     fn has_selected_rows(&self) -> bool;
 }
