@@ -106,18 +106,16 @@ async fn test_insert_and_publish() -> Result<(), TestError> {
     assert_eq!(snapshot.version(), 2);
 
     let catalog = UCCatalog::new(commits_client.as_ref());
-    let beyond_max = TableData::MAX_UNPUBLISHED_COMMITS as i64 + 5;
+    let beyond_max = TableData::MAX_UNPUBLISHED_COMMITS as u64 + 5;
 
     for i in 3..=beyond_max {
-        let expected_version = i as u64;
-
         // Commit
         let committer = Box::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
         let committed = match snapshot.clone().transaction(committer)?.commit(&engine)? {
             CommitResult::CommittedTransaction(t) => t,
             _ => return Err("Expected committed transaction".into()),
         };
-        assert_eq!(committed.commit_version(), expected_version);
+        assert_eq!(committed.commit_version(), i);
         snapshot = committed
             .post_commit_snapshot()
             .ok_or("no post commit snapshot")?
@@ -128,7 +126,7 @@ async fn test_insert_and_publish() -> Result<(), TestError> {
         snapshot.publish(&engine, &committer)?;
 
         // TODO(#1688): Have Snapshot::publish return a new Snapshot with the published state.
-        //       For now, we reload the snapshot to get updated max_published_version
+        //              For now, we reload the snapshot to get updated max_published_version
         snapshot = catalog
             .load_snapshot(TABLE_ID, table_uri.as_str(), &engine)
             .await?;
@@ -147,20 +145,20 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     } = setup().await?;
 
     // Start with 2 unpublished (v1, v2). Insert up to MAX, then the next should fail.
-    let max = TableData::MAX_UNPUBLISHED_COMMITS as i64;
+    let max = TableData::MAX_UNPUBLISHED_COMMITS as u64;
     for i in 3..=max {
         let committer = Box::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
         let committed = match snapshot.clone().transaction(committer)?.commit(&engine)? {
             CommitResult::CommittedTransaction(t) => t,
             _ => return Err("Expected committed transaction".into()),
         };
-        assert_eq!(committed.commit_version(), i as u64);
+        assert_eq!(committed.commit_version(), i);
         snapshot = committed
             .post_commit_snapshot()
             .ok_or("no post commit snapshot")?
             .clone();
     }
-    assert_eq!(snapshot.version(), max as u64);
+    assert_eq!(snapshot.version(), max);
 
     // Next insert should fail with MaxUnpublishedCommitsExceeded
     let committer = Box::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
