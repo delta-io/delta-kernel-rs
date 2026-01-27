@@ -199,7 +199,6 @@ impl<'a> SchemaTransform<'a> for NullableStatsTransform {
 /// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
 /// since null counts are always integers, while struct fields are recursed into
 /// to preserve the nested structure.
-#[allow(unused)]
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
