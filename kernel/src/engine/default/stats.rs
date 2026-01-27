@@ -5,72 +5,90 @@
 
 use std::sync::Arc;
 
-use crate::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray};
+use crate::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StructArray,
+};
 use crate::arrow::datatypes::{DataType, Field};
 use crate::column_trie::ColumnTrie;
 use crate::expressions::ColumnName;
 use crate::{DeltaResult, Error};
 
-/// Downcast helper with descriptive error message.
-fn downcast<T: 'static>(column: &ArrayRef) -> DeltaResult<&T> {
-    column.as_any().downcast_ref::<T>().ok_or_else(|| {
-        Error::generic(format!(
-            "Failed to downcast column to {}",
-            std::any::type_name::<T>(),
-        ))
-    })
+// ============================================================================
+// Column statistics computation
+// ============================================================================
+
+/// Statistics computed for a column (leaf or nested struct).
+#[derive(Default)]
+struct ColumnStats {
+    null_count: Option<ArrayRef>,
 }
 
-/// Compute null count for a column, filtering by the stats column filter.
+/// Compute all statistics for a column in a single traversal.
 ///
-/// Returns `Some(ArrayRef)` if this column should be included, `None` otherwise.
-/// For struct columns, returns a nested StructArray. For leaf columns, returns Int64Array.
-fn compute_null_count(
+/// Returns `ColumnStats` containing statistics for this column.
+/// For struct columns, these are nested StructArrays. For leaf columns, these are scalar arrays.
+/// Map, List, and other complex types are skipped (returns default empty stats).
+fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
-    filter: &ColumnTrie,
-) -> DeltaResult<Option<ArrayRef>> {
+    filter: &ColumnTrie<'_>,
+) -> DeltaResult<ColumnStats> {
     match column.data_type() {
         DataType::Struct(fields) => {
-            let struct_array = downcast::<StructArray>(column)?;
+            let struct_array = column
+                .as_struct_opt()
+                .ok_or_else(|| Error::generic("Failed to downcast column to StructArray"))?;
 
-            let mut child_fields: Vec<Field> = Vec::new();
-            let mut child_arrays: Vec<ArrayRef> = Vec::new();
+            // Accumulators for each stat type
+            let mut null_fields: Vec<Field> = Vec::new();
+            let mut null_arrays: Vec<ArrayRef> = Vec::new();
 
             for (i, field) in fields.iter().enumerate() {
                 path.push(field.name().to_string());
 
-                if let Some(child_array) = compute_null_count(struct_array.column(i), path, filter)?
-                {
-                    child_fields.push(Field::new(
-                        field.name(),
-                        child_array.data_type().clone(),
-                        true,
-                    ));
-                    child_arrays.push(child_array);
+                let child_stats = compute_column_stats(struct_array.column(i), path, filter)?;
+
+                if let Some(arr) = child_stats.null_count {
+                    null_fields.push(Field::new(field.name(), arr.data_type().clone(), true));
+                    null_arrays.push(arr);
                 }
 
                 path.pop();
             }
 
-            if child_fields.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(Arc::new(
-                    StructArray::try_new(child_fields.into(), child_arrays, None)
-                        .map_err(|e| Error::generic(format!("null count struct: {e}")))?,
-                ) as ArrayRef))
-            }
+            // Build result structs (None if empty)
+            let build_struct =
+                |fields: Vec<Field>, arrays: Vec<ArrayRef>| -> DeltaResult<Option<ArrayRef>> {
+                    if fields.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(Arc::new(
+                            StructArray::try_new(fields.into(), arrays, None)
+                                .map_err(|e| Error::generic(format!("stats struct: {e}")))?,
+                        ) as ArrayRef))
+                    }
+                };
+
+            Ok(ColumnStats {
+                null_count: build_struct(null_fields, null_arrays)?,
+            })
         }
+        // Skip complex types that don't support statistics
+        DataType::Map(_, _)
+        | DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => Ok(ColumnStats::default()),
         _ => {
-            // Leaf: check filter
+            // Leaf: check filter, compute all stats together
             if !filter.contains_prefix_of(path) {
-                return Ok(None);
+                return Ok(ColumnStats::default());
             }
 
-            Ok(Some(
-                Arc::new(Int64Array::from(vec![column.null_count() as i64])) as ArrayRef,
-            ))
+            Ok(ColumnStats {
+                null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
+            })
         }
     }
 }
@@ -126,13 +144,17 @@ pub(crate) fn collect_stats(
     let filter = ColumnTrie::from_columns(stats_columns);
     let schema = batch.schema();
 
+    // Collect all stats in a single traversal
     let mut null_counts = StatsAccumulator::new("nullCount");
 
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let mut path = vec![field.name().to_string()];
         let column = batch.column(col_idx);
 
-        if let Some(arr) = compute_null_count(column, &mut path, &filter)? {
+        // Single traversal computes all stats
+        let stats = compute_column_stats(column, &mut path, &filter)?;
+
+        if let Some(arr) = stats.null_count {
             null_counts.push(field.name(), arr);
         }
     }
@@ -378,5 +400,56 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(b_null.value(0), 1);
+    }
+
+    #[test]
+    fn test_collect_stats_skips_complex_types() {
+        use crate::arrow::array::ListArray;
+        use crate::arrow::buffer::OffsetBuffer;
+
+        // Schema with list column - should be skipped for statistics
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+        ]));
+
+        // Build list array: [[1, 2], [3], [4, 5, 6]]
+        let values = Int64Array::from(vec![1, 2, 3, 4, 5, 6]);
+        let offsets = OffsetBuffer::new(vec![0, 2, 3, 6].into());
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            offsets,
+            Arc::new(values),
+            None,
+        );
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(list_array),
+            ],
+        )
+        .unwrap();
+
+        // Request stats for both columns
+        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("list_col")]).unwrap();
+
+        let null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        // id should have null count
+        assert!(null_count.column_by_name("id").is_some());
+
+        // list_col should NOT have null count (complex type skipped)
+        assert!(null_count.column_by_name("list_col").is_none());
     }
 }
