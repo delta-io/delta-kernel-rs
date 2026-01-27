@@ -21,6 +21,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
 
@@ -2913,42 +2914,56 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
-async fn test_post_commit_snapshot_simple() {
+async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
+    let temp_dir = tempdir().unwrap();
+    let table_url = Url::from_directory_path(temp_dir.path()).unwrap();
+    let engine = create_default_engine(&table_url)?;
     let schema = get_simple_int_schema();
 
-    let setup = setup_test_tables(schema.clone(), &[], None, "test_table")
-        .await
-        .unwrap();
+    // Create table and verify post_commit_snapshot
+    let create_result = create_table_txn(table_url.as_str(), schema, env!("CARGO_PKG_VERSION"))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
 
-    for (table_url, engine, _store, _table_name) in setup {
-        let mut current_snapshot = Snapshot::builder_for(table_url).build(&engine).unwrap();
+    let mut current_snapshot = match create_result {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 0);
+            let post_snapshot = committed
+                .post_commit_snapshot()
+                .expect("should have post_commit_snapshot");
+            assert_eq!(post_snapshot.version(), 0);
+            post_snapshot.clone()
+        }
+        _ => panic!("Create should succeed"),
+    };
 
-        for i in 0..10 {
-            let base_version = current_snapshot.version();
+    // Do 10 inserts and verify post_commit_snapshot for each
+    for i in 1..11 {
+        let base_version = current_snapshot.version();
 
-            let txn = current_snapshot
-                .clone()
-                .transaction(Box::new(FileSystemCommitter::new()))
-                .unwrap()
-                .with_engine_info("test");
+        let txn = current_snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("test");
 
-            match txn.commit(&engine).unwrap() {
-                CommitResult::CommittedTransaction(committed) => {
-                    let post_snapshot = committed
-                        .post_commit_snapshot()
-                        .expect("should have post_commit_snapshot");
+        match txn.commit(engine.as_ref())? {
+            CommitResult::CommittedTransaction(committed) => {
+                let post_snapshot = committed
+                    .post_commit_snapshot()
+                    .expect("should have post_commit_snapshot");
 
-                    assert_eq!(post_snapshot.version(), base_version + 1);
-                    assert_eq!(post_snapshot.version(), committed.commit_version());
-                    assert_eq!(post_snapshot.schema(), current_snapshot.schema());
-                    assert_eq!(post_snapshot.table_root(), current_snapshot.table_root());
+                assert_eq!(post_snapshot.version(), base_version + 1);
+                assert_eq!(post_snapshot.version(), committed.commit_version());
+                assert_eq!(post_snapshot.schema(), current_snapshot.schema());
+                assert_eq!(post_snapshot.table_root(), current_snapshot.table_root());
 
-                    current_snapshot = post_snapshot.clone();
-                }
-                _ => panic!("Commit {} should succeed", i),
+                current_snapshot = post_snapshot.clone();
             }
+            _ => panic!("Commit {} should succeed", i),
         }
     }
+
+    Ok(())
 }
