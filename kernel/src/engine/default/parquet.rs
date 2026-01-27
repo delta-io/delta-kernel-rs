@@ -32,6 +32,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
@@ -201,6 +202,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
+        _stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values)
