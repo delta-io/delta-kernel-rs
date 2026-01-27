@@ -949,11 +949,8 @@ impl Transaction {
     ///
     /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
     /// stores path components separately (e.g., `ColumnName::new(["nested", "field"])`).
-    ///
-    /// When converted to strings via `to_string()`, field names containing special
-    /// characters (dots, spaces, etc.) are escaped with backticks:
-    /// - `["a", "b"]` → `"a.b"`
-    /// - `["a", "b.c"]` → ``"a.`b.c`"`` (field literally named "b.c")
+    /// See [`ColumnName`'s `Display` implementation][ColumnName#impl-Display-for-ColumnName]
+    /// for details on string formatting and escaping.
     ///
     /// Engines can use this to determine which columns need stats during writes.
     #[allow(unused)]

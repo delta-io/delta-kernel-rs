@@ -200,20 +200,20 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 ///
 /// All fields in the output are nullable.
 #[allow(unused)]
-struct BaseStatsTransform {
-    filter: StatsColumnFilter,
+struct BaseStatsTransform<'col> {
+    filter: StatsColumnFilter<'col>,
 }
 
-impl BaseStatsTransform {
+impl<'col> BaseStatsTransform<'col> {
     #[allow(unused)]
-    fn new(props: &TableProperties) -> Self {
+    fn new(props: &'col TableProperties) -> Self {
         Self {
             filter: StatsColumnFilter::new(props),
         }
     }
 }
 
-impl<'a> SchemaTransform<'a> for BaseStatsTransform {
+impl<'a, 'col> SchemaTransform<'a> for BaseStatsTransform<'col> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
 

@@ -14,7 +14,10 @@ use crate::{
 /// Filters columns according to:
 /// * `dataSkippingStatsColumns` - explicit list of columns to include (takes precedence)
 /// * `dataSkippingNumIndexedCols` - number of leaf columns to include (default 32)
-pub(crate) struct StatsColumnFilter {
+///
+/// The lifetime `'col` ties this filter to the column names it was built from when
+/// using `dataSkippingStatsColumns`.
+pub(crate) struct StatsColumnFilter<'col> {
     /// Maximum number of leaf columns to include. Set from `dataSkippingNumIndexedCols` table
     /// property. `None` when `dataSkippingStatsColumns` is specified (which takes precedence).
     n_columns: Option<DataSkippingNumIndexedCols>,
@@ -22,13 +25,13 @@ pub(crate) struct StatsColumnFilter {
     added_columns: u64,
     /// Trie built from user-specified columns for O(path_length) prefix matching.
     /// `None` when using `n_columns` limit instead of explicit column list.
-    column_trie: Option<ColumnTrie>,
+    column_trie: Option<ColumnTrie<'col>>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
 }
 
-impl StatsColumnFilter {
-    pub(crate) fn new(props: &TableProperties) -> Self {
+impl<'col> StatsColumnFilter<'col> {
+    pub(crate) fn new(props: &'col TableProperties) -> Self {
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
         if let Some(column_names) = &props.data_skipping_stats_columns {

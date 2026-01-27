@@ -10,19 +10,22 @@ use crate::expressions::ColumnName;
 
 /// A trie (prefix tree) for efficient column path matching.
 ///
+/// The lifetime `'col` ties this trie to the column names it was built from,
+/// allowing it to borrow string slices instead of cloning.
+///
 /// The `Default` implementation creates an empty trie node with no children and
 /// `is_terminal = false`. This is used both for creating a new root trie and for
 /// creating intermediate nodes during insertion (via `or_default()`).
 #[derive(Debug, Default)]
-pub(crate) struct ColumnTrie {
-    children: HashMap<String, ColumnTrie>,
+pub(crate) struct ColumnTrie<'col> {
+    children: HashMap<&'col str, ColumnTrie<'col>>,
     /// True if this node represents the end of a specified column path.
     /// Intermediate nodes have `is_terminal = false`; only the final node of
     /// an inserted column path has `is_terminal = true`.
     is_terminal: bool,
 }
 
-impl ColumnTrie {
+impl<'col> ColumnTrie<'col> {
     /// Creates an empty trie.
     pub(crate) fn new() -> Self {
         Self::default()
@@ -37,7 +40,7 @@ impl ColumnTrie {
     ///     ├── "b" (is_terminal=true)
     ///     └── "c" (is_terminal=true)
     /// ```
-    pub(crate) fn from_columns(columns: &[ColumnName]) -> Self {
+    pub(crate) fn from_columns(columns: &'col [ColumnName]) -> Self {
         let mut trie = Self::new();
         for column in columns {
             trie.insert(column);
@@ -58,10 +61,10 @@ impl ColumnTrie {
     ///     └── "b" (is_terminal=false)
     ///         └── "c" (is_terminal=true)
     /// ```
-    pub(crate) fn insert(&mut self, column: &ColumnName) {
+    pub(crate) fn insert(&mut self, column: &'col ColumnName) {
         let mut node = self;
         for part in column.iter() {
-            node = node.children.entry(part.clone()).or_default();
+            node = node.children.entry(part.as_str()).or_default();
         }
         node.is_terminal = true;
     }
@@ -81,7 +84,7 @@ impl ColumnTrie {
                 // So path is a descendant of this specified column.
                 return true;
             }
-            match node.children.get(part) {
+            match node.children.get(part.as_str()) {
                 Some(child) => node = child,
                 None => return false, // Path diverges from all specified columns
             }
@@ -98,7 +101,8 @@ mod tests {
     #[test]
     fn test_column_trie() {
         // Build trie with specified column ["a", "b"]
-        let trie = ColumnTrie::from_columns(&[ColumnName::new(["a", "b"])]);
+        let columns = [ColumnName::new(["a", "b"])];
+        let trie = ColumnTrie::from_columns(&columns);
 
         // Exact match: path = ["a", "b"] → include
         assert!(trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
@@ -115,14 +119,16 @@ mod tests {
 
         // Non-existent nested path: trie has ["a", "b", "c", "d"], path = ["a", "b"]
         // User asked for a.b.c.d but a.b is a leaf → NOT include
-        let deep_trie = ColumnTrie::from_columns(&[ColumnName::new(["a", "b", "c", "d"])]);
+        let deep_columns = [ColumnName::new(["a", "b", "c", "d"])];
+        let deep_trie = ColumnTrie::from_columns(&deep_columns);
         assert!(!deep_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
 
         // Multiple specified columns
-        let multi_trie = ColumnTrie::from_columns(&[
+        let multi_columns = [
             ColumnName::new(["a", "b"]),
             ColumnName::new(["x", "y", "z"]),
-        ]);
+        ];
+        let multi_trie = ColumnTrie::from_columns(&multi_columns);
         assert!(multi_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
         assert!(multi_trie.contains_prefix_of(&[
             "a".to_string(),
