@@ -114,6 +114,7 @@ mod arrow_compat;
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
 pub use arrow_compat::*;
 
+pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
 
