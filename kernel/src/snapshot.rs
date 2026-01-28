@@ -11,7 +11,7 @@ use crate::actions::domain_metadata::{
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
-use crate::committer::Committer;
+use crate::committer::{Committer, PublishMetadata};
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
@@ -549,6 +549,64 @@ impl Snapshot {
         }
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
+    }
+
+    /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
+    /// tables. This method is a no-op for filesystem-managed tables or if there are no catalog
+    /// commits to publish.
+    ///
+    /// Publishing copies ratified catalog commits to the Delta log as published Delta files,
+    /// reducing catalog storage requirements and enabling some table maintenance operations,
+    /// like checkpointing.
+    ///
+    /// # Parameters
+    ///
+    /// - `engine`: The engine to use for publishing commits
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publish operation fails, or if there are catalog commits that need
+    /// publishing but the table or committer don't support publishing.
+    ///
+    /// # See Also
+    ///
+    /// - [`Committer::publish`]
+    // TODO(#1688): Return a new Snapshot reflecting the published state
+    pub fn publish(&self, engine: &dyn Engine, committer: &dyn Committer) -> DeltaResult<()> {
+        let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
+
+        if unpublished_catalog_commits.is_empty() {
+            return Ok(());
+        }
+
+        require!(
+            unpublished_catalog_commits
+                .windows(2)
+                .all(|commits| commits[0].version() + 1 == commits[1].version()),
+            Error::generic(format!(
+                "Expected ordered and contiguous unpublished catalog commits. \
+                 Got: {unpublished_catalog_commits:?}"
+            ))
+        );
+
+        require!(
+            self.table_configuration().protocol().is_catalog_managed(),
+            Error::generic(
+                "There are catalog commits that need publishing, but the table is not catalog-managed.",
+            )
+        );
+
+        require!(
+            committer.is_catalog_committer(),
+            Error::generic(
+                "There are catalog commits that need publishing, but the committer is not a catalog committer.",
+            )
+        );
+
+        let publish_metadata =
+            PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
+
+        committer.publish(engine, publish_metadata)
     }
 
     #[allow(unused)]

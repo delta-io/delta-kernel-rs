@@ -11,7 +11,7 @@ use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
 mod in_memory;
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use in_memory::InMemoryCommitsClient;
+pub use in_memory::{InMemoryCommitsClient, TableData};
 
 /// Trait for UC commits API operations.
 ///
