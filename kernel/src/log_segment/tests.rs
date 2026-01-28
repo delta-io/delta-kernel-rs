@@ -2996,3 +2996,22 @@ async fn test_new_with_commit_not_end_version_plus_one() {
         "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
     );
 }
+
+// ============================================================================
+// get_unpublished_catalog_commits tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_unpublished_catalog_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_published_version, Some(2));
+    let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
+    let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
+    assert_eq!(versions, vec![3, 4]);
+}

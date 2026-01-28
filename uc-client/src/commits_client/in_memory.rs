@@ -14,15 +14,15 @@ use super::UCCommitsClient;
 // ============================================================================
 
 /// In-memory representation of a UC-managed Delta table's commit state.
-struct TableData {
+pub struct TableData {
     /// The highest version that has been ratified (committed) to this table.
-    max_ratified_version: i64,
+    pub max_ratified_version: i64,
     /// Commits that have been registered with UC but not yet published.
-    catalog_commits: Vec<Commit>,
+    pub catalog_commits: Vec<Commit>,
 }
 
 impl TableData {
-    const MAX_UNPUBLISHED_COMMITS: usize = 50;
+    pub const MAX_UNPUBLISHED_COMMITS: usize = 20;
 
     /// Creates a new `TableData` representing a UC Delta table that has just been created.
     /// The table starts with no commits and version 0.
@@ -120,6 +120,14 @@ impl InMemoryCommitsClient {
                 e.key()
             ))),
         }
+    }
+
+    /// Inserts a table with pre-existing state. Useful for testing.
+    pub fn insert_table(&self, table_id: impl Into<String>, table_data: TableData) {
+        self.tables
+            .write()
+            .unwrap()
+            .insert(table_id.into(), table_data);
     }
 }
 
@@ -271,11 +279,12 @@ mod tests {
     async fn test_commit_max_unpublished_commits_exceeded() {
         let client = InMemoryCommitsClient::new();
         client.create_table(TABLE_ID).unwrap();
-        for v in 1..=50 {
+        for v in 1..=TableData::MAX_UNPUBLISHED_COMMITS as i64 {
             client.commit(commit_request(v, None)).await.unwrap();
         }
+        let next_version = TableData::MAX_UNPUBLISHED_COMMITS as i64 + 1;
         assert!(matches!(
-            client.commit(commit_request(51, None)).await,
+            client.commit(commit_request(next_version, None)).await,
             Err(Error::MaxUnpublishedCommitsExceeded(_))
         ));
     }
