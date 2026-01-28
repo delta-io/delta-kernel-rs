@@ -1273,7 +1273,6 @@ async fn test_timestamp_with_ict_disabled() {
     assert_ne!(scanner.timestamp, 2000);
 }
 
-//delete???
 #[tokio::test]
 async fn test_timestamp_with_commit_info_not_first() {
     let engine = Arc::new(SyncEngine::new());
@@ -1322,12 +1321,16 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
-    let scanner = LogReplayScanner::try_new(
+    let result = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
         commit,
         &get_schema().into(),
-    )
-    .unwrap();
-    assert_ne!(scanner.timestamp, 2000);
+    );
+
+    // Should error because ICT is enabled but not found in the first action
+    assert_result_error_with_message(
+        result,
+        "In-commit timestamp is enabled but not found in commit at version 0",
+    );
 }

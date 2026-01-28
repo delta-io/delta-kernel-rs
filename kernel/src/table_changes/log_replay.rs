@@ -8,8 +8,8 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -168,11 +168,21 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary because
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
-        let action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&commit_file.location),
-            visitor_schema,
-            None, // not safe to apply data skipping yet
-        )?;
+        let mut action_iter = engine
+            .json_handler()
+            .read_json_files(
+                slice::from_ref(&commit_file.location),
+                visitor_schema,
+                None, // not safe to apply data skipping yet
+            )?
+            .peekable();
+
+        let mut in_commit_timestamp_opt = None;
+        if let Some(Ok(actions)) = action_iter.peek() {
+            let mut visitor = InCommitTimestampVisitor::default();
+            visitor.visit_rows_of(actions.as_ref())?;
+            in_commit_timestamp_opt = visitor.in_commit_timestamp;
+        }
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
@@ -256,24 +266,20 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
 
-        let mut timestamp = commit_file.location.last_modified;
-
         // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
-        if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp) {
-            let mut action_iter = engine.json_handler().read_json_files(
-                slice::from_ref(&commit_file.location),
-                InCommitTimestampVisitor::schema(),
-                None,
-            )?;
-            if let Some(actions) = action_iter.next() {
-                let actions = actions?;
-                let mut visitor = InCommitTimestampVisitor::default();
-                visitor.visit_rows_of(actions.as_ref())?;
-                if let Some(in_commit_timestamp) = visitor.in_commit_timestamp {
-                    timestamp = in_commit_timestamp;
-                }
+        let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
+        {
+            if let Some(in_commit_timestamp) = in_commit_timestamp_opt {
+                in_commit_timestamp
+            } else {
+                return Err(Error::generic(format!(
+                    "In-commit timestamp is enabled but not found in commit at version {}",
+                    commit_file.version
+                )));
             }
-        }
+        } else {
+            commit_file.location.last_modified
+        };
 
         info!(
             version = commit_file.version,
@@ -365,6 +371,14 @@ impl PreparePhaseVisitor<'_> {
             StructField::nullable(CDC_NAME, Cdc::to_schema()),
             StructField::nullable(METADATA_NAME, Metadata::to_schema()),
             StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+            StructField::nullable(
+                COMMIT_INFO_NAME,
+                StructType::new_unchecked([StructField::new(
+                    "inCommitTimestamp",
+                    DataType::LONG,
+                    true,
+                )]),
+            ),
         ]))
     }
 }
@@ -388,6 +402,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("remove.deletionVector.sizeInBytes")),
                 (LONG, column_name!("remove.deletionVector.cardinality")),
                 (STRING, column_name!("cdc.path")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -397,7 +412,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 10,
+            getters.len() == 11,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()

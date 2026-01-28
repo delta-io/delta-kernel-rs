@@ -232,8 +232,8 @@ pub(crate) struct FeatureInfo {
     /// Rust kernel's support for this feature (may vary by Operation type)
     ///
     /// Note: `kernel_support` validation depends on `feature_type`:
-    /// - Writer features: Only checked during `Operation::Write`
-    /// - ReaderWriter features: Checked during all operations (Scan/Write/CDF)
+    /// Writer features: Only checked during `Operation::Write`
+    /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
     /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
     /// Writer-only features is never invoked for Scan/CDF regardless of the custom check logic.
     pub kernel_support: KernelSupport,
