@@ -575,7 +575,6 @@ impl Protocol {
         }
     }
 
-    #[cfg(feature = "catalog-managed")]
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)

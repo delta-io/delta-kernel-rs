@@ -394,7 +394,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": true,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"tightBounds\":true}"
                 }
             }),
             json!({
@@ -404,7 +404,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": true,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"tightBounds\":true}"
                 }
             }),
         ];
@@ -602,7 +602,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": false,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"tightBounds\":true}"
                 }
             }),
             json!({
@@ -614,7 +614,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": false,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"tightBounds\":true}"
                 }
             }),
         ];
@@ -1079,6 +1079,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
+            Some(write_context.stats_columns()),
         )
         .await?;
 
@@ -1252,6 +1253,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
+            Some(write_context.stats_columns()),
         )
         .await?;
 

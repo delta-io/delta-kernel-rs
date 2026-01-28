@@ -10,6 +10,7 @@ use crate::actions::{
     get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
     PROTOCOL_NAME, SIDECAR_NAME,
 };
+use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -385,6 +386,15 @@ impl LogSegment {
         };
 
         Ok(new_log_segment)
+    }
+
+    pub(crate) fn get_unpublished_catalog_commits(&self) -> DeltaResult<Vec<CatalogCommit>> {
+        self.ascending_commit_files
+            .iter()
+            .filter(|file| file.file_type == LogPathFileType::StagedCommit)
+            .filter(|file| self.max_published_version.is_none_or(|v| file.version > v))
+            .map(|file| CatalogCommit::try_new(&self.log_root, file))
+            .collect()
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
