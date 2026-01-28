@@ -195,8 +195,12 @@ pub enum Error {
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
 
-    #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
-    ChangeDataFeedIncompatibleSchema(String, String),
+    #[error("Change data feed encountered incompatible schema at version {version}. Expected {expected}, got {actual}")]
+    ChangeDataFeedIncompatibleSchema {
+        version: Version,
+        expected: String,
+        actual: String,
+    },
 
     /// Invalid checkpoint files
     #[error("Invalid Checkpoint: {0}")]
@@ -282,10 +286,15 @@ impl Error {
         Self::ChangeDataFeedUnsupported(version.into())
     }
     pub(crate) fn change_data_feed_incompatible_schema(
+        version: impl Into<Version>,
         expected: &StructType,
         actual: &StructType,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+        Self::ChangeDataFeedIncompatibleSchema {
+            version: version.into(),
+            expected: format!("{expected:?}"),
+            actual: format!("{actual:?}"),
+        }
     }
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {

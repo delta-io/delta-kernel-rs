@@ -198,7 +198,11 @@ impl LogReplayScanner {
                 // See: https://github.com/delta-io/delta-kernel-rs/issues/523
                 require!(
                     table_schema.as_ref() == &schema,
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
+                    Error::change_data_feed_incompatible_schema(
+                        commit_file.version,
+                        table_schema,
+                        &schema
+                    )
                 );
             }
 
