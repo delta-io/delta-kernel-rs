@@ -1,5 +1,7 @@
+use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::{kernel_string_slice, AllocateStringFn, NullableCvoid, SharedSchema};
+use crate::SharedExternEngine;
+use crate::{kernel_string_slice, AllocateStringFn, ExternEngine, NullableCvoid, SharedSchema};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -19,13 +21,23 @@ pub struct SharedWriteContext;
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle.
+/// Caller is responsible for passing valid handles.
 #[no_mangle]
 pub unsafe extern "C" fn get_write_context(
     txn: Handle<ExclusiveTransaction>,
-) -> Handle<SharedWriteContext> {
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
-    Arc::new(txn.get_write_context()).into()
+    let engine = unsafe { engine.as_ref() };
+    get_write_context_impl(txn, engine).into_extern_result(&engine)
+}
+
+fn get_write_context_impl(
+    txn: &delta_kernel::transaction::Transaction,
+    extern_engine: &dyn ExternEngine,
+) -> delta_kernel::DeltaResult<Handle<SharedWriteContext>> {
+    let write_context = txn.get_write_context(extern_engine.engine().as_ref())?;
+    Ok(Arc::new(write_context).into())
 }
 
 #[no_mangle]

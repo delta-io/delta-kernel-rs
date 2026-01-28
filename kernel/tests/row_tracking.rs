@@ -62,7 +62,7 @@ async fn write_data_to_table(
     let mut txn = snapshot.transaction(committer)?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context(engine.as_ref())?);
     let tasks = data.into_iter().map(|data| {
         let engine = engine.clone();
         let write_context = write_context.clone();
@@ -661,8 +661,8 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     )?;
 
     // Write data for both transactions
-    let write_context1 = Arc::new(txn1.get_write_context());
-    let write_context2 = Arc::new(txn2.get_write_context());
+    let write_context1 = Arc::new(txn1.get_write_context(engine1.as_ref())?);
+    let write_context2 = Arc::new(txn2.get_write_context(engine2.as_ref())?);
 
     let metadata1 = engine1
         .write_parquet(

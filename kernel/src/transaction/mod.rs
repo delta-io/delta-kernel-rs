@@ -13,6 +13,7 @@ use crate::actions::{
     get_log_remove_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
     INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
+use crate::clustering::ClusteringDomainMetadata;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
@@ -938,11 +939,16 @@ impl Transaction {
     /// ```
     ///
     /// Engines should collect statistics matching this schema structure when writing files.
+    ///
+    /// Requires engine to fetch clustering columns from domain metadata. Per the Delta
+    /// protocol, clustering columns are always included in statistics even when table
+    /// properties would otherwise exclude them.
     #[allow(unused)]
-    pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
+    pub fn stats_schema(&self, engine: &dyn Engine) -> DeltaResult<SchemaRef> {
+        let clustering_cols = self.get_clustering_columns(engine)?;
         self.read_snapshot
             .table_configuration()
-            .expected_stats_schema()
+            .expected_stats_schema_with_clustering(clustering_cols.as_deref())
     }
 
     /// Returns the list of column names that should have statistics collected.
@@ -953,11 +959,22 @@ impl Transaction {
     /// for details on string formatting and escaping.
     ///
     /// Engines can use this to determine which columns need stats during writes.
+    ///
+    /// Requires engine to fetch clustering columns from domain metadata. Per the Delta
+    /// protocol, clustering columns are always included in statistics even when table
+    /// properties would otherwise exclude them.
     #[allow(unused)]
-    pub fn stats_columns(&self) -> Vec<ColumnName> {
-        self.read_snapshot
+    pub fn stats_columns(&self, engine: &dyn Engine) -> DeltaResult<Vec<ColumnName>> {
+        let clustering_cols = self.get_clustering_columns(engine)?;
+        Ok(self
+            .read_snapshot
             .table_configuration()
-            .stats_column_names()
+            .stats_column_names_with_clustering(clustering_cols.as_deref()))
+    }
+
+    /// Fetch clustering columns from domain metadata.
+    fn get_clustering_columns(&self, engine: &dyn Engine) -> DeltaResult<Option<Vec<ColumnName>>> {
+        ClusteringDomainMetadata::get_clustering_columns(self.read_snapshot.log_segment(), engine)
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -988,12 +1005,16 @@ impl Transaction {
     }
     /// Get the write context for this transaction. At the moment, this is constant for the whole
     /// transaction.
+    ///
+    /// Requires engine to fetch clustering columns from domain metadata. Per the Delta
+    /// protocol, clustering columns are always included in statistics even when table
+    /// properties would otherwise exclude them.
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
     // Note: Callers that use get_write_context may be writing data to the table and they might
     // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
+    pub fn get_write_context(&self, engine: &dyn Engine) -> DeltaResult<WriteContext> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
@@ -1011,16 +1032,16 @@ impl Transaction {
             .cloned();
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
-        // Get stats columns from table configuration
-        let stats_columns = self.stats_columns();
+        // Get stats columns from table configuration (includes clustering columns)
+        let stats_columns = self.stats_columns(engine)?;
 
-        WriteContext::new(
+        Ok(WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
             stats_columns,
-        )
+        ))
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -1578,7 +1599,7 @@ impl WriteContext {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
+    /// let write_context = transaction.get_write_context(&engine)?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
     /// ```
@@ -1801,7 +1822,7 @@ mod tests {
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context(&engine)?;
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -1833,7 +1854,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
 
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context(&engine)?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
@@ -1897,7 +1918,7 @@ mod tests {
 
         // Create a transaction and get write context
         let txn_without = snapshot_without.transaction(Box::new(FileSystemCommitter::new()))?;
-        let write_context_without = txn_without.get_write_context();
+        let write_context_without = txn_without.get_write_context(&engine)?;
         let expr_without = write_context_without.logical_to_physical();
 
         // Without materializePartitionColumns, partition column should be excluded
@@ -1947,7 +1968,7 @@ mod tests {
 
         // Create a transaction and get write context
         let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()))?;
-        let write_context_with = txn_with.get_write_context();
+        let write_context_with = txn_with.get_write_context(&engine)?;
         let expr_with = write_context_with.logical_to_physical();
 
         // With materializePartitionColumns, ALL columns including partition columns should be included

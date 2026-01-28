@@ -96,10 +96,25 @@ use column_filter::StatsColumnFilter;
 ///   tightBounds: boolean,
 /// }
 /// ```
+/// Generates the expected stats schema without clustering column overrides.
+/// See [`expected_stats_schema_with_clustering`] for the full version.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
+) -> DeltaResult<Schema> {
+    expected_stats_schema_with_clustering(physical_file_schema, table_properties, None)
+}
+
+/// Generates the expected schema for file statistics with clustering columns.
+///
+/// Clustering columns are always included in statistics, even when `dataSkippingStatsColumns`
+/// or `dataSkippingNumIndexedCols` would otherwise exclude them.
+#[allow(unused)]
+pub(crate) fn expected_stats_schema_with_clustering(
+    physical_file_schema: &Schema,
+    table_properties: &TableProperties,
+    clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
     let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable("numRecords", DataType::LONG));
@@ -107,7 +122,8 @@ pub(crate) fn expected_stats_schema(
     // generate the base stats schema:
     // - make all fields nullable
     // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
-    let mut base_transform = BaseStatsTransform::new(table_properties);
+    // - always include clustering columns per Delta protocol requirements
+    let mut base_transform = BaseStatsTransform::new(table_properties, clustering_columns);
     if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
         let base_schema = base_schema.into_owned();
 
@@ -137,15 +153,27 @@ pub(crate) fn expected_stats_schema(
 }
 
 /// Returns the list of column names that should have statistics collected.
-///
-/// This extracts just the column names without building the full stats schema,
-/// making it more efficient when only the column list is needed.
+/// See [`stats_column_names_with_clustering`] for the full version.
 #[allow(unused)]
 pub(crate) fn stats_column_names(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
 ) -> Vec<ColumnName> {
-    let mut filter = StatsColumnFilter::new(table_properties);
+    stats_column_names_with_clustering(physical_file_schema, table_properties, None)
+}
+
+/// Returns the list of column names that should have statistics collected,
+/// including clustering columns.
+///
+/// Clustering columns are always included, even when `dataSkippingStatsColumns`
+/// or `dataSkippingNumIndexedCols` would otherwise exclude them.
+#[allow(unused)]
+pub(crate) fn stats_column_names_with_clustering(
+    physical_file_schema: &Schema,
+    table_properties: &TableProperties,
+    clustering_columns: Option<&[ColumnName]>,
+) -> Vec<ColumnName> {
+    let mut filter = StatsColumnFilter::new(table_properties, clustering_columns);
     let mut columns = Vec::new();
     filter.collect_columns(physical_file_schema, &mut columns);
     columns
@@ -206,9 +234,9 @@ struct BaseStatsTransform<'col> {
 
 impl<'col> BaseStatsTransform<'col> {
     #[allow(unused)]
-    fn new(props: &'col TableProperties) -> Self {
+    fn new(props: &'col TableProperties, clustering_columns: Option<&'col [ColumnName]>) -> Self {
         Self {
-            filter: StatsColumnFilter::new(props),
+            filter: StatsColumnFilter::new(props, clustering_columns),
         }
     }
 }

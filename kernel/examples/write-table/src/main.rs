@@ -93,7 +93,7 @@ async fn try_main() -> DeltaResult<()> {
         .with_data_change(true);
 
     // Write the data using the engine
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context(&engine)?);
     let file_metadata = engine
         .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
         .await?;

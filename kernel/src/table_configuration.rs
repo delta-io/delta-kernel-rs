@@ -14,7 +14,10 @@ use url::Url;
 
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
-use crate::scan::data_skipping::stats_schema::{expected_stats_schema, stats_column_names};
+use crate::scan::data_skipping::stats_schema::{
+    expected_stats_schema, expected_stats_schema_with_clustering, stats_column_names,
+    stats_column_names_with_clustering,
+};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, StructType};
 use crate::table_features::{
@@ -198,6 +201,43 @@ impl TableConfiguration {
     pub(crate) fn stats_column_names(&self) -> Vec<ColumnName> {
         let physical_schema = self.physical_data_schema();
         stats_column_names(&physical_schema, self.table_properties())
+    }
+
+    /// Generates the expected schema for file statistics, including clustering columns.
+    ///
+    /// Clustering columns are always included in statistics, even when `dataSkippingStatsColumns`
+    /// or `dataSkippingNumIndexedCols` would otherwise exclude them.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn expected_stats_schema_with_clustering(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> DeltaResult<SchemaRef> {
+        let physical_schema = self.physical_data_schema();
+        Ok(Arc::new(expected_stats_schema_with_clustering(
+            &physical_schema,
+            self.table_properties(),
+            clustering_columns,
+        )?))
+    }
+
+    /// Returns the list of column names that should have statistics collected,
+    /// including clustering columns.
+    ///
+    /// Clustering columns are always included, even when `dataSkippingStatsColumns`
+    /// or `dataSkippingNumIndexedCols` would otherwise exclude them.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn stats_column_names_with_clustering(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> Vec<ColumnName> {
+        let physical_schema = self.physical_data_schema();
+        stats_column_names_with_clustering(
+            &physical_schema,
+            self.table_properties(),
+            clustering_columns,
+        )
     }
 
     /// Returns the physical schema for data columns (excludes partition columns).
