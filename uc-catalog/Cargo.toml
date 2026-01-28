@@ -23,6 +23,10 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed"] }
+delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed", "test-utils"] }
+uc-client = { path = "../uc-client", features = ["test-utils"] }
+object_store = "0.12"
+tempfile = "3"

@@ -7,7 +7,7 @@ use std::iter::Peekable;
 use std::ops::Deref;
 
 /// A (possibly nested) column name.
-#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct ColumnName {
     path: Vec<String>,
 }
@@ -469,6 +469,7 @@ macro_rules! __joined_column_expr {
 }
 #[doc(inline)]
 pub use __joined_column_expr as joined_column_expr;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod test {

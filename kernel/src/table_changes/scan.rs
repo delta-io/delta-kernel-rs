@@ -42,15 +42,14 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use test_utils::DefaultEngineExtension;
-/// # use delta_kernel::engine::default::DefaultEngine;
 /// # use delta_kernel::expressions::{column_expr, Scalar};
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
-/// # let engine = DefaultEngine::new_local();
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
+/// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
+/// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
@@ -151,7 +150,13 @@ impl TableChangesScan {
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema();
-        let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
+        let it = table_changes_action_iter(
+            engine,
+            &self.table_changes.start_table_config,
+            commits,
+            schema,
+            physical_predicate,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
