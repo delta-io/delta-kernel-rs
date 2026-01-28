@@ -58,7 +58,6 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<Actio
     /// Iterator over action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
-    #[allow(unused)]
     pub checkpoint_info: CheckpointReadInfo,
 }
 

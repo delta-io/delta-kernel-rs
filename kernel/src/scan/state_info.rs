@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
-use crate::scan::data_skipping::stats_schema::build_stats_schema;
+use crate::scan::data_skipping::stats_schema::{build_stats_schema, expected_stats_schema};
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
@@ -207,10 +207,15 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build stats schema from predicate columns for data skipping
+        // Build stats schema: use predicate columns when available, otherwise use full schema
+        // based on table properties (respects dataSkippingNumIndexedCols and dataSkippingStatsColumns)
         let stats_schema = match &physical_predicate {
-            PhysicalPredicate::Some(_, schema) => build_stats_schema(schema),
-            _ => None,
+            PhysicalPredicate::Some(_, predicate_schema) => {
+                build_stats_schema(predicate_schema.as_ref())
+            }
+            _ => expected_stats_schema(&physical_schema, table_configuration.table_properties())
+                .ok()
+                .map(Arc::new),
         };
 
         let transform_spec =

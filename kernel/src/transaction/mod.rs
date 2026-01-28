@@ -26,7 +26,7 @@ use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
-use crate::scan::{restored_add_schema, scan_row_schema};
+use crate::scan::{restored_add_schema, scan_row_schema, PARSED_STATS_COL_NAME};
 use crate::schema::{
     ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema,
 };
@@ -1320,7 +1320,9 @@ impl Transaction {
                     .into(),
             )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-            .with_dropped_field("modificationTime");
+            .with_dropped_field("modificationTime")
+            // Drop parsedStats if present - it's not part of the log schema
+            .with_dropped_field(PARSED_STATS_COL_NAME);
 
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {
@@ -1387,7 +1389,9 @@ impl Transaction {
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
                 )
-                .with_dropped_field(NEW_DELETION_VECTOR_NAME),
+                .with_dropped_field(NEW_DELETION_VECTOR_NAME)
+                // Drop parsedStats if present - it's not part of the scan row schema
+                .with_dropped_field(PARSED_STATS_COL_NAME),
         );
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),
