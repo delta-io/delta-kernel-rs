@@ -970,7 +970,7 @@ impl LogSegment {
             // If it exists but isn't a Struct, the schema is malformed and unusable.
             let DataType::Struct(checkpoint_values) = checkpoint_values_field.data_type() else {
                 debug!(
-                    "stats_parsed not compatible: stats_parsed. {} is not a Struct, got {:?}",
+                    "stats_parsed not compatible: stats_parsed.{} is not a Struct, got {:?}",
                     field_name,
                     checkpoint_values_field.data_type()
                 );
@@ -987,30 +987,64 @@ impl LogSegment {
                 continue;
             };
 
-            // Check type compatibility for each column needed for data skipping
-            // If it exists in checkpoint, verify types are compatible
-            for stats_field in stats_values.fields() {
-                if let Some(checkpoint_field) = checkpoint_values.field(&stats_field.name) {
-                    if checkpoint_field
-                        .data_type()
-                        .can_read_as(stats_field.data_type())
-                        .is_err()
-                    {
-                        debug!(
-                            "stats_parsed not compatible: incompatible type for column '{}' in {field_name}: checkpoint has {:?}, stats schema needs {:?}",
-                            stats_field.name,
-                            checkpoint_field.data_type(),
-                            stats_field.data_type()
-                        );
-                        return false;
-                    }
-                }
-                // If the column is missing from checkpoint's stats_parsed, it will return
-                // null when accessed, which is acceptable for data skipping.
+            // Check type compatibility recursively for nested structs.
+            // Only fields that exist in both schemas need compatible types.
+            // Extra fields in checkpoint are ignored; missing fields return null.
+            if !Self::structs_have_compatible_types(checkpoint_values, stats_values, field_name) {
+                return false;
             }
         }
 
         debug!("Checkpoint schema has compatible stats_parsed for data skipping");
+        true
+    }
+
+    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    ///
+    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
+    /// - Primitive types: must be compatible via `can_read_as` (allows type widening)
+    /// - Nested structs: recursively check inner fields
+    /// - Missing fields in checkpoint: OK (will return null when accessed)
+    /// - Extra fields in checkpoint: OK (ignored)
+    fn structs_have_compatible_types(
+        available: &StructType,
+        needed: &StructType,
+        context: &str,
+    ) -> bool {
+        for needed_field in needed.fields() {
+            let Some(available_field) = available.field(needed_field.name()) else {
+                // Field missing in checkpoint - that's OK, it will be null
+                continue;
+            };
+
+            match (available_field.data_type(), needed_field.data_type()) {
+                // Both are structs: recurse
+                (DataType::Struct(avail_struct), DataType::Struct(need_struct)) => {
+                    let nested_context = format!("{}.{}", context, needed_field.name());
+                    if !Self::structs_have_compatible_types(
+                        avail_struct,
+                        need_struct,
+                        &nested_context,
+                    ) {
+                        return false;
+                    }
+                }
+                // Non-struct types: use can_read_as for type compatibility
+                (avail_type, need_type) => {
+                    if avail_type.can_read_as(need_type).is_err() {
+                        debug!(
+                            "stats_parsed not compatible: incompatible type for '{}' in {}: \
+                             checkpoint has {:?}, stats schema needs {:?}",
+                            needed_field.name(),
+                            context,
+                            avail_type,
+                            need_type
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
         true
     }
 }
