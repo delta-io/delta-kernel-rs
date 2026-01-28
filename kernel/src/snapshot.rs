@@ -609,6 +609,20 @@ impl Snapshot {
         committer.publish(engine, publish_metadata)
     }
 
+    /// An API guarded by the `internal-api` feature flag for fetching both user-controlled and
+    /// system-controlled domain metadata for a specific domain in this snapshot.
+    ///
+    /// Returns the latest configuration for the domain, or None if the domain does not exist.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_domain_metadata_internal(
+        &self,
+        domain: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
+        domain_metadata_configuration(self.log_segment(), domain, engine)
+    }
+
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_domain_metadata(
@@ -1409,6 +1423,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+
+        // Test get_domain_metadata_internal
+        assert_eq!(
+            snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
+            Some("domain3_commit1".to_string())
+        );
 
         // Test get_all_domain_metadata
         let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
