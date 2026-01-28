@@ -121,7 +121,7 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
 
         debug!("commits for kernel: {:?}\n", commits);
 
-        Snapshot::builder_for(Url::parse(&(table_uri + "/"))?)
+        Snapshot::builder_for(table_url)
             .at_version(version)
             .with_log_tail(commits)
             .build(engine)

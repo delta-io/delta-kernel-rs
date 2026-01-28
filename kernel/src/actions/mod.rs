@@ -327,6 +327,11 @@ impl Metadata {
     }
 
     #[internal_api]
+    pub(crate) fn schema_string(&self) -> &String {
+        &self.schema_string
+    }
+
+    #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
@@ -570,7 +575,6 @@ impl Protocol {
         }
     }
 
-    #[cfg(feature = "catalog-managed")]
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)

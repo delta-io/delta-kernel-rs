@@ -21,6 +21,7 @@ use crate::{DeltaResult, EngineData};
 use delta_kernel_derive::internal_api;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tracing::debug;
 
@@ -203,6 +204,24 @@ impl ActionsBatch {
     }
 }
 
+#[internal_api]
+#[allow(unused)]
+pub(crate) trait ParallelLogReplayProcessor {
+    type Output;
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+}
+
+impl<T> ParallelLogReplayProcessor for Arc<T>
+where
+    T: ParallelLogReplayProcessor,
+{
+    type Output = T::Output;
+
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        T::process_actions_batch(self, actions_batch)
+    }
+}
+
 /// A trait for processing batches of actions from Delta transaction logs during log replay.
 ///
 /// Log replay processors scan transaction logs in **reverse chronological order** (newest to oldest),
@@ -336,6 +355,7 @@ pub(crate) trait HasSelectionVector {
 
 #[cfg(test)]
 mod tests {
+    use super::deduplicator::CheckpointDeduplicator;
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
@@ -583,5 +603,89 @@ mod tests {
         // Test with is_log_batch = false
         let deduplicator_checkpoint = create_deduplicator(&mut seen, false);
         assert!(!deduplicator_checkpoint.is_log_batch());
+    }
+
+    // ==================== CheckpointDeduplicator Tests ====================
+
+    #[test]
+    fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
+        let seen = HashSet::new();
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
+
+        let mut mock_add = MockGetData::new();
+        mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
+        let getters = create_getters_with_mocks(Some(&mock_add), None);
+        let result = deduplicator.extract_file_action(0, &getters, false)?;
+
+        assert!(result.is_some());
+        let (key, is_add) = result.unwrap();
+        assert_eq!(key.path, "checkpoint_file.parquet");
+        assert!(key.dv_unique_id.is_none());
+        assert!(is_add);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
+        let seen = HashSet::new();
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
+
+        let mut mock_dv = MockGetData::new();
+        mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
+        mock_dv.add_string(0, "deletionVector.storageType", "s3");
+        mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
+        mock_dv.add_int(0, "deletionVector.offset", 100);
+        let getters = create_getters_with_mocks(Some(&mock_dv), None);
+        let result = deduplicator.extract_file_action(0, &getters, false)?;
+
+        assert!(result.is_some());
+        let (key, is_add) = result.unwrap();
+        assert_eq!(key.path, "file_with_dv.parquet");
+        assert!(matches!(
+            key.dv_unique_id.as_deref(),
+            Some("s3path/to/dv@100")
+        ));
+        assert!(is_add);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_deduplicator_filters_commit_duplicates() -> DeltaResult<()> {
+        let mut seen = HashSet::new();
+
+        // Files "seen" during commit processing
+        seen.insert(FileActionKey::new("modified_in_commit.parquet", None));
+        seen.insert(FileActionKey::new(
+            "modified_with_dv.parquet",
+            Some("dv123".to_string()),
+        ));
+
+        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
+
+        // File modified in commit - should be filtered from checkpoint
+        let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);
+        assert!(
+            deduplicator.check_and_record_seen(commit_modified),
+            "Files seen in commits should be filtered from checkpoint"
+        );
+
+        // File with DV modified in commit - should be filtered
+        let commit_modified_dv =
+            FileActionKey::new("modified_with_dv.parquet", Some("dv123".to_string()));
+        assert!(
+            deduplicator.check_and_record_seen(commit_modified_dv),
+            "Files with DVs seen in commits should be filtered from checkpoint"
+        );
+
+        // File only in checkpoint - should NOT be filtered
+        let checkpoint_only = FileActionKey::new("checkpoint_only.parquet", None);
+        assert!(
+            !deduplicator.check_and_record_seen(checkpoint_only),
+            "Files only in checkpoint should not be filtered"
+        );
+
+        Ok(())
     }
 }
