@@ -132,6 +132,7 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::time::Instant;
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
@@ -214,13 +215,17 @@ mod tests {
     }
 
     // ignored test which you can run manually to play around with writing to a UC table. run with:
-    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." NUM_COMMITS=3 cargo t write_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test(flavor = "multi_thread")]
     async fn write_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+        let num_commits: u32 = env::var("NUM_COMMITS")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse()
+            .expect("NUM_COMMITS must be a number");
 
         // build shared config
         let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
@@ -234,8 +239,6 @@ mod tests {
             .get_credentials(&table_id, Operation::ReadWrite)
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
-
-        let catalog = UCCatalog::new(commits_client.as_ref());
 
         // TODO: support non-AWS
         let creds = creds
@@ -254,30 +257,45 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = store.into();
 
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
-        let snapshot = catalog
+
+        let catalog = UCCatalog::new(commits_client.as_ref());
+
+        let start = Instant::now();
+        let mut snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;
-        println!("latest snapshot version: {:?}", snapshot.version());
-        let txn = snapshot.clone().transaction(committer)?;
-        let _write_context = txn.get_write_context();
+        println!("loaded snapshot version: {} ({:?})", snapshot.version(), start.elapsed());
 
-        match txn.commit(&engine)? {
-            CommitResult::CommittedTransaction(t) => {
-                println!("🎉 committed version {}", t.commit_version());
-                // TODO: should use post-commit snapshot here (plumb through log tail)
-                let _snapshot = catalog
-                    .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
-                    .await?;
-                // then do publish
+        for i in 0..num_commits {
+            println!("\n--- commit {} ---", i + 1);
+
+            let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+            let txn = snapshot.clone().transaction(committer)?;
+
+            let start = Instant::now();
+            match txn.commit(&engine)? {
+                CommitResult::CommittedTransaction(t) => {
+                    println!("committed version {} ({:?})", t.commit_version(), start.elapsed());
+                    snapshot = t
+                        .post_commit_snapshot()
+                        .ok_or("no post-commit snapshot")?
+                        .clone();
+                }
+                CommitResult::ConflictedTransaction(t) => {
+                    return Err(format!("commit conflicted at version {}", t.conflict_version()).into());
+                }
+                CommitResult::RetryableTransaction(_) => {
+                    return Err("retryable transaction".into());
+                }
             }
-            CommitResult::ConflictedTransaction(t) => {
-                println!("💥 commit conflicted at version {}", t.conflict_version());
-            }
-            CommitResult::RetryableTransaction(_) => {
-                println!("we should retry...");
-            }
+
+            let committer = UCCommitter::new(commits_client.clone(), table_id.clone());
+            let start = Instant::now();
+            snapshot = snapshot.publish(&engine, &committer)?;
+            println!("published version {} ({:?})", snapshot.version(), start.elapsed());
         }
+
+        println!("\n🎉 completed {} commits", num_commits);
         Ok(())
     }
 }
