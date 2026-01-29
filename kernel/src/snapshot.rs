@@ -11,7 +11,9 @@ use crate::actions::domain_metadata::{
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
+use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
+use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
@@ -19,6 +21,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::require;
@@ -554,6 +557,28 @@ impl Snapshot {
         }
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
+    }
+
+    /// Get the clustering columns for this snapshot, if the table has clustering enabled.
+    ///
+    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
+    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
+    /// clustering metadata is malformed.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    pub(crate) fn get_clustering_columns(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        if self
+            .table_configuration
+            .protocol()
+            .has_table_feature(&TableFeature::ClusteredTable)
+        {
+            get_clustering_columns(&self.log_segment, engine)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed

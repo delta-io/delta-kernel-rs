@@ -156,6 +156,11 @@ impl<'col> StatsColumnFilter<'col> {
         // When at the column limit and no clustering columns, we can skip entirely.
         // When clustering columns exist, we must continue traversing in case
         // nested clustering columns need to be included.
+        //
+        // Note: We could optimize further by tracking which clustering columns have been
+        // found and returning early when all are collected. However, this would require
+        // maintaining a separate count of expected vs. found clustering leaf columns,
+        // adding complexity for marginal benefit since most tables have few clustering columns.
         if self.at_column_limit() && self.clustering_trie.is_none() {
             return;
         }
@@ -186,6 +191,7 @@ impl<'col> StatsColumnFilter<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ArrayType, StructField, StructType};
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
@@ -203,95 +209,88 @@ mod tests {
         .into()
     }
 
-    #[test]
-    fn test_clustering_columns_override_num_indexed_cols() {
-        // With limit of 1, normally only the first column would be included
-        let props = make_props_with_num_cols(1);
-        let clustering_cols = vec![ColumnName::new(["c"])]; // Third column
-
-        let schema = crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("a", DataType::LONG),
-            crate::schema::StructField::nullable("b", DataType::STRING),
-            crate::schema::StructField::nullable("c", DataType::INTEGER),
-        ]);
-
-        let mut filter = StatsColumnFilter::new(&props, Some(&clustering_cols));
-        let mut columns = Vec::new();
-        filter.collect_columns(&schema, &mut columns);
-
-        // Should include both "a" (first column within limit) and "c" (clustering column)
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["c"])]
-        );
+    /// Standard 3-column schema for clustering tests: a (LONG), b (STRING), c (INTEGER)
+    fn abc_schema() -> StructType {
+        StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+            StructField::nullable("c", DataType::INTEGER),
+        ])
     }
 
-    #[test]
-    fn test_clustering_columns_added_to_stats_columns() {
-        // Only "a" is in stats columns, but "c" is a clustering column
-        let props = make_props_with_stats_cols("a");
-        let clustering_cols = vec![ColumnName::new(["c"])];
-
-        let schema = crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("a", DataType::LONG),
-            crate::schema::StructField::nullable("b", DataType::STRING),
-            crate::schema::StructField::nullable("c", DataType::INTEGER),
-        ]);
-
-        let mut filter = StatsColumnFilter::new(&props, Some(&clustering_cols));
+    /// Helper to run column collection and return results
+    fn collect_stats_columns(
+        props: &TableProperties,
+        clustering_cols: Option<&[ColumnName]>,
+        schema: &Schema,
+    ) -> Vec<ColumnName> {
+        let mut filter = StatsColumnFilter::new(props, clustering_cols);
         let mut columns = Vec::new();
-        filter.collect_columns(&schema, &mut columns);
-
-        // Should include both "a" (explicit stats column) and "c" (clustering column)
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["c"])]
-        );
+        filter.collect_columns(schema, &mut columns);
+        columns
     }
 
-    #[test]
-    fn test_clustering_columns_already_included() {
-        // "a" is both in stats columns and is a clustering column
-        let props = make_props_with_stats_cols("a,b");
-        let clustering_cols = vec![ColumnName::new(["a"])];
+    // Tests for clustering columns with num_indexed_cols limit
+    #[rstest::rstest]
+    #[case::clustering_overrides_limit(
+        1,                              // num_indexed_cols limit
+        vec!["c"],                      // clustering columns (3rd column)
+        vec!["a", "c"]                  // expected: "a" (within limit) + "c" (clustering)
+    )]
+    #[case::no_clustering_uses_limit(
+        2,                              // num_indexed_cols limit
+        vec![],                         // no clustering columns
+        vec!["a", "b"]                  // expected: first 2 columns within limit
+    )]
+    fn test_clustering_with_num_indexed_cols(
+        #[case] num_cols: u64,
+        #[case] clustering: Vec<&str>,
+        #[case] expected: Vec<&str>,
+    ) {
+        let props = make_props_with_num_cols(num_cols);
+        let clustering_cols: Vec<ColumnName> =
+            clustering.iter().map(|c| ColumnName::new([*c])).collect();
+        let clustering_ref = if clustering_cols.is_empty() {
+            None
+        } else {
+            Some(clustering_cols.as_slice())
+        };
+        let schema = abc_schema();
 
-        let schema = crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("a", DataType::LONG),
-            crate::schema::StructField::nullable("b", DataType::STRING),
-            crate::schema::StructField::nullable("c", DataType::INTEGER),
-        ]);
+        let columns = collect_stats_columns(&props, clustering_ref, &schema);
 
-        let mut filter = StatsColumnFilter::new(&props, Some(&clustering_cols));
-        let mut columns = Vec::new();
-        filter.collect_columns(&schema, &mut columns);
-
-        // Should include "a" and "b" (both explicit stats columns), "a" is also clustering
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"])]
-        );
+        let expected_cols: Vec<ColumnName> =
+            expected.iter().map(|c| ColumnName::new([*c])).collect();
+        assert_eq!(columns, expected_cols);
     }
 
-    #[test]
-    fn test_no_clustering_columns() {
-        // No clustering columns specified - should work as before
-        let props = make_props_with_num_cols(2);
+    // Tests for clustering columns with explicit stats_columns
+    #[rstest::rstest]
+    #[case::clustering_added_to_stats(
+        "a",                            // stats columns
+        vec!["c"],                      // clustering columns
+        vec!["a", "c"]                  // expected: "a" (explicit) + "c" (clustering)
+    )]
+    #[case::clustering_already_in_stats(
+        "a,b",                          // stats columns include clustering col
+        vec!["a"],                      // clustering columns (already in stats)
+        vec!["a", "b"]                  // expected: no duplicates
+    )]
+    fn test_clustering_with_stats_columns(
+        #[case] stats_cols: &str,
+        #[case] clustering: Vec<&str>,
+        #[case] expected: Vec<&str>,
+    ) {
+        let props = make_props_with_stats_cols(stats_cols);
+        let clustering_cols: Vec<ColumnName> =
+            clustering.iter().map(|c| ColumnName::new([*c])).collect();
+        let schema = abc_schema();
 
-        let schema = crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("a", DataType::LONG),
-            crate::schema::StructField::nullable("b", DataType::STRING),
-            crate::schema::StructField::nullable("c", DataType::INTEGER),
-        ]);
+        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
 
-        let mut filter = StatsColumnFilter::new(&props, None);
-        let mut columns = Vec::new();
-        filter.collect_columns(&schema, &mut columns);
-
-        // Should include first 2 columns within the limit
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"])]
-        );
+        let expected_cols: Vec<ColumnName> =
+            expected.iter().map(|c| ColumnName::new([*c])).collect();
+        assert_eq!(columns, expected_cols);
     }
 
     #[test]
@@ -300,20 +299,15 @@ mod tests {
         let props = make_props_with_num_cols(32);
         let clustering_cols = vec![ColumnName::new(["arr"])];
 
-        let schema = crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("a", DataType::LONG),
-            crate::schema::StructField::nullable(
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable(
                 "arr",
-                DataType::Array(Box::new(crate::schema::ArrayType::new(
-                    DataType::STRING,
-                    false,
-                ))),
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
             ),
         ]);
 
-        let mut filter = StatsColumnFilter::new(&props, Some(&clustering_cols));
-        let mut columns = Vec::new();
-        filter.collect_columns(&schema, &mut columns);
+        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
 
         // Should only include "a" - arrays are not eligible for statistics
         assert_eq!(columns, vec![ColumnName::new(["a"])]);

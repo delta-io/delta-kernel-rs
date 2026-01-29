@@ -19,41 +19,39 @@ use crate::{DeltaResult, Engine};
 /// `delta.clustering` domain metadata.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ClusteringDomainMetadata {
+struct ClusteringDomainMetadata {
     clustering_columns: Vec<String>,
 }
 
-impl ClusteringDomainMetadata {
-    /// The domain name for clustering metadata.
-    const DOMAIN_NAME: &'static str = "delta.clustering";
+/// The domain name for clustering metadata.
+const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 
-    /// Parses clustering columns from a JSON configuration string.
-    ///
-    /// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
-    fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
-        let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
-        let columns = metadata
-            .clustering_columns
-            .into_iter()
-            .map(|name| name.parse())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(columns)
-    }
+/// Parses clustering columns from a JSON configuration string.
+///
+/// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
+fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
+    let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
+    let columns = metadata
+        .clustering_columns
+        .into_iter()
+        .map(|name| name.parse())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns)
+}
 
-    /// Reads clustering columns from the log segment's domain metadata.
-    ///
-    /// Returns `Ok(Some(columns))` if clustering is enabled for the table,
-    /// `Ok(None)` if clustering is not enabled, or an error if the metadata
-    /// is malformed.
-    pub(crate) fn get_clustering_columns(
-        log_segment: &LogSegment,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        let config = domain_metadata_configuration(log_segment, Self::DOMAIN_NAME, engine)?;
-        match config {
-            Some(json_str) => Ok(Some(Self::parse_clustering_columns(&json_str)?)),
-            None => Ok(None),
-        }
+/// Reads clustering columns from the log segment's domain metadata.
+///
+/// Returns `Ok(Some(columns))` if clustering is enabled for the table,
+/// `Ok(None)` if clustering is not enabled, or an error if the metadata
+/// is malformed.
+pub(crate) fn get_clustering_columns(
+    log_segment: &LogSegment,
+    engine: &dyn Engine,
+) -> DeltaResult<Option<Vec<ColumnName>>> {
+    let config = domain_metadata_configuration(log_segment, CLUSTERING_DOMAIN_NAME, engine)?;
+    match config {
+        Some(json_str) => Ok(Some(parse_clustering_columns(&json_str)?)),
+        None => Ok(None),
     }
 }
 
@@ -78,7 +76,7 @@ mod tests {
     #[test]
     fn test_parse_clustering_columns_nested() {
         let json = r#"{"clusteringColumns": ["id", "user.address.city", "metadata.tags"]}"#;
-        let columns = ClusteringDomainMetadata::parse_clustering_columns(json).unwrap();
+        let columns = parse_clustering_columns(json).unwrap();
         assert_eq!(
             columns,
             vec![

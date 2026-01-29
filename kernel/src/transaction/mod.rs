@@ -13,7 +13,6 @@ use crate::actions::{
     get_log_remove_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
     INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
-use crate::clustering::ClusteringDomainMetadata;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
@@ -311,16 +310,8 @@ impl Transaction {
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
 
-        // Only read clustering columns if the ClusteredTable feature is enabled
-        let clustering_columns = if read_snapshot
-            .table_configuration()
-            .protocol()
-            .has_table_feature(&TableFeature::ClusteredTable)
-        {
-            ClusteringDomainMetadata::get_clustering_columns(read_snapshot.log_segment(), engine)?
-        } else {
-            None
-        };
+        // Read clustering columns from snapshot (returns None if clustering not enabled)
+        let clustering_columns = read_snapshot.get_clustering_columns(engine)?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -373,6 +364,9 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
+            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
+            // return the correct columns for the new table.
             clustering_columns: None,
         })
     }
