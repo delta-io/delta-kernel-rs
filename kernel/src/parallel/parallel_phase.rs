@@ -40,6 +40,12 @@ pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
+    /// Creates a new parallel phase for processing checkpoint leaf files.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for reading parquet files
+    /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
+    /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn try_new(

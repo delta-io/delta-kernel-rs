@@ -617,7 +617,13 @@ impl Scan {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::{Engine, Table, DeltaResult};
+    /// # use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+    /// # fn main() -> DeltaResult<()> {
+    /// # let engine: Arc<dyn Engine> = unimplemented!();
+    /// # let snapshot = Table::try_from_uri("path")?.snapshot(&engine, None)?;
     /// let scan = snapshot.scan_builder().build()?;
     /// let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
     ///
@@ -633,9 +639,15 @@ impl Scan {
     ///         // All processing complete
     ///     }
     ///     AfterPhase1ScanMetadata::Parallel { processor, files } => {
-    ///         // Distribute files for parallel processing
-    ///         for partition in partition_files(files) {
-    ///             let phase2 = Phase2ScanMetadata::try_new(engine.clone(), processor.clone(), partition)?;
+    ///         // Wrap processor in Arc for sharing across threads
+    ///         let processor = Arc::new(processor);
+    ///         // Distribute files for parallel processing (e.g., one file per worker)
+    ///         for file in files {
+    ///             let phase2 = Phase2ScanMetadata::try_new(
+    ///                 engine.clone(),
+    ///                 processor.clone(),
+    ///                 vec![file],
+    ///             )?;
     ///             for result in phase2 {
     ///                 let scan_metadata = result?;
     ///                 // Process scan metadata...
@@ -643,7 +655,8 @@ impl Scan {
     ///         }
     ///     }
     /// }
-    /// ```
+    /// # Ok(())
+    /// # }
     pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
