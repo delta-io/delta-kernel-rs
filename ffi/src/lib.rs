@@ -644,8 +644,14 @@ pub unsafe extern "C" fn snapshot(
         None
     };
 
-    snapshot_impl(url, engine_ref, old_snapshot_handle, version_opt, Vec::new())
-        .into_extern_result(&engine_ref)
+    snapshot_impl(
+        url,
+        engine_ref,
+        old_snapshot_handle,
+        version_opt,
+        Vec::new(),
+    )
+    .into_extern_result(&engine_ref)
 }
 
 /// Get a snapshot with log tail support for catalog-managed tables.
@@ -708,8 +714,14 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
         None
     };
 
-    snapshot_impl(url, engine_ref, old_snapshot_handle, version_opt, log_tail_vec)
-        .into_extern_result(&engine_ref)
+    snapshot_impl(
+        url,
+        engine_ref,
+        old_snapshot_handle,
+        version_opt,
+        log_tail_vec,
+    )
+    .into_extern_result(&engine_ref)
 }
 
 fn snapshot_impl(
@@ -723,7 +735,9 @@ fn snapshot_impl(
         let snapshot_arc = unsafe { handle.clone_as_arc() };
         Snapshot::builder_from(snapshot_arc)
     } else {
-        Snapshot::builder_for(url.ok_or_else(|| delta_kernel::Error::generic("URL is required when not using an old snapshot"))??)
+        Snapshot::builder_for(url.ok_or_else(|| {
+            delta_kernel::Error::generic("URL is required when not using an old snapshot")
+        })??)
     };
 
     if let Some(v) = version {
@@ -1235,7 +1249,8 @@ mod tests {
 
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
-    async fn test_snapshot_with_log_tail_and_old_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_with_log_tail_and_old_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
         use test_utils::add_staged_commit;
         let storage = Arc::new(InMemory::new());
 
@@ -1289,8 +1304,10 @@ mod tests {
             path,
             commit2.filename().unwrap()
         );
-        let log_path1 = log_path::FfiLogPath::new(kernel_string_slice!(commit1_path), 123456789, 100);
-        let log_path2 = log_path::FfiLogPath::new(kernel_string_slice!(commit2_path), 123456790, 101);
+        let log_path1 =
+            log_path::FfiLogPath::new(kernel_string_slice!(commit1_path), 123456789, 100);
+        let log_path2 =
+            log_path::FfiLogPath::new(kernel_string_slice!(commit2_path), 123456790, 101);
         let log_tail = [log_path1, log_path2];
         let log_tail_array = log_path::LogPathArray {
             ptr: log_tail.as_ptr(),
