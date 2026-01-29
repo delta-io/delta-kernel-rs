@@ -156,11 +156,6 @@ impl<'col> StatsColumnFilter<'col> {
         // When at the column limit and no clustering columns, we can skip entirely.
         // When clustering columns exist, we must continue traversing in case
         // nested clustering columns need to be included.
-        //
-        // Note: We could optimize further by tracking which clustering columns have been
-        // found and returning early when all are collected. However, this would require
-        // maintaining a separate count of expected vs. found clustering leaf columns,
-        // adding complexity for marginal benefit since most tables have few clustering columns.
         if self.at_column_limit() && self.clustering_trie.is_none() {
             return;
         }

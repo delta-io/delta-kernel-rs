@@ -86,4 +86,15 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_parse_clustering_columns_tolerates_unknown_fields() {
+        // Per the protocol, Delta clients should be able to tolerate future unrecognized fields
+        let json = r#"{"clusteringColumns": ["col1", "col2"], "foo": "bar", "futureField": 123}"#;
+        let columns = parse_clustering_columns(json).unwrap();
+        assert_eq!(
+            columns,
+            vec![ColumnName::new(["col1"]), ColumnName::new(["col2"]),]
+        );
+    }
 }
