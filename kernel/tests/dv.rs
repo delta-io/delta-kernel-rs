@@ -102,7 +102,7 @@ fn get_write_context(
     engine: &dyn delta_kernel::Engine,
 ) -> Result<delta_kernel::transaction::WriteContext, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)?;
     Ok(txn.get_write_context())
 }
 
@@ -139,7 +139,7 @@ fn create_dv_update_transaction(
 ) -> Result<delta_kernel::transaction::Transaction, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
     Ok(snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("test engine")
         .with_operation("DELETE".to_string()))
 }
@@ -261,7 +261,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("WRITE".to_string());
 

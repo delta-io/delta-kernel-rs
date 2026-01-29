@@ -65,7 +65,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     // ===== FIRST COMMIT: Add files with row tracking =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("row tracking test")
         .with_data_change(true);
 
@@ -137,7 +137,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine_arc.as_ref())?;
     let mut txn2 = snapshot2
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine_arc.as_ref())?
         .with_engine_info("row tracking remove test")
         .with_data_change(true);
 
