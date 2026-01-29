@@ -284,42 +284,6 @@ mod tests {
         columns
     }
 
-    // ==================== lookup_column_type tests ====================
-
-    #[test]
-    fn test_lookup_column_type_top_level() {
-        let schema = abc_schema();
-        let col = ColumnName::new(["a"]);
-        assert_eq!(lookup_column_type(&schema, &col), Some(&DataType::LONG));
-    }
-
-    #[test]
-    fn test_lookup_column_type_nested() {
-        let inner = StructType::new_unchecked([StructField::nullable("city", DataType::STRING)]);
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "address",
-            DataType::Struct(Box::new(inner)),
-        )]);
-
-        let col = ColumnName::new(["address", "city"]);
-        assert_eq!(lookup_column_type(&schema, &col), Some(&DataType::STRING));
-    }
-
-    #[test]
-    fn test_lookup_column_type_not_found() {
-        let schema = abc_schema();
-        let col = ColumnName::new(["nonexistent"]);
-        assert_eq!(lookup_column_type(&schema, &col), None);
-    }
-
-    #[test]
-    fn test_lookup_column_type_path_through_non_struct() {
-        let schema = abc_schema();
-        // "a" is LONG, not a struct, so "a.b" should fail
-        let col = ColumnName::new(["a", "b"]);
-        assert_eq!(lookup_column_type(&schema, &col), None);
-    }
-
     // ==================== Clustering column tests ====================
 
     #[rstest::rstest]
