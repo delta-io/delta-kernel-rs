@@ -1701,3 +1701,177 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+/// Test that data skipping works with parsed stats from checkpoint.
+/// The parsed-stats table has 6 files with id ranges (4 from checkpoint, 2 from commits):
+/// - File 1: id 1-100, salary 50100-60000 (checkpoint)
+/// - File 2: id 101-200, salary 60100-70000 (checkpoint)
+/// - File 3: id 201-300, salary 70100-80000 (checkpoint)
+/// - File 4: id 301-400, salary 80100-90000 (checkpoint)
+/// - File 5: id 401-500, salary 90100-100000 (commit 4)
+/// - File 6: id 501-600, salary 100100-110000 (commit 5)
+#[test]
+fn data_skipping_with_parsed_stats() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Test 1: Predicate that should skip all files (id > 700)
+    // All files have max id of 600, so no files should match
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(700i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let files_scanned: usize = scan.execute(engine.clone())?.count();
+    assert_eq!(
+        files_scanned, 0,
+        "Expected 0 files when id > 700 (all files have max id 600)"
+    );
+
+    // Test 2: Predicate that should return only first file (id < 50)
+    // Only file 1 has ids 1-100 and min < 50
+    let predicate = Pred::lt(column_expr!("id"), Expr::literal(50i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine.clone())? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 1,
+        "Expected 1 file when id < 50 (only file 1 has min id 1)"
+    );
+
+    // Test 3: Predicate using salary column (salary > 105000)
+    // Only file 6 has salary range 100100-110000, with max 110000
+    let predicate = Pred::gt(column_expr!("salary"), Expr::literal(105000i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine.clone())? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 1,
+        "Expected 1 file when salary > 105000 (only file 6 has salary up to 110000)"
+    );
+
+    // Test 4: Predicate that matches multiple files (id > 350)
+    // Files 4, 5, 6 have ids starting from 301, 401, 501
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(350i64));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine)? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 3,
+        "Expected 3 files when id > 350 (files 4, 5, 6 have ids > 350)"
+    );
+
+    Ok(())
+}
+
+/// Test that `stats_parsed` column is populated correctly in `scan_files`.
+/// This verifies that:
+/// 1. Without predicate → `stats_parsed` column contains full stats schema
+/// 2. With predicate → `stats_parsed` column contains stats for predicate columns
+#[test]
+fn scan_metadata_parsed_stats() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Test 1: Without predicate, stats_parsed column should be present
+    let scan = snapshot.clone().scan_builder().build()?;
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut has_parsed_stats = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        // Convert scan_files data to Arrow to inspect the schema
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        // Check if stats_parsed column exists
+        if schema.column_with_name("stats_parsed").is_some() {
+            has_parsed_stats = true;
+            // Verify it's a struct column with expected fields
+            let (idx, field) = schema.column_with_name("stats_parsed").unwrap();
+            assert!(
+                matches!(
+                    field.data_type(),
+                    delta_kernel::arrow::datatypes::DataType::Struct(_)
+                ),
+                "stats_parsed should be a struct type"
+            );
+            // Verify the column has the same number of rows
+            assert_eq!(
+                batch.column(idx).len(),
+                batch.num_rows(),
+                "stats_parsed column should have correct number of rows"
+            );
+        }
+    }
+    assert!(
+        has_parsed_stats,
+        "Expected stats_parsed column to be present when no predicate"
+    );
+
+    // Test 2: With predicate, stats_parsed column should still be present
+    let predicate =
+        delta_kernel::expressions::Predicate::gt(column_expr!("id"), Expr::literal(100i64));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut has_parsed_stats_with_pred = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        if schema.column_with_name("stats_parsed").is_some() {
+            has_parsed_stats_with_pred = true;
+        }
+    }
+    assert!(
+        has_parsed_stats_with_pred,
+        "Expected stats_parsed column to be present with predicate"
+    );
+
+    Ok(())
+}
