@@ -19,7 +19,7 @@ use crate::log_replay::{
 };
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
@@ -35,6 +35,7 @@ struct InternalScanState {
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
+    stats_schema: Option<SchemaRef>,
 }
 
 /// Public-facing serialized processor state for distributed processing.
@@ -165,6 +166,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
+            stats_schema,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -180,6 +182,7 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             column_mapping_mode,
+            stats_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
@@ -235,6 +238,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
+            stats_schema: internal_state.stats_schema,
         });
 
         let processor = Self::new_with_seen_files(engine, state_info, state.seen_file_keys)?;
@@ -691,6 +695,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -983,6 +988,7 @@ mod tests {
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
                 column_mapping_mode: mode,
+                stats_schema: None,
             });
             let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1009,6 +1015,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         });
         let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1046,6 +1053,7 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1074,6 +1082,7 @@ mod tests {
             predicate_schema: None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
