@@ -3,9 +3,11 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
+use std::collections::HashSet;
+
 use crate::{
     column_trie::ColumnTrie,
-    schema::{ColumnName, DataType, Schema, StructField},
+    schema::{ColumnName, DataType, Schema, StructField, StructType},
     table_properties::{DataSkippingNumIndexedCols, TableProperties},
 };
 
@@ -19,6 +21,18 @@ use crate::{
 /// Per the Delta protocol, writers MUST write per-file statistics for clustering columns,
 /// regardless of table property settings.
 ///
+/// # Two-Pass Algorithm
+///
+/// Instead of interleaving clustering column detection with normal traversal, we use a
+/// more efficient two-pass approach:
+///
+/// 1. **Pass 1**: Collect columns according to table properties (up to limit or explicit list)
+/// 2. **Pass 2**: Directly look up each clustering column by path, adding any that weren't
+///    already included
+///
+/// This is O(limit + sum of clustering column path depths) instead of O(total schema columns),
+/// which is significant for wide schemas (e.g., 1000 columns) with few clustering columns.
+///
 /// The lifetime `'col` ties this filter to the column names it was built from when
 /// using `dataSkippingStatsColumns`.
 pub(crate) struct StatsColumnFilter<'col> {
@@ -30,9 +44,8 @@ pub(crate) struct StatsColumnFilter<'col> {
     /// Trie built from user-specified columns for O(path_length) prefix matching.
     /// `None` when using `n_columns` limit instead of explicit column list.
     column_trie: Option<ColumnTrie<'col>>,
-    /// Trie built from clustering columns that must always be included.
-    /// `None` when the table has no clustering columns.
-    clustering_trie: Option<ColumnTrie<'col>>,
+    /// Clustering columns to add after the main traversal.
+    clustering_columns: Option<&'col [ColumnName]>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
 }
@@ -46,14 +59,12 @@ impl<'col> StatsColumnFilter<'col> {
         props: &'col TableProperties,
         clustering_columns: Option<&'col [ColumnName]>,
     ) -> Self {
-        let clustering_trie = clustering_columns.map(ColumnTrie::from_columns);
-
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
         if let Some(column_names) = &props.data_skipping_stats_columns {
             let mut combined_trie = ColumnTrie::from_columns(column_names);
 
-            // Warn about missing clustering columns, then add them
+            // Add clustering columns to the trie so they're included in Pass 1
             if let Some(clustering_cols) = clustering_columns {
                 for col in clustering_cols {
                     let col_path: Vec<String> = col.iter().map(|s| s.to_string()).collect();
@@ -71,7 +82,7 @@ impl<'col> StatsColumnFilter<'col> {
                 n_columns: None,
                 added_columns: 0,
                 column_trie: Some(combined_trie),
-                clustering_trie,
+                clustering_columns: None, // Already added to trie, no Pass 2 needed
                 path: Vec::new(),
             }
         } else {
@@ -80,26 +91,52 @@ impl<'col> StatsColumnFilter<'col> {
                 n_columns: Some(n_cols),
                 added_columns: 0,
                 column_trie: None,
-                clustering_trie,
+                clustering_columns, // Will be handled in Pass 2
                 path: Vec::new(),
             }
         }
     }
 
-    /// Returns true if the current path is a clustering column.
-    fn is_clustering_column(&self) -> bool {
-        self.clustering_trie
-            .as_ref()
-            .is_some_and(|trie| trie.contains_prefix_of(&self.path))
-    }
-
     // ==================== Public API ====================
-    // These methods are used by consumers outside this module.
 
     /// Collects column names that should have statistics.
+    ///
+    /// Uses a two-pass algorithm:
+    /// 1. Pass 1: Traverse schema to collect columns up to the limit
+    /// 2. Pass 2: Directly look up clustering columns not already included
     pub(crate) fn collect_columns(&mut self, schema: &Schema, result: &mut Vec<ColumnName>) {
+        // Pass 1: Collect columns according to table properties
         for field in schema.fields() {
             self.collect_field(field, result);
+        }
+
+        // Pass 2: Add clustering columns not already included
+        // This is O(num_clustering_columns * path_depth) - much faster than full traversal
+        if let Some(clustering_cols) = self.clustering_columns {
+            // Build a set of already-included columns for O(1) lookup
+            let included: HashSet<&ColumnName> = result.iter().collect();
+
+            // Collect columns to add (avoids borrow conflict with result)
+            let to_add: Vec<_> = clustering_cols
+                .iter()
+                .filter(|col| !included.contains(col))
+                .filter_map(|col| {
+                    lookup_column_type(schema, col).and_then(|data_type| {
+                        if is_stats_eligible_type(data_type) {
+                            tracing::warn!(
+                                "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; \
+                                 adding anyway",
+                                col
+                            );
+                            Some(col.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+
+            result.extend(to_add);
         }
     }
 
@@ -117,14 +154,6 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on column_trie config.
     pub(crate) fn should_include_current(&self) -> bool {
         if self.at_column_limit() {
-            // Clustering columns are always included, even past the limit
-            if self.is_clustering_column() {
-                tracing::warn!(
-                    "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; adding anyway",
-                    self.path.join(".")
-                );
-                return true;
-            }
             return false;
         }
 
@@ -151,7 +180,14 @@ impl<'col> StatsColumnFilter<'col> {
 
     // ==================== Internal Helpers ====================
 
+    /// Pass 1: Collect columns up to the limit, stopping when limit is reached.
     fn collect_field(&mut self, field: &StructField, result: &mut Vec<ColumnName>) {
+        // Stop traversal once we've hit the column limit
+        // Clustering columns will be added in Pass 2
+        if self.at_column_limit() {
+            return;
+        }
+
         self.path.push(field.name.clone());
 
         match field.data_type() {
@@ -161,7 +197,6 @@ impl<'col> StatsColumnFilter<'col> {
                 }
             }
             // Map, Array, and Variant types are not eligible for statistics collection.
-            // We skip them entirely so they don't count against the column limit.
             DataType::Map(_) | DataType::Array(_) | DataType::Variant(_) => {}
             _ => {
                 if self.should_include_current() {
@@ -175,10 +210,46 @@ impl<'col> StatsColumnFilter<'col> {
     }
 }
 
+/// Looks up a column by path in the schema, returning its data type if found.
+///
+/// Navigates through nested structs following the path components.
+/// For example, `lookup_column_type(schema, "user.address.city")` will:
+/// 1. Find field "user" in schema
+/// 2. Find field "address" in user's struct type
+/// 3. Find field "city" in address's struct type
+/// 4. Return city's data type
+fn lookup_column_type<'a>(schema: &'a StructType, column: &ColumnName) -> Option<&'a DataType> {
+    let mut parts = column.iter();
+
+    // Get the first part to start navigation
+    let first = parts.next()?;
+    let mut current_field = schema.field(first)?;
+
+    // Navigate through remaining parts
+    for part in parts {
+        match current_field.data_type() {
+            DataType::Struct(struct_type) => {
+                current_field = struct_type.field(part)?;
+            }
+            _ => return None, // Path continues but current field is not a struct
+        }
+    }
+
+    Some(current_field.data_type())
+}
+
+/// Returns true if the data type is eligible for statistics collection.
+fn is_stats_eligible_type(data_type: &DataType) -> bool {
+    !matches!(
+        data_type,
+        DataType::Map(_) | DataType::Array(_) | DataType::Variant(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ArrayType, StructField, StructType};
+    use crate::schema::ArrayType;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
@@ -217,7 +288,44 @@ mod tests {
         columns
     }
 
-    // Tests for clustering columns with num_indexed_cols limit
+    // ==================== lookup_column_type tests ====================
+
+    #[test]
+    fn test_lookup_column_type_top_level() {
+        let schema = abc_schema();
+        let col = ColumnName::new(["a"]);
+        assert_eq!(lookup_column_type(&schema, &col), Some(&DataType::LONG));
+    }
+
+    #[test]
+    fn test_lookup_column_type_nested() {
+        let inner = StructType::new_unchecked([StructField::nullable("city", DataType::STRING)]);
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "address",
+            DataType::Struct(Box::new(inner)),
+        )]);
+
+        let col = ColumnName::new(["address", "city"]);
+        assert_eq!(lookup_column_type(&schema, &col), Some(&DataType::STRING));
+    }
+
+    #[test]
+    fn test_lookup_column_type_not_found() {
+        let schema = abc_schema();
+        let col = ColumnName::new(["nonexistent"]);
+        assert_eq!(lookup_column_type(&schema, &col), None);
+    }
+
+    #[test]
+    fn test_lookup_column_type_path_through_non_struct() {
+        let schema = abc_schema();
+        // "a" is LONG, not a struct, so "a.b" should fail
+        let col = ColumnName::new(["a", "b"]);
+        assert_eq!(lookup_column_type(&schema, &col), None);
+    }
+
+    // ==================== Clustering column tests ====================
+
     #[rstest::rstest]
     #[case::clustering_overrides_limit(
         1,                              // num_indexed_cols limit
@@ -251,7 +359,6 @@ mod tests {
         assert_eq!(columns, expected_cols);
     }
 
-    // Tests for clustering columns with explicit stats_columns
     #[rstest::rstest]
     #[case::clustering_added_to_stats(
         "a",                            // stats columns
@@ -341,6 +448,22 @@ mod tests {
                 ColumnName::new(["name"]),
                 ColumnName::new(["user", "address", "city"]),
             ]
+        );
+    }
+
+    #[test]
+    fn test_clustering_column_not_in_schema() {
+        // Clustering column that doesn't exist in schema should be silently ignored
+        let props = make_props_with_num_cols(2);
+        let clustering_cols = vec![ColumnName::new(["nonexistent", "column"])];
+        let schema = abc_schema();
+
+        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
+
+        // Should only include normal columns, clustering column not found
+        assert_eq!(
+            columns,
+            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
         );
     }
 }
