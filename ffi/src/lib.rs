@@ -604,7 +604,7 @@ pub struct SharedSnapshot;
 /// Parameters:
 /// - `path`: Table path (required when `old_snapshot` is not provided, ignored otherwise)
 /// - `engine`: The engine handle
-/// - `old_snapshot`: Pass an existing snapshot for optimized creation (avoids re-reading the entire log)
+/// - `old_snapshot`: Optionally pass an existing snapshot for optimized creation (avoids re-reading the entire log)
 /// - `version`: Specify a version to get a snapshot at a specific table version
 ///
 /// # Safety
@@ -1133,7 +1133,7 @@ mod tests {
         };
         let snapshot = unsafe {
             ok_or_panic(snapshot_with_log_tail(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::None,
@@ -1146,7 +1146,7 @@ mod tests {
         // Test getting snapshot at version
         let snapshot2 = unsafe {
             ok_or_panic(snapshot_with_log_tail(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::Some(1),
@@ -1253,7 +1253,7 @@ mod tests {
         // Create initial snapshot at version 0
         let old_snapshot = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::None,
@@ -1300,7 +1300,7 @@ mod tests {
         // Create new snapshot using old snapshot for optimization with log tail
         let new_snapshot = unsafe {
             ok_or_panic(snapshot_with_log_tail(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::Some(old_snapshot.shallow_copy()),
                 OptionalValue::None,
@@ -1313,7 +1313,7 @@ mod tests {
         // Create snapshot at specific version using old snapshot with log tail
         let snapshot_at_v1 = unsafe {
             ok_or_panic(snapshot_with_log_tail(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::Some(old_snapshot.shallow_copy()),
                 OptionalValue::Some(1),
