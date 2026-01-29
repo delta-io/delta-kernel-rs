@@ -399,13 +399,22 @@ fn compute_column_stats(
                 max_value: build_struct(max_fields, max_arrays)?,
             })
         }
-        // Skip complex types that don't support statistics
+        // Complex types: collect nullCount only (no min/max)
         DataType::Map(_, _)
         | DataType::List(_)
         | DataType::LargeList(_)
         | DataType::FixedSizeList(_, _)
         | DataType::ListView(_)
-        | DataType::LargeListView(_) => Ok(ColumnStats::default()),
+        | DataType::LargeListView(_) => {
+            if !filter.contains_prefix_of(path) {
+                return Ok(ColumnStats::default());
+            }
+            Ok(ColumnStats {
+                null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
+                min_value: None,
+                max_value: None,
+            })
+        }
         _ => {
             // Leaf: check filter, compute all stats together
             if !filter.contains_prefix_of(path) {
@@ -1075,11 +1084,11 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_stats_skips_complex_types() {
+    fn test_collect_stats_complex_types_null_count_only() {
         use crate::arrow::array::ListArray;
         use crate::arrow::buffer::OffsetBuffer;
 
-        // Schema with list column - should be skipped for statistics
+        // Schema with list column - should have nullCount but no min/max
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -1089,14 +1098,14 @@ mod tests {
             ),
         ]));
 
-        // Build list array: [[1, 2], [3], [4, 5, 6]]
-        let values = Int64Array::from(vec![1, 2, 3, 4, 5, 6]);
-        let offsets = OffsetBuffer::new(vec![0, 2, 3, 6].into());
+        // Build list array: [[1, 2], null, [4, 5, 6]]
+        let values = Int64Array::from(vec![1, 2, 4, 5, 6]);
+        let offsets = OffsetBuffer::new(vec![0, 2, 2, 5].into());
         let list_array = ListArray::new(
             Arc::new(Field::new("item", DataType::Int64, true)),
             offsets,
             Arc::new(values),
-            None,
+            Some(vec![true, false, true].into()), // second element is null
         );
 
         let batch = RecordBatch::try_new(
@@ -1118,13 +1127,25 @@ mod tests {
             .downcast_ref::<StructArray>()
             .unwrap();
 
-        // id should have null count
-        assert!(null_count.column_by_name("id").is_some());
+        // id should have null count = 0
+        let id_nulls = null_count
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_nulls.value(0), 0);
 
-        // list_col should NOT have null count (complex type skipped)
-        assert!(null_count.column_by_name("list_col").is_none());
+        // list_col should have null count = 1
+        let list_nulls = null_count
+            .column_by_name("list_col")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(list_nulls.value(0), 1);
 
-        // Same for minValues/maxValues
+        // minValues should have id but NOT list_col
         let min_values = stats
             .column_by_name("minValues")
             .unwrap()
@@ -1133,5 +1154,15 @@ mod tests {
             .unwrap();
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("list_col").is_none());
+
+        // maxValues should have id but NOT list_col
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(max_values.column_by_name("id").is_some());
+        assert!(max_values.column_by_name("list_col").is_none());
     }
 }
