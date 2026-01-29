@@ -191,9 +191,9 @@ impl CheckpointWriter {
             ))
         })?;
 
-        // We disallow checkpointing if the LogSegment contains any unpublished commits. (could
-        // create gaps in the version history, thereby breaking old readers)
-        snapshot.log_segment().validate_no_staged_commits()?;
+        // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
+        // create gaps in the version history, thereby breaking old readers.
+        snapshot.log_segment().validate_published()?;
 
         Ok(Self { snapshot, version })
     }

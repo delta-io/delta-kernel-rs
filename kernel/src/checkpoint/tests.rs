@@ -521,7 +521,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
+async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -558,7 +558,7 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
 
     assert!(matches!(
         snapshot.create_checkpoint_writer().unwrap_err(),
-        crate::Error::Generic(e) if e == "Found staged commit file in log segment"
+        crate::Error::Generic(e) if e == "Log segment is not published"
     ));
     Ok(())
 }
