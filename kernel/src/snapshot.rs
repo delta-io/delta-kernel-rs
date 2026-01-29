@@ -317,6 +317,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
+        // Read protocol and metadata
         let start = Instant::now();
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
         let read_metadata_duration = start.elapsed();
@@ -509,8 +510,12 @@ impl Snapshot {
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
-    pub fn transaction(self: Arc<Self>, committer: Box<dyn Committer>) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer)
+    pub fn transaction(
+        self: Arc<Self>,
+        committer: Box<dyn Committer>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Transaction> {
+        Transaction::try_new_existing_table(self, committer, engine)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
