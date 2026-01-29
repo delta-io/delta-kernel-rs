@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+pub mod conflict_detection;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -153,6 +154,7 @@ pub mod history_manager;
 pub(crate) mod history_manager;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
+pub use conflict_detection::check_no_protocol_or_metadata_changes;
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
 pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
