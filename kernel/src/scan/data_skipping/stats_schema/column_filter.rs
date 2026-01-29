@@ -19,13 +19,15 @@ use crate::{
 /// Per the Delta protocol, writers MUST write per-file statistics for clustering columns,
 /// regardless of table property settings.
 pub(crate) struct StatsColumnFilter<'col> {
-    /// Maximum number of leaf columns to include. Set from `dataSkippingNumIndexedCols` table
-    /// property. `None` when `dataSkippingStatsColumns` is specified (which takes precedence).
+    /// Maximum number of leaf columns to include. Set from `delta.dataSkippingNumIndexedCols`
+    /// table property. `Some` when using column-count-based filtering, `None` when
+    /// `delta.dataSkippingStatsColumns` is specified (which takes precedence).
     n_columns: Option<DataSkippingNumIndexedCols>,
     /// Counter for leaf columns included so far. Used to enforce the `n_columns` limit.
     added_columns: u64,
-    /// Trie built from user-specified columns for O(path_length) prefix matching.
-    /// `None` when using `n_columns` limit instead of explicit column list.
+    /// Trie built from columns specified in `delta.dataSkippingStatsColumns` for O(path_length)
+    /// prefix matching. `Some` when using explicit column list, `None` when using the
+    /// `delta.dataSkippingNumIndexedCols` count-based approach.
     column_trie: Option<ColumnTrie<'col>>,
     /// Trie built from clustering columns for O(path_length) matching.
     /// Used by `should_include_current()` to allow clustering columns past the limit.
