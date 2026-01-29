@@ -181,8 +181,7 @@ mod tests {
         #[case] expected_index: usize,
     ) {
         let values = vec![1, 3, 5, 7, 9];
-        let result =
-            binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
+        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
         assert_eq!(result, expected_index);
     }
 
@@ -195,8 +194,7 @@ mod tests {
         #[case] expected_index: usize,
     ) {
         let values = vec![1, 3, 5, 5, 5, 7, 9];
-        let result =
-            binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
+        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
         assert_eq!(result, expected_index);
     }
 

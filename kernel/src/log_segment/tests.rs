@@ -973,10 +973,7 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
 }
 
 #[test_log::test(rstest::rstest)]
-#[case::simple_path(
-    "example.parquet",
-    "file:///var/_delta_log/_sidecars/example.parquet"
-)]
+#[case::simple_path("example.parquet", "file:///var/_delta_log/_sidecars/example.parquet")]
 #[case::full_path(
     "file:///var/_delta_log/_sidecars/example.parquet",
     "file:///var/_delta_log/_sidecars/example.parquet"
