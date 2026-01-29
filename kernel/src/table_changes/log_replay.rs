@@ -269,14 +269,13 @@ impl LogReplayScanner {
         // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
-            if let Some(in_commit_timestamp) = in_commit_timestamp_opt {
-                in_commit_timestamp
-            } else {
+            let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
                 return Err(Error::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
                 )));
-            }
+            };
+            in_commit_timestamp
         } else {
             commit_file.location.last_modified
         };

@@ -1266,11 +1266,12 @@ async fn test_timestamp_with_ict_disabled() {
     let scanner = LogReplayScanner::try_new(
         engine.as_ref(),
         &mut table_config,
-        commit,
+        commit.clone(),
         &get_schema().into(),
     )
     .unwrap();
     assert_ne!(scanner.timestamp, 2000);
+    assert_eq!(scanner.timestamp, commit.location.last_modified);
 }
 
 #[tokio::test]
