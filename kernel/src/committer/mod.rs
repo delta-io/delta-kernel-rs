@@ -27,11 +27,13 @@
 
 mod commit_types;
 mod filesystem;
+mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitResponse};
 pub use filesystem::FileSystemCommitter;
+pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
+use crate::{DeltaResult, Engine, FilteredEngineData};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -50,11 +52,55 @@ use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 // Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
 // Committer then we can remove this bound and possibly just do an alias like CommitterRef =
 // Arc<dyn Committer + Send>.
-pub trait Committer: Send + AsAny {
+pub trait Committer: Send {
+    /// Commits actions to the table at the version specified in [`CommitMetadata`].
+    ///
+    /// Implementations must ensure that actions are committed atomically and either:
+    /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables), or
+    /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
     fn commit(
         &self,
         engine: &dyn Engine,
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
+
+    /// Returns `true` if this committer is for a catalog-managed table, else `false`.
+    fn is_catalog_committer(&self) -> bool;
+
+    /// Publishes catalog commits to the Delta log. Applicable only to catalog-managed tables.
+    ///
+    /// Publishing is the act of copying ratified catalog commits to the Delta log as published
+    /// Delta files (e.g., `_delta_log/00000000000000000001.json`).
+    ///
+    /// # When to call
+    ///
+    /// This method should only be called on catalog committers (i.e., when [`is_catalog_committer`]
+    /// returns `true`). Filesystem committers will error if called with catalog commits to publish.
+    ///
+    /// # Benefits
+    ///
+    /// - Reduces the number of commits the catalog needs to store internally and serve to readers
+    /// - Enables table maintenance operations that must operate on published versions only, such
+    ///   as checkpointing and log compaction
+    ///
+    /// # Requirements
+    ///
+    /// - This method must ensure that all catalog commits are published to the Delta log up to and
+    ///   including the snapshot version specified in [`PublishMetadata`]
+    /// - Commits must be published in order: version V-1 must be published before version V
+    ///
+    /// # Catalog-specific semantics
+    ///
+    /// Each catalog implementation may specify its own rules and semantics for publishing,
+    /// including whether it expects to be notified immediately upon publishing success, whether
+    /// published commits must appear with PUT-if-absent semantics in the Delta log, and whether
+    /// publishing happens in the client-side or server-side catalog component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publish operation fails.
+    ///
+    /// [`is_catalog_committer`]: Committer::is_catalog_committer
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()>;
 }

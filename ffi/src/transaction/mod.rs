@@ -39,9 +39,10 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
+    let engine = extern_engine.engine();
+    let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer);
+    let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
 

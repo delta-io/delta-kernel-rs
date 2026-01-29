@@ -15,6 +15,7 @@ use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
+use test_utils::LoggingTest;
 
 use itertools::Itertools;
 use std::collections::HashMap;
@@ -914,4 +915,250 @@ async fn file_meta_timestamp() {
     )
     .unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
+}
+
+#[tokio::test]
+async fn print_table_configuration() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            Action::Protocol(
+                Protocol::try_new(
+                    3,
+                    7,
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Table configuration updated during CDF query"));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("writerFeatures=[deletionVectors, changeDataFeed]"));
+    assert!(log_output.contains("minReaderVersion=3"));
+    assert!(log_output.contains("minWriterVersion=7"));
+    assert!(log_output.contains("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
+    assert!(log_output.contains("configuration="));
+    assert!(log_output.contains("\"delta.enableChangeDataFeed\": \"true\""));
+    assert!(log_output.contains("\"delta.columnMapping.mode\": \"none\""));
+    assert!(log_output.contains("\"delta.enableDeletionVectors\": \"true\""));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    // This specific commit (with these actions) isn't necessary to test the tracing for this test, we just need to have one commit with any actions
+    mock_table
+        .commit([
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            Action::Protocol(
+                Protocol::try_new(
+                    3,
+                    7,
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("remove_dvs_size=0"));
+    assert!(log_output.contains("has_cdc_action=false"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1_has_cdc() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    mock_table
+        .commit([
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Cdc(Cdc {
+                path: "fake_path_2".into(),
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("remove_dvs_size=0"));
+    assert!(log_output.contains("has_cdc_action=true"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1_has_dv() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    let deletion_vector1 = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+        offset: Some(1),
+        size_in_bytes: 36,
+        cardinality: 2,
+    };
+    let deletion_vector2 = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
+        offset: Some(1),
+        size_in_bytes: 38,
+        cardinality: 3,
+    };
+    // - fake_path_1 undergoes a restore. All rows are restored, so the deletion vector is removed.
+    // - All remaining rows of fake_path_2 are deleted
+    mock_table
+        .commit([
+            Action::Remove(Remove {
+                path: "fake_path_1".into(),
+                data_change: true,
+                deletion_vector: Some(deletion_vector1.clone()),
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Remove(Remove {
+                path: "fake_path_2".into(),
+                data_change: true,
+                deletion_vector: Some(deletion_vector2.clone()),
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    let expected_remove_dvs: Arc<HashMap<String, DvInfo>> = HashMap::from([(
+        "fake_path_1".to_string(),
+        DvInfo {
+            deletion_vector: Some(deletion_vector1.clone()),
+        },
+    )])
+    .into();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains(&format!("remove_dvs_size={}", expected_remove_dvs.len())));
+    assert!(log_output.contains("has_cdc_action=false"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
 }

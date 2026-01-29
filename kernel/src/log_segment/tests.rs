@@ -2426,62 +2426,6 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-#[test]
-fn test_publish_validation() {
-    use crate::Error;
-
-    // Test with only regular committed files - should pass validation
-    let regular_commits = vec![
-        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000002.json"),
-    ];
-
-    let log_segment = LogSegment {
-        ascending_commit_files: regular_commits,
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        checkpoint_version: None,
-        log_root: Url::parse("file:///path/").unwrap(),
-        end_version: 2,
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    assert!(log_segment.validate_no_staged_commits().is_ok());
-
-    // Test with a staged commit - should fail validation
-    let with_staged = vec![
-        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
-        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
-        create_log_path("file:///path/_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
-    ];
-
-    let log_segment_with_staged = LogSegment {
-        ascending_commit_files: with_staged,
-        ascending_compaction_files: vec![],
-        checkpoint_parts: vec![],
-        checkpoint_version: None,
-        log_root: Url::parse("file:///path/").unwrap(),
-        end_version: 2,
-        latest_crc_file: None,
-        latest_commit_file: None,
-        checkpoint_schema: None,
-        max_published_version: None,
-    };
-
-    // Should fail with staged commits
-    let result = log_segment_with_staged.validate_no_staged_commits();
-    assert!(result.is_err());
-    if let Err(Error::Generic(msg)) = result {
-        assert_eq!(msg, "Found staged commit file in log segment");
-    } else {
-        panic!("Expected Error::Generic");
-    }
-}
-
 /// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
@@ -2995,4 +2939,23 @@ async fn test_new_with_commit_not_end_version_plus_one() {
         result,
         "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
     );
+}
+
+// ============================================================================
+// get_unpublished_catalog_commits tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_get_unpublished_catalog_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_published_version, Some(2));
+    let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
+    let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
+    assert_eq!(versions, vec![3, 4]);
 }

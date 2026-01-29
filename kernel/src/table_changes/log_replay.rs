@@ -12,7 +12,7 @@ use crate::actions::{
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
-use crate::path::ParsedLogPath;
+use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
@@ -20,12 +20,12 @@ use crate::schema::{
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::Operation;
-use crate::table_features::TableFeature;
+use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
 use itertools::Itertools;
+use tracing::info;
 
 #[cfg(test)]
 mod tests;
@@ -210,6 +210,24 @@ impl LogReplayScanner {
                     protocol_opt,
                     commit_file.version,
                 )?;
+
+                let writer_features_str = table_configuration
+                    .protocol()
+                    .writer_features()
+                    .map(format_features)
+                    .unwrap_or_else(|| "[]".to_string());
+
+                info!(
+                    version = commit_file.version,
+                    id = table_configuration.metadata().id(),
+                    //Writer features is always a superset of reader features, so writer features is logged to trace the full set of table features
+                    writerFeatures = %writer_features_str,
+                    minReaderVersion = table_configuration.protocol().min_reader_version(),
+                    minWriterVersion = table_configuration.protocol().min_writer_version(),
+                    schemaString = %table_configuration.metadata().schema_string(),
+                    configuration = ?table_configuration.metadata().configuration(),
+                    "Table configuration updated during CDF query"
+                );
             }
 
             // If metadata is updated, check if Change Data Feed is enabled
@@ -235,8 +253,21 @@ impl LogReplayScanner {
             // same as an `add` action.
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
+
+        let timestamp = commit_file.location.last_modified;
+
+        info!(
+            version = commit_file.version,
+            id = table_configuration.metadata().id(),
+            remove_dvs_size = remove_dvs.len(),
+            has_cdc_action = has_cdc_action,
+            file_path = %commit_file.location.as_url(),
+            timestamp = timestamp,
+            "Phase 1 of CDF query processing completed"
+        );
+
         Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,

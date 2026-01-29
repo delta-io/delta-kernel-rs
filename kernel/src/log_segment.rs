@@ -10,6 +10,7 @@ use crate::actions::{
     get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
     PROTOCOL_NAME, SIDECAR_NAME,
 };
+use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -19,7 +20,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version,
+    StorageHandler, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -77,6 +78,27 @@ pub(crate) struct LogSegment {
 }
 
 impl LogSegment {
+    /// Creates a synthetic LogSegment for pre-commit transactions (e.g., create-table).
+    /// The sentinel version PRE_COMMIT_VERSION indicates no version exists yet on disk.
+    /// This is used to construct a pre-commit snapshot that provides table configuration
+    /// (protocol, metadata, schema) for operations like CTAS.
+    #[allow(dead_code)] // Used by create_table module
+    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
+        use crate::PRE_COMMIT_VERSION;
+        Self {
+            end_version: PRE_COMMIT_VERSION,
+            checkpoint_version: None,
+            log_root,
+            ascending_commit_files: vec![],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: None,
+            max_published_version: None,
+        }
+    }
+
     #[internal_api]
     pub(crate) fn try_new(
         listed_files: ListedLogFiles,
@@ -343,7 +365,7 @@ impl LogSegment {
             ))
         );
         require!(
-            tail_commit_file.version == self.end_version + 1,
+            tail_commit_file.version == self.end_version.wrapping_add(1),
             Error::internal_error(format!(
                 "Cannot extend and create new LogSegment. Tail commit file version ({}) does not \
                 equal LogSegment end_version ({}) + 1.",
@@ -364,6 +386,23 @@ impl LogSegment {
         };
 
         Ok(new_log_segment)
+    }
+
+    pub(crate) fn new_as_published(&self) -> DeltaResult<Self> {
+        // In the future, we can additionally convert the staged commit files to published commit
+        // files. That would reqire faking their FileMeta locations.
+        let mut new_log_segment = self.clone();
+        new_log_segment.max_published_version = Some(self.end_version);
+        Ok(new_log_segment)
+    }
+
+    pub(crate) fn get_unpublished_catalog_commits(&self) -> DeltaResult<Vec<CatalogCommit>> {
+        self.ascending_commit_files
+            .iter()
+            .filter(|file| file.file_type == LogPathFileType::StagedCommit)
+            .filter(|file| self.max_published_version.is_none_or(|v| file.version > v))
+            .map(|file| CatalogCommit::try_new(&self.log_root, file))
+            .collect()
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
@@ -734,8 +773,12 @@ impl LogSegment {
         self.read_actions(engine, schema, META_PREDICATE.clone())
     }
 
-    /// How many commits since a checkpoint, according to this log segment
+    /// How many commits since a checkpoint, according to this log segment.
+    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_checkpoint(&self) -> u64 {
+        if self.end_version == PRE_COMMIT_VERSION {
+            return 0;
+        }
         // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
         // is the correct number of commits since a checkpoint if there are no checkpoints
         let checkpoint_version = self.checkpoint_version.unwrap_or(0);
@@ -743,8 +786,12 @@ impl LogSegment {
         self.end_version - checkpoint_version
     }
 
-    /// How many commits since a log-compaction or checkpoint, according to this log segment
+    /// How many commits since a log-compaction or checkpoint, according to this log segment.
+    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
+        if self.end_version == PRE_COMMIT_VERSION {
+            return 0;
+        }
         // Annoyingly we have to search all the compaction files to determine this, because we only
         // sort by start version, so technically the max end version could be anywhere in the vec.
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct
@@ -767,15 +814,11 @@ impl LogSegment {
         self.end_version - to_sub
     }
 
-    /// Validates that all commit files in this log segment are not staged commits. We use this in
-    /// places like checkpoint writers, where we require all commits to be published.
-    pub(crate) fn validate_no_staged_commits(&self) -> DeltaResult<()> {
+    pub(crate) fn validate_published(&self) -> DeltaResult<()> {
         require!(
-            !self
-                .ascending_commit_files
-                .iter()
-                .any(|commit| matches!(commit.file_type, LogPathFileType::StagedCommit)),
-            Error::generic("Found staged commit file in log segment")
+            self.max_published_version
+                .is_some_and(|v| v == self.end_version),
+            Error::generic("Log segment is not published")
         );
         Ok(())
     }
