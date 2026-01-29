@@ -306,7 +306,11 @@ int main(int argc, char* argv[])
 
   SharedExternEngine* engine = engine_res.ok;
 
-  ExternResultHandleSharedSnapshot snapshot_res = snapshot(table_path_slice, engine);
+  ExternResultHandleSharedSnapshot snapshot_res = snapshot(
+    (OptionalValueKernelStringSlice){ .tag = SomeKernelStringSlice, .some = table_path_slice },
+    engine,
+    (OptionalValueHandleSharedSnapshot){ .tag = NoneHandleSharedSnapshot },
+    (OptionalValueVersion){ .tag = NoneVersion });
   if (snapshot_res.tag != OkHandleSharedSnapshot) {
     print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
     free_error((Error*)snapshot_res.err);
