@@ -20,21 +20,6 @@ use crate::{
 ///
 /// Per the Delta protocol, writers MUST write per-file statistics for clustering columns,
 /// regardless of table property settings.
-///
-/// # Two-Pass Algorithm
-///
-/// Instead of interleaving clustering column detection with normal traversal, we use a
-/// more efficient two-pass approach:
-///
-/// 1. **Pass 1**: Collect columns according to table properties (up to limit or explicit list)
-/// 2. **Pass 2**: Directly look up each clustering column by path, adding any that weren't
-///    already included
-///
-/// This is O(limit + sum of clustering column path depths) instead of O(total schema columns),
-/// which is significant for wide schemas (e.g., 1000 columns) with few clustering columns.
-///
-/// The lifetime `'col` ties this filter to the column names it was built from when
-/// using `dataSkippingStatsColumns`.
 pub(crate) struct StatsColumnFilter<'col> {
     /// Maximum number of leaf columns to include. Set from `dataSkippingNumIndexedCols` table
     /// property. `None` when `dataSkippingStatsColumns` is specified (which takes precedence).
@@ -101,7 +86,7 @@ impl<'col> StatsColumnFilter<'col> {
 
     /// Collects column names that should have statistics.
     ///
-    /// Uses a two-pass algorithm:
+    /// Traversal is done in two passes:
     /// 1. Pass 1: Traverse schema to collect columns up to the limit
     /// 2. Pass 2: Directly look up clustering columns not already included
     pub(crate) fn collect_columns(&mut self, schema: &Schema, result: &mut Vec<ColumnName>) {
@@ -111,7 +96,6 @@ impl<'col> StatsColumnFilter<'col> {
         }
 
         // Pass 2: Add clustering columns not already included
-        // This is O(num_clustering_columns * path_depth) - much faster than full traversal
         if let Some(clustering_cols) = self.clustering_columns {
             // Build a set of already-included columns for O(1) lookup
             let included: HashSet<&ColumnName> = result.iter().collect();
