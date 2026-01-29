@@ -13,6 +13,7 @@ use crate::actions::{
     get_log_remove_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
     INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
+use crate::clustering::ClusteringDomainMetadata;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
@@ -271,6 +272,9 @@ pub struct Transaction {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
+    // enabled. Used for determining which columns require statistics collection.
+    clustering_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -298,7 +302,7 @@ impl Transaction {
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
-        _engine: &dyn Engine,
+        engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
@@ -306,6 +310,17 @@ impl Transaction {
         read_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
+
+        // Only read clustering columns if the ClusteredTable feature is enabled
+        let clustering_columns = if read_snapshot
+            .table_configuration()
+            .protocol()
+            .has_table_feature(&TableFeature::ClusteredTable)
+        {
+            ClusteringDomainMetadata::get_clustering_columns(read_snapshot.log_segment(), engine)?
+        } else {
+            None
+        };
 
         let commit_timestamp = current_time_ms()?;
 
@@ -322,6 +337,7 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            clustering_columns,
         })
     }
 
@@ -357,6 +373,7 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            clustering_columns: None,
         })
     }
 
@@ -946,7 +963,7 @@ impl Transaction {
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         self.read_snapshot
             .table_configuration()
-            .expected_stats_schema()
+            .expected_stats_schema(self.clustering_columns.as_deref())
     }
 
     /// Returns the list of column names that should have statistics collected.
@@ -964,7 +981,7 @@ impl Transaction {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names()
+            .stats_column_names(self.clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
