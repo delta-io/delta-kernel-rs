@@ -1789,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
+e    fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
