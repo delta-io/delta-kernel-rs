@@ -182,10 +182,20 @@ pub struct TableProperties {
     pub unknown_properties: HashMap<String, String>,
 }
 
+/// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
+/// is not specified.
+pub const DEFAULT_NUM_INDEXED_COLS: u64 = 32;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DataSkippingNumIndexedCols {
     AllColumns,
     NumColumns(u64),
+}
+
+impl Default for DataSkippingNumIndexedCols {
+    fn default() -> Self {
+        DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEXED_COLS)
+    }
 }
 
 impl TryFrom<&str> for DataSkippingNumIndexedCols {
