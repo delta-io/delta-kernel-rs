@@ -3,6 +3,7 @@
 //! Provides `collect_stats` to compute min, max, and null count statistics
 //! for a single RecordBatch during file writes.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::arrow::array::{
@@ -74,10 +75,11 @@ fn truncate_min_string(s: &str) -> &str {
 /// This ensures correct data skipping behavior: any string starting with the truncated prefix
 /// will compare <= the truncated max + tie-breaker.
 ///
-/// Returns None if the string is too long to truncate safely (expansion limit exceeded).
-fn truncate_max_string(s: &str) -> Option<String> {
+/// Returns `Cow::Borrowed` if no truncation needed (avoiding allocation), `Cow::Owned` when
+/// truncation is performed, or `None` if the string is too long to truncate safely.
+fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
     if s.len() <= STRING_PREFIX_LENGTH {
-        return Some(s.to_string());
+        return Some(Cow::Borrowed(s));
     }
 
     // Start at STRING_PREFIX_LENGTH chars
@@ -90,7 +92,7 @@ fn truncate_max_string(s: &str) -> Option<String> {
     for len in STRING_PREFIX_LENGTH..=max_chars {
         if len >= char_indices.len() {
             // Reached end of string - return original
-            return Some(s.to_string());
+            return Some(Cow::Borrowed(s));
         }
 
         let (_, next_char) = char_indices[len];
@@ -113,7 +115,7 @@ fn truncate_max_string(s: &str) -> Option<String> {
             UTF8_MAX_CHAR
         };
 
-        return Some(format!("{}{}", truncated, tie_breaker));
+        return Some(Cow::Owned(format!("{}{}", truncated, tie_breaker)));
     }
 
     // Could not find a valid truncation point within expansion limit
@@ -216,10 +218,8 @@ fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
                 Arc::new(StringArray::from(vec![Some(truncated)])) as ArrayRef
             ))
         }
-        (Some(s), Agg::Max) => {
-            Ok(truncate_max_string(s)
-                .map(|t| Arc::new(StringArray::from(vec![Some(t)])) as ArrayRef))
-        }
+        (Some(s), Agg::Max) => Ok(truncate_max_string(s)
+            .map(|t| Arc::new(StringArray::from(vec![Some(&*t)])) as ArrayRef)),
         (None, _) => Ok(None),
     }
 }
@@ -245,7 +245,7 @@ fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
             ))
         }
         (Some(s), Agg::Max) => Ok(truncate_max_string(s)
-            .map(|t| Arc::new(LargeStringArray::from(vec![Some(t)])) as ArrayRef)),
+            .map(|t| Arc::new(LargeStringArray::from(vec![Some(&*t)])) as ArrayRef)),
         (None, _) => Ok(None),
     }
 }
@@ -270,7 +270,7 @@ fn agg_string_view(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>>
             ))
         }
         (Some(s), Agg::Max) => Ok(truncate_max_string(s)
-            .map(|t| Arc::new(StringViewArray::from(vec![Some(t)])) as ArrayRef)),
+            .map(|t| Arc::new(StringViewArray::from(vec![Some(&*t)])) as ArrayRef)),
         (None, _) => Ok(None),
     }
 }
@@ -916,31 +916,40 @@ mod tests {
 
     #[test]
     fn test_truncate_max_string() {
-        // Short string - no truncation, just to_string()
-        assert_eq!(truncate_max_string("hello"), Some("hello".to_string()));
+        // Short string - no truncation, returns Cow::Borrowed
+        assert_eq!(truncate_max_string("hello").as_deref(), Some("hello"));
 
         // Exactly 32 chars - no truncation
         let s32 = "a".repeat(32);
-        assert_eq!(truncate_max_string(&s32), Some(s32));
+        assert_eq!(truncate_max_string(&s32).as_deref(), Some(s32.as_str()));
 
         // Long ASCII string - truncated with 0x7F tie-breaker
         // The 33rd char ('a') is < 0x7F, so we use 0x7F
         let s50 = "a".repeat(50);
         let expected = format!("{}\x7F", "a".repeat(32));
-        assert_eq!(truncate_max_string(&s50), Some(expected));
+        assert_eq!(
+            truncate_max_string(&s50).as_deref(),
+            Some(expected.as_str())
+        );
 
         // Non-ASCII at truncation point - uses UTF8_MAX_CHAR
         // 32 'a's then 'À' (which is >= 0x7F), so we use UTF8_MAX
         let non_ascii = format!("{}À{}", "a".repeat(32), "b".repeat(20));
         let expected = format!("{}\u{10FFFF}", "a".repeat(32));
-        assert_eq!(truncate_max_string(&non_ascii), Some(expected));
+        assert_eq!(
+            truncate_max_string(&non_ascii).as_deref(),
+            Some(expected.as_str())
+        );
 
         // U+10FFFF at truncation point - must skip past it
         // 32 'a's then U+10FFFF then 'b' - we can't truncate at U+10FFFF (no tie-breaker > it)
         // so we include U+10FFFF in prefix and use 'b' to determine tie-breaker
         let with_max_char = format!("{}\u{10FFFF}b{}", "a".repeat(32), "c".repeat(10));
         let expected = format!("{}\u{10FFFF}\x7F", "a".repeat(32)); // 'b' < 0x7F
-        assert_eq!(truncate_max_string(&with_max_char), Some(expected));
+        assert_eq!(
+            truncate_max_string(&with_max_char).as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
