@@ -39,7 +39,7 @@ use url::Url;
 use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
-use crate::schema::{DataType, Schema, StructField, StructType};
+use crate::schema::{DataType, LogicalSchema, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
@@ -204,13 +204,13 @@ impl TableChanges {
             )));
         }
 
-        let schema = StructType::try_new(
+        let schema = LogicalSchema::new(StructType::try_new(
             end_snapshot
                 .schema()
                 .fields()
                 .cloned()
                 .chain(CDF_FIELDS.clone()),
-        )?;
+        )?);
 
         Ok(TableChanges {
             table_root,
@@ -333,7 +333,7 @@ mod tests {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
+        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema LogicalSchema(StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} }) and end version schema LogicalSchema(StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} })";
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));

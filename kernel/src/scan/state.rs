@@ -1,17 +1,17 @@
 //! This module encapsulates the state of a scan
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::scan::get_transform_for_row;
-use crate::schema::Schema;
+use crate::schema::{LogicalSchema, Schema};
 use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
-    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
+    schema::{ColumnName, ColumnNamesAndTypes, DataType, PhysicalSchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
@@ -96,19 +96,23 @@ impl DvInfo {
 pub fn transform_to_logical(
     engine: &dyn Engine,
     physical_data: Box<dyn EngineData>,
-    physical_schema: &SchemaRef,
+    physical_schema: &PhysicalSchemaRef,
     logical_schema: &Schema,
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
-        Some(transform) => engine
-            .evaluation_handler()
-            .new_expression_evaluator(
-                physical_schema.clone(),
-                transform,
-                logical_schema.clone().into(), // TODO: expensive deep clone!
-            )?
-            .evaluate(physical_data.as_ref()),
+        Some(transform) => {
+            // Convert physical schema to logical schema ref for evaluator input
+            let input_schema = Arc::new(LogicalSchema::new(physical_schema.as_struct_type().clone()));
+            engine
+                .evaluation_handler()
+                .new_expression_evaluator(
+                    input_schema,
+                    transform,
+                    logical_schema.clone().into(), // TODO: expensive deep clone!
+                )?
+                .evaluate(physical_data.as_ref())
+        }
         None => Ok(physical_data),
     }
 }

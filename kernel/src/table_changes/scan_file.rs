@@ -12,7 +12,7 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_expr, Expression};
 use crate::scan::state::DvInfo;
 use crate::schema::{
-    ColumnName, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+    ColumnName, ColumnNamesAndTypes, DataType, LogicalSchema, MapType, SchemaRef, StructField, StructType,
 };
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
@@ -184,8 +184,8 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
 
 /// Get the schema that scan rows (from [`TableChanges::scan_metadata`]) will be returned with.
 pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
-    static CDF_SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
-        let deletion_vector = StructType::new_unchecked([
+    static CDF_SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+        let deletion_vector = LogicalSchema::new_unchecked([
             StructField::nullable("storageType", DataType::STRING),
             StructField::nullable("pathOrInlineDv", DataType::STRING),
             StructField::nullable("offset", DataType::INTEGER),
@@ -194,24 +194,24 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
         ]);
         let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
         let file_constant_values =
-            StructType::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
+            LogicalSchema::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
 
-        let add = StructType::new_unchecked([
+        let add = LogicalSchema::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector.clone()),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
-        let remove = StructType::new_unchecked([
+        let remove = LogicalSchema::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
-        let cdc = StructType::new_unchecked([
+        let cdc = LogicalSchema::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("fileConstantValues", file_constant_values),
         ]);
 
-        Arc::new(StructType::new_unchecked([
+        Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("add", add),
             StructField::nullable("remove", remove),
             StructField::nullable("cdc", cdc),
@@ -258,7 +258,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Engine as _;
@@ -339,14 +339,14 @@ mod tests {
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
                 .unwrap();
-        let table_schema = StructType::new_unchecked([
+        let table_schema = LogicalSchema::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
             log_segment.ascending_commit_files.clone(),
-            table_schema.into(),
+            Arc::new(table_schema.into()),
             None,
         )
         .unwrap();

@@ -79,7 +79,7 @@ mod tests {
     use crate::kernel_string_slice;
     use crate::tests::get_default_engine;
     use crate::transaction::{commit, transaction};
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::{DataType, LogicalSchema, StructField, StructType};
     use delta_kernel::Snapshot;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -96,7 +96,7 @@ mod tests {
 
         // create a simple table: one int column named 'number'
         let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
+            LogicalSchema::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
         );
 
         for (table_url, engine, _store, _table_name) in

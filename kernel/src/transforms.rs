@@ -216,14 +216,14 @@ pub(crate) fn parse_partition_value_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{DataType, LogicalSchema, PrimitiveType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
     use std::collections::HashMap;
 
     // Tests for parse_partition_value function
     #[test]
     fn test_parse_partition_value_invalid_index() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new_unchecked(vec![StructField::nullable(
             "col1",
             DataType::STRING,
         )]));
@@ -236,7 +236,7 @@ mod tests {
     // Tests for parse_partition_values function
     #[test]
     fn test_parse_partition_values_mixed_transforms() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        let schema = Arc::new(LogicalSchema::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("age", DataType::LONG),
             StructField::nullable("_change_type", DataType::STRING),
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_parse_partition_values_empty_spec() {
-        let schema = Arc::new(StructType::new_unchecked(vec![]));
+        let schema = Arc::new(LogicalSchema::new_unchecked(vec![]));
         let transform_spec = vec![];
         let partition_values = HashMap::new();
 

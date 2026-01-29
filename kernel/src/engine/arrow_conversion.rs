@@ -68,6 +68,18 @@ impl TryFromKernel<&StructType> for ArrowSchema {
     }
 }
 
+impl TryFromKernel<&crate::schema::LogicalSchema> for ArrowSchema {
+    fn try_from_kernel(s: &crate::schema::LogicalSchema) -> Result<Self, ArrowError> {
+        Self::try_from_kernel(s.as_struct_type())
+    }
+}
+
+impl TryFromKernel<&crate::schema::PhysicalSchema> for ArrowSchema {
+    fn try_from_kernel(s: &crate::schema::PhysicalSchema) -> Result<Self, ArrowError> {
+        Self::try_from_kernel(s.as_struct_type())
+    }
+}
+
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
         let metadata = f

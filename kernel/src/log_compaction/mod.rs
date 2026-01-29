@@ -80,7 +80,7 @@ use crate::actions::{
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
     SIDECAR_NAME,
 };
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{LogicalSchema, SchemaRef, StructField, StructType, ToSchema as _};
 
 mod writer;
 
@@ -92,7 +92,7 @@ mod tests;
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
 static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
+    Arc::new(LogicalSchema::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),

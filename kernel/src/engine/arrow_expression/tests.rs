@@ -17,7 +17,7 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
+use crate::schema::{LogicalSchema, ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
 use crate::EvaluationHandlerExtension as _;
 
@@ -646,7 +646,7 @@ fn test_opaque() {
 #[test]
 fn test_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
-    let schema = Arc::new(StructType::new_unchecked(vec![
+    let schema: SchemaRef = Arc::new(LogicalSchema::new_unchecked(vec![
         StructField::nullable(
             "x",
             StructType::new_unchecked([
@@ -683,7 +683,7 @@ fn test_null_row() {
 
 #[test]
 fn test_null_row_err() {
-    let not_null_schema = Arc::new(StructType::new_unchecked(vec![StructField::not_null(
+    let not_null_schema = Arc::new(LogicalSchema::new_unchecked(vec![StructField::not_null(
         "a",
         KernelDataType::STRING,
     )]));
@@ -714,7 +714,7 @@ fn test_create_one() {
         3.into(),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new_unchecked([
+    let schema = Arc::new(LogicalSchema::new_unchecked([
         StructField::nullable("a", KernelDataType::INTEGER),
         StructField::nullable("b", KernelDataType::STRING),
         StructField::not_null("c", KernelDataType::INTEGER),
@@ -743,7 +743,7 @@ fn test_create_one() {
 #[test]
 fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+    let schema = Arc::new(LogicalSchema::new_unchecked([StructField::not_null(
         "a",
         KernelDataType::struct_type_unchecked([
             StructField::nullable("b", KernelDataType::INTEGER),
@@ -781,7 +781,7 @@ fn test_create_one_nested() {
 #[test]
 fn test_create_one_nested_null() {
     let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+    let schema = Arc::new(LogicalSchema::new_unchecked([StructField::not_null(
         "a",
         KernelDataType::struct_type_unchecked([
             StructField::nullable("b", KernelDataType::INTEGER),
@@ -820,7 +820,7 @@ fn test_create_one_nested_null() {
 fn test_create_one_mismatching_scalar_types() {
     // Scalar is a LONG but schema specifies INTEGER
     let values: &[Scalar] = &[Scalar::Long(10)];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+    let schema = Arc::new(LogicalSchema::new_unchecked([StructField::not_null(
         "version",
         KernelDataType::INTEGER,
     )]));
@@ -837,7 +837,7 @@ fn test_create_one_not_null_struct() {
         Scalar::Null(KernelDataType::INTEGER),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+    let schema = Arc::new(LogicalSchema::new_unchecked([StructField::not_null(
         "a",
         KernelDataType::struct_type_unchecked([
             StructField::not_null("b", KernelDataType::INTEGER),
@@ -856,7 +856,7 @@ fn test_create_one_top_level_null() {
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
-    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+    let schema = Arc::new(LogicalSchema::new_unchecked([StructField::not_null(
         "col_1",
         KernelDataType::INTEGER,
     )]));

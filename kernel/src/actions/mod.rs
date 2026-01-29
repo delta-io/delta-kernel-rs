@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
 use crate::schema::{
-    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+    ArrayType, DataType, LogicalSchema, MapType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{
     FeatureType, TableFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
@@ -69,7 +69,7 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
+    Arc::new(LogicalSchema::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -82,7 +82,7 @@ static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
+    Arc::new(LogicalSchema::new_unchecked(
         get_commit_schema().fields().cloned().chain([
             StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
             StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
@@ -91,35 +91,35 @@ static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         ADD_NAME,
         Add::to_schema(),
     )]))
 });
 
 static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         REMOVE_NAME,
         Remove::to_schema(),
     )]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
         CommitInfo::to_schema(),
     )]))
 });
 
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         SET_TRANSACTION_NAME,
         SetTransaction::to_schema(),
     )]))
 });
 
 static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         DOMAIN_METADATA_NAME,
         DomainMetadata::to_schema(),
     )]))
@@ -172,7 +172,7 @@ pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
 /// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
 /// schema in a top-level "add" struct.
 pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         ADD_NAME, schema,
     )]))
 }
@@ -1095,7 +1095,7 @@ mod tests {
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
         arrow::json::ReaderBuilder,
         engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
-        schema::{ArrayType, DataType, MapType, StructField},
+        schema::{ArrayType, DataType, LogicalSchema, MapType, StructField},
         utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
@@ -1153,15 +1153,15 @@ mod tests {
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "metaData",
-            StructType::new_unchecked([
+            LogicalSchema::new_unchecked([
                 StructField::not_null("id", DataType::STRING),
                 StructField::nullable("name", DataType::STRING),
                 StructField::nullable("description", DataType::STRING),
                 StructField::not_null(
                     "format",
-                    StructType::new_unchecked([
+                    LogicalSchema::new_unchecked([
                         StructField::not_null("provider", DataType::STRING),
                         StructField::not_null(
                             "options",
@@ -1187,9 +1187,9 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "add",
-            StructType::new_unchecked([
+            LogicalSchema::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
                     "partitionValues",
@@ -1244,9 +1244,9 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "remove",
-            StructType::new_unchecked([
+            LogicalSchema::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::nullable("deletionTimestamp", DataType::LONG),
                 StructField::not_null("dataChange", DataType::BOOLEAN),
@@ -1268,9 +1268,9 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get cdc field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "cdc",
-            StructType::new_unchecked([
+            LogicalSchema::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
                     "partitionValues",
@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn test_sidecar_schema() {
         let schema = Sidecar::to_schema();
-        let expected = StructType::new_unchecked([
+        let expected = LogicalSchema::new_unchecked([
             StructField::not_null("path", DataType::STRING),
             StructField::not_null("sizeInBytes", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
@@ -1301,9 +1301,9 @@ mod tests {
         let schema = get_all_actions_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "checkpointMetadata",
-            StructType::new_unchecked([
+            LogicalSchema::new_unchecked([
                 StructField::not_null("version", DataType::LONG),
                 tags_field(),
             ]),
@@ -1317,9 +1317,9 @@ mod tests {
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "txn",
-            StructType::new_unchecked([
+            LogicalSchema::new_unchecked([
                 StructField::not_null("appId", DataType::STRING),
                 StructField::not_null("version", DataType::LONG),
                 StructField::nullable("lastUpdated", DataType::LONG),
@@ -1334,7 +1334,7 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
-        let expected = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked(vec![StructField::nullable(
             "commitInfo",
             StructType::new_unchecked(vec![
                 StructField::nullable("timestamp", DataType::LONG),
@@ -1357,7 +1357,7 @@ mod tests {
         let schema = get_commit_schema()
             .project(&[DOMAIN_METADATA_NAME])
             .expect("Couldn't get domainMetadata field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let expected = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "domainMetadata",
             StructType::new_unchecked([
                 StructField::not_null("domain", DataType::STRING),
@@ -1707,7 +1707,7 @@ mod tests {
         };
 
         let engine_data =
-            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
+            set_transaction.into_engine_data(Arc::new(LogicalSchema::new(SetTransaction::to_schema())), &engine);
 
         let record_batch: RecordBatch = engine_data
             .unwrap()
@@ -1742,7 +1742,7 @@ mod tests {
         let commit_info = CommitInfo::new(0, None, None, None);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
-        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
+        let engine_data = commit_info.into_engine_data(Arc::new(LogicalSchema::new(CommitInfo::to_schema())), &engine);
 
         let record_batch: RecordBatch = engine_data
             .unwrap()
@@ -1783,7 +1783,7 @@ mod tests {
         };
 
         let engine_data =
-            domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
+            domain_metadata.into_engine_data(Arc::new(LogicalSchema::new(DomainMetadata::to_schema())), &engine);
 
         let record_batch: RecordBatch = engine_data
             .unwrap()
@@ -1945,7 +1945,7 @@ mod tests {
         let test_id = test_metadata.id.clone();
 
         let actual: RecordBatch = test_metadata
-            .into_engine_data(Metadata::to_schema().into(), &engine)
+            .into_engine_data(Arc::new(LogicalSchema::new(Metadata::to_schema())), &engine)
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -2041,7 +2041,7 @@ mod tests {
 
         let engine_data = protocol
             .clone()
-            .into_engine_data(Protocol::to_schema().into(), &engine);
+            .into_engine_data(Arc::new(LogicalSchema::new(Protocol::to_schema())), &engine);
         let record_batch: RecordBatch = engine_data
             .unwrap()
             .into_any()
@@ -2152,7 +2152,7 @@ mod tests {
             Protocol::try_new(3, 7, Some(empty_features.clone()), Some(empty_features)).unwrap();
 
         let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .into_engine_data(Arc::new(LogicalSchema::new(Protocol::to_schema())), &engine)
             .unwrap();
         let record_batch: RecordBatch = engine_data
             .into_any()
@@ -2186,7 +2186,7 @@ mod tests {
         let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
 
         let engine_data = protocol
-            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .into_engine_data(Arc::new(LogicalSchema::new(Protocol::to_schema())), &engine)
             .unwrap();
         let record_batch: RecordBatch = engine_data
             .into_any()
@@ -2242,7 +2242,7 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_empty_schema() {
-        let schema = Arc::new(StructType::new_unchecked([]));
+        let schema = Arc::new(LogicalSchema::new_unchecked([]));
         assert!(!schema_contains_file_actions(&schema));
     }
 

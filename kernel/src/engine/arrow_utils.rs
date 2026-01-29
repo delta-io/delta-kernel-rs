@@ -11,7 +11,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
     engine::arrow_data::{extract_record_batch, ArrowEngineData},
-    schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
+    schema::{DataType, LogicalSchema, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
@@ -402,7 +402,7 @@ fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
 /// if they are selected or not) and reordering information for the requested fields.
 fn get_indices(
     start_parquet_offset: usize,
-    requested_schema: &Schema,
+    requested_schema: &StructType,
     fields: &ArrowFields,
     mask_indices: &mut Vec<usize>,
 ) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
@@ -463,7 +463,7 @@ fn get_indices(
                     // we just want to transparently recurse into lists, need to transform the kernel
                     // list data type into a schema
                     if let DataType::Array(array_type) = requested_field.data_type() {
-                        let requested_schema = StructType::new_unchecked([StructField::new(
+                        let requested_schema = LogicalSchema::new_unchecked([StructField::new(
                             list_field.name().clone(), // so we find it in the inner call
                             array_type.element_type.clone(),
                             array_type.contains_null,
@@ -697,7 +697,7 @@ fn match_parquet_fields<'k, 'p>(
 /// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the
 /// returned array means.
 pub(crate) fn get_requested_indices(
-    requested_schema: &SchemaRef,
+    requested_schema: &StructType,
     parquet_schema: &ArrowSchemaRef,
 ) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
     let mut mask_indices = vec![];
@@ -713,7 +713,7 @@ pub(crate) fn get_requested_indices(
 /// Create a mask that will only select the specified indices from the parquet. `indices` can be
 /// computed from a [`Schema`] using [`get_requested_indices`]
 pub(crate) fn generate_mask(
-    _requested_schema: &SchemaRef,
+    _requested_schema: &StructType,
     _parquet_schema: &ArrowSchemaRef,
     parquet_physical_schema: &SchemaDescriptor,
     indices: &[usize],
@@ -1297,7 +1297,7 @@ mod tests {
     #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1306,7 +1306,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
@@ -1374,7 +1374,7 @@ mod tests {
             ArrowField::new("v", ArrowDataType::Int16, true)
         }
         // Top level variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "v",
             DataType::unshredded_variant(),
         )]));
@@ -1400,9 +1400,9 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Struct of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "struct_v",
-            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]),
+            LogicalSchema::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]),
         )]));
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "struct_v",
@@ -1421,7 +1421,7 @@ mod tests {
         assert!(matches!(result_shredded,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
         // Array of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "array_v",
             ArrayType::new(DataType::unshredded_variant(), true),
         )]));
@@ -1443,7 +1443,7 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Map of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "map_v",
             MapType::new(DataType::STRING, DataType::unshredded_variant(), true),
         )]));
@@ -1474,14 +1474,14 @@ mod tests {
     #[test]
     fn ensure_data_types_fails_correctly() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
@@ -1494,14 +1494,14 @@ mod tests {
                 "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
             );
 
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
                     .with_metadata(column_mapping_metadata(1)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false),
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, true),
@@ -1517,13 +1517,13 @@ mod tests {
     #[test]
     fn mask_with_map() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
+            let requested_schema = LogicalSchema::new_unchecked([StructField::not_null(
                 logical_name(0),
                 MapType::new(DataType::INTEGER, DataType::STRING, false),
             )
             .with_metadata(column_mapping_metadata(0))])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
 
             // The key and value may have field ids not present in the delta schema
             let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
@@ -1547,7 +1547,7 @@ mod tests {
     #[test]
     fn simple_reorder_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1556,7 +1556,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
                     .with_metadata(arrow_fid(2)),
@@ -1581,7 +1581,7 @@ mod tests {
     #[test]
     fn simple_nullable_field_missing() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1590,7 +1590,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
@@ -1622,7 +1622,7 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_only() {
-        let requested_schema = StructType::new_unchecked([
+        let requested_schema = LogicalSchema::new_unchecked([
             StructField::not_null("i_logical", DataType::INTEGER)
                 .with_metadata(kernel_fid_and_name(1, "i_physical")),
             StructField::nullable("s_logical", DataType::STRING)
@@ -1631,7 +1631,7 @@ mod tests {
                 .with_metadata(kernel_fid_and_name(3, "i2_physical")),
         ])
         .make_physical(ColumnMappingMode::Id)
-        .into();
+        .into_struct_type();
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("not-i", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
             ArrowField::new("not-i2", ArrowDataType::Int32, true).with_metadata(arrow_fid(3)),
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_falls_back_to_name() {
-        let requested_schema = StructType::new_unchecked([
+        let requested_schema = LogicalSchema::new_unchecked([
             StructField::not_null("i_logical", DataType::INTEGER)
                 .with_metadata(kernel_fid_and_name(1, "i_physical")),
             StructField::nullable("s_logical", DataType::STRING)
@@ -1669,7 +1669,7 @@ mod tests {
                 .with_metadata(kernel_fid_and_name(3, "i2_physical")),
         ])
         .make_physical(ColumnMappingMode::Id)
-        .into();
+        .into_struct_type();
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i_logical", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
             ArrowField::new("i2_physical", ArrowDataType::Int32, true).with_metadata(arrow_fid(3)),
@@ -1723,7 +1723,7 @@ mod tests {
     fn test_match_parquet_fields_filters_metadata_columns() {
         use crate::schema::MetadataColumnSpec;
 
-        let kernel_schema = StructType::new_unchecked([
+        let kernel_schema = LogicalSchema::new_unchecked([
             StructField::not_null("regular_field", DataType::INTEGER),
             StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
             StructField::nullable("another_field", DataType::STRING),
@@ -1826,7 +1826,7 @@ mod tests {
 
     #[test]
     fn simple_row_index_field() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::not_null("i", DataType::INTEGER),
             StructField::create_metadata_column("my_row_index", MetadataColumnSpec::RowIndex),
             StructField::nullable("i2", DataType::INTEGER),
@@ -1953,12 +1953,12 @@ mod tests {
     #[test]
     fn nested_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([
+                    LogicalSchema::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
                             .with_metadata(column_mapping_metadata(4)),
                         StructField::not_null(logical_name(5), DataType::STRING)
@@ -1970,7 +1970,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
@@ -1990,10 +1990,10 @@ mod tests {
     #[test]
     fn nested_indices_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([
+                    LogicalSchema::new_unchecked([
                         StructField::not_null(logical_name(5), DataType::STRING)
                             .with_metadata(column_mapping_metadata(5)),
                         StructField::not_null(logical_name(4), DataType::INTEGER)
@@ -2007,7 +2007,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(1)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
@@ -2028,12 +2028,12 @@ mod tests {
     #[test]
     fn nested_indices_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(3),
-                    StructType::new_unchecked([StructField::not_null(
+                    LogicalSchema::new_unchecked([StructField::not_null(
                         logical_name(4),
                         DataType::INTEGER,
                     )
@@ -2044,7 +2044,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
@@ -2062,7 +2062,7 @@ mod tests {
     #[test]
     fn simple_list_mask() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
@@ -2071,7 +2071,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(1)),
@@ -2104,13 +2104,13 @@ mod tests {
     #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
+            let requested_schema = LogicalSchema::new_unchecked([StructField::not_null(
                 logical_name(1),
                 ArrayType::new(DataType::INTEGER, false),
             )
             .with_metadata(column_mapping_metadata(1))])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
@@ -2136,13 +2136,13 @@ mod tests {
     #[test]
     fn nested_indices_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
-                        StructType::new_unchecked([
+                        LogicalSchema::new_unchecked([
                             StructField::not_null(logical_name(3), DataType::INTEGER)
                                 .with_metadata(column_mapping_metadata(3)),
                             StructField::not_null(logical_name(4), DataType::STRING)
@@ -2157,7 +2157,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
@@ -2201,14 +2201,14 @@ mod tests {
     #[test]
     fn nested_indices_unselected_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(1)),
@@ -2245,13 +2245,13 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new_unchecked([StructField::not_null(
+                        LogicalSchema::new_unchecked([StructField::not_null(
                             logical_name(4),
                             DataType::INTEGER,
                         )
@@ -2265,7 +2265,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(1)),
@@ -2306,13 +2306,13 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new_unchecked([
+                        LogicalSchema::new_unchecked([
                             StructField::not_null(logical_name(6), DataType::STRING)
                                 .with_metadata(column_mapping_metadata(6)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
@@ -2327,7 +2327,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(1)),
@@ -2373,12 +2373,12 @@ mod tests {
     #[test]
     fn skipped_struct() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
-                    StructType::new_unchecked([
+                    LogicalSchema::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
                             .with_metadata(column_mapping_metadata(4)),
                         StructField::not_null(logical_name(5), DataType::STRING)
@@ -2390,7 +2390,7 @@ mod tests {
                     .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(
                     "skipped",
@@ -2443,16 +2443,16 @@ mod tests {
 
     #[test]
     fn reorder_map_with_structs() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::not_null("i", DataType::INTEGER),
             StructField::not_null(
                 "map",
                 MapType::new(
-                    StructType::new_unchecked([
+                    LogicalSchema::new_unchecked([
                         StructField::not_null("k1", DataType::STRING),
                         StructField::not_null("k2", DataType::STRING),
                     ]),
-                    StructType::new_unchecked([
+                    LogicalSchema::new_unchecked([
                         StructField::not_null("v2", DataType::STRING),
                         StructField::not_null("v1", DataType::STRING),
                     ]),
@@ -2717,14 +2717,14 @@ mod tests {
     #[test]
     fn no_matches() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([
+            let requested_schema = LogicalSchema::new_unchecked([
                 StructField::nullable(logical_name(1), DataType::STRING)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
-            .into();
+            .into_struct_type();
             let nots_field =
                 ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));
             let noti2_field =
@@ -2760,7 +2760,7 @@ mod tests {
 
     #[test]
     fn empty_requested_schema() {
-        let requested_schema = Arc::new(StructType::new_unchecked([]));
+        let requested_schema = Arc::new(LogicalSchema::new_unchecked([]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Utf8, true),

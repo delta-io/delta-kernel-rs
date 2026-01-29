@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef};
+use crate::schema::{InvariantChecker, LogicalSchema, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureType, TableFeature,
@@ -87,7 +87,7 @@ impl TableConfiguration {
     ) -> DeltaResult<Self> {
         protocol.ensure_read_supported()?;
 
-        let schema = Arc::new(metadata.parse_schema()?);
+        let schema = Arc::new(LogicalSchema::new(metadata.parse_schema()?));
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -515,7 +515,7 @@ mod test {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, DataType, StructField, StructType};
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, TableFeature,
     };

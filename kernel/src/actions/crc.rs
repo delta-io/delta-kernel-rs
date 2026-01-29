@@ -6,7 +6,7 @@ use super::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::actions::PROTOCOL_NAME;
 use crate::engine_data::GetData;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{LogicalSchema, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
 use delta_kernel_derive::ToSchema;
@@ -149,7 +149,7 @@ mod tests {
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
-    use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, ArrayType, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_file_size_histogram_schema() {
         let schema = FileSizeHistogram::to_schema();
-        let expected = StructType::new_unchecked([
+        let expected = LogicalSchema::new_unchecked([
             StructField::not_null("sortedBinBoundaries", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("fileCounts", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("totalBytes", ArrayType::new(DataType::LONG, false)),
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn test_deleted_record_counts_histogram_schema() {
         let schema = DeletedRecordCountsHistogram::to_schema();
-        let expected = StructType::new_unchecked([StructField::not_null(
+        let expected = LogicalSchema::new_unchecked([StructField::not_null(
             "deletedRecordCounts",
             ArrayType::new(DataType::LONG, false),
         )]);
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_crc_schema() {
         let schema = Crc::to_schema();
-        let expected = StructType::new_unchecked([
+        let expected = LogicalSchema::new_unchecked([
             StructField::nullable("txnId", DataType::STRING),
             StructField::not_null("tableSizeBytes", DataType::LONG),
             StructField::not_null("numFiles", DataType::LONG),
@@ -242,7 +242,7 @@ mod tests {
         let engine_data = string_array_to_engine_data(json_strings);
         let engine = SyncEngine::new();
         let json_handler = engine.json_handler();
-        let output_schema = Arc::new(Crc::to_schema());
+        let output_schema = Arc::new(LogicalSchema::new(Crc::to_schema()));
         let data = json_handler.parse_json(engine_data, output_schema).unwrap();
 
         // run the visitor

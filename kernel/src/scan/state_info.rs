@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
+use crate::schema::{DataType, LogicalSchemaRef, MetadataColumnSpec, PhysicalSchema, PhysicalSchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::{FieldTransformSpec, TransformSpec};
@@ -18,9 +18,9 @@ use crate::{DeltaResult, Error, PredicateRef, StructField};
 #[derive(Debug)]
 pub(crate) struct StateInfo {
     /// The logical schema for this scan
-    pub(crate) logical_schema: SchemaRef,
+    pub(crate) logical_schema: LogicalSchemaRef,
     /// The physical schema to read from parquet files
-    pub(crate) physical_schema: SchemaRef,
+    pub(crate) physical_schema: PhysicalSchemaRef,
     /// The physical predicate for data skipping
     pub(crate) physical_predicate: PhysicalPredicate,
     /// Transform specification for converting physical to logical data
@@ -52,7 +52,7 @@ struct MetadataInfo<'a> {
 // Runs in O(supported_number_of_metadata_columns) time since each metadata
 // column can appear at most once in the schema
 fn validate_metadata_columns<'a>(
-    logical_schema: &'a SchemaRef,
+    logical_schema: &'a LogicalSchemaRef,
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
@@ -99,7 +99,7 @@ impl StateInfo {
     /// `predicate` - Optional predicate to filter data during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        logical_schema: SchemaRef,
+        logical_schema: LogicalSchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         classifier: C,
@@ -174,7 +174,7 @@ impl StateInfo {
                         // if it's a normal physical column
                         let physical_field = logical_field.make_physical(column_mapping_mode);
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                        let physical_name = physical_field.name.clone();
+                        let physical_name = physical_field.name().to_string();
 
                         if !logical_field.is_metadata_column()
                             && metadata_info.metadata_field_names.contains(&physical_name)
@@ -191,7 +191,7 @@ impl StateInfo {
             }
         }
 
-        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+        let physical_schema = Arc::new(PhysicalSchema::try_new(read_fields)?);
 
         let physical_predicate = match predicate {
             Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
@@ -223,21 +223,21 @@ pub(crate) mod tests {
 
     use crate::actions::{Metadata, Protocol};
     use crate::expressions::{column_expr, Expression as Expr};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::schema::{ColumnMetadataKey, LogicalSchema, MetadataValue, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
-        schema: SchemaRef,
+        schema: LogicalSchemaRef,
         partition_columns: Vec<String>,
     ) -> DeltaResult<StateInfo> {
         get_state_info(schema, partition_columns, None, HashMap::new(), vec![])
     }
 
     pub(crate) fn get_state_info(
-        schema: SchemaRef,
+        schema: LogicalSchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
         metadata_configuration: HashMap<String, String>,
@@ -246,7 +246,7 @@ pub(crate) mod tests {
         let metadata = Metadata::try_new(
             None,
             None,
-            schema.as_ref().clone(),
+            schema.as_struct_type().clone(),
             partition_columns,
             10,
             metadata_configuration,
@@ -262,11 +262,11 @@ pub(crate) mod tests {
 
         let mut schema = schema;
         for (name, spec) in metadata_cols.into_iter() {
-            schema = Arc::new(
+            schema = Arc::new(LogicalSchema::new(
                 schema
                     .add_metadata_column(name, spec)
                     .expect("Couldn't add metadata col"),
-            );
+            ));
         }
 
         StateInfo::try_new(schema.clone(), &table_configuration, predicate, ())
@@ -310,10 +310,10 @@ pub(crate) mod tests {
     #[test]
     fn no_partition_columns() {
         // Test case: No partition columns, no column mapping
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("value", DataType::LONG),
-        ]));
+        ])));
 
         let state_info = get_simple_state_info(schema.clone(), vec![]).unwrap();
 
@@ -331,11 +331,11 @@ pub(crate) mod tests {
     #[test]
     fn with_partition_columns() {
         // Test case: With partition columns
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("date", DataType::DATE), // Partition column
             StructField::nullable("value", DataType::LONG),
-        ]));
+        ])));
 
         let state_info = get_simple_state_info(
             schema.clone(),
@@ -368,12 +368,12 @@ pub(crate) mod tests {
     #[test]
     fn multiple_partition_columns() {
         // Test case: Multiple partition columns interspersed with regular columns
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![
             StructField::nullable("col1", DataType::STRING),
             StructField::nullable("part1", DataType::STRING), // Partition
             StructField::nullable("col2", DataType::LONG),
             StructField::nullable("part2", DataType::INTEGER), // Partition
-        ]));
+        ])));
 
         let state_info = get_simple_state_info(
             schema.clone(),
@@ -417,10 +417,10 @@ pub(crate) mod tests {
     #[test]
     fn with_predicate() {
         // Test case: With a valid predicate
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("value", DataType::LONG),
-        ]));
+        ])));
 
         let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
 
@@ -446,11 +446,11 @@ pub(crate) mod tests {
     #[test]
     fn partition_at_beginning() {
         // Test case: Partition column at the beginning
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![
             StructField::nullable("date", DataType::DATE), // Partition column
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("value", DataType::LONG),
-        ]));
+        ])));
 
         let state_info = get_simple_state_info(schema.clone(), vec!["date".to_string()]).unwrap();
 
@@ -479,10 +479,10 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
-        )]));
+        )])));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -511,10 +511,10 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_conflicting_row_index_col_name() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
             "row_indexes_for_row_id_0", // this will conflict with the first generated name for row indexes
             DataType::STRING,
-        )]));
+        )])));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -543,10 +543,10 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_and_indexes() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
-        )]));
+        )])));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -578,10 +578,10 @@ pub(crate) mod tests {
 
     #[test]
     fn invalid_rowtracking_config() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
-        )]));
+        )])));
 
         for (metadata_config, metadata_cols, expected_error) in [
             (HashMap::new(), vec![("row_id", MetadataColumnSpec::RowId)], "Unsupported: Row ids are not enabled on this table"),
@@ -598,10 +598,10 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
-        )]));
+        )])));
         let res = get_state_info(
             schema.clone(),
             vec!["part_col".to_string()],
@@ -617,7 +617,7 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_read_field() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
         )
@@ -632,7 +632,7 @@ pub(crate) mod tests {
                     .to_string(),
                 "other".into(),
             ),
-        ]))]));
+        ]))])));
         let res = get_state_info(
             schema.clone(),
             vec![],

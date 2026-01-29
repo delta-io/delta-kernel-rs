@@ -13,7 +13,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use super::super::arrow_utils::make_arrow_error;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
-use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
+use crate::schema::{LogicalSchema, ArrayType, DataType, MapType, Schema, StructField, StructType};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
 // names of fields, nullable, and metadata in the struct have been transformed to match those in
@@ -97,7 +97,7 @@ fn transform_struct(
 }
 
 // Transform a struct array. The data is in `array`, and the target fields are in `kernel_fields`.
-fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaResult<StructArray> {
+fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &StructType) -> DeltaResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
@@ -194,7 +194,7 @@ mod apply_schema_validation_tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, DataType, StructField, StructType};
 
     #[test]
     fn test_apply_schema_basic_functionality() {

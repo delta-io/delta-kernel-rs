@@ -19,7 +19,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
-use crate::schema::Schema;
+use crate::schema::{Schema, StructType};
 use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
@@ -98,7 +98,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
+        let input_schema = Schema::new(StructType::try_from_arrow(data.record_batch().schema())?);
         let output_schema = write_context.schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),

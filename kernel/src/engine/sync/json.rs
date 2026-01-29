@@ -10,7 +10,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
-use crate::schema::SchemaRef;
+use crate::schema::{PhysicalSchemaRef, SchemaRef};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
@@ -19,7 +19,7 @@ pub(crate) struct SyncJsonHandler;
 
 fn try_create_from_json(
     file: File,
-    _schema: SchemaRef,
+    _schema: PhysicalSchemaRef,
     arrow_schema: ArrowSchemaRef,
     _predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
@@ -33,7 +33,7 @@ impl JsonHandler for SyncJsonHandler {
     fn read_json_files(
         &self,
         files: &[FileMeta],
-        schema: SchemaRef,
+        schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_json)

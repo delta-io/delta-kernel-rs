@@ -11,7 +11,7 @@ use crate::actions::{
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, ToSchema as _};
+use crate::schema::{LogicalSchema, PhysicalSchema, PhysicalSchemaRef, SchemaRef, StructField, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -308,7 +308,7 @@ impl LogSegment {
             .json_handler()
             .read_json_files(
                 &commits_and_compactions,
-                commit_read_schema,
+                Arc::new(PhysicalSchema::new(commit_read_schema.as_struct_type().clone())),
                 meta_predicate.clone(),
             )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
@@ -407,7 +407,7 @@ impl LogSegment {
             action_schema.clone()
         } else {
             Arc::new(
-                action_schema.add([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])?,
+                LogicalSchema::new(action_schema.add([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])?),
             )
         };
 
@@ -419,6 +419,10 @@ impl LogSegment {
 
         let parquet_handler = engine.parquet_handler();
 
+        // Convert to PhysicalSchemaRef for reading checkpoint files
+        // Checkpoint files don't use column mapping, so we can directly convert
+        let physical_checkpoint_schema: PhysicalSchemaRef = Arc::new(PhysicalSchema::new(checkpoint_read_schema.as_struct_type().clone()));
+
         // Historically, we had a shared file reader trait for JSON and Parquet handlers,
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
@@ -427,14 +431,14 @@ impl LogSegment {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
+                    physical_checkpoint_schema.clone(),
                     meta_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
+                    physical_checkpoint_schema.clone(),
                     meta_predicate.clone(),
                 )?,
             Some(parsed_log_path) => {
@@ -513,10 +517,13 @@ impl LogSegment {
             .map(|sidecar| sidecar.to_filemeta(&log_root))
             .try_collect()?;
 
+        // Convert to PhysicalSchemaRef for reading sidecar files
+        let physical_schema = Arc::new(PhysicalSchema::new(checkpoint_read_schema.as_struct_type().clone()));
+
         // Read the sidecar files and return an iterator of sidecar file batches
         Ok(Some(parquet_handler.read_parquet_files(
             &sidecar_files,
-            checkpoint_read_schema,
+            physical_schema,
             meta_predicate,
         )?))
     }

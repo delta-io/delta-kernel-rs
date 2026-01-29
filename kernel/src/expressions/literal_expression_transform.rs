@@ -194,8 +194,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::expressions::{ArrayData, MapData};
-    use crate::schema::SchemaRef;
-    use crate::schema::StructType;
+    use crate::schema::{LogicalSchema, SchemaRef, StructType};
     use crate::DataType as DeltaDataTypes;
 
     use paste::paste;
@@ -228,14 +227,14 @@ mod tests {
     fn test_create_one_top_level_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+        let schema: SchemaRef = Arc::new(LogicalSchema::new_unchecked([StructField::not_null(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected = Expr::null_literal(schema.clone().into());
+        let expected = Expr::null_literal(DataType::from(schema.as_struct_type().clone()));
         assert_single_row_transform(values, schema, Ok(expected));
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
@@ -246,7 +245,7 @@ mod tests {
     #[test]
     fn test_create_one_missing_values() {
         let values = &[1.into()];
-        let schema = Arc::new(StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
         ]));
@@ -256,7 +255,7 @@ mod tests {
     #[test]
     fn test_create_one_extra_values() {
         let values = &[1.into(), 2.into(), 3.into()];
-        let schema = Arc::new(StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
         ]));
@@ -266,7 +265,7 @@ mod tests {
     #[test]
     fn test_create_one_incorrect_schema() {
         let values = &["a".into()];
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        let schema = Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
@@ -277,7 +276,7 @@ mod tests {
     #[test]
     fn test_many_structs() {
         let values: &[Scalar] = &[1.into(), 2.into(), 3.into(), 4.into()];
-        let schema = Arc::new(StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable(
                 "x",
                 DeltaDataTypes::struct_type_unchecked([
@@ -310,7 +309,7 @@ mod tests {
             Scalar::Map(map_data.clone()),
             Scalar::Array(array_data.clone()),
         ];
-        let schema = Arc::new(StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("map", DeltaDataTypes::Map(Box::new(map_type))),
             StructField::nullable("array", DeltaDataTypes::Array(Box::new(array_type))),
         ]));
@@ -351,10 +350,10 @@ mod tests {
         let field_b = StructField::new("b", DeltaDataTypes::INTEGER, test_schema.b_nullable);
         let field_x = StructField::new(
             "x",
-            StructType::new_unchecked([field_a.clone(), field_b.clone()]),
+            LogicalSchema::new_unchecked([field_a.clone(), field_b.clone()]),
             test_schema.x_nullable,
         );
-        let schema = Arc::new(StructType::new_unchecked([field_x.clone()]));
+        let schema: SchemaRef = Arc::new(LogicalSchema::new_unchecked([field_x.clone()]));
 
         let expected_result = match expected {
             Expected::Noop => {
@@ -364,7 +363,7 @@ mod tests {
                 ]);
                 Ok(Expr::struct_from([nested_struct]))
             }
-            Expected::Null => Ok(Expr::null_literal(schema.clone().into())),
+            Expected::Null => Ok(Expr::null_literal(DataType::from(schema.as_struct_type().clone()))),
             Expected::NullStruct => {
                 let nested_null = Expr::null_literal(field_x.data_type().clone());
                 Ok(Expr::struct_from([nested_null]))

@@ -99,7 +99,7 @@ use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
@@ -113,19 +113,18 @@ mod tests;
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
 /// field, which is only known at runtime.
 static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new_unchecked([
+    Arc::new(LogicalSchema::new_unchecked([
         StructField::not_null("version", DataType::LONG),
         StructField::not_null("size", DataType::LONG),
         StructField::nullable("parts", DataType::LONG),
         StructField::nullable("sizeInBytes", DataType::LONG),
         StructField::nullable("numOfAddFiles", DataType::LONG),
-    ])
-    .into()
+    ]))
 });
 
 /// Schema for extracting relevant actions from log files for checkpoint creation
 static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
+    Arc::new(LogicalSchema::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -139,7 +138,7 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 // We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
 // we're not supporting yet due to the lack of map support TODO(#880).
 static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+    Arc::new(LogicalSchema::new_unchecked([StructField::nullable(
         CHECKPOINT_METADATA_NAME,
         DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
     )]))

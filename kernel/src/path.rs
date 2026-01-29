@@ -2,9 +2,11 @@
 
 use std::slice;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
+use crate::schema::PhysicalSchema;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
@@ -276,9 +278,12 @@ impl ParsedLogPath<FileMeta> {
             )));
         }
 
+        // Convert logical schema to physical schema for reading commit metadata
+        let schema = InCommitTimestampVisitor::schema();
+        let physical_schema = Arc::new(PhysicalSchema::new(schema.as_struct_type().clone()));
         let mut action_iter = engine.json_handler().read_json_files(
             slice::from_ref(&self.location),
-            InCommitTimestampVisitor::schema(),
+            physical_schema,
             None,
         )?;
 

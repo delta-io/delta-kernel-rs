@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
-use delta_kernel::schema::Schema;
+use delta_kernel::schema::{PhysicalSchema, Schema};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -580,6 +580,9 @@ pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
 #[handle_descriptor(target=Schema, mutable=false, sized=true)]
 pub struct SharedSchema;
 
+#[handle_descriptor(target=PhysicalSchema, mutable=false, sized=true)]
+pub struct SharedPhysicalSchema;
+
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
@@ -724,6 +727,15 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
 /// Engine is responsible for providing a valid schema handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
+    schema.drop_handle();
+}
+
+/// Free a physical schema.
+///
+/// # Safety
+/// Engine is responsible for providing a valid physical schema handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_physical_schema(schema: Handle<SharedPhysicalSchema>) {
     schema.drop_handle();
 }
 

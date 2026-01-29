@@ -17,7 +17,7 @@ use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedPhysicalSchema, SharedSchema, SharedSnapshot,
     TryFromStringSlice,
 };
 
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 /// # Safety
 /// Engine is responsible for providing a valid `SharedScan` handle
 #[no_mangle]
-pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedPhysicalSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
 }

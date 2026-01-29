@@ -1,7 +1,7 @@
 //! Code to handle column mapping, including modes and schema transforms
 use super::TableFeature;
 use crate::actions::Protocol;
-use crate::schema::{
+use crate::schema::{LogicalSchema, 
     ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
 };
 use crate::table_properties::TableProperties;
@@ -165,6 +165,7 @@ mod tests {
     use super::*;
     use crate::schema::StructType;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn test_column_mapping_mode() {
@@ -313,45 +314,45 @@ mod tests {
         [ColumnMappingMode::Name, ColumnMappingMode::Id]
             .into_iter()
             .for_each(|mode| {
-                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).unwrap();
 
                 // missing annotation
-                let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
-                let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", None, "4", "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
-                let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
-                let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", "\"col-a7f4159c\"", "4", None)));
                 validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
 
                 // wrong-type field id annotation (string instead of int)
-                let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
-                let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
 
                 // wrong-type field name annotation (int instead of string)
-                let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", "555", "4", "\"col-5f422f40\"")));
                 validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
-                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
+                let schema = Arc::new(LogicalSchema::new(create_schema("5", "\"col-a7f4159c\"", "4", "444")));
                 validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
             });
     }
 
     #[test]
     fn test_column_mapping_disabled() {
-        let schema = create_schema(None, None, None, None);
+        let schema = Arc::new(LogicalSchema::new(create_schema(None, None, None, None)));
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).unwrap();
 
-        let schema = create_schema("5", None, None, None);
+        let schema = Arc::new(LogicalSchema::new(create_schema("5", None, None, None)));
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field id");
-        let schema = create_schema(None, "\"col-a7f4159c\"", None, None);
+        let schema = Arc::new(LogicalSchema::new(create_schema(None, "\"col-a7f4159c\"", None, None)));
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
-        let schema = create_schema(None, None, "4", None);
+        let schema = Arc::new(LogicalSchema::new(create_schema(None, None, "4", None)));
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field id");
-        let schema = create_schema(None, None, None, "\"col-5f422f40\"");
+        let schema = Arc::new(LogicalSchema::new(create_schema(None, None, None, "\"col-5f422f40\"")));
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
     }
 }

@@ -365,7 +365,7 @@ mod tests {
     };
     use crate::engine::sync::SyncEngine;
     use crate::expressions::ArrayData;
-    use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, LogicalSchema, StructField, StructType};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
@@ -443,7 +443,7 @@ mod tests {
         ];
 
         // Create schema for the new columns
-        let new_schema = Arc::new(StructType::new_unchecked([
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("age", DataType::INTEGER, true),
             StructField::new("active", DataType::BOOLEAN, false),
         ]));
@@ -501,7 +501,7 @@ mod tests {
             vec![25, 30, 35],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([StructField::new(
             "age",
             DataType::INTEGER,
             true,
@@ -533,7 +533,7 @@ mod tests {
             vec![Some("Alice".to_string()), Some("Bob".to_string())],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("name", DataType::STRING, true),
             StructField::new("email", DataType::STRING, true), // Extra field in schema
         ]));
@@ -566,7 +566,7 @@ mod tests {
             ArrayType::new(DataType::STRING, true),
             Vec::<Option<String>>::new(),
         )?];
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([StructField::new(
             "name",
             DataType::STRING,
             true,
@@ -597,7 +597,7 @@ mod tests {
 
         // Create empty schema and columns
         let new_columns = vec![];
-        let new_schema = Arc::new(StructType::new_unchecked([]));
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([]));
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -634,7 +634,7 @@ mod tests {
             )?,
         ];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("name", DataType::STRING, true),
             StructField::new("age", DataType::INTEGER, true),
         ]));
@@ -676,7 +676,7 @@ mod tests {
             ArrayData::try_new(ArrayType::new(DataType::BOOLEAN, false), vec![true, false])?,
         ];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("big_number", DataType::LONG, false),
             StructField::new("pi", DataType::DOUBLE, true),
             StructField::new("flag", DataType::BOOLEAN, false),
@@ -723,7 +723,7 @@ mod tests {
             vec![true, false, true],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
+        let new_schema = Arc::new(LogicalSchema::new_unchecked([StructField::new(
             "active",
             DataType::BOOLEAN,
             false,

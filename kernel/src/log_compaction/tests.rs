@@ -241,7 +241,7 @@ fn test_no_compaction_staged_commits() {
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};
-    use crate::schema::{DataType as KernelDataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, DataType as KernelDataType, StructField, StructType};
     use crate::utils::test_utils::Action;
 
     let metadata = Action::Metadata(

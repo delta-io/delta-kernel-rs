@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, LogicalSchema, Schema, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -632,9 +632,9 @@ impl InCommitTimestampVisitor {
     pub(crate) fn schema() -> Arc<Schema> {
         static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
             let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
-            Arc::new(StructType::new_unchecked(vec![StructField::new(
+            Arc::new(LogicalSchema::new_unchecked(vec![StructField::new(
                 COMMIT_INFO_NAME,
-                StructType::new_unchecked([ict_type]),
+                LogicalSchema::new_unchecked([ict_type]),
                 true,
             )]))
         });

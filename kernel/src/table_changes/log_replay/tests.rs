@@ -8,7 +8,7 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{DataType, StructField, StructType};
+use crate::schema::{LogicalSchema, DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
@@ -92,7 +92,7 @@ async fn metadata_protocol() {
         .into_iter();
 
     let scan_batches =
-        table_changes_action_iter(engine, commits, get_schema().into(), None).unwrap();
+        table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None).unwrap();
     let sv = result_to_sv(scan_batches);
     assert_eq!(sv, &[false, false]);
 }
@@ -122,7 +122,7 @@ async fn cdf_not_enabled() {
         .into_iter();
 
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
             .unwrap()
             .try_collect();
 
@@ -150,7 +150,7 @@ async fn unsupported_reader_feature() {
         .into_iter();
 
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
             .unwrap()
             .try_collect();
 
@@ -186,7 +186,7 @@ async fn column_mapping_should_fail() {
         .into_iter();
 
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
             .unwrap()
             .try_collect();
 
@@ -219,7 +219,7 @@ async fn incompatible_schemas_fail() {
             .into_iter();
 
         let res: DeltaResult<Vec<_>> =
-            table_changes_action_iter(engine, commits, cdf_schema.into(), None)
+            table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(cdf_schema)), None)
                 .unwrap()
                 .try_collect();
 
@@ -308,7 +308,7 @@ async fn add_remove() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -358,7 +358,7 @@ async fn filter_data_change() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -404,7 +404,7 @@ async fn cdc_selection() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -470,7 +470,7 @@ async fn dv() {
         },
     )])
     .into();
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -538,7 +538,7 @@ async fn data_skipping_filter() {
         column_expr!("id"),
         Scalar::from(4),
     );
-    let logical_schema = get_schema();
+    let logical_schema = Arc::new(LogicalSchema::new(get_schema()));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
@@ -548,7 +548,7 @@ async fn data_skipping_filter() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
+    let sv = table_changes_action_iter(engine, commits, logical_schema, predicate)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -594,7 +594,7 @@ async fn failing_protocol() {
         .into_iter();
 
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, commits, Arc::new(LogicalSchema::new(get_schema())), None)
             .unwrap()
             .try_collect();
 
@@ -623,6 +623,6 @@ async fn file_meta_timestamp() {
 
     let commit = commits.next().unwrap();
     let file_meta_ts = commit.location.last_modified;
-    let scanner = LogReplayScanner::try_new(engine.as_ref(), commit, &get_schema().into()).unwrap();
+    let scanner = LogReplayScanner::try_new(engine.as_ref(), commit, &Arc::new(LogicalSchema::new(get_schema()))).unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
 }

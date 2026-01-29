@@ -9,7 +9,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::SchemaRef;
+use crate::schema::{LogicalSchema, PhysicalSchemaRef, SchemaRef};
 use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
@@ -164,7 +164,7 @@ impl TableChangesScan {
     /// Get a shared reference to the physical [`Schema`] of the table changes scan.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn physical_schema(&self) -> &SchemaRef {
+    pub fn physical_schema(&self) -> &PhysicalSchemaRef {
         &self.state_info.physical_schema
     }
 
@@ -240,8 +240,10 @@ fn read_scan_file(
     // Only create an evaluator if transformation is needed
     let phys_to_logical_eval = transform_expr
         .map(|expr| {
+            // Convert physical schema to logical schema ref for evaluator
+            let input_schema = Arc::new(LogicalSchema::new(physical_schema.as_struct_type().clone()));
             engine.evaluation_handler().new_expression_evaluator(
-                physical_schema.clone(),
+                input_schema,
                 expr,
                 state_info.logical_schema.clone().into(),
             )
@@ -319,7 +321,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, DataType, StructField, StructType};
     use crate::table_changes::TableChanges;
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
     use crate::transforms::FieldTransformSpec;
@@ -406,11 +408,11 @@ mod tests {
         // Check logical schema matches projection
         assert_eq!(
             *scan.logical_schema(),
-            StructType::new_unchecked([
+            Arc::new(LogicalSchema::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),
             ])
-            .into()
+            .into())
         );
 
         // Check physical schema only has the regular field 'id' (no CDF metadata columns)

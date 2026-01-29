@@ -10,14 +10,14 @@ use crate::engine::arrow_utils::{
     RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
+use crate::schema::{PhysicalSchemaRef, SchemaRef};
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
 
 pub(crate) struct SyncParquetHandler;
 
 fn try_create_from_parquet(
     file: File,
-    schema: SchemaRef,
+    schema: PhysicalSchemaRef,
     _arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
@@ -47,7 +47,7 @@ impl ParquetHandler for SyncParquetHandler {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
-        schema: SchemaRef,
+        schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)

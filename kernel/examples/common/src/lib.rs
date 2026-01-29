@@ -187,19 +187,19 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
     let mut scan_schema = snapshot.schema();
     if let Some(cols) = args.columns.as_ref() {
         let cols: Vec<&str> = cols.split(",").map(str::trim).collect();
-        scan_schema = scan_schema.project_as_struct(&cols)?.into();
+        scan_schema = Arc::new(scan_schema.project_as_struct(&cols)?.into());
     }
 
     if args.with_row_index {
-        scan_schema = scan_schema
+        scan_schema = Arc::new(scan_schema
             .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
-            .into();
+            .into());
     }
 
     if args.with_row_id {
-        scan_schema = scan_schema
+        scan_schema = Arc::new(scan_schema
             .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
-            .into();
+            .into());
     }
 
     Ok(Some(

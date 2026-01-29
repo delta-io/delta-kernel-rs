@@ -144,7 +144,7 @@ pub unsafe extern "C" fn commit(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::{DataType, LogicalSchema, StructField, StructType};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -247,7 +247,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![
+        let schema = Arc::new(LogicalSchema::try_new(vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("string", DataType::STRING),
         ])?);

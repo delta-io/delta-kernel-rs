@@ -22,7 +22,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
-use crate::schema::SchemaRef;
+use crate::schema::{PhysicalSchemaRef, SchemaRef};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
@@ -96,7 +96,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn read_json_files(
         &self,
         files: &[FileMeta],
-        physical_schema: SchemaRef,
+        physical_schema: PhysicalSchemaRef,
         _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
@@ -272,7 +272,8 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
-    use crate::schema::{DataType as DeltaDataType, Schema, StructField};
+    use crate::schema::{DataType as DeltaDataType, PhysicalSchema, Schema, StructField};
+    use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
@@ -555,8 +556,9 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let physical_schema: PhysicalSchemaRef = Arc::new(get_commit_schema().make_physical(ColumnMappingMode::None));
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_commit_schema().clone(), None)
+            .read_json_files(files, physical_schema, None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -567,8 +569,9 @@ mod tests {
 
         // limit batch size
         let handler = handler.with_batch_size(2);
+        let physical_schema: PhysicalSchemaRef = Arc::new(get_commit_schema().make_physical(ColumnMappingMode::None));
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_commit_schema().clone(), None)
+            .read_json_files(files, physical_schema, None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -659,7 +662,7 @@ mod tests {
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
         let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
-        let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
+        let schema: PhysicalSchemaRef = Arc::new(PhysicalSchema::try_new(vec![field]).unwrap());
         let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
 
         // Helper to check that we get expected number of errors then stream ends
@@ -777,10 +780,10 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
+            let physical_schema: PhysicalSchemaRef = Arc::new(PhysicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
                 "val",
                 DeltaDataType::INTEGER,
-            )]));
+            )])));
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()

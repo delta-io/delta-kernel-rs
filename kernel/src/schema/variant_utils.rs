@@ -1,7 +1,7 @@
 //! Utility functions for the variant type and variant-related table features.
 
 use crate::actions::Protocol;
-use crate::schema::{Schema, SchemaTransform, StructType};
+use crate::schema::{LogicalSchema, Schema, SchemaTransform, StructType};
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -43,8 +43,9 @@ pub(crate) fn validate_variant_type_feature_support(
 mod tests {
     use super::*;
     use crate::actions::Protocol;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{LogicalSchema, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
+    use std::sync::Arc;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
@@ -78,18 +79,18 @@ mod tests {
                 TableFeature::VariantTypePreview,
             ),
         ];
-        let schema_with_variant = StructType::new_unchecked([
+        let schema_with_variant = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("v", DataType::unshredded_variant(), true),
-        ]);
+        ]));
 
-        let schema_without_variant = StructType::new_unchecked([
+        let schema_without_variant = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("name", DataType::STRING, true),
-        ]);
+        ]));
 
         // Nested schema with VARIANT
-        let nested_schema_with_variant = StructType::new_unchecked([
+        let nested_schema_with_variant = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
@@ -100,7 +101,7 @@ mod tests {
                 )]))),
                 true,
             ),
-        ]);
+        ]));
         features
             .iter()
             .for_each(|(variant_reader, variant_writer)| {

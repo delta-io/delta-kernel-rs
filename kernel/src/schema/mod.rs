@@ -27,8 +27,190 @@ pub mod derive_macro_utils;
 pub(crate) mod derive_macro_utils;
 pub(crate) mod variant_utils;
 
-pub type Schema = StructType;
-pub type SchemaRef = Arc<StructType>;
+/// Logical schema - user-facing schema from table metadata.
+/// This is the schema that users see and interact with, containing logical column names
+/// and types as defined in the Delta table metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LogicalSchema(StructType);
+
+/// Physical schema - storage schema for reading parquet files.
+/// This schema contains physical column names (potentially mapped via column mapping mode)
+/// and is used when actually reading data from storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PhysicalSchema(StructType);
+
+/// Reference-counted logical schema.
+pub type LogicalSchemaRef = Arc<LogicalSchema>;
+
+/// Reference-counted physical schema.
+pub type PhysicalSchemaRef = Arc<PhysicalSchema>;
+
+// Backward compatibility aliases
+pub type Schema = LogicalSchema;
+pub type SchemaRef = LogicalSchemaRef;
+
+impl LogicalSchema {
+    /// Creates a new logical schema from a StructType.
+    pub fn new(struct_type: StructType) -> Self {
+        Self(struct_type)
+    }
+
+    /// Creates a new [`LogicalSchema`] from the given fields.
+    ///
+    /// Returns an error if:
+    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate metadata columns
+    /// - the schema contains nested metadata columns
+    pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Ok(Self(StructType::try_new(fields)?))
+    }
+
+    /// Creates a new [`LogicalSchema`] from a fallible iterator of fields.
+    ///
+    /// This constructor collects all fields from the iterator, returning the first error
+    /// encountered, or a new [`LogicalSchema`] if all fields are successfully collected and validated.
+    pub fn try_from_results<E: Into<Error>>(
+        fields: impl IntoIterator<Item = Result<StructField, E>>,
+    ) -> DeltaResult<Self> {
+        Ok(Self(StructType::try_from_results(fields)?))
+    }
+
+    /// Creates a new [`LogicalSchema`] from the given fields without validating them.
+    ///
+    /// This should only be used when you are sure that the fields are valid.
+    /// Refer to [`LogicalSchema::try_new`] for more details on the validation checks.
+    #[internal_api]
+    pub(crate) fn new_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        Self(StructType::new_unchecked(fields))
+    }
+
+    /// Converts this logical schema to a physical schema by applying column mapping transformations.
+    ///
+    /// NOTE: Caller affirms that the schema was already validated by
+    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// always and only present when column mapping mode is enabled.
+    #[internal_api]
+    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> PhysicalSchema {
+        PhysicalSchema(self.0.make_physical(column_mapping_mode))
+    }
+
+    /// Returns a reference to the underlying StructType.
+    pub fn as_struct_type(&self) -> &StructType {
+        &self.0
+    }
+
+    /// Consumes self and returns the underlying StructType.
+    pub fn into_struct_type(self) -> StructType {
+        self.0
+    }
+}
+
+impl PhysicalSchema {
+    /// Creates a new physical schema from a StructType.
+    pub fn new(struct_type: StructType) -> Self {
+        Self(struct_type)
+    }
+
+    /// Creates a new [`PhysicalSchema`] from the given fields.
+    ///
+    /// Returns an error if:
+    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate metadata columns
+    /// - the schema contains nested metadata columns
+    pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Ok(Self(StructType::try_new(fields)?))
+    }
+
+    /// Creates a new [`PhysicalSchema`] from a fallible iterator of fields.
+    ///
+    /// This constructor collects all fields from the iterator, returning the first error
+    /// encountered, or a new [`PhysicalSchema`] if all fields are successfully collected and validated.
+    pub fn try_from_results<E: Into<Error>>(
+        fields: impl IntoIterator<Item = Result<StructField, E>>,
+    ) -> DeltaResult<Self> {
+        Ok(Self(StructType::try_from_results(fields)?))
+    }
+
+    /// Creates a new [`PhysicalSchema`] from the given fields without validating them.
+    ///
+    /// This should only be used when you are sure that the fields are valid.
+    /// Refer to [`PhysicalSchema::try_new`] for more details on the validation checks.
+    #[internal_api]
+    pub(crate) fn new_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        Self(StructType::new_unchecked(fields))
+    }
+
+    /// Returns a reference to the underlying StructType.
+    pub fn as_struct_type(&self) -> &StructType {
+        &self.0
+    }
+
+    /// Consumes self and returns the underlying StructType.
+    pub fn into_struct_type(self) -> StructType {
+        self.0
+    }
+}
+
+// Deref implementations for transparent access to StructType methods
+impl std::ops::Deref for LogicalSchema {
+    type Target = StructType;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for PhysicalSchema {
+    type Target = StructType;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Note: We intentionally do not provide From<StructType> implementations to force
+// explicit use of constructors (new, try_new, new_unchecked), making it clear whether
+// a LogicalSchema or PhysicalSchema is being created.
+
+// AsRef implementations
+impl AsRef<StructType> for LogicalSchema {
+    fn as_ref(&self) -> &StructType {
+        &self.0
+    }
+}
+
+impl AsRef<StructType> for PhysicalSchema {
+    fn as_ref(&self) -> &StructType {
+        &self.0
+    }
+}
+
+// PartialEq with StructType for convenience
+impl PartialEq<StructType> for LogicalSchema {
+    fn eq(&self, other: &StructType) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<LogicalSchema> for StructType {
+    fn eq(&self, other: &LogicalSchema) -> bool {
+        self == &other.0
+    }
+}
+
+impl PartialEq<StructType> for PhysicalSchema {
+    fn eq(&self, other: &StructType) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<PhysicalSchema> for StructType {
+    fn eq(&self, other: &PhysicalSchema) -> bool {
+        self == &other.0
+    }
+}
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
@@ -621,7 +803,7 @@ impl StructType {
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
     pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
         let struct_type = self.project_as_struct(names)?;
-        Ok(Arc::new(struct_type))
+        Ok(Arc::new(LogicalSchema::new(struct_type)))
     }
 
     /// Adds fields to this [`StructType`], returning a new [`StructType`].
@@ -1109,7 +1291,7 @@ impl MapType {
 
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        StructType::new_unchecked([
+        LogicalSchema::new_unchecked([
             StructField::not_null(key_name, self.key_type.clone()),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
@@ -1318,6 +1500,18 @@ impl From<MapType> for DataType {
 impl From<StructType> for DataType {
     fn from(struct_type: StructType) -> Self {
         DataType::Struct(Box::new(struct_type))
+    }
+}
+
+impl From<LogicalSchema> for DataType {
+    fn from(schema: LogicalSchema) -> Self {
+        schema.into_struct_type().into()
+    }
+}
+
+impl From<PhysicalSchema> for DataType {
+    fn from(schema: PhysicalSchema) -> Self {
+        schema.into_struct_type().into()
     }
 }
 
@@ -1695,6 +1889,7 @@ mod tests {
 
     use super::*;
     use serde_json;
+    use std::sync::Arc;
 
     fn example_schema_metadata() -> &'static str {
         r#"
@@ -2130,16 +2325,16 @@ mod tests {
 
     #[test]
     fn test_num_fields() {
-        let schema = StructType::new_unchecked([]);
+        let schema = LogicalSchema::new_unchecked([]);
         assert!(schema.num_fields() == 0);
-        let schema = StructType::new_unchecked([
+        let schema = LogicalSchema::new_unchecked([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
             StructField::nullable("d", DataType::LONG),
         ]);
         assert_eq!(schema.num_fields(), 4);
-        let schema = StructType::new_unchecked([
+        let schema = LogicalSchema::new_unchecked([
             StructField::nullable("b", DataType::LONG),
             StructField::not_null("b", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
@@ -2151,10 +2346,10 @@ mod tests {
     #[test]
     fn test_has_invariants() {
         // Schema with no invariants
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
-        ]);
+        ]));
         assert!(!InvariantChecker::has_invariants(&schema));
 
         // Schema with top-level invariant
@@ -2165,7 +2360,7 @@ mod tests {
         );
 
         let schema =
-            StructType::new_unchecked([StructField::nullable("a", DataType::STRING), field]);
+            Arc::new(LogicalSchema::new_unchecked([StructField::nullable("a", DataType::STRING), field]));
         assert!(InvariantChecker::has_invariants(&schema));
 
         // Schema with nested invariant in a struct
@@ -2182,11 +2377,11 @@ mod tests {
             .unwrap(),
         );
 
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             nested_field,
-        ]);
+        ]));
         assert!(InvariantChecker::has_invariants(&schema));
 
         // Schema with nested invariant in an array of structs
@@ -2206,11 +2401,11 @@ mod tests {
             ),
         );
 
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             array_field,
-        ]);
+        ]));
         assert!(InvariantChecker::has_invariants(&schema));
 
         // Schema with nested invariant in a map value that's a struct
@@ -2231,11 +2426,11 @@ mod tests {
             ),
         );
 
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(LogicalSchema::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             map_field,
-        ]);
+        ]));
         assert!(InvariantChecker::has_invariants(&schema));
     }
 

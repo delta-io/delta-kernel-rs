@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::schema::{DataType, Schema, SchemaRef};
+use delta_kernel::schema::{DataType, PhysicalSchemaRef, SchemaRef};
 use delta_kernel::{
     DeltaResult, EngineData, Error, Expression, ExpressionEvaluator, ExpressionRef,
     FileDataReadResultIterator,
@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::{
     ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, TryFromStringSlice,
+    NullableCvoid, SharedExternEngine, SharedPhysicalSchema, SharedSchema, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -105,7 +105,7 @@ pub unsafe extern "C" fn free_read_result_iter(data: Handle<ExclusiveFileReadRes
 pub unsafe extern "C" fn read_parquet_file(
     engine: Handle<SharedExternEngine>, // TODO Does this cause a free?
     file: &FileMeta,
-    physical_schema: Handle<SharedSchema>,
+    physical_schema: Handle<SharedPhysicalSchema>,
 ) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let physical_schema = unsafe { physical_schema.clone_as_arc() };
@@ -118,7 +118,7 @@ fn read_parquet_file_impl(
     extern_engine: Arc<dyn ExternEngine>,
     path: DeltaResult<&str>,
     file: &FileMeta,
-    physical_schema: Arc<Schema>,
+    physical_schema: PhysicalSchemaRef,
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = extern_engine.engine();
     let parquet_handler = engine.parquet_handler();
@@ -220,7 +220,7 @@ mod tests {
     use crate::ffi_test_utils::ok_or_panic;
     use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
     use delta_kernel::{
-        schema::{DataType, StructField, StructType},
+        schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType},
         Expression,
     };
     use std::sync::Arc;
@@ -228,8 +228,8 @@ mod tests {
     #[test]
     fn test_new_expression_evaluator() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
-        let in_schema = Arc::new(
-            StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
+        let in_schema: SchemaRef = Arc::new(
+            LogicalSchema::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
         );
         let expr = Expression::literal(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();

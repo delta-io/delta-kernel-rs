@@ -25,8 +25,8 @@ use crate::scan::log_replay::BASE_ROW_ID_NAME;
 use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
+    ArrayType, DataType, LogicalSchema, LogicalSchemaRef, MapType, PhysicalSchema, PhysicalSchemaRef, PrimitiveType, Schema,
+    SchemaRef, SchemaTransform, StructField, ToSchema as _,
 };
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -189,7 +189,7 @@ impl PhysicalPredicate {
         if let Some(predicate) = apply_mappings.transform_pred(predicate) {
             Ok(PhysicalPredicate::Some(
                 Arc::new(predicate.into_owned()),
-                Arc::new(schema.into_owned()),
+                Arc::new(LogicalSchema::new(schema.into_owned())),
             ))
         } else {
             Ok(PhysicalPredicate::None)
@@ -353,7 +353,7 @@ impl Scan {
     /// partition columns which are present in the logical schema but not in the physical schema.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn logical_schema(&self) -> &SchemaRef {
+    pub fn logical_schema(&self) -> &LogicalSchemaRef {
         &self.state_info.logical_schema
     }
 
@@ -361,7 +361,7 @@ impl Scan {
     /// of the underlying data files which must be read from storage.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn physical_schema(&self) -> &SchemaRef {
+    pub fn physical_schema(&self) -> &PhysicalSchemaRef {
         &self.state_info.physical_schema
     }
 
@@ -724,7 +724,7 @@ pub fn selection_vector(
 pub(crate) mod test_utils {
     use crate::arrow::array::StringArray;
     use crate::scan::state_info::StateInfo;
-    use crate::schema::StructType;
+    use crate::schema::{LogicalSchema, PhysicalSchema, StructType};
     use crate::utils::test_utils::string_array_to_engine_data;
     use itertools::Itertools;
     use std::sync::Arc;
@@ -852,10 +852,10 @@ pub(crate) mod test_utils {
         validate_callback: ScanCallback<T>,
     ) {
         let logical_schema =
-            logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
+            logical_schema.unwrap_or_else(|| Arc::new(LogicalSchema::new_unchecked(vec![])));
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
-            physical_schema: logical_schema,
+            physical_schema: Arc::new(PhysicalSchema::new_unchecked(vec![])),
             physical_predicate: PhysicalPredicate::None,
             transform_spec,
             column_mapping_mode: ColumnMappingMode::None,
@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_physical_predicate() {
-        let logical_schema = StructType::new_unchecked(vec![
+        let logical_schema = Arc::new(LogicalSchema::new_unchecked(vec![
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -958,7 +958,7 @@ mod tests {
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 "phys_mapped",
             )]),
-        ]);
+        ]));
 
         // NOTE: We break several column mapping rules here because they don't matter for this
         // test. For example, we do not provide field ids, and not all columns have physical names.
@@ -970,41 +970,38 @@ mod tests {
                 column_pred!("a"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("a").into(),
-                    StructType::new_unchecked(vec![StructField::nullable("a", DataType::LONG)])
-                        .into(),
+                    Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable("a", DataType::LONG)]))),
                 )),
             ),
             (
                 column_pred!("b"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("phys_b").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
+                    Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
                         "phys_b",
                         DataType::LONG,
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_b",
-                    )])])
-                    .into(),
+                    )])]))),
                 )),
             ),
             (
                 column_pred!("nested.x"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("nested.x").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
+                    Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
                         "nested",
                         StructType::new_unchecked(vec![StructField::nullable("x", DataType::LONG)]),
-                    )])
-                    .into(),
+                    )]))),
                 )),
             ),
             (
                 column_pred!("nested.y"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("nested.phys_y").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
+                    Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
                         "nested",
                         StructType::new_unchecked(vec![StructField::nullable(
                             "phys_y",
@@ -1014,15 +1011,14 @@ mod tests {
                             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                             "phys_y",
                         )])]),
-                    )])
-                    .into(),
+                    )]))),
                 )),
             ),
             (
                 column_pred!("mapped.n"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("phys_mapped.phys_n").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
+                    Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new_unchecked(vec![StructField::nullable(
                             "phys_n",
@@ -1036,15 +1032,14 @@ mod tests {
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_mapped",
-                    )])])
-                    .into(),
+                    )])]))),
                 )),
             ),
             (
                 Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
                 Some(PhysicalPredicate::Some(
                     Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
+                    Arc::new(LogicalSchema::new(StructType::new_unchecked(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new_unchecked(vec![StructField::nullable(
                             "phys_n",
@@ -1058,8 +1053,7 @@ mod tests {
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_mapped",
-                    )])])
-                    .into(),
+                    )])]))),
                 )),
             ),
             (

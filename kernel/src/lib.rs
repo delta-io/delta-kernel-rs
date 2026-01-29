@@ -82,7 +82,7 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::{DataType, SchemaRef};
+use self::schema::{DataType, PhysicalSchemaRef, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
@@ -159,7 +159,7 @@ pub use snapshot::SnapshotRef;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
-use schema::{SchemaTransform, StructField, StructType};
+use schema::{LogicalSchema, SchemaTransform, StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine-native-tls",
@@ -463,7 +463,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+        let null_row_schema: SchemaRef = Arc::new(LogicalSchema::new_unchecked(vec![StructField::nullable(
             "null_col",
             DataType::INTEGER,
         )]));
@@ -583,7 +583,7 @@ pub trait JsonHandler: AsAny {
     fn read_json_files(
         &self,
         files: &[FileMeta],
-        physical_schema: SchemaRef,
+        physical_schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
@@ -693,7 +693,7 @@ pub trait ParquetHandler: AsAny {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
-        physical_schema: SchemaRef,
+        physical_schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 }

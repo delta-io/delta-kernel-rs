@@ -16,7 +16,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
-    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, PhysicalSchema, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
@@ -148,6 +148,8 @@ impl LogReplayScanner {
         table_schema: &SchemaRef,
     ) -> DeltaResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
+        // Convert to PhysicalSchemaRef for reading commit files (no column mapping)
+        let physical_schema = Arc::new(PhysicalSchema::new(Arc::unwrap_or_clone(visitor_schema)));
 
         // Note: We do not perform data skipping yet because we need to visit all add and
         // remove actions for deletion vector resolution to be correct.
@@ -160,7 +162,7 @@ impl LogReplayScanner {
         // vectors are resolved so that we can skip both actions in the pair.
         let action_iter = engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
-            visitor_schema,
+            physical_schema,
             None, // not safe to apply data skipping yet
         )?;
 
@@ -230,9 +232,10 @@ impl LogReplayScanner {
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema();
+        let physical_schema = Arc::new(PhysicalSchema::new(schema.as_ref().clone()));
         let action_iter = engine.json_handler().read_json_files(
             slice::from_ref(&commit_file.location),
-            schema,
+            physical_schema,
             None,
         )?;
         let commit_version = commit_file

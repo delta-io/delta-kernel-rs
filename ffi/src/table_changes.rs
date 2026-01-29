@@ -23,7 +23,7 @@ use crate::scan::EnginePredicate;
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema,
+    SharedPhysicalSchema, SharedSchema,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn table_changes_scan_logical_schema(
 #[no_mangle]
 pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan: Handle<SharedTableChangesScan>,
-) -> Handle<SharedSchema> {
+) -> Handle<SharedPhysicalSchema> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     table_changes_scan.physical_schema().clone().into()
 }
@@ -338,7 +338,7 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
 mod tests {
     use super::*;
     use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
-    use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
+    use crate::{engine_to_handle, free_engine, free_physical_schema, free_schema, kernel_string_slice};
 
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
     use delta_kernel::arrow::datatypes::{Field, Schema};
@@ -600,7 +600,7 @@ mod tests {
             free_engine(engine);
             free_schema(schema);
             free_schema(logical_schema);
-            free_schema(physical_schema);
+            free_physical_schema(physical_schema);
         }
         Ok(())
     }

@@ -24,7 +24,7 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, LogicalSchema, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::{current_time_ms, require};
 use crate::{
@@ -39,7 +39,7 @@ pub(crate) type EngineDataResultIterator<'a> =
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange column.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
+    Arc::new(LogicalSchema::new_unchecked(vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null(
             "partitionValues",
@@ -66,7 +66,7 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(StructType::new_unchecked(
+    Arc::new(LogicalSchema::new_unchecked(
         mandatory_add_file_schema().fields().cloned().chain([stats]),
     ))
 });
@@ -83,7 +83,7 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
         .position(|f| f.name() == "modificationTime")
         .unwrap_or(len);
     fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
-    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
+    Arc::new(LogicalSchema::new_unchecked(fields.into_iter().cloned()))
 });
 
 // NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
@@ -98,7 +98,7 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
         .fields()
         .cloned()
         .chain([StructField::nullable("stats", DataType::STRING)]);
-    Arc::new(StructType::new_unchecked(fields))
+    Arc::new(LogicalSchema::new_unchecked(fields))
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
@@ -109,7 +109,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
         StructField::nullable("baseRowId", DataType::LONG),
         StructField::nullable("defaultRowCommitVersion", DataType::LONG),
     ]);
-    Arc::new(StructType::new_unchecked(fields))
+    Arc::new(LogicalSchema::new_unchecked(fields))
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -663,7 +663,7 @@ impl Transaction {
                         ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
                     add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                        with_row_tracking_cols(&Arc::new(LogicalSchema::new_unchecked(vec![]))),
                         vec![base_row_ids_array, commit_versions_array],
                     )
                 },
@@ -1071,7 +1071,7 @@ mod tests {
                 )]),
             ),
         ]);
-        assert_eq!(*schema, expected.into());
+        assert_eq!(schema.as_ref().as_ref(), &expected);
         Ok(())
     }
 

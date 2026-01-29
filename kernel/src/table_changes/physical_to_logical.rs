@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, PhysicalSchema, PhysicalSchemaRef, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -59,14 +60,14 @@ fn get_cdf_columns(
 pub(crate) fn scan_file_physical_schema(
     scan_file: &CdfScanFile,
     physical_schema: &StructType,
-) -> SchemaRef {
+) -> PhysicalSchemaRef {
     if scan_file.scan_type == CdfScanFileType::Cdc {
         let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
         let fields = physical_schema.fields().cloned().chain(Some(change_type));
         // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be used anywhere else
-        StructType::new_unchecked(fields).into()
+        Arc::new(PhysicalSchema::new(StructType::new_unchecked(fields)))
     } else {
-        physical_schema.clone().into()
+        Arc::new(PhysicalSchema::new(physical_schema.clone()))
     }
 }
 
@@ -131,14 +132,14 @@ mod tests {
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, LogicalSchema, PhysicalSchema, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     fn create_test_logical_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![
+        Arc::new(LogicalSchema::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("age", DataType::LONG),
             StructField::nullable("name", DataType::STRING),
@@ -179,7 +180,7 @@ mod tests {
         let physical_schema = create_test_physical_schema();
         StateInfo {
             logical_schema,
-            physical_schema: physical_schema.into(),
+            physical_schema: Arc::new(PhysicalSchema::new(physical_schema)),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
@@ -382,7 +383,7 @@ mod tests {
         };
 
         // Create a simple schema without CDF metadata columns
-        let logical_schema = Arc::new(StructType::new_unchecked(vec![
+        let logical_schema = Arc::new(LogicalSchema::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("name", DataType::STRING),
         ]));
@@ -397,7 +398,7 @@ mod tests {
 
         let state_info = StateInfo {
             logical_schema,
-            physical_schema: physical_schema.clone().into(),
+            physical_schema: Arc::new(PhysicalSchema::new(physical_schema.clone())),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,

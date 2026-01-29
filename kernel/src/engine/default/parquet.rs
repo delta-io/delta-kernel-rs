@@ -29,7 +29,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
+use crate::schema::{PhysicalSchema, PhysicalSchemaRef, SchemaRef};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -208,7 +208,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
-        physical_schema: SchemaRef,
+        physical_schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
@@ -251,7 +251,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
-    table_schema: SchemaRef,
+    table_schema: PhysicalSchemaRef,
     predicate: Option<PredicateRef>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
@@ -260,7 +260,7 @@ struct ParquetOpener {
 impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
-        table_schema: SchemaRef,
+        table_schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
         store: Arc<DynObjectStore>,
     ) -> Self {
@@ -353,14 +353,14 @@ struct PresignedUrlOpener {
     batch_size: usize,
     predicate: Option<PredicateRef>,
     limit: Option<usize>,
-    table_schema: SchemaRef,
+    table_schema: PhysicalSchemaRef,
     client: reqwest::Client,
 }
 
 impl PresignedUrlOpener {
     pub(crate) fn new(
         batch_size: usize,
-        schema: SchemaRef,
+        schema: PhysicalSchemaRef,
         predicate: Option<PredicateRef>,
     ) -> Self {
         Self {
@@ -435,6 +435,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::schema::StructType;
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -479,10 +480,11 @@ mod tests {
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let kernel_struct: StructType = physical_schema.try_into_kernel().unwrap();
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 files,
-                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                Arc::new(PhysicalSchema::new(kernel_struct)),
                 None,
             )
             .unwrap()
@@ -605,10 +607,11 @@ mod tests {
             .schema()
             .clone();
 
+        let kernel_struct: StructType = physical_schema.try_into_kernel().unwrap();
         let data: Vec<RecordBatch> = parquet_handler
             .read_parquet_files(
                 slice::from_ref(parquet_file),
-                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                Arc::new(PhysicalSchema::new(kernel_struct)),
                 None,
             )
             .unwrap()

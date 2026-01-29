@@ -13,7 +13,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateE
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, LogicalSchema, MapType, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -280,10 +280,10 @@ pub(crate) static TAGS_NAME: &str = "tags";
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
-pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
+pub(crate) static SCAN_ROW_SCHEMA: LazyLock<crate::schema::SchemaRef> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values = StructType::new_unchecked([
+    let file_constant_values = LogicalSchema::new_unchecked([
         StructField::nullable("partitionValues", partition_values),
         StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
         StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
@@ -296,7 +296,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
             ),
         ),
     ]);
-    Arc::new(StructType::new_unchecked([
+    Arc::new(LogicalSchema::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
@@ -421,12 +421,12 @@ mod tests {
         add_batch_with_remove, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
-    use crate::schema::MetadataColumnSpec;
+    use crate::schema::{LogicalSchemaRef, MetadataColumnSpec};
     use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,
-        schema::{DataType, SchemaRef, StructField, StructType},
+        schema::{DataType, LogicalSchema, PhysicalSchema, SchemaRef, StructField, StructType},
         ExpressionRef,
     };
 
@@ -481,10 +481,10 @@ mod tests {
     #[test]
     fn test_no_transforms() {
         let batch = vec![add_batch_simple(get_commit_schema().clone())];
-        let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
+        let logical_schema: LogicalSchemaRef = Arc::new(LogicalSchema::new_unchecked(vec![]));
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
-            physical_schema: logical_schema.clone(),
+            physical_schema: Arc::new(PhysicalSchema::new_unchecked(vec![])),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn test_simple_transform() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        let schema: SchemaRef = Arc::new(LogicalSchema::new_unchecked([
             StructField::new("value", DataType::INTEGER, true),
             StructField::new("date", DataType::DATE, true),
         ]));
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_row_id_transform() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+        let schema: SchemaRef = Arc::new(LogicalSchema::new_unchecked([StructField::new(
             "value",
             DataType::INTEGER,
             true,
