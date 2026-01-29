@@ -75,103 +75,30 @@ pub(crate) fn get_clustering_columns(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_clustering_columns_simple() {
-        // Simple top-level columns: each is a single-element array
-        let json = r#"{"clusteringColumns": [["col1"], ["col2"], ["col3"]]}"#;
+    #[rstest::rstest]
+    #[case::simple(
+        r#"{"clusteringColumns": [["col1"], ["col2"]]}"#,
+        vec![vec!["col1"], vec!["col2"]]
+    )]
+    #[case::empty(
+        r#"{"clusteringColumns": []}"#,
+        vec![]
+    )]
+    #[case::nested(
+        r#"{"clusteringColumns": [["id"], ["user", "address", "city"], ["a", "b", "c", "d", "e"]]}"#,
+        vec![vec!["id"], vec!["user", "address", "city"], vec!["a", "b", "c", "d", "e"]]
+    )]
+    #[case::special_characters(
+        r#"{"clusteringColumns": [["col.with.dot"], ["`backticks`", "nested"]]}"#,
+        vec![vec!["col.with.dot"], vec!["`backticks`", "nested"]]
+    )]
+    #[case::tolerates_unknown_fields(
+        r#"{"clusteringColumns": [["col1"]], "foo": "bar", "futureField": 123}"#,
+        vec![vec!["col1"]]
+    )]
+    fn test_parse_clustering_columns(#[case] json: &str, #[case] expected: Vec<Vec<&str>>) {
         let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(
-            columns,
-            vec![
-                ColumnName::new(["col1"]),
-                ColumnName::new(["col2"]),
-                ColumnName::new(["col3"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_empty() {
-        let json = r#"{"clusteringColumns": []}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert!(columns.is_empty());
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_nested() {
-        // Nested columns are represented as arrays of field names
-        let json =
-            r#"{"clusteringColumns": [["id"], ["user", "address", "city"], ["metadata", "tags"]]}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(
-            columns,
-            vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["user", "address", "city"]),
-                ColumnName::new(["metadata", "tags"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_with_special_characters() {
-        // Column names with dots, commas, or other special characters are stored as-is
-        // since each path component is a separate array element
-        let json = r#"{"clusteringColumns": [["col.with.dot"], ["col,with,comma"], ["normal"]]}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(
-            columns,
-            vec![
-                ColumnName::new(["col.with.dot"]),
-                ColumnName::new(["col,with,comma"]),
-                ColumnName::new(["normal"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_column_mapping_uuids() {
-        // With column mapping enabled, physical names are UUIDs
-        let json = r#"{"clusteringColumns": [["col-daadafd7-7c20-4697-98f8-bff70199b1f9"], ["col-5abe0e80-cf57-47ac-9ffc-a861a3d1077e"]]}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(
-            columns,
-            vec![
-                ColumnName::new(["col-daadafd7-7c20-4697-98f8-bff70199b1f9"]),
-                ColumnName::new(["col-5abe0e80-cf57-47ac-9ffc-a861a3d1077e"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_tolerates_unknown_fields() {
-        // Per the protocol, Delta clients should tolerate unrecognized fields
-        let json =
-            r#"{"clusteringColumns": [["col1"], ["col2"]], "foo": "bar", "futureField": 123}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["col1"]), ColumnName::new(["col2"]),]
-        );
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_deeply_nested() {
-        // Deeply nested column path
-        let json = r#"{"clusteringColumns": [["a", "b", "c", "d", "e"]]}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(columns, vec![ColumnName::new(["a", "b", "c", "d", "e"]),]);
-    }
-
-    #[test]
-    fn test_parse_clustering_columns_with_backticks_in_names() {
-        // Field names can contain backticks and other special characters
-        // since each path component is stored as a separate array element
-        let json = r#"{"clusteringColumns":[["col1","`col2,col3`","`col4.col5`,col6"]]}"#;
-        let columns = parse_clustering_columns(json).unwrap();
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["col1", "`col2,col3`", "`col4.col5`,col6"]),]
-        );
+        let expected_cols: Vec<ColumnName> = expected.into_iter().map(ColumnName::new).collect();
+        assert_eq!(columns, expected_cols);
     }
 }
