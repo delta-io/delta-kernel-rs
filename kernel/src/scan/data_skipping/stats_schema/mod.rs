@@ -100,6 +100,7 @@ use column_filter::StatsColumnFilter;
 pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
+    clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
     let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable("numRecords", DataType::LONG));
@@ -107,7 +108,8 @@ pub(crate) fn expected_stats_schema(
     // generate the base stats schema:
     // - make all fields nullable
     // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
-    let mut base_transform = BaseStatsTransform::new(table_properties);
+    // - always include clustering columns (per Delta protocol)
+    let mut base_transform = BaseStatsTransform::new(table_properties, clustering_columns);
     if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
         let base_schema = base_schema.into_owned();
 
@@ -140,12 +142,17 @@ pub(crate) fn expected_stats_schema(
 ///
 /// This extracts just the column names without building the full stats schema,
 /// making it more efficient when only the column list is needed.
+///
+/// Per the Delta protocol, clustering columns are always included in statistics,
+/// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
+/// settings.
 #[allow(unused)]
 pub(crate) fn stats_column_names(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
+    clustering_columns: Option<&[ColumnName]>,
 ) -> Vec<ColumnName> {
-    let mut filter = StatsColumnFilter::new(table_properties);
+    let mut filter = StatsColumnFilter::new(table_properties, clustering_columns);
     let mut columns = Vec::new();
     filter.collect_columns(physical_file_schema, &mut columns);
     columns
@@ -198,7 +205,8 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// additional transformations may be applied.
 /// Transforms a schema to filter columns for statistics based on table properties.
 ///
-/// All fields in the output are nullable.
+/// All fields in the output are nullable. Clustering columns are always included per
+/// the Delta protocol.
 #[allow(unused)]
 struct BaseStatsTransform<'col> {
     filter: StatsColumnFilter<'col>,
@@ -206,9 +214,9 @@ struct BaseStatsTransform<'col> {
 
 impl<'col> BaseStatsTransform<'col> {
     #[allow(unused)]
-    fn new(props: &'col TableProperties) -> Self {
+    fn new(props: &'col TableProperties, clustering_columns: Option<&'col [ColumnName]>) -> Self {
         Self {
-            filter: StatsColumnFilter::new(props),
+            filter: StatsColumnFilter::new(props, clustering_columns),
         }
     }
 }
@@ -325,7 +333,7 @@ mod tests {
         let properties: TableProperties = [("key", "value")].into();
         let file_schema = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
         let expected = StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", file_schema.clone()),
@@ -349,7 +357,7 @@ mod tests {
             StructField::not_null("id", DataType::LONG),
             StructField::not_null("user", DataType::Struct(Box::new(user_struct.clone()))),
         ]);
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected result: The stats schema should maintain the nested structure
         // but make all fields nullable
@@ -399,7 +407,7 @@ mod tests {
             ),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // nullCount excludes array fields (tags) - only eligible primitive types
         let expected_null_nested = StructType::new_unchecked([
@@ -448,7 +456,7 @@ mod tests {
             StructField::nullable("user.info", DataType::Struct(Box::new(user_struct.clone()))),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         let expected_nested =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
@@ -485,7 +493,7 @@ mod tests {
             StructField::nullable("age", DataType::INTEGER),
         ]);
 
-        let stats_schema = expected_stats_schema(&logical_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&logical_schema, &properties, None).unwrap();
 
         let expected_fields =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
@@ -519,7 +527,7 @@ mod tests {
             StructField::nullable("metadata", DataType::BINARY),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG
         let expected_null_count = StructType::new_unchecked([
@@ -561,7 +569,7 @@ mod tests {
             StructField::nullable("is_deleted", DataType::BOOLEAN), // NOT eligible for min/max
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG, maintaining structure
         let expected_null_user = StructType::new_unchecked([
@@ -611,7 +619,7 @@ mod tests {
             ),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // nullCount includes boolean and binary (primitives) but excludes array
         let expected_null_count = StructType::new_unchecked([
@@ -659,7 +667,7 @@ mod tests {
             StructField::nullable("col3", DataType::INTEGER), // Should be excluded by limit
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // nullCount has only eligible primitive columns (col1 and col2).
         // Map/Array/Variant are excluded from all stats.
@@ -701,7 +709,7 @@ mod tests {
             StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties);
+        let columns = stats_column_names(&file_schema, &properties, None);
 
         // With default settings, all leaf columns should be included
         assert_eq!(
@@ -729,7 +737,7 @@ mod tests {
             StructField::nullable("d", DataType::DOUBLE),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties);
+        let columns = stats_column_names(&file_schema, &properties, None);
 
         // Only first 2 columns should be included
         assert_eq!(
@@ -756,7 +764,7 @@ mod tests {
             StructField::nullable("extra", DataType::STRING),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties);
+        let columns = stats_column_names(&file_schema, &properties, None);
 
         // Only specified columns should be included (user.name and extra excluded)
         assert_eq!(
@@ -786,7 +794,7 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties);
+        let columns = stats_column_names(&file_schema, &properties, None);
 
         // Array and Map types should be excluded
         assert_eq!(
