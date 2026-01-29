@@ -36,30 +36,16 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::Metadata;
 use crate::committer::Committer;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
-};
-use crate::table_properties::DELTA_PROPERTY_PREFIX;
+use crate::table_property_protocol_config::TablePropertyProtocolConfig;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
-
-/// Properties that are allowed to be set during create table.
-/// This list will expand as more features are supported (e.g., column mapping, clustering).
-/// The allow list will be deprecated once auto feature enablement is implemented
-/// like the Java Kernel.
-const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
-    // Empty for now - will add properties as features are implemented:
-    // - "delta.columnMapping.mode" (for column mapping)
-    // - etc.
-];
 
 /// Ensures that no Delta table exists at the given path.
 ///
@@ -112,35 +98,6 @@ fn ensure_table_does_not_exist(
             Err(e)
         }
     }
-}
-
-/// Validates that table properties are allowed during CREATE TABLE.
-///
-/// This function enforces an allow list for delta properties:
-/// - Feature override properties (`delta.feature.*`) are never allowed
-/// - Delta properties (`delta.*`) must be on the allow list
-/// - Non-delta properties (user/application properties) are always allowed
-fn validate_table_properties(properties: &HashMap<String, String>) -> DeltaResult<()> {
-    for key in properties.keys() {
-        // Block all delta.feature.* properties (feature override properties)
-        if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
-            return Err(Error::generic(format!(
-                "Setting feature override property '{}' is not supported during CREATE TABLE",
-                key
-            )));
-        }
-        // For delta.* properties, check against allow list
-        if key.starts_with(DELTA_PROPERTY_PREFIX)
-            && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
-        {
-            return Err(Error::generic(format!(
-                "Setting delta property '{}' is not supported during CREATE TABLE",
-                key
-            )));
-        }
-        // Non-delta properties (user/application properties) are always allowed
-    }
-    Ok(())
 }
 
 /// Creates a builder for creating a new Delta table.
@@ -284,27 +241,22 @@ impl CreateTableTransactionBuilder {
     ) -> DeltaResult<Transaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
+        // Check if table already exists by looking for _delta_log directory
+        let delta_log_url = table_url.join("_delta_log/")?;
+        let storage = engine.storage_handler();
+        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
 
         // Validate schema is non-empty
         if self.schema.fields().len() == 0 {
             return Err(Error::generic("Schema cannot be empty"));
         }
 
-        // Validate table properties against allow list
-        validate_table_properties(&self.table_properties)?;
+        // Parse and validate table properties
+        let config = TablePropertyProtocolConfig::try_from(self.table_properties)?;
+        config.validate_for_create()?;
 
-        // Check if table already exists by looking for _delta_log directory
-        let delta_log_url = table_url.join("_delta_log/")?;
-        let storage = engine.storage_handler();
-        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
-
-        // Create Protocol action with table features support
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<String>::new()), // readerFeatures (empty for now)
-            Some(Vec::<String>::new()), // writerFeatures (empty for now)
-        )?;
+        // Use protocol from config (already created with table features support)
+        let protocol = config.protocol;
 
         // Create Metadata action
         let metadata = Metadata::try_new(
@@ -313,7 +265,7 @@ impl CreateTableTransactionBuilder {
             (*self.schema).clone(),
             Vec::new(), // partition_columns - added with data layout support
             current_time_ms()?,
-            self.table_properties,
+            config.table_properties,
         )?;
 
         // Create pre-commit snapshot from protocol/metadata
@@ -335,8 +287,11 @@ impl CreateTableTransactionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::committer::FileSystemCommitter;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::table_properties::{MIN_READER_VERSION_PROP, MIN_WRITER_VERSION_PROP};
+    use crate::utils::test_utils::assert_result_error_with_messages;
     use std::sync::Arc;
 
     fn test_schema() -> SchemaRef {
@@ -402,46 +357,113 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_supported_properties() {
-        // Empty properties are allowed
+    fn test_table_creation_config_parsing() {
+        // Empty properties are allowed - protocol is created with default features
         let properties = HashMap::new();
-        assert!(validate_table_properties(&properties).is_ok());
+        let config = TablePropertyProtocolConfig::try_from(properties).unwrap();
+        assert!(config.table_properties.is_empty());
+        // Protocol always has features (even if empty) at version 3/7
+        assert_eq!(config.protocol.min_reader_version(), 3);
+        assert_eq!(config.protocol.min_writer_version(), 7);
+        assert!(config.protocol.reader_features().unwrap().is_empty());
+        assert!(config.protocol.writer_features().unwrap().is_empty());
 
-        // User/application properties are allowed
-        let mut properties = HashMap::new();
-        properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert("custom.setting".to_string(), "value".to_string());
-        assert!(validate_table_properties(&properties).is_ok());
+        // User/application properties are passed through
+        let properties = HashMap::from([
+            ("myapp.version".to_string(), "1.0".to_string()),
+            ("custom.setting".to_string(), "value".to_string()),
+        ]);
+        let config = TablePropertyProtocolConfig::try_from(properties).unwrap();
+        assert_eq!(
+            config.table_properties.get("myapp.version"),
+            Some(&"1.0".to_string())
+        );
+        assert_eq!(
+            config.table_properties.get("custom.setting"),
+            Some(&"value".to_string())
+        );
+
+        // Protocol version properties are parsed and stripped from table_properties
+        let properties = HashMap::from([
+            (MIN_READER_VERSION_PROP.to_string(), "3".to_string()),
+            (MIN_WRITER_VERSION_PROP.to_string(), "7".to_string()),
+            ("myapp.version".to_string(), "1.0".to_string()),
+        ]);
+        let config = TablePropertyProtocolConfig::try_from(properties).unwrap();
+        // Protocol created with specified versions (always 3/7)
+        assert_eq!(config.protocol.min_reader_version(), 3);
+        assert_eq!(config.protocol.min_writer_version(), 7);
+        // Protocol properties should be stripped from table_properties
+        assert!(!config
+            .table_properties
+            .contains_key(MIN_READER_VERSION_PROP));
+        assert!(!config
+            .table_properties
+            .contains_key(MIN_WRITER_VERSION_PROP));
+        // User properties should remain
+        assert_eq!(
+            config.table_properties.get("myapp.version"),
+            Some(&"1.0".to_string())
+        );
     }
 
     #[test]
-    fn test_validate_unsupported_properties() {
-        // Delta properties not on allow list are rejected
-        let mut properties = HashMap::new();
-        properties.insert("delta.enableChangeDataFeed".to_string(), "true".to_string());
-        assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting delta property 'delta.enableChangeDataFeed' is not supported",
+    fn test_protocol_version_validation() {
+        let engine = SyncEngine::new();
+
+        // Helper to build a table with given properties and return the result
+        let try_create = |props: HashMap<String, String>| {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let table_path = temp_dir.path().to_str().unwrap();
+            CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+                .with_table_properties(props)
+                .build(&engine, Box::new(FileSystemCommitter::new()))
+        };
+
+        // Valid: both versions (3, 7)
+        let props = HashMap::from([
+            (MIN_READER_VERSION_PROP.to_string(), "3".to_string()),
+            (MIN_WRITER_VERSION_PROP.to_string(), "7".to_string()),
+        ]);
+        assert!(
+            try_create(props).is_ok(),
+            "Valid protocol versions (3, 7) should succeed"
         );
 
-        // Feature override properties are rejected
-        let mut properties = HashMap::new();
-        properties.insert(
-            "delta.feature.domainMetadata".to_string(),
-            "supported".to_string(),
-        );
-        assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting feature override property 'delta.feature.domainMetadata' is not supported",
+        // Valid: only reader version (3)
+        let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "3".to_string())]);
+        assert!(
+            try_create(props).is_ok(),
+            "Only reader version (3) should succeed"
         );
 
-        // Mixed properties with unsupported delta property are rejected
-        let mut properties = HashMap::new();
-        properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert("delta.appendOnly".to_string(), "true".to_string());
-        assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting delta property 'delta.appendOnly' is not supported",
+        // Valid: only writer version (7)
+        let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "7".to_string())]);
+        assert!(
+            try_create(props).is_ok(),
+            "Only writer version (7) should succeed"
         );
+
+        // Invalid: reader version 2 (only 3 is supported)
+        let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "2".to_string())]);
+        assert_result_error_with_messages(
+            try_create(props),
+            &["delta.minReaderVersion", "Only '3' is supported"],
+        );
+
+        // Invalid: writer version 5 (only 7 is supported)
+        let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "5".to_string())]);
+        assert_result_error_with_messages(
+            try_create(props),
+            &["delta.minWriterVersion", "Only '7' is supported"],
+        );
+
+        // Invalid: non-integer reader version
+        let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "abc".to_string())]);
+        assert_result_error_with_messages(try_create(props), &["Must be an integer"]);
+
+        // Invalid: non-integer writer version
+        let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "xyz".to_string())]);
+        assert_result_error_with_messages(try_create(props), &["Must be an integer"]);
     }
 }
