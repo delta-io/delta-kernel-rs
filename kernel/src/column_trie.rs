@@ -92,32 +92,6 @@ impl<'col> ColumnTrie<'col> {
         // We've consumed the entire path. Match only if we're at a terminal.
         node.is_terminal
     }
-
-    /// Returns true if `path` could lead to any inserted column (is an ancestor or exact match).
-    ///
-    /// This is the inverse of `contains_prefix_of` - it checks if path is a prefix of any
-    /// column in the trie, rather than checking if the trie contains a prefix of the path.
-    ///
-    /// For example, if the trie contains `["a", "b", "c"]`:
-    /// - `["a"]` → true (ancestor of a.b.c)
-    /// - `["a", "b"]` → true (ancestor of a.b.c)
-    /// - `["a", "b", "c"]` → true (exact match)
-    /// - `["a", "b", "c", "d"]` → false (descendant, not ancestor)
-    /// - `["x"]` → false (divergent path)
-    ///
-    /// Use this to skip entire subtrees during schema traversal when looking for specific columns.
-    pub(crate) fn could_contain_descendant(&self, path: &[String]) -> bool {
-        let mut node = self;
-        for part in path {
-            match node.children.get(part.as_str()) {
-                Some(child) => node = child,
-                None => return false, // Path diverges, can't reach any trie entry
-            }
-        }
-        // We've matched the entire path. Either we're at a terminal (exact match)
-        // or there are children (path is an ancestor of some entry).
-        node.is_terminal || !node.children.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -169,53 +143,5 @@ mod tests {
         assert!(!multi_trie.contains_prefix_of(&["x".to_string(), "y".to_string()])); // ancestor
         assert!(!multi_trie.contains_prefix_of(&["a".to_string(), "c".to_string()]));
         // divergent
-    }
-
-    #[test]
-    fn test_could_contain_descendant() {
-        // Build trie with column ["a", "b", "c"]
-        let columns = [ColumnName::new(["a", "b", "c"])];
-        let trie = ColumnTrie::from_columns(&columns);
-
-        // Ancestors should return true (path could lead to trie entry)
-        assert!(trie.could_contain_descendant(&["a".to_string()]));
-        assert!(trie.could_contain_descendant(&["a".to_string(), "b".to_string()]));
-
-        // Exact match should return true
-        assert!(trie.could_contain_descendant(&[
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string()
-        ]));
-
-        // Descendants should return false (path goes past the trie entry)
-        assert!(!trie.could_contain_descendant(&[
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-            "d".to_string()
-        ]));
-
-        // Divergent paths should return false
-        assert!(!trie.could_contain_descendant(&["x".to_string()]));
-        assert!(!trie.could_contain_descendant(&["a".to_string(), "x".to_string()]));
-
-        // Multiple columns
-        let multi_columns = [
-            ColumnName::new(["user", "address", "city"]),
-            ColumnName::new(["metadata", "tags"]),
-        ];
-        let multi_trie = ColumnTrie::from_columns(&multi_columns);
-
-        // Can reach user.address.city
-        assert!(multi_trie.could_contain_descendant(&["user".to_string()]));
-        assert!(multi_trie.could_contain_descendant(&["user".to_string(), "address".to_string()]));
-
-        // Can reach metadata.tags
-        assert!(multi_trie.could_contain_descendant(&["metadata".to_string()]));
-
-        // Cannot reach anything from these paths
-        assert!(!multi_trie.could_contain_descendant(&["foo".to_string()]));
-        assert!(!multi_trie.could_contain_descendant(&["user".to_string(), "name".to_string()]));
     }
 }

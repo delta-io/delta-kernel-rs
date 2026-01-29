@@ -117,7 +117,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on column_trie config.
     pub(crate) fn should_include_current(&self) -> bool {
         if self.at_column_limit() {
-            // Clustering columns are always included
+            // Clustering columns are always included, even past the limit
             if self.is_clustering_column() {
                 tracing::warn!(
                     "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; adding anyway",
@@ -150,25 +150,9 @@ impl<'col> StatsColumnFilter<'col> {
     }
 
     // ==================== Internal Helpers ====================
-    // These methods are private to this module.
-
-    /// Returns true if the current path could lead to any clustering column.
-    fn could_reach_clustering_column(&self) -> bool {
-        self.clustering_trie
-            .as_ref()
-            .is_some_and(|trie| trie.could_contain_descendant(&self.path))
-    }
 
     fn collect_field(&mut self, field: &StructField, result: &mut Vec<ColumnName>) {
         self.path.push(field.name.clone());
-
-        // Early termination: when at the column limit, only continue if this path
-        // could lead to a clustering column. This avoids traversing the entire schema
-        // (e.g., 1000 columns) when we only need to find a few nested clustering columns.
-        if self.at_column_limit() && !self.could_reach_clustering_column() {
-            self.path.pop();
-            return;
-        }
 
         match field.data_type() {
             DataType::Struct(struct_type) => {
@@ -318,8 +302,7 @@ mod tests {
 
     #[test]
     fn test_nested_clustering_column_with_limit() {
-        // Test that nested clustering columns are found even with a column limit,
-        // and that irrelevant subtrees are skipped for performance.
+        // Test that nested clustering columns are found even with a column limit.
         let props = make_props_with_num_cols(2);
 
         // Clustering column is deeply nested: user.address.city
@@ -351,7 +334,6 @@ mod tests {
         let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
 
         // Should include: id, name (first 2 within limit) + user.address.city (clustering)
-        // Should NOT include: user.name, user.address.street, user.address.zip, other.*, extra*
         assert_eq!(
             columns,
             vec![
