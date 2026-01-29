@@ -176,16 +176,22 @@ impl TableConfiguration {
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
+    /// - **Clustering columns**: Per the Delta protocol, clustering columns are always included
+    ///   in statistics, regardless of the above settings.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
+    pub(crate) fn expected_stats_schema(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> DeltaResult<SchemaRef> {
         let physical_schema = self.physical_data_schema();
         Ok(Arc::new(expected_stats_schema(
             &physical_schema,
             self.table_properties(),
+            clustering_columns,
         )?))
     }
 
@@ -193,11 +199,22 @@ impl TableConfiguration {
     ///
     /// Returns leaf column paths as [`ColumnName`] objects, which store path components
     /// separately and handle escaping of special characters (dots, spaces) via backticks.
+    ///
+    /// Per the Delta protocol, clustering columns are always included in statistics,
+    /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
+    /// settings.
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn stats_column_names(&self) -> Vec<ColumnName> {
+    pub(crate) fn stats_column_names(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> Vec<ColumnName> {
         let physical_schema = self.physical_data_schema();
-        stats_column_names(&physical_schema, self.table_properties())
+        stats_column_names(
+            &physical_schema,
+            self.table_properties(),
+            clustering_columns,
+        )
     }
 
     /// Returns the physical schema for data columns (excludes partition columns).
