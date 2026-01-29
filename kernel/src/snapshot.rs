@@ -1954,5 +1954,4 @@ mod tests {
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }
-
 }

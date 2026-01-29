@@ -225,10 +225,6 @@ impl<'a, 'col> SchemaTransform<'a> for BaseStatsTransform<'col> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
 
-        if self.filter.at_column_limit() {
-            return None;
-        }
-
         self.filter.enter_field(field.name());
         let data_type = field.data_type();
 
@@ -801,5 +797,148 @@ mod tests {
             columns,
             vec![ColumnName::new(["id"]), ColumnName::new(["name"]),]
         );
+    }
+
+    // ==================== clustering column tests ====================
+
+    #[test]
+    fn test_stats_schema_with_clustering_past_limit() {
+        // Test that clustering columns are included in stats schema even when past the limit
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+            StructField::nullable("c", DataType::INTEGER),
+        ]);
+
+        // "c" is a clustering column, should be included even though limit is 1
+        let clustering_columns = vec![ColumnName::new(["c"])];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, Some(&clustering_columns)).unwrap();
+
+        // Only "a" (first column) and "c" (clustering) should be included
+        let expected_null_count = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+        ]);
+        let expected_min_max = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("c", DataType::INTEGER),
+        ]);
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_nested_clustering_past_limit() {
+        // Test nested clustering column past the limit
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        )]
+        .into();
+
+        let user_struct = StructType::new_unchecked([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("city", DataType::STRING),
+        ]);
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+        ]);
+
+        // user.city is a clustering column
+        let clustering_columns = vec![ColumnName::new(["user", "city"])];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, Some(&clustering_columns)).unwrap();
+
+        // id (first column) and user.city (clustering) should be included
+        let expected_null_user =
+            StructType::new_unchecked([StructField::nullable("city", DataType::LONG)]);
+        let expected_null_count = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(expected_null_user))),
+        ]);
+
+        let expected_min_max_user =
+            StructType::new_unchecked([StructField::nullable("city", DataType::STRING)]);
+        let expected_min_max = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(expected_min_max_user))),
+        ]);
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_column_names_with_clustering() {
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+            StructField::nullable("c", DataType::INTEGER),
+        ]);
+
+        // "c" is a clustering column
+        let clustering_columns = vec![ColumnName::new(["c"])];
+        let columns = stats_column_names(&file_schema, &properties, Some(&clustering_columns));
+
+        // Only "a" (first) and "c" (clustering) should be included
+        assert_eq!(
+            columns,
+            vec![ColumnName::new(["a"]), ColumnName::new(["c"]),]
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_clustering_non_eligible_type() {
+        // Clustering columns with non-eligible types (Array/Map) should still be excluded
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+            StructField::nullable(
+                "c",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            ),
+        ]);
+
+        // "c" is a clustering column but it's an Array type
+        let clustering_columns = vec![ColumnName::new(["c"])];
+        let columns = stats_column_names(&file_schema, &properties, Some(&clustering_columns));
+
+        // Only "a" should be included, "c" is non-eligible type
+        assert_eq!(columns, vec![ColumnName::new(["a"]),]);
     }
 }

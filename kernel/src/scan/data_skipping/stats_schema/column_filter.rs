@@ -29,10 +29,12 @@ pub(crate) struct StatsColumnFilter<'col> {
     /// prefix matching. `Some` when using explicit column list, `None` when using the
     /// `delta.dataSkippingNumIndexedCols` count-based approach.
     column_trie: Option<ColumnTrie<'col>>,
-    /// Trie built from clustering columns for O(path_length) matching.
+    /// Trie built from clustering columns for O(path_length) lookup during traversal.
     /// Used by `should_include_current()` to allow clustering columns past the limit.
     clustering_trie: Option<ColumnTrie<'col>>,
     /// Clustering columns to add after the main traversal in `collect_columns()`.
+    /// Only set when using `delta.dataSkippingNumIndexedCols` (when using
+    /// `delta.dataSkippingStatsColumns`, clustering columns are merged into `column_trie`).
     clustering_columns: Option<&'col [ColumnName]>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
@@ -52,7 +54,7 @@ impl<'col> StatsColumnFilter<'col> {
         if let Some(column_names) = &props.data_skipping_stats_columns {
             let mut combined_trie = ColumnTrie::from_columns(column_names);
 
-            // Add clustering columns to the trie so they're included in Pass 1
+            // Add clustering columns to the trie so they're included during traversal
             if let Some(clustering_cols) = clustering_columns {
                 for col in clustering_cols {
                     let col_path: Vec<String> = col.iter().map(|s| s.to_string()).collect();
@@ -70,8 +72,8 @@ impl<'col> StatsColumnFilter<'col> {
                 n_columns: None,
                 added_columns: 0,
                 column_trie: Some(combined_trie),
-                clustering_trie: None,    // Already added to column_trie
-                clustering_columns: None, // Already added to trie, no Pass 2 needed
+                clustering_trie: None,    // Already in column_trie
+                clustering_columns: None, // Already added to trie
                 path: Vec::new(),
             }
         } else {
@@ -86,13 +88,6 @@ impl<'col> StatsColumnFilter<'col> {
                 path: Vec::new(),
             }
         }
-    }
-
-    /// Returns true if the current path is a clustering column.
-    fn is_clustering_column(&self) -> bool {
-        self.clustering_trie
-            .as_ref()
-            .is_some_and(|trie| trie.contains_prefix_of(&self.path))
     }
 
     // ==================== Public API ====================
@@ -141,25 +136,27 @@ impl<'col> StatsColumnFilter<'col> {
         )
     }
 
-    /// Returns true if the current path should be included based on column_trie config.
+    /// Returns true if the current path should be included based on filtering config.
     /// Clustering columns are always included, even past the column limit.
     pub(crate) fn should_include_current(&self) -> bool {
-        if self.at_column_limit() {
-            // Clustering columns are always included, even past the limit
-            if self.is_clustering_column() {
-                tracing::warn!(
-                    "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; adding anyway",
-                    self.path.join(".")
-                );
-                return true;
-            }
-            return false;
+        // When using dataSkippingStatsColumns, check the trie
+        if let Some(trie) = &self.column_trie {
+            return trie.contains_prefix_of(&self.path);
         }
 
-        self.column_trie
+        // When using dataSkippingNumIndexedCols, check limit but allow clustering columns
+        if self.at_column_limit() {
+            self.is_clustering_column()
+        } else {
+            true
+        }
+    }
+
+    /// Returns true if the current path is a clustering column.
+    fn is_clustering_column(&self) -> bool {
+        self.clustering_trie
             .as_ref()
-            .map(|trie| trie.contains_prefix_of(&self.path))
-            .unwrap_or(true)
+            .is_some_and(|trie| trie.contains_prefix_of(&self.path))
     }
 
     /// Enters a field path for filtering decisions.

@@ -20,7 +20,7 @@ use crate::{DeltaResult, Engine};
 /// `delta.clustering` domain metadata. Each clustering column is represented
 /// as an array of field names to support nested columns.
 ///
-/// The column names are **physical names**. If column mapping is enabled, these will be
+/// The column names are physical names. If column mapping is enabled, these will be
 /// the physical column identifiers (e.g., `col-uuid`); otherwise, they match the logical names.
 ///
 /// Example JSON:
