@@ -5,10 +5,14 @@ on: [push, pull_request]
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   format:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "" # No compilation, no sccache needed
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable with rustfmt
@@ -20,6 +24,8 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "" # Minimal compilation, sccache not worth the setup
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
@@ -40,6 +46,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -61,6 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
+      RUSTC_WRAPPER: "" # Doc generation, sccache not worth the setup
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable
@@ -105,6 +113,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
@@ -128,6 +137,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: test
@@ -168,6 +178,7 @@ jobs:
            fi
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
@@ -199,6 +210,8 @@ jobs:
   miri:
     name: "Miri"
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "" # Disable sccache for miri - it has its own wrapper
     steps:
       - uses: actions/checkout@v4
       - name: Install Miri
@@ -220,6 +233,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
