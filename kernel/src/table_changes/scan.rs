@@ -117,6 +117,7 @@ impl TableChangesScanBuilder {
             logical_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
+            None, // stats_columns not supported for table changes scan
             CdfTransformFieldClassifier,
         )?;
 
