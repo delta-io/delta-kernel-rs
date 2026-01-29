@@ -152,15 +152,23 @@ impl<'col> StatsColumnFilter<'col> {
     // ==================== Internal Helpers ====================
     // These methods are private to this module.
 
+    /// Returns true if the current path could lead to any clustering column.
+    fn could_reach_clustering_column(&self) -> bool {
+        self.clustering_trie
+            .as_ref()
+            .is_some_and(|trie| trie.could_contain_descendant(&self.path))
+    }
+
     fn collect_field(&mut self, field: &StructField, result: &mut Vec<ColumnName>) {
-        // When at the column limit and no clustering columns, we can skip entirely.
-        // When clustering columns exist, we must continue traversing in case
-        // nested clustering columns need to be included.
-        if self.at_column_limit() && self.clustering_trie.is_none() {
+        self.path.push(field.name.clone());
+
+        // Early termination: when at the column limit, only continue if this path
+        // could lead to a clustering column. This avoids traversing the entire schema
+        // (e.g., 1000 columns) when we only need to find a few nested clustering columns.
+        if self.at_column_limit() && !self.could_reach_clustering_column() {
+            self.path.pop();
             return;
         }
-
-        self.path.push(field.name.clone());
 
         match field.data_type() {
             DataType::Struct(struct_type) => {
@@ -306,5 +314,51 @@ mod tests {
 
         // Should only include "a" - arrays are not eligible for statistics
         assert_eq!(columns, vec![ColumnName::new(["a"])]);
+    }
+
+    #[test]
+    fn test_nested_clustering_column_with_limit() {
+        // Test that nested clustering columns are found even with a column limit,
+        // and that irrelevant subtrees are skipped for performance.
+        let props = make_props_with_num_cols(2);
+
+        // Clustering column is deeply nested: user.address.city
+        let clustering_cols = vec![ColumnName::new(["user", "address", "city"])];
+
+        let address_struct = StructType::new_unchecked([
+            StructField::nullable("street", DataType::STRING),
+            StructField::nullable("city", DataType::STRING), // clustering column
+            StructField::nullable("zip", DataType::STRING),
+        ]);
+        let user_struct = StructType::new_unchecked([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("address", DataType::Struct(Box::new(address_struct))),
+        ]);
+        let other_struct = StructType::new_unchecked([
+            StructField::nullable("foo", DataType::STRING),
+            StructField::nullable("bar", DataType::STRING),
+        ]);
+
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("other", DataType::Struct(Box::new(other_struct))),
+            StructField::nullable("extra1", DataType::STRING),
+            StructField::nullable("extra2", DataType::STRING),
+        ]);
+
+        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
+
+        // Should include: id, name (first 2 within limit) + user.address.city (clustering)
+        // Should NOT include: user.name, user.address.street, user.address.zip, other.*, extra*
+        assert_eq!(
+            columns,
+            vec![
+                ColumnName::new(["id"]),
+                ColumnName::new(["name"]),
+                ColumnName::new(["user", "address", "city"]),
+            ]
+        );
     }
 }
