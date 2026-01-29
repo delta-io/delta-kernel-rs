@@ -27,7 +27,10 @@ pub(crate) struct StatsColumnFilter<'col> {
     /// Trie built from user-specified columns for O(path_length) prefix matching.
     /// `None` when using `n_columns` limit instead of explicit column list.
     column_trie: Option<ColumnTrie<'col>>,
-    /// Clustering columns to add after the main traversal.
+    /// Trie built from clustering columns for O(path_length) matching.
+    /// Used by `should_include_current()` to allow clustering columns past the limit.
+    clustering_trie: Option<ColumnTrie<'col>>,
+    /// Clustering columns to add after the main traversal in `collect_columns()`.
     clustering_columns: Option<&'col [ColumnName]>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
@@ -65,19 +68,29 @@ impl<'col> StatsColumnFilter<'col> {
                 n_columns: None,
                 added_columns: 0,
                 column_trie: Some(combined_trie),
+                clustering_trie: None,    // Already added to column_trie
                 clustering_columns: None, // Already added to trie, no Pass 2 needed
                 path: Vec::new(),
             }
         } else {
             let n_cols = props.data_skipping_num_indexed_cols.unwrap_or_default();
+            let clustering_trie = clustering_columns.map(ColumnTrie::from_columns);
             Self {
                 n_columns: Some(n_cols),
                 added_columns: 0,
                 column_trie: None,
-                clustering_columns, // Will be handled in Pass 2
+                clustering_trie,
+                clustering_columns, // Will be handled in Pass 2 of collect_columns()
                 path: Vec::new(),
             }
         }
+    }
+
+    /// Returns true if the current path is a clustering column.
+    fn is_clustering_column(&self) -> bool {
+        self.clustering_trie
+            .as_ref()
+            .is_some_and(|trie| trie.contains_prefix_of(&self.path))
     }
 
     // ==================== Public API ====================
@@ -127,8 +140,17 @@ impl<'col> StatsColumnFilter<'col> {
     }
 
     /// Returns true if the current path should be included based on column_trie config.
+    /// Clustering columns are always included, even past the column limit.
     pub(crate) fn should_include_current(&self) -> bool {
         if self.at_column_limit() {
+            // Clustering columns are always included, even past the limit
+            if self.is_clustering_column() {
+                tracing::warn!(
+                    "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; adding anyway",
+                    self.path.join(".")
+                );
+                return true;
+            }
             return false;
         }
 
