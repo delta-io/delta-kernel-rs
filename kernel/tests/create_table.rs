@@ -263,3 +263,76 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_feature_overrides_and_delta_properties_rejected_until_on_allow_list() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))
+            .expect("Failed to create engine");
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    );
+
+    // Feature overrides are parsed but rejected during validation (not on allow-list)
+    let result = create_table(&table_path, schema.clone(), "FeatureTest/1.0")
+        .with_table_properties([("delta.feature.deletionVectors", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(
+        result,
+        "Enabling feature 'deletionVectors' is not supported during CREATE TABLE",
+    );
+
+    // Delta properties are rejected during validation (not on allow-list)
+    let result = create_table(&table_path, schema.clone(), "FeatureTest/1.0")
+        .with_table_properties([("delta.enableDeletionVectors", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(
+        result,
+        "Setting delta property 'delta.enableDeletionVectors' is not supported during CREATE TABLE",
+    );
+
+    // User/application properties (non-delta.*) are allowed
+    let result = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([("myapp.version", "1.0")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_ok(), "User properties should be allowed");
+}
+
+#[test]
+fn test_feature_override_rejects_invalid_value_only_supported_allowed() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))
+            .expect("Failed to create engine");
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    );
+
+    // "enabled" is not valid - only "supported" is allowed
+    let result = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([("delta.feature.deletionVectors", "enabled")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Invalid value"),
+        "Error should mention invalid value"
+    );
+    assert!(
+        err_msg.contains("supported"),
+        "Error should mention 'supported' as valid value"
+    );
+}
