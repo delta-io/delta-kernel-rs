@@ -5,6 +5,21 @@ on: [push, pull_request]
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Two-layer caching strategy for Rust builds:
+  #
+  # 1. Swatinem/rust-cache (crate-level):
+  #    - Caches ~/.cargo/registry, ~/.cargo/git, and ./target/
+  #    - Avoids re-downloading dependencies (tokio, serde, etc.)
+  #    - Restores pre-built dependency artifacts
+  #
+  # 2. sccache (file-level):
+  #    - Wraps rustc and caches individual compilation units
+  #    - When you change one file, only that file recompiles
+  #    - Shares compilation results across jobs and branches
+  #
+  # Why both? rust-cache handles dependency artifacts efficiently, while sccache
+  # provides incremental compilation benefits for the project's own code. Together
+  # they minimize both download time and compilation time.
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
