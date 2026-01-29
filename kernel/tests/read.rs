@@ -1701,3 +1701,664 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+/// Test that data skipping works with parsed stats from checkpoint.
+/// The parsed-stats table has 6 files with id ranges (4 from checkpoint, 2 from commits):
+/// - File 1: id 1-100, salary 50100-60000 (checkpoint)
+/// - File 2: id 101-200, salary 60100-70000 (checkpoint)
+/// - File 3: id 201-300, salary 70100-80000 (checkpoint)
+/// - File 4: id 301-400, salary 80100-90000 (checkpoint)
+/// - File 5: id 401-500, salary 90100-100000 (commit 4)
+/// - File 6: id 501-600, salary 100100-110000 (commit 5)
+#[test]
+fn data_skipping_with_parsed_stats() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Test 1: Predicate that should skip all files (id > 700)
+    // All files have max id of 600, so no files should match
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(700i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let files_scanned: usize = scan.execute(engine.clone())?.count();
+    assert_eq!(
+        files_scanned, 0,
+        "Expected 0 files when id > 700 (all files have max id 600)"
+    );
+
+    // Test 2: Predicate that should return only first file (id < 50)
+    // Only file 1 has ids 1-100 and min < 50
+    let predicate = Pred::lt(column_expr!("id"), Expr::literal(50i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine.clone())? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 1,
+        "Expected 1 file when id < 50 (only file 1 has min id 1)"
+    );
+
+    // Test 3: Predicate using salary column (salary > 105000)
+    // Only file 6 has salary range 100100-110000, with max 110000
+    let predicate = Pred::gt(column_expr!("salary"), Expr::literal(105000i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine.clone())? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 1,
+        "Expected 1 file when salary > 105000 (only file 6 has salary up to 110000)"
+    );
+
+    // Test 4: Predicate that matches multiple files (id > 350)
+    // Files 4, 5, 6 have ids starting from 301, 401, 501
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(350i64));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine)? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 3,
+        "Expected 3 files when id > 350 (files 4, 5, 6 have ids > 350)"
+    );
+
+    Ok(())
+}
+
+/// Test that `stats_parsed` column is populated correctly in `scan_files`.
+///
+/// The behavior is:
+/// - Neither predicate nor stats_columns → stats_parsed with default columns (from table properties)
+/// - Predicate only → stats_parsed with predicate columns (kernel uses it for data skipping)
+/// - stats_columns only → stats_parsed with user columns (user does their own data skipping)
+/// - Both predicate AND stats_columns → error (mutually exclusive)
+#[test]
+fn scan_metadata_parsed_stats() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Test 1: Without predicate or stats_columns, stats_parsed is present (default from table properties)
+    let scan = snapshot.clone().scan_builder().build()?;
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut has_parsed_stats_default = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        if schema.column_with_name("stats_parsed").is_some() {
+            has_parsed_stats_default = true;
+        }
+    }
+    assert!(
+        has_parsed_stats_default,
+        "Expected stats_parsed column to be present by default"
+    );
+
+    // Test 2: With predicate only, stats_parsed should be present (kernel needs it for data skipping)
+    let predicate =
+        delta_kernel::expressions::Predicate::gt(column_expr!("id"), Expr::literal(100i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut has_parsed_stats_with_pred = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        if schema.column_with_name("stats_parsed").is_some() {
+            has_parsed_stats_with_pred = true;
+        }
+    }
+    assert!(
+        has_parsed_stats_with_pred,
+        "Expected stats_parsed column to be present with predicate"
+    );
+
+    // Test 3: With stats_columns only, stats_parsed column should be present with user columns
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats_columns(vec![ColumnName::new(["id"])])
+        .build()?;
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut has_parsed_stats_with_cols = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        if schema.column_with_name("stats_parsed").is_some() {
+            has_parsed_stats_with_cols = true;
+            // Verify it's a struct column
+            let (_idx, field) = schema.column_with_name("stats_parsed").unwrap();
+            assert!(
+                matches!(
+                    field.data_type(),
+                    delta_kernel::arrow::datatypes::DataType::Struct(_)
+                ),
+                "stats_parsed should be a struct type"
+            );
+        }
+    }
+    assert!(
+        has_parsed_stats_with_cols,
+        "Expected stats_parsed column to be present with stats_columns"
+    );
+
+    // Test 4: Both predicate AND stats_columns should error
+    let predicate =
+        delta_kernel::expressions::Predicate::gt(column_expr!("id"), Expr::literal(100i64));
+    let result = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats_columns(vec![ColumnName::new(["id"])])
+        .build();
+
+    assert!(
+        result.is_err(),
+        "Expected error when both predicate and stats_columns are specified"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Cannot specify both predicate and stats_columns"),
+        "Expected specific error message, got: {}",
+        err_msg
+    );
+
+    Ok(())
+}
+
+/// Test stats_columns with a single column - verify the schema structure
+#[test]
+fn stats_columns_single_column_schema() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Request stats for only the "id" column
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![ColumnName::new(["id"])])
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        // Verify stats_parsed column exists
+        let (idx, field) = schema
+            .column_with_name("stats_parsed")
+            .expect("stats_parsed column should exist");
+
+        // Verify it's a struct with the expected fields
+        if let ArrowDataType::Struct(fields) = field.data_type() {
+            // Should have: numRecords, nullCount, minValues, maxValues
+            let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+            assert!(
+                field_names.contains(&"numRecords"),
+                "Should have numRecords field"
+            );
+            assert!(
+                field_names.contains(&"nullCount"),
+                "Should have nullCount field"
+            );
+            assert!(
+                field_names.contains(&"minValues"),
+                "Should have minValues field"
+            );
+            assert!(
+                field_names.contains(&"maxValues"),
+                "Should have maxValues field"
+            );
+
+            // Verify minValues only contains "id" column
+            let min_values_field = fields.iter().find(|f| f.name() == "minValues").unwrap();
+            if let ArrowDataType::Struct(min_fields) = min_values_field.data_type() {
+                let min_field_names: Vec<&str> =
+                    min_fields.iter().map(|f| f.name().as_str()).collect();
+                assert_eq!(
+                    min_field_names,
+                    vec!["id"],
+                    "minValues should only contain 'id' column"
+                );
+            } else {
+                panic!("minValues should be a struct");
+            }
+        } else {
+            panic!("stats_parsed should be a struct type");
+        }
+
+        // Verify the column has data
+        assert!(batch.column(idx).len() > 0, "stats_parsed should have data");
+    }
+
+    Ok(())
+}
+
+/// Test stats_columns with multiple columns
+#[test]
+fn stats_columns_multiple_columns() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Request stats for multiple columns: id, name, salary
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![
+            ColumnName::new(["id"]),
+            ColumnName::new(["name"]),
+            ColumnName::new(["salary"]),
+        ])
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        let (_idx, field) = schema
+            .column_with_name("stats_parsed")
+            .expect("stats_parsed column should exist");
+
+        if let ArrowDataType::Struct(fields) = field.data_type() {
+            // Verify minValues contains all requested columns
+            let min_values_field = fields.iter().find(|f| f.name() == "minValues").unwrap();
+            if let ArrowDataType::Struct(min_fields) = min_values_field.data_type() {
+                let min_field_names: std::collections::HashSet<&str> =
+                    min_fields.iter().map(|f| f.name().as_str()).collect();
+                assert!(
+                    min_field_names.contains("id"),
+                    "minValues should contain 'id'"
+                );
+                assert!(
+                    min_field_names.contains("name"),
+                    "minValues should contain 'name'"
+                );
+                assert!(
+                    min_field_names.contains("salary"),
+                    "minValues should contain 'salary'"
+                );
+                assert!(
+                    !min_field_names.contains("age"),
+                    "minValues should NOT contain 'age' (not requested)"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Test stats_columns with empty vector - should use default stats
+#[test]
+fn stats_columns_empty_vector() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Empty stats_columns vector should fall back to default behavior
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(Vec::<ColumnName>::new())
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    // Should still have stats_parsed (from default table properties)
+    let mut has_stats = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+        let schema = batch.schema();
+
+        if schema.column_with_name("stats_parsed").is_some() {
+            has_stats = true;
+        }
+    }
+    assert!(has_stats, "Empty stats_columns should use default stats");
+
+    Ok(())
+}
+
+/// Test that stats_columns actually contains parsed values
+#[test]
+fn stats_columns_values_are_parsed() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![ColumnName::new(["id"]), ColumnName::new(["name"])])
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+    let mut found_valid_stats = false;
+
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+
+        let (stats_idx, _) = batch
+            .schema()
+            .column_with_name("stats_parsed")
+            .expect("stats_parsed should exist");
+
+        let stats_col = batch.column(stats_idx);
+        let stats_struct = stats_col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("stats_parsed should be StructArray");
+
+        // Get numRecords - should be non-null integers
+        let num_records_idx = stats_struct
+            .column_by_name("numRecords")
+            .expect("Should have numRecords");
+        let num_records = num_records_idx
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("numRecords should be Int64Array");
+
+        // Verify numRecords has valid values (test data has 100 records per file)
+        for i in 0..num_records.len() {
+            if !num_records.is_null(i) {
+                let value = num_records.value(i);
+                assert_eq!(value, 100, "Each file should have 100 records");
+                found_valid_stats = true;
+            }
+        }
+
+        // Get minValues struct
+        let min_values = stats_struct
+            .column_by_name("minValues")
+            .expect("Should have minValues");
+        let min_values_struct = min_values
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("minValues should be StructArray");
+
+        // Check that minValues.id is an Int64Array with values
+        if let Some(min_id) = min_values_struct.column_by_name("id") {
+            let min_id_arr = min_id
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("minValues.id should be Int64Array");
+            // First file has min id = 1
+            if !min_id_arr.is_null(0) {
+                assert!(min_id_arr.value(0) >= 1, "min id should be >= 1");
+            }
+        }
+
+        // Check minValues.name is a StringArray
+        if let Some(min_name) = min_values_struct.column_by_name("name") {
+            let min_name_arr = min_name
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("minValues.name should be StringArray");
+            if !min_name_arr.is_null(0) {
+                assert!(
+                    min_name_arr.value(0).starts_with("name_"),
+                    "min name should start with 'name_'"
+                );
+            }
+        }
+    }
+
+    assert!(found_valid_stats, "Should have found valid parsed stats");
+    Ok(())
+}
+
+/// Test that stats_columns doesn't perform data skipping (no predicate)
+#[test]
+fn stats_columns_no_data_skipping() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // With stats_columns only (no predicate), all files should be returned
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![ColumnName::new(["id"])])
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut file_count = 0;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+
+        // Count files (each row is a file)
+        let selection = scan_metadata.scan_files.selection_vector();
+        for selected in selection.iter() {
+            if *selected {
+                file_count += 1;
+            }
+        }
+    }
+
+    // Test data has 6 files - all should be returned without data skipping
+    assert_eq!(
+        file_count, 6,
+        "All 6 files should be returned without predicate"
+    );
+
+    Ok(())
+}
+
+/// Test that predicate with data skipping works (for comparison)
+#[test]
+fn predicate_with_data_skipping() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // With predicate, data skipping should filter files
+    // id > 500 should only match the last file (id 501-600)
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(500i64));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut file_count = 0;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let selection = scan_metadata.scan_files.selection_vector();
+        for selected in selection.iter() {
+            if *selected {
+                file_count += 1;
+            }
+        }
+    }
+
+    // Only files with max(id) > 500 should be selected
+    // File 6 has id 501-600, so it should be selected
+    // Data skipping should filter out files where max(id) <= 500
+    assert!(
+        file_count < 6,
+        "Data skipping should filter some files (got {} files)",
+        file_count
+    );
+
+    Ok(())
+}
+
+/// Test with_stats_columns using None (should use default behavior)
+#[test]
+fn stats_columns_none_uses_default() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Passing None should be same as not calling with_stats_columns
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(None::<Vec<ColumnName>>)
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    let mut has_stats = false;
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+
+        if batch.schema().column_with_name("stats_parsed").is_some() {
+            has_stats = true;
+        }
+    }
+
+    assert!(has_stats, "None should use default stats behavior");
+    Ok(())
+}
+
+/// Test stats_columns with non-existent column (should handle gracefully)
+#[test]
+fn stats_columns_nonexistent_column() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::expressions::ColumnName;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Request stats for a column that doesn't exist
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![ColumnName::new(["nonexistent_column"])])
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+    // Should still work, but stats_parsed might be empty/null for the non-existent column
+    for scan_metadata in scan_metadata_iter {
+        let scan_metadata = scan_metadata?;
+        let data = scan_metadata.scan_files.data();
+        let arrow_data = data
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .expect("Expected ArrowEngineData");
+        let batch = arrow_data.record_batch();
+
+        // The scan should complete without error
+        // stats_parsed schema will be determined by what columns actually exist
+        assert!(batch.num_rows() > 0, "Should have rows");
+    }
+
+    Ok(())
+}
