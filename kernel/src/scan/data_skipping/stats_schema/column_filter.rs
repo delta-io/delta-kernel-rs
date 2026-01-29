@@ -3,8 +3,6 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
-use std::collections::HashSet;
-
 use crate::{
     column_trie::ColumnTrie,
     schema::{ColumnName, DataType, Schema, StructField, StructType},
@@ -96,31 +94,24 @@ impl<'col> StatsColumnFilter<'col> {
         }
 
         // Pass 2: Add clustering columns not already included
+        // Uses O(n) contains check, but clustering columns are typically few (1-4)
         if let Some(clustering_cols) = self.clustering_columns {
-            // Build a set of already-included columns for O(1) lookup
-            let included: HashSet<&ColumnName> = result.iter().collect();
-
-            // Collect columns to add (avoids borrow conflict with result)
-            let to_add: Vec<_> = clustering_cols
-                .iter()
-                .filter(|col| !included.contains(col))
-                .filter_map(|col| {
-                    lookup_column_type(schema, col).and_then(|data_type| {
-                        if is_stats_eligible_type(data_type) {
-                            tracing::warn!(
-                                "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; \
-                                 adding anyway",
-                                col
-                            );
-                            Some(col.clone())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
-            result.extend(to_add);
+            for col in clustering_cols {
+                if result.contains(col) {
+                    continue;
+                }
+                // Directly navigate to the clustering column in the schema
+                if let Some(data_type) = lookup_column_type(schema, col) {
+                    if is_stats_eligible_type(data_type) {
+                        tracing::warn!(
+                            "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; \
+                             adding anyway",
+                            col
+                        );
+                        result.push(col.clone());
+                    }
+                }
+            }
         }
     }
 
