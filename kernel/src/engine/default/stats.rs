@@ -23,6 +23,103 @@ use crate::{DeltaResult, Error};
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
 
+/// Maximum expansion when searching for a valid max truncation point.
+const STRING_EXPANSION_LIMIT: usize = STRING_PREFIX_LENGTH * 2;
+
+/// ASCII DEL character (0x7F) - used as tie-breaker for max values when truncated char is ASCII.
+const ASCII_MAX_CHAR: char = '\x7F';
+
+/// Maximum Unicode code point - used as tie-breaker for max values when truncated char is non-ASCII.
+const UTF8_MAX_CHAR: char = '\u{10FFFF}';
+
+// ============================================================================
+// String truncation for Delta statistics
+// ============================================================================
+
+/// Truncate a string for min statistics.
+///
+/// For min values, we simply truncate at the prefix length. The truncated value will always
+/// be <= the original, which is correct for min statistics.
+///
+/// Returns the original string if it's already within the limit.
+fn truncate_min_string(s: &str) -> &str {
+    if s.len() <= STRING_PREFIX_LENGTH {
+        return s;
+    }
+    // Find char boundary at or before STRING_PREFIX_LENGTH
+    let end = s
+        .char_indices()
+        .take(STRING_PREFIX_LENGTH + 1)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+
+    // Take exactly STRING_PREFIX_LENGTH chars
+    let truncated_end = s
+        .char_indices()
+        .nth(STRING_PREFIX_LENGTH)
+        .map(|(i, _)| i)
+        .unwrap_or(end);
+
+    &s[..truncated_end]
+}
+
+/// Truncate a string for max statistics.
+///
+/// For max values, we need to ensure the truncated value is >= all actual values in the column.
+/// We do this by appending a "tie-breaker" character after truncation:
+/// - ASCII_MAX_CHAR (0x7F) if the character at the truncation point is ASCII (< 0x7F)
+/// - UTF8_MAX_CHAR (U+10FFFF) otherwise
+///
+/// This ensures correct data skipping behavior: any string starting with the truncated prefix
+/// will compare <= the truncated max + tie-breaker.
+///
+/// Returns None if the string is too long to truncate safely (expansion limit exceeded).
+fn truncate_max_string(s: &str) -> Option<String> {
+    if s.len() <= STRING_PREFIX_LENGTH {
+        return Some(s.to_string());
+    }
+
+    // Start at STRING_PREFIX_LENGTH chars
+    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
+
+    // We can expand up to STRING_EXPANSION_LIMIT chars looking for a valid truncation point
+    let max_chars = char_indices.len().min(STRING_EXPANSION_LIMIT);
+
+    // Start from STRING_PREFIX_LENGTH and look for a valid truncation point
+    for len in STRING_PREFIX_LENGTH..=max_chars {
+        if len >= char_indices.len() {
+            // Reached end of string - return original
+            return Some(s.to_string());
+        }
+
+        let (_, next_char) = char_indices[len];
+
+        // If the character being truncated is U+10FFFF (max Unicode code point), we cannot
+        // use this position. The tie-breaker must be >= the truncated char, but nothing is
+        // greater than U+10FFFF. Include it in the prefix and check the next character.
+        // (In Scala/Java this is a surrogate pair requiring substring check; in Rust it's one char)
+        if next_char == UTF8_MAX_CHAR {
+            continue;
+        }
+
+        let truncation_byte_idx = char_indices[len].0;
+        let truncated = &s[..truncation_byte_idx];
+
+        // Choose tie-breaker based on the character being truncated
+        let tie_breaker = if next_char < ASCII_MAX_CHAR {
+            ASCII_MAX_CHAR
+        } else {
+            UTF8_MAX_CHAR
+        };
+
+        return Some(format!("{}{}", truncated, tie_breaker));
+    }
+
+    // Could not find a valid truncation point within expansion limit
+    None
+}
+
 // ============================================================================
 // Min/Max computation using Arrow compute kernels
 // ============================================================================
@@ -32,11 +129,6 @@ const STRING_PREFIX_LENGTH: usize = 32;
 enum Agg {
     Min,
     Max,
-}
-
-/// Truncate string to maximum prefix length for Delta statistics.
-fn truncate_string(s: &str) -> String {
-    s.chars().take(STRING_PREFIX_LENGTH).collect()
 }
 
 /// Compute aggregation for a primitive array.
@@ -117,7 +209,19 @@ fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
         Agg::Min => min_string(array),
         Agg::Max => max_string(array),
     };
-    Ok(result.map(|s| Arc::new(StringArray::from(vec![Some(truncate_string(s))])) as ArrayRef))
+    match (result, agg) {
+        (Some(s), Agg::Min) => {
+            let truncated = truncate_min_string(s);
+            Ok(Some(
+                Arc::new(StringArray::from(vec![Some(truncated)])) as ArrayRef
+            ))
+        }
+        (Some(s), Agg::Max) => {
+            Ok(truncate_max_string(s)
+                .map(|t| Arc::new(StringArray::from(vec![Some(t)])) as ArrayRef))
+        }
+        (None, _) => Ok(None),
+    }
 }
 
 /// Compute aggregation for a large string array with truncation.
@@ -133,10 +237,17 @@ fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
         Agg::Min => array.iter().flatten().min(),
         Agg::Max => array.iter().flatten().max(),
     };
-    Ok(
-        result
-            .map(|s| Arc::new(LargeStringArray::from(vec![Some(truncate_string(s))])) as ArrayRef),
-    )
+    match (result, agg) {
+        (Some(s), Agg::Min) => {
+            let truncated = truncate_min_string(s);
+            Ok(Some(
+                Arc::new(LargeStringArray::from(vec![Some(truncated)])) as ArrayRef,
+            ))
+        }
+        (Some(s), Agg::Max) => Ok(truncate_max_string(s)
+            .map(|t| Arc::new(LargeStringArray::from(vec![Some(t)])) as ArrayRef)),
+        (None, _) => Ok(None),
+    }
 }
 
 /// Compute aggregation for a string view array with truncation.
@@ -151,7 +262,17 @@ fn agg_string_view(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>>
         Agg::Min => array.iter().flatten().min(),
         Agg::Max => array.iter().flatten().max(),
     };
-    Ok(result.map(|s| Arc::new(StringViewArray::from(vec![Some(truncate_string(s))])) as ArrayRef))
+    match (result, agg) {
+        (Some(s), Agg::Min) => {
+            let truncated = truncate_min_string(s);
+            Ok(Some(
+                Arc::new(StringViewArray::from(vec![Some(truncated)])) as ArrayRef
+            ))
+        }
+        (Some(s), Agg::Max) => Ok(truncate_max_string(s)
+            .map(|t| Arc::new(StringViewArray::from(vec![Some(t)])) as ArrayRef)),
+        (None, _) => Ok(None),
+    }
 }
 
 /// Compute min or max for a leaf column based on its data type.
@@ -642,14 +763,101 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_stats_string_truncation() {
+    fn test_collect_stats_string_truncation_ascii() {
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
 
-        // Create a string longer than 32 characters
+        // Create an ASCII string longer than 32 characters
         let long_string = "a".repeat(50);
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from(vec![long_string.as_str()]))],
+        )
+        .unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+
+        // Check minValues - should be truncated to exactly 32 chars
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let text_min = min_values
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(text_min.value(0).len(), 32);
+        assert_eq!(text_min.value(0), "a".repeat(32));
+
+        // Check maxValues - should be 32 chars + 0x7F tie-breaker (since 'a' < 0x7F)
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let text_max = max_values
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let expected_max = format!("{}\x7F", "a".repeat(32));
+        assert_eq!(text_max.value(0), expected_max);
+    }
+
+    #[test]
+    fn test_collect_stats_string_truncation_non_ascii() {
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+
+        // Create a string where the character BEING TRUNCATED (at position 32) is non-ASCII.
+        // The tie-breaker is chosen based on the first char being removed, not the last kept.
+        // 32 'a's followed by 'À' (>= 0x7F) followed by more chars
+        let long_string = format!("{}À{}", "a".repeat(32), "b".repeat(20));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![long_string.as_str()]))],
+        )
+        .unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+
+        // Check maxValues - should use UTF8_MAX_CHAR since 'À' (the truncated char) >= 0x7F
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let text_max = max_values
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Should be 32 'a's + U+10FFFF (tie-breaker for non-ASCII truncated char)
+        let expected_max = format!("{}\u{10FFFF}", "a".repeat(32));
+        assert_eq!(text_max.value(0), expected_max);
+    }
+
+    #[test]
+    fn test_collect_stats_string_no_truncation_needed() {
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+
+        // String within 32 chars - should not be truncated
+        let short_string = "hello world";
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![short_string]))],
         )
         .unwrap();
 
@@ -669,8 +877,70 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        // Should be truncated to 32 chars
-        assert_eq!(text_min.value(0).len(), 32);
+        assert_eq!(text_min.value(0), short_string);
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let text_max = max_values
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(text_max.value(0), short_string);
+    }
+
+    #[test]
+    fn test_truncate_min_string() {
+        // Short string - no truncation
+        assert_eq!(truncate_min_string("hello"), "hello");
+
+        // Exactly 32 chars - no truncation
+        let s32 = "a".repeat(32);
+        assert_eq!(truncate_min_string(&s32), s32);
+
+        // Long string - truncated to 32 chars
+        let s50 = "a".repeat(50);
+        assert_eq!(truncate_min_string(&s50), "a".repeat(32));
+
+        // Multi-byte characters
+        let multi = format!("{}À", "a".repeat(35)); // 'À' is 2 bytes in UTF-8
+        assert_eq!(truncate_min_string(&multi).chars().count(), 32);
+    }
+
+    #[test]
+    fn test_truncate_max_string() {
+        // Short string - no truncation, just to_string()
+        assert_eq!(truncate_max_string("hello"), Some("hello".to_string()));
+
+        // Exactly 32 chars - no truncation
+        let s32 = "a".repeat(32);
+        assert_eq!(truncate_max_string(&s32), Some(s32));
+
+        // Long ASCII string - truncated with 0x7F tie-breaker
+        // The 33rd char ('a') is < 0x7F, so we use 0x7F
+        let s50 = "a".repeat(50);
+        let expected = format!("{}\x7F", "a".repeat(32));
+        assert_eq!(truncate_max_string(&s50), Some(expected));
+
+        // Non-ASCII at truncation point - uses UTF8_MAX_CHAR
+        // 32 'a's then 'À' (which is >= 0x7F), so we use UTF8_MAX
+        let non_ascii = format!("{}À{}", "a".repeat(32), "b".repeat(20));
+        let expected = format!("{}\u{10FFFF}", "a".repeat(32));
+        assert_eq!(truncate_max_string(&non_ascii), Some(expected));
+
+        // U+10FFFF at truncation point - must skip past it
+        // 32 'a's then U+10FFFF then 'b' - we can't truncate at U+10FFFF (no tie-breaker > it)
+        // so we include U+10FFFF in prefix and use 'b' to determine tie-breaker
+        let with_max_char = format!("{}\u{10FFFF}b{}", "a".repeat(32), "c".repeat(10));
+        let expected = format!("{}\u{10FFFF}\x7F", "a".repeat(32)); // 'b' < 0x7F
+        assert_eq!(truncate_max_string(&with_max_char), Some(expected));
     }
 
     #[test]
