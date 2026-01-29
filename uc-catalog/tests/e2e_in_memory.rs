@@ -24,7 +24,8 @@ struct TestSetup {
     engine: DefaultEngine<TokioMultiThreadExecutor>,
     snapshot: Arc<Snapshot>,
     table_uri: url::Url,
-    /// Hold on to this so the temp directory isn't deleted until the test completes.
+    /// Tests must bind this field (not ignore with `..` or `_`) to prevent the temp directory
+    /// from being dropped and cleaned up before the test completes.
     _tmp_dir: tempfile::TempDir,
 }
 

@@ -572,14 +572,14 @@ impl Snapshot {
     ///
     /// - [`Committer::publish`]
     pub fn publish(
-        self: Arc<Self>,
+        self: &SnapshotRef,
         engine: &dyn Engine,
         committer: &dyn Committer,
     ) -> DeltaResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
         if unpublished_catalog_commits.is_empty() {
-            return Ok(self);
+            return Ok(Arc::clone(self));
         }
 
         require!(
