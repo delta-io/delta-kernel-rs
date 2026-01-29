@@ -388,6 +388,14 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
+    pub(crate) fn new_as_published(&self) -> DeltaResult<Self> {
+        // In the future, we can additionally convert the staged commit files to published commit
+        // files. That would reqire faking their FileMeta locations.
+        let mut new_log_segment = self.clone();
+        new_log_segment.max_published_version = Some(self.end_version);
+        Ok(new_log_segment)
+    }
+
     pub(crate) fn get_unpublished_catalog_commits(&self) -> DeltaResult<Vec<CatalogCommit>> {
         self.ascending_commit_files
             .iter()
@@ -806,15 +814,11 @@ impl LogSegment {
         self.end_version - to_sub
     }
 
-    /// Validates that all commit files in this log segment are not staged commits. We use this in
-    /// places like checkpoint writers, where we require all commits to be published.
-    pub(crate) fn validate_no_staged_commits(&self) -> DeltaResult<()> {
+    pub(crate) fn validate_published(&self) -> DeltaResult<()> {
         require!(
-            !self
-                .ascending_commit_files
-                .iter()
-                .any(|commit| matches!(commit.file_type, LogPathFileType::StagedCommit)),
-            Error::generic("Found staged commit file in log segment")
+            self.max_published_version
+                .is_some_and(|v| v == self.end_version),
+            Error::generic("Log segment is not published")
         );
         Ok(())
     }
