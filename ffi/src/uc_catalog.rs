@@ -43,7 +43,7 @@ pub struct CommitsRequest {
 pub struct ExclusiveCommitsResponse;
 
 /// Get a handle to an `ExclusiveCommitsResponse`. This can be passed to [`add_commit_to_response`]
-/// to populate the response, and then can be returned from [`get_commits`]
+/// to populate the response, and then can be returned from the [`CGetCommits`] callback.
 ///
 /// # Safety
 ///
@@ -118,13 +118,13 @@ pub struct CommitRequest {
 /// }
 /// return response;
 /// ```
-type CGetCommits = extern "C" fn(request: CommitsRequest) -> Handle<ExclusiveCommitsResponse>;
+pub type CGetCommits = extern "C" fn(request: CommitsRequest) -> Handle<ExclusiveCommitsResponse>;
 
 /// The callback that will be called when the client wants to commit. Return `None` on success, or
 /// `Some("error description")` if an error occured.
 // Note, it doesn't make sense to return an ExternResult here because that can't hold the string
 // error msg
-type CCommit = extern "C" fn(request: CommitRequest) -> OptionalValue<Handle<ExclusiveRustString>>;
+pub type CCommit = extern "C" fn(request: CommitRequest) -> OptionalValue<Handle<ExclusiveRustString>>;
 
 pub struct FfiUCCommitsClient {
     get_commits_callback: CGetCommits,
@@ -245,9 +245,9 @@ fn get_uc_committer_impl(
     Ok(committer.into())
 }
 
-/// Free a committer obtained via get_uc_committer. Warning! Normally the value returned here will be
-/// consumed when creating a transaction via [`transaction_with_committer`] and will NOT need to be
-/// freed.
+/// Free a committer obtained via get_uc_committer. Warning! Normally the value returned here will
+/// be consumed when creating a transaction via [`crate::transaction::transaction_with_committer`]
+/// and will NOT need to be freed.
 ///
 /// # Safety
 ///
