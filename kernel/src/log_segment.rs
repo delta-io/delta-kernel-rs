@@ -676,37 +676,33 @@ impl LogSegment {
                 });
 
         // Build final schema with any additional fields needed (stats_parsed, sidecar)
-        // Only modify the schema if it has an "add" field (i.e., we need file actions)
-        let augmented_checkpoint_read_schema = if let Some(add_field) = action_schema.field("add") {
+        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
+        let augmented_checkpoint_read_schema = if let (true, Some(add_field), Some(stats_schema)) =
+            (has_stats_parsed, action_schema.field("add"), stats_schema)
+        {
+            // Add stats_parsed to the "add" field
             let DataType::Struct(add_struct) = add_field.data_type() else {
                 return Err(Error::internal_error(
                     "add field in action schema must be a struct",
                 ));
             };
             let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
-            // Add stats_parsed if checkpoint has compatible parsed stats
-            if let (true, Some(stats_schema)) = (has_stats_parsed, stats_schema) {
-                add_fields.push(StructField::nullable(
-                    "stats_parsed",
-                    DataType::Struct(Box::new(stats_schema.clone())),
-                ));
-            }
-
-            // Rebuild the add field with any new fields (stats_parsed)
-            let new_add_field = StructField::new(
-                add_field.name(),
-                StructType::new_unchecked(add_fields),
-                add_field.is_nullable(),
-            )
-            .with_metadata(add_field.metadata.clone());
+            add_fields.push(StructField::nullable(
+                "stats_parsed",
+                DataType::Struct(Box::new(stats_schema.clone())),
+            ));
 
             // Rebuild schema with modified add field
             let mut new_fields: Vec<StructField> = action_schema
                 .fields()
                 .map(|f| {
                     if f.name() == "add" {
-                        new_add_field.clone()
+                        StructField::new(
+                            add_field.name(),
+                            StructType::new_unchecked(add_fields.clone()),
+                            add_field.is_nullable(),
+                        )
+                        .with_metadata(add_field.metadata.clone())
                     } else {
                         f.clone()
                     }
@@ -714,14 +710,18 @@ impl LogSegment {
                 .collect();
 
             // Add sidecar column at top-level for V2 checkpoints
-            if need_file_actions && !sidecar_files.is_empty() {
+            if needs_sidecar {
                 new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
             }
 
             Arc::new(StructType::new_unchecked(new_fields))
+        } else if needs_sidecar {
+            // Only need to add sidecar, no stats_parsed
+            let mut new_fields: Vec<StructField> = action_schema.fields().cloned().collect();
+            new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+            Arc::new(StructType::new_unchecked(new_fields))
         } else {
-            // Schema doesn't have "add" field (e.g., for metadata/protocol only reads)
-            // Use the action_schema as-is
+            // No modifications needed, use schema as-is
             action_schema.clone()
         };
 
@@ -984,7 +984,7 @@ impl LogSegment {
             // If it exists but isn't a Struct, the schema is malformed and unusable.
             let DataType::Struct(checkpoint_values) = checkpoint_values_field.data_type() else {
                 debug!(
-                    "stats_parsed not compatible: stats_parsed. {} is not a Struct, got {:?}",
+                    "stats_parsed not compatible: stats_parsed.{} is not a Struct, got {:?}",
                     field_name,
                     checkpoint_values_field.data_type()
                 );
@@ -1001,30 +1001,64 @@ impl LogSegment {
                 continue;
             };
 
-            // Check type compatibility for each column needed for data skipping
-            // If it exists in checkpoint, verify types are compatible
-            for stats_field in stats_values.fields() {
-                if let Some(checkpoint_field) = checkpoint_values.field(&stats_field.name) {
-                    if checkpoint_field
-                        .data_type()
-                        .can_read_as(stats_field.data_type())
-                        .is_err()
-                    {
-                        debug!(
-                            "stats_parsed not compatible: incompatible type for column '{}' in {field_name}: checkpoint has {:?}, stats schema needs {:?}",
-                            stats_field.name,
-                            checkpoint_field.data_type(),
-                            stats_field.data_type()
-                        );
-                        return false;
-                    }
-                }
-                // If the column is missing from checkpoint's stats_parsed, it will return
-                // null when accessed, which is acceptable for data skipping.
+            // Check type compatibility recursively for nested structs.
+            // Only fields that exist in both schemas need compatible types.
+            // Extra fields in checkpoint are ignored; missing fields return null.
+            if !Self::structs_have_compatible_types(checkpoint_values, stats_values, field_name) {
+                return false;
             }
         }
 
         debug!("Checkpoint schema has compatible stats_parsed for data skipping");
+        true
+    }
+
+    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    ///
+    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
+    /// - Primitive types: must be compatible via `can_read_as` (allows type widening)
+    /// - Nested structs: recursively check inner fields
+    /// - Missing fields in checkpoint: OK (will return null when accessed)
+    /// - Extra fields in checkpoint: OK (ignored)
+    fn structs_have_compatible_types(
+        available: &StructType,
+        needed: &StructType,
+        context: &str,
+    ) -> bool {
+        for needed_field in needed.fields() {
+            let Some(available_field) = available.field(needed_field.name()) else {
+                // Field missing in checkpoint - that's OK, it will be null
+                continue;
+            };
+
+            match (available_field.data_type(), needed_field.data_type()) {
+                // Both are structs: recurse
+                (DataType::Struct(avail_struct), DataType::Struct(need_struct)) => {
+                    let nested_context = format!("{}.{}", context, needed_field.name());
+                    if !Self::structs_have_compatible_types(
+                        avail_struct,
+                        need_struct,
+                        &nested_context,
+                    ) {
+                        return false;
+                    }
+                }
+                // Non-struct types: use can_read_as for type compatibility
+                (avail_type, need_type) => {
+                    if avail_type.can_read_as(need_type).is_err() {
+                        debug!(
+                            "stats_parsed not compatible: incompatible type for '{}' in {}: \
+                             checkpoint has {:?}, stats schema needs {:?}",
+                            needed_field.name(),
+                            context,
+                            avail_type,
+                            need_type
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
         true
     }
 }
