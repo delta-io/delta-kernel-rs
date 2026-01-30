@@ -20,7 +20,7 @@ use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Sca
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::LogSegment;
+use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -31,6 +31,10 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
+
+/// Name of the parsed stats column added to scan_files when stats are available.
+/// This matches the `stats_parsed` field in the Delta Protocol's Add action.
+pub const PARSED_STATS_COL_NAME: &str = "stats_parsed";
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
@@ -134,7 +138,8 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            (), // No classifer, default is for scans
+            None, // No stats_columns for now - will be added in later PR
+            (),   // No classifer, default is for scans
         )?;
 
         Ok(Scan {
@@ -435,7 +440,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        let result = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, result.actions, result.checkpoint_info)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -514,7 +520,16 @@ impl Scan {
         // to apply file skipping and provide the required transformations.
         if existing_version == self.snapshot.version() {
             let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            // Existing data is treated as checkpoint data but without parsed stats
+            let checkpoint_info = CheckpointReadInfo {
+                has_stats_parsed: false,
+                checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+            };
+            return Ok(Box::new(self.scan_metadata_inner(
+                engine,
+                scan,
+                checkpoint_info,
+            )?));
         }
 
         let log_segment = self.snapshot.log_segment();
@@ -544,27 +559,39 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
-        let it = new_log_segment
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
-                COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
-                None,
-            )?
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+            None,
+        )?;
+        let it = result
+            .actions
             .chain(existing_data.into_iter().map(apply_transform));
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            it,
+            result.checkpoint_info,
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        checkpoint_info: CheckpointReadInfo,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            action_batch_iter,
+            self.state_info.clone(),
+            checkpoint_info,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -572,7 +599,9 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
@@ -582,6 +611,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
+                self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
             )
     }
 
