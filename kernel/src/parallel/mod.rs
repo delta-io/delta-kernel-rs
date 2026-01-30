@@ -1,7 +1,5 @@
 //! Two-phase log replay for parallel execution of checkpoint processing.
 
-use crate::internal_api;
-
 #[cfg(feature = "internal-api")]
 pub mod parallel_phase;
 #[cfg(not(feature = "internal-api"))]
