@@ -669,8 +669,7 @@ impl Scan {
     /// }
     /// # Ok(())
     /// # }
-    #[internal_api]
-    pub(crate) fn parallel_scan_metadata(
+    pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
