@@ -331,6 +331,7 @@ impl ActionReconciliationVisitor<'_> {
     const TXN_APP_ID_INDEX: usize = 11;
     const TXN_LAST_UPDATED_INDEX: usize = 12;
     const DOMAIN_METADATA_DOMAIN_INDEX: usize = 13;
+    const DOMAIN_METADATA_REMOVED_INDEX: usize = 14;
 
     // These are the column names used to access the data in the getters
     const REMOVE_DELETION_TIMESTAMP: &'static str = "remove.deletionTimestamp";
@@ -339,6 +340,7 @@ impl ActionReconciliationVisitor<'_> {
     const TXN_APP_ID: &'static str = "txn.appId";
     const TXN_LAST_UPDATED: &'static str = "txn.lastUpdated";
     const DOMAIN_METADATA_DOMAIN: &'static str = "domainMetadata.domain";
+    const DOMAIN_METADATA_REMOVED: &'static str = "domainMetadata.removed";
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
@@ -504,20 +506,31 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential domainMetadata action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid domainMetadata action.
-    /// Returns `Ok(Some(false))` if the row contains a domainMetadata action but it's suppressed (duplicate).
+    /// Returns `Ok(Some(false))` if the row contains a domainMetadata action but it's suppressed
+    ///         (duplicate or tombstone with removed=true).
     /// Returns `Ok(None)` if the row doesn't contain a domainMetadata action (continue checking other action types).
     /// Returns `Err(...)` if there was an error processing the action.
     fn check_domain_metadata_action<'a>(
         &mut self,
         i: usize,
-        getter: &'a dyn GetData<'a>,
+        getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
-        let Some(domain) = getter.get_str(i, Self::DOMAIN_METADATA_DOMAIN)? else {
+        let Some(domain) =
+            getters[Self::DOMAIN_METADATA_DOMAIN_INDEX].get_str(i, Self::DOMAIN_METADATA_DOMAIN)?
+        else {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
 
-        // If the domain already exists in the set, the insertion will return false, indicating
-        //that this is a duplicate.
+        // Exclude tombstones (removed=true) from checkpoint per protocol spec
+        let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED_INDEX]
+            .get_opt(i, Self::DOMAIN_METADATA_REMOVED)?
+            .unwrap_or(false);
+        if removed {
+            return Ok(Some(false));
+        }
+
+        // If the domain already exists in the set, the insertion will return false,
+        // indicating that this is a duplicate.
         Ok(Some(self.seen_domains.insert(domain.to_string())))
     }
 
@@ -546,9 +559,7 @@ impl ActionReconciliationVisitor<'_> {
             result
         } else if let Some(result) = self.check_txn_action(i, getters)? {
             result
-        } else if let Some(result) =
-            self.check_domain_metadata_action(i, getters[Self::DOMAIN_METADATA_DOMAIN_INDEX])?
-        {
+        } else if let Some(result) = self.check_domain_metadata_action(i, getters)? {
             result
         } else if let Some(result) =
             self.check_protocol_action(i, getters[Self::PROTOCOL_MIN_READER_VERSION_INDEX])?
@@ -581,6 +592,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
             const STRING: DataType = DataType::STRING;
             const INTEGER: DataType = DataType::INTEGER;
             const LONG: DataType = DataType::LONG;
+            const BOOLEAN: DataType = DataType::BOOLEAN;
             let types_and_names = vec![
                 // File action columns
                 (STRING, column_name!("add.path")),
@@ -598,6 +610,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
                 (STRING, column_name!("txn.appId")),
                 (LONG, column_name!("txn.lastUpdated")),
                 (STRING, column_name!("domainMetadata.domain")),
+                (BOOLEAN, column_name!("domainMetadata.removed")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -607,7 +620,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 14,
+            getters.len() == 15,
             Error::InternalError(format!(
                 "Wrong number of visitor getters: {}",
                 getters.len()
@@ -1209,7 +1222,7 @@ mod tests {
         error_field: &'static str,
         error_type: &'static str,
     ) -> Vec<MockErrorGetData> {
-        (0..14)
+        (0..15)
             .map(|i| {
                 if i == error_index {
                     MockErrorGetData::new(error_field, error_type)
@@ -1229,7 +1242,7 @@ mod tests {
         let mut visitor =
             create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, None);
         let getter = MockErrorGetData::default();
-        let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 14)!
+        let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 15)!
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
         assert!(result
@@ -1274,8 +1287,12 @@ mod tests {
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
-        let mut visitor =
-            create_test_visitor(&mut seen_file_keys, &mut seen_txns, &mut seen_domains, Some(1000));
+        let mut visitor = create_test_visitor(
+            &mut seen_file_keys,
+            &mut seen_txns,
+            &mut seen_domains,
+            Some(1000),
+        );
         let defaults = (0..11)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
@@ -1283,11 +1300,13 @@ mod tests {
             error_field: "lastUpdated",
         };
         let domain_default = MockErrorGetData::default();
+        let domain_removed_default = MockErrorGetData::default();
         let mut getters: Vec<&dyn GetData<'_>> =
             defaults.iter().map(|g| g as &dyn GetData<'_>).collect();
         getters.push(&error_mock); // txn fields
         getters.push(&error_mock);
         getters.push(&domain_default); // domainMetadata.domain
+        getters.push(&domain_removed_default); // domainMetadata.removed
         let result = visitor.visit(1, &getters);
         assert!(result.is_err());
         assert!(result
@@ -1307,7 +1326,7 @@ mod tests {
         let error_mock = FlexibleMock {
             error_field: "deletionTimestamp",
         };
-        let defaults2 = (0..8)
+        let defaults2 = (0..9)
             .map(|_| MockErrorGetData::default())
             .collect::<Vec<_>>();
         let mut getters: Vec<&dyn GetData<'_>> =
