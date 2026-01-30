@@ -448,6 +448,10 @@ pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
+    /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
+    /// with (worker_threads, max_blocking_threads). If None, use the default single-threaded
+    /// background executor.
+    multithreaded_executor_config: Option<(Option<usize>, Option<usize>)>,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -482,6 +486,7 @@ fn get_engine_builder_impl(
         url: url?,
         allocate_fn,
         options: HashMap::default(),
+        multithreaded_executor_config: None,
     });
     Ok(Box::into_raw(builder))
 }
@@ -512,6 +517,37 @@ fn set_builder_option_impl(
     Ok(true)
 }
 
+/// Configure the builder to use a multi-threaded executor instead of the default
+/// single-threaded background executor.
+///
+/// # Parameters
+/// - `builder`: The engine builder to configure.
+/// - `worker_threads`: Number of worker threads. Pass 0 to use Tokio's default.
+/// - `max_blocking_threads`: Maximum number of blocking threads. Pass 0 to use Tokio's default.
+///
+/// # Safety
+///
+/// Caller must pass a valid EngineBuilder pointer.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
+    builder: &mut EngineBuilder,
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) {
+    let worker_threads = if worker_threads == 0 {
+        None
+    } else {
+        Some(worker_threads)
+    };
+    let max_blocking_threads = if max_blocking_threads == 0 {
+        None
+    } else {
+        Some(max_blocking_threads)
+    };
+    builder.multithreaded_executor_config = Some((worker_threads, max_blocking_threads));
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -529,6 +565,7 @@ pub unsafe extern "C" fn builder_build(
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
+        builder_box.multithreaded_executor_config,
         builder_box.allocate_fn,
     )
     .into_extern_result(&builder_box.allocate_fn)
@@ -553,7 +590,7 @@ fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(url?, Default::default(), allocate_error)
+    get_default_engine_impl(url?, Default::default(), None, allocate_error)
 }
 
 /// Safety
@@ -571,17 +608,37 @@ fn engine_to_handle(
     engine.into()
 }
 
+/// Build the default engine with optional multithreaded executor configuration.
+///
+/// If `executor_config` is `Some((worker_threads, max_blocking_threads))`, uses a multi-threaded
+/// executor that owns its runtime. Otherwise, uses the default single-threaded background executor.
 #[cfg(feature = "default-engine-base")]
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
+    executor_config: Option<(Option<usize>, Option<usize>)>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::storage::store_from_url_opts;
     use delta_kernel::engine::default::DefaultEngineBuilder;
+
     let store = store_from_url_opts(&url, options)?;
-    let engine = DefaultEngineBuilder::new(store).build();
-    Ok(engine_to_handle(Arc::new(engine), allocate_error))
+
+    let engine: Arc<dyn Engine> =
+        if let Some((worker_threads, max_blocking_threads)) = executor_config {
+            use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+            let executor =
+                TokioMultiThreadExecutor::new_owned_runtime(worker_threads, max_blocking_threads)?;
+            Arc::new(
+                DefaultEngineBuilder::new(store)
+                    .with_task_executor(Arc::new(executor))
+                    .build(),
+            )
+        } else {
+            Arc::new(DefaultEngineBuilder::new(store).build())
+        };
+
+    Ok(engine_to_handle(engine, allocate_error))
 }
 
 /// # Safety
