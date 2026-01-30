@@ -49,7 +49,7 @@ pub mod tokio {
     use std::sync::mpsc::channel;
     use tokio::runtime::RuntimeFlavor;
 
-    use crate::DeltaResult;
+    use crate::{DeltaResult, Error};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
@@ -145,7 +145,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
         }
     }
 
@@ -189,7 +189,7 @@ pub mod tokio {
         pub fn new_owned_runtime(
             worker_threads: Option<usize>,
             max_blocking_threads: Option<usize>,
-        ) -> crate::DeltaResult<Self> {
+        ) -> DeltaResult<Self> {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             builder.enable_all();
 
@@ -201,7 +201,7 @@ pub mod tokio {
             }
 
             let runtime = builder.build().map_err(|e| {
-                crate::Error::generic(format!("Failed to create Tokio runtime: {e}"))
+                Error::generic(format!("Failed to create Tokio runtime: {e}"))
             })?;
 
             let handle = runtime.handle().clone();
@@ -260,7 +260,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
         }
     }
 
