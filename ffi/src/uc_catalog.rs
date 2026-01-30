@@ -18,6 +18,8 @@ use uc_client::models::{
     CommitsRequest as ClientCommitsRequest, CommitsResponse as ClientCommitsResponse,
 };
 
+use tracing::debug;
+
 /// Data representing a commit.
 #[repr(C)]
 pub struct Commit {
@@ -207,18 +209,343 @@ pub unsafe extern "C" fn get_uc_commit_client(
     .into()
 }
 
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUCCommitsClient>) {
+    debug!("released uc commit client");
+    commit_client.drop_handle();
+}
+
 /// Get a commit client that will call the passed callbacks when it wants to request commits or to
 /// make a commit.
 ///
 /// # Safety
 ///
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitsClient, obtained via
-///  calling [`get_uc_commit_client`].
+///  calling [`get_uc_commit_client`], a valid KernelStringSlice as the table_id, and a valid error
+///  function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn get_uc_commiter(
+pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitsClient>,
-) -> Handle<MutableCommitter> {
+    table_id: KernelStringSlice,
+    error_fn: AllocateErrorFn,
+) -> ExternResult<Handle<MutableCommitter>> {
+    get_uc_committer_impl(commit_client, table_id).into_extern_result(&error_fn)
+}
+
+fn get_uc_committer_impl(
+    commit_client: Handle<SharedFfiUCCommitsClient>,
+    table_id: KernelStringSlice,
+) -> DeltaResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitsClient> = unsafe { commit_client.clone_as_arc() };
-    let committer: Box<dyn Committer> = Box::new(UCCommitter::new(client, "foo"));
-    committer.into()
+    let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
+    let committer: Box<dyn Committer> = Box::new(UCCommitter::new(client, table_id_str));
+    Ok(committer.into())
+}
+
+/// Free a committer obtained via get_uc_committer. Warning! Normally the value returned here will be
+/// consumed when creating a transaction via [`transaction_with_committer`] and will NOT need to be
+/// freed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
+#[no_mangle]
+pub unsafe extern "C" fn free_uc_commiter(commit_client: Handle<MutableCommitter>) {
+    debug!("released uc committer");
+    commit_client.drop_handle();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::{kernel_string_slice, OptionalValue};
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use uc_client::UCCommitsClient;
+
+    #[test]
+    fn test_init_commits_response() {
+        let latest_version = 42;
+        let response = unsafe { init_commits_response(latest_version) };
+
+        let response_inner = unsafe { response.into_inner() };
+        assert_eq!(response_inner.latest_table_version, latest_version);
+        assert!(response_inner.commits.is_none());
+    }
+
+    #[test]
+    fn test_add_commit_to_response() {
+        let latest_version = 10;
+        let response = unsafe { init_commits_response(latest_version) };
+
+        let file_name = String::from("00000000000000000005.json");
+        let commit = Commit {
+            version: 5,
+            timestamp: 1234567890,
+            file_name: kernel_string_slice!(file_name),
+            file_size: 1024,
+            file_modification_timestamp: 1234567900,
+        };
+
+        let response =
+            unsafe { ok_or_panic(add_commit_to_response(response, commit, allocate_err)) };
+
+        let response_inner = unsafe { response.into_inner() };
+        assert_eq!(response_inner.latest_table_version, latest_version);
+        assert!(response_inner.commits.is_some());
+
+        let commits = response_inner.commits.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].version, 5);
+        assert_eq!(commits[0].timestamp, 1234567890);
+        assert_eq!(commits[0].file_name, "00000000000000000005.json");
+        assert_eq!(commits[0].file_size, 1024);
+        assert_eq!(commits[0].file_modification_timestamp, 1234567900);
+    }
+
+    #[test]
+    fn test_add_multiple_commits_to_response() {
+        let latest_version = 20;
+        let mut response = unsafe { init_commits_response(latest_version) };
+
+        let commits_data = vec![
+            (10, "00000000000000000010.json", 2048),
+            (11, "00000000000000000011.json", 4096),
+            (12, "00000000000000000012.json", 8192),
+        ];
+
+        for (version, file_name_str, file_size) in commits_data {
+            let file_name = String::from(file_name_str);
+            let commit = Commit {
+                version,
+                timestamp: 1234567890 + version,
+                file_name: kernel_string_slice!(file_name),
+                file_size,
+                file_modification_timestamp: 1234567900 + version,
+            };
+
+            response =
+                unsafe { ok_or_panic(add_commit_to_response(response, commit, allocate_err)) };
+        }
+
+        let response_inner = unsafe { response.into_inner() };
+        assert_eq!(response_inner.latest_table_version, latest_version);
+        assert!(response_inner.commits.is_some());
+
+        let commits = response_inner.commits.unwrap();
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].version, 10);
+        assert_eq!(commits[1].version, 11);
+        assert_eq!(commits[2].version, 12);
+    }
+
+    thread_local! {
+        static GET_COMMITS_CALLED: RefCell<bool> = const { RefCell::new(false) };
+        static COMMIT_CALLED: RefCell<bool> = const { RefCell::new(false) };
+        static LAST_COMMITS_REQUEST: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+        static LAST_COMMIT_REQUEST: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+        static SHOULD_FAIL_COMMIT: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    #[no_mangle]
+    extern "C" fn test_get_commits_callback(
+        request: CommitsRequest,
+    ) -> Handle<ExclusiveCommitsResponse> {
+        GET_COMMITS_CALLED.with(|called| *called.borrow_mut() = true);
+
+        let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
+        let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
+
+        LAST_COMMITS_REQUEST.with(|req| {
+            *req.borrow_mut() = Some((table_id.clone(), table_uri.clone()));
+        });
+
+        let response = unsafe { init_commits_response(5) };
+
+        let file_name = String::from("00000000000000000003.json");
+        let commit = Commit {
+            version: 3,
+            timestamp: 1000000000,
+            file_name: kernel_string_slice!(file_name),
+            file_size: 512,
+            file_modification_timestamp: 1000000100,
+        };
+
+        unsafe { ok_or_panic(add_commit_to_response(response, commit, allocate_err)) }
+    }
+
+    #[no_mangle]
+    extern "C" fn test_commit_callback(
+        request: CommitRequest,
+    ) -> OptionalValue<Handle<ExclusiveRustString>> {
+        COMMIT_CALLED.with(|called| *called.borrow_mut() = true);
+
+        let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
+        let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
+
+        LAST_COMMIT_REQUEST.with(|req| {
+            *req.borrow_mut() = Some((table_id.clone(), table_uri.clone()));
+        });
+
+        SHOULD_FAIL_COMMIT.with(|should_fail| {
+            if *should_fail.borrow() {
+                let error_msg = String::from("Test commit failure");
+                OptionalValue::Some(Box::new(error_msg).into())
+            } else {
+                OptionalValue::None
+            }
+        })
+    }
+
+    #[test]
+    fn test_get_uc_commit_client() {
+        let client =
+            unsafe { get_uc_commit_client(test_get_commits_callback, test_commit_callback) };
+
+        let _client_ref: Arc<FfiUCCommitsClient> = unsafe { client.clone_as_arc() };
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[tokio::test]
+    async fn test_ffi_uc_commits_client_get_commits() {
+        GET_COMMITS_CALLED.with(|c| *c.borrow_mut() = false);
+
+        let client =
+            unsafe { get_uc_commit_client(test_get_commits_callback, test_commit_callback) };
+
+        let client_arc: Arc<FfiUCCommitsClient> = unsafe { client.clone_as_arc() };
+
+        let request = ClientCommitsRequest {
+            table_id: "test_table_id".to_string(),
+            table_uri: "s3://bucket/path".to_string(),
+            start_version: None,
+            end_version: None,
+        };
+
+        let result = client_arc.get_commits(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.latest_table_version, 5);
+        assert!(response.commits.is_some());
+
+        let commits = response.commits.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].version, 3);
+        assert_eq!(commits[0].file_name, "00000000000000000003.json");
+
+        assert!(GET_COMMITS_CALLED.with(|c| *c.borrow()));
+
+        LAST_COMMITS_REQUEST.with(|req| {
+            let req = req.borrow();
+            let (table_id, table_uri) = req.as_ref().unwrap();
+            assert_eq!(table_id, "test_table_id");
+            assert_eq!(table_uri, "s3://bucket/path");
+        });
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[tokio::test]
+    async fn test_ffi_uc_commits_client_commit_success() {
+        COMMIT_CALLED.with(|c| *c.borrow_mut() = false);
+        SHOULD_FAIL_COMMIT.with(|f| *f.borrow_mut() = false);
+
+        let client =
+            unsafe { get_uc_commit_client(test_get_commits_callback, test_commit_callback) };
+
+        let client_arc: Arc<FfiUCCommitsClient> = unsafe { client.clone_as_arc() };
+
+        let request = ClientCommitRequest {
+            table_id: "test_table_id".to_string(),
+            table_uri: "s3://bucket/path".to_string(),
+            commit_info: Some(ClientCommit {
+                version: 10,
+                timestamp: 2000000000,
+                file_name: "00000000000000000010.json".to_string(),
+                file_size: 1024,
+                file_modification_timestamp: 2000000100,
+            }),
+            latest_backfilled_version: None,
+            metadata: None,
+            protocol: None,
+        };
+
+        let result: uc_client::Result<()> = client_arc.commit(request).await;
+
+        assert!(result.is_ok());
+        assert!(COMMIT_CALLED.with(|c| *c.borrow()));
+
+        LAST_COMMIT_REQUEST.with(|req| {
+            let req = req.borrow();
+            let (table_id, table_uri) = req.as_ref().unwrap();
+            assert_eq!(table_id, "test_table_id");
+            assert_eq!(table_uri, "s3://bucket/path");
+        });
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[tokio::test]
+    async fn test_ffi_uc_commits_client_commit_failure() {
+        COMMIT_CALLED.with(|c| *c.borrow_mut() = false);
+        SHOULD_FAIL_COMMIT.with(|f| *f.borrow_mut() = true);
+
+        let client =
+            unsafe { get_uc_commit_client(test_get_commits_callback, test_commit_callback) };
+
+        let client_arc: Arc<FfiUCCommitsClient> = unsafe { client.clone_as_arc() };
+
+        let request = ClientCommitRequest {
+            table_id: "test_table_id".to_string(),
+            table_uri: "s3://bucket/path".to_string(),
+            commit_info: Some(ClientCommit {
+                version: 10,
+                timestamp: 2000000000,
+                file_name: "00000000000000000010.json".to_string(),
+                file_size: 1024,
+                file_modification_timestamp: 2000000100,
+            }),
+            latest_backfilled_version: None,
+            metadata: None,
+            protocol: None,
+        };
+
+        let result: uc_client::Result<()> = client_arc.commit(request).await;
+
+        assert!(result.is_err());
+        assert!(COMMIT_CALLED.with(|c| *c.borrow()));
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, uc_client::Error::Generic(_)));
+        if let uc_client::Error::Generic(msg) = error {
+            assert_eq!(msg, "Test commit failure");
+        }
+
+        unsafe { free_uc_commit_client(client) };
+    }
+
+    #[test]
+    fn test_get_uc_committer() {
+        let client =
+            unsafe { get_uc_commit_client(test_get_commits_callback, test_commit_callback) };
+
+        let table_id = "test_table_id";
+        let committer = unsafe {
+            ok_or_panic(get_uc_committer(
+                client.shallow_copy(),
+                kernel_string_slice!(table_id),
+                allocate_err,
+            ))
+        };
+
+        unsafe {
+            free_uc_commit_client(client);
+            free_uc_commiter(committer);
+        }
+    }
 }
