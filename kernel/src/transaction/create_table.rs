@@ -286,7 +286,6 @@ impl CreateTableTransactionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_properties::{MIN_READER_VERSION_PROP, MIN_WRITER_VERSION_PROP};
     use std::sync::Arc;
