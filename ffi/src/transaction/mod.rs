@@ -21,7 +21,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 pub struct ExclusiveTransaction;
 
 /// Handle for a mutable boxed committer that can be passed across FFI
-#[handle_descriptor(target = dyn Committer, mutable = true)]
+#[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
 pub struct MutableCommitter;
 
 /// Start a transaction on the latest snapshot of the table.
@@ -46,6 +46,35 @@ fn transaction_impl(
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
+    let transaction = snapshot.transaction(committer, engine.as_ref());
+    Ok(Box::new(transaction?).into())
+}
+
+/// Start a transaction with a custom committer
+/// NOTE: This consumes the committer handle
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles
+#[no_mangle]
+pub unsafe extern "C" fn transaction_with_committer(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    committer: Handle<MutableCommitter>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine = unsafe { engine.as_ref() };
+    let committer = unsafe { committer.into_inner() };
+    transaction_with_committer_impl(url, engine, committer).into_extern_result(&engine)
+}
+
+fn transaction_with_committer_impl(
+    url: DeltaResult<Url>,
+    extern_engine: &dyn ExternEngine,
+    committer: Box<dyn Committer>,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let engine = extern_engine.engine();
+    let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
