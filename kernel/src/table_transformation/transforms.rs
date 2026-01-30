@@ -17,7 +17,7 @@ use crate::{DeltaResult, Error};
 
 use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
 
-use super::{ProtocolMetadataTransform, TransformId};
+use super::{ProtocolMetadataTransform, TransformId, TransformOutput};
 
 // ============================================================================
 // FeatureSignalTransform
@@ -101,10 +101,7 @@ impl ProtocolMetadataTransform for FeatureSignalTransform {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        mut config: TableProtocolMetadataConfig,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
+    fn apply(&self, mut config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
         // Add each feature to the protocol
         // Note: with_feature() is idempotent - if feature already exists, it's a no-op.
         // This handles the case where a feature was:
@@ -127,7 +124,7 @@ impl ProtocolMetadataTransform for FeatureSignalTransform {
         }
         config.metadata = config.metadata.with_configuration(filtered_config);
 
-        Ok(config)
+        Ok(TransformOutput::new(config))
     }
 }
 
@@ -157,10 +154,7 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
         "ProtocolVersion: sets version from properties or defaults"
     }
 
-    fn apply(
-        &self,
-        mut config: TableProtocolMetadataConfig,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
+    fn apply(&self, mut config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
         let metadata_config = config.metadata.configuration();
 
         // Parse reader version (default to 3 for table features support)
@@ -219,7 +213,7 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
         filtered_config.remove(MIN_WRITER_VERSION_PROP);
         config.metadata = config.metadata.with_configuration(filtered_config);
 
-        Ok(config)
+        Ok(TransformOutput::new(config))
     }
 }
 
@@ -263,11 +257,210 @@ impl ProtocolMetadataTransform for DeltaPropertyValidationTransform {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        config: TableProtocolMetadataConfig,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
+    fn apply(&self, config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
         // Validation-only transform - no modifications
-        Ok(config)
+        Ok(TransformOutput::new(config))
+    }
+}
+
+// ============================================================================
+// PartitioningTransform
+// ============================================================================
+
+/// Sets partition columns on metadata.
+///
+/// This transform:
+/// 1. Validates partition columns exist in schema (top-level only)
+/// 2. Sets the partition_columns on metadata
+#[derive(Debug)]
+pub(crate) struct PartitioningTransform {
+    columns: Vec<crate::schema::ColumnName>,
+}
+
+impl PartitioningTransform {
+    pub(crate) fn new(columns: Vec<crate::schema::ColumnName>) -> Self {
+        Self { columns }
+    }
+}
+
+impl ProtocolMetadataTransform for PartitioningTransform {
+    fn id(&self) -> TransformId {
+        TransformId::Partitioning
+    }
+
+    fn name(&self) -> &'static str {
+        "Partitioning: sets partition columns"
+    }
+
+    fn validate_preconditions(&self, config: &TableProtocolMetadataConfig) -> DeltaResult<()> {
+        let schema = config.metadata.parse_schema()?;
+
+        for col in &self.columns {
+            // Partition columns must be top-level (single path element)
+            if col.path().len() != 1 {
+                return Err(Error::generic(format!(
+                    "Partition column '{}' must be a top-level column, not a nested path",
+                    col
+                )));
+            }
+
+            let col_name = &col.path()[0];
+            if schema.field(col_name).is_none() {
+                return Err(Error::generic(format!(
+                    "Partition column '{}' not found in schema",
+                    col_name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply(&self, config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
+        let partition_columns: Vec<String> = self
+            .columns
+            .iter()
+            .map(|c| c.path()[0].clone())
+            .collect();
+
+        Ok(TransformOutput::new(
+            config.with_partition_columns(partition_columns),
+        ))
+    }
+}
+
+// ============================================================================
+// DomainMetadataTransform
+// ============================================================================
+
+/// Enables the DomainMetadata writer feature.
+///
+/// This transform is added as a dependency when clustering is enabled,
+/// since clustering writes domain metadata.
+#[derive(Debug)]
+pub(crate) struct DomainMetadataTransform;
+
+impl ProtocolMetadataTransform for DomainMetadataTransform {
+    fn id(&self) -> TransformId {
+        TransformId::DomainMetadata
+    }
+
+    fn name(&self) -> &'static str {
+        "DomainMetadata: enables domain metadata feature"
+    }
+
+    fn apply(&self, mut config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
+        // Add DomainMetadata writer feature
+        if !config.protocol.has_table_feature(&TableFeature::DomainMetadata) {
+            config.protocol = config.protocol.with_feature(TableFeature::DomainMetadata)?;
+        }
+        Ok(TransformOutput::new(config))
+    }
+}
+
+// ============================================================================
+// ClusteringTransform
+// ============================================================================
+
+/// Enables clustering with domain metadata.
+///
+/// This transform:
+/// 1. Validates clustering columns exist in schema
+/// 2. Validates column count is within limits
+/// 3. Adds ClusteredTable writer feature
+/// 4. Creates delta.clustering domain metadata
+#[derive(Debug)]
+pub(crate) struct ClusteringTransform {
+    columns: Vec<crate::schema::ColumnName>,
+}
+
+impl ClusteringTransform {
+    pub(crate) fn new(columns: Vec<crate::schema::ColumnName>) -> Self {
+        Self { columns }
+    }
+}
+
+impl ProtocolMetadataTransform for ClusteringTransform {
+    fn id(&self) -> TransformId {
+        TransformId::Clustering
+    }
+
+    fn name(&self) -> &'static str {
+        "Clustering: enables clustered table"
+    }
+
+    fn dependencies(&self) -> Vec<super::TransformDependency> {
+        // Clustering requires DomainMetadata to be enabled first
+        vec![super::TransformDependency::TransformRequired(
+            TransformId::DomainMetadata,
+        )]
+    }
+
+    fn validate_preconditions(&self, config: &TableProtocolMetadataConfig) -> DeltaResult<()> {
+        use crate::transaction::data_layout::MAX_CLUSTERING_COLUMNS;
+
+        // Validate column count
+        if self.columns.len() > MAX_CLUSTERING_COLUMNS {
+            return Err(Error::generic(format!(
+                "Clustering supports at most {} columns, but {} were specified",
+                MAX_CLUSTERING_COLUMNS,
+                self.columns.len()
+            )));
+        }
+
+        // Validate columns exist in schema
+        let schema = config.metadata.parse_schema()?;
+        for col in &self.columns {
+            // Clustering columns must be top-level (single path element)
+            if col.path().len() != 1 {
+                return Err(Error::generic(format!(
+                    "Clustering column '{}' must be a top-level column, not a nested path",
+                    col
+                )));
+            }
+
+            let col_name = &col.path()[0];
+            if schema.field(col_name).is_none() {
+                return Err(Error::generic(format!(
+                    "Clustering column '{}' not found in schema",
+                    col_name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply(&self, mut config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
+        use crate::actions::DomainMetadata;
+        use crate::clustering::{ClusteringMetadataDomain, CLUSTERING_DOMAIN_NAME};
+
+        // Add ClusteredTable writer feature
+        if !config.protocol.has_table_feature(&TableFeature::ClusteredTable) {
+            config.protocol = config.protocol.with_feature(TableFeature::ClusteredTable)?;
+        }
+
+        // Create clustering domain metadata
+        let column_names: Vec<String> = self
+            .columns
+            .iter()
+            .map(|c| c.path()[0].clone())
+            .collect();
+
+        let clustering_metadata = ClusteringMetadataDomain {
+            clustering_columns: column_names,
+        };
+
+        let domain_metadata = DomainMetadata::new(
+            CLUSTERING_DOMAIN_NAME.to_string(),
+            serde_json::to_string(&clustering_metadata).map_err(|e| {
+                Error::generic(format!("Failed to serialize clustering metadata: {}", e))
+            })?,
+        );
+
+        Ok(TransformOutput::with_domain_metadata(
+            config,
+            vec![domain_metadata],
+        ))
     }
 }

@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::transaction::data_layout::DataLayout;
 use crate::DeltaResult;
 
 use super::transforms::{
-    DeltaPropertyValidationTransform, FeatureSignalTransform, ProtocolVersionTransform,
+    ClusteringTransform, DeltaPropertyValidationTransform, DomainMetadataTransform,
+    FeatureSignalTransform, PartitioningTransform, ProtocolVersionTransform,
 };
 use super::ProtocolMetadataTransform;
 
@@ -51,13 +53,14 @@ impl TransformRegistry {
         self.schema_transforms.push(factory);
     }
 
-    /// Get all transforms that may apply based on raw properties.
+    /// Get all transforms that may apply based on raw properties and data layout.
     ///
     /// Uses raw properties (not config) so transforms can see signal flags
     /// like delta.feature.* before they're processed.
     pub(crate) fn select_transforms(
         &self,
         properties: &HashMap<String, String>,
+        data_layout: &DataLayout,
     ) -> DeltaResult<Vec<Box<dyn ProtocolMetadataTransform>>> {
         let mut transforms: Vec<Box<dyn ProtocolMetadataTransform>> = Vec::new();
 
@@ -71,6 +74,19 @@ impl TransformRegistry {
         // These add explicit features to the protocol (e.g., deletionVectors, columnMapping)
         if let Some(feature_transform) = FeatureSignalTransform::new(properties)? {
             transforms.push(Box::new(feature_transform));
+        }
+
+        // Data layout transforms: partitioning or clustering
+        match data_layout {
+            DataLayout::None => {}
+            DataLayout::Partitioned { columns } => {
+                transforms.push(Box::new(PartitioningTransform::new(columns.clone())));
+            }
+            DataLayout::Clustered { columns } => {
+                // Clustering requires DomainMetadata feature, so add that transform first
+                transforms.push(Box::new(DomainMetadataTransform));
+                transforms.push(Box::new(ClusteringTransform::new(columns.clone())));
+            }
         }
 
         // Property-triggered transforms: enable features based on delta.* properties
