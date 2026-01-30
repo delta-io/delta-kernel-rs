@@ -8,7 +8,7 @@ use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
-use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -19,6 +19,10 @@ use delta_kernel_ffi_macros::handle_descriptor;
 /// to stage changes and commit them atomically to the Delta table.
 #[handle_descriptor(target=Transaction, mutable=true, sized=true)]
 pub struct ExclusiveTransaction;
+
+/// Handle for a mutable boxed committer that can be passed across FFI
+#[handle_descriptor(target = dyn Committer, mutable = true)]
+pub struct MutableCommitter;
 
 /// Start a transaction on the latest snapshot of the table.
 ///

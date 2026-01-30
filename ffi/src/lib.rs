@@ -51,6 +51,8 @@ pub mod log_path;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
+#[cfg(feature = "uc-catalog")]
+pub mod uc_catalog;
 
 #[cfg(test)]
 mod ffi_test_utils;
@@ -212,6 +214,27 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
 /// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
 /// function is that `kernel_str` is _only_ valid until the return from this function
 pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
+
+/// An opaque type that rust will understand as a string. This can be obtained by calling
+/// [`allocate_kernel_string`] with a [`KernelStringSlice`]
+#[handle_descriptor(target=String, mutable=true, sized=true)]
+pub struct ExclusiveRustString;
+
+/// Allow engines to create an opaque pointer that Rust will understand as a String. This will _panic_
+#[no_mangle]
+pub unsafe extern "C" fn allocate_kernel_string(
+    kernel_str: KernelStringSlice,
+    error_fn: AllocateErrorFn,
+) -> ExternResult<Handle<ExclusiveRustString>> {
+    allocate_kernel_string_impl(kernel_str).into_extern_result(&error_fn)
+}
+
+fn allocate_kernel_string_impl(
+    kernel_str: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveRustString>> {
+    let s = unsafe { String::try_from_slice(&kernel_str) }?;
+    Ok(Box::new(s).into())
+}
 
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
