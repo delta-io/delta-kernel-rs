@@ -1,4 +1,6 @@
 use itertools::Itertools;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
@@ -679,6 +681,20 @@ impl TableFeature {
             TableFeature::Unknown(_) => None,
         }
     }
+
+    /// Parse a feature name string into a TableFeature.
+    ///
+    /// Known feature names are parsed into their corresponding variants.
+    /// Unknown feature names are wrapped in `TableFeature::Unknown`.
+    pub(crate) fn from_name(name: &str) -> Self {
+        TableFeature::from_str(name).unwrap_or_else(|_| TableFeature::Unknown(name.to_string()))
+    }
+
+    /// Returns true if this is a ReaderWriter feature (appears in both reader and writer feature lists).
+    /// Returns false for Writer-only features and Unknown features.
+    pub(crate) fn is_reader_writer(&self) -> bool {
+        matches!(self.feature_type(), FeatureType::ReaderWriter)
+    }
 }
 
 impl ToDataType for TableFeature {
@@ -828,5 +844,50 @@ mod tests {
             let from_str: TableFeature = expected.parse().unwrap();
             assert_eq!(from_str, feature);
         }
+    }
+
+    #[test]
+    fn test_from_name() {
+        // Known features
+        assert_eq!(
+            TableFeature::from_name("deletionVectors"),
+            TableFeature::DeletionVectors
+        );
+        assert_eq!(
+            TableFeature::from_name("changeDataFeed"),
+            TableFeature::ChangeDataFeed
+        );
+        assert_eq!(
+            TableFeature::from_name("columnMapping"),
+            TableFeature::ColumnMapping
+        );
+        assert_eq!(
+            TableFeature::from_name("timestampNtz"),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        // Unknown features
+        assert_eq!(
+            TableFeature::from_name("unknownFeature"),
+            TableFeature::Unknown("unknownFeature".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_reader_writer() {
+        // ReaderWriter features
+        assert!(TableFeature::DeletionVectors.is_reader_writer());
+        assert!(TableFeature::ColumnMapping.is_reader_writer());
+        assert!(TableFeature::TimestampWithoutTimezone.is_reader_writer());
+        assert!(TableFeature::V2Checkpoint.is_reader_writer());
+
+        // Writer-only features
+        assert!(!TableFeature::ChangeDataFeed.is_reader_writer());
+        assert!(!TableFeature::AppendOnly.is_reader_writer());
+        assert!(!TableFeature::DomainMetadata.is_reader_writer());
+        assert!(!TableFeature::RowTracking.is_reader_writer());
+
+        // Unknown features
+        assert!(!TableFeature::unknown("something").is_reader_writer());
     }
 }

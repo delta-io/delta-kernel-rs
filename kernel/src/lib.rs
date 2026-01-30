@@ -103,6 +103,8 @@ pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
+mod table_protocol_metadata_config;
+mod table_transformation;
 pub mod transaction;
 pub(crate) mod transforms;
 
