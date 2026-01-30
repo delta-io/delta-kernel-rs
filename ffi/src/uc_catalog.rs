@@ -263,7 +263,7 @@ pub unsafe extern "C" fn free_uc_commiter(commit_client: Handle<MutableCommitter
 mod tests {
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
-    use crate::{kernel_string_slice, OptionalValue};
+    use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
     use std::cell::RefCell;
     use std::sync::Arc;
     use uc_client::UCCommitsClient;
@@ -394,8 +394,14 @@ mod tests {
 
         SHOULD_FAIL_COMMIT.with(|should_fail| {
             if *should_fail.borrow() {
-                let error_msg = String::from("Test commit failure");
-                OptionalValue::Some(Box::new(error_msg).into())
+                let error_msg = "Test commit failure";
+                let error_str = unsafe {
+                    ok_or_panic(allocate_kernel_string(
+                        kernel_string_slice!(error_msg),
+                        allocate_err,
+                    ))
+                };
+                OptionalValue::Some(error_str)
             } else {
                 OptionalValue::None
             }
