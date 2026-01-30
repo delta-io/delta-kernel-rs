@@ -293,7 +293,7 @@ mod tests {
         let latest_version = 10;
         let response = unsafe { init_commits_response(latest_version) };
 
-        let file_name = String::from("00000000000000000005.json");
+        let file_name = String::from("00000000000000000005.uuid.json");
         let commit = Commit {
             version: 5,
             timestamp: 1234567890,
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].version, 5);
         assert_eq!(commits[0].timestamp, 1234567890);
-        assert_eq!(commits[0].file_name, "00000000000000000005.json");
+        assert_eq!(commits[0].file_name, "00000000000000000005.uuid.json");
         assert_eq!(commits[0].file_size, 1024);
         assert_eq!(commits[0].file_modification_timestamp, 1234567900);
     }
@@ -324,9 +324,9 @@ mod tests {
         let mut response = unsafe { init_commits_response(latest_version) };
 
         let commits_data = vec![
-            (10, "00000000000000000010.json", 2048),
-            (11, "00000000000000000011.json", 4096),
-            (12, "00000000000000000012.json", 8192),
+            (10, "00000000000000000010.uuid.json", 2048),
+            (11, "00000000000000000011.uuid.json", 4096),
+            (12, "00000000000000000012.uuid.json", 8192),
         ];
 
         for (version, file_name_str, file_size) in commits_data {
@@ -378,7 +378,7 @@ mod tests {
 
         let response = unsafe { init_commits_response(5) };
 
-        let file_name = String::from("00000000000000000003.json");
+        let file_name = String::from("00000000000000000003.uuid.json");
         let commit = Commit {
             version: 3,
             timestamp: 1000000000,
@@ -463,7 +463,7 @@ mod tests {
         let commits = response.commits.unwrap();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].version, 3);
-        assert_eq!(commits[0].file_name, "00000000000000000003.json");
+        assert_eq!(commits[0].file_name, "00000000000000000003.uuid.json");
 
         assert!(GET_COMMITS_CALLED.with(|c| *c.borrow()));
 
@@ -542,7 +542,7 @@ mod tests {
             commit_info: Some(ClientCommit {
                 version: 10,
                 timestamp: 2000000000,
-                file_name: "00000000000000000010.json".to_string(),
+                file_name: "00000000000000000010.uuid.json".to_string(),
                 file_size: 1024,
                 file_modification_timestamp: 2000000100,
             }),
