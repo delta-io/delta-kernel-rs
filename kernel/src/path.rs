@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
+use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
@@ -23,6 +24,8 @@ const UUID_PART_LEN: usize = 36;
 /// The subdirectory name within the table root where the delta log resides
 const DELTA_LOG_DIR: &str = "_delta_log";
 const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
+/// The subdirectory name within the delta log where staged commits reside
+const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -218,6 +221,21 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         }))
     }
 
+    /// Parse a location into a commit path (published or staged), returning an error if invalid or
+    /// not a commit.
+    pub(crate) fn parse_commit(location: Location) -> DeltaResult<Self> {
+        let url = location.as_url().to_string();
+        let parsed = Self::try_from(location)?.ok_or_else(|| Error::invalid_log_path(&url))?;
+        require!(
+            parsed.is_commit(),
+            Error::generic(format!(
+                "Expected a commit path, got {} of type {:?}",
+                url, parsed.file_type
+            ))
+        );
+        Ok(parsed)
+    }
+
     pub(crate) fn should_list(&self) -> bool {
         match self.file_type {
             LogPathFileType::Commit
@@ -387,22 +405,40 @@ impl ParsedLogPath<Url> {
 /// A wrapper around parsed log path to provide more structure/safety when handling
 /// table/log/commit paths.
 #[derive(Debug, Clone)]
-pub(crate) struct LogRoot(Url);
+pub(crate) struct LogRoot {
+    table_root: Url,
+    log_root: Url,
+}
 
 impl LogRoot {
     /// Create a new LogRoot from the table root URL (e.g. s3://bucket/table ->
     /// s3://bucket/table/_delta_log/)
     ///
     /// TODO: could take a `table_root: TableRoot`
-    pub(crate) fn new(table_root: Url) -> DeltaResult<Self> {
-        // FIXME: need to check for trailing slash
-        Ok(Self(table_root.join(DELTA_LOG_DIR_WITH_SLASH)?))
+    pub(crate) fn new(mut table_root: Url) -> DeltaResult<Self> {
+        if !table_root.path().ends_with('/') {
+            let new_path = format!("{}/", table_root.path());
+            table_root.set_path(&new_path);
+        }
+        let log_root = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?;
+        Ok(Self {
+            table_root,
+            log_root,
+        })
+    }
+
+    pub(crate) fn table_root(&self) -> &Url {
+        &self.table_root
+    }
+
+    pub(crate) fn log_root(&self) -> &Url {
+        &self.log_root
     }
 
     /// Create a new commit path (absolute path) for the given version.
     pub(crate) fn new_commit_path(&self, version: Version) -> DeltaResult<ParsedLogPath<Url>> {
         let filename = format!("{version:020}.json");
-        let path = self.0.join(&filename)?;
+        let path = self.log_root().join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
@@ -416,7 +452,7 @@ impl LogRoot {
     ) -> DeltaResult<ParsedLogPath<Url>> {
         let uuid = uuid::Uuid::new_v4();
         let filename = format!("{version:020}.{uuid}.json");
-        let path = self.0.join(&filename)?;
+        let path = self.log_root().join(STAGED_COMMITS_DIR)?.join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
@@ -424,17 +460,49 @@ impl LogRoot {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::utils::test_utils::assert_result_error_with_message;
     use object_store::memory::InMemory;
     use test_utils::add_commit;
+
+    impl ParsedLogPath<FileMeta> {
+        pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {
+            let filename = format!("{version:020}.json");
+            let location = table_root
+                .join(DELTA_LOG_DIR_WITH_SLASH)
+                .unwrap()
+                .join(&filename)
+                .unwrap();
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+                .unwrap()
+                .unwrap();
+            assert!(parsed.file_type == LogPathFileType::Commit);
+            parsed
+        }
+
+        pub(crate) fn create_parsed_staged_commit(table_root: &Url, version: Version) -> Self {
+            let uuid = Uuid::new_v4();
+            let filename = format!("{version:020}.{uuid}.json");
+            let location = table_root
+                .join(DELTA_LOG_DIR_WITH_SLASH)
+                .unwrap()
+                .join(STAGED_COMMITS_DIR)
+                .unwrap()
+                .join(&filename)
+                .unwrap();
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+                .unwrap()
+                .unwrap();
+            assert!(parsed.file_type == LogPathFileType::StagedCommit);
+            parsed
+        }
+    }
 
     fn table_root_dir_url() -> Url {
         let path = PathBuf::from("./tests/data/table-with-dv-small/");
@@ -958,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
         let table_url = url::Url::parse("memory://test/").unwrap();
 
         // Create a commit file with ICT using add_commit
@@ -987,7 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
         let table_url = url::Url::parse("memory://test/").unwrap();
 
         // Create a commit file without ICT

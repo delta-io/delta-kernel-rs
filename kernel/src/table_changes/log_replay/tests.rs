@@ -10,10 +10,12 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
+use test_utils::LoggingTest;
 
 use itertools::Itertools;
 use std::collections::HashMap;
@@ -25,6 +27,93 @@ fn get_schema() -> StructType {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("value", DataType::STRING),
     ])
+}
+
+fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
+    let metadata = Metadata::try_new(
+        None,
+        None,
+        get_schema(),
+        vec![],
+        0,
+        HashMap::from([
+            ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+            ("delta.columnMapping.mode".to_string(), "none".to_string()),
+        ]),
+    )
+    .unwrap();
+    // CDF requires min_writer_version = 4
+    let protocol = Protocol::try_new(1, 4, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+    TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
+}
+
+/// Helper to create a Metadata action with the given schema and configuration
+fn metadata_action(schema: StructType, configuration: HashMap<String, String>) -> Action {
+    Action::Metadata(Metadata::try_new(None, None, schema, vec![], 0, configuration).unwrap())
+}
+
+/// Helper to create a Metadata action with CDF enabled
+fn metadata_with_cdf(schema: StructType) -> Action {
+    metadata_action(
+        schema,
+        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+    )
+}
+
+/// Helper to create a Protocol action
+fn protocol_action(
+    min_reader: i32,
+    min_writer: i32,
+    reader_features: Option<Vec<TableFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
+) -> Action {
+    Action::Protocol(
+        Protocol::try_new(min_reader, min_writer, reader_features, writer_features).unwrap(),
+    )
+}
+
+/// Helper to execute table_changes_action_iter for a specific version range
+fn execute_table_changes(
+    engine: Arc<dyn Engine>,
+    mock_table: &LocalMockTable,
+    start_version: Version,
+    end_version: Option<Version>,
+) -> DeltaResult<Vec<TableChangesScanMetadata>> {
+    let commits = get_segment(
+        engine.as_ref(),
+        mock_table.table_root(),
+        start_version,
+        end_version,
+    )?
+    .into_iter();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)?
+        .try_collect()
+}
+
+/// Helper to assert midstream failure pattern:
+/// - Reading v0 alone succeeds
+/// - Reading v0-v1 fails with ChangeDataFeedUnsupported
+/// - Reading v1 alone fails with ChangeDataFeedUnsupported
+fn assert_midstream_failure(engine: Arc<dyn Engine>, mock_table: &LocalMockTable) {
+    // Reading just the first commit (0 to 0) should succeed
+    let res_v0 = execute_table_changes(engine.clone(), mock_table, 0, Some(0));
+    assert!(res_v0.is_ok(), "Reading version 0 alone should succeed");
+
+    // Reading commits 0-1 should fail
+    let res_v0_v1 = execute_table_changes(engine.clone(), mock_table, 0, Some(1));
+    assert!(
+        matches!(res_v0_v1, Err(Error::ChangeDataFeedUnsupported(_))),
+        "Reading versions 0-1 should fail"
+    );
+
+    // Reading just commit 1 should also fail
+    let res_v1 = execute_table_changes(engine, mock_table, 1, Some(1));
+    assert!(
+        matches!(res_v1, Err(Error::ChangeDataFeedUnsupported(_))),
+        "Reading version 1 alone should fail"
+    );
 }
 
 fn get_segment(
@@ -80,7 +169,7 @@ async fn metadata_protocol() {
                     3,
                     7,
                     Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
                 )
                 .unwrap(),
             ),
@@ -91,8 +180,11 @@ async fn metadata_protocol() {
         .unwrap()
         .into_iter();
 
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
     let scan_batches =
-        table_changes_action_iter(engine, commits, get_schema().into(), None).unwrap();
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap();
     let sv = result_to_sv(scan_batches);
     assert_eq!(sv, &[false, false]);
 }
@@ -121,8 +213,10 @@ async fn cdf_not_enabled() {
         .unwrap()
         .into_iter();
 
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
@@ -138,8 +232,14 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+                Some([
+                    TableFeature::DeletionVectors,
+                    TableFeature::unknown("unsupportedReaderFeature"),
+                ]),
+                Some([
+                    TableFeature::DeletionVectors,
+                    TableFeature::unknown("unsupportedReaderFeature"),
+                ]),
             )
             .unwrap(),
         )])
@@ -149,15 +249,18 @@ async fn unsupported_reader_feature() {
         .unwrap()
         .into_iter();
 
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
 }
+
 #[tokio::test]
-async fn column_mapping_should_fail() {
+async fn column_mapping_should_succeed() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
@@ -185,15 +288,67 @@ async fn column_mapping_should_fail() {
         .unwrap()
         .into_iter();
 
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    // Column mapping with CDF should now succeed
+    assert!(res.is_ok(), "CDF should now support column mapping");
 }
 
-// Note: This should be removed once type widening support is added for CDF
+// Test that CDF fails when disabled mid-stream
+#[tokio::test]
+async fn cdf_disabled_midstream() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    // First commit: CDF enabled
+    mock_table.commit([metadata_with_cdf(get_schema())]).await;
+
+    // Second commit: CDF disabled
+    mock_table
+        .commit([metadata_action(
+            get_schema(),
+            HashMap::from([(
+                "delta.enableChangeDataFeed".to_string(),
+                "false".to_string(),
+            )]),
+        )])
+        .await;
+
+    assert_midstream_failure(engine, &mock_table);
+}
+
+// Test that unsupported protocol features added mid-stream are rejected
+#[tokio::test]
+async fn unsupported_protocol_feature_midstream() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    // First commit: Basic protocol with CDF enabled
+    mock_table
+        .commit([
+            protocol_action(2, 6, None, None),
+            metadata_with_cdf(get_schema()),
+        ])
+        .await;
+
+    // Second commit: Protocol update with unsupported feature
+    mock_table
+        .commit([protocol_action(
+            3,
+            7,
+            Some(vec![TableFeature::unknown("unsupportedFeature")]),
+            Some(vec![TableFeature::unknown("unsupportedFeature")]),
+        )])
+        .await;
+
+    assert_midstream_failure(engine, &mock_table);
+}
+
 #[tokio::test]
 async fn incompatible_schemas_fail() {
     async fn assert_incompatible_schema(commit_schema: StructType, cdf_schema: StructType) {
@@ -218,8 +373,10 @@ async fn incompatible_schemas_fail() {
             .unwrap()
             .into_iter();
 
+        let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_config = get_default_table_config(&table_root_url);
         let res: DeltaResult<Vec<_>> =
-            table_changes_action_iter(engine, commits, cdf_schema.into(), None)
+            table_changes_action_iter(engine, &table_config, commits, cdf_schema.into(), None)
                 .unwrap()
                 .try_collect();
 
@@ -285,6 +442,113 @@ async fn incompatible_schemas_fail() {
     assert_incompatible_schema(schema, get_schema()).await;
 }
 
+// Helper function to test schema evolution scenarios.
+// Returns an error if schema evolution fails (which is expected currently).
+async fn test_schema_evolution(
+    initial_schema: StructType,
+    evolved_schema: StructType,
+) -> DeltaResult<Vec<TableChangesScanMetadata>> {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    // Create initial commit with initial schema
+    mock_table
+        .commit([
+            metadata_with_cdf(initial_schema.clone()),
+            protocol_action(1, 1, None, None),
+        ])
+        .await;
+
+    // Add some data with initial schema
+    mock_table
+        .commit([Action::Add(Add {
+            path: "file1.parquet".into(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+
+    // Evolve the schema
+    mock_table
+        .commit([metadata_with_cdf(evolved_schema.clone())])
+        .await;
+
+    // Add data with evolved schema
+    mock_table
+        .commit([Action::Add(Add {
+            path: "file2.parquet".into(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    // Try to read CDF using the evolved schema - this currently fails
+    table_changes_action_iter(engine, &table_config, commits, evolved_schema.into(), None)?
+        .try_collect()
+}
+
+// This test demonstrates various schema evolution scenarios that currently fail
+// but could be supported in the future. See: https://github.com/delta-io/delta-kernel-rs/issues/523
+#[tokio::test]
+async fn demonstration_schema_evolution_failures() {
+    // Scenario 1: Adding a nullable column (safe evolution)
+    // Initial: {id: int, value: string}
+    // Evolved: {id: int, value: string, new_col: int?}
+    let initial = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let evolved = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+        StructField::nullable("new_col", DataType::INTEGER),
+    ]);
+    let res = test_schema_evolution(initial, evolved).await;
+    assert!(
+        matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+        "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
+    );
+
+    // Scenario 2: Type widening (int -> long) - supported by type widening feature
+    // Initial: {id: int, value: string}
+    // Evolved: {id: long, value: string}
+    let initial = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let evolved = StructType::new_unchecked([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let res = test_schema_evolution(initial, evolved).await;
+    assert!(
+        matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+        "Expected ChangeDataFeedIncompatibleSchema error for type widening"
+    );
+
+    // Scenario 3: Changing nullability from non-null to nullable (safe evolution)
+    // Initial: {id: int!, value: string}
+    // Evolved: {id: int?, value: string}
+    let initial = StructType::new_unchecked([
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let evolved = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let res = test_schema_evolution(initial, evolved).await;
+    assert!(
+        matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+        "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
+    );
+}
+
 #[tokio::test]
 async fn add_remove() {
     let engine = Arc::new(SyncEngine::new());
@@ -308,7 +572,9 @@ async fn add_remove() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -358,7 +624,9 @@ async fn filter_data_change() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -404,7 +672,9 @@ async fn cdc_selection() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -470,7 +740,9 @@ async fn dv() {
         },
     )])
     .into();
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -548,13 +820,21 @@ async fn data_skipping_filter() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
-        .unwrap()
-        .flat_map(|scan_metadata| {
-            let scan_metadata = scan_metadata.unwrap();
-            scan_metadata.selection_vector
-        })
-        .collect_vec();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let sv = table_changes_action_iter(
+        engine,
+        &table_config,
+        commits,
+        logical_schema.into(),
+        predicate,
+    )
+    .unwrap()
+    .flat_map(|scan_metadata| {
+        let scan_metadata = scan_metadata.unwrap();
+        scan_metadata.selection_vector
+    })
+    .collect_vec();
 
     // Note: since the first pair is a dv operation, remove action will always be filtered
     assert_eq!(sv, &[false, true, false, false, true]);
@@ -593,8 +873,10 @@ async fn failing_protocol() {
         .unwrap()
         .into_iter();
 
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
@@ -623,6 +905,260 @@ async fn file_meta_timestamp() {
 
     let commit = commits.next().unwrap();
     let file_meta_ts = commit.location.last_modified;
-    let scanner = LogReplayScanner::try_new(engine.as_ref(), commit, &get_schema().into()).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let mut table_config = get_default_table_config(&table_root_url);
+    let scanner = LogReplayScanner::try_new(
+        engine.as_ref(),
+        &mut table_config,
+        commit,
+        &get_schema().into(),
+    )
+    .unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
+}
+
+#[tokio::test]
+async fn print_table_configuration() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            Action::Protocol(
+                Protocol::try_new(
+                    3,
+                    7,
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Table configuration updated during CDF query"));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("writerFeatures=[deletionVectors, changeDataFeed]"));
+    assert!(log_output.contains("minReaderVersion=3"));
+    assert!(log_output.contains("minWriterVersion=7"));
+    assert!(log_output.contains("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
+    assert!(log_output.contains("configuration="));
+    assert!(log_output.contains("\"delta.enableChangeDataFeed\": \"true\""));
+    assert!(log_output.contains("\"delta.columnMapping.mode\": \"none\""));
+    assert!(log_output.contains("\"delta.enableDeletionVectors\": \"true\""));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    // This specific commit (with these actions) isn't necessary to test the tracing for this test, we just need to have one commit with any actions
+    mock_table
+        .commit([
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            Action::Protocol(
+                Protocol::try_new(
+                    3,
+                    7,
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("remove_dvs_size=0"));
+    assert!(log_output.contains("has_cdc_action=false"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1_has_cdc() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    mock_table
+        .commit([
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Cdc(Cdc {
+                path: "fake_path_2".into(),
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("remove_dvs_size=0"));
+    assert!(log_output.contains("has_cdc_action=true"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1_has_dv() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    let deletion_vector1 = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+        offset: Some(1),
+        size_in_bytes: 36,
+        cardinality: 2,
+    };
+    let deletion_vector2 = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
+        offset: Some(1),
+        size_in_bytes: 38,
+        cardinality: 3,
+    };
+    // - fake_path_1 undergoes a restore. All rows are restored, so the deletion vector is removed.
+    // - All remaining rows of fake_path_2 are deleted
+    mock_table
+        .commit([
+            Action::Remove(Remove {
+                path: "fake_path_1".into(),
+                data_change: true,
+                deletion_vector: Some(deletion_vector1.clone()),
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Remove(Remove {
+                path: "fake_path_2".into(),
+                data_change: true,
+                deletion_vector: Some(deletion_vector2.clone()),
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    let expected_remove_dvs: Arc<HashMap<String, DvInfo>> = HashMap::from([(
+        "fake_path_1".to_string(),
+        DvInfo {
+            deletion_vector: Some(deletion_vector1.clone()),
+        },
+    )])
+    .into();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains(&format!("remove_dvs_size={}", expected_remove_dvs.len())));
+    assert!(log_output.contains("has_cdc_action=false"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
 }

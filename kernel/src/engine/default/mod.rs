@@ -7,9 +7,10 @@
 //! the [executor] module.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
+use futures::stream::{BoxStream, StreamExt as _};
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -20,6 +21,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
@@ -31,7 +33,57 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod stats;
 pub mod storage;
+
+/// Converts a Stream-producing future to a synchronous iterator.
+///
+/// This method performs the initial blocking call to extract the stream from the future, and each
+/// subsequent call to `next` on the iterator translates to a blocking `stream.next()` call, using
+/// the provided `task_executor`. Buffered streams allow concurrency in the form of prefetching,
+/// because that initial call will attempt to populate the N buffer slots; every call to
+/// `stream.next()` leaves an empty slot (out of N buffer slots) that the stream immediately
+/// attempts to fill by launching another future that can make progress in the background while we
+/// block on and consume each of the N-1 entries that precede it.
+///
+/// This is an internal utility for bridging object_store's async API to
+/// Delta Kernel's synchronous handler traits.
+pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
+    task_executor: Arc<E>,
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
+) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    Ok(Box::new(BlockingStreamIterator {
+        stream: Some(task_executor.block_on(stream_future)?),
+        task_executor,
+    }))
+}
+
+struct BlockingStreamIterator<T: Send + 'static, E: executor::TaskExecutor> {
+    stream: Option<BoxStream<'static, T>>,
+    task_executor: Arc<E>,
+}
+
+impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIterator<T, E> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Move the stream into the future so we can block on it.
+        let mut stream = self.stream.take()?;
+        let (item, stream) = self
+            .task_executor
+            .block_on(async move { (stream.next().await, stream) });
+
+        // We must not poll an exhausted stream after it returned None.
+        if item.is_some() {
+            self.stream = Some(stream);
+        }
+
+        item
+    }
+}
+
+const DEFAULT_BUFFER_SIZE: usize = 1000;
+const DEFAULT_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
@@ -40,41 +92,96 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn try_new<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        // table root is the path of the table in the ObjectStore
-        let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(object_store), task_executor))
+/// Builder for creating [`DefaultEngine`] instances.
+///
+/// # Example
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use delta_kernel::engine::default::DefaultEngineBuilder;
+/// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+/// # use object_store::local::LocalFileSystem;
+/// // Build a DefaultEngine with default executor
+/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+///     .build();
+///
+/// // Build with a custom executor
+/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
+///     .build();
+/// ```
+#[derive(Debug)]
+pub struct DefaultEngineBuilder<E: TaskExecutor> {
+    object_store: Arc<DynObjectStore>,
+    task_executor: Arc<E>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+}
+
+impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self {
+            object_store,
+            task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+            metrics_reporter: None,
+        }
+    }
+}
+
+impl<E: TaskExecutor> DefaultEngineBuilder<E> {
+    /// Set the metrics reporter for the engine.
+    pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
+        self.metrics_reporter = Some(reporter);
+        self
     }
 
-    /// Create a new [`DefaultEngine`] instance
+    /// Set a custom task executor for the engine.
+    ///
+    /// See [`executor::TaskExecutor`] for more details.
+    pub fn with_task_executor<F: TaskExecutor>(
+        self,
+        task_executor: Arc<F>,
+    ) -> DefaultEngineBuilder<F> {
+        DefaultEngineBuilder {
+            object_store: self.object_store,
+            task_executor,
+            metrics_reporter: self.metrics_reporter,
+        }
+    }
+
+    /// Build the [`DefaultEngine`] instance.
+    pub fn build(self) -> DefaultEngine<E> {
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
+    }
+}
+
+impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a [`DefaultEngineBuilder`] for constructing a [`DefaultEngine`] with custom options.
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn builder(
+        object_store: Arc<DynObjectStore>,
+    ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+        DefaultEngineBuilder::new(object_store)
+    }
+}
+
+impl<E: TaskExecutor> DefaultEngine<E> {
+    fn new_with_opts(
+        object_store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+    ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+                None,
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
@@ -86,6 +193,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
+            metrics_reporter,
         }
     }
 
@@ -101,7 +209,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.schema();
+        let output_schema = write_context.physical_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
@@ -109,7 +217,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
         self.parquet
-            .write_parquet_file(write_context.target_dir(), physical_data, partition_values)
+            .write_parquet_file(
+                write_context.target_dir(),
+                physical_data,
+                partition_values,
+                Some(write_context.stats_columns()),
+            )
             .await
     }
 }
@@ -129,6 +242,10 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        self.metrics_reporter.clone()
     }
 }
 
@@ -163,17 +280,88 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
+    use crate::metrics::MetricEvent;
     use object_store::local::LocalFileSystem;
+
+    #[derive(Debug)]
+    struct TestMetricsReporter;
+
+    impl MetricsReporter for TestMetricsReporter {
+        fn report(&self, _event: MetricEvent) {}
+    }
 
     #[test]
     fn test_default_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngineBuilder::new(object_store).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_new_and_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngineBuilder::new(object_store).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_with_metrics_reporter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let reporter = Arc::new(TestMetricsReporter);
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_metrics_reporter(reporter)
+            .build();
+        assert!(engine.get_metrics_reporter().is_some());
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_with_custom_executor() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let executor = Arc::new(executor::tokio::TokioMultiThreadExecutor::new(
+            rt.handle().clone(),
+        ));
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_task_executor(executor)
+            .build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::builder(object_store).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_all_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let reporter = Arc::new(TestMetricsReporter);
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_metrics_reporter(reporter)
+            .with_task_executor(executor)
+            .build();
+        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
