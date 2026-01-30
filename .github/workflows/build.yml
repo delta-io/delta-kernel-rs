@@ -210,7 +210,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls,uc_catalog
 
   coverage:
     runs-on: ubuntu-latest
