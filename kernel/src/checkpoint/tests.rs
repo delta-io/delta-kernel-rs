@@ -276,7 +276,7 @@ fn do_checkpoint<E: Engine>(snapshot: SnapshotRef, engine: &E) -> DeltaResult<()
     // Get checkpoint data iterator and consume it while collecting filtered batches
     let mut data_iter = writer.checkpoint_data(engine)?;
     let mut filtered_batches: Vec<Box<dyn EngineData>> = Vec::new();
-    while let Some(batch_result) = data_iter.next() {
+    for batch_result in data_iter.by_ref() {
         let filtered_data: FilteredEngineData = batch_result?;
         if filtered_data.has_selected_rows() {
             filtered_batches.push(filtered_data.apply_selection_vector()?);
