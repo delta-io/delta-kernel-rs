@@ -462,12 +462,14 @@ mod tests {
         static LAST_COMMIT_TABLE_ID: Mutex<Option<String>> = Mutex::new(None);
         static STAGED_COMMIT_FILE_NAME: Mutex<Option<String>> = Mutex::new(None);
 
+        // LCOV_EXCL_START
         #[no_mangle]
         extern "C" fn test_uc_get_commits(
             _request: CommitsRequest,
         ) -> Handle<ExclusiveCommitsResponse> {
             panic!("Shouldn't be called");
         }
+        // LCOV_EXCL_STOP
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
@@ -491,10 +493,10 @@ mod tests {
             OptionalValue::None
         }
 
-        let schema = Arc::new(StructType::try_new(vec![
+        let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("string", DataType::STRING),
-        ])?);
+        ]));
 
         let tmp_test_dir = tempdir()?;
         let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
