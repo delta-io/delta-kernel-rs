@@ -63,6 +63,12 @@ use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
 // Re-export for use by the pipeline
 pub(crate) use registry::TRANSFORM_REGISTRY;
 
+// Re-export transforms for tests
+#[cfg(test)]
+pub(crate) use transforms::{
+    DeltaPropertyValidationTransform, FeatureSignalTransform, ProtocolVersionTransform,
+};
+
 // ============================================================================
 // Transform Types
 // ============================================================================
@@ -99,7 +105,7 @@ pub(crate) use registry::TRANSFORM_REGISTRY;
 /// validated in `validate_preconditions()` using `FeatureInfo.feature_requirements`.
 /// TODO: Implement this when per-feature transforms (ColumnMapping, DomainMetadata, etc.)
 /// are added. The topological sort ensures dependent transforms have already run by that point.
-
+///
 /// Canonical identifier for each transform type.
 ///
 /// Used for:
@@ -488,12 +494,11 @@ impl TransformationPipeline {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_features::TableFeature;
 
     /// Helper to construct a HashMap<String, String> from string slice pairs.
-    #[allow(dead_code)]
     fn props<const N: usize>(pairs: [(&str, &str); N]) -> HashMap<String, String> {
         pairs
             .into_iter()
@@ -502,10 +507,283 @@ mod tests {
     }
 
     /// Helper to create a simple test schema.
-    #[allow(dead_code)]
     fn test_schema() -> StructType {
         StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)])
     }
-}
 
-// Note: Transform-specific tests are added with the implementations in a follow-up commit.
+    // =========================================================================
+    // FeatureSignalTransform Tests
+    // =========================================================================
+
+    #[test]
+    fn test_feature_flag_transform_parses_signals() {
+        let properties = props([
+            ("delta.feature.deletionVectors", "supported"),
+            ("delta.feature.changeDataFeed", "supported"),
+            ("myapp.version", "1.0"),
+        ]);
+
+        let transform = FeatureSignalTransform::new(&properties)
+            .unwrap()
+            .expect("Should have signals");
+
+        assert_eq!(transform.signals.len(), 2);
+    }
+
+    #[test]
+    fn test_feature_flag_transform_rejects_invalid_value() {
+        let properties = props([("delta.feature.deletionVectors", "enabled")]);
+
+        let result = FeatureSignalTransform::new(&properties);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Only 'supported' is allowed"));
+    }
+
+    #[test]
+    fn test_feature_flag_transform_rejects_unknown_feature() {
+        let properties = props([("delta.feature.unknownFeature", "supported")]);
+
+        let result = FeatureSignalTransform::new(&properties);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown"));
+    }
+
+    #[test]
+    fn test_feature_flag_transform_adds_features() {
+        let properties = props([("delta.feature.deletionVectors", "supported")]);
+
+        let transform = FeatureSignalTransform::new(&properties)
+            .unwrap()
+            .expect("Should have signals");
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let result = transform.apply(config).unwrap();
+
+        let writer_features = result.protocol.writer_features().unwrap();
+        assert!(writer_features.contains(&TableFeature::DeletionVectors));
+    }
+
+    #[test]
+    fn test_feature_flag_transform_strips_signals_from_metadata() {
+        let properties = props([
+            ("delta.feature.deletionVectors", "supported"),
+            ("myapp.version", "1.0"),
+        ]);
+
+        let transform = FeatureSignalTransform::new(&properties)
+            .unwrap()
+            .expect("Should have signals");
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let result = transform.apply(config).unwrap();
+
+        // Signal should be stripped
+        assert!(!result
+            .metadata
+            .configuration()
+            .contains_key("delta.feature.deletionVectors"));
+        // User property should remain
+        assert!(result.metadata.configuration().contains_key("myapp.version"));
+    }
+
+    // =========================================================================
+    // ProtocolVersionTransform Tests
+    // =========================================================================
+
+    #[test]
+    fn test_protocol_version_transform_uses_defaults() {
+        let properties = HashMap::new();
+        let config = TableProtocolMetadataConfig::new(test_schema(), vec![], properties).unwrap();
+
+        let transform = ProtocolVersionTransform;
+        let result = transform.apply(config).unwrap();
+
+        // Default to v3/v7 for table features support
+        assert_eq!(result.protocol.min_reader_version(), 3);
+        assert_eq!(result.protocol.min_writer_version(), 7);
+    }
+
+    #[test]
+    fn test_protocol_version_transform_sets_version() {
+        let properties = props([
+            ("delta.minReaderVersion", "3"),
+            ("delta.minWriterVersion", "7"),
+        ]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = ProtocolVersionTransform;
+        let result = transform.apply(config).unwrap();
+
+        assert_eq!(result.protocol.min_reader_version(), 3);
+        assert_eq!(result.protocol.min_writer_version(), 7);
+    }
+
+    #[test]
+    fn test_protocol_version_transform_rejects_invalid_reader_version() {
+        let properties = props([("delta.minReaderVersion", "2")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = ProtocolVersionTransform;
+        let result = transform.apply(config);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("minReaderVersion"));
+    }
+
+    #[test]
+    fn test_protocol_version_transform_rejects_invalid_writer_version() {
+        let properties = props([("delta.minWriterVersion", "6")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = ProtocolVersionTransform;
+        let result = transform.apply(config);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("minWriterVersion"));
+    }
+
+    #[test]
+    fn test_protocol_version_transform_rejects_non_integer() {
+        let properties = props([("delta.minReaderVersion", "abc")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = ProtocolVersionTransform;
+        let result = transform.apply(config);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_protocol_version_transform_strips_signals_from_metadata() {
+        let properties = props([
+            ("delta.minReaderVersion", "3"),
+            ("delta.minWriterVersion", "7"),
+            ("myapp.version", "1.0"),
+        ]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = ProtocolVersionTransform;
+        let result = transform.apply(config).unwrap();
+
+        // Version signals should be stripped
+        assert!(!result
+            .metadata
+            .configuration()
+            .contains_key("delta.minReaderVersion"));
+        assert!(!result
+            .metadata
+            .configuration()
+            .contains_key("delta.minWriterVersion"));
+        // User property should remain
+        assert!(result.metadata.configuration().contains_key("myapp.version"));
+    }
+
+    // =========================================================================
+    // DeltaPropertyValidationTransform Tests
+    // =========================================================================
+
+    #[test]
+    fn test_delta_property_validation_allows_signal_flags() {
+        let properties = props([("delta.feature.deletionVectors", "supported")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = DeltaPropertyValidationTransform;
+        assert!(transform.validate_preconditions(&config).is_ok());
+    }
+
+    #[test]
+    fn test_delta_property_validation_allows_version_properties() {
+        let properties = props([
+            ("delta.minReaderVersion", "3"),
+            ("delta.minWriterVersion", "7"),
+        ]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = DeltaPropertyValidationTransform;
+        assert!(transform.validate_preconditions(&config).is_ok());
+    }
+
+    #[test]
+    fn test_delta_property_validation_allows_user_properties() {
+        let properties = props([("myapp.version", "1.0"), ("spark.sql.shuffle", "200")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = DeltaPropertyValidationTransform;
+        assert!(transform.validate_preconditions(&config).is_ok());
+    }
+
+    #[test]
+    fn test_delta_property_validation_rejects_unsupported_property() {
+        let properties = props([("delta.enableDeletionVectors", "true")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let transform = DeltaPropertyValidationTransform;
+        let result = transform.validate_preconditions(&config);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported during CREATE TABLE"));
+    }
+
+    // =========================================================================
+    // Pipeline Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pipeline_rejects_unsupported_feature() {
+        // DeletionVectors is not in ALLOWED_DELTA_FEATURES, so should be rejected
+        let properties = props([("delta.feature.deletionVectors", "supported")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let result = TransformationPipeline::apply_transforms(config, &properties);
+
+        // Should fail because deletionVectors is not in ALLOWED_DELTA_FEATURES
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported during CREATE TABLE"));
+    }
+
+    #[test]
+    fn test_pipeline_with_invalid_version() {
+        let properties = props([("delta.minReaderVersion", "1")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let result = TransformationPipeline::apply_transforms(config, &properties);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("minReaderVersion"));
+    }
+
+    #[test]
+    fn test_pipeline_with_no_signals() {
+        let properties = props([("myapp.version", "1.0")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let result = TransformationPipeline::apply_transforms(config, &properties);
+
+        assert!(result.is_ok());
+        let final_config = result.unwrap();
+        assert!(final_config.protocol.writer_features().unwrap().is_empty());
+    }
+}
