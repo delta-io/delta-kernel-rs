@@ -220,7 +220,8 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 #[handle_descriptor(target=String, mutable=true, sized=true)]
 pub struct ExclusiveRustString;
 
-/// Allow engines to create an opaque pointer that Rust will understand as a String. This will _panic_
+/// Allow engines to create an opaque pointer that Rust will understand as a String. Returns an
+/// error if the slice contains invalid utf-8 data.
 #[no_mangle]
 pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
