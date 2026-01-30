@@ -6,7 +6,7 @@
 
 ### 🐛 Bug Fixes
 
-1. fix: Include domain metadata in checkpoints (#1718)
+1. fix: Include domain metadata in checkpoints ([#1718])
 
 This issue could cause **data corruption** if kernel is used to checkpoint a table with row-tracking
 enabled, as the row highwatermark is stored in a domain-metadata, and would therefore be lost during
