@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, ScanMetadata};
+use super::{PhysicalPredicate, ScanMetadata, PARSED_STATS_COL_NAME};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
+use crate::expressions::{
+    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
@@ -102,7 +103,10 @@ pub struct SerializableScanState {
 pub struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
-    add_transform: Arc<dyn ExpressionEvaluator>,
+    /// Transform for log batches (commit files) - uses ParseJson for stats
+    log_transform: Arc<dyn ExpressionEvaluator>,
+    /// Transform for checkpoint batches - uses coalesce(stats_parsed, ParseJson) when available
+    checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -142,34 +146,37 @@ impl ScanLogReplayProcessor {
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
-        _checkpoint_info: CheckpointReadInfo,
+        checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
     ) -> DeltaResult<Self> {
-        // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
-        // The DataSkippingFilter and partition_filter components expect the predicate
-        // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
-        // the enum representation to the tuple format.
+        let CheckpointReadInfo {
+            has_stats_parsed,
+            checkpoint_read_schema,
+        } = checkpoint_info;
+
+        let output_schema = scan_row_schema_with_stats(state_info.physical_stats_schema.clone());
+
+        // Extract the physical predicate for data skipping and partition filtering.
+        // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
         let physical_predicate = match &state_info.physical_predicate {
-            PhysicalPredicate::Some(predicate, schema) => {
-                // Valid predicate that can be used for data skipping and partition filtering
-                Some((predicate.clone(), schema.clone()))
-            }
-            PhysicalPredicate::StaticSkipAll => {
-                debug_assert!(false, "StaticSkipAll case should be handled at a higher level and not reach this code");
-                None
-            }
-            PhysicalPredicate::None => {
-                // No predicate provided
-                None
-            }
+            PhysicalPredicate::Some(predicate, schema) => Some((predicate.clone(), schema.clone())),
+            _ => None,
         };
+
         Ok(Self {
-            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
+            partition_filter: physical_predicate.as_ref().map(|(p, _)| p.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
-            add_transform: engine.evaluation_handler().new_expression_evaluator(
-                get_log_add_schema().clone(),
-                get_add_transform_expr(),
-                SCAN_ROW_DATATYPE.clone(),
+            // Log transform: always parse JSON (no stats_parsed in JSON commit files)
+            log_transform: engine.evaluation_handler().new_expression_evaluator(
+                checkpoint_read_schema.clone(),
+                get_add_transform_expr(state_info.physical_stats_schema.clone(), false),
+                output_schema.clone().into(),
+            )?,
+            // Checkpoint transform: use coalesce(stats_parsed, ParseJson) when available
+            checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
+                checkpoint_read_schema,
+                get_add_transform_expr(state_info.physical_stats_schema.clone(), has_stats_parsed),
+                output_schema.into(),
             )?,
             seen_file_keys,
             state_info,
@@ -494,28 +501,65 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
-    LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
+/// Build the scan row schema with optional stats_parsed column.
+///
+/// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
+fn scan_row_schema_with_stats(stats_schema: Option<SchemaRef>) -> SchemaRef {
+    match stats_schema {
+        Some(schema) => {
+            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+            fields.push(StructField::nullable(
+                PARSED_STATS_COL_NAME,
+                schema.as_ref().clone(),
+            ));
+            Arc::new(StructType::new_unchecked(fields))
+        }
+        None => SCAN_ROW_SCHEMA.clone(),
+    }
+}
 
-fn get_add_transform_expr() -> ExpressionRef {
-    use crate::expressions::column_expr_ref;
-    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+/// Build the add transform expression with stats parsing.
+///
+/// # Parameters
+/// - `stats_schema`: Schema for stats_parsed output (or None if no stats output)
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats
+///
+/// The transform includes `stats_parsed` only when `stats_schema` is Some.
+fn get_add_transform_expr(
+    stats_schema: Option<SchemaRef>,
+    has_stats_parsed: bool,
+) -> ExpressionRef {
+    let mut fields = vec![
+        column_expr_ref!("add.path"),
+        column_expr_ref!("add.size"),
+        column_expr_ref!("add.modificationTime"),
+        column_expr_ref!("add.stats"),
+        column_expr_ref!("add.deletionVector"),
         Arc::new(Expression::Struct(vec![
-            column_expr_ref!("add.path"),
-            column_expr_ref!("add.size"),
-            column_expr_ref!("add.modificationTime"),
-            column_expr_ref!("add.stats"),
-            column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(vec![
-                column_expr_ref!("add.partitionValues"),
-                column_expr_ref!("add.baseRowId"),
-                column_expr_ref!("add.defaultRowCommitVersion"),
-                column_expr_ref!("add.tags"),
-                column_expr_ref!("add.clusteringProvider"),
-            ])),
-        ]))
-    });
-    EXPR.clone()
+            column_expr_ref!("add.partitionValues"),
+            column_expr_ref!("add.baseRowId"),
+            column_expr_ref!("add.defaultRowCommitVersion"),
+            column_expr_ref!("add.tags"),
+            column_expr_ref!("add.clusteringProvider"),
+        ])),
+    ];
+
+    // Add stats_parsed when stats output is requested
+    if let Some(schema) = stats_schema {
+        let stats_parsed_expr = if has_stats_parsed {
+            // Checkpoint has stats_parsed - use coalesce to prefer pre-parsed over JSON
+            Expression::coalesce([
+                column_expr!("add.stats_parsed"),
+                Expression::parse_json(column_expr!("add.stats"), schema),
+            ])
+        } else {
+            // No stats_parsed available (JSON log files) - parse JSON
+            Expression::parse_json(column_expr!("add.stats"), schema)
+        };
+        fields.push(Arc::new(stats_parsed_expr));
+    }
+
+    Arc::new(Expression::Struct(fields))
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -580,8 +624,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
+        // Use checkpoint transform (parallel processor only handles checkpoint files)
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions.as_ref())?;
+        let result = self.checkpoint_transform.evaluate(actions.as_ref())?;
         ScanMetadata::try_new(
             result,
             visitor.selection_vector,
@@ -594,11 +639,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
     // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
-    // performed to this function probably also need to be applied to the other copy of the
-    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
-    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
-    // cannot easily be unified.
+    // ParallelLogReplayProcessor>::process_actions_batch`]! Any changes performed to this function
+    // probably also need to be applied to the other copy. The copy exists because
+    // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
+    // `&self`. Presently, the different in mutabilities cannot easily be unified.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -626,8 +670,16 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
+        // Use the correct transform based on batch type:
+        // - Log batches: use ParseJson (no stats_parsed in JSON commit files)
+        // - Checkpoint batches: use coalesce(stats_parsed, ParseJson) when available
+        let transform = if is_log_batch {
+            &self.log_transform
+        } else {
+            &self.checkpoint_transform
+        };
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions.as_ref())?;
+        let result = transform.evaluate(actions.as_ref())?;
         ScanMetadata::try_new(
             result,
             visitor.selection_vector,
@@ -797,13 +849,17 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
         });
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
-            test_checkpoint_info(),
+            checkpoint_info,
         )
         .unwrap();
         for res in iter {
@@ -824,13 +880,17 @@ mod tests {
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-            test_checkpoint_info(),
+            checkpoint_info,
         )
         .unwrap();
 
@@ -903,13 +963,17 @@ mod tests {
         );
 
         let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-            test_checkpoint_info(),
+            checkpoint_info,
         )
         .unwrap();
 
@@ -938,6 +1002,13 @@ mod tests {
             } else {
                 panic!("Should have been a transform expression");
             }
+        }
+    }
+
+    fn test_checkpoint_info() -> CheckpointReadInfo {
+        CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
         }
     }
 
