@@ -102,7 +102,7 @@ mod tests {
         // Try to commit a transaction with FileSystemCommitter
         let committer = Box::new(FileSystemCommitter::new());
         let err = snapshot
-            .transaction(committer)
+            .transaction(committer, &engine)
             .unwrap()
             .commit(&engine)
             .unwrap_err();

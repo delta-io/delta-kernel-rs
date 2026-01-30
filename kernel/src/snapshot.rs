@@ -317,6 +317,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
+        // Read protocol and metadata
         let start = Instant::now();
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
         let read_metadata_duration = start.elapsed();
@@ -509,8 +510,12 @@ impl Snapshot {
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
-    pub fn transaction(self: Arc<Self>, committer: Box<dyn Committer>) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer)
+    pub fn transaction(
+        self: Arc<Self>,
+        committer: Box<dyn Committer>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Transaction> {
+        Transaction::try_new_existing_table(self, committer, engine)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
@@ -571,12 +576,15 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
-    // TODO(#1688): Return a new Snapshot reflecting the published state
-    pub fn publish(&self, engine: &dyn Engine, committer: &dyn Committer) -> DeltaResult<()> {
+    pub fn publish(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+        committer: &dyn Committer,
+    ) -> DeltaResult<SnapshotRef> {
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
         if unpublished_catalog_commits.is_empty() {
-            return Ok(());
+            return Ok(Arc::clone(self));
         }
 
         require!(
@@ -606,7 +614,12 @@ impl Snapshot {
         let publish_metadata =
             PublishMetadata::try_new(self.version(), unpublished_catalog_commits)?;
 
-        committer.publish(engine, publish_metadata)
+        committer.publish(engine, publish_metadata)?;
+
+        Ok(Arc::new(Snapshot::new(
+            self.log_segment().new_as_published()?,
+            self.table_configuration().clone(),
+        )))
     }
 
     /// An API guarded by the `internal-api` feature flag for fetching both user-controlled and
