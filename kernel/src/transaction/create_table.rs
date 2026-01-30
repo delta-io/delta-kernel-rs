@@ -251,8 +251,9 @@ impl CreateTableTransactionBuilder {
             return Err(Error::generic("Schema cannot be empty"));
         }
 
-        // Create initial config with bare protocol and all properties
-        let config = TableProtocolMetadataConfig::new(
+        // Create initial config with bare protocol and user properties only
+        // (delta.* properties are filtered out - transforms read them from TransformContext)
+        let config = TableProtocolMetadataConfig::new_base_for_create(
             (*self.schema).clone(),
             Vec::new(), // partition_columns - added with data layout support
             self.table_properties.clone(),
@@ -358,7 +359,9 @@ mod tests {
 
         // Empty properties are allowed - protocol is created with default features
         let properties = HashMap::new();
-        let config = TableProtocolMetadataConfig::new(schema.clone(), vec![], properties).unwrap();
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema.clone(), vec![], properties)
+                .unwrap();
         assert!(config.metadata.configuration().is_empty());
         // Protocol always has features (even if empty) at version 3/7
         assert_eq!(config.protocol.min_reader_version(), 3);
@@ -371,7 +374,9 @@ mod tests {
             ("myapp.version".to_string(), "1.0".to_string()),
             ("custom.setting".to_string(), "value".to_string()),
         ]);
-        let config = TableProtocolMetadataConfig::new(schema.clone(), vec![], properties).unwrap();
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema.clone(), vec![], properties)
+                .unwrap();
         assert_eq!(
             config.metadata.configuration().get("myapp.version"),
             Some(&"1.0".to_string())
@@ -381,22 +386,23 @@ mod tests {
             Some(&"value".to_string())
         );
 
-        // try_from creates bare protocol and passes all properties through
+        // new_base_for_create creates bare protocol and filters delta.* properties
         let properties = HashMap::from([
             (MIN_READER_VERSION_PROP.to_string(), "3".to_string()),
             (MIN_WRITER_VERSION_PROP.to_string(), "7".to_string()),
             ("myapp.version".to_string(), "1.0".to_string()),
         ]);
-        let config = TableProtocolMetadataConfig::new(schema, vec![], properties).unwrap();
-        // Protocol is bare v3/v7 (transforms would process version signals)
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema, vec![], properties).unwrap();
+        // Protocol is bare v3/v7 (transforms process version signals from TransformContext)
         assert_eq!(config.protocol.min_reader_version(), 3);
         assert_eq!(config.protocol.min_writer_version(), 7);
-        // All properties pass through in try_from (including version props)
-        assert!(config
+        // delta.* properties are filtered out - only user properties remain
+        assert!(!config
             .metadata
             .configuration()
             .contains_key(MIN_READER_VERSION_PROP));
-        assert!(config
+        assert!(!config
             .metadata
             .configuration()
             .contains_key(MIN_WRITER_VERSION_PROP));

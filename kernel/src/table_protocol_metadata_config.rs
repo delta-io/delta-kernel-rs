@@ -7,10 +7,10 @@
 //!
 //! The configuration flows through a transform pipeline:
 //!
-//! 1. `TableProtocolMetadataConfig::new()` - Creates initial config with bare protocol
-//!    and all properties passed through to metadata
+//! 1. `TableProtocolMetadataConfig::new_base_for_create()` - Creates initial config with bare
+//!    protocol and user properties only (delta.* properties filtered out)
 //! 2. `TransformationPipeline::apply_transforms()` - Applies registered transforms based on
-//!    the raw properties (enables features, validates properties, etc.)
+//!    the raw properties from `TransformContext` (enables features, validates properties, etc.)
 //!
 //! See [`crate::table_transformation`] for the transform pipeline implementation.
 //!
@@ -54,10 +54,10 @@ use crate::DeltaResult;
 ///     ("myapp.version".to_string(), "1.0".to_string()),
 /// ]);
 ///
-/// // Create initial config
-/// let config = TableProtocolMetadataConfig::new(schema, vec![], props.clone())?;
+/// // Create initial config (delta.* properties are filtered out)
+/// let config = TableProtocolMetadataConfig::new_base_for_create(schema, vec![], props.clone())?;
 ///
-/// // Apply transforms
+/// // Apply transforms (they read delta.* from TransformContext)
 /// let final_config = TransformationPipeline::apply_transforms(config, &props)?;
 /// ```
 #[derive(Debug)]
@@ -71,21 +71,22 @@ pub(crate) struct TableProtocolMetadataConfig {
 
 #[allow(dead_code)] // Used by table_transformation module
 impl TableProtocolMetadataConfig {
-    /// Create initial config from schema, partition columns, and properties.
+    /// Create base config for CREATE TABLE with only user properties.
     ///
     /// This creates a "bare" configuration:
     /// - Protocol: v3/v7 with empty feature lists
-    /// - Metadata: schema + partition columns + ALL properties (no filtering)
+    /// - Metadata: schema + partition columns + user properties (delta.* filtered out)
     ///
-    /// Signal processing (delta.feature.*, version props) happens in transforms.
+    /// Delta.* properties are transient signals processed by transforms via
+    /// `TransformContext`, not stored in table metadata.
     /// See [`crate::table_transformation::TransformationPipeline`].
     ///
     /// # Arguments
     ///
     /// * `schema` - The table schema
     /// * `partition_columns` - Column names for partitioning
-    /// * `properties` - All user-provided table properties (pass-through)
-    pub(crate) fn new(
+    /// * `properties` - All user-provided table properties (delta.* will be filtered)
+    pub(crate) fn new_base_for_create(
         schema: StructType,
         partition_columns: Vec<String>,
         properties: HashMap<String, String>,
@@ -100,15 +101,20 @@ impl TableProtocolMetadataConfig {
             Some(empty_features.iter()),
         )?;
 
-        // Create Metadata with ALL properties - no filtering here
-        // Transforms will validate and process delta.* properties
+        // Filter out delta.* properties - they are transient signals
+        // processed by transforms via TransformContext, not stored in metadata
+        let user_properties: HashMap<String, String> = properties
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("delta."))
+            .collect();
+
         let metadata = Metadata::try_new(
             None, // name
             None, // description
             schema,
             partition_columns,
             current_time_ms()?,
-            properties,
+            user_properties,
         )?;
 
         Ok(Self { protocol, metadata })
@@ -123,7 +129,8 @@ impl TableProtocolMetadataConfig {
     ///
     /// Returns `true` if the property is:
     /// - Not a delta.* property (user properties like `myapp.version` are always allowed)
-    /// - A signal flag (`delta.feature.*`, `delta.minReaderVersion`, `delta.minWriterVersion`)
+    /// - A feature signal (`delta.feature.*`) for an allowed feature
+    /// - `delta.minReaderVersion` or `delta.minWriterVersion`
     /// - An explicitly allowed delta property
     pub(crate) fn is_delta_property_allowed(key: &str) -> bool {
         // Non-delta properties are always allowed (user properties)
@@ -131,10 +138,17 @@ impl TableProtocolMetadataConfig {
             return true;
         }
 
-        // Signal flags are always allowed (they're processed and stripped)
-        if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
-            return true;
+        // Feature signals: delta.feature.X - check if X is an allowed feature
+        if let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
+            // Parse the feature name and check if it's allowed
+            if let Ok(feature) = feature_name.parse::<TableFeature>() {
+                return Self::is_delta_feature_allowed(&feature);
+            }
+            // Unknown feature name - not allowed
+            return false;
         }
+
+        // Version properties are always allowed
         if key == MIN_READER_VERSION_PROP || key == MIN_WRITER_VERSION_PROP {
             return true;
         }
@@ -187,9 +201,11 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_try_from_creates_bare_protocol() {
+    fn test_new_base_for_create_creates_bare_protocol() {
         let properties = props([("myapp.version", "1.0"), ("custom.property", "value")]);
-        let config = TableProtocolMetadataConfig::new(test_schema(), vec![], properties).unwrap();
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(test_schema(), vec![], properties)
+                .unwrap();
 
         // Protocol should be bare v3/v7 with empty features
         assert_eq!(config.protocol.min_reader_version(), 3);
@@ -199,46 +215,50 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_passes_all_properties_through() {
+    fn test_new_base_for_create_filters_delta_properties() {
         let properties = props([
             ("myapp.version", "1.0"),
             ("delta.feature.deletionVectors", "supported"),
             ("delta.minReaderVersion", "3"),
             ("custom.property", "value"),
         ]);
-        let config = TableProtocolMetadataConfig::new(test_schema(), vec![], properties).unwrap();
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(test_schema(), vec![], properties)
+                .unwrap();
 
-        // ALL properties should be in metadata - no filtering in try_from
-        assert_eq!(config.metadata.configuration().len(), 4);
+        // Only user properties should be in metadata - delta.* properties are filtered out
+        assert_eq!(config.metadata.configuration().len(), 2);
         assert_eq!(
             config.metadata.configuration().get("myapp.version"),
             Some(&"1.0".to_string())
         );
         assert_eq!(
-            config
-                .metadata
-                .configuration()
-                .get("delta.feature.deletionVectors"),
-            Some(&"supported".to_string())
+            config.metadata.configuration().get("custom.property"),
+            Some(&"value".to_string())
         );
-        assert_eq!(
-            config
-                .metadata
-                .configuration()
-                .get("delta.minReaderVersion"),
-            Some(&"3".to_string())
-        );
+        // delta.* properties should NOT be in metadata
+        assert!(!config
+            .metadata
+            .configuration()
+            .contains_key("delta.feature.deletionVectors"));
+        assert!(!config
+            .metadata
+            .configuration()
+            .contains_key("delta.minReaderVersion"));
     }
 
     #[test]
-    fn test_try_from_with_partition_columns() {
+    fn test_new_base_for_create_with_partition_columns() {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("region", DataType::STRING, false),
         ]);
-        let config =
-            TableProtocolMetadataConfig::new(schema, vec!["region".to_string()], HashMap::new())
-                .unwrap();
+        let config = TableProtocolMetadataConfig::new_base_for_create(
+            schema,
+            vec!["region".to_string()],
+            HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(config.metadata.partition_columns(), &["region".to_string()]);
     }
@@ -253,8 +273,12 @@ mod tests {
 
         // With no signal flags, config passes through with empty features
         let properties = props([("myapp.version", "1.0")]);
-        let config =
-            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+        let config = TableProtocolMetadataConfig::new_base_for_create(
+            test_schema(),
+            vec![],
+            properties.clone(),
+        )
+        .unwrap();
 
         let final_config = TransformationPipeline::apply_transforms(config, &properties).unwrap();
 
