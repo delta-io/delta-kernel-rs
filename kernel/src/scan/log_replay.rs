@@ -72,7 +72,8 @@ pub struct SerializableScanState {
 /// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
 /// vector indicating which rows are valid, and any row-level transformation expressions that need
 /// to be applied to the selected rows.
-pub(crate) struct ScanLogReplayProcessor {
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
+pub struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
