@@ -400,7 +400,9 @@ mod tests {
         let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
 
         if let OptionalValue::Some(commit_info) = request.commit_info {
-            let file_name = unsafe { crate::TryFromStringSlice::try_from_slice(&commit_info.file_name).unwrap() };
+            let file_name = unsafe {
+                crate::TryFromStringSlice::try_from_slice(&commit_info.file_name).unwrap()
+            };
             LAST_STAGED_FILENAME.with(|sf| {
                 *sf.borrow_mut() = Some(file_name);
             });
@@ -515,7 +517,10 @@ mod tests {
         LAST_STAGED_FILENAME.with(|sf| {
             let sf = sf.borrow();
             let staged_path = sf.as_ref().unwrap();
-            assert_eq!(staged_path, "_staged_commits/00000000000000000010.uuid.json");
+            assert_eq!(
+                staged_path,
+                "_staged_commits/00000000000000000010.uuid.json"
+            );
         });
 
         unsafe { free_uc_commit_client(client) };
