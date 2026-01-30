@@ -174,6 +174,69 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
     ])))
 }
 
+/// Builds a schema containing only the specified columns from the physical schema.
+/// Uses column names to filter down to the requested fields.
+pub(crate) fn build_schema_for_columns(
+    physical_schema: &StructType,
+    columns: &[ColumnName],
+) -> Option<StructType> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut filter = ColumnNameFilter::new(columns);
+    filter
+        .transform_struct(physical_schema)
+        .map(Cow::into_owned)
+}
+
+/// Filter schema to include only the specified column names.
+struct ColumnNameFilter<'a> {
+    columns: &'a [ColumnName],
+    current_path: Vec<&'a str>,
+}
+
+impl<'a> ColumnNameFilter<'a> {
+    fn new(columns: &'a [ColumnName]) -> Self {
+        Self {
+            columns,
+            current_path: Vec::new(),
+        }
+    }
+
+    fn should_include_field(&self, field_name: &str) -> bool {
+        // Check if any column name starts with the current path + this field
+        self.columns.iter().any(|col| {
+            let parts: Vec<_> = col.iter().collect();
+            if parts.len() < self.current_path.len() + 1 {
+                return false;
+            }
+            // Check if the path prefix matches
+            self.current_path
+                .iter()
+                .zip(parts.iter())
+                .all(|(a, b)| *a == *b)
+                && parts[self.current_path.len()] == field_name
+        })
+    }
+}
+
+impl<'a, 'b> SchemaTransform<'b> for ColumnNameFilter<'a>
+where
+    'b: 'a,
+{
+    fn transform_struct_field(&mut self, field: &'b StructField) -> Option<Cow<'b, StructField>> {
+        if !self.should_include_field(field.name()) {
+            return None;
+        }
+
+        self.current_path.push(field.name());
+        let result = self.recurse_into_struct_field(field);
+        self.current_path.pop();
+        result
+    }
+}
+
 /// Transforms a schema to make all fields nullable.
 /// Used for stats schemas where stats may not be available for all columns.
 pub(crate) struct NullableStatsTransform;
