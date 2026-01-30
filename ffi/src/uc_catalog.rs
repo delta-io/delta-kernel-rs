@@ -124,7 +124,8 @@ pub type CGetCommits = extern "C" fn(request: CommitsRequest) -> Handle<Exclusiv
 /// `Some("error description")` if an error occured.
 // Note, it doesn't make sense to return an ExternResult here because that can't hold the string
 // error msg
-pub type CCommit = extern "C" fn(request: CommitRequest) -> OptionalValue<Handle<ExclusiveRustString>>;
+pub type CCommit =
+    extern "C" fn(request: CommitRequest) -> OptionalValue<Handle<ExclusiveRustString>>;
 
 pub struct FfiUCCommitsClient {
     get_commits_callback: CGetCommits,
