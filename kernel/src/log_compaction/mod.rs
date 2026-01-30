@@ -97,8 +97,8 @@ static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
         StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     ]))
 });

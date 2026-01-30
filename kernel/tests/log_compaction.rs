@@ -407,3 +407,5 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
     );
     Ok(())
 }
+
+// TODO: Add e2e test that log compaction contains domain metadtaas (and not tombstoned ones)
