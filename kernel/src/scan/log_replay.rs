@@ -95,7 +95,7 @@ impl ScanLogReplayProcessor {
     const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
-    pub fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
         Self::new_with_seen_files(engine, state_info, Default::default())
     }
 
