@@ -4,6 +4,7 @@
 //! Partition the leaf files across executors and create one `ParallelPhase` per partition.
 //!
 //! [`SequentialPhase`]: super::sequential_phase::SequentialPhase
+#![allow(unused)]
 
 use std::sync::Arc;
 
@@ -33,7 +34,6 @@ use itertools::Itertools;
 /// - Create one `ParallelPhase<Arc<Processor>>` per executor with its file subset
 /// - Each instance processes its files independently while sharing deduplication state
 #[internal_api]
-#[allow(unused)]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
     leaf_checkpoint_reader: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>>>,

@@ -25,6 +25,8 @@ use stats_schema::{NullCountStatsTransform, NullableStatsTransform};
 #[cfg(test)]
 mod tests;
 
+use delta_kernel_derive::internal_api;
+
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
@@ -52,7 +54,8 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
-pub struct DataSkippingFilter {
+#[internal_api]
+pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,

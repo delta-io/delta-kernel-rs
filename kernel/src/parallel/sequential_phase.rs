@@ -7,6 +7,7 @@
 //!
 //! For multi-part checkpoints, the sequential phase skips manifest processing and returns
 //! the checkpoint parts for parallel processing.
+#![allow(unused)]
 
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
+use delta_kernel_derive::internal_api;
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -61,7 +63,8 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 ///     }
 /// }
 /// ```
-pub struct SequentialPhase<P: LogReplayProcessor> {
+#[internal_api]
+pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
     // The commit reader that will be used to read the commit files
@@ -76,7 +79,8 @@ pub struct SequentialPhase<P: LogReplayProcessor> {
 }
 
 /// Result of sequential log replay processing.
-pub enum AfterSequential<P: LogReplayProcessor> {
+#[internal_api]
+pub(crate) enum AfterSequential<P: LogReplayProcessor> {
     /// All processing complete sequentially - no parallel phase needed.
     Done(P),
     /// Parallel phase needed - distribute files for parallel processing.
@@ -90,7 +94,8 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `processor`: The log replay processor
     /// - `log_segment`: The log segment to process
     /// - `engine`: Engine for reading files
-    pub fn try_new(
+    #[internal_api]
+    pub(crate) fn try_new(
         processor: P,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
@@ -138,7 +143,8 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
-    pub fn finish(self) -> DeltaResult<AfterSequential<P>> {
+    #[internal_api]
+    pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
             return Err(Error::generic(
                 "Must exhaust iterator before calling finish()",

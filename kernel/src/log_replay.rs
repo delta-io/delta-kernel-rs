@@ -205,7 +205,6 @@ impl ActionsBatch {
 }
 
 #[internal_api]
-#[allow(unused)]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
@@ -276,7 +275,8 @@ where
 ///
 /// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
-pub trait LogReplayProcessor: Sized {
+#[internal_api]
+pub(crate) trait LogReplayProcessor: Sized {
     /// The type of results produced by this processor must implement the
     /// [`HasSelectionVector`] trait to allow filtering out batches with no selected rows.
     type Output: HasSelectionVector;
@@ -349,7 +349,8 @@ pub trait LogReplayProcessor: Sized {
 
 /// This trait is used to determine if a processor's output contains any selected rows.
 /// This is used to filter out batches with no selected rows from the log replay results.
-pub trait HasSelectionVector {
+#[internal_api]
+pub(crate) trait HasSelectionVector {
     /// Check if the selection vector contains at least one selected row
     fn has_selected_rows(&self) -> bool;
 }

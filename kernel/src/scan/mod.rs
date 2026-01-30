@@ -21,7 +21,8 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
-use crate::parallel::{AfterSequential, ParallelPhase, SequentialPhase};
+use crate::parallel::parallel_phase::ParallelPhase;
+use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -66,6 +67,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
 #[internal_api]
+#[allow(unused)]
 pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
 
 /// Type alias for the distributed (Phase 2) scan metadata processing.
@@ -73,6 +75,7 @@ pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
 /// This phase processes checkpoint sidecars or multi-part checkpoint parts in parallel.
 /// Create this phase from the files contained in [`AfterPhase1ScanMetadata::Parallel`].
 #[internal_api]
+#[allow(unused)]
 pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
 
 /// Type alias for the result after Phase 1 scan metadata processing completes.
@@ -81,6 +84,7 @@ pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
 /// - `Done`: All processing completed sequentially - no distributed phase needed.
 /// - `Parallel`: Contains processor and files for parallel processing.
 #[internal_api]
+#[allow(unused)]
 pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
 
 /// Builder to scan a snapshot of a table.
@@ -669,7 +673,9 @@ impl Scan {
     /// }
     /// # Ok(())
     /// # }
-    pub fn parallel_scan_metadata(
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
