@@ -11,15 +11,20 @@ use crate::arrow::{
     datatypes::Field,
 };
 use crate::checkpoint::create_last_checkpoint_data;
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngine;
+use crate::engine_data::FilteredEngineData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot, SnapshotRef};
 
+use object_store::local::LocalFileSystem;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
+use tempfile::tempdir;
 use test_utils::delta_path_for_version;
 use url::Url;
 
@@ -261,6 +266,35 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> 
     let data = store.get(&path).await?;
     let byte_data = data.bytes().await?;
     Ok(from_slice(&byte_data)?)
+}
+
+/// Performs a full checkpoint write for the given snapshot.
+fn do_checkpoint<E: Engine>(snapshot: SnapshotRef, engine: &E) -> DeltaResult<()> {
+    let writer = snapshot.checkpoint()?;
+    let checkpoint_path = writer.checkpoint_path()?;
+
+    // Get checkpoint data iterator and consume it while collecting filtered batches
+    let mut data_iter = writer.checkpoint_data(engine)?;
+    let mut filtered_batches: Vec<Box<dyn EngineData>> = Vec::new();
+    for batch_result in data_iter.by_ref() {
+        let filtered_data: FilteredEngineData = batch_result?;
+        if filtered_data.has_selected_rows() {
+            filtered_batches.push(filtered_data.apply_selection_vector()?);
+        }
+    }
+
+    // Write the checkpoint data to parquet
+    let batches_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        Box::new(filtered_batches.into_iter().map(Ok));
+    engine
+        .parquet_handler()
+        .write_parquet_file(checkpoint_path.clone(), batches_iter)?;
+
+    // Get file metadata (size) from storage and finalize
+    let metadata = engine.storage_handler().head(&checkpoint_path)?;
+    writer.finalize(engine, &metadata, data_iter)?;
+
+    Ok(())
 }
 
 /// Tests the `checkpoint()` API with:
@@ -561,3 +595,82 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
     ));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
+    // ===== Setup =====
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // ===== Create Table =====
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["domainMetadata"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    // ===== Create Engine =====
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngine::new_with_executor(store.clone(), executor);
+
+    let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+        let result = txn
+            .with_domain_metadata(domain.to_string(), value.to_string())
+            .commit(&engine)?;
+        assert!(result.is_committed());
+        Ok(())
+    };
+
+    // ===== Commit Domain Metadata =====
+    commit_domain_metadata("foo", "bar1")?;
+    commit_domain_metadata("foo", "bar2")?;
+
+    // ===== Case 1: Verify domain metadata is preserved *before* checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), 2);
+    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    assert_eq!(domain_value, Some("bar2".to_string()));
+
+    // Trigger checkpoint
+    do_checkpoint(snapshot, &engine)?;
+
+    // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(&engine)?;
+    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    assert_eq!(domain_value, Some("bar2".to_string()));
+
+    Ok(())
+}
+
+// TODO: Add test that checkpoint does not contain tombstoned domain metadata.

@@ -91,8 +91,9 @@ use crate::action_reconciliation::log_replay::{
 };
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::actions::{
-    Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
+    CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
@@ -132,6 +133,7 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
         StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     ]))
 });
