@@ -33,6 +33,7 @@ use itertools::Itertools;
 /// - Partition leaf files across N executors
 /// - Create one `ParallelPhase<Arc<Processor>>` per executor with its file subset
 /// - Each instance processes its files independently while sharing deduplication state
+/// cbindgen:ignore
 #[internal_api]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,

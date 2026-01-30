@@ -63,6 +63,7 @@ use delta_kernel_derive::internal_api;
 ///     }
 /// }
 /// ```
+/// cbindgen:ignore
 #[internal_api]
 pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
@@ -79,6 +80,7 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
 }
 
 /// Result of sequential log replay processing.
+/// cbindgen:ignore
 #[internal_api]
 pub(crate) enum AfterSequential<P: LogReplayProcessor> {
     /// All processing complete sequentially - no parallel phase needed.
