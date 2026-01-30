@@ -746,3 +746,5 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 
     Ok(())
 }
+
+// TODO: Add test that checkpoint does not contain tombstoned domain metadata.
