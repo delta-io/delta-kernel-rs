@@ -18,7 +18,6 @@ release = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-itertools = "0.14.0"
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -43,6 +42,7 @@ test_utils = { path = "../test-utils" }
 tokio = { version = "1.47" }
 trybuild = "1.0"
 tempfile = "3.20.0"
+itertools = "0.14.0"
 object_store = "0.12.3"
 
 [features]
