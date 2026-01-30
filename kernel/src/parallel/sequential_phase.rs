@@ -219,6 +219,7 @@ mod tests {
             snapshot.schema(),
             snapshot.table_configuration(),
             None,
+            None,
             (),
         )?);
 
@@ -309,6 +310,7 @@ mod tests {
         let state_info = Arc::new(StateInfo::try_new(
             snapshot.schema(),
             snapshot.table_configuration(),
+            None,
             None,
             (),
         )?);

@@ -3,11 +3,12 @@
 mod column_filter;
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::{
     schema::{
-        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaTransform,
-        StructField, StructType,
+        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+        SchemaTransform, StructField, StructType,
     },
     table_properties::TableProperties,
     DeltaResult,
@@ -149,6 +150,91 @@ pub(crate) fn stats_column_names(
     let mut columns = Vec::new();
     filter.collect_columns(physical_file_schema, &mut columns);
     columns
+}
+
+/// Creates a stats schema from a referenced schema (columns from predicate).
+/// Returns schema: `{ numRecords, nullCount, minValues, maxValues }`
+///
+/// This is used to build the schema for parsing JSON stats and for reading stats_parsed
+/// from checkpoints.
+pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
+    let stats_schema = NullableStatsTransform
+        .transform_struct(referenced_schema)?
+        .into_owned();
+
+    let nullcount_schema = NullCountStatsTransform
+        .transform_struct(&stats_schema)?
+        .into_owned();
+
+    Some(Arc::new(StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("nullCount", nullcount_schema),
+        StructField::nullable("minValues", stats_schema.clone()),
+        StructField::nullable("maxValues", stats_schema),
+    ])))
+}
+
+/// Builds a schema containing only the specified columns from the physical schema.
+/// Uses column names to filter down to the requested fields.
+pub(crate) fn build_schema_for_columns(
+    physical_schema: &StructType,
+    columns: &[ColumnName],
+) -> Option<StructType> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut filter = ColumnNameFilter::new(columns);
+    filter
+        .transform_struct(physical_schema)
+        .map(Cow::into_owned)
+}
+
+/// Filter schema to include only the specified column names.
+struct ColumnNameFilter<'a> {
+    columns: &'a [ColumnName],
+    current_path: Vec<&'a str>,
+}
+
+impl<'a> ColumnNameFilter<'a> {
+    fn new(columns: &'a [ColumnName]) -> Self {
+        Self {
+            columns,
+            current_path: Vec::new(),
+        }
+    }
+
+    fn should_include_field(&self, field_name: &str) -> bool {
+        // Check if any column name starts with the current path + this field
+        self.columns.iter().any(|col| {
+            let parts: Vec<_> = col.iter().collect();
+            if parts.len() < self.current_path.len() + 1 {
+                return false;
+            }
+            // Check if the path prefix matches
+            self.current_path
+                .iter()
+                .zip(parts.iter())
+                .all(|(a, b)| *a == *b)
+                && parts[self.current_path.len()] == field_name
+        })
+    }
+}
+
+impl<'a, 'b> SchemaTransform<'b> for ColumnNameFilter<'a>
+where
+    'b: 'a,
+{
+    fn transform_struct_field(&mut self, field: &'b StructField) -> Option<Cow<'b, StructField>> {
+        if !self.should_include_field(field.name()) {
+            return None;
+        }
+
+        self.current_path.push(field.name());
+        let result = self.recurse_into_struct_field(field);
+        self.current_path.pop();
+        result
+    }
 }
 
 /// Transforms a schema to make all fields nullable.
