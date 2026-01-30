@@ -155,36 +155,46 @@ impl uc_client::UCCommitsClient for FfiUCCommitsClient {
     async fn commit(&self, request: ClientCommitRequest) -> uc_client::Result<()> {
         let table_id = request.table_id;
         let table_uri = request.table_uri;
-        let commit_info = request
-            .commit_info
-            .map(|ci| {
-                let file_name = ci.file_name;
-                let file_name = kernel_string_slice!(file_name);
-                Commit {
-                    version: ci.version,
-                    timestamp: ci.timestamp,
-                    file_name,
-                    file_size: ci.file_size,
-                    file_modification_timestamp: ci.file_modification_timestamp,
+
+        // there is a subtle issue here where we need to ensure that the string we use to refer to
+        // the commit_info.file_name stays in scope until _after_ the callback returns, so that the
+        // KernelStringSlice remains valid. This means we can't get clever with
+        // request.commit_info.map to build an Option<Commit>. Rather we just use a closure to hold
+        // the common code and call it from a scope where the string remains valid until after the
+        // closure finishes
+
+        let send_request = |commit_info| -> uc_client::Result<()> {
+            let c_commit_request = CommitRequest {
+                table_id: kernel_string_slice!(table_id),
+                table_uri: kernel_string_slice!(table_uri),
+                commit_info,
+                latest_backfilled_version: request.latest_backfilled_version.into(),
+                metadata: None.into(),
+                protocol: None.into(),
+            };
+
+            match (self.commit_callback)(c_commit_request) {
+                OptionalValue::Some(e) => {
+                    let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
+                    let s: String = *boxed_str; // move back onto the stack
+                    uc_client::Result::Err(uc_client::Error::Generic(s))
                 }
-            })
-            .into();
-        let c_commit_request = CommitRequest {
-            table_id: kernel_string_slice!(table_id),
-            table_uri: kernel_string_slice!(table_uri),
-            commit_info,
-            latest_backfilled_version: request.latest_backfilled_version.into(),
-            metadata: None.into(),
-            protocol: None.into(),
+                OptionalValue::None => uc_client::Result::Ok(()),
+            }
         };
 
-        match (self.commit_callback)(c_commit_request) {
-            OptionalValue::Some(e) => {
-                let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
-                let s: String = *boxed_str; // move back onto the stack
-                uc_client::Result::Err(uc_client::Error::Generic(s))
-            }
-            OptionalValue::None => uc_client::Result::Ok(()),
+        if let Some(client_commit_info) = request.commit_info {
+            let file_name = client_commit_info.file_name;
+            let commit_info = Some(Commit {
+                version: client_commit_info.version,
+                timestamp: client_commit_info.timestamp,
+                file_name: kernel_string_slice!(file_name),
+                file_size: client_commit_info.file_size,
+                file_modification_timestamp: client_commit_info.file_modification_timestamp,
+            });
+            send_request(commit_info.into())
+        } else {
+            send_request(None.into())
         }
     }
 }
@@ -349,6 +359,7 @@ mod tests {
         static COMMIT_CALLED: RefCell<bool> = const { RefCell::new(false) };
         static LAST_COMMITS_REQUEST: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
         static LAST_COMMIT_REQUEST: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+        static LAST_STAGED_FILENAME: RefCell<Option<String>> = const { RefCell::new(None) };
         static SHOULD_FAIL_COMMIT: RefCell<bool> = const { RefCell::new(false) };
     }
 
@@ -387,6 +398,13 @@ mod tests {
 
         let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
         let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
+
+        if let OptionalValue::Some(commit_info) = request.commit_info {
+            let file_name = unsafe { crate::TryFromStringSlice::try_from_slice(&commit_info.file_name).unwrap() };
+            LAST_STAGED_FILENAME.with(|sf| {
+                *sf.borrow_mut() = Some(file_name);
+            });
+        }
 
         LAST_COMMIT_REQUEST.with(|req| {
             *req.borrow_mut() = Some((table_id.clone(), table_uri.clone()));
@@ -473,7 +491,7 @@ mod tests {
             commit_info: Some(ClientCommit {
                 version: 10,
                 timestamp: 2000000000,
-                file_name: "00000000000000000010.json".to_string(),
+                file_name: "_staged_commits/00000000000000000010.uuid.json".to_string(),
                 file_size: 1024,
                 file_modification_timestamp: 2000000100,
             }),
@@ -492,6 +510,12 @@ mod tests {
             let (table_id, table_uri) = req.as_ref().unwrap();
             assert_eq!(table_id, "test_table_id");
             assert_eq!(table_uri, "s3://bucket/path");
+        });
+
+        LAST_STAGED_FILENAME.with(|sf| {
+            let sf = sf.borrow();
+            let staged_path = sf.as_ref().unwrap();
+            assert_eq!(staged_path, "_staged_commits/00000000000000000010.uuid.json");
         });
 
         unsafe { free_uc_commit_client(client) };
