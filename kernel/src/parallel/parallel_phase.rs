@@ -390,6 +390,7 @@ mod tests {
             snapshot.schema(),
             snapshot.table_configuration(),
             None,
+            None,
             (),
         )?);
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;

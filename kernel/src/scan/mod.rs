@@ -134,7 +134,8 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            (), // No classifer, default is for scans
+            None, // No stats_columns for now - will be added in later PR
+            (),   // No classifer, default is for scans
         )?;
 
         Ok(Scan {
