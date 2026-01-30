@@ -147,6 +147,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         transform_spec,
         column_mapping_mode: ColumnMappingMode::None,
         stats_schema: None,
+        output_stats_schema: None,
     });
     let iter = scan_action_iter(
         &SyncEngine::new(),

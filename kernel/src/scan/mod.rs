@@ -92,6 +92,7 @@ pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    stats_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -99,6 +100,7 @@ impl std::fmt::Debug for ScanBuilder {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
+            .field("stats_columns", &self.stats_columns)
             .finish()
     }
 }
@@ -110,6 +112,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            stats_columns: None,
         }
     }
 
@@ -142,8 +145,37 @@ impl ScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
+    ///
+    /// NOTE (MVP limitation): This method cannot be used together with [`with_stats_columns`].
+    /// Using both will result in an error when calling [`build`].
+    ///
+    /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
+    /// [`build`]: ScanBuilder::build
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
+        self
+    }
+
+    /// Specify columns for which parsed statistics should be included in scan metadata.
+    ///
+    /// When set, the scan will include a `stats_parsed` column in the scan metadata containing
+    /// pre-parsed file statistics (minValues, maxValues, nullCount, numRecords) that integrations
+    /// can use for their own data skipping logic.
+    ///
+    /// # MVP Behavior
+    ///
+    /// Currently only an empty column list (`vec![]`) is supported, which outputs ALL statistics
+    /// from the table's expected stats schema. Specifying specific columns is not yet implemented.
+    ///
+    /// # MVP Limitations
+    ///
+    /// This method cannot be used together with [`with_predicate`]. Using both will result in
+    /// an error when calling [`build`].
+    ///
+    /// [`with_predicate`]: ScanBuilder::with_predicate
+    /// [`build`]: ScanBuilder::build
+    pub fn with_stats_columns(mut self, columns: impl Into<Vec<ColumnName>>) -> Self {
+        self.stats_columns = Some(columns.into());
         self
     }
 
@@ -165,6 +197,7 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
+            self.stats_columns,
             (), // No classifer, default is for scans
         )?;
 
