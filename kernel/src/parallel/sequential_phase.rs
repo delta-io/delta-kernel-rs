@@ -201,10 +201,11 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::get_log_add_schema;
+    use crate::log_segment::CheckpointReadInfo;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state_info::StateInfo;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
-    use std::sync::Arc;
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
     fn verify_sequential_processing(
@@ -222,7 +223,13 @@ mod tests {
             (),
         )?);
 
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        // Use base log add schema for tests - no stats_parsed optimization
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
+
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info, checkpoint_info)?;
         let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Process all batches and collect Add file paths
@@ -313,7 +320,13 @@ mod tests {
             (),
         )?);
 
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        // Use base log add schema for tests - no stats_parsed optimization
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
+
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info, checkpoint_info)?;
         let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Call next() once but don't exhaust the iterator
