@@ -222,6 +222,10 @@ pub struct ExclusiveRustString;
 
 /// Allow engines to create an opaque pointer that Rust will understand as a String. Returns an
 /// error if the slice contains invalid utf-8 data.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid KernelStringSlice
 #[no_mangle]
 pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,

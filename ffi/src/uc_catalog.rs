@@ -42,6 +42,10 @@ pub struct ExclusiveCommitsResponse;
 
 /// Get a handle to an `ExclusiveCommitsResponse`. This can be passed to [`add_commit_to_response`]
 /// to populate the response, and then can be returned from [`get_commits`]
+///
+/// # Safety
+///
+///  Caller is responsible for passing a valid i64 as the table version
 pub unsafe extern "C" fn init_commits_response(
     latest_table_version: i64,
 ) -> Handle<ExclusiveCommitsResponse> {
@@ -54,6 +58,11 @@ pub unsafe extern "C" fn init_commits_response(
 
 /// Add a commit to the response. Important! This consumes the passed response and returns a new
 /// one. The passed response is no longer valid after this call.
+///
+/// # Safety
+///
+///  Caller is responsible for passing a valid pointer to a response, valid `Commit` data, and a
+///  valid error callback
 pub unsafe extern "C" fn add_commit_to_response(
     response: Handle<ExclusiveCommitsResponse>,
     commit: Commit,
@@ -180,6 +189,12 @@ impl uc_client::UCCommitsClient for FfiUCCommitsClient {
 #[handle_descriptor(target=FfiUCCommitsClient, mutable=false, sized=true)]
 pub struct SharedFfiUCCommitsClient;
 
+/// Get a commit client that will call the passed callbacks when it wants to request commits or to
+/// make a commit.
+///
+/// # Safety
+///
+///  Caller is responsible for passing a valid pointers for the callbacks
 #[no_mangle]
 pub unsafe extern "C" fn get_uc_commit_client(
     get_commits_callback: CGetCommits,
@@ -192,6 +207,13 @@ pub unsafe extern "C" fn get_uc_commit_client(
     .into()
 }
 
+/// Get a commit client that will call the passed callbacks when it wants to request commits or to
+/// make a commit.
+///
+/// # Safety
+///
+///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitsClient, obtained via
+///  calling [`get_uc_commit_client`].
 #[no_mangle]
 pub unsafe extern "C" fn get_uc_commiter(
     commit_client: Handle<SharedFfiUCCommitsClient>,
