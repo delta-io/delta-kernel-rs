@@ -105,6 +105,7 @@ pub mod table_features;
 pub mod table_properties;
 mod table_protocol_metadata_config;
 mod table_transformation;
+pub(crate) mod clustering;
 pub mod transaction;
 pub(crate) mod transforms;
 

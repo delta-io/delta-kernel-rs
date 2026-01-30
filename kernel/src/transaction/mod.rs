@@ -47,6 +47,11 @@ pub mod create_table;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod create_table;
 
+#[cfg(feature = "internal-api")]
+pub mod data_layout;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod data_layout;
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;

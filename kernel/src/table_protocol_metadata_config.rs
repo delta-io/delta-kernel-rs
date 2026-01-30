@@ -160,6 +160,14 @@ impl TableProtocolMetadataConfig {
         // "delta.columnMapping.mode",
         // "delta.enableChangeDataFeed",
     ];
+
+    /// Return a new config with updated partition columns.
+    pub(crate) fn with_partition_columns(self, partition_columns: Vec<String>) -> Self {
+        Self {
+            protocol: self.protocol,
+            metadata: self.metadata.with_partition_columns(partition_columns),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,18 +258,22 @@ mod tests {
 
     #[test]
     fn test_apply_transforms_with_no_signals() {
+        use crate::transaction::data_layout::DataLayout;
+
         // With no signal flags, config passes through with empty features
         let properties = props([("myapp.version", "1.0")]);
         let config =
             TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone())
                 .unwrap();
 
-        let final_config = TransformationPipeline::apply_transforms(config, &properties).unwrap();
+        let output =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None)
+                .unwrap();
 
         // Protocol still bare, properties still there
-        assert!(final_config.protocol.writer_features().unwrap().is_empty());
+        assert!(output.config.protocol.writer_features().unwrap().is_empty());
         assert_eq!(
-            final_config.metadata.configuration().get("myapp.version"),
+            output.config.metadata.configuration().get("myapp.version"),
             Some(&"1.0".to_string())
         );
     }
