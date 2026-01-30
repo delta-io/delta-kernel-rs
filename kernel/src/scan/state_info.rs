@@ -16,7 +16,7 @@ use crate::{DeltaResult, Error, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
 #[derive(Debug, Clone)]
-pub struct StateInfo {
+pub(crate) struct StateInfo {
     /// The logical schema for this scan
     pub(crate) logical_schema: SchemaRef,
     /// The physical schema to read from parquet files
