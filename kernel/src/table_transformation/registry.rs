@@ -338,12 +338,8 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
     // Process delta.feature.X=supported signals (if any present)
     // Note: This uses a special factory that parses properties at creation time
     registry.register_operation_transform(TransformTrigger::FeatureSignalsPresent, || {
-        // This factory is only called when signals are present, but we need
-        // to create the transform without access to properties here.
-        // The actual parsing happens in apply_transforms() for this special case.
-        Box::new(FeatureSignalTransform {
-            signals: Vec::new(),
-        })
+        // The transform parses signals from config.metadata in validate_preconditions/apply
+        Box::new(FeatureSignalTransform)
     });
 
     // =========================================================================
