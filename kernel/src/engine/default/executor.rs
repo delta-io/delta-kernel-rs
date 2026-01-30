@@ -200,9 +200,9 @@ pub mod tokio {
                 builder.max_blocking_threads(max_blocking);
             }
 
-            let runtime = builder.build().map_err(|e| {
-                Error::generic(format!("Failed to create Tokio runtime: {e}"))
-            })?;
+            let runtime = builder
+                .build()
+                .map_err(|e| Error::generic(format!("Failed to create Tokio runtime: {e}")))?;
 
             let handle = runtime.handle().clone();
             Ok(Self {
