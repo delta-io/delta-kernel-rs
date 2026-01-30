@@ -275,6 +275,7 @@ where
 ///   filtered by the **selection vector** to determine which rows are included in the final checkpoint.
 ///
 /// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub trait LogReplayProcessor: Sized {
     /// The type of results produced by this processor must implement the
     /// [`HasSelectionVector`] trait to allow filtering out batches with no selected rows.

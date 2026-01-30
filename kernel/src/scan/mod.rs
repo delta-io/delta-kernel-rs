@@ -65,20 +65,23 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
 /// This phase processes commits and single-part checkpoint manifests sequentially.
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
-pub type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
+#[internal_api]
+pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
 
 /// Type alias for the distributed (Phase 2) scan metadata processing.
 ///
 /// This phase processes checkpoint sidecars or multi-part checkpoint parts in parallel.
 /// Create this phase from the files contained in [`AfterPhase1ScanMetadata::Parallel`].
-pub type Phase2ScanMetadata = ParallelPhase<ScanLogReplayProcessor>;
+#[internal_api]
+pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
 
 /// Type alias for the result after Phase 1 scan metadata processing completes.
 ///
 /// This enum indicates whether distributed processing is needed:
 /// - `Done`: All processing completed sequentially - no distributed phase needed.
 /// - `Parallel`: Contains processor and files for parallel processing.
-pub type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
+#[internal_api]
+pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -619,11 +622,20 @@ impl Scan {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::{Engine, Table, DeltaResult};
+    /// # use delta_kernel::{Engine, DeltaResult};
     /// # use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+    /// # use delta_kernel::Snapshot;
+    /// # use url::Url;
+    /// # use delta_kernel::engine::default::DefaultEngineBuilder;
+    /// # use object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
-    /// # let engine: Arc<dyn Engine> = unimplemented!();
-    /// # let snapshot = Table::try_from_uri("path")?.snapshot(&engine, None)?;
+    /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+    /// let table_root = Url::parse("file:///path/to/table")?;
+    ///
+    /// // Build a snapshot
+    /// let snapshot = Snapshot::builder_for(table_root.clone())
+    ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
+    ///     .build(engine.as_ref())?;
     /// let scan = snapshot.scan_builder().build()?;
     /// let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
     ///
@@ -657,7 +669,8 @@ impl Scan {
     /// }
     /// # Ok(())
     /// # }
-    pub fn parallel_scan_metadata(
+    #[internal_api]
+    pub(crate) fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
