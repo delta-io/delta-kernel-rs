@@ -107,7 +107,7 @@ pub(crate) struct RowIndexBuilder {
 
 impl RowIndexBuilder {
     pub(crate) fn new(row_groups: &[RowGroupMetaData]) -> Self {
-        let mut row_group_row_index_ranges = vec![];
+        let mut row_group_row_index_ranges = Vec::with_capacity(row_groups.len());
         let mut offset = 0;
         for row_group in row_groups {
             let num_rows = row_group.num_rows();
@@ -136,7 +136,7 @@ impl RowIndexBuilder {
     pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
-                let mut seen_ordinals = HashSet::new();
+                let mut seen_ordinals = HashSet::with_capacity(ordinals.len());
                 ordinals
                     .iter()
                     .map(|&i| {

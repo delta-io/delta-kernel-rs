@@ -132,8 +132,9 @@ where
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
-        let mut result = vec![];
-        for i in 0..EngineList::len(self, row_index) {
+        let len = EngineList::len(self, row_index);
+        let mut result = Vec::with_capacity(len);
+        for i in 0..len {
             result.push(self.get(row_index, i));
         }
         result
@@ -159,10 +160,10 @@ impl EngineMap for MapArray {
     }
 
     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
-        let mut ret = HashMap::new();
         let map_val = self.value(row_index);
         let keys = map_val.column(0).as_string::<i32>();
         let values = map_val.column(1).as_string::<i32>();
+        let mut ret = HashMap::with_capacity(keys.len());
         for (key, value) in keys.iter().zip(values.iter()) {
             if let (Some(key), Some(value)) = (key, value) {
                 ret.insert(key.into(), value.into());
@@ -221,7 +222,8 @@ impl EngineData for ArrowEngineData {
         // Collect the names of all leaf columns we want to extract, along with their parents, to
         // guide our depth-first extraction. If the list contains any non-leaf, duplicate, or
         // missing column references, the extracted column list will be too short (error out below).
-        let mut mask = HashSet::new();
+        let mask_capacity: usize = leaf_columns.iter().map(|c| c.len()).sum();
+        let mut mask = HashSet::with_capacity(mask_capacity);
         for column in leaf_columns {
             for i in 0..column.len() {
                 mask.insert(&column[..i + 1]);
@@ -229,7 +231,7 @@ impl EngineData for ArrowEngineData {
         }
         debug!("Column mask for selected columns {leaf_columns:?} is {mask:#?}");
 
-        let mut getters = vec![];
+        let mut getters = Vec::with_capacity(leaf_columns.len());
         Self::extract_columns(&mut vec![], &mut getters, leaf_types, &mask, &self.data)?;
         if getters.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
@@ -248,8 +250,12 @@ impl EngineData for ArrowEngineData {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // Combine existing and new schema fields
         let schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
-        let mut combined_fields = self.data.schema().fields().to_vec();
-        combined_fields.extend_from_slice(schema.fields());
+        let existing_schema = self.data.schema();
+        let existing_fields = existing_schema.fields();
+        let new_fields = schema.fields();
+        let mut combined_fields = Vec::with_capacity(existing_fields.len() + new_fields.len());
+        combined_fields.extend_from_slice(existing_fields);
+        combined_fields.extend_from_slice(new_fields);
         let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
 
         // Combine existing and new columns
@@ -257,7 +263,9 @@ impl EngineData for ArrowEngineData {
             .into_iter()
             .map(|array_data| array_data.to_arrow())
             .try_collect()?;
-        let mut combined_columns = self.data.columns().to_vec();
+        let existing_columns = self.data.columns();
+        let mut combined_columns = Vec::with_capacity(existing_columns.len() + new_columns.len());
+        combined_columns.extend_from_slice(existing_columns);
         combined_columns.extend(new_columns);
 
         // Create a new ArrowEngineData with the combined schema and columns
