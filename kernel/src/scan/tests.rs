@@ -374,11 +374,8 @@ fn test_replay_for_scan_metadata() {
 
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
-    let data: Vec<_> = scan
-        .replay_for_scan_metadata(&engine)
-        .unwrap()
-        .try_collect()
-        .unwrap();
+    let result = scan.replay_for_scan_metadata(&engine).unwrap();
+    let data: Vec<_> = result.actions.try_collect().unwrap();
     // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
     // could be skipped when looking for adds/removes.
     //
