@@ -271,6 +271,9 @@ pub struct Transaction {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
+    // enabled. Used for determining which columns require statistics collection.
+    clustering_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -298,7 +301,7 @@ impl Transaction {
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
-        _engine: &dyn Engine,
+        engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
@@ -306,6 +309,9 @@ impl Transaction {
         read_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
+
+        // Read clustering columns from snapshot (returns None if clustering not enabled)
+        let clustering_columns = read_snapshot.get_clustering_columns(engine)?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -322,6 +328,7 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            clustering_columns,
         })
     }
 
@@ -357,6 +364,10 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
+            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
+            // return the correct columns for the new table.
+            clustering_columns: None,
         })
     }
 
@@ -946,7 +957,7 @@ impl Transaction {
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         self.read_snapshot
             .table_configuration()
-            .expected_stats_schema()
+            .expected_stats_schema(self.clustering_columns.as_deref())
     }
 
     /// Returns the list of column names that should have statistics collected.
@@ -964,7 +975,7 @@ impl Transaction {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names()
+            .stats_column_names(self.clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
