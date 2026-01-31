@@ -232,11 +232,10 @@ fn lookup_column_type<'a>(schema: &'a StructType, column: &ColumnName) -> Option
     Some(current_field.data_type())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
             "delta.dataSkippingNumIndexedCols".to_string(),
@@ -336,7 +335,6 @@ mod tests {
             expected.iter().map(|c| ColumnName::new([*c])).collect();
         assert_eq!(columns, expected_cols);
     }
-
 
     #[test]
     fn test_nested_clustering_column_with_limit() {
