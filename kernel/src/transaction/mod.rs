@@ -957,7 +957,7 @@ impl Transaction {
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         self.read_snapshot
             .table_configuration()
-            .expected_stats_schema(self.clustering_columns.as_deref())
+            .expected_stats_schema(self.clustering_columns.as_deref(), None)
     }
 
     /// Returns the list of column names that should have statistics collected.

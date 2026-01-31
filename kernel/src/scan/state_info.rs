@@ -102,6 +102,50 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
+/// Converts logical column names to physical column names for matching against stats schema.
+///
+/// Walks through each component of the column path, finding the corresponding field in the
+/// schema and extracting its physical name. If a component is not found in the schema,
+/// the logical name is used as-is.
+fn logical_to_physical_columns(
+    columns: &[ColumnName],
+    logical_schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|col| logical_to_physical_column_name(col, logical_schema, column_mapping_mode))
+        .collect()
+}
+
+/// Converts a single logical column name to its physical column name.
+///
+/// Traverses the schema hierarchy, mapping each path component from its logical name
+/// to its physical name based on the column mapping mode.
+fn logical_to_physical_column_name(
+    logical_name: &ColumnName,
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> ColumnName {
+    let parts: Vec<_> = logical_name.iter().collect();
+    let mut physical_parts = Vec::with_capacity(parts.len());
+    let mut current_schema = schema;
+
+    for part in parts {
+        if let Some(field) = current_schema.field(part) {
+            physical_parts.push(field.physical_name(column_mapping_mode).to_string());
+            if let DataType::Struct(nested) = field.data_type() {
+                current_schema = nested;
+            }
+        } else {
+            // Column not found in schema, use logical name as-is
+            physical_parts.push(part.to_string());
+        }
+    }
+
+    ColumnName::new(physical_parts)
+}
+
 impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
@@ -222,18 +266,19 @@ impl StateInfo {
         }
 
         // Build output_stats_schema from stats_columns
-        // MVP: only empty list is supported, which means output ALL stats from expected_stats_schema
+        // Read path doesn't have clustering columns (first param), pass requested columns (second param)
         let output_stats_schema = match &stats_columns {
             Some(columns) if columns.is_empty() => {
                 // Empty list means output all stats from expected_stats_schema
-                Some(table_configuration.expected_stats_schema()?)
+                Some(table_configuration.expected_stats_schema(None, None)?)
             }
-            Some(_) => {
-                // Non-empty list not supported in MVP
-                return Err(Error::generic(
-                    "Only empty stats_columns is supported (outputs all stats). \
-                     Specifying specific columns is not yet implemented.",
-                ));
+            Some(columns) => {
+                // Non-empty list: filter expected_stats_schema to requested columns
+                // Convert logical column names to physical for matching against stats schema
+                let physical_columns =
+                    logical_to_physical_columns(columns, &logical_schema, column_mapping_mode);
+
+                Some(table_configuration.expected_stats_schema(None, Some(&physical_columns))?)
             }
             None => None,
         };
