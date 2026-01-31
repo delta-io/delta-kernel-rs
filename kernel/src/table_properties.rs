@@ -26,6 +26,14 @@ pub use deserialize::ParseIntervalError;
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
 
+/// Table property key for specifying the minimum reader protocol version.
+/// This is a signal flag property - it affects protocol creation but is not stored in metadata.
+pub const MIN_READER_VERSION_PROP: &str = "delta.minReaderVersion";
+
+/// Table property key for specifying the minimum writer protocol version.
+/// This is a signal flag property - it affects protocol creation but is not stored in metadata.
+pub const MIN_WRITER_VERSION_PROP: &str = "delta.minWriterVersion";
+
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
 ///
