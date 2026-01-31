@@ -513,6 +513,9 @@ impl Snapshot {
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
+    ///
+    /// Note: For tables with clustering enabled, this performs log replay to read clustering
+    /// columns from domain metadata, which may have a performance cost.
     pub fn transaction(
         self: Arc<Self>,
         committer: Box<dyn Committer>,

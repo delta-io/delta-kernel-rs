@@ -110,16 +110,14 @@ impl<'col> StatsColumnFilter<'col> {
                 if result.contains(col) {
                     continue;
                 }
-                // Directly navigate to the clustering column in the schema
-                if let Some(data_type) = lookup_column_type(schema, col) {
-                    if is_stats_eligible_type(data_type) {
-                        tracing::warn!(
-                            "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; \
-                             adding anyway",
-                            col
-                        );
-                        result.push(col.clone());
-                    }
+                // Verify the clustering column exists in schema before adding
+                if lookup_column_type(schema, col).is_some() {
+                    tracing::warn!(
+                        "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; \
+                         adding anyway",
+                        col
+                    );
+                    result.push(col.clone());
                 }
             }
         }
@@ -234,19 +232,11 @@ fn lookup_column_type<'a>(schema: &'a StructType, column: &ColumnName) -> Option
     Some(current_field.data_type())
 }
 
-/// Returns true if the data type is eligible for statistics collection.
-fn is_stats_eligible_type(data_type: &DataType) -> bool {
-    !matches!(
-        data_type,
-        DataType::Map(_) | DataType::Array(_) | DataType::Variant(_)
-    )
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ArrayType;
-
+    
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
             "delta.dataSkippingNumIndexedCols".to_string(),
@@ -347,25 +337,6 @@ mod tests {
         assert_eq!(columns, expected_cols);
     }
 
-    #[test]
-    fn test_clustering_column_non_eligible_type() {
-        // Array/Map clustering columns should be excluded as they're not eligible for stats
-        let props = make_props_with_num_cols(32);
-        let clustering_cols = vec![ColumnName::new(["arr"])];
-
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable(
-                "arr",
-                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            ),
-        ]);
-
-        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
-
-        // Should only include "a" - arrays are not eligible for statistics
-        assert_eq!(columns, vec![ColumnName::new(["a"])]);
-    }
 
     #[test]
     fn test_nested_clustering_column_with_limit() {
