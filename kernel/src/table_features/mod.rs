@@ -230,6 +230,12 @@ pub(crate) struct FeatureInfo {
     /// Requirements this feature has (features + custom validations)
     pub feature_requirements: &'static [FeatureRequirement],
     /// Rust kernel's support for this feature (may vary by Operation type)
+    ///
+    /// Note: `kernel_support` validation depends on `feature_type`:
+    /// Writer features: Only checked during `Operation::Write`
+    /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
+    /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
+    /// Writer-only features is never invoked for Scan/CDF regardless of the custom check logic.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
@@ -315,10 +321,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
-            "Feature 'inCommitTimestamp' is not supported for CDF",
-        )),
+        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
     }),
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
