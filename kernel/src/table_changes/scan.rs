@@ -113,10 +113,12 @@ impl TableChangesScanBuilder {
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
 
         // Create StateInfo using CDF field classifier
+        // CDF doesn't support stats_columns
         let state_info = StateInfo::try_new(
             logical_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
+            None, // stats_columns
             CdfTransformFieldClassifier,
         )?;
 
