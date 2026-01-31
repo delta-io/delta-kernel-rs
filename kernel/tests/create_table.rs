@@ -1,5 +1,6 @@
 //! Integration tests for the CreateTable API
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
@@ -8,11 +9,34 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
+use delta_kernel::table_properties::{MIN_READER_VERSION_PROP, MIN_WRITER_VERSION_PROP};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::DeltaResult;
 use serde_json::Value;
 use tempfile::tempdir;
 use test_utils::{assert_result_error_with_message, create_default_engine};
+
+/// Helper to create a simple test schema.
+fn test_schema() -> Arc<StructType> {
+    Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    )
+}
+
+/// Helper to assert an error contains multiple expected substrings.
+fn assert_error_contains_messages(result: DeltaResult<impl std::fmt::Debug>, messages: &[&str]) {
+    assert!(result.is_err(), "Expected error but got Ok result");
+    let err_msg = result.unwrap_err().to_string();
+    for msg in messages {
+        assert!(
+            err_msg.contains(msg),
+            "Error '{}' should contain '{}'",
+            err_msg,
+            msg
+        );
+    }
+}
 
 #[tokio::test]
 async fn test_create_simple_table() -> DeltaResult<()> {
@@ -262,4 +286,146 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn test_user_properties_allowed() {
+    // User/application properties (non-delta.*) are allowed
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))
+            .expect("Failed to create engine");
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    );
+
+    let result = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([("myapp.version", "1.0")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_ok(), "User properties should be allowed");
+}
+
+#[test]
+fn test_feature_overrides_rejected_until_on_allow_list() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))
+            .expect("Failed to create engine");
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    );
+
+    // Feature overrides are parsed but rejected during validation (not on allow-list)
+    let result = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([("delta.feature.deletionVectors", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(
+        result,
+        "Enabling feature 'deletionVectors' is not supported during CREATE TABLE",
+    );
+}
+
+#[test]
+fn test_feature_override_rejects_invalid_value() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))
+            .expect("Failed to create engine");
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    );
+
+    // "enabled" is not valid - only "supported" is allowed
+    let result = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([("delta.feature.deletionVectors", "enabled")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Invalid value"),
+        "Error should mention invalid value: {}",
+        err_msg
+    );
+    assert!(
+        err_msg.contains("supported"),
+        "Error should mention 'supported' as valid value: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_protocol_version_validation() {
+    // Helper to build a table with given properties and return the result
+    let try_create = |props: HashMap<String, String>| {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap().to_string();
+        let engine = create_default_engine(
+            &url::Url::from_directory_path(&table_path).expect("Invalid URL"),
+        )
+        .expect("Failed to create engine");
+        create_table(&table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+    };
+
+    // Valid: both versions (3, 7)
+    let props = HashMap::from([
+        (MIN_READER_VERSION_PROP.to_string(), "3".to_string()),
+        (MIN_WRITER_VERSION_PROP.to_string(), "7".to_string()),
+    ]);
+    assert!(
+        try_create(props).is_ok(),
+        "Valid protocol versions (3, 7) should succeed"
+    );
+
+    // Valid: only reader version (3)
+    let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "3".to_string())]);
+    assert!(
+        try_create(props).is_ok(),
+        "Only reader version (3) should succeed"
+    );
+
+    // Valid: only writer version (7)
+    let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "7".to_string())]);
+    assert!(
+        try_create(props).is_ok(),
+        "Only writer version (7) should succeed"
+    );
+
+    // Invalid: reader version 2 (only 3 is supported)
+    let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "2".to_string())]);
+    assert_error_contains_messages(
+        try_create(props),
+        &["delta.minReaderVersion", "Only '3' is supported"],
+    );
+
+    // Invalid: writer version 5 (only 7 is supported)
+    let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "5".to_string())]);
+    assert_error_contains_messages(
+        try_create(props),
+        &["delta.minWriterVersion", "Only '7' is supported"],
+    );
+
+    // Invalid: non-integer reader version
+    let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "abc".to_string())]);
+    assert_error_contains_messages(try_create(props), &["Must be an integer"]);
+
+    // Invalid: non-integer writer version
+    let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "xyz".to_string())]);
+    assert_error_contains_messages(try_create(props), &["Must be an integer"]);
 }
