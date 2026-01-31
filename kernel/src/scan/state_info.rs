@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
@@ -28,9 +29,13 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
-    /// The stats schema for data skipping (built from predicate columns).
+    /// The stats schema for reading/parsing stats from checkpoints.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) stats_schema: Option<SchemaRef>,
+    /// The stats schema for output to the engine.
+    /// Contains only the stats_columns specified by the user.
+    /// When None, no stats_parsed column is included in scan output.
+    pub(crate) output_stats_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -97,6 +102,50 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
+/// Converts logical column names to physical column names for matching against stats schema.
+///
+/// Walks through each component of the column path, finding the corresponding field in the
+/// schema and extracting its physical name. If a component is not found in the schema,
+/// the logical name is used as-is.
+fn logical_to_physical_columns(
+    columns: &[ColumnName],
+    logical_schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|col| logical_to_physical_column_name(col, logical_schema, column_mapping_mode))
+        .collect()
+}
+
+/// Converts a single logical column name to its physical column name.
+///
+/// Traverses the schema hierarchy, mapping each path component from its logical name
+/// to its physical name based on the column mapping mode.
+fn logical_to_physical_column_name(
+    logical_name: &ColumnName,
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> ColumnName {
+    let parts: Vec<_> = logical_name.iter().collect();
+    let mut physical_parts = Vec::with_capacity(parts.len());
+    let mut current_schema = schema;
+
+    for part in parts {
+        if let Some(field) = current_schema.field(part) {
+            physical_parts.push(field.physical_name(column_mapping_mode).to_string());
+            if let DataType::Struct(nested) = field.data_type() {
+                current_schema = nested;
+            }
+        } else {
+            // Column not found in schema, use logical name as-is
+            physical_parts.push(part.to_string());
+        }
+    }
+
+    ColumnName::new(physical_parts)
+}
+
 impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
@@ -104,11 +153,13 @@ impl StateInfo {
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
+    /// `stats_columns` - Optional list of columns to include in parsed stats output
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
+        stats_columns: Option<Vec<ColumnName>>,
         classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.metadata().partition_columns();
@@ -207,9 +258,37 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build stats schema from predicate columns for data skipping
-        let stats_schema = match &physical_predicate {
-            PhysicalPredicate::Some(_, schema) => build_stats_schema(schema),
+        // MVP validation: stats_columns cannot be used with predicate
+        if stats_columns.is_some() && !matches!(physical_predicate, PhysicalPredicate::None) {
+            return Err(Error::generic(
+                "Cannot use both predicate and stats_columns in the same scan (MVP limitation)",
+            ));
+        }
+
+        // Build output_stats_schema from stats_columns
+        // Read path doesn't have clustering columns (first param), pass requested columns (second param)
+        let output_stats_schema = match &stats_columns {
+            Some(columns) if columns.is_empty() => {
+                // Empty list means output all stats from expected_stats_schema
+                Some(table_configuration.expected_stats_schema(None, None)?)
+            }
+            Some(columns) => {
+                // Non-empty list: filter expected_stats_schema to requested columns
+                // Convert logical column names to physical for matching against stats schema
+                let physical_columns =
+                    logical_to_physical_columns(columns, &logical_schema, column_mapping_mode);
+
+                Some(table_configuration.expected_stats_schema(None, Some(&physical_columns))?)
+            }
+            None => None,
+        };
+
+        // Build stats_schema for reading/data skipping
+        // - If output_stats_schema is set, use it (stats_columns case)
+        // - Otherwise, use predicate columns for data skipping
+        let stats_schema = match (&output_stats_schema, &physical_predicate) {
+            (Some(schema), _) => Some(schema.clone()),
+            (_, PhysicalPredicate::Some(_, schema)) => build_stats_schema(schema),
             _ => None,
         };
 
@@ -227,6 +306,7 @@ impl StateInfo {
             transform_spec,
             column_mapping_mode,
             stats_schema,
+            output_stats_schema,
         })
     }
 }
@@ -285,7 +365,7 @@ pub(crate) mod tests {
             );
         }
 
-        StateInfo::try_new(schema.clone(), &table_configuration, predicate, ())
+        StateInfo::try_new(schema.clone(), &table_configuration, predicate, None, ())
     }
 
     pub(crate) fn assert_transform_spec(

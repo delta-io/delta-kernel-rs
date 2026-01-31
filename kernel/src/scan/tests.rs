@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::arrow::array::BooleanArray;
+use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
+use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
@@ -484,4 +485,485 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
         vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
     );
     Ok(())
+}
+
+/// Helper to validate that JSON stats object values match the corresponding parsed struct array.
+fn assert_stats_struct_matches_json(
+    struct_array: &StructArray,
+    json_object: &serde_json::Map<String, serde_json::Value>,
+    row_idx: usize,
+    field_name: &str,
+) {
+    for (col_name, json_val) in json_object {
+        let Some(col) = struct_array.column_by_name(col_name) else {
+            continue;
+        };
+        if col.is_null(row_idx) {
+            continue;
+        }
+        // Currently only validates Int64 columns (the table has integer stats)
+        if let Some(int_col) = col.as_any().downcast_ref::<Int64Array>() {
+            assert_eq!(
+                json_val.as_i64().unwrap(),
+                int_col.value(row_idx),
+                "{}.{} mismatch at row {}",
+                field_name,
+                col_name,
+                row_idx
+            );
+        }
+    }
+}
+
+/// Test that `with_stats_columns(vec![])` outputs parsed stats in scan_metadata batches.
+/// Uses a table with a checkpoint that contains stats_parsed for e2e verification.
+#[test]
+fn test_scan_metadata_with_stats_columns() {
+    const STATS_PARSED_COL: &str = "stats_parsed";
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    let mut total_num_records: i64 = 0;
+    let mut file_count = 0;
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        // Verify stats_parsed schema
+        let schema = filtered_batch.schema();
+        let field = schema
+            .field_with_name(STATS_PARSED_COL)
+            .expect("Schema should contain stats_parsed column");
+        assert!(
+            matches!(field.data_type(), ArrowDataType::Struct(_)),
+            "stats_parsed should be a struct type, got: {:?}",
+            field.data_type()
+        );
+
+        // Extract stats_parsed struct array
+        let stats_parsed = filtered_batch
+            .column_by_name(STATS_PARSED_COL)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("stats_parsed should be a StructArray");
+
+        let num_records = stats_parsed
+            .column_by_name("numRecords")
+            .expect("should have numRecords")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("numRecords should be Int64Array");
+
+        let min_values = stats_parsed
+            .column_by_name("minValues")
+            .expect("should have minValues")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("minValues should be StructArray");
+
+        let max_values = stats_parsed
+            .column_by_name("maxValues")
+            .expect("should have maxValues")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("maxValues should be StructArray");
+
+        let null_count = stats_parsed
+            .column_by_name("nullCount")
+            .expect("should have nullCount")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("nullCount should be StructArray");
+
+        // Extract JSON stats column
+        let stats_json = filtered_batch
+            .column_by_name("stats")
+            .expect("should have stats JSON column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("stats should be StringArray");
+
+        // Validate each row: JSON stats should match structured stats
+        for i in 0..stats_json.len() {
+            if stats_parsed.is_null(i) || stats_json.is_null(i) {
+                continue;
+            }
+
+            let json_stats: serde_json::Value =
+                serde_json::from_str(stats_json.value(i)).expect("stats JSON should be valid");
+
+            // Validate numRecords
+            if let Some(json_num) = json_stats.get("numRecords").and_then(|v| v.as_i64()) {
+                assert_eq!(
+                    json_num,
+                    num_records.value(i),
+                    "numRecords mismatch at row {i}"
+                );
+            }
+
+            // Validate minValues, maxValues, nullCount
+            if let Some(obj) = json_stats.get("minValues").and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(min_values, obj, i, "minValues");
+            }
+            if let Some(obj) = json_stats.get("maxValues").and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(max_values, obj, i, "maxValues");
+            }
+            if let Some(obj) = json_stats.get("nullCount").and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(null_count, obj, i, "nullCount");
+            }
+
+            total_num_records += num_records.value(i);
+            file_count += 1;
+        }
+    }
+
+    assert!(file_count > 0, "Should have processed at least one file");
+    assert!(total_num_records > 0, "Should have non-zero numRecords");
+    println!(
+        "Verified {file_count} files with total {total_num_records} records from stats_parsed"
+    );
+}
+
+/// Test that `with_stats_columns` cannot be used with `with_predicate` in MVP.
+#[test]
+fn test_scan_metadata_stats_columns_with_predicate_errors() {
+    // Use the parsed-stats table
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Build scan with both predicate (that references a column) and stats_columns should error
+    // Note: Pred::literal(true) has no column references, so it becomes PhysicalPredicate::None
+    // We need a predicate with actual column references to trigger the MVP validation
+    let predicate = Arc::new(column_pred!("id")); // References 'id' column
+    let result = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats_columns(vec![])
+        .build();
+
+    assert!(
+        result.is_err(),
+        "Should error when using both predicate and stats_columns"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("predicate") || err.to_string().contains("stats_columns"),
+        "Error message should mention predicate or stats_columns: {}",
+        err
+    );
+}
+
+/// Test that `with_stats_columns` with specific columns only returns stats for those columns.
+/// Verifies that requesting `vec![col!("id")]` only includes `id` in minValues/maxValues/nullCount.
+#[test]
+fn test_scan_metadata_with_specific_stats_columns() {
+    use crate::expressions::column_name;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Request only "id" column stats
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![column_name!("id")])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        let stats_parsed = filtered_batch
+            .column_by_name("stats_parsed")
+            .expect("Should have stats_parsed")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("stats_parsed should be StructArray");
+
+        // Check minValues only has "id"
+        let min_values = stats_parsed
+            .column_by_name("minValues")
+            .expect("should have minValues")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("minValues should be StructArray");
+
+        let min_fields: Vec<_> = min_values
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            min_fields,
+            vec!["id"],
+            "minValues should only contain 'id', got: {:?}",
+            min_fields
+        );
+
+        // Check maxValues only has "id"
+        let max_values = stats_parsed
+            .column_by_name("maxValues")
+            .expect("should have maxValues")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("maxValues should be StructArray");
+
+        let max_fields: Vec<_> = max_values
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            max_fields,
+            vec!["id"],
+            "maxValues should only contain 'id', got: {:?}",
+            max_fields
+        );
+
+        // Check nullCount only has "id"
+        let null_count = stats_parsed
+            .column_by_name("nullCount")
+            .expect("should have nullCount")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("nullCount should be StructArray");
+
+        let null_fields: Vec<_> = null_count
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            null_fields,
+            vec!["id"],
+            "nullCount should only contain 'id', got: {:?}",
+            null_fields
+        );
+    }
+}
+
+/// Test that `with_stats_columns` with multiple specific columns returns stats for all of them.
+#[test]
+fn test_scan_metadata_with_multiple_stats_columns() {
+    use crate::expressions::column_name;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Request "id" and "name" column stats (not "age" or "salary")
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![column_name!("id"), column_name!("name")])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        let stats_parsed = filtered_batch
+            .column_by_name("stats_parsed")
+            .expect("Should have stats_parsed")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("stats_parsed should be StructArray");
+
+        // Check minValues has "id" and "name" but not "age" or "salary"
+        let min_values = stats_parsed
+            .column_by_name("minValues")
+            .expect("should have minValues")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("minValues should be StructArray");
+
+        let min_fields: Vec<_> = min_values
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            min_fields,
+            vec!["id", "name"],
+            "minValues should contain 'id' and 'name', got: {:?}",
+            min_fields
+        );
+
+        // Verify "age" and "salary" are NOT present
+        assert!(
+            min_values.column_by_name("age").is_none(),
+            "minValues should NOT contain 'age'"
+        );
+        assert!(
+            min_values.column_by_name("salary").is_none(),
+            "minValues should NOT contain 'salary'"
+        );
+
+        // Check maxValues has the same columns
+        let max_values = stats_parsed
+            .column_by_name("maxValues")
+            .expect("should have maxValues")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("maxValues should be StructArray");
+
+        let max_fields: Vec<_> = max_values
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            max_fields,
+            vec!["id", "name"],
+            "maxValues should contain 'id' and 'name', got: {:?}",
+            max_fields
+        );
+
+        // Check nullCount has the same columns
+        let null_count = stats_parsed
+            .column_by_name("nullCount")
+            .expect("should have nullCount")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("nullCount should be StructArray");
+
+        let null_fields: Vec<_> = null_count
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            null_fields,
+            vec!["id", "name"],
+            "nullCount should contain 'id' and 'name', got: {:?}",
+            null_fields
+        );
+    }
+}
+
+/// Test that requesting a non-existent column returns empty stats (no matching columns).
+#[test]
+fn test_scan_metadata_with_nonexistent_stats_column() {
+    use crate::expressions::column_name;
+
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Request a column that doesn't exist in the table
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![column_name!("nonexistent_column")])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        let stats_parsed = filtered_batch
+            .column_by_name("stats_parsed")
+            .expect("Should have stats_parsed")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("stats_parsed should be StructArray");
+
+        // Should have numRecords but no minValues/maxValues/nullCount
+        // (or they exist but are empty structs)
+        assert!(
+            stats_parsed.column_by_name("numRecords").is_some(),
+            "Should still have numRecords"
+        );
+
+        // minValues/maxValues/nullCount should either be absent or empty
+        if let Some(min_values) = stats_parsed.column_by_name("minValues") {
+            let min_struct = min_values
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("minValues should be StructArray");
+            assert!(
+                min_struct.num_columns() == 0,
+                "minValues should be empty struct, got {} columns",
+                min_struct.num_columns()
+            );
+        }
+    }
 }

@@ -186,12 +186,14 @@ impl TableConfiguration {
     pub(crate) fn expected_stats_schema(
         &self,
         clustering_columns: Option<&[ColumnName]>,
+        requested_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<SchemaRef> {
         let physical_schema = self.physical_data_schema();
         Ok(Arc::new(expected_stats_schema(
             &physical_schema,
             self.table_properties(),
             clustering_columns,
+            requested_columns,
         )?))
     }
 
