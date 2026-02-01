@@ -1,3 +1,5 @@
+//! Configuration for reading existing Delta tables.
+//!
 //! This module defines [`TableConfiguration`], a high level api to check feature support and
 //! feature enablement for a table at a given version. This encapsulates [`Protocol`], [`Metadata`],
 //! [`Schema`], [`TableProperties`], and [`ColumnMappingMode`]. These structs in isolation should
