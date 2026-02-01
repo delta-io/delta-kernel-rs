@@ -2,7 +2,6 @@
 //!
 //! This module contains the standard transforms that are applied during table creation:
 //!
-//! - [`FeatureSignalTransform`]: Processes `delta.feature.X=supported` signals
 //! - [`ProtocolVersionTransform`]: Sets protocol version from properties or defaults
 //! - [`DeltaPropertyValidationTransform`]: Validates `delta.*` properties are allowed
 //!
@@ -15,38 +14,16 @@ use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
 use super::{ProtocolMetadataTransform, TransformContext, TransformId};
 
 // ============================================================================
-// FeatureSignalTransform (Stub)
-// ============================================================================
-
-/// Processes delta.feature.X=supported signals.
-#[derive(Debug)]
-#[allow(dead_code)] // Constructed by registry
-pub(crate) struct FeatureSignalTransform;
-
-impl ProtocolMetadataTransform for FeatureSignalTransform {
-    fn id(&self) -> TransformId {
-        TransformId::FeatureSignals
-    }
-
-    fn name(&self) -> &'static str {
-        "FeatureSignals: processes delta.feature.* signals"
-    }
-
-    fn apply(
-        &self,
-        config: TableProtocolMetadataConfig,
-        _context: &TransformContext<'_>,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
-        // Stub: pass through unchanged
-        Ok(config)
-    }
-}
-
-// ============================================================================
 // ProtocolVersionTransform (Stub)
 // ============================================================================
 
 /// Determines and sets the protocol version from user properties.
+///
+/// This transform:
+/// 1. Parses version properties (defaults to 3/7 if not specified)
+/// 2. Validates they are supported (only 3/7 currently)
+/// 3. Sets the protocol version
+/// 4. Strips the version properties from metadata (transient signals)
 #[derive(Debug)]
 #[allow(dead_code)] // Constructed by registry
 pub(crate) struct ProtocolVersionTransform;
@@ -65,7 +42,7 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
         config: TableProtocolMetadataConfig,
         _context: &TransformContext<'_>,
     ) -> DeltaResult<TableProtocolMetadataConfig> {
-        // Stub: pass through unchanged
+        // Stub: pass through unchanged (version already set in Protocol::new())
         Ok(config)
     }
 }
@@ -74,7 +51,10 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
 // DeltaPropertyValidationTransform (Stub)
 // ============================================================================
 
-/// Validates that delta.* properties are allowed for table creation.
+/// Validates that all delta.* properties are supported.
+///
+/// This transform runs first to reject unsupported properties early, before
+/// any other transforms process the configuration.
 #[derive(Debug)]
 #[allow(dead_code)] // Constructed by registry
 pub(crate) struct DeltaPropertyValidationTransform;
@@ -85,7 +65,7 @@ impl ProtocolMetadataTransform for DeltaPropertyValidationTransform {
     }
 
     fn name(&self) -> &'static str {
-        "DeltaPropertyValidation: validates delta.* properties are allowed"
+        "DeltaPropertyValidation: validates delta.* properties"
     }
 
     fn apply(
@@ -93,7 +73,7 @@ impl ProtocolMetadataTransform for DeltaPropertyValidationTransform {
         config: TableProtocolMetadataConfig,
         _context: &TransformContext<'_>,
     ) -> DeltaResult<TableProtocolMetadataConfig> {
-        // Stub: pass through unchanged (no validation yet)
+        // Stub: pass through unchanged
         Ok(config)
     }
 }
