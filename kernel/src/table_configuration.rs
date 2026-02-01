@@ -9,12 +9,6 @@
 //! reader/writer features, and ensure that the deletion vector table property is enabled in the
 //! [`TableProperties`].
 //!
-//! # Related Modules
-//!
-//! - [`crate::table_protocol_metadata_config`]: For **creating/modifying** tables. Parses
-//!   user-provided properties to extract signal flags and create protocols. Use this when building
-//!   new tables or modifying existing table properties.
-//!
 //! [`Schema`]: crate::schema::Schema
 use std::sync::Arc;
 
