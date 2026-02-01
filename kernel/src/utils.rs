@@ -292,6 +292,28 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Assert that a Result is an error and that the error message contains all expected substrings.
+    pub(crate) fn assert_result_error_with_messages<T, E: ToString>(
+        res: Result<T, E>,
+        messages: &[&str],
+    ) {
+        match res {
+            Ok(_) => panic!(
+                "Expected error with messages {:?}, but got Ok result",
+                messages
+            ),
+            Err(error) => {
+                let error_str = error.to_string();
+                for message in messages {
+                    assert!(
+                        error_str.contains(message),
+                        "Error message does not contain expected substring.\nExpected substring:\t{message}\nActual message:\t\t{error_str}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Helper to get a field from a StructType by name, panicking if not found.
     pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
         struct_type
