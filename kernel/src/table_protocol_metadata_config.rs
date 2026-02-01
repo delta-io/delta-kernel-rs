@@ -244,6 +244,25 @@ mod tests {
     }
 
     // =========================================================================
-    // Pipeline Integration Tests (added after TransformationPipeline is available)
+    // Pipeline Integration Tests
     // =========================================================================
+
+    #[test]
+    fn test_apply_transforms_with_no_signals() {
+        use crate::table_transformation::TransformationPipeline;
+
+        // With no signal flags, config passes through with empty features
+        let properties = props([("myapp.version", "1.0")]);
+        let config =
+            TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
+
+        let final_config = TransformationPipeline::apply_transforms(config, &properties).unwrap();
+
+        // Protocol still bare, properties still there
+        assert!(final_config.protocol.writer_features().unwrap().is_empty());
+        assert_eq!(
+            final_config.metadata.configuration().get("myapp.version"),
+            Some(&"1.0".to_string())
+        );
+    }
 }
