@@ -191,7 +191,7 @@ mod tests {
             .map(|path| FileActionKey::new(*path, None))
             .collect();
 
-        ScanLogReplayProcessor::new_with_seen_files(engine, state_info, seen_file_keys)
+        ScanLogReplayProcessor::new_with_seen_files(engine, state_info, seen_file_keys, false)
     }
 
     // ============================================================
