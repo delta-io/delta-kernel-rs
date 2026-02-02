@@ -187,10 +187,12 @@ impl TableConfiguration {
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<SchemaRef> {
-        let physical_schema = self.physical_data_schema();
         Ok(Arc::new(expected_stats_schema(
-            &physical_schema,
-            self.table_properties(),
+            &self.physical_data_schema(),
+            self.table_properties()
+                .data_skipping_stats_columns
+                .as_deref(),
+            self.table_properties().data_skipping_num_indexed_cols,
             clustering_columns,
         )?))
     }
@@ -209,10 +211,12 @@ impl TableConfiguration {
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let physical_schema = self.physical_data_schema();
         stats_column_names(
-            &physical_schema,
-            self.table_properties(),
+            &self.physical_data_schema(),
+            self.table_properties()
+                .data_skipping_stats_columns
+                .as_deref(),
+            self.table_properties().data_skipping_num_indexed_cols,
             clustering_columns,
         )
     }

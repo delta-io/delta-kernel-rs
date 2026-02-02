@@ -6,7 +6,7 @@
 use crate::{
     column_trie::ColumnTrie,
     schema::{ColumnName, DataType, Schema, StructField, StructType},
-    table_properties::{DataSkippingNumIndexedCols, TableProperties},
+    table_properties::DataSkippingNumIndexedCols,
 };
 
 /// Handles column filtering logic for statistics based on table properties.
@@ -28,13 +28,13 @@ pub(crate) struct StatsColumnFilter<'col> {
     /// Trie built from columns specified in `delta.dataSkippingStatsColumns` for O(path_length)
     /// prefix matching. `Some` when using explicit column list, `None` when using the
     /// `delta.dataSkippingNumIndexedCols` count-based approach.
-    column_trie: Option<ColumnTrie<'col>>,
+    data_skipping_stats_trie: Option<ColumnTrie<'col>>,
     /// Trie built from clustering columns for O(path_length) lookup during traversal.
     /// Used by `should_include_current()` to allow clustering columns past the limit.
     clustering_trie: Option<ColumnTrie<'col>>,
     /// Clustering columns to add after the main traversal in `collect_columns()`.
     /// Only set when using `delta.dataSkippingNumIndexedCols` (when using
-    /// `delta.dataSkippingStatsColumns`, clustering columns are merged into `column_trie`).
+    /// `delta.dataSkippingStatsColumns`, clustering columns are merged into `data_skipping_stats_trie`).
     clustering_columns: Option<&'col [ColumnName]>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
@@ -45,13 +45,18 @@ impl<'col> StatsColumnFilter<'col> {
     ///
     /// Clustering columns are always included in statistics, even when `dataSkippingStatsColumns`
     /// or `dataSkippingNumIndexedCols` would otherwise exclude them.
+    ///
+    /// Note: `data_skipping_stats_columns` should use physical column names (matching the physical
+    /// schema) when column mapping is enabled. The caller is responsible for converting logical
+    /// column names from table properties to physical names before passing them here.
     pub(crate) fn new(
-        props: &'col TableProperties,
+        data_skipping_stats_columns: Option<&'col [ColumnName]>,
+        data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
         clustering_columns: Option<&'col [ColumnName]>,
     ) -> Self {
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
-        if let Some(column_names) = &props.data_skipping_stats_columns {
+        if let Some(column_names) = data_skipping_stats_columns {
             let mut combined_trie = ColumnTrie::from_columns(column_names);
 
             // Add clustering columns to the trie so they're included during traversal
@@ -71,18 +76,18 @@ impl<'col> StatsColumnFilter<'col> {
             Self {
                 n_columns: None,
                 added_columns: 0,
-                column_trie: Some(combined_trie),
-                clustering_trie: None,    // Already in column_trie
+                data_skipping_stats_trie: Some(combined_trie),
+                clustering_trie: None,    // Already in data_skipping_stats_trie
                 clustering_columns: None, // Already added to trie
                 path: Vec::new(),
             }
         } else {
-            let n_cols = props.data_skipping_num_indexed_cols.unwrap_or_default();
+            let n_cols = data_skipping_num_indexed_cols.unwrap_or_default();
             let clustering_trie = clustering_columns.map(ColumnTrie::from_columns);
             Self {
                 n_columns: Some(n_cols),
                 added_columns: 0,
-                column_trie: None,
+                data_skipping_stats_trie: None,
                 clustering_trie,
                 clustering_columns, // Will be handled in Pass 2 of collect_columns()
                 path: Vec::new(),
@@ -138,7 +143,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Clustering columns are always included, even past the column limit.
     pub(crate) fn should_include_current(&self) -> bool {
         // When using dataSkippingStatsColumns, check the trie
-        if let Some(trie) = &self.column_trie {
+        if let Some(trie) = &self.data_skipping_stats_trie {
             return trie.contains_prefix_of(&self.path);
         }
 
@@ -236,22 +241,6 @@ fn lookup_column_type<'a>(schema: &'a StructType, column: &ColumnName) -> Option
 mod tests {
     use super::*;
 
-    fn make_props_with_num_cols(n: u64) -> TableProperties {
-        [(
-            "delta.dataSkippingNumIndexedCols".to_string(),
-            n.to_string(),
-        )]
-        .into()
-    }
-
-    fn make_props_with_stats_cols(cols: &str) -> TableProperties {
-        [(
-            "delta.dataSkippingStatsColumns".to_string(),
-            cols.to_string(),
-        )]
-        .into()
-    }
-
     /// Standard 3-column schema for clustering tests: a (LONG), b (STRING), c (INTEGER)
     fn abc_schema() -> StructType {
         StructType::new_unchecked([
@@ -261,13 +250,29 @@ mod tests {
         ])
     }
 
-    /// Helper to run column collection and return results
-    fn collect_stats_columns(
-        props: &TableProperties,
+    /// Helper to run column collection with data_skipping_num_indexed_cols and return results
+    fn collect_with_num_cols(
+        num_cols: u64,
         clustering_cols: Option<&[ColumnName]>,
         schema: &Schema,
     ) -> Vec<ColumnName> {
-        let mut filter = StatsColumnFilter::new(props, clustering_cols);
+        let mut filter = StatsColumnFilter::new(
+            None,
+            Some(DataSkippingNumIndexedCols::NumColumns(num_cols)),
+            clustering_cols,
+        );
+        let mut columns = Vec::new();
+        filter.collect_columns(schema, &mut columns);
+        columns
+    }
+
+    /// Helper to run column collection with stats_columns and return results
+    fn collect_with_stats_cols(
+        stats_cols: &[ColumnName],
+        clustering_cols: Option<&[ColumnName]>,
+        schema: &Schema,
+    ) -> Vec<ColumnName> {
+        let mut filter = StatsColumnFilter::new(Some(stats_cols), None, clustering_cols);
         let mut columns = Vec::new();
         filter.collect_columns(schema, &mut columns);
         columns
@@ -277,21 +282,20 @@ mod tests {
 
     #[rstest::rstest]
     #[case::clustering_overrides_limit(
-        1,                              // num_indexed_cols limit
+        1,                              // data_skipping_num_indexed_cols limit
         vec!["c"],                      // clustering columns (3rd column)
         vec!["a", "c"]                  // expected: "a" (within limit) + "c" (clustering)
     )]
     #[case::no_clustering_uses_limit(
-        2,                              // num_indexed_cols limit
+        2,                              // data_skipping_num_indexed_cols limit
         vec![],                         // no clustering columns
         vec!["a", "b"]                  // expected: first 2 columns within limit
     )]
-    fn test_clustering_with_num_indexed_cols(
+    fn test_clustering_with_data_skipping_num_indexed_cols(
         #[case] num_cols: u64,
         #[case] clustering: Vec<&str>,
         #[case] expected: Vec<&str>,
     ) {
-        let props = make_props_with_num_cols(num_cols);
         let clustering_cols: Vec<ColumnName> =
             clustering.iter().map(|c| ColumnName::new([*c])).collect();
         let clustering_ref = if clustering_cols.is_empty() {
@@ -301,7 +305,7 @@ mod tests {
         };
         let schema = abc_schema();
 
-        let columns = collect_stats_columns(&props, clustering_ref, &schema);
+        let columns = collect_with_num_cols(num_cols, clustering_ref, &schema);
 
         let expected_cols: Vec<ColumnName> =
             expected.iter().map(|c| ColumnName::new([*c])).collect();
@@ -310,26 +314,27 @@ mod tests {
 
     #[rstest::rstest]
     #[case::clustering_added_to_stats(
-        "a",                            // stats columns
+        vec!["a"],                      // stats columns
         vec!["c"],                      // clustering columns
         vec!["a", "c"]                  // expected: "a" (explicit) + "c" (clustering)
     )]
     #[case::clustering_already_in_stats(
-        "a,b",                          // stats columns include clustering col
+        vec!["a", "b"],                 // stats columns include clustering col
         vec!["a"],                      // clustering columns (already in stats)
         vec!["a", "b"]                  // expected: no duplicates
     )]
     fn test_clustering_with_stats_columns(
-        #[case] stats_cols: &str,
+        #[case] stats_cols: Vec<&str>,
         #[case] clustering: Vec<&str>,
         #[case] expected: Vec<&str>,
     ) {
-        let props = make_props_with_stats_cols(stats_cols);
+        let stats_col_names: Vec<ColumnName> =
+            stats_cols.iter().map(|c| ColumnName::new([*c])).collect();
         let clustering_cols: Vec<ColumnName> =
             clustering.iter().map(|c| ColumnName::new([*c])).collect();
         let schema = abc_schema();
 
-        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
+        let columns = collect_with_stats_cols(&stats_col_names, Some(&clustering_cols), &schema);
 
         let expected_cols: Vec<ColumnName> =
             expected.iter().map(|c| ColumnName::new([*c])).collect();
@@ -339,8 +344,6 @@ mod tests {
     #[test]
     fn test_nested_clustering_column_with_limit() {
         // Test that nested clustering columns are found even with a column limit.
-        let props = make_props_with_num_cols(2);
-
         // Clustering column is deeply nested: user.address.city
         let clustering_cols = vec![ColumnName::new(["user", "address", "city"])];
 
@@ -367,7 +370,7 @@ mod tests {
             StructField::nullable("extra2", DataType::STRING),
         ]);
 
-        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
+        let columns = collect_with_num_cols(2, Some(&clustering_cols), &schema);
 
         // Should include: id, name (first 2 within limit) + user.address.city (clustering)
         assert_eq!(
@@ -383,11 +386,10 @@ mod tests {
     #[test]
     fn test_clustering_column_not_in_schema() {
         // Clustering column that doesn't exist in schema should be silently ignored
-        let props = make_props_with_num_cols(2);
         let clustering_cols = vec![ColumnName::new(["nonexistent", "column"])];
         let schema = abc_schema();
 
-        let columns = collect_stats_columns(&props, Some(&clustering_cols), &schema);
+        let columns = collect_with_num_cols(2, Some(&clustering_cols), &schema);
 
         // Should only include normal columns, clustering column not found
         assert_eq!(

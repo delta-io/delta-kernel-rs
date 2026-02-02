@@ -10,7 +10,7 @@ use crate::{
         ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
         SchemaTransform, StructField, StructType,
     },
-    table_properties::TableProperties,
+    table_properties::DataSkippingNumIndexedCols,
     DeltaResult,
 };
 
@@ -20,9 +20,9 @@ use column_filter::StatsColumnFilter;
 ///
 /// The base stats schema is dependent on the current table configuration and derived via:
 /// - only fields present in data files are included (use physical names, no partition columns)
-/// - if the table property `delta.dataSkippingStatsColumns` is set, include only those columns.
-///   Column names may refer to struct fields in which case all child fields are included.
-/// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included.
+/// - if `stats_columns` is provided, include only those columns. Column names may refer to
+///   struct fields in which case all child fields are included. Physical column names are expected.
+/// - otherwise the first `data_skipping_num_indexed_cols` (default 32) leaf fields are included.
 /// - all fields are made nullable.
 ///
 /// The `nullCount` struct field is a nested structure mirroring the table's column hierarchy.
@@ -100,7 +100,8 @@ use column_filter::StatsColumnFilter;
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
-    table_properties: &TableProperties,
+    data_skipping_stats_columns: Option<&[ColumnName]>,
+    data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
     clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
     let mut fields = Vec::with_capacity(5);
@@ -108,9 +109,13 @@ pub(crate) fn expected_stats_schema(
 
     // generate the base stats schema:
     // - make all fields nullable
-    // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
+    // - include fields according to table properties (data_skipping_num_indexed_cols, data_skipping_stats_columns, ...)
     // - always include clustering columns (per Delta protocol)
-    let mut base_transform = BaseStatsTransform::new(table_properties, clustering_columns);
+    let mut base_transform = BaseStatsTransform::new(
+        data_skipping_stats_columns,
+        data_skipping_num_indexed_cols,
+        clustering_columns,
+    );
     if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
         let base_schema = base_schema.into_owned();
 
@@ -147,13 +152,20 @@ pub(crate) fn expected_stats_schema(
 /// Per the Delta protocol, clustering columns are always included in statistics,
 /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
 /// settings.
+///
+/// Note: `data_skipping_stats_columns` must contain physical column names (post column mapping).
 #[allow(unused)]
 pub(crate) fn stats_column_names(
     physical_file_schema: &Schema,
-    table_properties: &TableProperties,
+    data_skipping_stats_columns: Option<&[ColumnName]>,
+    data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
     clustering_columns: Option<&[ColumnName]>,
 ) -> Vec<ColumnName> {
-    let mut filter = StatsColumnFilter::new(table_properties, clustering_columns);
+    let mut filter = StatsColumnFilter::new(
+        data_skipping_stats_columns,
+        data_skipping_num_indexed_cols,
+        clustering_columns,
+    );
     let mut columns = Vec::new();
     filter.collect_columns(physical_file_schema, &mut columns);
     columns
@@ -237,9 +249,17 @@ struct BaseStatsTransform<'col> {
 
 impl<'col> BaseStatsTransform<'col> {
     #[allow(unused)]
-    fn new(props: &'col TableProperties, clustering_columns: Option<&'col [ColumnName]>) -> Self {
+    fn new(
+        data_skipping_stats_columns: Option<&'col [ColumnName]>,
+        data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
+        clustering_columns: Option<&'col [ColumnName]>,
+    ) -> Self {
         Self {
-            filter: StatsColumnFilter::new(props, clustering_columns),
+            filter: StatsColumnFilter::new(
+                data_skipping_stats_columns,
+                data_skipping_num_indexed_cols,
+                clustering_columns,
+            ),
         }
     }
 }
@@ -349,10 +369,9 @@ mod tests {
 
     #[test]
     fn test_stats_schema_simple() {
-        let properties: TableProperties = [("key", "value")].into();
         let file_schema = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, None, None, None).unwrap();
         let expected = StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", file_schema.clone()),
@@ -366,8 +385,6 @@ mod tests {
 
     #[test]
     fn test_stats_schema_nested() {
-        let properties: TableProperties = [("key", "value")].into();
-
         let user_struct = StructType::new_unchecked([
             StructField::not_null("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
@@ -376,7 +393,7 @@ mod tests {
             StructField::not_null("id", DataType::LONG),
             StructField::not_null("user", DataType::Struct(Box::new(user_struct.clone()))),
         ]);
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, None, None, None).unwrap();
 
         // Expected result: The stats schema should maintain the nested structure
         // but make all fields nullable
@@ -402,8 +419,6 @@ mod tests {
 
     #[test]
     fn test_stats_schema_with_non_eligible_field() {
-        let properties: TableProperties = [("key", "value")].into();
-
         // Create a nested logical schema with:
         // - top-level field "id" (LONG) - eligible for data skipping
         // - nested struct "metadata" containing:
@@ -426,7 +441,7 @@ mod tests {
             ),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, None, None, None).unwrap();
 
         // nullCount excludes array fields (tags) - only eligible primitive types
         let expected_null_nested = StructType::new_unchecked([
@@ -460,11 +475,7 @@ mod tests {
 
     #[test]
     fn test_stats_schema_col_names() {
-        let properties: TableProperties = [(
-            "delta.dataSkippingStatsColumns".to_string(),
-            "`user.info`.name".to_string(),
-        )]
-        .into();
+        let stats_cols = vec![ColumnName::new(["user.info", "name"])];
 
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
@@ -475,7 +486,8 @@ mod tests {
             StructField::nullable("user.info", DataType::Struct(Box::new(user_struct.clone()))),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema =
+            expected_stats_schema(&file_schema, Some(&stats_cols), None, None).unwrap();
 
         let expected_nested =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
@@ -501,18 +513,18 @@ mod tests {
 
     #[test]
     fn test_stats_schema_n_cols() {
-        let properties: TableProperties = [(
-            "delta.dataSkippingNumIndexedCols".to_string(),
-            "1".to_string(),
-        )]
-        .into();
-
         let logical_schema = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
         ]);
 
-        let stats_schema = expected_stats_schema(&logical_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(
+            &logical_schema,
+            None,
+            Some(DataSkippingNumIndexedCols::NumColumns(1)),
+            None,
+        )
+        .unwrap();
 
         let expected_fields =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
@@ -534,8 +546,6 @@ mod tests {
 
     #[test]
     fn test_stats_schema_different_fields_in_null_vs_minmax() {
-        let properties: TableProperties = [("key", "value")].into();
-
         // Create a schema with fields that have different eligibility for min/max vs null count
         // - "id" (LONG) - eligible for both null count and min/max
         // - "is_active" (BOOLEAN) - eligible for null count but NOT for min/max
@@ -546,7 +556,7 @@ mod tests {
             StructField::nullable("metadata", DataType::BINARY),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, None, None, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG
         let expected_null_count = StructType::new_unchecked([
@@ -572,8 +582,6 @@ mod tests {
 
     #[test]
     fn test_stats_schema_nested_different_fields_in_null_vs_minmax() {
-        let properties: TableProperties = [("key", "value")].into();
-
         // Create a nested schema where some nested fields are eligible for min/max and others aren't
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING), // eligible for min/max
@@ -588,7 +596,7 @@ mod tests {
             StructField::nullable("is_deleted", DataType::BOOLEAN), // NOT eligible for min/max
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, None, None, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG, maintaining structure
         let expected_null_user = StructType::new_unchecked([
@@ -626,8 +634,6 @@ mod tests {
 
     #[test]
     fn test_stats_schema_only_non_eligible_fields() {
-        let properties: TableProperties = [("key", "value")].into();
-
         // Create a schema with only fields that are NOT eligible for min/max skipping
         let file_schema = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::BOOLEAN),
@@ -638,7 +644,7 @@ mod tests {
             ),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, None, None, None).unwrap();
 
         // nullCount includes boolean and binary (primitives) but excludes array
         let expected_null_count = StructType::new_unchecked([
@@ -662,12 +668,6 @@ mod tests {
         // With a limit of 2, if we have: array, map, col1, col2, col3
         // We should get stats for col1 and col2 (the first 2 eligible columns),
         // not be limited by the array and map fields.
-        let properties: TableProperties = [(
-            "delta.dataSkippingNumIndexedCols".to_string(),
-            "2".to_string(),
-        )]
-        .into();
-
         let file_schema = StructType::new_unchecked([
             StructField::nullable(
                 "tags",
@@ -686,7 +686,13 @@ mod tests {
             StructField::nullable("col3", DataType::INTEGER), // Should be excluded by limit
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            None,
+            Some(DataSkippingNumIndexedCols::NumColumns(2)),
+            None,
+        )
+        .unwrap();
 
         // nullCount has only eligible primitive columns (col1 and col2).
         // Map/Array/Variant are excluded from all stats.
@@ -717,8 +723,6 @@ mod tests {
 
     #[test]
     fn test_stats_column_names_default() {
-        let properties: TableProperties = [("key", "value")].into();
-
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("age", DataType::INTEGER),
@@ -728,7 +732,7 @@ mod tests {
             StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let columns = stats_column_names(&file_schema, None, None, None);
 
         // With default settings, all leaf columns should be included
         assert_eq!(
@@ -742,13 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_column_names_with_num_indexed_cols() {
-        let properties: TableProperties = [(
-            "delta.dataSkippingNumIndexedCols".to_string(),
-            "2".to_string(),
-        )]
-        .into();
-
+    fn test_stats_column_names_with_data_skipping_num_indexed_cols() {
         let file_schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::STRING),
@@ -756,7 +754,12 @@ mod tests {
             StructField::nullable("d", DataType::DOUBLE),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let columns = stats_column_names(
+            &file_schema,
+            None,
+            Some(DataSkippingNumIndexedCols::NumColumns(2)),
+            None,
+        );
 
         // Only first 2 columns should be included
         assert_eq!(
@@ -767,11 +770,7 @@ mod tests {
 
     #[test]
     fn test_stats_column_names_with_stats_columns() {
-        let properties: TableProperties = [(
-            "delta.dataSkippingStatsColumns".to_string(),
-            "id,user.age".to_string(),
-        )]
-        .into();
+        let stats_cols = vec![ColumnName::new(["id"]), ColumnName::new(["user", "age"])];
 
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
@@ -783,7 +782,7 @@ mod tests {
             StructField::nullable("extra", DataType::STRING),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let columns = stats_column_names(&file_schema, Some(&stats_cols), None, None);
 
         // Only specified columns should be included (user.name and extra excluded)
         assert_eq!(
@@ -794,8 +793,6 @@ mod tests {
 
     #[test]
     fn test_stats_column_names_skips_non_eligible_types() {
-        let properties: TableProperties = [("key", "value")].into();
-
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable(
@@ -813,7 +810,7 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let columns = stats_column_names(&file_schema, None, None, None);
 
         // Array and Map types should be excluded
         assert_eq!(
@@ -827,12 +824,6 @@ mod tests {
     #[test]
     fn test_stats_schema_with_clustering_past_limit() {
         // Test that clustering columns are included in stats schema even when past the limit
-        let properties: TableProperties = [(
-            "delta.dataSkippingNumIndexedCols".to_string(),
-            "1".to_string(),
-        )]
-        .into();
-
         let file_schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::STRING),
@@ -841,8 +832,13 @@ mod tests {
 
         // "c" is a clustering column, should be included even though limit is 1
         let clustering_columns = vec![ColumnName::new(["c"])];
-        let stats_schema =
-            expected_stats_schema(&file_schema, &properties, Some(&clustering_columns)).unwrap();
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            None,
+            Some(DataSkippingNumIndexedCols::NumColumns(1)),
+            Some(&clustering_columns),
+        )
+        .unwrap();
 
         // Only "a" (first column) and "c" (clustering) should be included
         let expected_null_count = StructType::new_unchecked([
