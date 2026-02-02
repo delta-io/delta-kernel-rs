@@ -451,7 +451,14 @@ pub struct EngineBuilder {
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// with (worker_threads, max_blocking_threads). If None, use the default single-threaded
     /// background executor.
-    multithreaded_executor_config: Option<(Option<usize>, Option<usize>)>,
+    multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+}
+
+#[cfg(feature = "default-engine-base")]
+#[derive(Clone, Copy, Debug)]
+struct MultithreadedExecutorConfig {
+    worker_threads: Option<usize>,
+    max_blocking_threads: Option<usize>,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -545,7 +552,10 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
     } else {
         Some(max_blocking_threads)
     };
-    builder.multithreaded_executor_config = Some((worker_threads, max_blocking_threads));
+    builder.multithreaded_executor_config = Some(MultithreadedExecutorConfig {
+        worker_threads,
+        max_blocking_threads,
+    });
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
@@ -610,13 +620,13 @@ fn engine_to_handle(
 
 /// Build the default engine with optional multithreaded executor configuration.
 ///
-/// If `executor_config` is `Some((worker_threads, max_blocking_threads))`, uses a multi-threaded
-/// executor that owns its runtime. Otherwise, uses the default single-threaded background executor.
+/// If `executor_config` is `Some`, uses a multi-threaded executor that owns its runtime. Otherwise,
+/// uses the default single-threaded background executor.
 #[cfg(feature = "default-engine-base")]
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
-    executor_config: Option<(Option<usize>, Option<usize>)>,
+    executor_config: Option<MultithreadedExecutorConfig>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::storage::store_from_url_opts;
@@ -625,10 +635,10 @@ fn get_default_engine_impl(
     let store = store_from_url_opts(&url, options)?;
 
     let engine: Arc<dyn Engine> =
-        if let Some((worker_threads, max_blocking_threads)) = executor_config {
+        if let Some(config) = executor_config {
             use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
             let executor =
-                TokioMultiThreadExecutor::new_owned_runtime(worker_threads, max_blocking_threads)?;
+                TokioMultiThreadExecutor::new_owned_runtime(config.worker_threads, config.max_blocking_threads)?;
             Arc::new(
                 DefaultEngineBuilder::new(store)
                     .with_task_executor(Arc::new(executor))
