@@ -18,6 +18,7 @@ use crate::arrow::datatypes::{
     UInt64Type, UInt8Type,
 };
 use crate::column_trie::ColumnTrie;
+use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::expressions::ColumnName;
 use crate::{DeltaResult, Error};
 
@@ -343,13 +344,16 @@ struct ColumnStats {
 fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
-    filter: &ColumnTrie<'_>,
+    col_filter: &ColumnTrie<'_>,
 ) -> DeltaResult<ColumnStats> {
     match column.data_type() {
         DataType::Struct(fields) => {
             let struct_array = column
                 .as_struct_opt()
                 .ok_or_else(|| Error::generic("Failed to downcast column to StructArray"))?;
+
+            // Propagate struct-level nulls to all descendants
+            let fixed_struct = fix_nested_null_masks(struct_array.clone());
 
             // Accumulators for each stat type
             let mut null_fields: Vec<Field> = Vec::new();
@@ -362,7 +366,7 @@ fn compute_column_stats(
             for (i, field) in fields.iter().enumerate() {
                 path.push(field.name().to_string());
 
-                let child_stats = compute_column_stats(struct_array.column(i), path, filter)?;
+                let child_stats = compute_column_stats(fixed_struct.column(i), path, col_filter)?;
 
                 if let Some(arr) = child_stats.null_count {
                     null_fields.push(Field::new(field.name(), arr.data_type().clone(), true));
@@ -406,7 +410,7 @@ fn compute_column_stats(
         | DataType::FixedSizeList(_, _)
         | DataType::ListView(_)
         | DataType::LargeListView(_) => {
-            if !filter.contains_prefix_of(path) {
+            if !col_filter.contains_prefix_of(path) {
                 return Ok(ColumnStats::default());
             }
             Ok(ColumnStats {
@@ -417,7 +421,7 @@ fn compute_column_stats(
         }
         _ => {
             // Leaf: check filter, compute all stats together
-            if !filter.contains_prefix_of(path) {
+            if !col_filter.contains_prefix_of(path) {
                 return Ok(ColumnStats::default());
             }
 
@@ -480,7 +484,7 @@ pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
 ) -> DeltaResult<StructArray> {
-    let filter = ColumnTrie::from_columns(stats_columns);
+    let col_filter = ColumnTrie::from_columns(stats_columns);
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
@@ -493,7 +497,7 @@ pub(crate) fn collect_stats(
         let column = batch.column(col_idx);
 
         // Single traversal computes all three stats
-        let stats = compute_column_stats(column, &mut path, &filter)?;
+        let stats = compute_column_stats(column, &mut path, &col_filter)?;
 
         if let Some(arr) = stats.null_count {
             null_counts.push(field.name(), arr);
@@ -529,7 +533,7 @@ pub(crate) fn collect_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{Array, Int64Array, StringArray};
+    use crate::arrow::array::{Array, Int32Array, Int64Array, StringArray};
     use crate::arrow::datatypes::{Fields, Schema};
     use crate::expressions::column_name;
 
@@ -1164,5 +1168,112 @@ mod tests {
             .unwrap();
         assert!(max_values.column_by_name("id").is_some());
         assert!(max_values.column_by_name("list_col").is_none());
+    }
+
+    #[test]
+    fn test_collect_stats_struct_with_nulls_at_struct_level() {
+        use crate::arrow::buffer::NullBuffer;
+        use crate::arrow::datatypes::{Int32Type, Int64Type};
+
+        // Schema: { my_struct: { a: int32, b: int32 (nullable) } }
+        // Test both struct-level nulls and field-level nulls
+        let child_fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ]);
+
+        let a_values = Int32Array::from(vec![1, 2, 3, 4]);
+        // b has field-level nulls at rows 0 and 2
+        let b_values = Int32Array::from(vec![None, Some(20), None, Some(40)]);
+
+        // Struct validity: [false, true, true, false]
+        // In Arrow: false = null, true = valid
+        // So rows 0 and 3 have null structs (entire struct is null)
+        let nulls = NullBuffer::from(vec![false, true, true, false]);
+
+        let struct_array = StructArray::new(
+            child_fields.clone(),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+            Some(nulls),
+        );
+
+        let schema = Schema::new(vec![Field::new(
+            "my_struct",
+            DataType::Struct(child_fields),
+            true,
+        )]);
+
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("my_struct")]).unwrap();
+
+        // Visualizing the data:
+        // Row 0: struct=NULL,  (a=1, b=None are "invisible")
+        // Row 1: struct=VALID, a=2, b=20
+        // Row 2: struct=VALID, a=3, b=None
+        // Row 3: struct=NULL,  (a=4, b=40 are "invisible")
+        //
+        // Expected behavior (struct nulls propagate to children):
+        // - a: visible values are [2, 3], nullCount = 2 (rows 0, 3 are struct-null)
+        // - b: visible values are [20, None], nullCount = 3 (rows 0, 3 struct-null + row 2 field-null)
+        // - a: min=2, max=3
+        // - b: min=20, max=20
+
+        // nullCount includes struct-level nulls
+        assert_eq!(
+            get_stat::<Int64Type>(&stats, "nullCount", "my_struct", "a"),
+            2
+        );
+        assert_eq!(
+            get_stat::<Int64Type>(&stats, "nullCount", "my_struct", "b"),
+            3
+        );
+
+        // minValues excludes values from null struct rows
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "minValues", "my_struct", "a"),
+            2
+        );
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "minValues", "my_struct", "b"),
+            20
+        );
+
+        // maxValues excludes values from null struct rows
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "a"),
+            3
+        );
+        assert_eq!(
+            get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "b"),
+            20
+        );
+    }
+
+    // Generic helper to extract and downcast nested columns from stats
+    fn get_stat<T>(
+        stats: &StructArray,
+        stat_name: &str,
+        struct_name: &str,
+        field_name: &str,
+    ) -> T::Native
+    where
+        T: crate::arrow::datatypes::ArrowPrimitiveType,
+    {
+        stats
+            .column_by_name(stat_name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name(struct_name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name(field_name)
+            .unwrap()
+            .as_primitive::<T>()
+            .value(0)
     }
 }
