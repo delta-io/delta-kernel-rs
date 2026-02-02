@@ -95,9 +95,10 @@ pub(crate) enum TransformId {
     Partitioning,
     /// Enables DomainMetadata writer feature
     DomainMetadata,
+    /// Enables clustering with domain metadata
+    Clustering,
     // Future transforms:
     // ColumnMapping,
-    // Clustering,
     // DeletionVectors,
     // etc.
 }

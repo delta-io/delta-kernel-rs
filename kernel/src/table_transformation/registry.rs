@@ -27,8 +27,8 @@ use crate::transaction::data_layout::DataLayout;
 use crate::DeltaResult;
 
 use super::transforms::{
-    DeltaPropertyValidationTransform, DomainMetadataTransform, FeatureSignalTransform,
-    PartitioningTransform, ProtocolVersionTransform,
+    ClusteringTransform, DeltaPropertyValidationTransform, DomainMetadataTransform,
+    FeatureSignalTransform, PartitioningTransform, ProtocolVersionTransform,
 };
 use super::{ProtocolMetadataTransform, TransformId};
 
@@ -246,9 +246,19 @@ impl TransformRegistry {
                     transforms.push(Box::new(PartitioningTransform::new(columns.clone())));
                 }
             }
-            DataLayout::Clustered { .. } | DataLayout::None => {
-                // Clustering support will be added in a subsequent commit
+            DataLayout::Clustered { columns } => {
+                // Add DomainMetadataTransform first (ClusteringTransform depends on it)
+                if !included_ids.contains(&TransformId::DomainMetadata) {
+                    included_ids.insert(TransformId::DomainMetadata);
+                    transforms.push(Box::new(DomainMetadataTransform));
+                }
+                // Add ClusteringTransform
+                if !included_ids.contains(&TransformId::Clustering) {
+                    included_ids.insert(TransformId::Clustering);
+                    transforms.push(Box::new(ClusteringTransform::new(columns.clone())));
+                }
             }
+            DataLayout::None => {}
         }
 
         Ok(transforms)

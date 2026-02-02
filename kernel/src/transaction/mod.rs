@@ -346,6 +346,9 @@ impl Transaction {
     /// that will be committed. It uses `PRE_COMMIT_VERSION` as a sentinel to indicate no
     /// version exists yet on disk.
     ///
+    /// The `clustering_columns` parameter should be provided when creating a clustered table,
+    /// so that `stats_schema()` and `stats_columns()` return the correct columns for statistics.
+    ///
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     #[allow(dead_code)] // Used by create_table module
     pub(crate) fn try_new_create_table(
@@ -353,6 +356,7 @@ impl Transaction {
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
+        clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
         // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
@@ -371,10 +375,7 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
-            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
-            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
-            // return the correct columns for the new table.
-            clustering_columns: None,
+            clustering_columns,
         })
     }
 

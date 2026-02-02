@@ -293,13 +293,21 @@ impl CreateTableTransactionBuilder {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
 
+        // Extract clustering columns from data layout (if clustered)
+        // This ensures stats_schema() and stats_columns() return the correct columns
+        let clustering_columns = match &self.data_layout {
+            DataLayout::Clustered { columns } => Some(columns.clone()),
+            _ => None,
+        };
+
         // Create Transaction with pre-commit snapshot
-        // Domain metadata from transforms is passed as system domain metadata
+        // Domain metadata from transforms (e.g., delta.clustering) is passed as system domain metadata
         Transaction::try_new_create_table(
             Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
             output.domain_metadata,
+            clustering_columns,
         )
     }
 }
@@ -434,4 +442,45 @@ mod tests {
     // - Invalid reader version (not 3) fails
     // - Invalid writer version (not 7) fails
     // - Non-integer versions fail
+
+    #[test]
+    fn test_clustered_table_stats_columns() {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::schema::ColumnName;
+
+        let engine = SyncEngine::new();
+
+        // Create schema with multiple columns
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("value", DataType::LONG, true),
+        ]));
+
+        // Create a temp directory for the table
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create a clustered table with "id" and "name" as clustering columns
+        let transaction = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["id", "name"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap();
+
+        // Verify stats_columns() returns the clustering columns
+        let stats_cols = transaction.stats_columns();
+
+        // Stats columns should include clustering columns
+        assert!(
+            stats_cols.contains(&ColumnName::new(["id"])),
+            "stats_columns should include clustering column 'id', got: {:?}",
+            stats_cols
+        );
+        assert!(
+            stats_cols.contains(&ColumnName::new(["name"])),
+            "stats_columns should include clustering column 'name', got: {:?}",
+            stats_cols
+        );
+    }
 }
