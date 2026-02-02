@@ -259,12 +259,12 @@ impl CreateTableTransactionBuilder {
         )?;
 
         // Apply transforms based on properties (enables features, validates, etc.)
-        let final_config =
+        let output =
             TransformationPipeline::apply_transforms(config, &self.table_properties)?;
 
         // Extract protocol and metadata from final config
-        let protocol = final_config.protocol;
-        let metadata = final_config.metadata;
+        let protocol = output.config.protocol;
+        let metadata = output.config.metadata;
 
         // Create pre-commit snapshot from protocol/metadata
         let log_root = table_url.join("_delta_log/")?;
@@ -273,11 +273,12 @@ impl CreateTableTransactionBuilder {
             TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
 
         // Create Transaction with pre-commit snapshot
+        // Domain metadata from transforms is passed as system domain metadata
         Transaction::try_new_create_table(
             Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
-            vec![], // system_domain_metadata - not supported in base API
+            output.domain_metadata,
         )
     }
 }

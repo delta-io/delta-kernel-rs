@@ -144,8 +144,9 @@ impl TableProtocolMetadataConfig {
     }
 
     /// Table features allowed during CREATE TABLE.
-    const ALLOWED_DELTA_FEATURES: [TableFeature; 0] = [
-        // Currently empty - no features allowed yet
+    const ALLOWED_DELTA_FEATURES: [TableFeature; 1] = [
+        // DomainMetadata: required for clustering, can also be enabled explicitly
+        TableFeature::DomainMetadata,
         // As transforms are added, their features go here:
         // TableFeature::DeletionVectors,
         // TableFeature::ColumnMapping,
@@ -256,12 +257,12 @@ mod tests {
         let config =
             TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
 
-        let final_config = TransformationPipeline::apply_transforms(config, &properties).unwrap();
+        let output = TransformationPipeline::apply_transforms(config, &properties).unwrap();
 
         // Protocol still bare, properties still there
-        assert!(final_config.protocol.writer_features().unwrap().is_empty());
+        assert!(output.config.protocol.writer_features().unwrap().is_empty());
         assert_eq!(
-            final_config.metadata.configuration().get("myapp.version"),
+            output.config.metadata.configuration().get("myapp.version"),
             Some(&"1.0".to_string())
         );
     }
