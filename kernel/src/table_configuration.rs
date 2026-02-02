@@ -8,6 +8,7 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use url::Url;
@@ -16,7 +17,7 @@ use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{expected_stats_schema, stats_column_names};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, StructType};
+use crate::schema::{DataType, InvariantChecker, SchemaRef, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
@@ -187,11 +188,15 @@ impl TableConfiguration {
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<SchemaRef> {
-        Ok(Arc::new(expected_stats_schema(
-            &self.physical_data_schema(),
+        let physical_stats_columns = self.logical_to_physical_columns(
             self.table_properties()
                 .data_skipping_stats_columns
                 .as_deref(),
+        );
+
+        Ok(Arc::new(expected_stats_schema(
+            &self.physical_data_schema(),
+            physical_stats_columns.as_deref(),
             self.table_properties().data_skipping_num_indexed_cols,
             clustering_columns,
         )?))
@@ -211,14 +216,61 @@ impl TableConfiguration {
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        stats_column_names(
-            &self.physical_data_schema(),
+        let physical_stats_columns = self.logical_to_physical_columns(
             self.table_properties()
                 .data_skipping_stats_columns
                 .as_deref(),
+        );
+
+        stats_column_names(
+            &self.physical_data_schema(),
+            physical_stats_columns.as_deref(),
             self.table_properties().data_skipping_num_indexed_cols,
             clustering_columns,
         )
+    }
+
+    /// Converts logical column names to physical column names.
+    ///
+    /// When column mapping is enabled (Id or Name mode), converts each logical column name
+    /// to its physical counterpart. When column mapping is disabled, returns the columns
+    /// borrowed as-is since logical and physical names are identical.
+    fn logical_to_physical_columns<'a>(
+        &self,
+        logical_columns: Option<&'a [ColumnName]>,
+    ) -> Option<Cow<'a, [ColumnName]>> {
+        let columns = logical_columns?;
+
+        if matches!(self.column_mapping_mode(), ColumnMappingMode::None) {
+            return Some(Cow::Borrowed(columns));
+        }
+
+        let physical: Vec<ColumnName> = columns
+            .iter()
+            .filter_map(|name| self.logical_to_physical_column_name(name))
+            .collect();
+        Some(Cow::Owned(physical))
+    }
+
+    /// Converts a logical column name to its physical column name.
+    ///
+    /// Walks the schema following the logical column path, using `StructField::physical_name`
+    /// to get the physical name at each level.
+    fn logical_to_physical_column_name(&self, logical_name: &ColumnName) -> Option<ColumnName> {
+        let mode = self.column_mapping_mode();
+        let mut physical_parts = Vec::with_capacity(logical_name.len());
+        let mut current_struct: &StructType = self.schema.as_ref();
+
+        for part in logical_name.iter() {
+            let field = current_struct.field(part)?;
+            physical_parts.push(field.physical_name(mode).to_string());
+
+            if let DataType::Struct(nested) = field.data_type() {
+                current_struct = nested;
+            }
+        }
+
+        Some(ColumnName::new(physical_parts))
     }
 
     /// Returns the physical schema for data columns (excludes partition columns).
@@ -641,6 +693,9 @@ mod test {
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
+
+    use crate::schema::ColumnName;
+    use crate::table_features::ColumnMappingMode;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
 
@@ -1456,5 +1511,155 @@ mod test {
 
         let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    /// Helper to create a schema with column mapping metadata
+    fn schema_with_column_mapping() -> StructType {
+        // Create fields with column mapping metadata using JSON deserialization
+        let field_a: StructField = serde_json::from_str(
+            r#"{
+                "name": "col_a",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "phys_col_a"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let field_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "col_b",
+                "type": "string",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 2,
+                    "delta.columnMapping.physicalName": "phys_col_b"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        StructType::new_unchecked([field_a, field_b])
+    }
+
+    fn create_table_config_with_column_mapping(
+        schema: StructType,
+        stats_columns: Option<&str>,
+        column_mapping_mode: &str,
+    ) -> TableConfiguration {
+        let mut props = HashMap::new();
+        props.insert(
+            "delta.columnMapping.mode".to_string(),
+            column_mapping_mode.to_string(),
+        );
+        if let Some(cols) = stats_columns {
+            props.insert(
+                "delta.dataSkippingStatsColumns".to_string(),
+                cols.to_string(),
+            );
+        }
+
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+
+        // Use reader version 2 which supports column mapping
+        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn test_logical_to_physical_column_name_no_mapping() {
+        // Without column mapping, logical names should be returned as-is
+        let schema = StructType::new_unchecked([
+            StructField::nullable("col_a", DataType::LONG),
+            StructField::nullable("col_b", DataType::STRING),
+        ]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
+
+        let logical_name = ColumnName::new(["col_a"]);
+        let physical_name = config.logical_to_physical_column_name(&logical_name);
+        assert_eq!(physical_name, Some(ColumnName::new(["col_a"])));
+    }
+
+    #[test]
+    fn test_logical_to_physical_column_name_with_mapping() {
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, None, "name");
+
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+
+        // Logical name should be converted to physical name
+        let logical_name = ColumnName::new(["col_a"]);
+        let physical_name = config.logical_to_physical_column_name(&logical_name);
+        assert_eq!(physical_name, Some(ColumnName::new(["phys_col_a"])));
+
+        let logical_name = ColumnName::new(["col_b"]);
+        let physical_name = config.logical_to_physical_column_name(&logical_name);
+        assert_eq!(physical_name, Some(ColumnName::new(["phys_col_b"])));
+    }
+
+    #[test]
+    fn test_logical_to_physical_column_name_not_found() {
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, None, "name");
+
+        // Non-existent column should return None
+        let logical_name = ColumnName::new(["nonexistent"]);
+        let physical_name = config.logical_to_physical_column_name(&logical_name);
+        assert_eq!(physical_name, None);
+    }
+
+    #[test]
+    fn test_logical_to_physical_columns_no_mapping() {
+        // Without column mapping, columns should be returned as-is (borrowed)
+        let schema = StructType::new_unchecked([
+            StructField::nullable("col_a", DataType::LONG),
+            StructField::nullable("col_b", DataType::STRING),
+        ]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let columns = vec![ColumnName::new(["col_a"]), ColumnName::new(["col_b"])];
+        let physical_cols = config.logical_to_physical_columns(Some(&columns));
+        assert_eq!(
+            physical_cols.as_deref(),
+            Some([ColumnName::new(["col_a"]), ColumnName::new(["col_b"])].as_slice())
+        );
+    }
+
+    #[test]
+    fn test_logical_to_physical_columns_with_mapping() {
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, None, "name");
+
+        // Columns should be converted from logical to physical names
+        let columns = vec![ColumnName::new(["col_a"]), ColumnName::new(["col_b"])];
+        let physical_cols = config.logical_to_physical_columns(Some(&columns)).unwrap();
+        assert_eq!(
+            physical_cols.as_ref(),
+            &[
+                ColumnName::new(["phys_col_a"]),
+                ColumnName::new(["phys_col_b"])
+            ]
+        );
+    }
+
+    #[test]
+    fn test_logical_to_physical_columns_none_input() {
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, None, "name");
+
+        // Should return None when input is None
+        assert!(config.logical_to_physical_columns(None).is_none());
     }
 }
