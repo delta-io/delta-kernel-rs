@@ -17,7 +17,7 @@ pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 // Write-side column mapping support
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
-    resolve_logical_to_physical_path, COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+    resolve_logical_to_physical_path, COLUMN_MAPPING_MAX_COLUMN_ID_KEY, COLUMN_MAPPING_MODE_KEY,
 };
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;

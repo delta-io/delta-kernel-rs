@@ -443,4 +443,255 @@ mod tests {
     // - Invalid reader version (not 3) fails
     // - Invalid writer version (not 7) fails
     // - Non-integer versions fail
+
+    /// Tests the end-to-end CTAS flow with column mapping enabled.
+    ///
+    /// This test validates that when creating a table with `delta.columnMapping.mode=name`:
+    /// 1. The schema gets column mapping metadata (IDs and physical names)
+    /// 2. `WriteContext.stats_columns()` returns physical column names
+    /// 3. `WriteContext.physical_schema()` has fields with physical names
+    /// 4. The transaction's `stats_schema()` uses physical column names
+    #[test]
+    fn test_ctas_with_column_mapping_stats_use_physical_names() {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::schema::ColumnMetadataKey;
+        use crate::table_features::ColumnMappingMode;
+        use tempfile::tempdir;
+
+        // The constant for checking maxColumnId in configuration
+        const COLUMN_MAPPING_MAX_COLUMN_ID_KEY: &str = "delta.columnMapping.maxColumnId";
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create a schema with nested fields to test column mapping thoroughly
+        let inner_struct = StructType::new_unchecked([
+            StructField::new("x", DataType::INTEGER, false),
+            StructField::new("y", DataType::STRING, true),
+        ]);
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("nested", DataType::Struct(Box::new(inner_struct)), true),
+        ]));
+
+        // Create table with column mapping mode = name
+        let txn = create_table(table_path, schema.clone(), "TestEngine/1.0")
+            .with_table_properties([("delta.columnMapping.mode", "name")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .expect("Failed to create table with column mapping");
+
+        // === Verify 1: Schema has column mapping metadata ===
+        let table_config = txn.read_snapshot.table_configuration();
+        let logical_schema = table_config.schema();
+
+        // Check column mapping mode is enabled
+        assert_eq!(
+            table_config.column_mapping_mode(),
+            ColumnMappingMode::Name,
+            "Column mapping mode should be 'name'"
+        );
+
+        // Check each field has column mapping metadata
+        for field in logical_schema.fields() {
+            let col_id = field.get_config_value(&ColumnMetadataKey::ColumnMappingId);
+            let physical_name =
+                field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName);
+
+            assert!(
+                col_id.is_some(),
+                "Field '{}' should have column mapping ID",
+                field.name()
+            );
+            assert!(
+                physical_name.is_some(),
+                "Field '{}' should have physical name",
+                field.name()
+            );
+
+            // Physical name should be different from logical name (uuid-based)
+            if let Some(crate::schema::MetadataValue::String(phys)) = physical_name {
+                assert!(
+                    phys.starts_with("col-"),
+                    "Physical name '{}' should start with 'col-' prefix",
+                    phys
+                );
+                assert_ne!(
+                    phys,
+                    field.name(),
+                    "Physical name should differ from logical name"
+                );
+            }
+        }
+
+        // === Verify 2: WriteContext uses physical names ===
+        let write_context = txn.get_write_context();
+
+        // stats_columns should return physical column names
+        let stats_cols = write_context.stats_columns();
+        assert!(!stats_cols.is_empty(), "Stats columns should not be empty");
+
+        // Each stats column should be a physical name (starts with "col-")
+        // Check the path components directly since to_string() adds backtick escaping
+        for col_name in stats_cols {
+            let path = col_name.path();
+            // All path components should be physical names (col-* prefix)
+            for component in path {
+                assert!(
+                    component.starts_with("col-"),
+                    "Stats column path component '{}' should use physical name (col-* prefix)",
+                    component
+                );
+            }
+        }
+
+        // === Verify 3: Physical schema fields have column mapping metadata ===
+        // Note: WriteContext.physical_schema() uses logical field names but includes
+        // column mapping metadata. The engine should use this metadata to determine
+        // the physical column names to write to parquet files.
+        let physical_schema = write_context.physical_schema();
+
+        for field in physical_schema.fields() {
+            // Field names are logical, but they have column mapping metadata
+            let physical_name =
+                field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName);
+            assert!(
+                physical_name.is_some(),
+                "Physical schema field '{}' should have column mapping physical name metadata",
+                field.name()
+            );
+
+            // Verify the physical name metadata is a col-* name
+            if let Some(crate::schema::MetadataValue::String(phys)) = physical_name {
+                assert!(
+                    phys.starts_with("col-"),
+                    "Physical name metadata '{}' for field '{}' should have col-* prefix",
+                    phys,
+                    field.name()
+                );
+            }
+
+            // For nested structs, check inner fields too
+            if let DataType::Struct(inner) = field.data_type() {
+                for inner_field in inner.fields() {
+                    let inner_phys =
+                        inner_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName);
+                    assert!(
+                        inner_phys.is_some(),
+                        "Nested field '{}' should have physical name metadata",
+                        inner_field.name()
+                    );
+                }
+            }
+        }
+
+        // === Verify 4: Stats schema uses physical names ===
+        let stats_schema = txn.stats_schema().expect("Should get stats schema");
+
+        // Find minValues/maxValues fields and verify they use physical column names
+        if let Some(min_values_field) = stats_schema.field("minValues") {
+            if let DataType::Struct(min_struct) = min_values_field.data_type() {
+                for field in min_struct.fields() {
+                    assert!(
+                        field.name().starts_with("col-"),
+                        "Stats minValues field '{}' should use physical name",
+                        field.name()
+                    );
+                }
+            }
+        }
+
+        // === Verify 5: Logical schema still has logical names ===
+        let logical_schema_from_ctx = write_context.logical_schema();
+        let logical_field_names: Vec<&str> = logical_schema_from_ctx
+            .fields()
+            .map(|f| f.name().as_str())
+            .collect();
+
+        assert!(
+            logical_field_names.contains(&"id"),
+            "Logical schema should contain 'id'"
+        );
+        assert!(
+            logical_field_names.contains(&"name"),
+            "Logical schema should contain 'name'"
+        );
+        assert!(
+            logical_field_names.contains(&"nested"),
+            "Logical schema should contain 'nested'"
+        );
+
+        // Verify maxColumnId was set in configuration
+        let config = table_config.metadata().configuration();
+        assert!(
+            config.contains_key(COLUMN_MAPPING_MAX_COLUMN_ID_KEY),
+            "Configuration should contain maxColumnId"
+        );
+        let max_id: i64 = config
+            .get(COLUMN_MAPPING_MAX_COLUMN_ID_KEY)
+            .unwrap()
+            .parse()
+            .unwrap();
+        // We have 5 fields total: id, name, nested, nested.x, nested.y
+        assert!(
+            max_id >= 5,
+            "maxColumnId should be at least 5 for 5 fields, got {}",
+            max_id
+        );
+    }
+
+    /// Tests that CTAS without column mapping uses logical names for stats.
+    #[test]
+    fn test_ctas_without_column_mapping_stats_use_logical_names() {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::table_features::ColumnMappingMode;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("value", DataType::STRING, true),
+        ]));
+
+        // Create table WITHOUT column mapping
+        let txn = create_table(table_path, schema, "TestEngine/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .expect("Failed to create table");
+
+        let table_config = txn.read_snapshot.table_configuration();
+
+        // Verify column mapping is NOT enabled
+        assert_eq!(
+            table_config.column_mapping_mode(),
+            ColumnMappingMode::None,
+            "Column mapping mode should be 'none'"
+        );
+
+        // WriteContext stats_columns should use logical names
+        let write_context = txn.get_write_context();
+        let stats_cols = write_context.stats_columns();
+
+        for col_name in stats_cols {
+            // Without column mapping, path components should be logical names (not col-* prefix)
+            for component in col_name.path() {
+                assert!(
+                    !component.starts_with("col-"),
+                    "Without column mapping, stats column component '{}' should use logical name",
+                    component
+                );
+            }
+        }
+
+        // Physical schema should use logical names (same as logical)
+        let physical_schema = write_context.physical_schema();
+        let field_names: Vec<&str> = physical_schema.fields().map(|f| f.name().as_str()).collect();
+        assert!(field_names.contains(&"id"), "Should have 'id' field");
+        assert!(field_names.contains(&"value"), "Should have 'value' field");
+    }
 }

@@ -273,11 +273,11 @@ impl ProtocolMetadataTransform for ColumnMappingTransform {
     fn apply(
         &self,
         mut config: TableProtocolMetadataConfig,
-        _context: &TransformContext<'_>,
+        context: &TransformContext<'_>,
     ) -> DeltaResult<TransformOutput> {
         use crate::table_features::{
             assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
-            ColumnMappingMode, COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+            ColumnMappingMode, COLUMN_MAPPING_MAX_COLUMN_ID_KEY, COLUMN_MAPPING_MODE_KEY,
         };
 
         // Always add the columnMapping feature to protocol (idempotent)
@@ -288,8 +288,9 @@ impl ProtocolMetadataTransform for ColumnMappingTransform {
             config.protocol = config.protocol.with_feature(TableFeature::ColumnMapping)?;
         }
 
-        // Check if mode is actually set (not just the feature signal)
-        let mode = get_column_mapping_mode_from_properties(config.metadata.configuration())?;
+        // Read mode from context.properties (raw user properties)
+        // not from config.metadata which has delta.* properties filtered out
+        let mode = get_column_mapping_mode_from_properties(context.properties)?;
 
         match mode {
             ColumnMappingMode::None => {
@@ -302,11 +303,20 @@ impl ProtocolMetadataTransform for ColumnMappingTransform {
                 let mut max_id = 0i64;
                 let new_schema = assign_column_mapping_metadata(&schema, &mut max_id)?;
 
-                // Update metadata with new schema and maxColumnId
+                // Get the mode string from user properties
+                let mode_str = context
+                    .properties
+                    .get(COLUMN_MAPPING_MODE_KEY)
+                    .cloned()
+                    .unwrap_or_else(|| "none".to_string());
+
+                // Update metadata with new schema, maxColumnId, AND the mode property
+                // The mode needs to be persisted so the table knows its column mapping mode
                 config.metadata = config
                     .metadata
                     .with_schema(new_schema)?
-                    .with_configuration_value(COLUMN_MAPPING_MAX_COLUMN_ID_KEY, max_id.to_string());
+                    .with_configuration_value(COLUMN_MAPPING_MAX_COLUMN_ID_KEY, max_id.to_string())
+                    .with_configuration_value(COLUMN_MAPPING_MODE_KEY, mode_str);
 
                 Ok(TransformOutput::new(config))
             }

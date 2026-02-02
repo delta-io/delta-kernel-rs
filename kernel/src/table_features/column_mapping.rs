@@ -213,7 +213,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 ///
 /// * `schema` - The schema to process
 /// * `max_id` - Mutable reference to track the highest column ID. Will be updated to
-///              reflect the maximum ID seen or assigned.
+///   reflect the maximum ID seen or assigned.
 ///
 /// # Returns
 ///
