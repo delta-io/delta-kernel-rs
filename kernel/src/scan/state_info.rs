@@ -225,8 +225,11 @@ impl StateInfo {
         // MVP: only empty list is supported, which means output ALL stats from expected_stats_schema
         let output_stats_schema = match &stats_columns {
             Some(columns) if columns.is_empty() => {
-                // Empty list means output all stats from expected_stats_schema
-                Some(table_configuration.expected_stats_schema()?)
+                // Empty list means output all stats from expected_stats_schema.
+                // Clustering columns are not needed here - that parameter ensures clustering
+                // columns are always included when writing stats. For reading, we just use
+                // the schema determined by table properties.
+                Some(table_configuration.expected_stats_schema(None)?)
             }
             Some(_) => {
                 // Non-empty list not supported in MVP
