@@ -90,12 +90,13 @@ pub(crate) enum TransformId {
     ProtocolVersion,
     /// Enables DomainMetadata writer feature
     DomainMetadata,
+    /// Enables column mapping (assigns IDs and physical names when mode is set)
+    ColumnMapping,
     /// Sets partition columns on metadata
     Partitioning,
     /// Enables clustered table with domain metadata
     Clustering,
     // Future transforms:
-    // ColumnMapping,
     // DeletionVectors,
     // etc.
 }
@@ -523,6 +524,7 @@ impl TransformationPipeline {
 mod tests {
     use super::*;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_features::TableFeature;
     use crate::transaction::data_layout::DataLayout;
 
     /// Helper to construct a HashMap<String, String> from string slice pairs.
@@ -812,5 +814,178 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.config.protocol.writer_features().unwrap().is_empty());
+    }
+
+    // =========================================================================
+    // ColumnMapping Transform Tests
+    // =========================================================================
+
+    #[test]
+    fn test_column_mapping_feature_signal_only() {
+        // Feature signal only - adds feature but no schema transformation
+        let properties = props([("delta.feature.columnMapping", "supported")]);
+        let config = TableProtocolMetadataConfig::new_base_for_create(
+            test_schema(),
+            vec![],
+            properties.clone(),
+        )
+        .unwrap();
+
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+
+        // Feature should be added to protocol
+        assert!(output
+            .config
+            .protocol
+            .has_table_feature(&TableFeature::ColumnMapping));
+
+        // Schema should NOT have column mapping metadata (no IDs or physical names)
+        let schema = output.config.metadata.parse_schema().unwrap();
+        let field = schema.field("id").unwrap();
+        assert!(
+            !field
+                .metadata
+                .contains_key("delta.columnMapping.id"),
+            "Schema should not have column mapping ID when only feature signal is set"
+        );
+    }
+
+    #[test]
+    fn test_column_mapping_mode_property() {
+        // Mode property - adds feature AND transforms schema
+        let properties = props([("delta.columnMapping.mode", "name")]);
+        let config = TableProtocolMetadataConfig::new_base_for_create(
+            test_schema(),
+            vec![],
+            properties.clone(),
+        )
+        .unwrap();
+
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+
+        // Feature should be added to protocol
+        assert!(output
+            .config
+            .protocol
+            .has_table_feature(&TableFeature::ColumnMapping));
+
+        // Schema SHOULD have column mapping metadata
+        let schema = output.config.metadata.parse_schema().unwrap();
+        let field = schema.field("id").unwrap();
+        assert!(
+            field.metadata.contains_key("delta.columnMapping.id"),
+            "Schema should have column mapping ID when mode is set"
+        );
+        assert!(
+            field.metadata.contains_key("delta.columnMapping.physicalName"),
+            "Schema should have physical name when mode is set"
+        );
+
+        // maxColumnId should be set in properties
+        assert!(output
+            .config
+            .metadata
+            .configuration()
+            .contains_key("delta.columnMapping.maxColumnId"));
+    }
+
+    #[test]
+    fn test_column_mapping_both_signal_and_mode() {
+        // Both feature signal and mode property - mode takes precedence
+        let properties = props([
+            ("delta.feature.columnMapping", "supported"),
+            ("delta.columnMapping.mode", "id"),
+        ]);
+        let config = TableProtocolMetadataConfig::new_base_for_create(
+            test_schema(),
+            vec![],
+            properties.clone(),
+        )
+        .unwrap();
+
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+
+        // Feature should be added to protocol
+        assert!(output
+            .config
+            .protocol
+            .has_table_feature(&TableFeature::ColumnMapping));
+
+        // Schema should have column mapping metadata (mode takes precedence)
+        let schema = output.config.metadata.parse_schema().unwrap();
+        let field = schema.field("id").unwrap();
+        assert!(
+            field.metadata.contains_key("delta.columnMapping.id"),
+            "Schema should have column mapping metadata"
+        );
+    }
+
+    #[test]
+    fn test_clustering_with_column_mapping() {
+        use crate::schema::ColumnName;
+
+        // Create schema with two columns
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ]);
+
+        // Clustering + column mapping
+        let properties = props([("delta.columnMapping.mode", "name")]);
+        let data_layout = DataLayout::Clustered {
+            columns: vec![ColumnName::new(["id"])],
+        };
+
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema, vec![], properties.clone())
+                .unwrap();
+
+        let result = TransformationPipeline::apply_transforms(config, &properties, &data_layout);
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+
+        // Both features should be in protocol
+        assert!(output
+            .config
+            .protocol
+            .has_table_feature(&TableFeature::ColumnMapping));
+        assert!(output
+            .config
+            .protocol
+            .has_table_feature(&TableFeature::ClusteredTable));
+        assert!(output
+            .config
+            .protocol
+            .has_table_feature(&TableFeature::DomainMetadata));
+
+        // Should have domain metadata for clustering
+        assert_eq!(output.domain_metadata.len(), 1);
+        let domain = &output.domain_metadata[0];
+        assert_eq!(domain.domain(), "delta.clustering");
+
+        // The clustering domain metadata should contain physical column names
+        // (not logical names) when column mapping is enabled
+        let config_str = domain.configuration();
+        // The config should contain a physical name (col-*) not the logical name "id"
+        // Since we use UUID-generated names, we just check it doesn't contain
+        // the raw logical name as the only path element
+        assert!(
+            config_str.contains("col-") || !config_str.contains("\"id\""),
+            "Clustering domain metadata should use physical names when column mapping is enabled: {}",
+            config_str
+        );
     }
 }

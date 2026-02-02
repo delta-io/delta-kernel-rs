@@ -364,6 +364,27 @@ impl Metadata {
         self.partition_columns = partition_columns;
         self
     }
+
+    /// Return a new Metadata with updated schema.
+    ///
+    /// This is used by transforms that need to modify the schema, such as the
+    /// column mapping transform which assigns IDs and physical names to fields.
+    #[internal_api]
+    #[allow(dead_code)] // Used by table_transformation module
+    pub(crate) fn with_schema(mut self, schema: StructType) -> DeltaResult<Self> {
+        self.schema_string = serde_json::to_string(&schema)?;
+        Ok(self)
+    }
+
+    /// Return a new Metadata with an additional configuration value.
+    ///
+    /// If the key already exists, its value will be updated.
+    #[internal_api]
+    #[allow(dead_code)] // Used by table_transformation module
+    pub(crate) fn with_configuration_value(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.configuration.insert(key.into(), value.into());
+        self
+    }
 }
 
 // NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,

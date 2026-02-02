@@ -156,25 +156,26 @@ impl TableProtocolMetadataConfig {
     }
 
     /// Table features allowed during CREATE TABLE.
-    const ALLOWED_DELTA_FEATURES: [TableFeature; 2] = [
+    const ALLOWED_DELTA_FEATURES: [TableFeature; 3] = [
         // DomainMetadata: required for clustering, can also be enabled explicitly
         TableFeature::DomainMetadata,
         // ClusteredTable: enabled when using clustered data layout
         TableFeature::ClusteredTable,
+        // ColumnMapping: enables column mapping (name/id mode)
+        TableFeature::ColumnMapping,
         // As transforms are added, their features go here:
         // TableFeature::DeletionVectors,
-        // TableFeature::ColumnMapping,
         // TableFeature::TimestampWithoutTimezone,
     ];
 
     /// Delta properties allowed during CREATE TABLE.
     /// Signal flags (delta.feature.*, delta.minReaderVersion, delta.minWriterVersion)
     /// are always allowed and handled separately.
-    const ALLOWED_DELTA_PROPERTIES: [&'static str; 0] = [
-        // Currently empty - no delta.* properties allowed yet
+    const ALLOWED_DELTA_PROPERTIES: [&'static str; 1] = [
+        // ColumnMapping mode property: triggers column mapping transform
+        "delta.columnMapping.mode",
         // As property transforms are added, their properties go here:
         // "delta.enableDeletionVectors",
-        // "delta.columnMapping.mode",
         // "delta.enableChangeDataFeed",
     ];
 

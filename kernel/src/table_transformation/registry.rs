@@ -29,8 +29,8 @@ use crate::transaction::data_layout::DataLayout;
 use crate::DeltaResult;
 
 use super::transforms::{
-    ClusteringTransform, DeltaPropertyValidationTransform, DomainMetadataTransform,
-    PartitioningTransform, ProtocolVersionTransform,
+    ClusteringTransform, ColumnMappingTransform, DeltaPropertyValidationTransform,
+    DomainMetadataTransform, PartitioningTransform, ProtocolVersionTransform,
 };
 use super::{ProtocolMetadataTransform, TransformDependency, TransformId};
 
@@ -449,6 +449,34 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
         |_ctx| Some(Box::new(DomainMetadataTransform)),
     );
 
+    // ColumnMapping - enables column mapping feature and optionally transforms schema
+    //
+    // Two activation paths:
+    // 1. Feature signal only (delta.feature.columnMapping=supported):
+    //    - Adds columnMapping to protocol reader/writer features
+    //    - Does NOT transform the schema
+    //
+    // 2. Mode property (delta.columnMapping.mode=name|id):
+    //    - Adds columnMapping to protocol reader/writer features
+    //    - Transforms the schema (assigns IDs and physical names)
+    //    - Sets delta.columnMapping.maxColumnId
+    //
+    // We register BOTH triggers - the registry deduplicates by transform ID,
+    // so only one ColumnMappingTransform instance will be created.
+    registry.register_feature_transform(
+        TransformId::ColumnMapping,
+        TableFeature::ColumnMapping,
+        TransformTrigger::FeatureSignal(TableFeature::ColumnMapping),
+        |_ctx| Some(Box::new(ColumnMappingTransform)),
+    );
+
+    registry.register_feature_transform(
+        TransformId::ColumnMapping,
+        TableFeature::ColumnMapping,
+        TransformTrigger::Property("delta.columnMapping.mode"),
+        |_ctx| Some(Box::new(ColumnMappingTransform)),
+    );
+
     // =========================================================================
     // Data layout transforms
     // =========================================================================
@@ -493,13 +521,6 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
     //     TableFeature::DeletionVectors,
     //     TransformTrigger::Property("delta.enableDeletionVectors"),
     //     |_ctx| Some(Box::new(DeletionVectorsTransform)),
-    // );
-    //
-    // registry.register_feature_transform(
-    //     TransformId::ColumnMapping,
-    //     TableFeature::ColumnMapping,
-    //     TransformTrigger::Property("delta.columnMapping.mode"),
-    //     |_ctx| Some(Box::new(ColumnMappingTransform)),
     // );
     //
     // registry.register_feature_transform(

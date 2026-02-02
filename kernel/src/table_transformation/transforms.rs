@@ -238,6 +238,83 @@ impl ProtocolMetadataTransform for DomainMetadataTransform {
 }
 
 // ============================================================================
+// ColumnMappingTransform
+// ============================================================================
+
+/// Enables column mapping with optional schema transformation.
+///
+/// This transform handles two activation paths:
+///
+/// 1. **Feature signal only** (`delta.feature.columnMapping=supported`):
+///    - Adds `columnMapping` to protocol reader/writer features
+///    - Does NOT transform the schema (no IDs or physical names assigned)
+///    - Table supports column mapping but it's not active
+///
+/// 2. **Mode property** (`delta.columnMapping.mode=name|id`):
+///    - Adds `columnMapping` to protocol reader/writer features
+///    - Transforms the schema (assigns IDs and physical names)
+///    - Sets `delta.columnMapping.maxColumnId` property
+///    - Column mapping is fully active
+///
+/// The transform determines which path by checking if the mode property is set
+/// and is not `none`.
+#[derive(Debug)]
+pub(crate) struct ColumnMappingTransform;
+
+impl ProtocolMetadataTransform for ColumnMappingTransform {
+    fn id(&self) -> TransformId {
+        TransformId::ColumnMapping
+    }
+
+    fn name(&self) -> &'static str {
+        "ColumnMapping: enables column mapping feature and optionally transforms schema"
+    }
+
+    fn apply(
+        &self,
+        mut config: TableProtocolMetadataConfig,
+        _context: &TransformContext<'_>,
+    ) -> DeltaResult<TransformOutput> {
+        use crate::table_features::{
+            assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
+            ColumnMappingMode, COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+        };
+
+        // Always add the columnMapping feature to protocol (idempotent)
+        if !config
+            .protocol
+            .has_table_feature(&TableFeature::ColumnMapping)
+        {
+            config.protocol = config.protocol.with_feature(TableFeature::ColumnMapping)?;
+        }
+
+        // Check if mode is actually set (not just the feature signal)
+        let mode = get_column_mapping_mode_from_properties(config.metadata.configuration())?;
+
+        match mode {
+            ColumnMappingMode::None => {
+                // Path 1: Feature signal only - just update protocol, no schema changes
+                Ok(TransformOutput::new(config))
+            }
+            ColumnMappingMode::Name | ColumnMappingMode::Id => {
+                // Path 2: Full activation - update protocol AND transform schema
+                let schema = config.metadata.parse_schema()?;
+                let mut max_id = 0i64;
+                let new_schema = assign_column_mapping_metadata(&schema, &mut max_id)?;
+
+                // Update metadata with new schema and maxColumnId
+                config.metadata = config
+                    .metadata
+                    .with_schema(new_schema)?
+                    .with_configuration_value(COLUMN_MAPPING_MAX_COLUMN_ID_KEY, max_id.to_string());
+
+                Ok(TransformOutput::new(config))
+            }
+        }
+    }
+}
+
+// ============================================================================
 // PartitioningTransform
 // ============================================================================
 
@@ -338,10 +415,13 @@ impl ProtocolMetadataTransform for ClusteringTransform {
     }
 
     fn dependencies(&self) -> Vec<TransformDependency> {
-        // Clustering requires DomainMetadata to be enabled first
-        vec![TransformDependency::TransformRequired(
-            TransformId::DomainMetadata,
-        )]
+        vec![
+            // Clustering requires DomainMetadata to be enabled first
+            TransformDependency::TransformRequired(TransformId::DomainMetadata),
+            // If column mapping is in the pipeline, it should run before clustering
+            // so we can use physical column names in domain metadata
+            TransformDependency::TransformCompletedIfPresent(TransformId::ColumnMapping),
+        ]
     }
 
     fn validate_preconditions(
@@ -390,6 +470,9 @@ impl ProtocolMetadataTransform for ClusteringTransform {
     ) -> DeltaResult<TransformOutput> {
         use crate::actions::DomainMetadata;
         use crate::clustering::{ClusteringDomainMetadata, CLUSTERING_DOMAIN_NAME};
+        use crate::table_features::{
+            get_column_mapping_mode_from_properties, resolve_logical_to_physical_path,
+        };
 
         // Add ClusteredTable writer feature
         if !config
@@ -399,10 +482,21 @@ impl ProtocolMetadataTransform for ClusteringTransform {
             config.protocol = config.protocol.with_feature(TableFeature::ClusteredTable)?;
         }
 
+        // Get column mapping mode to determine if we need to resolve physical names
+        // Note: If ColumnMappingTransform has run, the schema already has physical names
+        // assigned, and we need to use them in the domain metadata
+        let column_mapping_mode =
+            get_column_mapping_mode_from_properties(config.metadata.configuration())?;
+        let schema = config.metadata.parse_schema()?;
+
         // Create clustering domain metadata
-        // Each column is stored as a path (array of field names) to support nested columns
-        let column_paths: Vec<Vec<String>> =
-            self.columns.iter().map(|c| c.path().to_vec()).collect();
+        // When column mapping is enabled, we store physical column names in domain metadata
+        // so the clustering metadata remains valid after column renames
+        let column_paths: Vec<Vec<String>> = self
+            .columns
+            .iter()
+            .map(|c| resolve_logical_to_physical_path(c.path(), &schema, column_mapping_mode))
+            .collect::<DeltaResult<Vec<_>>>()?;
 
         let clustering_metadata = ClusteringDomainMetadata {
             clustering_columns: column_paths,
