@@ -92,9 +92,10 @@ pub(crate) enum TransformId {
     DomainMetadata,
     /// Sets partition columns on metadata
     Partitioning,
+    /// Enables clustered table with domain metadata
+    Clustering,
     // Future transforms:
     // ColumnMapping,
-    // Clustering,
     // DeletionVectors,
     // etc.
 }
@@ -106,7 +107,6 @@ pub(crate) enum TransformDependency {
     ///
     /// Example: ClusteringTransform requires DomainMetadataTransform to have run,
     /// because Clustering needs to write domain metadata.
-    #[allow(dead_code)] // Used when ClusteringTransform is added
     TransformRequired(TransformId),
 
     /// Soft ordering: If this transform is in the pipeline, run it before me.

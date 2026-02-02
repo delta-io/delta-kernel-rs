@@ -13,7 +13,9 @@ use crate::{DeltaResult, Error};
 
 use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
 
-use super::{ProtocolMetadataTransform, TransformContext, TransformId, TransformOutput};
+use super::{
+    ProtocolMetadataTransform, TransformContext, TransformDependency, TransformId, TransformOutput,
+};
 
 // ============================================================================
 // ProtocolVersionTransform
@@ -298,6 +300,124 @@ impl ProtocolMetadataTransform for PartitioningTransform {
 
         Ok(TransformOutput::new(
             config.with_partition_columns(partition_columns),
+        ))
+    }
+}
+
+// ============================================================================
+// ClusteringTransform
+// ============================================================================
+
+/// Enables clustering with domain metadata.
+///
+/// This transform:
+/// 1. Validates clustering columns exist in schema
+/// 2. Validates column count is within limits
+/// 3. Adds ClusteredTable writer feature
+/// 4. Creates delta.clustering domain metadata
+///
+/// Requires DomainMetadata transform to run first (declared as dependency).
+#[derive(Debug)]
+pub(crate) struct ClusteringTransform {
+    columns: Vec<crate::schema::ColumnName>,
+}
+
+impl ClusteringTransform {
+    pub(crate) fn new(columns: Vec<crate::schema::ColumnName>) -> Self {
+        Self { columns }
+    }
+}
+
+impl ProtocolMetadataTransform for ClusteringTransform {
+    fn id(&self) -> TransformId {
+        TransformId::Clustering
+    }
+
+    fn name(&self) -> &'static str {
+        "Clustering: enables clustered table"
+    }
+
+    fn dependencies(&self) -> Vec<TransformDependency> {
+        // Clustering requires DomainMetadata to be enabled first
+        vec![TransformDependency::TransformRequired(
+            TransformId::DomainMetadata,
+        )]
+    }
+
+    fn validate_preconditions(
+        &self,
+        config: &TableProtocolMetadataConfig,
+        _context: &TransformContext<'_>,
+    ) -> DeltaResult<()> {
+        use crate::transaction::data_layout::MAX_CLUSTERING_COLUMNS;
+
+        // Validate column count
+        if self.columns.len() > MAX_CLUSTERING_COLUMNS {
+            return Err(Error::generic(format!(
+                "Clustering supports at most {} columns, but {} were specified",
+                MAX_CLUSTERING_COLUMNS,
+                self.columns.len()
+            )));
+        }
+
+        // Validate columns exist in schema
+        let schema = config.metadata.parse_schema()?;
+        for col in &self.columns {
+            // Clustering columns must be top-level (single path element)
+            if col.path().len() != 1 {
+                return Err(Error::generic(format!(
+                    "Clustering column '{}' must be a top-level column, not a nested path",
+                    col
+                )));
+            }
+
+            let col_name = &col.path()[0];
+            if schema.field(col_name).is_none() {
+                return Err(Error::generic(format!(
+                    "Clustering column '{}' not found in schema",
+                    col_name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply(
+        &self,
+        mut config: TableProtocolMetadataConfig,
+        _context: &TransformContext<'_>,
+    ) -> DeltaResult<TransformOutput> {
+        use crate::actions::DomainMetadata;
+        use crate::clustering::{ClusteringDomainMetadata, CLUSTERING_DOMAIN_NAME};
+
+        // Add ClusteredTable writer feature
+        if !config
+            .protocol
+            .has_table_feature(&TableFeature::ClusteredTable)
+        {
+            config.protocol = config.protocol.with_feature(TableFeature::ClusteredTable)?;
+        }
+
+        // Create clustering domain metadata
+        // Each column is stored as a path (array of field names) to support nested columns
+        let column_paths: Vec<Vec<String>> =
+            self.columns.iter().map(|c| c.path().to_vec()).collect();
+
+        let clustering_metadata = ClusteringDomainMetadata {
+            clustering_columns: column_paths,
+        };
+
+        let domain_metadata = DomainMetadata::new(
+            CLUSTERING_DOMAIN_NAME.to_string(),
+            serde_json::to_string(&clustering_metadata).map_err(|e| {
+                Error::generic(format!("Failed to serialize clustering metadata: {}", e))
+            })?,
+        );
+
+        Ok(TransformOutput::with_domain_metadata(
+            config,
+            vec![domain_metadata],
         ))
     }
 }

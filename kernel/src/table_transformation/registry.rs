@@ -29,8 +29,8 @@ use crate::transaction::data_layout::DataLayout;
 use crate::DeltaResult;
 
 use super::transforms::{
-    DeltaPropertyValidationTransform, DomainMetadataTransform, PartitioningTransform,
-    ProtocolVersionTransform,
+    ClusteringTransform, DeltaPropertyValidationTransform, DomainMetadataTransform,
+    PartitioningTransform, ProtocolVersionTransform,
 };
 use super::{ProtocolMetadataTransform, TransformDependency, TransformId};
 
@@ -90,7 +90,6 @@ pub(crate) enum SchemaTypeCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataLayoutKind {
     Partitioned,
-    #[allow(dead_code)] // Used when ClusteringTransform is added
     Clustered,
 }
 
@@ -468,6 +467,21 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
         },
     );
 
+    // Clustering - enables clustered table with domain metadata
+    // Triggered when DataLayout::Clustered is specified
+    // DomainMetadataTransform is auto-included via dependency resolution
+    registry.register_builder_transform(
+        TransformId::Clustering,
+        TransformTrigger::DataLayout(DataLayoutKind::Clustered),
+        |ctx| {
+            if let DataLayout::Clustered { columns } = ctx.data_layout {
+                Some(Box::new(ClusteringTransform::new(columns.clone())))
+            } else {
+                None
+            }
+        },
+    );
+
     // =========================================================================
     // Future: Additional feature transforms
     // =========================================================================
@@ -554,6 +568,42 @@ mod tests {
         assert!(!transforms
             .iter()
             .any(|t| t.id() == TransformId::Partitioning));
+    }
+
+    #[test]
+    fn test_clustered_layout_triggers_clustering_transform() {
+        let props = HashMap::new();
+        let data_layout = DataLayout::Clustered {
+            columns: vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        };
+
+        let transforms = TRANSFORM_REGISTRY
+            .select_transforms_to_trigger(&props, &data_layout)
+            .unwrap();
+
+        // Should include Clustering transform
+        assert!(transforms
+            .iter()
+            .any(|t| t.id() == TransformId::Clustering));
+
+        // Should also include DomainMetadata (auto-included as dependency)
+        assert!(transforms
+            .iter()
+            .any(|t| t.id() == TransformId::DomainMetadata));
+    }
+
+    #[test]
+    fn test_no_clustering_when_layout_none() {
+        let props = HashMap::new();
+
+        let transforms = TRANSFORM_REGISTRY
+            .select_transforms_to_trigger(&props, &DataLayout::None)
+            .unwrap();
+
+        // Should NOT include Clustering transform
+        assert!(!transforms
+            .iter()
+            .any(|t| t.id() == TransformId::Clustering));
     }
 
     #[test]

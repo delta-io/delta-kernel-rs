@@ -156,9 +156,11 @@ impl TableProtocolMetadataConfig {
     }
 
     /// Table features allowed during CREATE TABLE.
-    const ALLOWED_DELTA_FEATURES: [TableFeature; 1] = [
+    const ALLOWED_DELTA_FEATURES: [TableFeature; 2] = [
         // DomainMetadata: required for clustering, can also be enabled explicitly
         TableFeature::DomainMetadata,
+        // ClusteredTable: enabled when using clustered data layout
+        TableFeature::ClusteredTable,
         // As transforms are added, their features go here:
         // TableFeature::DeletionVectors,
         // TableFeature::ColumnMapping,
