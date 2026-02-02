@@ -357,6 +357,13 @@ impl Metadata {
         self.configuration = configuration;
         self
     }
+
+    /// Return a new Metadata with updated partition columns.
+    #[internal_api]
+    pub(crate) fn with_partition_columns(mut self, partition_columns: Vec<String>) -> Self {
+        self.partition_columns = partition_columns;
+        self
+    }
 }
 
 // NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,

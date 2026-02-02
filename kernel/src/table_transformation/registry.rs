@@ -25,10 +25,12 @@ use std::sync::LazyLock;
 
 use crate::schema::{DataType, StructType};
 use crate::table_features::TableFeature;
+use crate::transaction::data_layout::DataLayout;
 use crate::DeltaResult;
 
 use super::transforms::{
-    DeltaPropertyValidationTransform, DomainMetadataTransform, ProtocolVersionTransform,
+    DeltaPropertyValidationTransform, DomainMetadataTransform, PartitioningTransform,
+    ProtocolVersionTransform,
 };
 use super::{ProtocolMetadataTransform, TransformDependency, TransformId};
 
@@ -45,12 +47,20 @@ use super::{ProtocolMetadataTransform, TransformDependency, TransformId};
 pub(crate) struct TransformContext<'a> {
     /// Raw properties from the user (includes signal flags like delta.feature.*)
     pub properties: &'a HashMap<String, String>,
+    /// Data layout (partitioning/clustering) configuration
+    pub data_layout: &'a DataLayout,
 }
 
 impl<'a> TransformContext<'a> {
     /// Create a new transform context.
-    pub(crate) fn new(properties: &'a HashMap<String, String>) -> Self {
-        Self { properties }
+    pub(crate) fn new(
+        properties: &'a HashMap<String, String>,
+        data_layout: &'a DataLayout,
+    ) -> Self {
+        Self {
+            properties,
+            data_layout,
+        }
     }
 }
 
@@ -78,9 +88,9 @@ pub(crate) enum SchemaTypeCheck {
 /// Used when DataLayout support is added to trigger transforms based on
 /// whether the table is partitioned or clustered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum DataLayoutKind {
     Partitioned,
+    #[allow(dead_code)] // Used when ClusteringTransform is added
     Clustered,
 }
 
@@ -117,7 +127,6 @@ pub(crate) enum TransformTrigger {
     ///
     /// Example: `TransformTrigger::DataLayout(DataLayoutKind::Clustered)`
     /// triggers when the table uses clustered data layout.
-    #[allow(dead_code)]
     DataLayout(DataLayoutKind),
 }
 
@@ -211,6 +220,7 @@ impl TransformRegistry {
     /// # Arguments
     ///
     /// * `properties` - Raw properties map (for property and signal triggers)
+    /// * `data_layout` - Data layout configuration (for partitioning/clustering triggers)
     ///
     /// # Returns
     ///
@@ -219,8 +229,9 @@ impl TransformRegistry {
     pub(crate) fn select_transforms_to_trigger(
         &self,
         properties: &HashMap<String, String>,
+        data_layout: &DataLayout,
     ) -> DeltaResult<Vec<Box<dyn ProtocolMetadataTransform>>> {
-        let context = TransformContext::new(properties);
+        let context = TransformContext::new(properties, data_layout);
         let mut transforms: Vec<Box<dyn ProtocolMetadataTransform>> = Vec::new();
         let mut included_ids: HashSet<TransformId> = HashSet::new();
 
@@ -245,8 +256,12 @@ impl TransformRegistry {
                 // Schema type detection - requires schema parameter (future enhancement)
                 TransformTrigger::SchemaType(_check) => false,
 
-                // Data layout - requires data_layout parameter (added in partitioning commit)
-                TransformTrigger::DataLayout(_kind) => false,
+                // Data layout triggers
+                TransformTrigger::DataLayout(kind) => matches!(
+                    (kind, data_layout),
+                    (DataLayoutKind::Partitioned, DataLayout::Partitioned { .. })
+                        | (DataLayoutKind::Clustered, DataLayout::Clustered { .. })
+                ),
             };
 
             if should_include {
@@ -436,6 +451,24 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
     );
 
     // =========================================================================
+    // Data layout transforms
+    // =========================================================================
+
+    // Partitioning - sets partition columns on metadata
+    // Triggered when DataLayout::Partitioned is specified
+    registry.register_builder_transform(
+        TransformId::Partitioning,
+        TransformTrigger::DataLayout(DataLayoutKind::Partitioned),
+        |ctx| {
+            if let DataLayout::Partitioned { columns } = ctx.data_layout {
+                Some(Box::new(PartitioningTransform::new(columns.clone())))
+            } else {
+                None
+            }
+        },
+    );
+
+    // =========================================================================
     // Future: Additional feature transforms
     // =========================================================================
     //
@@ -472,14 +505,14 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{ColumnName, DataType, StructField, StructType};
 
     #[test]
     fn test_always_triggers_select_core_transforms() {
         let props = HashMap::new();
 
         let transforms = TRANSFORM_REGISTRY
-            .select_transforms_to_trigger(&props)
+            .select_transforms_to_trigger(&props, &DataLayout::None)
             .unwrap();
 
         // Should have validation and protocol version transforms
@@ -490,6 +523,37 @@ mod tests {
         assert!(transforms
             .iter()
             .any(|t| t.id() == TransformId::ProtocolVersion));
+    }
+
+    #[test]
+    fn test_partitioned_layout_triggers_partitioning_transform() {
+        let props = HashMap::new();
+        let data_layout = DataLayout::Partitioned {
+            columns: vec![ColumnName::new(["region"])],
+        };
+
+        let transforms = TRANSFORM_REGISTRY
+            .select_transforms_to_trigger(&props, &data_layout)
+            .unwrap();
+
+        // Should include Partitioning transform
+        assert!(transforms
+            .iter()
+            .any(|t| t.id() == TransformId::Partitioning));
+    }
+
+    #[test]
+    fn test_no_partitioning_when_layout_none() {
+        let props = HashMap::new();
+
+        let transforms = TRANSFORM_REGISTRY
+            .select_transforms_to_trigger(&props, &DataLayout::None)
+            .unwrap();
+
+        // Should NOT include Partitioning transform
+        assert!(!transforms
+            .iter()
+            .any(|t| t.id() == TransformId::Partitioning));
     }
 
     #[test]

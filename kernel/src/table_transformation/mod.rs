@@ -43,8 +43,8 @@
 //! ```ignore
 //! use delta_kernel::table_transformation::TransformationPipeline;
 //!
-//! let config = TableProtocolMetadataConfig::new(schema, vec![], props.clone())?;
-//! let final_config = TransformationPipeline::apply_transforms(config, &props)?;
+//! let config = TableProtocolMetadataConfig::new_base_for_create(schema, vec![], props.clone())?;
+//! let output = TransformationPipeline::apply_transforms(config, &props, &DataLayout::None)?;
 //! ```
 
 mod registry;
@@ -90,6 +90,8 @@ pub(crate) enum TransformId {
     ProtocolVersion,
     /// Enables DomainMetadata writer feature
     DomainMetadata,
+    /// Sets partition columns on metadata
+    Partitioning,
     // Future transforms:
     // ColumnMapping,
     // Clustering,
@@ -285,12 +287,12 @@ impl TransformationPipeline {
     ///
     /// # Arguments
     ///
-    /// * `config` - Initial config from `TableProtocolMetadataConfig::new()`
+    /// * `config` - Initial config from `TableProtocolMetadataConfig::new_base_for_create()`
     /// * `properties` - Raw properties map (for transform lookup)
     ///
     /// # Steps
     ///
-    /// 1. Get applicable transforms from registry based on properties
+    /// 1. Get applicable transforms from registry based on properties and data layout
     /// 2. Topological sort by dependencies
     /// 3. Apply each transform (with validation)
     /// 4. Run final validation
@@ -300,13 +302,14 @@ impl TransformationPipeline {
     pub(crate) fn apply_transforms(
         config: TableProtocolMetadataConfig,
         properties: &HashMap<String, String>,
+        data_layout: &crate::transaction::data_layout::DataLayout,
     ) -> DeltaResult<TransformOutput> {
-        // Get transforms from registry using raw properties
+        // Get transforms from registry using raw properties and data layout
         // The registry auto-resolves dependencies (e.g., ClusteringTransform -> DomainMetadataTransform)
-        let transforms = TRANSFORM_REGISTRY.select_transforms_to_trigger(properties)?;
+        let transforms = TRANSFORM_REGISTRY.select_transforms_to_trigger(properties, data_layout)?;
 
         // Create context for transforms
-        let context = TransformContext::new(properties);
+        let context = TransformContext::new(properties, data_layout);
 
         // Apply via pipeline
         let mut pipeline = Self::new(transforms);
@@ -520,6 +523,7 @@ impl TransformationPipeline {
 mod tests {
     use super::*;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::transaction::data_layout::DataLayout;
 
     /// Helper to construct a HashMap<String, String> from string slice pairs.
     fn props<const N: usize>(pairs: [(&str, &str); N]) -> HashMap<String, String> {
@@ -535,8 +539,11 @@ mod tests {
     }
 
     /// Helper to create a TransformContext from properties.
-    fn test_context(properties: &HashMap<String, String>) -> TransformContext<'_> {
-        TransformContext::new(properties)
+    fn test_context<'a>(
+        properties: &'a HashMap<String, String>,
+        data_layout: &'a DataLayout,
+    ) -> TransformContext<'a> {
+        TransformContext::new(properties, data_layout)
     }
 
     // =========================================================================
@@ -552,7 +559,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context).unwrap();
@@ -576,7 +584,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context).unwrap();
@@ -594,7 +603,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context);
@@ -612,7 +622,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context);
@@ -630,7 +641,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context);
@@ -653,7 +665,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context).unwrap();
@@ -692,7 +705,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = DeltaPropertyValidationTransform;
         let result = transform.validate_preconditions(&config, &context);
@@ -715,7 +729,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = DeltaPropertyValidationTransform;
         assert!(transform.validate_preconditions(&config, &context).is_ok());
@@ -730,7 +745,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = DeltaPropertyValidationTransform;
         assert!(transform.validate_preconditions(&config, &context).is_ok());
@@ -745,7 +761,8 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        let context = test_context(&properties);
+        let data_layout = DataLayout::default();
+        let context = test_context(&properties, &data_layout);
 
         let transform = DeltaPropertyValidationTransform;
         // Validation reads from context.properties, not config.metadata
@@ -772,7 +789,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = TransformationPipeline::apply_transforms(config, &properties);
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("minReaderVersion"));
@@ -788,7 +806,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = TransformationPipeline::apply_transforms(config, &properties);
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
 
         assert!(result.is_ok());
         let output = result.unwrap();
