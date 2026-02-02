@@ -26,7 +26,8 @@ use crate::table_features::TableFeature;
 use crate::DeltaResult;
 
 use super::transforms::{
-    DeltaPropertyValidationTransform, FeatureSignalTransform, ProtocolVersionTransform,
+    DeltaPropertyValidationTransform, DomainMetadataTransform, FeatureSignalTransform,
+    ProtocolVersionTransform,
 };
 use super::{ProtocolMetadataTransform, TransformId};
 
@@ -343,7 +344,19 @@ pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::ne
     });
 
     // =========================================================================
-    // Future: Feature-specific transforms
+    // Feature-specific transforms
+    // =========================================================================
+
+    // DomainMetadata: enables the domain metadata writer feature
+    // Triggered via delta.feature.domainMetadata=supported signal
+    registry.register_feature(
+        TableFeature::DomainMetadata,
+        TransformTrigger::FeatureSignal(TableFeature::DomainMetadata),
+        || Box::new(DomainMetadataTransform),
+    );
+
+    // =========================================================================
+    // Future: Additional feature-specific transforms
     // =========================================================================
     //
     // When implementing new features, register them here. Examples:
