@@ -534,7 +534,9 @@ pub(crate) fn collect_stats(
 mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int32Array, Int64Array, StringArray};
+    use crate::arrow::buffer::NullBuffer;
     use crate::arrow::datatypes::{Fields, Schema};
+    use crate::arrow::datatypes::{Int32Type, Int64Type};
     use crate::expressions::column_name;
 
     #[test]
@@ -1172,9 +1174,6 @@ mod tests {
 
     #[test]
     fn test_collect_stats_struct_with_nulls_at_struct_level() {
-        use crate::arrow::buffer::NullBuffer;
-        use crate::arrow::datatypes::{Int32Type, Int64Type};
-
         // Schema: { my_struct: { a: int32, b: int32 (nullable) } }
         // Test both struct-level nulls and field-level nulls
         let child_fields = Fields::from(vec![
