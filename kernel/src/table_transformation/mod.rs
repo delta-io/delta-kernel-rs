@@ -57,6 +57,7 @@ use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
 };
+use crate::transaction::data_layout::DataLayout;
 use crate::{DeltaResult, Error};
 
 use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
@@ -90,6 +91,8 @@ pub(crate) enum TransformId {
     ProtocolVersion,
     /// Processes delta.feature.X=supported signals
     FeatureSignals,
+    /// Sets partition columns on metadata
+    Partitioning,
     /// Enables DomainMetadata writer feature
     DomainMetadata,
     // Future transforms:
@@ -287,7 +290,7 @@ impl TransformationPipeline {
     ///
     /// # Steps
     ///
-    /// 1. Get applicable transforms from registry based on properties and schema
+    /// 1. Get applicable transforms from registry based on properties, schema, and data layout
     /// 2. Topological sort by dependencies
     /// 3. Apply each transform (with validation)
     /// 4. Run final validation
@@ -297,12 +300,14 @@ impl TransformationPipeline {
     pub(crate) fn apply_transforms(
         config: TableProtocolMetadataConfig,
         properties: &HashMap<String, String>,
+        data_layout: &DataLayout,
     ) -> DeltaResult<TransformOutput> {
         // Parse schema for registry to check schema-triggered transforms
         let schema = config.metadata.parse_schema()?;
 
-        // Get transforms from registry using raw properties and schema
-        let transforms = TRANSFORM_REGISTRY.select_transforms_to_trigger(properties, &schema)?;
+        // Get transforms from registry using raw properties, schema, and data layout
+        let transforms =
+            TRANSFORM_REGISTRY.select_transforms_to_trigger(properties, &schema, data_layout)?;
 
         // Apply via pipeline
         let mut pipeline = Self::new(transforms);
@@ -768,7 +773,8 @@ mod tests {
         let config =
             TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
 
-        let result = TransformationPipeline::apply_transforms(config, &properties);
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
 
         // Should fail because deletionVectors is not in ALLOWED_DELTA_FEATURES
         assert!(result.is_err());
@@ -784,7 +790,8 @@ mod tests {
         let config =
             TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
 
-        let result = TransformationPipeline::apply_transforms(config, &properties);
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("minReaderVersion"));
@@ -796,7 +803,8 @@ mod tests {
         let config =
             TableProtocolMetadataConfig::new(test_schema(), vec![], properties.clone()).unwrap();
 
-        let result = TransformationPipeline::apply_transforms(config, &properties);
+        let result =
+            TransformationPipeline::apply_transforms(config, &properties, &DataLayout::None);
 
         assert!(result.is_ok());
         let output = result.unwrap();

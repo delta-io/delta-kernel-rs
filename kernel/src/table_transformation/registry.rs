@@ -23,11 +23,12 @@ use std::sync::LazyLock;
 
 use crate::schema::{DataType, StructType};
 use crate::table_features::TableFeature;
+use crate::transaction::data_layout::DataLayout;
 use crate::DeltaResult;
 
 use super::transforms::{
     DeltaPropertyValidationTransform, DomainMetadataTransform, FeatureSignalTransform,
-    ProtocolVersionTransform,
+    PartitioningTransform, ProtocolVersionTransform,
 };
 use super::{ProtocolMetadataTransform, TransformId};
 
@@ -174,6 +175,7 @@ impl TransformRegistry {
     ///
     /// * `properties` - Raw properties map (for property and signal triggers)
     /// * `schema` - Table schema (for schema type triggers)
+    /// * `data_layout` - Data layout configuration (for partitioning/clustering triggers)
     ///
     /// # Returns
     ///
@@ -183,6 +185,7 @@ impl TransformRegistry {
         &self,
         properties: &HashMap<String, String>,
         schema: &StructType,
+        data_layout: &DataLayout,
     ) -> DeltaResult<Vec<Box<dyn ProtocolMetadataTransform>>> {
         let mut transforms: Vec<Box<dyn ProtocolMetadataTransform>> = Vec::new();
         let mut included_ids: HashSet<TransformId> = HashSet::new();
@@ -209,16 +212,12 @@ impl TransformRegistry {
                     SchemaTypeCheck::ContainsType(dtype) => schema_contains_type(schema, dtype),
                 },
 
-                // Data layout (placeholder - always false until DataLayout is added)
-                TransformTrigger::DataLayout(_kind) => {
-                    // TODO: When DataLayout is added, check:
-                    // match (kind, data_layout) {
-                    //     (DataLayoutKind::Partitioned, DataLayout::Partitioned { .. }) => true,
-                    //     (DataLayoutKind::Clustered, DataLayout::Clustered { .. }) => true,
-                    //     _ => false,
-                    // }
-                    false
-                }
+                // Data layout trigger
+                TransformTrigger::DataLayout(kind) => matches!(
+                    (kind, data_layout),
+                    (DataLayoutKind::Partitioned, DataLayout::Partitioned { .. })
+                        | (DataLayoutKind::Clustered, DataLayout::Clustered { .. })
+                ),
 
                 // Special: check if any delta.feature.* signals exist
                 TransformTrigger::FeatureSignalsPresent => {
@@ -236,6 +235,19 @@ impl TransformRegistry {
                     included_ids.insert(id);
                     transforms.push(transform);
                 }
+            }
+        }
+
+        // Handle data-layout triggered transforms that need column information
+        match data_layout {
+            DataLayout::Partitioned { columns } => {
+                if !included_ids.contains(&TransformId::Partitioning) {
+                    included_ids.insert(TransformId::Partitioning);
+                    transforms.push(Box::new(PartitioningTransform::new(columns.clone())));
+                }
+            }
+            DataLayout::Clustered { .. } | DataLayout::None => {
+                // Clustering support will be added in a subsequent commit
             }
         }
 
@@ -401,7 +413,7 @@ mod tests {
         let schema = test_schema();
 
         let transforms = TRANSFORM_REGISTRY
-            .select_transforms_to_trigger(&props, &schema)
+            .select_transforms_to_trigger(&props, &schema, &DataLayout::None)
             .unwrap();
 
         // Should have at least validation and protocol version transforms
@@ -424,7 +436,7 @@ mod tests {
         let schema = test_schema();
 
         let transforms = TRANSFORM_REGISTRY
-            .select_transforms_to_trigger(&props, &schema)
+            .select_transforms_to_trigger(&props, &schema, &DataLayout::None)
             .unwrap();
 
         // Should include FeatureSignals transform when signals present
@@ -439,7 +451,7 @@ mod tests {
         let schema = test_schema();
 
         let transforms = TRANSFORM_REGISTRY
-            .select_transforms_to_trigger(&props, &schema)
+            .select_transforms_to_trigger(&props, &schema, &DataLayout::None)
             .unwrap();
 
         // Should NOT include FeatureSignals when no signals present

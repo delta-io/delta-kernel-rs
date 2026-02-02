@@ -43,6 +43,7 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
 use crate::table_transformation::TransformationPipeline;
+use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
@@ -157,6 +158,7 @@ pub struct CreateTableTransactionBuilder {
     schema: SchemaRef,
     engine_info: String,
     table_properties: HashMap<String, String>,
+    data_layout: DataLayout,
 }
 
 impl CreateTableTransactionBuilder {
@@ -169,6 +171,7 @@ impl CreateTableTransactionBuilder {
             schema,
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
+            data_layout: DataLayout::None,
         }
     }
 
@@ -211,6 +214,21 @@ impl CreateTableTransactionBuilder {
     {
         self.table_properties
             .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Sets the data layout for the new Delta table.
+    ///
+    /// The data layout determines how data files are organized within the table:
+    ///
+    /// - [`DataLayout::None`]: No special organization (default)
+    /// - [`DataLayout::Partitioned`]: Data files are organized by partition column values
+    /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
+    ///
+    /// Note: Partitioning and clustering are mutually exclusive. A table can have one or the
+    /// other, but not both.
+    pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
+        self.data_layout = layout;
         self
     }
 
@@ -258,9 +276,12 @@ impl CreateTableTransactionBuilder {
             self.table_properties.clone(),
         )?;
 
-        // Apply transforms based on properties (enables features, validates, etc.)
-        let output =
-            TransformationPipeline::apply_transforms(config, &self.table_properties)?;
+        // Apply transforms based on properties and data layout (enables features, validates, etc.)
+        let output = TransformationPipeline::apply_transforms(
+            config,
+            &self.table_properties,
+            &self.data_layout,
+        )?;
 
         // Extract protocol and metadata from final config
         let protocol = output.config.protocol;

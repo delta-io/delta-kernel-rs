@@ -260,6 +260,69 @@ impl ProtocolMetadataTransform for DeltaPropertyValidationTransform {
 }
 
 // ============================================================================
+// PartitioningTransform
+// ============================================================================
+
+/// Sets partition columns on metadata.
+///
+/// This transform:
+/// 1. Validates partition columns exist in schema (top-level only)
+/// 2. Sets the partition_columns on metadata
+#[derive(Debug)]
+pub(crate) struct PartitioningTransform {
+    columns: Vec<crate::schema::ColumnName>,
+}
+
+impl PartitioningTransform {
+    pub(crate) fn new(columns: Vec<crate::schema::ColumnName>) -> Self {
+        Self { columns }
+    }
+}
+
+impl ProtocolMetadataTransform for PartitioningTransform {
+    fn id(&self) -> TransformId {
+        TransformId::Partitioning
+    }
+
+    fn name(&self) -> &'static str {
+        "Partitioning: sets partition columns"
+    }
+
+    fn validate_preconditions(&self, config: &TableProtocolMetadataConfig) -> DeltaResult<()> {
+        let schema = config.metadata.parse_schema()?;
+
+        for col in &self.columns {
+            // Partition columns must be top-level (single path element)
+            if col.path().len() != 1 {
+                return Err(Error::generic(format!(
+                    "Partition column '{}' must be a top-level column, not a nested path",
+                    col
+                )));
+            }
+
+            let col_name = &col.path()[0];
+            if schema.field(col_name).is_none() {
+                return Err(Error::generic(format!(
+                    "Partition column '{}' not found in schema",
+                    col_name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply(&self, config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
+        let partition_columns: Vec<String> =
+            self.columns.iter().map(|c| c.path()[0].clone()).collect();
+
+        Ok(TransformOutput::new(
+            config.with_partition_columns(partition_columns),
+        ))
+    }
+}
+
+// ============================================================================
 // DomainMetadataTransform
 // ============================================================================
 

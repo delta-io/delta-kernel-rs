@@ -352,9 +352,15 @@ impl Metadata {
 
     /// Return a new Metadata with updated configuration.
     #[internal_api]
-    #[allow(dead_code)] // Used by table_transformation module
     pub(crate) fn with_configuration(mut self, configuration: HashMap<String, String>) -> Self {
         self.configuration = configuration;
+        self
+    }
+
+    /// Return a new Metadata with updated partition columns.
+    #[internal_api]
+    pub(crate) fn with_partition_columns(mut self, partition_columns: Vec<String>) -> Self {
+        self.partition_columns = partition_columns;
         self
     }
 }
