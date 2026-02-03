@@ -28,13 +28,13 @@ pub(crate) struct StatsColumnFilter<'col> {
     /// Trie built from columns specified in `delta.dataSkippingStatsColumns` for O(path_length)
     /// prefix matching. `Some` when using explicit column list, `None` when using the
     /// `delta.dataSkippingNumIndexedCols` count-based approach.
-    column_trie: Option<ColumnTrie<'col>>,
+    data_skipping_stats_trie: Option<ColumnTrie<'col>>,
     /// Trie built from clustering columns for O(path_length) lookup during traversal.
     /// Used by `should_include_current()` to allow clustering columns past the limit.
     clustering_trie: Option<ColumnTrie<'col>>,
     /// Clustering columns to add after the main traversal in `collect_columns()`.
     /// Only set when using `delta.dataSkippingNumIndexedCols` (when using
-    /// `delta.dataSkippingStatsColumns`, clustering columns are merged into `column_trie`).
+    /// `delta.dataSkippingStatsColumns`, clustering columns are merged into `data_skipping_stats_trie`).
     clustering_columns: Option<&'col [ColumnName]>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
@@ -71,8 +71,8 @@ impl<'col> StatsColumnFilter<'col> {
             Self {
                 n_columns: None,
                 added_columns: 0,
-                column_trie: Some(combined_trie),
-                clustering_trie: None,    // Already in column_trie
+                data_skipping_stats_trie: Some(combined_trie),
+                clustering_trie: None,    // Already in data_skipping_stats_trie
                 clustering_columns: None, // Already added to trie
                 path: Vec::new(),
             }
@@ -82,7 +82,7 @@ impl<'col> StatsColumnFilter<'col> {
             Self {
                 n_columns: Some(n_cols),
                 added_columns: 0,
-                column_trie: None,
+                data_skipping_stats_trie: None,
                 clustering_trie,
                 clustering_columns, // Will be handled in Pass 2 of collect_columns()
                 path: Vec::new(),
@@ -138,7 +138,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Clustering columns are always included, even past the column limit.
     pub(crate) fn should_include_current(&self) -> bool {
         // When using dataSkippingStatsColumns, check the trie
-        if let Some(trie) = &self.column_trie {
+        if let Some(trie) = &self.data_skipping_stats_trie {
             return trie.contains_prefix_of(&self.path);
         }
 

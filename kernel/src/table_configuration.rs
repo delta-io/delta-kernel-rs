@@ -14,9 +14,11 @@ use url::Url;
 
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
-use crate::scan::data_skipping::stats_schema::{expected_stats_schema, stats_column_names};
+use crate::scan::data_skipping::stats_schema::{
+    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
+};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{DataType, InvariantChecker, SchemaRef, StructField, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
@@ -26,34 +28,6 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
-
-/// Converts a stats schema's nested data fields to use physical column names.
-///
-/// The stats schema has wrapper fields (`numRecords`, `nullCount`, `minValues`, `maxValues`,
-/// `tightBounds`) that don't have column mapping metadata. Only the nested struct fields inside
-/// `nullCount`, `minValues`, and `maxValues` need physical name conversion.
-fn make_physical_stats_schema(
-    logical_stats_schema: &StructType,
-    column_mapping_mode: ColumnMappingMode,
-) -> StructType {
-    let fields = logical_stats_schema.fields().map(|field| {
-        match field.data_type() {
-            DataType::Struct(inner) => {
-                // Convert nested data fields to physical names
-                let physical_inner = inner.make_physical(column_mapping_mode);
-                StructField {
-                    name: field.name.clone(),
-                    data_type: DataType::Struct(Box::new(physical_inner)),
-                    nullable: field.nullable,
-                    metadata: field.metadata.clone(),
-                }
-            }
-            // Primitive fields (numRecords, tightBounds) don't need conversion
-            _ => field.clone(),
-        }
-    });
-    StructType::new_unchecked(fields)
-}
 
 /// Expected schemas for file statistics.
 ///
@@ -243,10 +217,12 @@ impl TableConfiguration {
         )?);
         let physical_stats_schema = match self.column_mapping_mode() {
             ColumnMappingMode::None => logical_stats_schema.clone(),
-            _ => Arc::new(make_physical_stats_schema(
-                &logical_stats_schema,
-                self.column_mapping_mode(),
-            )),
+            _ => PhysicalStatsSchemaTransform {
+                column_mapping_mode: self.column_mapping_mode(),
+            }
+            .transform_struct(&logical_stats_schema)
+            .map(|s| Arc::new(s.into_owned()))
+            .unwrap_or_else(|| logical_stats_schema.clone()),
         };
         Ok(ExpectedStatsSchemas {
             logical: logical_stats_schema,
