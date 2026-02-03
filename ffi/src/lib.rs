@@ -449,8 +449,7 @@ pub struct EngineBuilder {
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
-    /// with (worker_threads, max_blocking_threads). If None, use the default single-threaded
-    /// background executor.
+    /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
 }
 
@@ -618,7 +617,7 @@ fn engine_to_handle(
     engine.into()
 }
 
-/// Build the default engine with optional multithreaded executor configuration.
+/// Build the default engine
 ///
 /// If `executor_config` is `Some`, uses a multi-threaded executor that owns its runtime. Otherwise,
 /// uses the default single-threaded background executor.
