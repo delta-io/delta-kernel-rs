@@ -95,7 +95,6 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
-pub(crate) mod parallel;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -109,6 +108,8 @@ pub(crate) mod transforms;
 pub use log_path::LogPath;
 
 mod row_tracking;
+
+pub(crate) mod clustering;
 
 mod arrow_compat;
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
@@ -151,6 +152,11 @@ pub(crate) mod listed_log_files;
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
+
+#[cfg(feature = "internal-api")]
+pub mod parallel;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;

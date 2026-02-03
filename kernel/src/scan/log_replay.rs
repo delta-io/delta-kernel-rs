@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
 
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
@@ -19,7 +20,7 @@ use crate::log_replay::{
 };
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
@@ -35,12 +36,31 @@ struct InternalScanState {
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
+    stats_schema: Option<SchemaRef>,
 }
 
-/// Public-facing serialized processor state for distributed processing.
+/// Serializable processor state for distributed processing. This can be serialized using the
+/// defualt serde serialization, or through custom serialization in the engine.
 ///
 /// This struct contains all the information needed to reconstruct a `ScanLogReplayProcessor`
 /// on remote compute nodes, enabling distributed log replay processing.
+///
+/// # Serialization Limitations
+///
+/// - **Opaque expressions**: Predicates containing [`Predicate::Opaque`] or expressions containing
+///   [`Expression::Opaque`] cannot be serialized using serde. Attempting to serialize state with
+///   opaque expressions will result in an error. Connectors that require opaque expression support
+///   can work around this by serializing the predicate separately using their own serialization
+///   mechanism, then reconstructing the processor state on the remote node.
+///
+/// - **Large state**: The `seen_file_keys` field can be large for tables with many commits.
+///   Connectors are free to serialize this field using their own format (e.g., more compact binary
+///   representations) rather than using the serde-based serialization.
+///
+/// [`Predicate::Opaque`]: crate::expressions::Predicate::Opaque
+/// [`Expression::Opaque`]: crate::expressions::Expression::Opaque
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SerializableScanState {
     /// Optional predicate for data skipping (if provided)
     pub predicate: Option<PredicateRef>,
@@ -72,7 +92,8 @@ pub struct SerializableScanState {
 /// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
 /// vector indicating which rows are valid, and any row-level transformation expressions that need
 /// to be applied to the selected rows.
-pub(crate) struct ScanLogReplayProcessor {
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
+pub struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
@@ -165,6 +186,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
+            stats_schema,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -180,6 +202,7 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             column_mapping_mode,
+            stats_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
@@ -235,6 +258,7 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
+            stats_schema: internal_state.stats_schema,
         });
 
         let processor = Self::new_with_seen_files(engine, state_info, state.seen_file_keys)?;
@@ -617,7 +641,13 @@ mod tests {
 
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{BinaryExpressionOp, Scalar};
+    use crate::expressions::{
+        BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+    };
+    use crate::kernel_predicates::{
+        DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+        IndirectDataSkippingPredicateEvaluator,
+    };
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
@@ -633,12 +663,51 @@ mod tests {
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::DeltaResult;
     use crate::Expression as Expr;
     use crate::ExpressionRef;
 
     use super::{
         scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
     };
+
+    /// A minimal opaque predicate op for testing serialization behavior
+    #[derive(Debug, PartialEq)]
+    struct OpaqueTestOp(String);
+
+    impl OpaquePredicateOp for OpaqueTestOp {
+        fn name(&self) -> &str {
+            &self.0
+        }
+
+        fn eval_pred_scalar(
+            &self,
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _evaluator: &DirectPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> DeltaResult<Option<bool>> {
+            unimplemented!()
+        }
+
+        fn eval_as_data_skipping_predicate(
+            &self,
+            _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<bool> {
+            unimplemented!()
+        }
+
+        fn as_data_skipping_predicate(
+            &self,
+            _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<Predicate> {
+            unimplemented!()
+        }
+    }
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
@@ -691,6 +760,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -983,6 +1053,7 @@ mod tests {
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
                 column_mapping_mode: mode,
+                stats_schema: None,
             });
             let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1009,6 +1080,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         });
         let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1046,6 +1118,7 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1074,6 +1147,7 @@ mod tests {
             predicate_schema: None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
@@ -1082,5 +1156,41 @@ mod tests {
 
         let res: Result<InternalScanState, _> = serde_json::from_str(&invalid_blob);
         assert_result_error_with_message(res, "unknown field");
+    }
+
+    #[test]
+    fn deserialize_serializable_scan_state_with_extra_fields_fails() {
+        let state = SerializableScanState {
+            predicate: None,
+            internal_state_blob: vec![],
+            seen_file_keys: HashSet::new(),
+        };
+        let blob = serde_json::to_string(&state).unwrap();
+        let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
+        obj["new_field"] = serde_json::json!("my_new_value");
+        let invalid_blob = obj.to_string();
+
+        let res: Result<SerializableScanState, _> = serde_json::from_str(&invalid_blob);
+        assert_result_error_with_message(res, "unknown field");
+    }
+
+    #[test]
+    fn serializng_scan_state_with_opaque_predicate_fails() {
+        // Opaque predicates cannot be serialized. Connectors requiring opaque expression support
+        // must serialize the predicate separately using their own mechanism.
+
+        // Create an opaque predicate
+        let opaque_predicate = Arc::new(Predicate::opaque(OpaqueTestOp("test_op".to_string()), []));
+
+        // Directly create a SerializableScanState with the opaque predicate
+        let state = SerializableScanState {
+            predicate: Some(opaque_predicate),
+            internal_state_blob: vec![],
+            seen_file_keys: HashSet::new(),
+        };
+
+        // Serialization should fail because opaque expressions cannot be serialized
+        let result = serde_json::to_string(&state);
+        assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
     }
 }

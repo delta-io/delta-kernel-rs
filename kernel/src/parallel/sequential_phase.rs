@@ -7,6 +7,7 @@
 //!
 //! For multi-part checkpoints, the sequential phase skips manifest processing and returns
 //! the checkpoint parts for parallel processing.
+#![allow(unused)]
 
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
+use delta_kernel_derive::internal_api;
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -61,7 +63,8 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 ///     }
 /// }
 /// ```
-#[allow(unused)]
+/// cbindgen:ignore
+#[internal_api]
 pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
@@ -77,7 +80,8 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
 }
 
 /// Result of sequential log replay processing.
-#[allow(unused)]
+/// cbindgen:ignore
+#[internal_api]
 pub(crate) enum AfterSequential<P: LogReplayProcessor> {
     /// All processing complete sequentially - no parallel phase needed.
     Done(P),
@@ -92,7 +96,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `processor`: The log replay processor
     /// - `log_segment`: The log segment to process
     /// - `engine`: Engine for reading files
-    #[allow(unused)]
+    #[internal_api]
     pub(crate) fn try_new(
         processor: P,
         log_segment: &LogSegment,
@@ -141,7 +145,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
-    #[allow(unused)]
+    #[internal_api]
     pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
             return Err(Error::generic(
@@ -201,10 +205,8 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::log_replay::ScanLogReplayProcessor;
-    use crate::scan::state_info::StateInfo;
+    use crate::scan::AfterPhase1ScanMetadata;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
-    use std::sync::Arc;
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
     fn verify_sequential_processing(
@@ -213,17 +215,9 @@ mod tests {
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
-        let log_segment = snapshot.log_segment();
 
-        let state_info = Arc::new(StateInfo::try_new(
-            snapshot.schema(),
-            snapshot.table_configuration(),
-            None,
-            (),
-        )?);
-
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
+        let scan = snapshot.scan_builder().build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine)?;
 
         // Process all batches and collect Add file paths
         let mut file_paths = Vec::new();
@@ -245,7 +239,7 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = sequential.finish()?;
         match (expected_sidecars, result) {
-            (sidecars, AfterSequential::Done(_)) => {
+            (sidecars, AfterPhase1ScanMetadata::Done(_)) => {
                 assert!(
                     sidecars.is_empty(),
                     "Expected Done but got sidecars {:?}",
@@ -304,22 +298,9 @@ mod tests {
     #[test]
     fn test_sequential_finish_before_exhaustion_error() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let log_segment = snapshot.log_segment();
 
-        let state_info = Arc::new(StateInfo::try_new(
-            snapshot.schema(),
-            snapshot.table_configuration(),
-            None,
-            (),
-        )?);
-
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
-
-        // Call next() once but don't exhaust the iterator
-        if let Some(result) = sequential.next() {
-            result?;
-        }
+        let scan = snapshot.scan_builder().build()?;
+        let sequential = scan.parallel_scan_metadata(engine)?;
 
         // Try to call finish() before exhausting the iterator
         let result = sequential.finish();
