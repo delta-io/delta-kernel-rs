@@ -31,7 +31,7 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
 use itertools::Itertools;
-use tracing::{debug, warn};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -186,7 +186,7 @@ impl LogSegment {
             );
         }
 
-        Ok(LogSegment {
+        let log_segment = LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
@@ -197,7 +197,32 @@ impl LogSegment {
             latest_commit_file,
             checkpoint_schema,
             max_published_version,
-        })
+        };
+
+        info!(segment = %log_segment.summary());
+
+        Ok(log_segment)
+    }
+
+    /// Succinct summary string for logging purposes.
+    fn summary(&self) -> String {
+        format!(
+            "{{v={}, commits={}, checkpoint_v={}, checkpoint_parts={}, compactions={}, crc_v={}, max_pub_v={}}}",
+            self.end_version,
+            self.ascending_commit_files.len(),
+            self.checkpoint_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".into()),
+            self.checkpoint_parts.len(),
+            self.ascending_compaction_files.len(),
+            self.latest_crc_file
+                .as_ref()
+                .map(|f| f.version.to_string())
+                .unwrap_or_else(|| "none".into()),
+            self.max_published_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".into()),
+        )
     }
 
     /// Constructs a [`LogSegment`] to be used for [`Snapshot`]. For a `Snapshot` at version `n`:
@@ -212,6 +237,7 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
+    #[instrument(name = "log_seg.for_snap", skip_all, err)]
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
@@ -827,8 +853,9 @@ impl LogSegment {
             .try_collect()
     }
 
-    // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    // the LogSegment
+    /// Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
+    /// the LogSegment.
+    #[instrument(name = "log_seg.load_p_m", skip_all, err)]
     pub(crate) fn protocol_and_metadata(
         &self,
         engine: &dyn Engine,

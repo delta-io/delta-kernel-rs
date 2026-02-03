@@ -8,7 +8,7 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
@@ -54,22 +54,38 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
+    #[instrument(name = "last_checkpoint.read", skip_all, err)]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         match storage.read_files(vec![(file_path, None)])?.next() {
-            Some(Ok(data)) => Ok(serde_json::from_slice(&data)
-                .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                .ok()),
-            Some(Err(Error::FileNotFound(_))) => Ok(None),
+            Some(Ok(data)) => {
+                let result: Option<LastCheckpointHint> = serde_json::from_slice(&data)
+                    .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                    .ok();
+                debug!(hint = result.as_ref().map(|h| h.summary()));
+                Ok(result)
+            }
+            Some(Err(Error::FileNotFound(_))) => {
+                info!("_last_checkpoint file not found");
+                Ok(None)
+            }
             Some(Err(err)) => Err(err),
             None => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)
             }
         }
+    }
+
+    /// Succinct summary string for logging purposes.
+    fn summary(&self) -> String {
+        format!(
+            "{{v={}, size={}, parts={:?}}}",
+            self.version, self.size, self.parts
+        )
     }
 
     /// Convert the LastCheckpointHint to JSON bytes
