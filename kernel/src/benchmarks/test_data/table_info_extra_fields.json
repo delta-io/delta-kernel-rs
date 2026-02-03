@@ -1,0 +1,5 @@
+{
+    "name": "table_with_extras",
+    "description": "A table with extra fields",
+    "extra_field": "should be ignored"
+}
