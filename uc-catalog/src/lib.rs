@@ -121,7 +121,7 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
 
         debug!("commits for kernel: {:?}\n", commits);
 
-        Snapshot::builder_for(Url::parse(&(table_uri + "/"))?)
+        Snapshot::builder_for(table_url)
             .at_version(version)
             .with_log_tail(commits)
             .build(engine)
@@ -259,7 +259,7 @@ mod tests {
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;
         println!("latest snapshot version: {:?}", snapshot.version());
-        let txn = snapshot.clone().transaction(committer)?;
+        let txn = snapshot.clone().transaction(committer, &engine)?;
         let _write_context = txn.get_write_context();
 
         match txn.commit(&engine)? {

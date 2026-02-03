@@ -701,6 +701,14 @@ impl Expression {
         Self::Variadic(VariadicExpression::new(op, exprs))
     }
 
+    /// Creates a new COALESCE expression that returns the first non-null value.
+    ///
+    /// COALESCE evaluates expressions in order and returns the first non-null result.
+    /// If all expressions evaluate to null, the result is null.
+    pub fn coalesce(exprs: impl IntoIterator<Item = impl Into<Expression>>) -> Self {
+        Self::variadic(VariadicExpressionOp::Coalesce, exprs)
+    }
+
     /// Creates a new opaque expression
     pub fn opaque(
         op: impl OpaqueExpressionOp,
@@ -1158,7 +1166,7 @@ mod tests {
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, Predicate, Scalar, Transform, UnaryExpressionOp, VariadicExpressionOp,
+            Expression, Predicate, Scalar, Transform, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::utils::test_utils::assert_result_error_with_message;
@@ -1297,14 +1305,11 @@ mod tests {
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::variadic(
-                VariadicExpressionOp::Coalesce,
-                [
-                    column_expr!("a"),
-                    column_expr!("b"),
-                    Expression::literal("default"),
-                ],
-            );
+            let expr = Expression::coalesce([
+                column_expr!("a"),
+                column_expr!("b"),
+                Expression::literal("default"),
+            ]);
             assert_roundtrip(&expr);
         }
 
@@ -1505,10 +1510,7 @@ mod tests {
                 column_expr!("c"),
                 column_expr!("d"),
             );
-            let coalesce = Expression::variadic(
-                VariadicExpressionOp::Coalesce,
-                [add, mul, Expression::literal(0)],
-            );
+            let coalesce = Expression::coalesce([add, mul, Expression::literal(0)]);
             let pred = Predicate::gt(coalesce, Expression::literal(100));
             assert_roundtrip(&pred);
 
