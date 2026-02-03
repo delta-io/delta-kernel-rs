@@ -344,7 +344,7 @@ struct ColumnStats {
 fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
-    col_filter: &ColumnTrie<'_>,
+    filter: &ColumnTrie<'_>,
 ) -> DeltaResult<ColumnStats> {
     match column.data_type() {
         DataType::Struct(fields) => {
@@ -366,7 +366,7 @@ fn compute_column_stats(
             for (i, field) in fields.iter().enumerate() {
                 path.push(field.name().to_string());
 
-                let child_stats = compute_column_stats(fixed_struct.column(i), path, col_filter)?;
+                let child_stats = compute_column_stats(fixed_struct.column(i), path, filter)?;
 
                 if let Some(arr) = child_stats.null_count {
                     null_fields.push(Field::new(field.name(), arr.data_type().clone(), true));
@@ -410,7 +410,7 @@ fn compute_column_stats(
         | DataType::FixedSizeList(_, _)
         | DataType::ListView(_)
         | DataType::LargeListView(_) => {
-            if !col_filter.contains_prefix_of(path) {
+            if !filter.contains_prefix_of(path) {
                 return Ok(ColumnStats::default());
             }
             Ok(ColumnStats {
@@ -421,7 +421,7 @@ fn compute_column_stats(
         }
         _ => {
             // Leaf: check filter, compute all stats together
-            if !col_filter.contains_prefix_of(path) {
+            if !filter.contains_prefix_of(path) {
                 return Ok(ColumnStats::default());
             }
 
@@ -484,7 +484,7 @@ pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
 ) -> DeltaResult<StructArray> {
-    let col_filter = ColumnTrie::from_columns(stats_columns);
+    let filter = ColumnTrie::from_columns(stats_columns);
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
@@ -497,7 +497,7 @@ pub(crate) fn collect_stats(
         let column = batch.column(col_idx);
 
         // Single traversal computes all three stats
-        let stats = compute_column_stats(column, &mut path, &col_filter)?;
+        let stats = compute_column_stats(column, &mut path, &filter)?;
 
         if let Some(arr) = stats.null_count {
             null_counts.push(field.name(), arr);
