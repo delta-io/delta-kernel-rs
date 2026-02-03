@@ -955,9 +955,11 @@ impl Transaction {
     /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        self.read_snapshot
+        let stats_schemas = self
+            .read_snapshot
             .table_configuration()
-            .expected_stats_schema(self.clustering_columns.as_deref())
+            .build_expected_stats_schemas(self.clustering_columns.as_deref())?;
+        Ok(stats_schemas.physical)
     }
 
     /// Returns the list of column names that should have statistics collected.
