@@ -142,12 +142,9 @@ impl ScanLogReplayProcessor {
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
-        checkpoint_info: CheckpointReadInfo,
+        _checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
     ) -> DeltaResult<Self> {
-        // TODO: Use checkpoint_info to optimize stats reading from checkpoints
-        let _ = checkpoint_info;
-
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
