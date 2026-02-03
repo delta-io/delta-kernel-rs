@@ -1,28 +1,38 @@
-//! CRC (version checksum) file
+//! CRC (version checksum) file support.
+//!
+//! A [CRC file] contains a snapshot of table state at a specific version, which can be used to
+//! optimize log replay operations like reading Protocol/Metadata, domain metadata, and ICT.
+//!
+//! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
+
+mod lazy;
+mod reader;
+
+#[allow(unused_imports)] // Will be used in Phase 2
+pub(crate) use lazy::{CrcLoadResult, LazyCrc};
+pub(crate) use reader::try_read_crc_file;
+
 use std::sync::LazyLock;
 
-use super::visitors::{visit_metadata_at, visit_protocol_at};
-use super::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::actions::PROTOCOL_NAME;
-use crate::engine_data::GetData;
+use crate::actions::visitors::{visit_metadata_at, visit_protocol_at};
+use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction, PROTOCOL_NAME};
+use crate::engine_data::{GetData, TypedGetData};
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
 use delta_kernel_derive::ToSchema;
 
-/// Though technically not an action, we include the CRC (version checksum) file here. A [CRC file]
-/// must:
+/// Parsed content of a CRC (version checksum) file.
+///
+/// A CRC file must:
 /// 1. Be named `{version}.crc` with version zero-padded to 20 digits: `00000000000000000001.crc`
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
-/// 3. Contain exactly one JSON object with the schema of this [`Crc`] struct.
-///
-/// [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
+/// 3. Contain exactly one JSON object with the schema of this struct.
 #[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub(crate) struct Crc {
-    /// A unique identifier for the transaction that produced this commit.
-    pub(crate) txn_id: Option<String>,
+    // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
     /// [`Add`] actions.
     pub(crate) table_size_bytes: i64,
@@ -32,16 +42,20 @@ pub(crate) struct Crc {
     pub(crate) num_metadata: i64,
     /// Number of [`Protocol`] actions. Must be 1.
     pub(crate) num_protocol: i64,
+    /// The table [`Metadata`] at this version.
+    pub(crate) metadata: Metadata,
+    /// The table [`Protocol`] at this version.
+    pub(crate) protocol: Protocol,
+
+    // ===== Optional fields =====
+    /// A unique identifier for the transaction that produced this commit.
+    pub(crate) txn_id: Option<String>,
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub(crate) in_commit_timestamp_opt: Option<i64>,
     /// Live transaction identifier ([`SetTransaction`]) actions at this version.
     pub(crate) set_transactions: Option<Vec<SetTransaction>>,
     /// Live [`DomainMetadata`] actions at this version, excluding tombstones.
     pub(crate) domain_metadata: Option<Vec<DomainMetadata>>,
-    /// The table [`Metadata`] at this version.
-    pub(crate) metadata: Metadata,
-    /// The table [`Protocol`] at this version.
-    pub(crate) protocol: Protocol,
     /// Size distribution information of files remaining after action reconciliation.
     pub(crate) file_size_histogram: Option<FileSizeHistogram>,
     /// All live [`Add`] file actions at this version.
@@ -56,6 +70,8 @@ pub(crate) struct Crc {
 
 /// The [FileSizeHistogram] object represents a histogram tracking file counts and total bytes
 /// across different size ranges.
+///
+/// TODO: This struct is defined for schema generation but not yet parsed from CRC files.
 ///
 /// [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -73,6 +89,8 @@ pub(crate) struct FileSizeHistogram {
 /// The [DeletedRecordCountsHistogram] object represents a histogram tracking the distribution of
 /// deleted record counts across files in the table. Each bin in the histogram represents a range
 /// of deletion counts and stores the number of files having that many deleted records.
+///
+/// TODO: This struct is defined for schema generation but not yet parsed from CRC files.
 ///
 /// The histogram bins correspond to the following ranges:
 /// Bin 0: [0, 0] (files with no deletions)
@@ -94,34 +112,74 @@ pub(crate) struct DeletedRecordCountsHistogram {
     pub(crate) deleted_record_counts: Vec<i64>,
 }
 
-/// For now we just define a visitor for Protocol and Metadata in CRC files since (for now) that's
-/// the only optimization we implement. Since CRC files can contain lots of other data, we have a
-/// specific visitor for only Protocol/Metadata here.
-#[allow(unused)] // TODO: remove after we read CRCs
+/// Visitor for extracting data from CRC files.
+///
+/// This visitor extracts Protocol, Metadata, and additional fields needed for CRC optimizations
+/// (in-commit timestamp, table statistics). The visitor builds a [`Crc`] directly during visitation.
+#[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug, Default)]
-pub(crate) struct CrcProtocolMetadataVisitor {
-    pub(crate) protocol: Protocol,
-    pub(crate) metadata: Metadata,
+pub(crate) struct CrcVisitor {
+    pub(crate) crc: Option<Crc>,
 }
 
-impl RowVisitor for CrcProtocolMetadataVisitor {
+#[allow(unused)] // TODO: remove after we complete CRC support
+impl CrcVisitor {
+    pub(crate) fn into_crc(self) -> DeltaResult<Crc> {
+        self.crc
+            .ok_or_else(|| Error::generic("CRC file was not visited"))
+    }
+}
+
+/// Number of leaf columns for Metadata in the visitor schema.
+const METADATA_LEAF_COUNT: usize = 9;
+/// Number of leaf columns for Protocol in the visitor schema.
+const PROTOCOL_LEAF_COUNT: usize = 4;
+
+impl RowVisitor for CrcVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            // annoyingly, the 'metadata' in CRC is under the name 'metadata', not 'metaData'
-            let mut cols = Metadata::to_schema().leaves("metadata");
+            // Follow Crc struct field order (skipping fields we hardcode or don't extract yet)
+            let mut cols = ColumnNamesAndTypes::default();
+            cols.extend(
+                (
+                    vec![ColumnName::new(["tableSizeBytes"])],
+                    vec![DataType::LONG],
+                )
+                    .into(),
+            );
+            cols.extend((vec![ColumnName::new(["numFiles"])], vec![DataType::LONG]).into());
+            // num_metadata: hardcoded to 1
+            // num_protocol: hardcoded to 1
+            // NOTE: CRC uses 'metadata' not 'metaData' like in actions
+            cols.extend(Metadata::to_schema().leaves("metadata"));
             cols.extend(Protocol::to_schema().leaves(PROTOCOL_NAME));
+            // txn_id: not extracted yet
+            cols.extend(
+                (
+                    vec![ColumnName::new(["inCommitTimestampOpt"])],
+                    vec![DataType::LONG],
+                )
+                    .into(),
+            );
             cols
         });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // getters = sum of Protocol + Metadata
+        // Getters follow Crc struct order:
+        // [0]: tableSizeBytes
+        // [1]: numFiles
+        // [2..11]: metadata (9 leaf columns)
+        // [11..15]: protocol (4 leaf columns)
+        // [15]: inCommitTimestampOpt
+        const EXPECTED_GETTERS: usize = 2 + METADATA_LEAF_COUNT + PROTOCOL_LEAF_COUNT + 1;
         require!(
-            getters.len() == 13,
+            getters.len() == EXPECTED_GETTERS,
             Error::InternalError(format!(
-                "Wrong number of CrcProtocolMetadataVisitor getters: {}",
-                getters.len()
+                "Wrong number of CrcVisitor getters: {} (expected {})",
+                getters.len(),
+                EXPECTED_GETTERS
             ))
         );
         if row_count != 1 {
@@ -130,29 +188,46 @@ impl RowVisitor for CrcProtocolMetadataVisitor {
             )));
         }
 
-        self.metadata = visit_metadata_at(0, &getters[..9])?
-            .ok_or(Error::generic("Metadata not found in CRC file"))?;
-        self.protocol = visit_protocol_at(0, &getters[9..])?
-            .ok_or(Error::generic("Protocol not found in CRC file"))?;
+        let table_size_bytes: i64 = getters[0].get(0, "crc.tableSizeBytes")?;
+        let num_files: i64 = getters[1].get(0, "crc.numFiles")?;
+        let metadata_end = 2 + METADATA_LEAF_COUNT;
+        let protocol_end = metadata_end + PROTOCOL_LEAF_COUNT;
+        let metadata = visit_metadata_at(0, &getters[2..metadata_end])?
+            .ok_or_else(|| Error::generic("Metadata not found in CRC file"))?;
+        let protocol = visit_protocol_at(0, &getters[metadata_end..protocol_end])?
+            .ok_or_else(|| Error::generic("Protocol not found in CRC file"))?;
+        let in_commit_timestamp_opt: Option<i64> =
+            getters[protocol_end].get_opt(0, "crc.inCommitTimestampOpt")?;
+
+        self.crc = Some(Crc {
+            table_size_bytes,
+            num_files,
+            num_metadata: 1, // Always 1 per protocol
+            num_protocol: 1, // Always 1 per protocol
+            metadata,
+            protocol,
+            txn_id: None, // TODO: extract this
+            in_commit_timestamp_opt,
+            set_transactions: None,                    // TODO: extract this
+            domain_metadata: None,                     // TODO: extract this
+            file_size_histogram: None,                 // TODO: extract this
+            all_files: None,                           // TODO: extract this
+            num_deleted_records_opt: None,             // TODO: extract this
+            num_deletion_vectors_opt: None,            // TODO: extract this
+            deleted_record_counts_histogram_opt: None, // TODO: extract this
+        });
+
         Ok(())
     }
 }
 
+// See reader::tests::test_read_crc_file for the e2e test that tests CrcVisitor.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
-    use crate::arrow::array::StringArray;
-
-    use crate::actions::{Format, Metadata, Protocol};
-    use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::table_features::TableFeature;
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use crate::Engine;
 
     #[test]
     fn test_file_size_histogram_schema() {
@@ -179,11 +254,15 @@ mod tests {
     fn test_crc_schema() {
         let schema = Crc::to_schema();
         let expected = StructType::new_unchecked([
-            StructField::nullable("txnId", DataType::STRING),
+            // Required fields
             StructField::not_null("tableSizeBytes", DataType::LONG),
             StructField::not_null("numFiles", DataType::LONG),
             StructField::not_null("numMetadata", DataType::LONG),
             StructField::not_null("numProtocol", DataType::LONG),
+            StructField::not_null("metadata", Metadata::to_data_type()),
+            StructField::not_null("protocol", Protocol::to_data_type()),
+            // Optional fields
+            StructField::nullable("txnId", DataType::STRING),
             StructField::nullable("inCommitTimestampOpt", DataType::LONG),
             StructField::nullable(
                 "setTransactions",
@@ -193,8 +272,6 @@ mod tests {
                 "domainMetadata",
                 ArrayType::new(DomainMetadata::to_data_type(), false),
             ),
-            StructField::not_null("metadata", Metadata::to_data_type()),
-            StructField::not_null("protocol", Protocol::to_data_type()),
             StructField::nullable("fileSizeHistogram", FileSizeHistogram::to_data_type()),
             StructField::nullable("allFiles", ArrayType::new(Add::to_data_type(), false)),
             StructField::nullable("numDeletedRecordsOpt", DataType::LONG),
@@ -205,73 +282,5 @@ mod tests {
             ),
         ]);
         assert_eq!(schema, expected);
-    }
-
-    #[test]
-    fn test_crc_protocol_metadata_visitor() {
-        // create CRC to visit
-        let crc_json = serde_json::json!({
-            "tableSizeBytes": 100,
-            "numFiles": 10,
-            "numMetadata": 1,
-            "numProtocol": 1,
-            "metadata": {
-                "id": "testId",
-                "format": {
-                    "provider": "parquet",
-                    "options": {}
-                },
-                "schemaString": r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#,
-                "partitionColumns": [],
-                "configuration": {
-                    "delta.columnMapping.mode": "none"
-                },
-                "createdTime": 1677811175
-            },
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": ["columnMapping"],
-                "writerFeatures": ["columnMapping"]
-            }
-        });
-
-        // convert JSON -> StringArray -> (string)EngineData -> actual CRC EngineData
-        let json_string = crc_json.to_string();
-        let json_strings = StringArray::from(vec![json_string.as_str()]);
-        let engine_data = string_array_to_engine_data(json_strings);
-        let engine = SyncEngine::new();
-        let json_handler = engine.json_handler();
-        let output_schema = Arc::new(Crc::to_schema());
-        let data = json_handler.parse_json(engine_data, output_schema).unwrap();
-
-        // run the visitor
-        let mut visitor = CrcProtocolMetadataVisitor::default();
-        visitor.visit_rows_of(data.as_ref()).unwrap();
-
-        let expected_protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![TableFeature::ColumnMapping]),
-            writer_features: Some(vec![TableFeature::ColumnMapping]),
-        };
-        let expected_metadata = Metadata {
-            id: "testId".to_string(),
-            name: None,
-            description: None,
-            format: Format {
-                provider: "parquet".to_string(),
-                options: std::collections::HashMap::new(),
-            },
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            partition_columns: vec![],
-            created_time: Some(1677811175),
-            configuration: std::collections::HashMap::from([
-                ("delta.columnMapping.mode".to_string(), "none".to_string()),
-            ]),
-        };
-
-        assert_eq!(visitor.protocol, expected_protocol);
-        assert_eq!(visitor.metadata, expected_metadata);
     }
 }
