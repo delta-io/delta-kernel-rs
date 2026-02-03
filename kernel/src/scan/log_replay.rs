@@ -37,6 +37,8 @@ struct InternalScanState {
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
     stats_schema: Option<SchemaRef>,
+    #[serde(default)]
+    skip_stats: bool,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -102,6 +104,8 @@ pub struct ScanLogReplayProcessor {
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen_file_keys: HashSet<FileActionKey>,
+    /// Skip reading file statistics.
+    skip_stats: bool,
 }
 
 impl ScanLogReplayProcessor {
@@ -115,8 +119,12 @@ impl ScanLogReplayProcessor {
     const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
-    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
-        Self::new_with_seen_files(engine, state_info, Default::default())
+    pub(crate) fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        skip_stats: bool,
+    ) -> DeltaResult<Self> {
+        Self::new_with_seen_files(engine, state_info, Default::default(), skip_stats)
     }
 
     /// Create new [`ScanLogReplayProcessor`] with pre-populated seen_file_keys.
@@ -128,10 +136,12 @@ impl ScanLogReplayProcessor {
     /// - `engine`: Engine for creating evaluators and filters
     /// - `state_info`: StateInfo containing schemas, transforms, and predicates
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
+    /// - `skip_stats`: Skip reading file statistics
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         seen_file_keys: HashSet<FileActionKey>,
+        skip_stats: bool,
     ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
@@ -151,16 +161,30 @@ impl ScanLogReplayProcessor {
                 None
             }
         };
+
+        // Select the appropriate transform expression based on skip_stats
+        let transform_expr = if skip_stats {
+            get_add_transform_expr_no_stats()
+        } else {
+            get_add_transform_expr()
+        };
+
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            // Disable data skipping when stats are skipped
+            data_skipping_filter: if skip_stats {
+                None
+            } else {
+                DataSkippingFilter::new(engine, physical_predicate)
+            },
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
-                get_add_transform_expr(),
+                transform_expr,
                 SCAN_ROW_DATATYPE.clone(),
             )?,
             seen_file_keys,
             state_info,
+            skip_stats,
         })
     }
 
@@ -203,6 +227,7 @@ impl ScanLogReplayProcessor {
             predicate_schema,
             column_mapping_mode,
             stats_schema,
+            skip_stats: self.skip_stats,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
@@ -261,7 +286,12 @@ impl ScanLogReplayProcessor {
             stats_schema: internal_state.stats_schema,
         });
 
-        let processor = Self::new_with_seen_files(engine, state_info, state.seen_file_keys)?;
+        let processor = Self::new_with_seen_files(
+            engine,
+            state_info,
+            state.seen_file_keys,
+            internal_state.skip_stats,
+        )?;
 
         Ok(Arc::new(processor))
     }
@@ -475,24 +505,37 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
     LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
-fn get_add_transform_expr() -> ExpressionRef {
+/// Build transform expression for add actions to scan file rows.
+fn build_add_transform_expr(include_stats: bool) -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+    let stats_expr = if include_stats {
+        column_expr_ref!("add.stats")
+    } else {
+        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+    };
+    Arc::new(Expression::Struct(vec![
+        column_expr_ref!("add.path"),
+        column_expr_ref!("add.size"),
+        column_expr_ref!("add.modificationTime"),
+        stats_expr,
+        column_expr_ref!("add.deletionVector"),
         Arc::new(Expression::Struct(vec![
-            column_expr_ref!("add.path"),
-            column_expr_ref!("add.size"),
-            column_expr_ref!("add.modificationTime"),
-            column_expr_ref!("add.stats"),
-            column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(vec![
-                column_expr_ref!("add.partitionValues"),
-                column_expr_ref!("add.baseRowId"),
-                column_expr_ref!("add.defaultRowCommitVersion"),
-                column_expr_ref!("add.tags"),
-                column_expr_ref!("add.clusteringProvider"),
-            ])),
-        ]))
-    });
+            column_expr_ref!("add.partitionValues"),
+            column_expr_ref!("add.baseRowId"),
+            column_expr_ref!("add.defaultRowCommitVersion"),
+            column_expr_ref!("add.tags"),
+            column_expr_ref!("add.clusteringProvider"),
+        ])),
+    ]))
+}
+
+fn get_add_transform_expr() -> ExpressionRef {
+    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| build_add_transform_expr(true));
+    EXPR.clone()
+}
+
+fn get_add_transform_expr_no_stats() -> ExpressionRef {
+    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| build_add_transform_expr(false));
     EXPR.clone()
 }
 
@@ -582,6 +625,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             actions,
             is_log_batch,
         } = actions_batch;
+
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
@@ -596,6 +640,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
         );
+
         let mut visitor = AddRemoveDedupVisitor::new(
             deduplicator,
             selection_vector,
@@ -630,8 +675,10 @@ pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    skip_stats: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(ScanLogReplayProcessor::new(engine, state_info, skip_stats)?
+        .process_actions_iter(action_iter))
 }
 
 #[cfg(test)]
@@ -768,6 +815,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            false,
         )
         .unwrap();
         for res in iter {
@@ -794,6 +842,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false,
         )
         .unwrap();
 
@@ -872,6 +921,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false,
         )
         .unwrap();
 
@@ -914,6 +964,7 @@ mod tests {
         let mut processor = ScanLogReplayProcessor::new(
             &engine,
             Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
+            false,
         )
         .unwrap();
 
@@ -979,7 +1030,7 @@ mod tests {
             PhysicalPredicate::Some(_, s) => s.clone(),
             _ => panic!("Expected predicate"),
         };
-        let processor = ScanLogReplayProcessor::new(&engine, state_info.clone()).unwrap();
+        let processor = ScanLogReplayProcessor::new(&engine, state_info.clone(), false).unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
             processor.into_serializable_state().unwrap(),
@@ -1024,7 +1075,7 @@ mod tests {
         );
         let original_transform = state_info.transform_spec.clone();
         assert!(original_transform.is_some());
-        let processor = ScanLogReplayProcessor::new(&engine, state_info.clone()).unwrap();
+        let processor = ScanLogReplayProcessor::new(&engine, state_info.clone(), false).unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
             processor.into_serializable_state().unwrap(),
@@ -1055,7 +1106,7 @@ mod tests {
                 column_mapping_mode: mode,
                 stats_schema: None,
             });
-            let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
+            let processor = ScanLogReplayProcessor::new(&engine, state_info, false).unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
                 &engine,
                 processor.into_serializable_state().unwrap(),
@@ -1082,7 +1133,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             stats_schema: None,
         });
-        let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
+        let processor = ScanLogReplayProcessor::new(&engine, state_info, false).unwrap();
         let serialized = processor.into_serializable_state().unwrap();
         assert!(serialized.predicate.is_none());
         let deserialized =
@@ -1119,6 +1170,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             stats_schema: None,
+            skip_stats: false,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1148,6 +1200,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             stats_schema: None,
+            skip_stats: false,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
@@ -1192,5 +1245,37 @@ mod tests {
         // Serialization should fail because opaque expressions cannot be serialized
         let result = serde_json::to_string(&state);
         assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
+    }
+
+    #[test]
+    fn test_scan_action_iter_with_skip_stats() {
+        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ]));
+        let state_info = get_simple_state_info(schema, vec!["date".to_string()]).unwrap();
+
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+            true,
+        )
+        .unwrap();
+
+        let mut found_add = false;
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            scan_metadata
+                .visit_scan_files((), |_: &mut (), scan_file: ScanFile| {
+                    assert!(scan_file.stats.is_none());
+                })
+                .unwrap();
+            found_add = true;
+        }
+        assert!(found_add);
     }
 }

@@ -87,11 +87,30 @@ pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
 #[allow(unused)]
 pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
 
+/// Checkpoint schema WITHOUT stats for column projection pushdown.
+/// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
+#[allow(clippy::unwrap_used)]
+static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    use crate::actions::Add;
+    let add_schema = Add::to_schema();
+    let fields_no_stats: Vec<_> = add_schema
+        .fields()
+        .filter(|f| f.name() != "stats")
+        .cloned()
+        .collect();
+    let add_no_stats = StructType::new_unchecked(fields_no_stats);
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        add_no_stats,
+    )]))
+});
+
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    skip_stats: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -99,6 +118,7 @@ impl std::fmt::Debug for ScanBuilder {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
+            .field("skip_stats", &self.skip_stats)
             .finish()
     }
 }
@@ -110,6 +130,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            skip_stats: false,
         }
     }
 
@@ -147,6 +168,21 @@ impl ScanBuilder {
         self
     }
 
+    /// Skip reading file statistics from checkpoint files.
+    ///
+    /// When enabled:
+    /// - Parquet checkpoint reads use column projection to skip the stats column
+    /// - The `stats` field in scan results will be `None`
+    /// - Data skipping is disabled (predicates still filter partitions, but not files)
+    ///
+    /// Use this when data skipping is handled externally (e.g., by the query engine).
+    ///
+    /// Default is `false` (stats are read).
+    pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
+        self.skip_stats = skip_stats;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -171,6 +207,7 @@ impl ScanBuilder {
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
+            skip_stats: self.skip_stats,
         })
     }
 }
@@ -388,6 +425,7 @@ impl HasSelectionVector for ScanMetadata {
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
+    skip_stats: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -395,6 +433,7 @@ impl std::fmt::Debug for Scan {
         f.debug_struct("Scan")
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
+            .field("skip_stats", &self.skip_stats)
             .finish()
     }
 }
@@ -598,7 +637,12 @@ impl Scan {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            action_batch_iter,
+            self.state_info.clone(),
+            self.skip_stats,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -611,12 +655,17 @@ impl Scan {
     > {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
+        let checkpoint_schema = if self.skip_stats {
+            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
+                checkpoint_schema,
                 None,
                 self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
             )
@@ -685,7 +734,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone())?;
+        let processor =
+            ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone(), self.skip_stats)?;
         SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
     }
 
