@@ -238,14 +238,23 @@ pub mod tokio {
             // We throw away the handle, but it should continue on.
             self.handle.spawn(fut);
 
-            // Use block_in_place to tell Tokio we're about to block - this allows
-            // the runtime to move tasks off this worker's local queue so they can
-            // be stolen by other workers.
-            tokio::task::block_in_place(|| {
+            let recv = || {
                 receiver
                     .recv()
                     .expect("TokioMultiThreadExecutor has crashed")
-            })
+            };
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Use block_in_place to tell Tokio we're about to block - this allows
+                // the runtime to move tasks off this worker's local queue so they can
+                // be stolen by other workers. Only use block_in_place if we're inside
+                // a Tokio runtime.
+                tokio::task::block_in_place(recv)
+            } else {
+                // If we're not inside a Tokio runtime, we can't use block_in_place,
+                // so we just block on the receiver.
+                recv()
+            }
         }
 
         fn spawn<F>(&self, task: F)
@@ -396,6 +405,25 @@ pub mod tokio {
                 result.is_err(),
                 "Expected deadlock with 1 worker thread, 1 blocking thread and 4 nested block_on calls",
             );
+        }
+
+        #[test]
+        fn test_block_on_works_outside_tokio_runtime() {
+            // Verify we're not inside a Tokio runtime
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Test must run outside of a Tokio runtime"
+            );
+
+            let executor = TokioMultiThreadExecutor::new_owned_runtime(None, None)
+                .expect("Failed to create executor");
+
+            // block_on should work even though we're not inside a Tokio runtime
+            let result = executor.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                42
+            });
+            assert_eq!(result, 42);
         }
     }
 }
