@@ -37,6 +37,22 @@ pub struct TableInfo {
     pub description: Option<String>,
 }
 
+// Specs define the operation performed on a table - defines what operation at what version (e.g. read at version 0)
+// There will be multiple specs for a given table
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Spec {
+    Read {
+        version: Option<i64>, //If version is None, read at latest version
+    },
+}
+
+//For Read specs, we will either run a read data operation or a read metadata operation
+pub enum ReadOperation {
+    ReadData,
+    ReadMetadata,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +102,66 @@ mod tests {
             table_info.description,
             Some("A table with extra fields".to_string())
         );
+    }
+
+    #[test]
+    fn test_deserialize_spec_read_with_version() {
+        let json_content = include_str!("test_data/spec_read_with_version.json");
+        let spec: Spec = serde_json::from_str(json_content)
+            .expect("Failed to deserialize spec_read_with_version.json");
+
+        if let Spec::Read { version } = spec {
+            assert_eq!(version, Some(5));
+        } else {
+            panic!("Expected Spec::Read variant");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_spec_read_without_version() {
+        let json_content = include_str!("test_data/spec_read_without_version.json");
+        let spec: Spec = serde_json::from_str(json_content)
+            .expect("Failed to deserialize spec_read_without_version.json");
+
+        if let Spec::Read { version } = spec {
+            assert_eq!(version, None);
+        } else {
+            panic!("Expected Spec::Read variant");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_spec_missing_type() {
+        let json_content = include_str!("test_data/spec_missing_type.json");
+        let result: Result<Spec, _> = serde_json::from_str(json_content);
+
+        assert!(
+            result.is_err(),
+            "Expected deserialization to fail when type field is missing"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_spec_invalid_type() {
+        let json_content = include_str!("test_data/spec_invalid_type.json");
+        let result: Result<Spec, _> = serde_json::from_str(json_content);
+
+        assert!(
+            result.is_err(),
+            "Expected deserialization to fail with invalid type value"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_spec_extra_fields() {
+        let json_content = include_str!("test_data/spec_extra_fields.json");
+        let spec: Spec = serde_json::from_str(json_content)
+            .expect("Failed to deserialize spec_extra_fields.json");
+
+        if let Spec::Read { version } = spec {
+            assert_eq!(version, Some(7));
+        } else {
+            panic!("Expected Spec::Read variant");
+        }
     }
 }

@@ -1,0 +1,5 @@
+{
+    "type": "read",
+    "version": 7,
+    "extra_field": "should be ignored"
+}
