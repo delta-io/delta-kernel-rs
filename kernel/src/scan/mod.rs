@@ -92,7 +92,7 @@ pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
-    include_stats: bool,
+    stats_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -100,7 +100,7 @@ impl std::fmt::Debug for ScanBuilder {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
-            .field("include_stats", &self.include_stats)
+            .field("stats_columns", &self.stats_columns)
             .finish()
     }
 }
@@ -112,7 +112,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
-            include_stats: false,
+            stats_columns: None,
         }
     }
 
@@ -173,7 +173,7 @@ impl ScanBuilder {
     /// [`build`]: ScanBuilder::build
     /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
     pub fn include_stats_columns(mut self) -> Self {
-        self.include_stats = true;
+        self.stats_columns = Some(Vec::new());
         self
     }
 
@@ -195,8 +195,8 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            self.include_stats.then(Vec::new), // Empty list = all stats
-            (),                                // No classifer, default is for scans
+            self.stats_columns,
+            (), // No classifier, default is for scans
         )?;
 
         Ok(Scan {
@@ -472,6 +472,21 @@ impl Scan {
         } else {
             None
         }
+    }
+
+    /// Get the logical schema for file statistics.
+    ///
+    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
+    /// contains file statistics read using physical column names (to handle column mapping).
+    /// This method returns the corresponding logical schema that maps those physical column
+    /// names back to the table's logical column names, enabling engines to interpret the stats
+    /// correctly.
+    ///
+    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
+        self.state_info.logical_stats_schema.as_ref()
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles

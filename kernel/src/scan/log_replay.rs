@@ -38,8 +38,7 @@ struct InternalScanState {
     column_mapping_mode: ColumnMappingMode,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
-    /// Logical stats schema for output (stats_columns only, or None if no stats_columns)
-    #[serde(default)]
+    /// Logical stats schema for the file statistics.
     logical_stats_schema: Option<SchemaRef>,
 }
 

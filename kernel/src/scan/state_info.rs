@@ -32,9 +32,9 @@ pub(crate) struct StateInfo {
     /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) physical_stats_schema: Option<SchemaRef>,
-    /// Logical stats schema for output to the engine.
-    /// Contains only the stats_columns specified by the user.
-    /// When None, no stats_parsed column is included in scan output.
+    /// Logical stats schema for the file statistics. When `stats_columns` is requested,
+    /// the engine receives stats with physical column names (for column mapping). This
+    /// logical schema maps those stats back to the table's logical column names.
     pub(crate) logical_stats_schema: Option<SchemaRef>,
 }
 
@@ -214,46 +214,42 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // MVP validation: stats_columns cannot be used with predicate
-        if stats_columns.is_some() && !matches!(physical_predicate, PhysicalPredicate::None) {
-            return Err(Error::generic(
-                "Cannot use both predicate and stats_columns in the same scan (MVP limitation)",
-            ));
-        }
-
-        // Build logical_stats_schema from stats_columns
-        // MVP: only empty list is supported, which means output ALL stats from expected_stats_schema
-        let logical_stats_schema = match &stats_columns {
-            Some(columns) if columns.is_empty() => {
-                // Empty list means output all stats from expected_stats_schema.
-                // Clustering columns are not needed here - that parameter ensures clustering
-                // columns are always included when writing stats. For reading, we just use
-                // the schema determined by table properties.
-                // Use logical schema for output (user-facing column names).
-                Some(
-                    table_configuration
-                        .build_expected_stats_schemas(None)?
-                        .logical,
-                )
-            }
-            Some(_) => {
-                // Non-empty list not supported in MVP
-                return Err(Error::generic(
-                    "Only empty stats_columns is supported (outputs all stats). \
-                     Specifying specific columns is not yet implemented.",
-                ));
-            }
-            None => None,
-        };
-
-        // Build physical_stats_schema for reading stats from checkpoint files
-        // - If logical_stats_schema is set, use it (stats_columns case)
-        // - Otherwise, use predicate columns for data skipping
-        let physical_stats_schema = match (&logical_stats_schema, &physical_predicate) {
-            (Some(schema), _) => Some(schema.clone()),
-            (_, PhysicalPredicate::Some(_, schema)) => build_stats_schema(schema),
-            _ => None,
-        };
+        // Build stats schemas:
+        // - From stats_columns if specified (for outputting stats to the engine)
+        // - From predicate columns otherwise (for data skipping only, no logical schema needed)
+        // Returns (physical_stats_schema, logical_stats_schema) tuple
+        let (physical_stats_schema, logical_stats_schema) =
+            match (&stats_columns, &physical_predicate) {
+                // stats_columns + predicate not supported together
+                (Some(_), PhysicalPredicate::Some(..)) => {
+                    return Err(Error::generic(
+                        "Cannot use both predicate and stats_columns in the same scan",
+                    ));
+                }
+                // stats_columns = Some([]) means output all stats from expected_stats_schema.
+                // Clustering columns parameter is not needed here - that's for ensuring columns
+                // are included when writing stats. For reading, we use the table properties.
+                (Some(columns), _) if columns.is_empty() => {
+                    let expected_stats_schemas =
+                        table_configuration.build_expected_stats_schemas(None)?;
+                    (
+                        Some(expected_stats_schemas.physical),
+                        Some(expected_stats_schemas.logical),
+                    )
+                }
+                // Non-empty stats_columns list not supported yet
+                (Some(_), _) => {
+                    return Err(Error::generic(
+                        "Only empty stats_columns is supported (outputs all stats). \
+                         Specifying specific columns is not yet implemented.",
+                    ));
+                }
+                // No stats_columns, but has predicate - use predicate columns for data skipping
+                // (no logical stats schema needed for internal data skipping)
+                (None, PhysicalPredicate::Some(_, schema)) => (build_stats_schema(schema), None),
+                // No stats_columns and no predicate
+                (None, _) => (None, None),
+            };
 
         let transform_spec =
             if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
