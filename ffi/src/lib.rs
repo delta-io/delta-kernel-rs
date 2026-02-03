@@ -634,19 +634,20 @@ fn get_default_engine_impl(
 
     let store = store_from_url_opts(&url, options)?;
 
-    let engine: Arc<dyn Engine> =
-        if let Some(config) = executor_config {
-            use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-            let executor =
-                TokioMultiThreadExecutor::new_owned_runtime(config.worker_threads, config.max_blocking_threads)?;
-            Arc::new(
-                DefaultEngineBuilder::new(store)
-                    .with_task_executor(Arc::new(executor))
-                    .build(),
-            )
-        } else {
-            Arc::new(DefaultEngineBuilder::new(store).build())
-        };
+    let engine: Arc<dyn Engine> = if let Some(config) = executor_config {
+        use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+        let executor = TokioMultiThreadExecutor::new_owned_runtime(
+            config.worker_threads,
+            config.max_blocking_threads,
+        )?;
+        Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_task_executor(Arc::new(executor))
+                .build(),
+        )
+    } else {
+        Arc::new(DefaultEngineBuilder::new(store).build())
+    };
 
     Ok(engine_to_handle(engine, allocate_error))
 }
@@ -1153,9 +1154,10 @@ mod tests {
     }
 
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
+    // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to build engine without existing tokio runtime.
     #[cfg(feature = "default-engine-base")]
-    #[tokio::test]
-    async fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
+    #[test]
+    fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
         use object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
@@ -1172,29 +1174,38 @@ mod tests {
             .join("\n");
 
         let table_url = url::Url::from_directory_path(tmp_path).unwrap();
-        add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
-        add_commit(
-            storage.as_ref(),
-            1,
-            actions_to_string(vec![
-                TestAction::Add("file1.parquet".into()),
-                TestAction::Add("file2.parquet".into()),
-            ]),
-        )
-        .await?;
-        add_commit(
-            storage.as_ref(),
-            2,
-            actions_to_string(vec![
-                TestAction::Add("file3.parquet".into()),
-                TestAction::Remove("file1.parquet".into()),
-            ]),
-        )
-        .await?;
+
+        // Use a temporary runtime for async setup, then drop it before FFI calls
+        {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
+                add_commit(
+                    storage.as_ref(),
+                    1,
+                    actions_to_string(vec![
+                        TestAction::Add("file1.parquet".into()),
+                        TestAction::Add("file2.parquet".into()),
+                    ]),
+                )
+                .await?;
+                add_commit(
+                    storage.as_ref(),
+                    2,
+                    actions_to_string(vec![
+                        TestAction::Add("file3.parquet".into()),
+                        TestAction::Remove("file1.parquet".into()),
+                    ]),
+                )
+                .await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        } // runtime dropped here, before FFI calls
 
         // Build engine using FFI APIs
         let path = table_url.as_str();
-        let builder = unsafe { ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err)) };
+        let builder =
+            unsafe { ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err)) };
         unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
