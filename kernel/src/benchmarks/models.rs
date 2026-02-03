@@ -110,11 +110,8 @@ mod tests {
         let spec: Spec = serde_json::from_str(json_content)
             .expect("Failed to deserialize spec_read_with_version.json");
 
-        if let Spec::Read { version } = spec {
-            assert_eq!(version, Some(5));
-        } else {
-            panic!("Expected Spec::Read variant");
-        }
+        let Spec::Read { version } = spec;
+        assert_eq!(version, Some(5));
     }
 
     #[test]
@@ -123,11 +120,8 @@ mod tests {
         let spec: Spec = serde_json::from_str(json_content)
             .expect("Failed to deserialize spec_read_without_version.json");
 
-        if let Spec::Read { version } = spec {
-            assert_eq!(version, None);
-        } else {
-            panic!("Expected Spec::Read variant");
-        }
+        let Spec::Read { version } = spec;
+        assert_eq!(version, None);
     }
 
     #[test]
@@ -158,10 +152,7 @@ mod tests {
         let spec: Spec = serde_json::from_str(json_content)
             .expect("Failed to deserialize spec_extra_fields.json");
 
-        if let Spec::Read { version } = spec {
-            assert_eq!(version, Some(7));
-        } else {
-            panic!("Expected Spec::Read variant");
-        }
+        let Spec::Read { version } = spec;
+        assert_eq!(version, Some(7));
     }
 }
