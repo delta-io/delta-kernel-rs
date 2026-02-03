@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, ScanMetadata, PARSED_STATS_COL_NAME};
+use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -154,7 +154,11 @@ impl ScanLogReplayProcessor {
             checkpoint_read_schema,
         } = checkpoint_info;
 
-        let output_schema = scan_row_schema_with_stats(state_info.physical_stats_schema.clone());
+        // Physical schema for parsing stats from JSON/checkpoints (uses physical column names)
+        // Logical schema for output to the engine (uses logical column names)
+        let physical_stats_schema = state_info.physical_stats_schema.clone();
+        let logical_stats_schema = state_info.logical_stats_schema.clone();
+        let output_schema = scan_row_schema_with_stats(logical_stats_schema.clone());
 
         // Extract the physical predicate for data skipping and partition filtering.
         // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
@@ -169,13 +173,21 @@ impl ScanLogReplayProcessor {
             // Log transform: always parse JSON (no stats_parsed in JSON commit files)
             log_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema.clone(),
-                get_add_transform_expr(state_info.physical_stats_schema.clone(), false),
+                get_add_transform_expr(
+                    physical_stats_schema.clone(),
+                    logical_stats_schema.clone(),
+                    false,
+                ),
                 output_schema.clone().into(),
             )?,
-            // Checkpoint transform: use coalesce(stats_parsed, ParseJson) when available
+            // Checkpoint transform: read stats_parsed directly when available, otherwise parse JSON
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
-                get_add_transform_expr(state_info.physical_stats_schema.clone(), has_stats_parsed),
+                get_add_transform_expr(
+                    physical_stats_schema,
+                    logical_stats_schema,
+                    has_stats_parsed,
+                ),
                 output_schema.into(),
             )?,
             seen_file_keys,
@@ -509,7 +521,7 @@ fn scan_row_schema_with_stats(stats_schema: Option<SchemaRef>) -> SchemaRef {
         Some(schema) => {
             let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
             fields.push(StructField::nullable(
-                PARSED_STATS_COL_NAME,
+                "stats_parsed",
                 schema.as_ref().clone(),
             ));
             Arc::new(StructType::new_unchecked(fields))
@@ -518,15 +530,61 @@ fn scan_row_schema_with_stats(stats_schema: Option<SchemaRef>) -> SchemaRef {
     }
 }
 
-/// Build the add transform expression with stats parsing.
+/// Build a struct projection expression that reads from physical column names and outputs
+/// with logical column names. This is used when reading stats_parsed from checkpoints with
+/// column mapping enabled.
 ///
 /// # Parameters
-/// - `stats_schema`: Schema for stats_parsed output (or None if no stats output)
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats
+/// - `base_path`: The base column path (e.g., "add.stats_parsed")
+/// - `physical_schema`: Schema with physical column names (what's in the checkpoint)
+/// - `logical_schema`: Schema with logical column names (what we want to output)
 ///
-/// The transform includes `stats_parsed` only when `stats_schema` is Some.
+/// Both schemas must have the same structure (same number of fields at each level).
+fn build_stats_projection_expr(
+    base_path: &ColumnName,
+    physical_schema: &StructType,
+    logical_schema: &StructType,
+) -> Expression {
+    let fields: Vec<ExpressionRef> = physical_schema
+        .fields()
+        .zip(logical_schema.fields())
+        .map(|(physical_field, logical_field)| {
+            let field_path = base_path.join(&ColumnName::new([physical_field.name()]));
+            match (&physical_field.data_type, &logical_field.data_type) {
+                (DataType::Struct(phys_inner), DataType::Struct(log_inner)) => {
+                    // Recursively build projection for nested structs
+                    Arc::new(build_stats_projection_expr(
+                        &field_path,
+                        phys_inner,
+                        log_inner,
+                    ))
+                }
+                _ => {
+                    // Leaf field - just read the physical column
+                    Arc::new(Expression::Column(field_path))
+                }
+            }
+        })
+        .collect();
+    Expression::Struct(fields)
+}
+
+/// Build the add transform expression with optional stats parsing.
+///
+/// # Parameters
+/// - `physical_stats_schema`: Schema for parsing stats from JSON (physical column names).
+///   Used in the `parse_json` expression.
+/// - `output_stats_schema`: Schema for stats_parsed in output (logical column names), or None
+///   if stats should not be included in output.
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+///
+/// The transform includes `stats_parsed` only when `output_stats_schema` is Some.
+/// When column mapping is enabled, `physical_stats_schema` and `output_stats_schema` differ:
+/// - `physical_stats_schema` uses physical names (for JSON parsing)
+/// - `output_stats_schema` uses logical names (for engine output)
 fn get_add_transform_expr(
-    stats_schema: Option<SchemaRef>,
+    physical_stats_schema: Option<SchemaRef>,
+    output_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
 ) -> ExpressionRef {
     let mut fields = vec![
@@ -545,16 +603,30 @@ fn get_add_transform_expr(
     ];
 
     // Add stats_parsed when stats output is requested
-    if let Some(schema) = stats_schema {
+    // output_stats_schema controls whether stats appear in output (and uses logical names)
+    // physical_stats_schema is used for JSON parsing (uses physical names)
+    if let Some(output_schema) = output_stats_schema {
         let stats_parsed_expr = if has_stats_parsed {
-            // Checkpoint has stats_parsed - use coalesce to prefer pre-parsed over JSON
-            Expression::coalesce([
-                column_expr!("add.stats_parsed"),
-                Expression::parse_json(column_expr!("add.stats"), schema),
-            ])
+            // Checkpoint has stats_parsed column - build projection to rename physical to logical
+            match physical_stats_schema {
+                Some(ref physical_schema) if physical_schema != &output_schema => {
+                    // Column mapping is in use - build explicit projection
+                    build_stats_projection_expr(
+                        &column_name!("add.stats_parsed"),
+                        physical_schema,
+                        &output_schema,
+                    )
+                }
+                _ => {
+                    // No column mapping - read directly
+                    column_expr!("add.stats_parsed")
+                }
+            }
         } else {
-            // No stats_parsed available (JSON log files) - parse JSON
-            Expression::parse_json(column_expr!("add.stats"), schema)
+            // No stats_parsed available (JSON log files) - parse JSON using physical schema
+            // The physical schema matches the JSON field names; engine sees output schema names
+            let parse_schema = physical_stats_schema.unwrap_or(output_schema);
+            Expression::parse_json(column_expr!("add.stats"), parse_schema)
         };
         fields.push(Arc::new(stats_parsed_expr));
     }
@@ -849,17 +921,13 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
         });
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
-            checkpoint_info,
+            test_checkpoint_info(),
         )
         .unwrap();
         for res in iter {
@@ -880,17 +948,13 @@ mod tests {
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-            checkpoint_info,
+            test_checkpoint_info(),
         )
         .unwrap();
 
@@ -963,17 +1027,13 @@ mod tests {
         );
 
         let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-            checkpoint_info,
+            test_checkpoint_info(),
         )
         .unwrap();
 
@@ -1002,13 +1062,6 @@ mod tests {
             } else {
                 panic!("Should have been a transform expression");
             }
-        }
-    }
-
-    fn test_checkpoint_info() -> CheckpointReadInfo {
-        CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
         }
     }
 

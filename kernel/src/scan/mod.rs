@@ -373,10 +373,6 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// Name of the parsed stats column added to scan_files when stats output is requested.
-/// This matches the `stats_parsed` field in the Delta Protocol's Add action.
-pub(crate) const PARSED_STATS_COL_NAME: &str = "stats_parsed";
-
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
 /// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
 /// from those files.

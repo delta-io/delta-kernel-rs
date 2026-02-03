@@ -528,7 +528,7 @@ fn test_scan_metadata_with_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![])
+        .include_stats_columns()
         .build()
         .unwrap();
 
@@ -667,7 +667,7 @@ fn test_scan_metadata_stats_columns_with_predicate_errors() {
     let result = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats_columns(vec![])
+        .include_stats_columns()
         .build();
 
     assert!(

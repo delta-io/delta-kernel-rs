@@ -132,7 +132,12 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::sync::Arc;
 
+    use delta_kernel::arrow::array::RecordBatch;
+    use delta_kernel::arrow::compute::filter_record_batch;
+    use delta_kernel::arrow::util::pretty::print_batches;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
 
@@ -209,6 +214,45 @@ mod tests {
         // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
 
         println!("🎉 loaded snapshot: {snapshot:?}");
+
+        // Build scan with stats columns to get parsed stats
+        let scan = snapshot.scan_builder().include_stats_columns().build()?;
+
+        println!("\n📊 Inspecting parsed stats from scan_metadata:");
+
+        // Get scan metadata which contains the parsed stats
+        for (i, scan_metadata_result) in scan.scan_metadata(&engine)?.enumerate() {
+            let scan_metadata = scan_metadata_result?;
+            let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)?.into();
+
+            // Apply selection vector filter
+            let bool_array = delta_kernel::arrow::array::BooleanArray::from(selection_vector);
+            let filtered_batch = filter_record_batch(&batch, &bool_array)?;
+
+            println!("\n--- Batch {} ({} rows) ---", i, filtered_batch.num_rows());
+
+            // Print schema to verify column names
+            println!("\n📋 Schema:");
+            for field in filtered_batch.schema().fields() {
+                println!("  - {}: {:?}", field.name(), field.data_type());
+            }
+
+            // Print stats_parsed schema specifically
+            let schema = filtered_batch.schema();
+            if let Ok(stats_idx) = schema.index_of("stats_parsed") {
+                let stats_field = schema.field(stats_idx);
+                if let delta_kernel::arrow::datatypes::DataType::Struct(fields) =
+                    stats_field.data_type()
+                {
+                    for f in fields {
+                        println!("  - {}: {:?}", f.name(), f.data_type());
+                    }
+                }
+            }
+
+            print_batches(&[filtered_batch])?;
+        }
 
         Ok(())
     }
