@@ -10,6 +10,7 @@ use crate::{
         ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
         SchemaTransform, StructField, StructType,
     },
+    table_features::ColumnMappingMode,
     table_properties::TableProperties,
     DeltaResult,
 };
@@ -97,9 +98,13 @@ use column_filter::StatsColumnFilter;
 ///   tightBounds: boolean,
 /// }
 /// ```
+/// Generates the expected schema for file statistics using logical column names.
+///
+/// To get the physical stats schema (with physical column names for column mapping),
+/// call `make_physical(column_mapping_mode)` on the result.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
-    physical_file_schema: &Schema,
+    logical_data_schema: &Schema,
     table_properties: &TableProperties,
     clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
@@ -111,7 +116,7 @@ pub(crate) fn expected_stats_schema(
     // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
     // - always include clustering columns (per Delta protocol)
     let mut base_transform = BaseStatsTransform::new(table_properties, clustering_columns);
-    if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
+    if let Some(base_schema) = base_transform.transform_struct(logical_data_schema) {
         let base_schema = base_schema.into_owned();
 
         // convert all leaf fields to data type LONG for null count
@@ -139,7 +144,7 @@ pub(crate) fn expected_stats_schema(
     StructType::try_new(fields)
 }
 
-/// Returns the list of column names that should have statistics collected.
+/// Returns the list of logical column names that should have statistics collected.
 ///
 /// This extracts just the column names without building the full stats schema,
 /// making it more efficient when only the column list is needed.
@@ -149,13 +154,13 @@ pub(crate) fn expected_stats_schema(
 /// settings.
 #[allow(unused)]
 pub(crate) fn stats_column_names(
-    physical_file_schema: &Schema,
+    logical_data_schema: &Schema,
     table_properties: &TableProperties,
     clustering_columns: Option<&[ColumnName]>,
 ) -> Vec<ColumnName> {
     let mut filter = StatsColumnFilter::new(table_properties, clustering_columns);
     let mut columns = Vec::new();
-    filter.collect_columns(physical_file_schema, &mut columns);
+    filter.collect_columns(logical_data_schema, &mut columns);
     columns
 }
 
@@ -205,18 +210,20 @@ impl<'a> SchemaTransform<'a> for NullableStatsTransform {
 /// The nullCount struct field tracks the number of null values for each column.
 /// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
 /// since null counts are always integers, while struct fields are recursed into
-/// to preserve the nested structure.
-#[allow(unused)]
+/// to preserve the nested structure. Field metadata (including column mapping info)
+/// is preserved for all fields.
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         // Only recurse into struct fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
-            _ => Some(Cow::Owned(StructField::nullable(
-                &field.name,
-                DataType::LONG,
-            ))),
+            _ => Some(Cow::Owned(StructField {
+                name: field.name.clone(),
+                data_type: DataType::LONG,
+                nullable: true,
+                metadata: field.metadata.clone(),
+            })),
         }
     }
 }
@@ -226,7 +233,6 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// Base stats schema in this case refers the subsets of fields in the table schema
 /// that may be considered for stats collection. Depending on the type of stats - min/max/nullcount/... -
 /// additional transformations may be applied.
-/// Transforms a schema to filter columns for statistics based on table properties.
 ///
 /// All fields in the output are nullable. Clustering columns are always included per
 /// the Delta protocol.
@@ -271,14 +277,18 @@ impl<'a, 'col> SchemaTransform<'a> for BaseStatsTransform<'col> {
             self.filter.record_included();
         }
 
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) if field.is_nullable() => Borrowed(field),
-            data_type => Owned(StructField {
+        let field = match self.transform(&field.data_type) {
+            Some(Borrowed(_)) if field.is_nullable() => Borrowed(field),
+            Some(data_type) => Owned(StructField {
                 name: field.name.clone(),
                 data_type: data_type.into_owned(),
                 nullable: true,
-                metadata: Default::default(),
+                metadata: field.metadata.clone(),
             }),
+            None => {
+                self.filter.exit_field();
+                return None;
+            }
         };
 
         self.filter.exit_field();
@@ -339,6 +349,34 @@ fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::String
             | PrimitiveType::Decimal(_)
     )
+}
+
+/// Converts a stats schema's nested data fields to use physical column names.
+///
+/// The stats schema has wrapper fields (`numRecords`, `nullCount`, `minValues`, `maxValues`,
+/// `tightBounds`) that don't have column mapping metadata. Only the nested struct fields inside
+/// `nullCount`, `minValues`, and `maxValues` need physical name conversion.
+pub(crate) struct PhysicalStatsSchemaTransform {
+    pub column_mapping_mode: ColumnMappingMode,
+}
+
+impl<'a> SchemaTransform<'a> for PhysicalStatsSchemaTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        match field.data_type() {
+            DataType::Struct(inner) => {
+                // Convert nested data fields to physical names
+                let physical_inner = inner.make_physical(self.column_mapping_mode);
+                Some(Cow::Owned(StructField {
+                    name: field.name.clone(),
+                    data_type: DataType::Struct(Box::new(physical_inner)),
+                    nullable: field.nullable,
+                    metadata: field.metadata.clone(),
+                }))
+            }
+            // Primitive fields (numRecords, tightBounds) don't need conversion
+            _ => Some(Cow::Borrowed(field)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -863,5 +901,190 @@ mod tests {
         ]);
 
         assert_eq!(&expected, &stats_schema);
+    }
+
+    // ==================== PhysicalStatsSchemaTransform tests ====================
+
+    fn field_with_physical_name(
+        logical_name: &str,
+        physical_name: &str,
+        data_type: DataType,
+    ) -> StructField {
+        serde_json::from_value(serde_json::json!({
+            "name": logical_name,
+            "type": data_type,
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 1,
+                "delta.columnMapping.physicalName": physical_name
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_physical_stats_transform_preserves_wrapper_field_names() {
+        // The stats schema wrapper fields (numRecords, tightBounds) should keep their names
+        let stats_schema = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        let result = PhysicalStatsSchemaTransform {
+            column_mapping_mode: ColumnMappingMode::Name,
+        }
+        .transform_struct(&stats_schema)
+        .unwrap()
+        .into_owned();
+
+        // Wrapper fields should be unchanged
+        assert!(result.field("numRecords").is_some());
+        assert!(result.field("tightBounds").is_some());
+    }
+
+    #[test]
+    fn test_physical_stats_transform_converts_nested_fields() {
+        // Create a stats schema with nested struct fields that have column mapping metadata
+        let inner_schema = StructType::new_unchecked([
+            field_with_physical_name("col_a", "phys_a", DataType::LONG),
+            field_with_physical_name("col_b", "phys_b", DataType::STRING),
+        ]);
+
+        let stats_schema = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(
+                "nullCount",
+                DataType::Struct(Box::new(inner_schema.clone())),
+            ),
+            StructField::nullable(
+                "minValues",
+                DataType::Struct(Box::new(inner_schema.clone())),
+            ),
+            StructField::nullable("maxValues", DataType::Struct(Box::new(inner_schema))),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        let result = PhysicalStatsSchemaTransform {
+            column_mapping_mode: ColumnMappingMode::Name,
+        }
+        .transform_struct(&stats_schema)
+        .unwrap()
+        .into_owned();
+
+        // Wrapper field names should be preserved
+        assert!(result.field("numRecords").is_some());
+        assert!(result.field("nullCount").is_some());
+        assert!(result.field("minValues").is_some());
+        assert!(result.field("maxValues").is_some());
+        assert!(result.field("tightBounds").is_some());
+
+        // Nested fields should have physical names
+        if let DataType::Struct(inner) = result.field("minValues").unwrap().data_type() {
+            assert!(
+                inner.field("phys_a").is_some(),
+                "Should have physical name phys_a"
+            );
+            assert!(
+                inner.field("phys_b").is_some(),
+                "Should have physical name phys_b"
+            );
+            assert!(
+                inner.field("col_a").is_none(),
+                "Should not have logical name"
+            );
+        } else {
+            panic!("Expected minValues to be a struct");
+        }
+    }
+
+    #[test]
+    fn test_physical_stats_transform_with_deeply_nested_struct() {
+        // Test with nested struct inside data columns
+        let user_field: StructField = serde_json::from_value(serde_json::json!({
+            "name": "user",
+            "type": {
+                "type": "struct",
+                "fields": [
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "nullable": true,
+                        "metadata": {
+                            "delta.columnMapping.id": 2,
+                            "delta.columnMapping.physicalName": "phys_name"
+                        }
+                    },
+                    {
+                        "name": "address",
+                        "type": {
+                            "type": "struct",
+                            "fields": [
+                                {
+                                    "name": "city",
+                                    "type": "string",
+                                    "nullable": true,
+                                    "metadata": {
+                                        "delta.columnMapping.id": 3,
+                                        "delta.columnMapping.physicalName": "phys_city"
+                                    }
+                                }
+                            ]
+                        },
+                        "nullable": true,
+                        "metadata": {
+                            "delta.columnMapping.id": 4,
+                            "delta.columnMapping.physicalName": "phys_address"
+                        }
+                    }
+                ]
+            },
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 1,
+                "delta.columnMapping.physicalName": "phys_user"
+            }
+        }))
+        .unwrap();
+
+        let inner_schema = StructType::new_unchecked([user_field]);
+
+        let stats_schema = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("minValues", DataType::Struct(Box::new(inner_schema))),
+        ]);
+
+        let result = PhysicalStatsSchemaTransform {
+            column_mapping_mode: ColumnMappingMode::Name,
+        }
+        .transform_struct(&stats_schema)
+        .unwrap()
+        .into_owned();
+
+        // Check that deeply nested fields have physical names
+        let min_values = result.field("minValues").unwrap();
+        if let DataType::Struct(inner) = min_values.data_type() {
+            // Top-level data field should have physical name
+            assert!(inner.field("phys_user").is_some());
+            assert!(inner.field("user").is_none());
+
+            // Nested struct field should also have physical names
+            if let DataType::Struct(user_inner) = inner.field("phys_user").unwrap().data_type() {
+                assert!(user_inner.field("phys_name").is_some());
+                assert!(user_inner.field("phys_address").is_some());
+
+                // Deeply nested field
+                if let DataType::Struct(addr_inner) =
+                    user_inner.field("phys_address").unwrap().data_type()
+                {
+                    assert!(addr_inner.field("phys_city").is_some());
+                } else {
+                    panic!("Expected address to be a struct");
+                }
+            } else {
+                panic!("Expected user to be a struct");
+            }
+        } else {
+            panic!("Expected minValues to be a struct");
+        }
     }
 }
