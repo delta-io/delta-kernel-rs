@@ -29,13 +29,13 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
-    /// The stats schema for reading/parsing stats from checkpoints.
+    /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
-    pub(crate) stats_schema: Option<SchemaRef>,
-    /// The stats schema for output to the engine.
+    pub(crate) physical_stats_schema: Option<SchemaRef>,
+    /// Logical stats schema for output to the engine.
     /// Contains only the stats_columns specified by the user.
     /// When None, no stats_parsed column is included in scan output.
-    pub(crate) output_stats_schema: Option<SchemaRef>,
+    pub(crate) logical_stats_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -221,15 +221,20 @@ impl StateInfo {
             ));
         }
 
-        // Build output_stats_schema from stats_columns
+        // Build logical_stats_schema from stats_columns
         // MVP: only empty list is supported, which means output ALL stats from expected_stats_schema
-        let output_stats_schema = match &stats_columns {
+        let logical_stats_schema = match &stats_columns {
             Some(columns) if columns.is_empty() => {
                 // Empty list means output all stats from expected_stats_schema.
                 // Clustering columns are not needed here - that parameter ensures clustering
                 // columns are always included when writing stats. For reading, we just use
                 // the schema determined by table properties.
-                Some(table_configuration.expected_stats_schema(None)?)
+                // Use logical schema for output (user-facing column names).
+                Some(
+                    table_configuration
+                        .build_expected_stats_schemas(None)?
+                        .logical,
+                )
             }
             Some(_) => {
                 // Non-empty list not supported in MVP
@@ -241,10 +246,10 @@ impl StateInfo {
             None => None,
         };
 
-        // Build stats_schema for reading/data skipping
-        // - If output_stats_schema is set, use it (stats_columns case)
+        // Build physical_stats_schema for reading stats from checkpoint files
+        // - If logical_stats_schema is set, use it (stats_columns case)
         // - Otherwise, use predicate columns for data skipping
-        let stats_schema = match (&output_stats_schema, &physical_predicate) {
+        let physical_stats_schema = match (&logical_stats_schema, &physical_predicate) {
             (Some(schema), _) => Some(schema.clone()),
             (_, PhysicalPredicate::Some(_, schema)) => build_stats_schema(schema),
             _ => None,
@@ -263,8 +268,8 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
-            stats_schema,
-            output_stats_schema,
+            physical_stats_schema,
+            logical_stats_schema,
         })
     }
 }
