@@ -1152,6 +1152,68 @@ mod tests {
         Ok(())
     }
 
+    // Test checkpoint using FFI engine builder APIs with multithreaded executor.
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    async fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
+        use object_store::local::LocalFileSystem;
+        use tempfile::tempdir;
+
+        let tmp_dir = tempdir()?;
+        let tmp_path = tmp_dir.path();
+        let storage = Arc::new(LocalFileSystem::new_with_prefix(tmp_path)?);
+
+        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
+        // add/remove commits.
+        let protocol_and_metadata = METADATA
+            .lines()
+            .skip(1) // skip commitInfo
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let table_url = url::Url::from_directory_path(tmp_path).unwrap();
+        add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
+        add_commit(
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![
+                TestAction::Add("file1.parquet".into()),
+                TestAction::Add("file2.parquet".into()),
+            ]),
+        )
+        .await?;
+        add_commit(
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![
+                TestAction::Add("file3.parquet".into()),
+                TestAction::Remove("file1.parquet".into()),
+            ]),
+        )
+        .await?;
+
+        // Build engine using FFI APIs
+        let path = table_url.as_str();
+        let builder = unsafe { ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err)) };
+        unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
+        let engine = unsafe { ok_or_panic(builder_build(builder)) };
+
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let did_checkpoint = unsafe {
+            ok_or_panic(checkpoint_snapshot(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        assert!(did_checkpoint);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
