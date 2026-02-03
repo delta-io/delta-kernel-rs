@@ -159,12 +159,19 @@ fn evaluate_transform_expression(
     }
 
     // Extract the input path, if any
-    let source_data = transform
+    let source_array = transform
         .input_path()
         .map(|path| extract_column(batch, path))
         .transpose()?;
 
-    let source_data: &dyn ProvidesColumnByName = match source_data {
+    // For nested transforms, get the source struct's null bitmap to preserve null rows
+    let source_null_buffer = source_array.as_ref().and_then(|arr| {
+        arr.as_any()
+            .downcast_ref::<StructArray>()
+            .and_then(|s| s.nulls().cloned())
+    });
+
+    let source_data: &dyn ProvidesColumnByName = match source_array {
         Some(ref array) => array
             .as_any()
             .downcast_ref::<StructArray>()
@@ -204,7 +211,7 @@ fn evaluate_transform_expression(
         return Err(Error::generic("Too many fields in output schema"));
     }
 
-    // Build the final struct
+    // Build the final struct, preserving null bitmap for nested transforms
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
         .zip(output_schema.fields())
@@ -216,7 +223,7 @@ fn evaluate_transform_expression(
             )
         })
         .collect();
-    let data = StructArray::try_new(output_fields.into(), output_cols, None)?;
+    let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
     Ok(Arc::new(data))
 }
 
@@ -1178,13 +1185,10 @@ mod tests {
         // Create coalesce expression with column that has no nulls, followed by
         // a reference to a non-existent column. If short-circuit works, the
         // non-existent column is never evaluated and no error occurs.
-        let expr = Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![
-                Expression::column(["a"]),
-                Expression::column(["nonexistent"]), // Would fail if evaluated
-            ],
-        );
+        let expr = Expression::coalesce([
+            Expression::column(["a"]),
+            Expression::column(["nonexistent"]), // Would fail if evaluated
+        ]);
 
         // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1209,14 +1213,11 @@ mod tests {
 
         // Create coalesce expression: a has nulls, b has none, c doesn't exist.
         // Short-circuit should stop after evaluating b.
-        let expr = Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![
-                Expression::column(["a"]),
-                Expression::column(["b"]),
-                Expression::column(["nonexistent"]), // Would fail if evaluated
-            ],
-        );
+        let expr = Expression::coalesce([
+            Expression::column(["a"]),
+            Expression::column(["b"]),
+            Expression::column(["nonexistent"]), // Would fail if evaluated
+        ]);
 
         // Should coalesce a and b, never evaluate "nonexistent"
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
@@ -1235,10 +1236,7 @@ mod tests {
         let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
 
-        let expr = Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![Expression::column(["a"])],
-        );
+        let expr = Expression::coalesce([Expression::column(["a"])]);
 
         // Request STRING type but array is INT32 - should fail even with short-circuit
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));

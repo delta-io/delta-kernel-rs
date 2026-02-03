@@ -23,6 +23,9 @@ use strum::EnumString;
 mod deserialize;
 pub use deserialize::ParseIntervalError;
 
+/// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
+pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
+
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
 ///
@@ -179,10 +182,20 @@ pub struct TableProperties {
     pub unknown_properties: HashMap<String, String>,
 }
 
+/// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
+/// is not specified.
+pub const DEFAULT_NUM_INDEXED_COLS: u64 = 32;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DataSkippingNumIndexedCols {
     AllColumns,
     NumColumns(u64),
+}
+
+impl Default for DataSkippingNumIndexedCols {
+    fn default() -> Self {
+        DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEXED_COLS)
+    }
 }
 
 impl TryFrom<&str> for DataSkippingNumIndexedCols {

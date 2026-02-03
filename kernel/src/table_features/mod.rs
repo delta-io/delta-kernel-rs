@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
@@ -14,6 +15,23 @@ pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
+
+/// Minimum reader version for tables that use table features.
+/// When set to 3, the protocol requires an explicit `readerFeatures` array.
+pub const TABLE_FEATURES_MIN_READER_VERSION: i32 = 3;
+
+/// Minimum writer version for tables that use table features.
+/// When set to 7, the protocol requires an explicit `writerFeatures` array.
+pub const TABLE_FEATURES_MIN_WRITER_VERSION: i32 = 7;
+
+/// Prefix for table feature override properties.
+/// Properties with this prefix (e.g., `delta.feature.deletionVectors`) are used to
+/// explicitly turn on support for the feature in the protocol.
+pub const SET_TABLE_FEATURE_SUPPORTED_PREFIX: &str = "delta.feature.";
+
+/// Value to add support for a table feature when used with [`SET_TABLE_FEATURE_SUPPORTED_PREFIX`].
+/// Example: `"delta.feature.deletionVectors" -> "supported"`
+pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 
 /// Table features represent protocol capabilities required to correctly read or write a given table.
 /// - Readers must implement all features required for correct table reads.
@@ -212,6 +230,12 @@ pub(crate) struct FeatureInfo {
     /// Requirements this feature has (features + custom validations)
     pub feature_requirements: &'static [FeatureRequirement],
     /// Rust kernel's support for this feature (may vary by Operation type)
+    ///
+    /// Note: `kernel_support` validation depends on `feature_type`:
+    /// Writer features: Only checked during `Operation::Write`
+    /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
+    /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
+    /// Writer-only features is never invoked for Scan/CDF regardless of the custom check logic.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
@@ -297,10 +321,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
-            "Feature 'inCommitTimestamp' is not supported for CDF",
-        )),
+        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
     }),
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
@@ -680,6 +701,12 @@ impl TableFeature {
     pub(crate) fn unknown(s: impl ToString) -> Self {
         TableFeature::Unknown(s.to_string())
     }
+}
+
+/// Formats a slice of table features using Delta's standard serialization (camelCase).
+pub(crate) fn format_features(features: &[TableFeature]) -> String {
+    let feature_strings: Vec<&str> = features.iter().map(|f| f.as_ref()).collect_vec();
+    format!("[{}]", feature_strings.join(", "))
 }
 
 #[cfg(test)]
