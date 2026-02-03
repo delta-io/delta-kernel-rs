@@ -92,7 +92,7 @@ impl<'col> StatsColumnFilter<'col> {
 
     // ==================== Public API ====================
 
-    /// Collects column names that should have statistics.
+    /// Collects logical column names that should have statistics.
     ///
     /// Traversal is done in two passes:
     /// 1. Pass 1: Traverse schema to collect columns up to the limit

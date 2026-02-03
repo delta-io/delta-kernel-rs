@@ -97,9 +97,13 @@ use column_filter::StatsColumnFilter;
 ///   tightBounds: boolean,
 /// }
 /// ```
+/// Generates the expected schema for file statistics using logical column names.
+///
+/// To get the physical stats schema (with physical column names for column mapping),
+/// call `make_physical(column_mapping_mode)` on the result.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
-    physical_file_schema: &Schema,
+    logical_data_schema: &Schema,
     table_properties: &TableProperties,
     clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
@@ -111,7 +115,7 @@ pub(crate) fn expected_stats_schema(
     // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
     // - always include clustering columns (per Delta protocol)
     let mut base_transform = BaseStatsTransform::new(table_properties, clustering_columns);
-    if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
+    if let Some(base_schema) = base_transform.transform_struct(logical_data_schema) {
         let base_schema = base_schema.into_owned();
 
         // convert all leaf fields to data type LONG for null count
@@ -139,7 +143,7 @@ pub(crate) fn expected_stats_schema(
     StructType::try_new(fields)
 }
 
-/// Returns the list of column names that should have statistics collected.
+/// Returns the list of logical column names that should have statistics collected.
 ///
 /// This extracts just the column names without building the full stats schema,
 /// making it more efficient when only the column list is needed.
@@ -149,13 +153,13 @@ pub(crate) fn expected_stats_schema(
 /// settings.
 #[allow(unused)]
 pub(crate) fn stats_column_names(
-    physical_file_schema: &Schema,
+    logical_data_schema: &Schema,
     table_properties: &TableProperties,
     clustering_columns: Option<&[ColumnName]>,
 ) -> Vec<ColumnName> {
     let mut filter = StatsColumnFilter::new(table_properties, clustering_columns);
     let mut columns = Vec::new();
-    filter.collect_columns(physical_file_schema, &mut columns);
+    filter.collect_columns(logical_data_schema, &mut columns);
     columns
 }
 
@@ -205,18 +209,20 @@ impl<'a> SchemaTransform<'a> for NullableStatsTransform {
 /// The nullCount struct field tracks the number of null values for each column.
 /// All leaf fields (primitives, arrays, maps, variants) are converted to LONG type
 /// since null counts are always integers, while struct fields are recursed into
-/// to preserve the nested structure.
-#[allow(unused)]
+/// to preserve the nested structure. Field metadata (including column mapping info)
+/// is preserved for all fields.
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         // Only recurse into struct fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
-            _ => Some(Cow::Owned(StructField::nullable(
-                &field.name,
-                DataType::LONG,
-            ))),
+            _ => Some(Cow::Owned(StructField {
+                name: field.name.clone(),
+                data_type: DataType::LONG,
+                nullable: true,
+                metadata: field.metadata.clone(),
+            })),
         }
     }
 }
@@ -226,7 +232,6 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// Base stats schema in this case refers the subsets of fields in the table schema
 /// that may be considered for stats collection. Depending on the type of stats - min/max/nullcount/... -
 /// additional transformations may be applied.
-/// Transforms a schema to filter columns for statistics based on table properties.
 ///
 /// All fields in the output are nullable. Clustering columns are always included per
 /// the Delta protocol.
@@ -277,7 +282,7 @@ impl<'a, 'col> SchemaTransform<'a> for BaseStatsTransform<'col> {
                 name: field.name.clone(),
                 data_type: data_type.into_owned(),
                 nullable: true,
-                metadata: Default::default(),
+                metadata: field.metadata.clone(),
             }),
         };
 
