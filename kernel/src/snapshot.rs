@@ -33,7 +33,7 @@ mod builder;
 pub use builder::SnapshotBuilder;
 
 use delta_kernel::actions::DomainMetadata;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
@@ -99,6 +99,10 @@ impl Snapshot {
 
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        info!(
+            version = table_configuration.version(),
+            "Created snapshot"
+        );
         Self {
             log_segment,
             table_configuration,
@@ -335,10 +339,7 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self {
-            log_segment,
-            table_configuration,
-        })
+        Ok(Self::new(log_segment, table_configuration))
     }
 
     /// Create a new [`Snapshot`] instance.
