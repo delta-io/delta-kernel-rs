@@ -277,7 +277,7 @@ pub(crate) mod tests {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::expressions::{column_expr, Expression as Expr};
+    use crate::expressions::{column_expr, column_name, ColumnName, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::utils::test_utils::assert_result_error_with_message;
 
@@ -297,6 +297,24 @@ pub(crate) mod tests {
         predicate: Option<PredicateRef>,
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
+    ) -> DeltaResult<StateInfo> {
+        get_state_info_with_stats(
+            schema,
+            partition_columns,
+            predicate,
+            metadata_configuration,
+            metadata_cols,
+            None,
+        )
+    }
+
+    pub(crate) fn get_state_info_with_stats(
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        predicate: Option<PredicateRef>,
+        metadata_configuration: HashMap<String, String>,
+        metadata_cols: Vec<(&str, MetadataColumnSpec)>,
+        stats_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<StateInfo> {
         let metadata = Metadata::try_new(
             None,
@@ -324,7 +342,13 @@ pub(crate) mod tests {
             );
         }
 
-        StateInfo::try_new(schema.clone(), &table_configuration, predicate, None, ())
+        StateInfo::try_new(
+            schema.clone(),
+            &table_configuration,
+            predicate,
+            stats_columns,
+            (),
+        )
     }
 
     pub(crate) fn assert_transform_spec(
@@ -698,6 +722,52 @@ pub(crate) mod tests {
         assert_result_error_with_message(
             res,
             "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'"
+        );
+    }
+
+    #[test]
+    fn stats_columns_with_predicate_errors() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+
+        let res = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            HashMap::new(),
+            vec![],
+            Some(vec![]), // empty stats_columns = include all stats
+        );
+
+        assert_result_error_with_message(
+            res,
+            "Cannot use both predicate and stats_columns in the same scan",
+        );
+    }
+
+    #[test]
+    fn non_empty_stats_columns_errors() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let res = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            HashMap::new(),
+            vec![],
+            Some(vec![column_name!("value")]), // non-empty stats_columns not yet supported
+        );
+
+        assert_result_error_with_message(
+            res,
+            "Only empty stats_columns is supported (outputs all stats)",
         );
     }
 }
