@@ -599,7 +599,7 @@ impl Scan {
                 actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
-                    checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+                    checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
             return Ok(Box::new(
