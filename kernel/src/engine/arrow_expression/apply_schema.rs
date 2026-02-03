@@ -15,15 +15,18 @@ use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
 
-// Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
-// the names of fields, nullable, and metadata in the struct have been transformed to match those
-// in the schema specified by `schema`.
-//
-// Note: If the struct array has top-level nulls, the child columns are expected to already have
-// those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
-// through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
-// buffer since RecordBatch cannot have top-level nulls.
-pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
+/// Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
+/// the names of fields, nullable, and metadata in the struct have been transformed to match those
+/// in the schema specified by `schema`.
+///
+/// This function uses ordinal matching - the order of fields in the schema must match the order of
+/// columns in the array. This is useful for renaming columns from physical names to logical names.
+///
+/// Note: If the struct array has top-level nulls, the child columns are expected to already have
+/// those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
+/// through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
+/// buffer since RecordBatch cannot have top-level nulls.
+pub fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(Error::generic(
             "apply_schema at top-level must be passed a struct schema",
@@ -167,9 +170,12 @@ fn apply_schema_to_map(array: &dyn Array, kernel_map_type: &MapType) -> DeltaRes
     )?)
 }
 
-// apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
-// actual data types don't match, this will return an error
-pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
+/// Apply a kernel schema to an Arrow array. This handles renaming fields using ordinal matching,
+/// and adjusting nullability and metadata. If the actual data types don't match, this will return
+/// an error.
+///
+/// This is useful for converting data with physical column names to logical column names.
+pub fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),

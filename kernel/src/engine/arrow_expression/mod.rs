@@ -20,7 +20,7 @@ use tracing::debug;
 use apply_schema::{apply_schema, apply_schema_to};
 use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
 
-mod apply_schema;
+pub mod apply_schema;
 pub mod evaluate_expression;
 pub mod opaque;
 
