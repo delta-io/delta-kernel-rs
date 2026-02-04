@@ -6,17 +6,17 @@
 // we re-allow panics in tests
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+#[cfg(feature = "default-engine-base")]
+use {
+    delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    std::collections::HashMap,
+};
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
-#[cfg(feature = "default-engine-base")]
-use {
-    delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
-    std::collections::HashMap,
-};
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
