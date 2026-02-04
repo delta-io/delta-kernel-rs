@@ -91,18 +91,58 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     // Build the expected RecordBatch
     // Note: The schema is a struct with a single field "checkpointMetadata" of type struct
-    // containing a single field "version" of type long
+    // containing "version" (long) and "tags" (nullable Map<String, String>)
+    use crate::arrow::array::{MapBuilder, MapFieldNames, StringBuilder};
+    use crate::arrow::datatypes::Fields;
+
+    let key_value_field = Field::new(
+        "key_value",
+        DataType::Struct(Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ])),
+        false,
+    );
+    let tags_field = Field::new(
+        "tags",
+        DataType::Map(Arc::new(key_value_field), false),
+        true,
+    );
+
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
         "checkpointMetadata",
-        DataType::Struct(vec![Field::new("version", DataType::Int64, false)].into()),
+        DataType::Struct(
+            vec![
+                Field::new("version", DataType::Int64, false),
+                tags_field.clone(),
+            ]
+            .into(),
+        ),
         true,
     )]));
+
+    // Create a null map array for tags with correct field names and non-nullable values
+    let names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut map_builder = MapBuilder::new(Some(names), StringBuilder::new(), StringBuilder::new())
+        .with_values_field(Field::new("value", DataType::Utf8, false));
+    map_builder.append(false).unwrap(); // append null
+
     let expected = RecordBatch::try_new(
         expected_schema,
-        vec![Arc::new(StructArray::from(vec![(
-            Arc::new(Field::new("version", DataType::Int64, false)),
-            create_array!(Int64, [0]) as ArrayRef,
-        )]))],
+        vec![Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("version", DataType::Int64, false)),
+                create_array!(Int64, [0]) as ArrayRef,
+            ),
+            (
+                Arc::new(tags_field),
+                Arc::new(map_builder.finish()) as ArrayRef,
+            ),
+        ]))],
     )
     .unwrap();
 
