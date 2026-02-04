@@ -29,7 +29,6 @@ use delta_kernel_derive::ToSchema;
 /// 1. Be named `{version}.crc` with version zero-padded to 20 digits: `00000000000000000001.crc`
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
 /// 3. Contain exactly one JSON object with the schema of this struct.
-#[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub(crate) struct Crc {
     // ===== Required fields =====
@@ -116,13 +115,11 @@ pub(crate) struct DeletedRecordCountsHistogram {
 ///
 /// This visitor extracts Protocol, Metadata, and additional fields needed for CRC optimizations
 /// (in-commit timestamp, table statistics). The visitor builds a [`Crc`] directly during visitation.
-#[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug, Default)]
 pub(crate) struct CrcVisitor {
     pub(crate) crc: Option<Crc>,
 }
 
-#[allow(unused)] // TODO: remove after we complete CRC support
 impl CrcVisitor {
     pub(crate) fn into_crc(self) -> DeltaResult<Crc> {
         self.crc

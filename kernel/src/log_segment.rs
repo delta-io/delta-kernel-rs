@@ -1,9 +1,11 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::borrow::Cow;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
-
 use std::time::Instant;
+
+use crate::crc::{CrcLoadResult, LazyCrc};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
@@ -31,7 +33,7 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
 use itertools::Itertools;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -88,7 +90,7 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file
+    /// Latest CRC (checksum) file, only if version >= checkpoint version.
     pub latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
@@ -822,15 +824,64 @@ impl LogSegment {
             .try_collect()
     }
 
-    // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    // the LogSegment
+    /// Find the latest Protocol and Metadata in the LogSegment.
+    ///
+    /// Uses CRC files when available to optimize log replay:
+    /// 1. If CRC exists at target version, return P&M directly from CRC
+    /// 2. If CRC exists at earlier version (but newer than checkpoint), create a pruned log
+    ///    segment containing only commits after CRC version
+    /// 3. Replay the (possibly pruned) segment for P&M
+    /// 4. If P&M not found in replay, fallback to CRC
+    ///
+    /// The `lazy_crc` parameter allows the CRC to be loaded at most once and shared for
+    /// future use (domain metadata, ICT, statistics, etc.).
     pub(crate) fn protocol_and_metadata(
         &self,
         engine: &dyn Engine,
+        lazy_crc: &LazyCrc,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let actions_batches = self.replay_for_metadata(engine)?;
+        let crc_version = lazy_crc.crc_version();
+
+        // Step 1: If CRC at target version, use it directly and exit early
+        if crc_version == Some(self.end_version) {
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                info!("P&M from CRC at target version {}", self.end_version);
+                return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
+            }
+            info!(
+                "CRC at target version {} failed to load, falling back to log replay",
+                self.end_version
+            );
+        }
+
+        // Step 2: We didn't return above, so now we need to potentially prune the log segment (and
+        //         will do log replay on it in Step 3).
+        //
+        // Case 2.a: CRC exists at an earlier version => Prune the log segment to only include
+        //           commits/compactions *after* the CRC version. If we don't find a new P & M, we
+        //           will fall back to the CRC.
+        //           TODO: This CRC read could fail, too! Technically we should continue to normal
+        //           log replay if it does. Handle this later.
+        // Case 2.b: CRC at target version failed to load => Full P & M log replay.
+        // Case 2.c: No CRC exists at all => Same as 2.b
+        let pm_log_segment: Cow<'_, Self> = match crc_version {
+            Some(crc_v) if crc_v < self.end_version => {
+                // Case 2.a: CRC at earlier version - prune segment
+                info!("Pruning log segment to commits after CRC version {}", crc_v);
+                let mut pruned = self.clone();
+                pruned.checkpoint_version = None;
+                pruned.checkpoint_parts.clear();
+                pruned.ascending_commit_files.retain(|c| c.version > crc_v);
+                // TODO: Think through compaction semantics here - which ones to keep?
+                pruned.ascending_compaction_files.clear();
+                Cow::Owned(pruned)
+            }
+            _ => Cow::Borrowed(self), // Case 2.b or 2.c: Full replay
+        };
+
+        // Step 3: Replay log segment (which may or may not be prunted) for P&M
         let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for actions_batch in actions_batches {
+        for actions_batch in pm_log_segment.replay_for_metadata(engine)? {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
@@ -839,16 +890,42 @@ impl LogSegment {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
             if metadata_opt.is_some() && protocol_opt.is_some() {
-                // we've found both, we can stop
-                break;
+                info!("P&M from log replay");
+                return Ok((metadata_opt, protocol_opt));
             }
         }
+
+        // Step 4: Fallback to CRC for missing P&M (only relevant for case 2.a)
+        if crc_version.is_some_and(|v| v < self.end_version) {
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                info!("P&M fallback to CRC (no P&M changes after CRC version)");
+                return Ok((
+                    metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                    protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                ));
+            }
+        }
+
+        // At least one of metadata_opt/protocol_opt is None (otherwise we'd have returned
+        // earlier), and CRC either doesn't exist or failed to load.
+        info!(
+            "P&M incomplete: metadata={}, protocol={}",
+            metadata_opt.is_some(),
+            protocol_opt.is_some()
+        );
         Ok((metadata_opt, protocol_opt))
     }
 
-    // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
-        match self.protocol_and_metadata(engine)? {
+    /// Get the most up-to-date Protocol and Metadata actions.
+    ///
+    /// The `lazy_crc` parameter allows the CRC to be loaded at most once and shared for
+    /// future use (domain metadata, ICT, statistics, etc.).
+    pub(crate) fn read_metadata(
+        &self,
+        engine: &dyn Engine,
+        lazy_crc: &LazyCrc,
+    ) -> DeltaResult<(Metadata, Protocol)> {
+        match self.protocol_and_metadata(engine, lazy_crc)? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),

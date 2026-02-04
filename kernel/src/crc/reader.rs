@@ -11,7 +11,6 @@ use crate::{DeltaResult, Engine, Error, RowVisitor as _};
 ///
 /// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON, missing
 /// required fields). The caller should handle errors gracefully by falling back to log replay.
-#[allow(unused)] // TODO: remove after we complete CRC support
 pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
     let json_handler = engine.json_handler();
     let file_meta = crc_path.location.clone();
