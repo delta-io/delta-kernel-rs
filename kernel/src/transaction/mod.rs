@@ -1242,7 +1242,7 @@ impl Transaction {
     /// # {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?;
+    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
