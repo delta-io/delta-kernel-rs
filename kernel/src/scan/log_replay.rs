@@ -154,7 +154,8 @@ impl ScanLogReplayProcessor {
             checkpoint_read_schema,
         } = checkpoint_info;
 
-        let output_schema = scan_row_schema_with_stats(state_info.physical_stats_schema.clone());
+        let output_schema =
+            scan_row_schema_with_stats_parsed(state_info.physical_stats_schema.clone());
 
         // Extract the physical predicate for data skipping and partition filtering.
         // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
@@ -504,7 +505,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 /// Build the scan row schema with optional stats_parsed column.
 ///
 /// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
-fn scan_row_schema_with_stats(stats_schema: Option<SchemaRef>) -> SchemaRef {
+fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
     match stats_schema {
         Some(schema) => {
             let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();

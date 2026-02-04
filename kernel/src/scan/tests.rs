@@ -650,7 +650,9 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that `with_stats_columns` cannot be used with `with_predicate` in MVP.
+/// Test that `with_stats_columns` cannot be used with `with_predicate`.
+/// See [#1751] for tracking.
+/// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
 #[test]
 fn test_scan_metadata_stats_columns_with_predicate_errors() {
     // Use the parsed-stats table
@@ -662,7 +664,6 @@ fn test_scan_metadata_stats_columns_with_predicate_errors() {
 
     // Build scan with both predicate (that references a column) and stats_columns should error
     // Note: Pred::literal(true) has no column references, so it becomes PhysicalPredicate::None
-    // We need a predicate with actual column references to trigger the MVP validation
     let predicate = Arc::new(column_pred!("id")); // References 'id' column
     let result = snapshot
         .scan_builder()
