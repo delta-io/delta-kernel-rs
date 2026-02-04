@@ -20,7 +20,7 @@ use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Sca
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, LogSegment};
+use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
@@ -512,8 +512,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        let result = self.replay_for_scan_metadata(engine)?;
-        self.scan_metadata_inner(engine, result.actions)
+        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -588,14 +588,24 @@ impl Scan {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
 
+        let log_segment = self.snapshot.log_segment();
+
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Since we're only processing existing data (no checkpoint), we use the base schema
+        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+                actions: existing_data.into_iter().map(apply_transform),
+                checkpoint_info: CheckpointReadInfo {
+                    has_stats_parsed: false,
+                    checkpoint_read_schema: restored_add_schema().clone(),
+                },
+            };
+            return Ok(Box::new(
+                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+            ));
         }
-
-        let log_segment = self.snapshot.log_segment();
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -622,29 +632,47 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
+        // For incremental reads, new_log_segment has no checkpoint but we use the
+        // checkpoint schema returned by the function for consistency.
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
             None,
-            None,
+            self.state_info
+                .physical_stats_schema
+                .as_ref()
+                .map(|s| s.as_ref()),
         )?;
-        let it = result
-            .actions
-            .chain(existing_data.into_iter().map(apply_transform));
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .chain(existing_data.into_iter().map(apply_transform)),
+            checkpoint_info: result.checkpoint_info,
+        };
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            actions_with_checkpoint_info,
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
+            impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            actions_with_checkpoint_info.actions,
+            self.state_info.clone(),
+            actions_with_checkpoint_info.checkpoint_info,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -734,7 +762,15 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone())?;
+        // For the sequential/parallel phase approach, we use a conservative checkpoint_info
+        // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
+        // currently support stats_parsed optimization.
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+        };
+        let processor =
+            ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone(), checkpoint_info)?;
         SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
     }
 

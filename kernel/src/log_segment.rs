@@ -40,7 +40,7 @@ mod tests;
 /// Information about checkpoint reading for data skipping optimization.
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CheckpointReadInfo {
     /// Whether the checkpoint has compatible pre-parsed stats for data skipping.
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
