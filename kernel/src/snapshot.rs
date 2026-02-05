@@ -99,10 +99,7 @@ impl Snapshot {
 
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
-        info!(
-            version = table_configuration.version(),
-            "Created snapshot"
-        );
+        info!(version = table_configuration.version(), "Created snapshot");
         Self {
             log_segment,
             table_configuration,

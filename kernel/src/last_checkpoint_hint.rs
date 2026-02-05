@@ -8,7 +8,7 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
@@ -65,7 +65,7 @@ impl LastCheckpointHint {
                 let result: Option<LastCheckpointHint> = serde_json::from_slice(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
                     .ok();
-                debug!(hint = result.as_ref().map(|h| h.summary()));
+                info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
             Some(Err(Error::FileNotFound(_))) => {
