@@ -316,6 +316,13 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     txn_expiration_timestamp: Option<i64>,
 }
 
+/// A projected column used by `ActionReconciliationVisitor`.
+///
+/// `index` is the position in the `getters: &[&dyn GetData]` slice.
+/// `name` is the fully-qualified field path used when calling `get_*` (and appears in errors).
+///
+/// Invariant: these constants must match the order in
+/// `ActionReconciliationVisitor::selected_column_names_and_types()`.
 #[derive(Debug, Copy, Clone)]
 struct GetterColumn {
     index: usize,
@@ -330,6 +337,8 @@ impl GetterColumn {
 
 #[allow(unused)]
 impl ActionReconciliationVisitor<'_> {
+    // Projected columns in the same order as `selected_column_names_and_types()`.
+    // DV columns are defined individually for completeness, even when accessed via a start index.
     const ADD_PATH: GetterColumn = GetterColumn::new(0, "add.path");
     const ADD_DV_STORAGE_TYPE: GetterColumn =
         GetterColumn::new(1, "add.deletionVector.storageType");
