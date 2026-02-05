@@ -3,9 +3,8 @@ use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
+use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
-
-use url::Url;
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -13,12 +12,11 @@ use url::Url;
 ///
 /// ```no_run
 /// # use delta_kernel::{Snapshot, Engine};
-/// # use url::Url;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
-/// let table_root = Url::parse("file:///path/to/table")?;
+/// let table_root = "file:///path/to/table";
 ///
 /// // Build a snapshot
-/// let snapshot = Snapshot::builder_for(table_root.clone())
+/// let snapshot = Snapshot::builder_for(table_root)
 ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
 ///     .build(engine)?;
 ///
@@ -31,16 +29,16 @@ use url::Url;
 // types/add type state.
 #[derive(Debug)]
 pub struct SnapshotBuilder {
-    table_root: Option<Url>,
+    table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new_for(table_root: Url) -> Self {
+    pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
-            table_root: Some(table_root),
+            table_root: Some(table_root.as_ref().to_string()),
             existing_snapshot: None,
             version: None,
             log_tail: Vec::new(),
@@ -87,7 +85,8 @@ impl SnapshotBuilder {
         let operation_id = MetricId::new();
         let reporter = engine.get_metrics_reporter();
 
-        if let Some(table_root) = self.table_root {
+        if let Some(table_root_uri) = self.table_root {
+            let table_root = try_parse_uri(table_root_uri)?;
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
@@ -140,15 +139,15 @@ mod tests {
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
         Arc<dyn ObjectStore>,
-        Url,
+        &'static str,
     ) {
-        let table_root = Url::parse("memory:///test_table").unwrap();
+        let table_root = "memory:///test_table";
         let store = Arc::new(InMemory::new());
         let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
         (engine, store, table_root)
     }
 
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &Url) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &str) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -218,12 +217,12 @@ mod tests {
     async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();
-        create_table(&store, &table_root).await?;
+        create_table(&store, table_root).await?;
 
-        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::new_for(table_root).build(engine)?;
         assert_eq!(snapshot.version(), 1);
 
-        let snapshot = SnapshotBuilder::new_for(table_root.clone())
+        let snapshot = SnapshotBuilder::new_for(table_root)
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);

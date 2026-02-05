@@ -84,7 +84,7 @@ mod tests {
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
-        let table_root = Url::parse("memory:///").unwrap();
+        let table_root = "memory:///";
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
         let actions = [
