@@ -171,7 +171,22 @@ impl ScanBuilder {
     ///
     /// [`with_predicate`]: ScanBuilder::with_predicate
     pub fn include_stats_columns(mut self) -> Self {
-        self.stats_columns = Some(Vec::new());
+        if self.stats_columns.is_none() {
+            self.stats_columns = Some(Vec::new());
+        }
+        self
+    }
+
+    /// Include specific columns in the scan metadata.
+    ///
+    /// This method is used to include specific columns in the scan metadata.
+    /// Takes priority over `include_stats_columns`.
+    /// If `columns` is empty, all stats columns are included.
+    ///
+    /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
+    /// [`build`]: ScanBuilder::build
+    pub fn with_stats_columns(mut self, columns: Vec<ColumnName>) -> Self {
+        self.stats_columns = Some(columns);
         self
     }
 

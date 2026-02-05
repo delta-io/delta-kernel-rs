@@ -227,18 +227,20 @@ impl StateInfo {
                 // reads stats_parsed from the transformed batch, which uses this schema.
                 (Some(columns), _) if columns.is_empty() => {
                     let expected_stats_schemas =
-                        table_configuration.build_expected_stats_schemas(None)?;
+                        table_configuration.build_expected_stats_schemas(None, None)?;
                     (
                         Some(expected_stats_schemas.physical),
                         Some(expected_stats_schemas.logical),
                     )
                 }
-                // Non-empty stats_columns list not supported yet
-                (Some(_), _) => {
-                    return Err(Error::generic(
-                        "Only empty stats_columns is supported (outputs all stats). \
-                         Specifying specific columns is not yet implemented.",
-                    ));
+                // Non-empty stats_columns list - build the stats schemas for the requested columns
+                (Some(requested_columns), _) => {
+                    let expected_stats_schemas = table_configuration
+                        .build_expected_stats_schemas(None, Some(requested_columns))?;
+                    (
+                        Some(expected_stats_schemas.physical),
+                        Some(expected_stats_schemas.logical),
+                    )
                 }
                 // No stats_columns, but has predicate - use predicate columns for data skipping
                 // (no logical stats schema needed for internal data skipping)
@@ -758,24 +760,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn non_empty_stats_columns_errors() {
+    fn non_empty_stats_columns_filters_schema() {
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let res = get_state_info_with_stats(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             None,
             HashMap::new(),
             vec![],
-            Some(vec![column_name!("value")]), // non-empty stats_columns not yet supported
-        );
+            Some(vec![column_name!("value")]), // request only 'value' column stats
+        )
+        .unwrap();
 
-        assert_result_error_with_message(
-            res,
-            "Only empty stats_columns is supported (outputs all stats)",
-        );
+        // Should have logical stats schema with only 'value' column
+        let logical_stats = state_info
+            .logical_stats_schema
+            .expect("should have logical stats schema");
+
+        // Check that minValues/maxValues only contain 'value', not 'id'
+        let min_values = logical_stats
+            .field("minValues")
+            .expect("should have minValues");
+        if let DataType::Struct(inner) = min_values.data_type() {
+            assert!(
+                inner.field("value").is_some(),
+                "minValues should have 'value'"
+            );
+            assert!(
+                inner.field("id").is_none(),
+                "minValues should not have 'id'"
+            );
+        } else {
+            panic!("minValues should be a struct");
+        }
     }
 }

@@ -958,7 +958,7 @@ impl Transaction {
         let stats_schemas = self
             .read_snapshot
             .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns.as_deref())?;
+            .build_expected_stats_schemas(self.clustering_columns.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 

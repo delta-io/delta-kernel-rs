@@ -15,6 +15,7 @@ use crate::{
 /// * `dataSkippingStatsColumns` - explicit list of columns to include (takes precedence)
 /// * `dataSkippingNumIndexedCols` - number of leaf columns to include (default 32)
 /// * Clustering columns - always included per Delta protocol requirements
+/// * `requested_columns` - optional additional filter for user-requested columns (read path)
 ///
 /// Per the Delta protocol, writers MUST write per-file statistics for clustering columns,
 /// regardless of table property settings.
@@ -30,25 +31,38 @@ pub(crate) struct StatsColumnFilter<'col> {
     /// `delta.dataSkippingNumIndexedCols` count-based approach.
     data_skipping_stats_trie: Option<ColumnTrie<'col>>,
     /// Trie built from clustering columns for O(path_length) lookup during traversal.
-    /// Used by `should_include_current()` to allow clustering columns past the limit.
+    /// Used by `should_include_for_table()` to allow clustering columns past the limit.
     clustering_trie: Option<ColumnTrie<'col>>,
     /// Clustering columns to add after the main traversal in `collect_columns()`.
     /// Only set when using `delta.dataSkippingNumIndexedCols` (when using
     /// `delta.dataSkippingStatsColumns`, clustering columns are merged into `data_skipping_stats_trie`).
     clustering_columns: Option<&'col [ColumnName]>,
+    /// Trie built from user-requested columns. When set, only columns matching this trie
+    /// are included (in addition to table property filtering). Used for read path filtering.
+    requested_trie: Option<ColumnTrie<'col>>,
     /// Current path during schema traversal. Pushed on field entry, popped on exit.
     path: Vec<String>,
 }
 
 impl<'col> StatsColumnFilter<'col> {
-    /// Creates a new StatsColumnFilter with optional clustering columns.
+    /// Creates a new StatsColumnFilter with optional clustering and requested columns.
     ///
-    /// Clustering columns are always included in statistics, even when `dataSkippingStatsColumns`
-    /// or `dataSkippingNumIndexedCols` would otherwise exclude them.
+    /// - `data_skipping_stats_columns`: Columns from `delta.dataSkippingStatsColumns` table
+    ///   property. Must be physical column names (post column mapping conversion).
+    /// - `num_indexed_cols`: Value from `delta.dataSkippingNumIndexedCols` table property.
+    /// - `clustering_columns`: Always included in statistics, even when other settings would
+    ///   exclude them. Used for write path.
+    /// - `requested_columns`: Additional filter for read path - only these columns are included
+    ///   in the output (if they also pass table property filtering).
     pub(crate) fn new(
         props: &'col TableProperties,
         clustering_columns: Option<&'col [ColumnName]>,
+        requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
+        let requested_trie = requested_columns
+            .filter(|cols| !cols.is_empty())
+            .map(ColumnTrie::from_columns);
+
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
         if let Some(column_names) = &props.data_skipping_stats_columns {
@@ -74,6 +88,7 @@ impl<'col> StatsColumnFilter<'col> {
                 data_skipping_stats_trie: Some(combined_trie),
                 clustering_trie: None,    // Already in data_skipping_stats_trie
                 clustering_columns: None, // Already added to trie
+                requested_trie,
                 path: Vec::new(),
             }
         } else {
@@ -85,6 +100,7 @@ impl<'col> StatsColumnFilter<'col> {
                 data_skipping_stats_trie: None,
                 clustering_trie,
                 clustering_columns, // Will be handled in Pass 2 of collect_columns()
+                requested_trie,
                 path: Vec::new(),
             }
         }
@@ -134,10 +150,12 @@ impl<'col> StatsColumnFilter<'col> {
         )
     }
 
-    /// Returns true if the current path should be included based on filtering config.
+    /// Returns true if the current path should be included based on table property filter.
+    ///
+    /// This checks the `dataSkippingStatsColumns` table property (if set) and clustering columns.
     /// Clustering columns are always included, even past the column limit.
-    pub(crate) fn should_include_current(&self) -> bool {
-        // When using dataSkippingStatsColumns, check the trie
+    pub(crate) fn should_include_for_table(&self) -> bool {
+        // When using dataSkippingStatsColumns, check the trie (which includes clustering)
         if let Some(trie) = &self.data_skipping_stats_trie {
             return trie.contains_prefix_of(&self.path);
         }
@@ -155,6 +173,16 @@ impl<'col> StatsColumnFilter<'col> {
         self.clustering_trie
             .as_ref()
             .is_some_and(|trie| trie.contains_prefix_of(&self.path))
+    }
+
+    /// Returns true if the current path should be included based on requested columns filter.
+    ///
+    /// This checks the user-specified `requested_columns` (if set).
+    pub(crate) fn should_include_for_requested(&self) -> bool {
+        self.requested_trie
+            .as_ref()
+            .map(|trie| trie.contains_prefix_of(&self.path))
+            .unwrap_or(true)
     }
 
     /// Enters a field path for filtering decisions.
@@ -193,7 +221,7 @@ impl<'col> StatsColumnFilter<'col> {
             // Map, Array, and Variant types are not eligible for statistics collection.
             DataType::Map(_) | DataType::Array(_) | DataType::Variant(_) => {}
             _ => {
-                if self.should_include_current() {
+                if self.should_include_for_table() {
                     result.push(ColumnName::new(&self.path));
                     self.added_columns += 1;
                 }
@@ -267,7 +295,7 @@ mod tests {
         clustering_cols: Option<&[ColumnName]>,
         schema: &Schema,
     ) -> Vec<ColumnName> {
-        let mut filter = StatsColumnFilter::new(props, clustering_cols);
+        let mut filter = StatsColumnFilter::new(props, clustering_cols, None);
         let mut columns = Vec::new();
         filter.collect_columns(schema, &mut columns);
         columns
