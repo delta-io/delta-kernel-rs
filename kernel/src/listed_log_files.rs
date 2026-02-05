@@ -21,7 +21,7 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::log::*;
+use tracing::{debug, info, instrument};
 use url::Url;
 
 /// Represents the set of log files found during a listing operation in the Delta log directory.
@@ -344,6 +344,7 @@ impl ListedLogFiles {
     // TODO: encode some of these guarantees in the output types. e.g. we could have:
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same version)
+    #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,

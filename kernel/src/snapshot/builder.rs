@@ -6,6 +6,8 @@ use crate::snapshot::SnapshotRef;
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
+use tracing::{info, instrument};
+
 /// Builder for creating [`Snapshot`] instances.
 ///
 /// # Example
@@ -79,9 +81,21 @@ impl SnapshotBuilder {
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
+    #[instrument(
+        name = "snap.build",
+        skip_all,
+        fields(table_path = %self.table_path()),
+        err
+    )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
-        let log_tail = self.log_tail.into_iter().map(Into::into).collect();
+        info!(
+            target = self.target_version_str(),
+            from_version = ?self.existing_snapshot.as_ref().map(|s| s.version()),
+            log_tail_len = self.log_tail.len(),
+            "building snapshot"
+        );
 
+        let log_tail = self.log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
         let reporter = engine.get_metrics_reporter();
 
@@ -118,6 +132,26 @@ impl SnapshotBuilder {
                 Some(operation_id),
             )
         }
+    }
+
+    // ===== Instrumentation Helpers =====
+
+    fn table_path(&self) -> &str {
+        self.table_root
+            .as_ref()
+            .map(|u| u.as_str())
+            .or_else(|| {
+                self.existing_snapshot
+                    .as_ref()
+                    .map(|s| s.table_root().as_str())
+            })
+            .unwrap_or("unknown")
+    }
+
+    fn target_version_str(&self) -> String {
+        self.version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "LATEST".into())
     }
 }
 
@@ -213,7 +247,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();
