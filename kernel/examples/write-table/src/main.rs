@@ -87,7 +87,7 @@ async fn try_main() -> DeltaResult<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer)?
+        .transaction(committer, &engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);

@@ -11,6 +11,7 @@ use crate::arrow::{
     datatypes::Field,
 };
 use crate::checkpoint::create_last_checkpoint_data;
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
@@ -19,8 +20,10 @@ use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
+use object_store::local::LocalFileSystem;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
+use tempfile::tempdir;
 use test_utils::delta_path_for_version;
 use url::Url;
 
@@ -651,3 +654,84 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
+    // ===== Setup =====
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // ===== Create Table =====
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["domainMetadata"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    // ===== Create Engine =====
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let result = txn
+            .with_domain_metadata(domain.to_string(), value.to_string())
+            .commit(&engine)?;
+        assert!(result.is_committed());
+        Ok(())
+    };
+
+    // ===== Commit Domain Metadata =====
+    commit_domain_metadata("foo", "bar1")?;
+    commit_domain_metadata("foo", "bar2")?;
+
+    // ===== Case 1: Verify domain metadata is preserved *before* checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), 2);
+    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    assert_eq!(domain_value, Some("bar2".to_string()));
+
+    // Trigger checkpoint
+    snapshot.checkpoint(&engine)?;
+
+    // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(&engine)?;
+    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    assert_eq!(domain_value, Some("bar2".to_string()));
+
+    Ok(())
+}
+
+// TODO: Add test that checkpoint does not contain tombstoned domain metadata.

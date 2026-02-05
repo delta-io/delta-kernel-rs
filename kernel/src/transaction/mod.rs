@@ -3,6 +3,7 @@ use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
+use tracing::{info, instrument};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -244,6 +245,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 /// txn.commit(&engine)?;
 /// ```
 pub struct Transaction {
+    span: tracing::Span,
     // The snapshot this transaction is based on. For create-table transactions,
     // this is a pre-commit snapshot with PRE_COMMIT_VERSION.
     read_snapshot: SnapshotRef,
@@ -271,6 +273,9 @@ pub struct Transaction {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
+    // enabled. Used for determining which columns require statistics collection.
+    clustering_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -298,6 +303,7 @@ impl Transaction {
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
+        engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
@@ -306,9 +312,19 @@ impl Transaction {
             .table_configuration()
             .ensure_operation_supported(Operation::Write)?;
 
+        // Read clustering columns from snapshot (returns None if clustering not enabled)
+        let clustering_columns = read_snapshot.get_clustering_columns(engine)?;
+
         let commit_timestamp = current_time_ms()?;
 
+        let span = tracing::info_span!(
+            "txn",
+            path = %read_snapshot.table_root(),
+            read_version = read_snapshot.version(),
+        );
+
         Ok(Transaction {
+            span,
             read_snapshot,
             committer,
             operation: None,
@@ -321,6 +337,7 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            clustering_columns,
         })
     }
 
@@ -343,7 +360,14 @@ impl Transaction {
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
         // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
         // the was read vs the effective snapshot we will use for the commit.
+        let span = tracing::info_span!(
+            "txn",
+            path = %pre_commit_snapshot.table_root(),
+            operation = "CREATE",
+        );
+
         Ok(Transaction {
+            span,
             read_snapshot: pre_commit_snapshot,
             committer,
             operation: Some("CREATE TABLE".to_string()),
@@ -356,6 +380,10 @@ impl Transaction {
             domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
+            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
+            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
+            // return the correct columns for the new table.
+            clustering_columns: None,
         })
     }
 
@@ -378,7 +406,21 @@ impl Transaction {
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    #[instrument(
+        parent = &self.span,
+        name = "txn.commit",
+        skip_all,
+        fields(
+            commit_version = self.get_commit_version(),
+        ),
+        err
+    )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+        info!(
+            num_add_files = self.add_files_metadata.len(),
+            num_remove_files = self.remove_files_metadata.len(),
+            num_dv_updates = self.dv_matched_files.len(),
+        );
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -751,6 +793,12 @@ impl Transaction {
     /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[instrument(
+        name = "txn.update_dvs",
+        skip_all,
+        fields(num_dv_updates = new_dv_descriptors.len()),
+        err
+    )]
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
@@ -938,11 +986,16 @@ impl Transaction {
     /// ```
     ///
     /// Engines should collect statistics matching this schema structure when writing files.
+    ///
+    /// Per the Delta protocol, clustering columns are always included in statistics,
+    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        self.read_snapshot
+        let stats_schemas = self
+            .read_snapshot
             .table_configuration()
-            .expected_stats_schema()
+            .build_expected_stats_schemas(self.clustering_columns.as_deref())?;
+        Ok(stats_schemas.physical)
     }
 
     /// Returns the list of column names that should have statistics collected.
@@ -953,11 +1006,14 @@ impl Transaction {
     /// for details on string formatting and escaping.
     ///
     /// Engines can use this to determine which columns need stats during writes.
+    ///
+    /// Per the Delta protocol, clustering columns are always included in statistics,
+    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
     #[allow(unused)]
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names()
+            .stats_column_names(self.clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -1033,6 +1089,7 @@ impl Transaction {
     }
 
     /// Generate add actions, handling row tracking internally if needed
+    #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
         engine: &dyn Engine,
@@ -1222,7 +1279,7 @@ impl Transaction {
     /// # {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?;
+    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -1266,6 +1323,7 @@ impl Transaction {
     ///
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
+    #[instrument(name = "txn.gen_removes", skip_all, err)]
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,
@@ -1745,9 +1803,12 @@ mod tests {
         }
     }
 
-    fn create_dv_transaction(snapshot: Arc<Snapshot>) -> DeltaResult<Transaction> {
+    fn create_dv_transaction(
+        snapshot: Arc<Snapshot>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Transaction> {
         Ok(snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), engine)?
             .with_operation("DELETE".to_string())
             .with_engine_info("test_engine"))
     }
@@ -1764,7 +1825,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
@@ -1799,7 +1860,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
         let write_context = txn.get_write_context();
 
@@ -1830,7 +1891,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         let write_context = txn.get_write_context();
@@ -1896,7 +1957,8 @@ mod tests {
         );
 
         // Create a transaction and get write context
-        let txn_without = snapshot_without.transaction(Box::new(FileSystemCommitter::new()))?;
+        let txn_without =
+            snapshot_without.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_context_without = txn_without.get_write_context();
         let expr_without = write_context_without.logical_to_physical();
 
@@ -1946,7 +2008,7 @@ mod tests {
         );
 
         // Create a transaction and get write context
-        let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()))?;
+        let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let write_context_with = txn_with.get_write_context();
         let expr_with = write_context_with.logical_to_physical();
 
@@ -1973,8 +2035,8 @@ mod tests {
     /// Validates that attempting DV updates on unsupported tables returns protocol error.
     #[test]
     fn test_update_deletion_vectors_unsupported_table() -> Result<(), Box<dyn std::error::Error>> {
-        let (_engine, snapshot) = setup_non_dv_table();
-        let mut txn = create_dv_transaction(snapshot)?;
+        let (engine, snapshot) = setup_non_dv_table();
+        let mut txn = create_dv_transaction(snapshot, &engine)?;
 
         let dv_map = HashMap::new();
         let result = txn.update_deletion_vectors(dv_map, std::iter::empty());
@@ -1994,8 +2056,8 @@ mod tests {
     /// Validates detection of mismatch between provided DV descriptors and actual files.
     #[test]
     fn test_update_deletion_vectors_mismatch_count() -> Result<(), Box<dyn std::error::Error>> {
-        let (_engine, snapshot) = setup_dv_enabled_table();
-        let mut txn = create_dv_transaction(snapshot)?;
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot, &engine)?;
 
         let mut dv_map = HashMap::new();
         let descriptor = create_test_dv_descriptor("non_existent");
@@ -2019,8 +2081,8 @@ mod tests {
     /// This edge case occurs when a DELETE operation matches no rows.
     #[test]
     fn test_update_deletion_vectors_empty_inputs() -> Result<(), Box<dyn std::error::Error>> {
-        let (_engine, snapshot) = setup_dv_enabled_table();
-        let mut txn = create_dv_transaction(snapshot)?;
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot, &engine)?;
 
         let dv_map = HashMap::new();
         let result = txn.update_deletion_vectors(dv_map, std::iter::empty());

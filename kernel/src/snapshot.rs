@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tracing::instrument;
+
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::{
     all_domain_metadata_configuration, domain_metadata_configuration,
@@ -11,7 +13,9 @@ use crate::actions::domain_metadata::{
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
+use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
+use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
@@ -19,6 +23,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::require;
@@ -30,7 +35,7 @@ mod builder;
 pub use builder::SnapshotBuilder;
 
 use delta_kernel::actions::DomainMetadata;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
@@ -40,11 +45,20 @@ pub type SnapshotRef = Arc<Snapshot>;
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
-#[derive(PartialEq, Eq)]
 pub struct Snapshot {
+    span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
 }
+
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.log_segment == other.log_segment
+            && self.table_configuration == other.table_configuration
+    }
+}
+
+impl Eq for Snapshot {}
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -96,7 +110,15 @@ impl Snapshot {
 
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        let span = tracing::info_span!(
+            parent: tracing::Span::none(),
+            "snap",
+            path = %table_configuration.table_root(),
+            version = table_configuration.version(),
+        );
+        info!(parent: &span, "Created snapshot");
         Self {
+            span,
             log_segment,
             table_configuration,
         }
@@ -317,6 +339,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
+        // Read protocol and metadata
         let start = Instant::now();
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
         let read_metadata_duration = start.elapsed();
@@ -331,10 +354,7 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self {
-            log_segment,
-            table_configuration,
-        })
+        Ok(Self::new(log_segment, table_configuration))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -412,10 +432,7 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot {
-            table_configuration: new_table_configuration,
-            log_segment: new_log_segment,
-        })
+        Ok(Snapshot::new(new_log_segment, new_table_configuration))
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -435,6 +452,7 @@ impl Snapshot {
     /// (e.g., `SyncEngine`).
     ///
     /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
+    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
         let writer = self.create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
@@ -509,14 +527,22 @@ impl Snapshot {
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
-    pub fn transaction(self: Arc<Self>, committer: Box<dyn Committer>) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer)
+    ///
+    /// Note: For tables with clustering enabled, this performs log replay to read clustering
+    /// columns from domain metadata, which may have a performance cost.
+    pub fn transaction(
+        self: Arc<Self>,
+        committer: Box<dyn Committer>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Transaction> {
+        Transaction::try_new_existing_table(self, committer, engine)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
         self: Arc<Self>,
         application_id: &str,
@@ -551,6 +577,28 @@ impl Snapshot {
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 
+    /// Get the clustering columns for this snapshot, if the table has clustering enabled.
+    ///
+    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
+    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
+    /// clustering metadata is malformed.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    pub(crate) fn get_clustering_columns(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        if self
+            .table_configuration
+            .protocol()
+            .has_table_feature(&TableFeature::ClusteredTable)
+        {
+            get_clustering_columns(&self.log_segment, engine)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
     /// tables. This method is a no-op for filesystem-managed tables or if there are no catalog
     /// commits to publish.
@@ -571,6 +619,7 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
+    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
@@ -652,6 +701,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
