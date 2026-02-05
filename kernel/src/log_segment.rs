@@ -865,7 +865,7 @@ impl LogSegment {
         // Case 3: CRC at target version failed to load => Full P&M log replay.
         //
         // Case 4: No CRC exists at all => Same as Case 3.
-       
+
         if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
             // Case 2(a): Replay only commits after CRC version
             info!("Pruning log segment to commits after CRC version {}", crc_v);
