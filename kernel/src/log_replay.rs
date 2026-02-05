@@ -390,6 +390,10 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
+        fn is_valid(&self, _row_index: usize) -> bool {
+            true // Mock data is always valid unless explicitly set otherwise
+        }
+
         fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
             if let Some(error_msg) = self.errors.get(&(row_index, field_name.to_string())) {
                 return Err(crate::Error::Generic(error_msg.clone()));
