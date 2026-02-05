@@ -17,6 +17,8 @@ use crate::arrow::datatypes::{
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
+use delta_kernel_derive::internal_api;
+
 use crate::column_trie::ColumnTrie;
 use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::expressions::ColumnName;
@@ -480,6 +482,7 @@ impl StatsAccumulator {
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist).
 ///   Only these columns will appear in nullCount/minValues/maxValues.
+#[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
