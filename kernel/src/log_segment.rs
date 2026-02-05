@@ -1,6 +1,5 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
-use std::borrow::Cow;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -842,7 +841,7 @@ impl LogSegment {
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         let crc_version = lazy_crc.crc_version();
 
-        // Step 1: If CRC at target version, use it directly and exit early
+        // Case 1: If CRC at target version, use it directly and exit early.
         if crc_version == Some(self.end_version) {
             if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
                 info!("P&M from CRC at target version {}", self.end_version);
@@ -854,49 +853,31 @@ impl LogSegment {
             );
         }
 
-        // Step 2: We didn't return above, so now we need to potentially prune the log segment (and
-        //         will do log replay on it in Step 3).
+        // We didn't return above, so we need to do log replay to find P&M.
         //
-        // Case 2.a: CRC exists at an earlier version => Prune the log segment to only include
-        //           commits/compactions *after* the CRC version. If we don't find a new P & M, we
-        //           will fall back to the CRC.
-        //           TODO: This CRC read could fail, too! Technically we should continue to normal
-        //           log replay if it does. Handle this later.
-        // Case 2.b: CRC at target version failed to load => Full P & M log replay.
-        // Case 2.c: No CRC exists at all => Same as 2.b
-        let pm_log_segment: Cow<'_, Self> = match crc_version {
-            Some(crc_v) if crc_v < self.end_version => {
-                // Case 2.a: CRC at earlier version - prune segment
-                info!("Pruning log segment to commits after CRC version {}", crc_v);
-                let mut pruned = self.clone();
-                pruned.checkpoint_version = None;
-                pruned.checkpoint_parts.clear();
-                pruned.ascending_commit_files.retain(|c| c.version > crc_v);
-                // TODO: Think through compaction semantics here - which ones to keep?
-                pruned.ascending_compaction_files.clear();
-                Cow::Owned(pruned)
-            }
-            _ => Cow::Borrowed(self), // Case 2.b or 2.c: Full replay
-        };
+        // Case 2: CRC exists at an earlier version => Prune the log segment to only replay
+        //         commits *after* the CRC version.
+        //   (a) If we find new P&M in the pruned replay, return it.
+        //   (b) If we don't find new P&M, fall back to the CRC.
+        //   (c) If the CRC also fails, fall back to replaying the remaining segment
+        //       (checkpoint + commits up through the CRC version).
+        //
+        // Case 3: CRC at target version failed to load => Full P&M log replay.
+        //
+        // Case 4: No CRC exists at all => Same as Case 3.
+       
+        if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
+            // Case 2(a): Replay only commits after CRC version
+            info!("Pruning log segment to commits after CRC version {}", crc_v);
+            let pruned = self.pruned_after(crc_v);
+            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine, None, None)?;
 
-        // Step 3: Replay log segment (which may or may not be prunted) for P&M
-        let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for actions_batch in pm_log_segment.replay_for_metadata(engine)? {
-            let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
             if metadata_opt.is_some() && protocol_opt.is_some() {
-                info!("P&M from log replay");
+                info!("P&M from pruned log replay (commits after CRC)");
                 return Ok((metadata_opt, protocol_opt));
             }
-        }
 
-        // Step 4: Fallback to CRC for missing P&M (only relevant for case 2.a)
-        if crc_version.is_some_and(|v| v < self.end_version) {
+            // Case 2(b): P&M incomplete from pruned replay, try CRC
             if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
                 info!("P&M fallback to CRC (no P&M changes after CRC version)");
                 return Ok((
@@ -904,16 +885,20 @@ impl LogSegment {
                     protocol_opt.or_else(|| Some(crc.protocol.clone())),
                 ));
             }
+
+            // Case 2(c): CRC failed to load. Replay the remaining segment (checkpoint +
+            // commits up through CRC version), carrying forward any partial results from the
+            // pruned replay above.
+            info!(
+                "CRC at version {} failed to load, replaying remaining segment",
+                crc_v
+            );
+            let remaining = self.pruned_through(crc_v);
+            return remaining.replay_for_pm(engine, metadata_opt, protocol_opt);
         }
 
-        // At least one of metadata_opt/protocol_opt is None (otherwise we'd have returned
-        // earlier), and CRC either doesn't exist or failed to load.
-        info!(
-            "P&M incomplete: metadata={}, protocol={}",
-            metadata_opt.is_some(),
-            protocol_opt.is_some()
-        );
-        Ok((metadata_opt, protocol_opt))
+        // Case 3 / Case 4: Full P&M log replay.
+        self.replay_for_pm(engine, None, None)
     }
 
     /// Get the most up-to-date Protocol and Metadata actions.
@@ -948,6 +933,55 @@ impl LogSegment {
         });
         // read the same protocol and metadata schema for both commits and checkpoints
         self.read_actions(engine, schema, META_PREDICATE.clone())
+    }
+
+    /// Replays the log segment for Protocol and Metadata, merging with any already-found values.
+    /// Stops early once both are found.
+    fn replay_for_pm(
+        &self,
+        engine: &dyn Engine,
+        mut metadata_opt: Option<Metadata>,
+        mut protocol_opt: Option<Protocol>,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        for actions_batch in self.replay_for_metadata(engine)? {
+            let actions = actions_batch?.actions;
+            if metadata_opt.is_none() {
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            }
+            if protocol_opt.is_none() {
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+            }
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                break;
+            }
+        }
+        Ok((metadata_opt, protocol_opt))
+    }
+
+    /// Creates a pruned LogSegment containing only commits after `version`.
+    /// Clears checkpoint and compaction files since they are covered by CRC at `version`.
+    fn pruned_after(&self, version: Version) -> Self {
+        let mut pruned = self.clone();
+        pruned.checkpoint_version = None;
+        pruned.checkpoint_parts.clear();
+        pruned
+            .ascending_commit_files
+            .retain(|c| c.version > version);
+        // TODO: Think through compaction semantics here - which ones to keep?
+        pruned.ascending_compaction_files.clear();
+        pruned
+    }
+
+    /// Creates a pruned LogSegment containing checkpoint + commits up through `version`.
+    /// Used as fallback when CRC at `version` fails to load.
+    fn pruned_through(&self, version: Version) -> Self {
+        let mut remaining = self.clone();
+        remaining
+            .ascending_commit_files
+            .retain(|c| c.version <= version);
+        // TODO: Think through compaction semantics here - which ones to keep?
+        remaining.ascending_compaction_files.clear();
+        remaining
     }
 
     /// How many commits since a checkpoint, according to this log segment.
