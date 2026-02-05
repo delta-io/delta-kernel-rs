@@ -1431,7 +1431,8 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_size =
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
-    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
+    // Sidecar batches now use the same schema as checkpoint (including sidecar column)
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFilesBuilder {
