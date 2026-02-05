@@ -14,6 +14,18 @@ use crate::{EngineData, Snapshot};
 
 use super::*;
 
+/// Helper macro to extract a typed column from a RecordBatch or StructArray.
+macro_rules! get_column {
+    ($source:expr, $name:expr, $ty:ty) => {
+        $source
+            .column_by_name($name)
+            .unwrap_or_else(|| panic!("should have column '{}'", $name))
+            .as_any()
+            .downcast_ref::<$ty>()
+            .unwrap_or_else(|| panic!("column '{}' should be {}", $name, stringify!($ty)))
+    };
+}
+
 #[test]
 fn test_static_skipping() {
     const NULL: Pred = Pred::null_literal();
@@ -566,48 +578,14 @@ fn test_scan_metadata_with_stats_columns() {
         );
 
         // Extract stats_parsed struct array
-        let stats_parsed = filtered_batch
-            .column_by_name(STATS_PARSED_COL)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("stats_parsed should be a StructArray");
-
-        let num_records = stats_parsed
-            .column_by_name("numRecords")
-            .expect("should have numRecords")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("numRecords should be Int64Array");
-
-        let min_values = stats_parsed
-            .column_by_name("minValues")
-            .expect("should have minValues")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("minValues should be StructArray");
-
-        let max_values = stats_parsed
-            .column_by_name("maxValues")
-            .expect("should have maxValues")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("maxValues should be StructArray");
-
-        let null_count = stats_parsed
-            .column_by_name("nullCount")
-            .expect("should have nullCount")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("nullCount should be StructArray");
+        let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
+        let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
+        let min_values = get_column!(stats_parsed, "minValues", StructArray);
+        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
+        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
 
         // Extract JSON stats column
-        let stats_json = filtered_batch
-            .column_by_name("stats")
-            .expect("should have stats JSON column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("stats should be StringArray");
+        let stats_json = get_column!(filtered_batch, "stats", StringArray);
 
         // Validate each row: JSON stats should match structured stats
         for i in 0..stats_json.len() {

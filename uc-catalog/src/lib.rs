@@ -132,15 +132,8 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::sync::Arc;
 
-    use delta_kernel::arrow::array::{AsArray, RecordBatch};
-    use delta_kernel::arrow::compute::filter_record_batch;
-    use delta_kernel::arrow::util::pretty::print_batches;
-    use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::engine::arrow_expression::apply_schema::apply_schema_to;
     use delta_kernel::engine::default::DefaultEngineBuilder;
-    use delta_kernel::schema::DataType as KernelDataType;
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
@@ -215,73 +208,7 @@ mod tests {
         // or time travel
         // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
 
-        // println!("🎉 loaded snapshot: {snapshot:?}");
-
-        // Build scan with stats columns to get parsed stats
-        let scan = snapshot.scan_builder().include_stats_columns().build()?;
-
-        // Get the logical stats schema (user-facing column names)
-        let logical_stats_schema = scan.logical_stats_schema();
-
-        println!("\n📋 Logical Stats Schema (user-facing column names):");
-        if let Some(schema) = &logical_stats_schema {
-            for field in schema.fields() {
-                println!("  - {}: {:?}", field.name(), field.data_type());
-            }
-        } else {
-            println!("  No logical stats schema available");
-        }
-
-        println!("\n📊 Inspecting parsed stats from scan_metadata:");
-
-        // Get scan metadata which contains the parsed stats
-        for (i, scan_metadata_result) in scan.scan_metadata(&engine)?.enumerate() {
-            let scan_metadata = scan_metadata_result?;
-            let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
-            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)?.into();
-
-            // Apply selection vector filter
-            let bool_array = delta_kernel::arrow::array::BooleanArray::from(selection_vector);
-            let filtered_batch = filter_record_batch(&batch, &bool_array)?;
-
-            println!("\n--- Batch {} ({} rows) ---", i, filtered_batch.num_rows());
-
-            // Print physical stats_parsed schema
-            let schema = filtered_batch.schema();
-            if let Ok(stats_idx) = schema.index_of("stats_parsed") {
-                let stats_field = schema.field(stats_idx);
-                if let delta_kernel::arrow::datatypes::DataType::Struct(fields) =
-                    stats_field.data_type()
-                {
-                    println!("\n🔧 Physical Parsed Stats Schema (from stats_parsed column):");
-                    for f in fields {
-                        println!("  - {}: {:?}", f.name(), f.data_type());
-                    }
-
-                    // Get the stats_parsed column and convert to logical names using apply_schema_to
-                    if let Some(logical_schema) = &logical_stats_schema {
-                        let stats_column = filtered_batch.column(stats_idx).clone();
-
-                        // Use apply_schema_to for ordinal-based renaming (physical -> logical)
-                        let logical_stats = apply_schema_to(
-                            &stats_column,
-                            &KernelDataType::Struct(Box::new(logical_schema.as_ref().clone())),
-                        )?;
-
-                        println!("\n✨ Parsed Stats with Logical Names (using apply_schema_to):");
-                        let stats_struct = logical_stats.as_struct();
-                        let (logical_fields, logical_cols, _) = stats_struct.clone().into_parts();
-                        let logical_batch = RecordBatch::try_new(
-                            Arc::new(delta_kernel::arrow::datatypes::Schema::new(
-                                logical_fields.to_vec(),
-                            )),
-                            logical_cols,
-                        )?;
-                        print_batches(&[logical_batch])?;
-                    }
-                }
-            }
-        }
+        println!("🎉 loaded snapshot: {snapshot:?}");
 
         Ok(())
     }
