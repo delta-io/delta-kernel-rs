@@ -762,9 +762,14 @@ impl LogSegment {
             None => Box::new(std::iter::empty()),
         };
 
-        // Read sidecars using cached sidecar files from earlier
+        // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
+        // The sidecar column will be null in sidecar batches, which is harmless.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            parquet_handler.read_parquet_files(&sidecar_files, action_schema, meta_predicate)?
+            parquet_handler.read_parquet_files(
+                &sidecar_files,
+                augmented_checkpoint_read_schema.clone(),
+                meta_predicate,
+            )?
         } else {
             Box::new(std::iter::empty())
         };
