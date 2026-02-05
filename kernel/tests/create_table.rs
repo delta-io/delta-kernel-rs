@@ -424,3 +424,406 @@ async fn test_clustering_column_not_in_schema() -> DeltaResult<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// Column Mapping Integration Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_create_table_with_column_mapping_name_mode() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("name", DataType::STRING, true),
+    ])?);
+
+    // Create table with column mapping mode = name
+    let _result = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Read the log file and verify
+    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
+    let actions: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect();
+
+    // Verify protocol has columnMapping feature in BOTH reader and writer features
+    let protocol_action = actions
+        .iter()
+        .find(|a| a.get("protocol").is_some())
+        .unwrap();
+    let protocol = protocol_action.get("protocol").unwrap();
+
+    let reader_features = protocol["readerFeatures"].as_array().unwrap();
+    assert!(
+        reader_features.iter().any(|f| f == "columnMapping"),
+        "Protocol should have columnMapping in reader features"
+    );
+
+    let writer_features = protocol["writerFeatures"].as_array().unwrap();
+    assert!(
+        writer_features.iter().any(|f| f == "columnMapping"),
+        "Protocol should have columnMapping in writer features"
+    );
+
+    // Verify metadata has the column mapping properties
+    let metadata_action = actions
+        .iter()
+        .find(|a| a.get("metaData").is_some())
+        .unwrap();
+    let metadata = metadata_action.get("metaData").unwrap();
+    let configuration = metadata["configuration"].as_object().unwrap();
+
+    // Check maxColumnId is set correctly (2 fields)
+    assert!(
+        configuration.contains_key("delta.columnMapping.maxColumnId"),
+        "Configuration should have maxColumnId"
+    );
+    let max_id: i64 = configuration["delta.columnMapping.maxColumnId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(max_id, 2, "maxColumnId should equal total field count");
+
+    // Check mode is set
+    assert_eq!(
+        configuration["delta.columnMapping.mode"].as_str().unwrap(),
+        "name"
+    );
+
+    // Verify schema has column mapping annotations on ALL fields
+    let schema_str = metadata["schemaString"].as_str().unwrap();
+    let schema_value: Value = serde_json::from_str(schema_str).unwrap();
+    let fields = schema_value["fields"].as_array().unwrap();
+
+    for field in fields {
+        let field_name = field["name"].as_str().unwrap();
+        let field_metadata = field["metadata"].as_object().unwrap();
+
+        assert!(
+            field_metadata.contains_key("delta.columnMapping.id"),
+            "Field '{}' should have column mapping id",
+            field_name
+        );
+        assert!(
+            field_metadata.contains_key("delta.columnMapping.physicalName"),
+            "Field '{}' should have physical name",
+            field_name
+        );
+
+        // Verify physical name format
+        let physical_name = field_metadata["delta.columnMapping.physicalName"]
+            .as_str()
+            .unwrap();
+        assert!(
+            physical_name.starts_with("col-"),
+            "Physical name '{}' should start with 'col-'",
+            physical_name
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_table_with_column_mapping_id_mode() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::new(
+        "id",
+        DataType::INTEGER,
+        false,
+    )])?);
+
+    // Create table with column mapping mode = id
+    let _result = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "id")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Verify table was created with column mapping
+    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
+    let actions: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect();
+
+    let protocol_action = actions
+        .iter()
+        .find(|a| a.get("protocol").is_some())
+        .unwrap();
+    let protocol = protocol_action.get("protocol").unwrap();
+
+    // Verify columnMapping feature in both reader and writer features
+    let reader_features = protocol["readerFeatures"].as_array().unwrap();
+    assert!(reader_features.iter().any(|f| f == "columnMapping"));
+
+    let writer_features = protocol["writerFeatures"].as_array().unwrap();
+    assert!(writer_features.iter().any(|f| f == "columnMapping"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_column_mapping_mode_none_no_annotations() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("name", DataType::STRING, true),
+    ])?);
+
+    // Create table WITHOUT column mapping
+    let _result = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Read the log file
+    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
+    let actions: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect();
+
+    // Verify protocol does NOT have columnMapping feature
+    let protocol_action = actions
+        .iter()
+        .find(|a| a.get("protocol").is_some())
+        .unwrap();
+    let protocol = protocol_action.get("protocol").unwrap();
+
+    let reader_features = protocol["readerFeatures"].as_array().unwrap();
+    assert!(
+        !reader_features.iter().any(|f| f == "columnMapping"),
+        "Protocol should NOT have columnMapping feature when mode is not set"
+    );
+
+    // Verify configuration does NOT have maxColumnId
+    let metadata_action = actions
+        .iter()
+        .find(|a| a.get("metaData").is_some())
+        .unwrap();
+    let metadata = metadata_action.get("metaData").unwrap();
+    let configuration = metadata["configuration"].as_object().unwrap();
+
+    assert!(
+        !configuration.contains_key("delta.columnMapping.maxColumnId"),
+        "Configuration should NOT have maxColumnId when mode is not set"
+    );
+
+    // Verify schema does NOT have column mapping annotations
+    let schema_str = metadata["schemaString"].as_str().unwrap();
+    let schema_value: Value = serde_json::from_str(schema_str).unwrap();
+    let fields = schema_value["fields"].as_array().unwrap();
+
+    for field in fields {
+        let field_metadata = field["metadata"].as_object().unwrap();
+        assert!(
+            !field_metadata.contains_key("delta.columnMapping.id"),
+            "Fields should NOT have column mapping id"
+        );
+        assert!(
+            !field_metadata.contains_key("delta.columnMapping.physicalName"),
+            "Fields should NOT have physical name"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_column_mapping_invalid_mode_rejected() {
+    let (_temp_dir, table_path, engine) = test_table_setup().unwrap();
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+    );
+
+    // Try to create table with invalid column mapping mode
+    let result = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "invalid")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid column mapping mode"));
+}
+
+#[tokio::test]
+async fn test_create_clustered_table_with_column_mapping() -> DeltaResult<()> {
+    use delta_kernel::transaction::data_layout::DataLayout;
+
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("name", DataType::STRING, true),
+    ])?);
+
+    // Create clustered table with column mapping enabled
+    let _result = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .with_data_layout(DataLayout::clustered(["id"])?)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Read the log file and verify
+    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
+    let actions: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect();
+
+    // Verify protocol has all three features
+    let protocol_action = actions
+        .iter()
+        .find(|a| a.get("protocol").is_some())
+        .unwrap();
+    let protocol = protocol_action.get("protocol").unwrap();
+    let writer_features = protocol["writerFeatures"].as_array().unwrap();
+    let reader_features = protocol["readerFeatures"].as_array().unwrap();
+
+    assert!(
+        writer_features.iter().any(|f| f == "columnMapping"),
+        "Should have columnMapping writer feature"
+    );
+    assert!(
+        reader_features.iter().any(|f| f == "columnMapping"),
+        "Should have columnMapping reader feature"
+    );
+    assert!(
+        writer_features.iter().any(|f| f == "clustering"),
+        "Should have clustering writer feature"
+    );
+    assert!(
+        writer_features.iter().any(|f| f == "domainMetadata"),
+        "Should have domainMetadata writer feature"
+    );
+
+    // Verify clustering domain metadata uses PHYSICAL column names (not logical)
+    let dm_action = actions.iter().find(|a| {
+        a.get("domainMetadata")
+            .and_then(|dm| dm.get("domain"))
+            .map(|d| d == "delta.clustering")
+            .unwrap_or(false)
+    });
+
+    assert!(
+        dm_action.is_some(),
+        "Should have domainMetadata action for clustering"
+    );
+    let clustering_dm = dm_action.unwrap().get("domainMetadata").unwrap();
+    let config: Value =
+        serde_json::from_str(clustering_dm["configuration"].as_str().unwrap()).unwrap();
+    let cols = config["clusteringColumns"].as_array().unwrap();
+
+    // The clustering column should be the PHYSICAL name (col-*), not "id"
+    let clustering_col_name = cols[0][0].as_str().unwrap();
+    assert!(
+        clustering_col_name.starts_with("col-"),
+        "Clustering domain metadata should use physical name '{}' not logical name 'id'",
+        clustering_col_name
+    );
+
+    // Verify maxColumnId is set correctly in configuration
+    let metadata_action = actions
+        .iter()
+        .find(|a| a.get("metaData").is_some())
+        .unwrap();
+    let metadata = metadata_action.get("metaData").unwrap();
+    let configuration = metadata["configuration"].as_object().unwrap();
+
+    assert!(
+        configuration.contains_key("delta.columnMapping.maxColumnId"),
+        "Configuration should have maxColumnId"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_column_mapping_nested_schema() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Create nested schema
+    let address_type = StructType::try_new(vec![
+        StructField::new("street", DataType::STRING, true),
+        StructField::new("city", DataType::STRING, true),
+    ])?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("address", DataType::Struct(Box::new(address_type)), true),
+    ])?);
+
+    // Create table with column mapping
+    let _result = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Read the log file
+    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
+    let actions: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect();
+
+    // Verify maxColumnId accounts for all fields (including nested)
+    // id=1, address=2, street=3, city=4 => total 4 fields
+    let metadata_action = actions
+        .iter()
+        .find(|a| a.get("metaData").is_some())
+        .unwrap();
+    let metadata = metadata_action.get("metaData").unwrap();
+    let configuration = metadata["configuration"].as_object().unwrap();
+
+    let max_id: i64 = configuration["delta.columnMapping.maxColumnId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        max_id, 4,
+        "maxColumnId should account for nested fields too"
+    );
+
+    // Verify nested fields have column mapping annotations
+    let schema_str = metadata["schemaString"].as_str().unwrap();
+    let schema_value: Value = serde_json::from_str(schema_str).unwrap();
+    let fields = schema_value["fields"].as_array().unwrap();
+
+    // Find the address field and check its nested fields
+    let address_field = fields.iter().find(|f| f["name"] == "address").unwrap();
+    let nested_fields = address_field["type"]["fields"].as_array().unwrap();
+
+    for field in nested_fields {
+        let field_name = field["name"].as_str().unwrap();
+        let field_metadata = field["metadata"].as_object().unwrap();
+
+        assert!(
+            field_metadata.contains_key("delta.columnMapping.id"),
+            "Nested field '{}' should have column mapping id",
+            field_name
+        );
+        assert!(
+            field_metadata.contains_key("delta.columnMapping.physicalName"),
+            "Nested field '{}' should have physical name",
+            field_name
+        );
+    }
+
+    Ok(())
+}
