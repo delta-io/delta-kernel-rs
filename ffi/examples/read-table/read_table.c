@@ -271,7 +271,7 @@ int main(int argc, char* argv[])
   // we could also do something like this if we want less control over formatting
   // enable_formatted_log_line_tracing(log_line_callback, TRACE, FULL, true, true, false, false);
 #else
-  enable_event_tracing(tracing_callback, INFO);
+  enable_event_tracing(tracing_callback, WARN);
 #endif
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
