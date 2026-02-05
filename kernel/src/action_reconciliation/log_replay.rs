@@ -316,8 +316,44 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     txn_expiration_timestamp: Option<i64>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone)]
+struct GetterColumn {
+    index: usize,
+    name: &'static str,
+}
+
+impl GetterColumn {
+    const fn new(index: usize, name: &'static str) -> Self {
+        GetterColumn { index, name }
+    }
+}
+
 #[allow(unused)]
 impl ActionReconciliationVisitor<'_> {
+    const ADD_PATH_COL: GetterColumn = GetterColumn::new(0, "add.path");
+    const ADD_DV_STORAGE_TYPE_COL: GetterColumn =
+        GetterColumn::new(1, "add.deletionVector.storageType");
+    const ADD_DV_PATH_OR_INLINE_DV_COL: GetterColumn =
+        GetterColumn::new(2, "add.deletionVector.pathOrInlineDv");
+    const ADD_DV_OFFSET_COL: GetterColumn = GetterColumn::new(3, "add.deletionVector.offset");
+    const REMOVE_PATH_COL: GetterColumn = GetterColumn::new(4, "remove.path");
+    const REMOVE_DELETION_TIMESTAMP_COL: GetterColumn =
+        GetterColumn::new(5, "remove.deletionTimestamp");
+    const REMOVE_DV_STORAGE_TYPE_COL: GetterColumn =
+        GetterColumn::new(6, "remove.deletionVector.storageType");
+    const REMOVE_DV_PATH_OR_INLINE_DV_COL: GetterColumn =
+        GetterColumn::new(7, "remove.deletionVector.pathOrInlineDv");
+    const REMOVE_DV_OFFSET_COL: GetterColumn = GetterColumn::new(8, "remove.deletionVector.offset");
+    const METADATA_ID_COL: GetterColumn = GetterColumn::new(9, "metaData.id");
+    const PROTOCOL_MIN_READER_VERSION_COL: GetterColumn =
+        GetterColumn::new(10, "protocol.minReaderVersion");
+    const TXN_APP_ID_COL: GetterColumn = GetterColumn::new(11, "txn.appId");
+    const TXN_LAST_UPDATED_COL: GetterColumn = GetterColumn::new(12, "txn.lastUpdated");
+    const DOMAIN_METADATA_DOMAIN_COL: GetterColumn = GetterColumn::new(13, "domainMetadata.domain");
+    const DOMAIN_METADATA_REMOVED_COL: GetterColumn =
+        GetterColumn::new(14, "domainMetadata.removed");
+
     // TODO(#1717): Combine index and field name constants into a single struct
     // These index positions correspond to the order of columns defined in
     // `selected_column_names_and_types()`
