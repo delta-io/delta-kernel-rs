@@ -39,7 +39,23 @@ pub struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new_for(table_root: Url) -> Self {
+    pub(crate) fn new_for(mut table_root: Url) -> Self {
+        // Ensure `table_root` behaves like a directory for `Url::join`.
+        // Without a trailing slash, `join` replaces the last path segment instead of appending.
+        //
+        // Example:
+        // "s3://bucket/path/to/table".join("_delta_log/") -> "s3://bucket/path/to/_delta_log/" (wrong)
+        // "s3://bucket/path/to/table/".join("_delta_log/") -> "s3://bucket/path/to/table/_delta_log/" (correct)
+        let path = table_root.path();
+        if !path.ends_with('/') {
+            if path.is_empty() {
+                table_root.set_path("/");
+            } else {
+                let mut new_path = path.to_string();
+                new_path.push('/');
+                table_root.set_path(&new_path);
+            }
+        }
         Self {
             table_root: Some(table_root),
             existing_snapshot: None,
@@ -218,7 +234,17 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
+        let table_prefix = _table_root
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        let log_prefix = if table_prefix.is_empty() {
+            "_delta_log".to_string()
+        } else {
+            format!("{table_prefix}/_delta_log")
+        };
+
+        let path = object_store::path::Path::from(format!("{log_prefix}/{:020}.json", 0).as_str());
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -241,7 +267,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
+        let path = object_store::path::Path::from(format!("{log_prefix}/{:020}.json", 1).as_str());
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())

@@ -882,6 +882,59 @@ mod tests {
         add_commit(store, version, commit_data).await.unwrap();
     }
 
+    fn normalize_table_root(mut table_root: Url) -> Url {
+        let path = table_root.path();
+        if !path.ends_with('/') {
+            if path.is_empty() {
+                table_root.set_path("/");
+            } else {
+                let mut new_path = path.to_string();
+                new_path.push('/');
+                table_root.set_path(&new_path);
+            }
+        }
+        table_root
+    }
+
+    fn delta_path_for_version_at(table_root: &Url, version: u64, suffix: &str) -> Path {
+        let table_prefix = table_root
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if table_prefix.is_empty() {
+            Path::from(format!("_delta_log/{version:020}.{suffix}").as_str())
+        } else {
+            Path::from(format!("{table_prefix}/_delta_log/{version:020}.{suffix}").as_str())
+        }
+    }
+
+    async fn add_commit_at(
+        store: &dyn ObjectStore,
+        table_root: &Url,
+        version: u64,
+        data: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = delta_path_for_version_at(table_root, version, "json");
+        store.put(&path, data.into()).await?;
+        Ok(())
+    }
+
+    async fn commit_at(
+        store: &InMemory,
+        table_root: &Url,
+        version: Version,
+        commit: Vec<serde_json::Value>,
+    ) {
+        let commit_data = commit
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+            .join("\n");
+        add_commit_at(store, table_root, version, commit_data)
+            .await
+            .unwrap();
+    }
+
     // interesting cases for testing Snapshot::new_from:
     // 1. new version < existing version
     // 2. new version == existing version
@@ -1600,11 +1653,11 @@ mod tests {
                 }
             }),
         ];
-        commit(store.as_ref(), 0, commit_data.to_vec()).await;
+        commit_at(store.as_ref(), &url, 0, commit_data.to_vec()).await;
 
         // Create commit that predates ICT enablement (no inCommitTimestamp)
         let commit_predates = [create_commit_info(1234567890, None)];
-        commit(store.as_ref(), 1, commit_predates.to_vec()).await;
+        commit_at(store.as_ref(), &url, 1, commit_predates.to_vec()).await;
 
         let snapshot_predates = Snapshot::builder_for(url).at_version(1).build(&engine)?;
         let result_predates = snapshot_predates.get_in_commit_timestamp(&engine);
@@ -1635,11 +1688,11 @@ mod tests {
                 false,
             ),
         ];
-        commit(store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+        commit_at(store.as_ref(), &url, 0, commit_data.to_vec()).await; // ICT enabled from version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];
-        commit(store.as_ref(), 1, commit_missing_ict.to_vec()).await;
+        commit_at(store.as_ref(), &url, 1, commit_missing_ict.to_vec()).await;
 
         let snapshot_missing = Snapshot::builder_for(url).at_version(1).build(&engine)?;
         let result = snapshot_missing.get_in_commit_timestamp(&engine);
@@ -1668,17 +1721,20 @@ mod tests {
                 false,
             ),
         ];
-        commit(store.as_ref(), 0, commit_data.to_vec()).await;
+        commit_at(store.as_ref(), &url, 0, commit_data.to_vec()).await;
 
         // Build snapshot to get table configuration
         let snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
 
+        let normalized_table_root = normalize_table_root(url.clone());
+
         // Create a log segment with only checkpoint and no commit file (simulating scenario
         // where a checkpoint exists but the commit file has been cleaned up)
         let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
-            location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
+            location: normalized_table_root
+                .join("_delta_log/00000000000000000000.checkpoint.parquet")?,
             last_modified: 0,
             size: 100,
         })?
@@ -1690,8 +1746,12 @@ mod tests {
         }
         .build()?;
 
-        let log_segment =
-            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
+        let log_segment = LogSegment::try_new(
+            listed_files,
+            normalized_table_root.join("_delta_log/")?,
+            Some(0),
+            None,
+        )?;
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
@@ -1723,7 +1783,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(store.as_ref(), 0, commit0_data.to_vec()).await;
+        commit_at(store.as_ref(), &url, 0, commit0_data.to_vec()).await;
 
         // Create 00000000000000000001.checkpoint.parquet
         let checkpoint_data = [
@@ -1756,13 +1816,13 @@ mod tests {
         writer.write(&checkpoint)?;
         writer.close()?;
 
-        let checkpoint_path = delta_path_for_version(1, "checkpoint.parquet");
+        let checkpoint_path = delta_path_for_version_at(&url, 1, "checkpoint.parquet");
         store.put(&checkpoint_path, buffer.into()).await?;
 
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
         let commit1_data = [create_commit_info(1587968586200, Some(expected_ict))];
-        commit(store.as_ref(), 1, commit1_data.to_vec()).await;
+        commit_at(store.as_ref(), &url, 1, commit1_data.to_vec()).await;
 
         // Build snapshot - LogSegment will filter out the commit file because checkpoint exists at same version
         let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
