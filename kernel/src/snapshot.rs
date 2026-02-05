@@ -13,6 +13,7 @@ use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
+use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
@@ -214,7 +215,9 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let (new_metadata, new_protocol) = new_log_segment.protocol_and_metadata(engine)?;
+        let lazy_crc = LazyCrc::new(new_log_segment.latest_crc_file.clone());
+        let (new_metadata, new_protocol) =
+            new_log_segment.protocol_and_metadata(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -320,9 +323,12 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
-        // Read protocol and metadata
+        // Create lazy CRC loader for P&M optimization
+        let lazy_crc = LazyCrc::new(log_segment.latest_crc_file.clone());
+
+        // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let (metadata, protocol) = log_segment.read_metadata(engine, &lazy_crc)?;
         let read_metadata_duration = start.elapsed();
 
         reporter.as_ref().inspect(|r| {
@@ -1102,7 +1108,9 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let protocol = |reader_version, writer_version| {
+
+        // Protocol for commit files (wrapped in "protocol" key)
+        let commit_protocol = |reader_version, writer_version| {
             json!({
                 "protocol": {
                     "minReaderVersion": reader_version,
@@ -1110,7 +1118,16 @@ mod tests {
                 }
             })
         };
-        let metadata = json!({
+        // Protocol for CRC files (not wrapped)
+        let crc_protocol = |reader_version, writer_version| {
+            json!({
+                "minReaderVersion": reader_version,
+                "minWriterVersion": writer_version
+            })
+        };
+
+        // Metadata for commit files (wrapped in "metaData" key)
+        let commit_metadata = json!({
             "metaData": {
                 "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
                 "format": {
@@ -1123,6 +1140,19 @@ mod tests {
                 "createdTime": 1587968585495i64
             }
         });
+        // Metadata for CRC files (not wrapped, uses "metadata" key in CRC)
+        let crc_metadata = json!({
+            "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        });
+
         let commit0 = vec![
             json!({
                 "commitInfo": {
@@ -1132,8 +1162,8 @@ mod tests {
                     "isBlindAppend":true
                 }
             }),
-            protocol(1, 1),
-            metadata.clone(),
+            commit_protocol(1, 1),
+            commit_metadata.clone(),
         ];
         let commit1 = vec![
             json!({
@@ -1144,7 +1174,7 @@ mod tests {
                     "isBlindAppend":true
                 }
             }),
-            protocol(1, 2),
+            commit_protocol(1, 2),
         ];
 
         // commit 0 and 1 jsons
@@ -1153,18 +1183,18 @@ mod tests {
 
         // a) CRC: old one has 0.crc, no new one (expect 0.crc)
         // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 1),
+        let crc0 = json!({
+            "tableSizeBytes": 100,
+            "numFiles": 1,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": crc_metadata,
+            "protocol": crc_protocol(1, 1),
         });
 
         // put the old crc
         let path = delta_path_for_version(0, "crc");
-        store.put(&path, crc.to_string().into()).await?;
+        store.put(&path, crc0.to_string().into()).await?;
 
         // base snapshot is at version 0
         let base_snapshot = Snapshot::builder_for(url.clone())
@@ -1192,15 +1222,15 @@ mod tests {
         // second test: new crc
         // put the new crc
         let path = delta_path_for_version(1, "crc");
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 2),
+        let crc1 = json!({
+            "tableSizeBytes": 100,
+            "numFiles": 1,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": crc_metadata,
+            "protocol": crc_protocol(1, 2),
         });
-        store.put(&path, crc.to_string().into()).await?;
+        store.put(&path, crc1.to_string().into()).await?;
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
