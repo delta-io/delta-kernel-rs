@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tracing::instrument;
+
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::{
     all_domain_metadata_configuration, domain_metadata_configuration,
@@ -437,6 +439,7 @@ impl Snapshot {
     /// (e.g., `SyncEngine`).
     ///
     /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
+    #[instrument(name = "snap.checkpoint", skip_all, fields(version = self.version()), err)]
     pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
         let writer = self.create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
@@ -526,6 +529,7 @@ impl Snapshot {
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    #[instrument(name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
         self: Arc<Self>,
         application_id: &str,
@@ -602,6 +606,7 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
+    #[instrument(name = "snap.publish", skip_all, fields(version = self.version()), err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
@@ -683,6 +688,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[instrument(name = "snap.get_ict", skip_all, err)]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self

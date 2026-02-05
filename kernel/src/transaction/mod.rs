@@ -3,6 +3,7 @@ use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
+use tracing::instrument;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -390,6 +391,15 @@ impl Transaction {
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    #[instrument(
+        name = "txn.commit",
+        skip_all,
+        fields(
+            read_version = self.read_snapshot.version(),
+            commit_version = self.get_commit_version(),
+        ),
+        err
+    )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
@@ -763,6 +773,12 @@ impl Transaction {
     /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[instrument(
+        name = "txn.update_dvs",
+        skip_all,
+        fields(num_dv_updates = new_dv_descriptors.len()),
+        err
+    )]
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
@@ -1053,6 +1069,7 @@ impl Transaction {
     }
 
     /// Generate add actions, handling row tracking internally if needed
+    #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
         engine: &dyn Engine,
@@ -1286,6 +1303,7 @@ impl Transaction {
     ///
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
+    #[instrument(name = "txn.gen_removes", skip_all, err)]
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,
