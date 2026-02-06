@@ -43,9 +43,12 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info() {
-        let json_content = include_str!("test_data/table_info.json");
-        let table_info: TableInfo =
-            serde_json::from_str(json_content).expect("Failed to deserialize table_info.json");
+        let json_content = r#"{
+    "name": "basic_append",
+    "description": "A basic table with two append writes"
+}"#;
+        let table_info: TableInfo = serde_json::from_str(json_content)
+            .expect("Failed to deserialize basic_append table info");
 
         assert_eq!(table_info.name, "basic_append");
         assert_eq!(
@@ -56,9 +59,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_missing_description() {
-        let json_content = include_str!("test_data/table_info_missing_description.json");
+        let json_content = r#"{
+    "name": "table_without_description"
+}"#;
         let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_info_missing_description.json");
+            .expect("Failed to deserialize table_without_description table info");
 
         assert_eq!(table_info.name, "table_without_description");
         assert_eq!(table_info.description, None);
@@ -66,7 +71,9 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_missing_name() {
-        let json_content = include_str!("test_data/table_info_missing_name.json");
+        let json_content = r#"{
+    "description": "A table missing the required name field"
+}"#;
         let result: Result<TableInfo, _> = serde_json::from_str(json_content);
 
         assert!(
@@ -77,9 +84,13 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_extra_fields() {
-        let json_content = include_str!("test_data/table_info_extra_fields.json");
+        let json_content = r#"{
+    "name": "table_with_extra_fields",
+    "description": "A table with extra fields",
+    "extra_field": "should be ignored"
+}"#;
         let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_info_extra_fields.json");
+            .expect("Failed to deserialize table_with_extra_fields table info");
 
         assert_eq!(table_info.name, "table_with_extras");
         assert_eq!(
