@@ -268,6 +268,8 @@ pub struct Transaction {
     domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // Whether this transaction should be marked as a blind append.
+    is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -327,6 +329,7 @@ impl Transaction {
             domain_metadata_additions: vec![],
             domain_removals: vec![],
             data_change: true,
+            is_blind_append: false,
             dv_matched_files: vec![],
             clustering_columns,
         })
@@ -363,6 +366,7 @@ impl Transaction {
             domain_metadata_additions: system_domain_metadata,
             domain_removals: vec![],
             data_change: true,
+            is_blind_append: false,
             dv_matched_files: vec![],
             // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
             // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
@@ -434,6 +438,8 @@ impl Transaction {
             );
         }
 
+        self.validate_blind_append_semantics()?;
+
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
@@ -446,6 +452,7 @@ impl Transaction {
             self.commit_timestamp,
             self.get_in_commit_timestamp(engine)?,
             self.operation.clone(),
+            self.is_blind_append,
             self.engine_info.clone(),
         );
         let commit_info_action =
@@ -554,6 +561,14 @@ impl Transaction {
         self
     }
 
+    /// Mark this transaction as a blind append.
+    ///
+    /// Blind append transactions should only add new files and avoid write operations that
+    /// depend on existing table state.
+    pub fn set_is_blind_append(&mut self) {
+        self.is_blind_append = true;
+    }
+
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
     /// using a fluent API.
     #[internal_api]
@@ -610,6 +625,33 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.domain_removals.push(domain);
         self
+    }
+
+    /// Validate constraints for transactions marked as blind append.
+    fn validate_blind_append_semantics(&self) -> DeltaResult<()> {
+        if !self.is_blind_append {
+            return Ok(());
+        }
+
+        if self.is_create_table() {
+            return Err(Error::generic(
+                "Blind append is not supported for create-table transactions",
+            ));
+        }
+
+        if !self.remove_files_metadata.is_empty() || !self.dv_matched_files.is_empty() {
+            return Err(Error::generic(
+                "Blind append transactions cannot contain remove or deletion vector update actions",
+            ));
+        }
+
+        if !self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty() {
+            return Err(Error::generic(
+                "Blind append transactions cannot include domain metadata operations",
+            ));
+        }
+
+        Ok(())
     }
 
     /// Returns true if this is a create-table transaction.
@@ -2055,6 +2097,32 @@ mod tests {
             result
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_blind_append_rejects_domain_metadata_operations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_non_dv_table();
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_operation("WRITE".to_string())
+            .with_domain_metadata("my.domain".to_string(), "config".to_string());
+        txn.set_is_blind_append();
+
+        let err = txn
+            .commit(&engine)
+            .expect_err("Blind append should reject domain metadata operations");
+        assert!(err
+            .to_string()
+            .contains("Blind append transactions cannot include domain metadata operations"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_blind_append_sets_commit_info_flag() -> Result<(), Box<dyn std::error::Error>> {
+        let commit_info = CommitInfo::new(1, None, None, true, None);
+        assert_eq!(commit_info.is_blind_append, Some(true));
         Ok(())
     }
 

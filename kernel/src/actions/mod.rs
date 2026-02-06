@@ -604,6 +604,8 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
+    /// Whether this commit is a blind append.
+    pub(crate) is_blind_append: Option<bool>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
@@ -615,6 +617,7 @@ impl CommitInfo {
         timestamp: i64,
         in_commit_timestamp: Option<i64>,
         operation: Option<String>,
+        is_blind_append: bool,
         engine_info: Option<String>,
     ) -> Self {
         Self {
@@ -623,6 +626,7 @@ impl CommitInfo {
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
@@ -1198,6 +1202,7 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
+                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
             ]),
@@ -1492,7 +1497,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None);
+        let commit_info = CommitInfo::new(0, None, None, false, None);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1510,6 +1515,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
             ],
