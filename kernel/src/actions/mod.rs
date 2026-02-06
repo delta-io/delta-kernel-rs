@@ -30,7 +30,6 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
-pub(crate) mod crc;
 pub(crate) mod domain_metadata;
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -349,6 +348,30 @@ impl Metadata {
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_unchecked(
+        id: impl Into<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format: Format,
+        schema_string: impl Into<String>,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name,
+            description,
+            format,
+            schema_string: schema_string.into(),
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
 }
 
 // NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
@@ -578,6 +601,21 @@ impl Protocol {
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<Vec<TableFeature>>,
+        writer_features: Option<Vec<TableFeature>>,
+    ) -> Self {
+        Self {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        }
     }
 }
 
