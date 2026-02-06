@@ -87,7 +87,7 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file
+    /// Latest CRC (checksum) file, only if version >= checkpoint version.
     pub latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
@@ -850,6 +850,48 @@ impl LogSegment {
             .iter()
             .map(|sidecar| sidecar.to_filemeta(&self.log_root))
             .try_collect()
+    }
+
+    /// Creates a pruned LogSegment containing only commits after `start_v_exclusive`.
+    ///
+    /// Clears checkpoint files since they are covered by CRC at `start_v_exclusive`.
+    /// Keeps only compaction files whose entire range `[lo, hi]` falls within
+    /// `(start_v_exclusive, end_version]`.
+    pub(crate) fn pruned_after(&self, start_v_exclusive: Version) -> Self {
+        let end = self.end_version;
+        let mut pruned = self.clone();
+        pruned.checkpoint_version = None;
+        pruned.checkpoint_parts.clear();
+        pruned
+            .ascending_commit_files
+            .retain(|c| start_v_exclusive < c.version);
+        pruned.ascending_compaction_files.retain(|c| {
+            matches!(
+                c.file_type,
+                LogPathFileType::CompactedCommit { hi } if start_v_exclusive < c.version && hi <= end
+            )
+        });
+        pruned
+    }
+
+    /// Creates a pruned LogSegment containing checkpoint + commits up through `end_v_inclusive`.
+    ///
+    /// Used as fallback when CRC at `end_v_inclusive` fails to load.
+    /// Keeps only compaction files whose entire range `[lo, hi]` falls within
+    /// `(checkpoint_version, end_v_inclusive]`.
+    pub(crate) fn pruned_through(&self, end_v_inclusive: Version) -> Self {
+        let cp = self.checkpoint_version.unwrap_or(0);
+        let mut remaining = self.clone();
+        remaining
+            .ascending_commit_files
+            .retain(|c| c.version <= end_v_inclusive);
+        remaining.ascending_compaction_files.retain(|c| {
+            matches!(
+                c.file_type,
+                LogPathFileType::CompactedCommit { hi } if cp < c.version && hi <= end_v_inclusive
+            )
+        });
+        remaining
     }
 
     /// How many commits since a checkpoint, according to this log segment.
