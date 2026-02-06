@@ -6,10 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{
-    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
-    PROTOCOL_NAME, SIDECAR_NAME,
-};
+use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
 use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -19,8 +16,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version, PRE_COMMIT_VERSION,
+    DeltaResult, Engine, Error, FileMeta, PredicateRef, RowVisitor, StorageHandler, Version,
+    PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -33,6 +30,8 @@ use crate::schema::compare::SchemaComparison;
 use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
+
+mod protocol_metadata_replay;
 
 #[cfg(test)]
 mod tests;
@@ -851,58 +850,6 @@ impl LogSegment {
             .iter()
             .map(|sidecar| sidecar.to_filemeta(&self.log_root))
             .try_collect()
-    }
-
-    /// Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    /// the LogSegment.
-    #[instrument(name = "log_seg.load_p_m", skip_all, err)]
-    pub(crate) fn protocol_and_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let actions_batches = self.replay_for_metadata(engine)?;
-        let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
-            if metadata_opt.is_some() && protocol_opt.is_some() {
-                // we've found both, we can stop
-                break;
-            }
-        }
-        Ok((metadata_opt, protocol_opt))
-    }
-
-    // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
-        match self.protocol_and_metadata(engine)? {
-            (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
-        }
-    }
-
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
-    fn replay_for_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-            )))
-        });
-        // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema, META_PREDICATE.clone())
     }
 
     /// How many commits since a checkpoint, according to this log segment.
