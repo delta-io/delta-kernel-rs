@@ -78,7 +78,10 @@ async fn benchmark_snapshot_load() -> Result<(), Box<dyn std::error::Error + Sen
         }
         let snapshot = last_snapshot.unwrap();
         println!("loaded snapshot version: {}", snapshot.version());
-        println!("checkpoint_version: {:?}", snapshot.log_segment().checkpoint_version);
+        println!(
+            "checkpoint_version: {:?}",
+            snapshot.log_segment().checkpoint_version
+        );
         println!(
             "latest_crc_file: {:?}",
             snapshot
@@ -97,7 +100,10 @@ async fn benchmark_snapshot_load() -> Result<(), Box<dyn std::error::Error + Sen
 
         println!(
             "All times (ms): {:?}",
-            times.iter().map(|t| format!("{:.2}", t.as_secs_f64() * 1000.0)).collect::<Vec<_>>()
+            times
+                .iter()
+                .map(|t| format!("{:.2}", t.as_secs_f64() * 1000.0))
+                .collect::<Vec<_>>()
         );
         println!(
             "{:<8} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
