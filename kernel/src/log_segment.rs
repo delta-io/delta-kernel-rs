@@ -34,6 +34,8 @@ use url::Url;
 mod protocol_metadata_replay;
 
 #[cfg(test)]
+mod crc_tests;
+#[cfg(test)]
 mod tests;
 
 /// Information about checkpoint reading for data skipping optimization.
