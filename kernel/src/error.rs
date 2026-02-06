@@ -211,6 +211,14 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Protocol changed concurrently during a transaction
+    #[error("Concurrent protocol change detected: {0}")]
+    ProtocolChanged(String),
+
+    /// Metadata changed concurrently during a transaction
+    #[error("Concurrent metadata change detected: {0}")]
+    MetadataChanged(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -294,6 +302,14 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn protocol_changed(msg: impl ToString) -> Self {
+        Self::ProtocolChanged(msg.to_string())
+    }
+
+    pub fn metadata_changed(msg: impl ToString) -> Self {
+        Self::MetadataChanged(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.
