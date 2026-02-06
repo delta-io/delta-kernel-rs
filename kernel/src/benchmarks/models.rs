@@ -59,7 +59,10 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info() {
-        let json_content = include_str!("test_data/table_info.json");
+        let json_content = r#"{
+    "name": "basic_append",
+    "description": "A basic table with two append writes"
+}"#;
         let table_info: TableInfo =
             serde_json::from_str(json_content).expect("Failed to deserialize table_info.json");
 
@@ -72,7 +75,9 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_missing_description() {
-        let json_content = include_str!("test_data/table_info_missing_description.json");
+        let json_content = r#"{
+    "name": "table_without_description"
+}"#;
         let table_info: TableInfo = serde_json::from_str(json_content)
             .expect("Failed to deserialize table_info_missing_description.json");
 
@@ -82,7 +87,9 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_missing_name() {
-        let json_content = include_str!("test_data/table_info_missing_name.json");
+        let json_content = r#"{
+    "description": "A table missing the required name field"
+}"#;
         let result: Result<TableInfo, _> = serde_json::from_str(json_content);
 
         assert!(
@@ -93,7 +100,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_extra_fields() {
-        let json_content = include_str!("test_data/table_info_extra_fields.json");
+        let json_content = r#"{
+    "name": "table_with_extras",
+    "description": "A table with extra fields",
+    "extra_field": "should be ignored"
+}"#;
         let table_info: TableInfo = serde_json::from_str(json_content)
             .expect("Failed to deserialize table_info_extra_fields.json");
 
@@ -106,7 +117,10 @@ mod tests {
 
     #[test]
     fn test_deserialize_spec_read_with_version() {
-        let json_content = include_str!("test_data/spec_read_with_version.json");
+        let json_content = r#"{
+    "type": "read",
+    "version": 5
+}"#;
         let spec: Spec = serde_json::from_str(json_content)
             .expect("Failed to deserialize spec_read_with_version.json");
 
@@ -116,7 +130,9 @@ mod tests {
 
     #[test]
     fn test_deserialize_spec_read_without_version() {
-        let json_content = include_str!("test_data/spec_read_without_version.json");
+        let json_content = r#"{
+    "type": "read"
+}"#;
         let spec: Spec = serde_json::from_str(json_content)
             .expect("Failed to deserialize spec_read_without_version.json");
 
@@ -126,7 +142,9 @@ mod tests {
 
     #[test]
     fn test_deserialize_spec_missing_type() {
-        let json_content = include_str!("test_data/spec_missing_type.json");
+        let json_content = r#"{
+    "version": 10
+}"#;
         let result: Result<Spec, _> = serde_json::from_str(json_content);
 
         assert!(
@@ -137,7 +155,10 @@ mod tests {
 
     #[test]
     fn test_deserialize_spec_invalid_type() {
-        let json_content = include_str!("test_data/spec_invalid_type.json");
+        let json_content = r#"{
+    "type": "write",
+    "version": 3
+}"#;
         let result: Result<Spec, _> = serde_json::from_str(json_content);
 
         assert!(
@@ -148,7 +169,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_spec_extra_fields() {
-        let json_content = include_str!("test_data/spec_extra_fields.json");
+        let json_content = r#"{
+    "type": "read",
+    "version": 7,
+    "extra_field": "should be ignored"
+}"#;
         let spec: Spec = serde_json::from_str(json_content)
             .expect("Failed to deserialize spec_extra_fields.json");
 
