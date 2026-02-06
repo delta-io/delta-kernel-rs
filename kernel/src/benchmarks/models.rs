@@ -63,8 +63,8 @@ mod tests {
     "name": "basic_append",
     "description": "A basic table with two append writes"
 }"#;
-        let table_info: TableInfo =
-            serde_json::from_str(json_content).expect("Failed to deserialize table_info.json");
+        let table_info: TableInfo = serde_json::from_str(json_content)
+            .expect("Failed to deserialize basic_append table info");
 
         assert_eq!(table_info.name, "basic_append");
         assert_eq!(
@@ -79,7 +79,7 @@ mod tests {
     "name": "table_without_description"
 }"#;
         let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_info_missing_description.json");
+            .expect("Failed to deserialize table_without_description table info");
 
         assert_eq!(table_info.name, "table_without_description");
         assert_eq!(table_info.description, None);
@@ -101,12 +101,12 @@ mod tests {
     #[test]
     fn test_deserialize_table_info_extra_fields() {
         let json_content = r#"{
-    "name": "table_with_extras",
+    "name": "table_with_extra_fields",
     "description": "A table with extra fields",
     "extra_field": "should be ignored"
 }"#;
         let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_info_extra_fields.json");
+            .expect("Failed to deserialize table_with_extra_fields table info");
 
         assert_eq!(table_info.name, "table_with_extras");
         assert_eq!(
@@ -122,7 +122,7 @@ mod tests {
     "version": 5
 }"#;
         let spec: Spec = serde_json::from_str(json_content)
-            .expect("Failed to deserialize spec_read_with_version.json");
+            .expect("Failed to deserialize read spec with version");
 
         let Spec::Read { version } = spec;
         assert_eq!(version, Some(5));
@@ -134,7 +134,7 @@ mod tests {
     "type": "read"
 }"#;
         let spec: Spec = serde_json::from_str(json_content)
-            .expect("Failed to deserialize spec_read_without_version.json");
+            .expect("Failed to deserialize read spec without version");
 
         let Spec::Read { version } = spec;
         assert_eq!(version, None);
@@ -175,7 +175,7 @@ mod tests {
     "extra_field": "should be ignored"
 }"#;
         let spec: Spec = serde_json::from_str(json_content)
-            .expect("Failed to deserialize spec_extra_fields.json");
+            .expect("Failed to deserialize read spec with extra fields");
 
         let Spec::Read { version } = spec;
         assert_eq!(version, Some(7));
