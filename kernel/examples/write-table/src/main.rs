@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{create_dir_all, write};
+use std::fs::create_dir_all;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -9,17 +9,16 @@ use arrow::util::pretty::print_batches;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use itertools::Itertools;
-use serde_json::{json, to_vec};
 use url::Url;
-use uuid::Uuid;
 
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
@@ -77,7 +76,7 @@ async fn try_main() -> DeltaResult<()> {
 
     // Get the engine for local filesystem
     use delta_kernel::engine::default::storage::store_from_url;
-    let engine = DefaultEngine::new(store_from_url(&url)?);
+    let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
@@ -88,7 +87,7 @@ async fn try_main() -> DeltaResult<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer)?
+        .transaction(committer, &engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
@@ -152,7 +151,7 @@ async fn create_or_get_base_snapshot(
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
-            create_table(url, &schema).await?;
+            create_table(url, &schema, engine).await?;
             Snapshot::builder_for(url.clone()).build(engine)
         }
     }
@@ -192,66 +191,13 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
     Ok(Arc::new(StructType::try_new(fields)?))
 }
 
-/// Create a new Delta table with the given schema.
-///
-/// Creating a Delta table is not officially supported by kernel-rs yet, so we manually create the
-/// initial transaction log.
-async fn create_table(table_url: &Url, schema: &SchemaRef) -> DeltaResult<()> {
-    let table_id = Uuid::new_v4().to_string();
-    let schema_str = serde_json::to_string(&schema)?;
-
-    let (reader_features, writer_features) = {
-        let reader_features: Vec<&'static str> = vec![];
-        let writer_features: Vec<&'static str> = vec![];
-
-        // TODO: Support adding specific table features
-        (reader_features, writer_features)
-    };
-
-    let protocol = json!({
-        "protocol": {
-            "minReaderVersion": 3,
-            "minWriterVersion": 7,
-            "readerFeatures": reader_features,
-            "writerFeatures": writer_features,
-        }
-    });
-    let partition_columns: Vec<String> = vec![];
-    let metadata = json!({
-        "metaData": {
-            "id": table_id,
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": schema_str,
-            "partitionColumns": partition_columns,
-            "configuration": {},
-            "createdTime": 1677811175819u64
-        }
-    });
-
-    let data = [
-        to_vec(&protocol).unwrap(),
-        b"\n".to_vec(),
-        to_vec(&metadata).unwrap(),
-    ]
-    .concat();
-
-    // Write the initial transaction with protocol and metadata to 0.json
-    let delta_log_path = table_url
-        .join("_delta_log/")?
-        .to_file_path()
-        .map_err(|_e| Error::generic("URL cannot be converted to local file path"))?;
-    let file_path = delta_log_path.join("00000000000000000000.json");
-
-    // Create the _delta_log directory if it doesn't exist
-    create_dir_all(&delta_log_path)
-        .map_err(|e| Error::generic(format!("Failed to create _delta_log directory: {e}")))?;
-
-    // Write the file using standard filesystem operations
-    write(&file_path, data)
-        .map_err(|e| Error::generic(format!("Failed to write initial transaction log: {e}")))?;
+/// Create a new Delta table with the given schema using the official CreateTable API.
+async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) -> DeltaResult<()> {
+    // Use the create_table API to create the table
+    let table_path = table_url.as_str();
+    let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
+        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())
@@ -317,14 +263,7 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> DeltaResult<_> {
-            let record_batch: RecordBatch = data?
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-            Ok(record_batch)
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
     print_batches(&batches)?;

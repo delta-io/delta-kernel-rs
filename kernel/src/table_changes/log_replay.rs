@@ -5,27 +5,28 @@ use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
+use crate::actions::visitors::visit_deletion_vector_at;
+use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
-use crate::path::ParsedLogPath;
+use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
-    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
-use crate::table_properties::TableProperties;
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
 use itertools::Itertools;
+use tracing::info;
 
 #[cfg(test)]
 mod tests;
@@ -52,15 +53,23 @@ pub(crate) struct TableChangesScanMetadata {
 /// (JSON) commit files.
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+
+    let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
+            let scanner = LogReplayScanner::try_new(
+                engine.as_ref(),
+                &mut current_configuration,
+                commit_file,
+                &table_schema,
+            )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
@@ -144,6 +153,7 @@ impl LogReplayScanner {
     /// For more details, see the documentation for [`LogReplayScanner`].
     fn try_new(
         engine: &dyn Engine,
+        table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
     ) -> DeltaResult<Self> {
@@ -158,15 +168,26 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary because
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
-        let action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&commit_file.location),
-            visitor_schema,
-            None, // not safe to apply data skipping yet
-        )?;
+        let mut action_iter = engine
+            .json_handler()
+            .read_json_files(
+                slice::from_ref(&commit_file.location),
+                visitor_schema,
+                None, // not safe to apply data skipping yet
+            )?
+            .peekable();
+
+        let mut in_commit_timestamp_opt = None;
+        if let Some(Ok(actions)) = action_iter.peek() {
+            let mut visitor = InCommitTimestampVisitor::default();
+            visitor.visit_rows_of(actions.as_ref())?;
+            in_commit_timestamp_opt = visitor.in_commit_timestamp;
+        }
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
+
         for actions in action_iter {
             let actions = actions?;
 
@@ -174,17 +195,16 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
-                protocol: None,
-                metadata_info: None,
             };
             visitor.visit_rows_of(actions.as_ref())?;
 
-            if let Some(protocol) = visitor.protocol {
-                ensure_cdf_read_supported(&protocol)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
-            }
-            if let Some((schema, configuration)) = visitor.metadata_info {
-                let schema: StructType = serde_json::from_str(&schema)?;
+            let metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            let has_metadata_update = metadata_opt.is_some();
+            let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+            let has_protocol_update = protocol_opt.is_some();
+
+            if let Some(ref metadata) = metadata_opt {
+                let schema = metadata.parse_schema()?;
                 // Currently, schema compatibility is defined as having equal schema types. In the
                 // future, more permisive schema evolution will be supported.
                 // See: https://github.com/delta-io/delta-kernel-rs/issues/523
@@ -192,8 +212,48 @@ impl LogReplayScanner {
                     table_schema.as_ref() == &schema,
                     Error::change_data_feed_incompatible_schema(table_schema, &schema)
                 );
-                let table_properties = TableProperties::from(configuration);
-                check_cdf_table_properties(&table_properties)
+            }
+
+            // Update table configuration with any new Protocol or Metadata from this commit
+            if has_metadata_update || has_protocol_update {
+                *table_configuration = TableConfiguration::try_new_from(
+                    table_configuration,
+                    metadata_opt,
+                    protocol_opt,
+                    commit_file.version,
+                )?;
+
+                let writer_features_str = table_configuration
+                    .protocol()
+                    .writer_features()
+                    .map(format_features)
+                    .unwrap_or_else(|| "[]".to_string());
+
+                info!(
+                    version = commit_file.version,
+                    id = table_configuration.metadata().id(),
+                    //Writer features is always a superset of reader features, so writer features is logged to trace the full set of table features
+                    writerFeatures = %writer_features_str,
+                    minReaderVersion = table_configuration.protocol().min_reader_version(),
+                    minWriterVersion = table_configuration.protocol().min_writer_version(),
+                    schemaString = %table_configuration.metadata().schema_string(),
+                    configuration = ?table_configuration.metadata().configuration(),
+                    "Table configuration updated during CDF query"
+                );
+            }
+
+            // If metadata is updated, check if Change Data Feed is enabled
+            if has_metadata_update {
+                require!(
+                    table_configuration.is_feature_enabled(&TableFeature::ChangeDataFeed),
+                    Error::change_data_feed_unsupported(commit_file.version)
+                );
+            }
+
+            // If protocol is updated, check if Change Data Feed is supported
+            if has_protocol_update {
+                table_configuration
+                    .ensure_operation_supported(Operation::Cdf)
                     .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
             }
         }
@@ -205,8 +265,33 @@ impl LogReplayScanner {
             // same as an `add` action.
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
+
+        // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
+        let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
+        {
+            let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
+                return Err(Error::generic(format!(
+                    "In-commit timestamp is enabled but not found in commit at version {}",
+                    commit_file.version
+                )));
+            };
+            in_commit_timestamp
+        } else {
+            commit_file.location.last_modified
+        };
+
+        info!(
+            version = commit_file.version,
+            id = table_configuration.metadata().id(),
+            remove_dvs_size = remove_dvs.len(),
+            has_cdc_action = has_cdc_action,
+            file_path = %commit_file.location.as_url(),
+            timestamp = timestamp,
+            "Phase 1 of CDF query processing completed"
+        );
+
         Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,
@@ -273,8 +358,6 @@ impl LogReplayScanner {
 // This is a visitor used in the prepare phase of [`LogReplayScanner`]. See
 // [`LogReplayScanner::try_new`] for details usage.
 struct PreparePhaseVisitor<'a> {
-    protocol: Option<Protocol>,
-    metadata_info: Option<(String, HashMap<String, String>)>,
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
@@ -287,6 +370,14 @@ impl PreparePhaseVisitor<'_> {
             StructField::nullable(CDC_NAME, Cdc::to_schema()),
             StructField::nullable(METADATA_NAME, Metadata::to_schema()),
             StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+            StructField::nullable(
+                COMMIT_INFO_NAME,
+                StructType::new_unchecked([StructField::new(
+                    "inCommitTimestamp",
+                    DataType::LONG,
+                    true,
+                )]),
+            ),
         ]))
     }
 }
@@ -299,8 +390,6 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             const INTEGER: DataType = DataType::INTEGER;
             const LONG: DataType = DataType::LONG;
             const BOOLEAN: DataType = DataType::BOOLEAN;
-            let string_list: DataType = ArrayType::new(STRING, false).into();
-            let string_string_map = MapType::new(STRING, STRING, false).into();
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (BOOLEAN, column_name!("add.dataChange")),
@@ -312,12 +401,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("remove.deletionVector.sizeInBytes")),
                 (LONG, column_name!("remove.deletionVector.cardinality")),
                 (STRING, column_name!("cdc.path")),
-                (STRING, column_name!("metaData.schemaString")),
-                (string_string_map, column_name!("metaData.configuration")),
-                (INTEGER, column_name!("protocol.minReaderVersion")),
-                (INTEGER, column_name!("protocol.minWriterVersion")),
-                (string_list.clone(), column_name!("protocol.readerFeatures")),
-                (string_list, column_name!("protocol.writerFeatures")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -327,7 +411,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 11,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
@@ -348,12 +432,6 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
                 *self.has_cdc_action = true;
-            } else if let Some(schema) = getters[10].get_str(i, "metaData.schemaString")? {
-                let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
-                let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-                self.metadata_info = Some((schema.to_string(), configuration));
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..])? {
-                self.protocol = Some(protocol);
             }
         }
         Ok(())

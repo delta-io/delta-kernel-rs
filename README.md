@@ -52,10 +52,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.18.0"
+delta_kernel = "0.19.0"
 
 # or turn on the default engine, based on latest arrow
-delta_kernel = { version = "0.18.0", features = ["default-engine", "arrow"] }
+delta_kernel = { version = "0.19.0", features = ["default-engine", "arrow"] }
 ```
 
 ### Feature flags
@@ -85,7 +85,6 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-55`: Use arrow version 55
 - `arrow-56`: Use arrow version 56
 - `arrow-57`: Use arrow version 57
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
@@ -107,7 +106,6 @@ and then checking what version of `object_store` it depends on.
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
-- [architecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
 
 ## Examples
 

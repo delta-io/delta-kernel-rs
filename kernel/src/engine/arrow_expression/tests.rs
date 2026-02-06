@@ -7,6 +7,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
@@ -535,7 +536,7 @@ impl OpaqueLessThanOp {
             panic!("Invalid arg count: {}", args.len());
         };
 
-        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::BOOLEAN));
+        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::INTEGER));
         Ok(op_fn(&eval(left)?, &eval(right)?)?)
     }
 }
@@ -673,11 +674,8 @@ fn test_null_row() {
         ],
     )
     .unwrap();
-    let result: RecordBatch = result
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .unwrap()
-        .into();
+
+    let result = result.try_into_record_batch().unwrap();
     assert_eq!(result, expected);
 }
 
@@ -698,11 +696,7 @@ fn test_null_row_err() {
 fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;
     let actual = handler.create_one(schema, values).unwrap();
-    let actual_rb: RecordBatch = actual
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .unwrap()
-        .into();
+    let actual_rb = actual.try_into_record_batch().unwrap();
     assert_eq!(actual_rb, expected);
 }
 
@@ -833,6 +827,8 @@ fn test_create_one_mismatching_scalar_types() {
 
 #[test]
 fn test_create_one_not_null_struct() {
+    // Creating a NOT NULL struct field with null values should error.
+    // The error comes from Arrow's RecordBatch validation (non-nullable column has nulls).
     let values: &[Scalar] = &[
         Scalar::Null(KernelDataType::INTEGER),
         Scalar::Null(KernelDataType::INTEGER),
@@ -847,12 +843,14 @@ fn test_create_one_not_null_struct() {
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
         handler.create_one(schema, values),
-        "Invalid struct data: Top-level nulls in struct are not supported",
+        "Column 'a' is declared as non-nullable but contains null values",
     );
 }
 
 #[test]
 fn test_create_one_top_level_null() {
+    // Creating a NOT NULL field with null value should error.
+    // The error comes from Arrow's RecordBatch validation.
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
@@ -860,10 +858,10 @@ fn test_create_one_top_level_null() {
         "col_1",
         KernelDataType::INTEGER,
     )]));
-    assert!(matches!(
+    assert_result_error_with_message(
         handler.create_one(schema, values),
-        Err(Error::InvalidStructData(_))
-    ));
+        "Column 'col_1' is declared as non-nullable but contains null values",
+    );
 }
 
 #[test]

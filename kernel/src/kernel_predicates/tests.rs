@@ -11,12 +11,33 @@ use crate::DeltaResult;
 
 use std::collections::HashMap;
 
+/// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
+trait LogicalEq {
+    fn logical_eq(&self, other: &Self) -> bool;
+}
+
+impl LogicalEq for Option<Scalar> {
+    fn logical_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Some(a), Some(b)) => a.logical_eq(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl LogicalEq for Option<bool> {
+    fn logical_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 macro_rules! expect_eq {
     ( $expr: expr, $expect: expr, $fmt: literal ) => {
         let expect = ($expect);
         let result = ($expr);
         assert!(
-            result == expect,
+            result.logical_eq(&expect),
             "Expected {} = {:?}, got {:?}",
             format!($fmt),
             expect,
@@ -31,27 +52,27 @@ impl ResolveColumnAsScalar for Scalar {
     }
 }
 
-#[test]
-fn test_default_eval_scalar() {
-    let test_cases = [
-        (Scalar::Boolean(true), false, Some(true)),
-        (Scalar::Boolean(true), true, Some(false)),
-        (Scalar::Boolean(false), false, Some(false)),
-        (Scalar::Boolean(false), true, Some(true)),
-        (Scalar::Long(1), false, None),
-        (Scalar::Long(1), true, None),
-        (Scalar::Null(DataType::BOOLEAN), false, None),
-        (Scalar::Null(DataType::BOOLEAN), true, None),
-        (Scalar::Null(DataType::LONG), false, None),
-        (Scalar::Null(DataType::LONG), true, None),
-    ];
-    for (value, inverted, expect) in test_cases.into_iter() {
-        assert_eq!(
-            KernelPredicateEvaluatorDefaults::eval_pred_scalar(&value, inverted),
-            expect,
-            "value: {value:?} inverted: {inverted}"
-        );
-    }
+#[rstest::rstest]
+#[case::bool_true_not_inverted(Scalar::Boolean(true), false, Some(true))]
+#[case::bool_true_inverted(Scalar::Boolean(true), true, Some(false))]
+#[case::bool_false_not_inverted(Scalar::Boolean(false), false, Some(false))]
+#[case::bool_false_inverted(Scalar::Boolean(false), true, Some(true))]
+#[case::long_not_inverted(Scalar::Long(1), false, None)]
+#[case::long_inverted(Scalar::Long(1), true, None)]
+#[case::null_boolean_not_inverted(Scalar::Null(DataType::BOOLEAN), false, None)]
+#[case::null_boolean_inverted(Scalar::Null(DataType::BOOLEAN), true, None)]
+#[case::null_long_not_inverted(Scalar::Null(DataType::LONG), false, None)]
+#[case::null_long_inverted(Scalar::Null(DataType::LONG), true, None)]
+fn test_default_eval_scalar(
+    #[case] value: Scalar,
+    #[case] inverted: bool,
+    #[case] expect: Option<bool>,
+) {
+    assert_eq!(
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(&value, inverted),
+        expect,
+        "value: {value:?} inverted: {inverted}"
+    );
 }
 
 // verifies that partial orderings behave as expected for all Scalar types
@@ -427,46 +448,42 @@ fn test_eval_junction() {
     }
 }
 
-#[test]
-fn test_eval_column() {
-    let test_cases = [
-        (Scalar::from(true), Some(true)),
-        (Scalar::from(false), Some(false)),
-        (Scalar::Null(DataType::BOOLEAN), None),
-        (Scalar::from(1), None),
-    ];
+#[rstest::rstest]
+#[case::bool_true(Scalar::from(true), Some(true))]
+#[case::bool_false(Scalar::from(false), Some(false))]
+#[case::null_boolean(Scalar::Null(DataType::BOOLEAN), None)]
+#[case::long(Scalar::from(1), None)]
+fn test_eval_column(
+    #[case] input: Scalar,
+    #[case] expect: Option<bool>,
+    #[values(true, false)] inverted: bool,
+) {
     let col = &column_name!("x");
-    for (input, expect) in &test_cases {
-        let filter = DefaultKernelPredicateEvaluator::from(input.clone());
-        for inverted in [true, false] {
-            expect_eq!(
-                filter.eval_pred_column(col, inverted),
-                expect.map(|v| v != inverted),
-                "{input:?} (inverted: {inverted})"
-            );
-        }
-    }
+    let filter = DefaultKernelPredicateEvaluator::from(input.clone());
+    expect_eq!(
+        filter.eval_pred_column(col, inverted),
+        expect.map(|v| v != inverted),
+        "{input:?} (inverted: {inverted})"
+    );
 }
 
-#[test]
-fn test_eval_not() {
-    let test_cases = [
-        (Scalar::Boolean(true), Some(false)),
-        (Scalar::Boolean(false), Some(true)),
-        (Scalar::Null(DataType::BOOLEAN), None),
-        (Scalar::Long(1), None),
-    ];
+#[rstest::rstest]
+#[case::bool_true(Scalar::Boolean(true), Some(false))]
+#[case::bool_false(Scalar::Boolean(false), Some(true))]
+#[case::null_boolean(Scalar::Null(DataType::BOOLEAN), None)]
+#[case::long(Scalar::Long(1), None)]
+fn test_eval_not(
+    #[case] input: Scalar,
+    #[case] expect: Option<bool>,
+    #[values(true, false)] inverted: bool,
+) {
     let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
-    for (input, expect) in test_cases {
-        let input = Pred::from_expr(input);
-        for inverted in [true, false] {
-            expect_eq!(
-                filter.eval_pred_not(&input, inverted),
-                expect.map(|v| v != inverted),
-                "NOT({input:?}) (inverted: {inverted})"
-            );
-        }
-    }
+    let input = Pred::from_expr(input);
+    expect_eq!(
+        filter.eval_pred_not(&input, inverted),
+        expect.map(|v| v != inverted),
+        "NOT({input:?}) (inverted: {inverted})"
+    );
 }
 
 #[test]

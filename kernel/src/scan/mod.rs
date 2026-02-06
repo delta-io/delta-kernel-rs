@@ -18,17 +18,18 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::LogSegment;
-use crate::scan::log_replay::BASE_ROW_ID_NAME;
-use crate::scan::state::{DvInfo, Stats};
+use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::parallel::parallel_phase::ParallelPhase;
+use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
+use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
+    StructType, ToSchema as _,
 };
-use crate::table_features::ColumnMappingMode;
+use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -39,23 +40,59 @@ pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
 
+// Re-export types for public API
+pub use log_replay::ScanLogReplayProcessor;
+
+#[cfg(test)]
+pub(crate) mod test_utils;
+
+#[cfg(test)]
+mod tests;
+
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
-static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     get_commit_schema()
         .project(&[ADD_NAME, REMOVE_NAME])
         .unwrap()
 });
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
-static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
+pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+
+/// Type alias for the sequential (Phase 1) scan metadata processing.
+///
+/// This phase processes commits and single-part checkpoint manifests sequentially.
+/// After exhaustion, call `finish()` to get the result which indicates whether
+/// a distributed phase is needed.
+#[internal_api]
+#[allow(unused)]
+pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
+
+/// Type alias for the distributed (Phase 2) scan metadata processing.
+///
+/// This phase processes checkpoint sidecars or multi-part checkpoint parts in parallel.
+/// Create this phase from the files contained in [`AfterPhase1ScanMetadata::Parallel`].
+#[internal_api]
+#[allow(unused)]
+pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
+
+/// Type alias for the result after Phase 1 scan metadata processing completes.
+///
+/// This enum indicates whether distributed processing is needed:
+/// - `Done`: All processing completed sequentially - no distributed phase needed.
+/// - `Parallel`: Contains processor and files for parallel processing.
+#[internal_api]
+#[allow(unused)]
+pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    stats_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -63,6 +100,7 @@ impl std::fmt::Debug for ScanBuilder {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
+            .field("stats_columns", &self.stats_columns)
             .finish()
     }
 }
@@ -74,6 +112,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            stats_columns: None,
         }
     }
 
@@ -106,8 +145,35 @@ impl ScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
+    ///
+    /// NOTE: This method cannot currently be used together with [`include_stats_columns`].
+    /// Using both will result in an error when calling [`build`]. See [#1751] for tracking.
+    ///
+    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
+    /// [`build`]: ScanBuilder::build
+    /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
+        self
+    }
+
+    /// Include all parsed statistics in scan metadata.
+    ///
+    /// When enabled, the scan will include a `stats_parsed` column in the scan metadata
+    /// containing pre-parsed file statistics (minValues, maxValues, nullCount, numRecords)
+    /// that integrations can use for their own data skipping logic.
+    ///
+    /// The statistics schema is determined by the table's configuration
+    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`).
+    ///
+    /// NOTE: This method cannot currently be used together with [`with_predicate`]. Using both
+    /// will result in an error when calling [`build`]. See [#1751] for tracking.
+    ///
+    /// [`with_predicate`]: ScanBuilder::with_predicate
+    /// [`build`]: ScanBuilder::build
+    /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
+    pub fn include_stats_columns(mut self) -> Self {
+        self.stats_columns = Some(Vec::new());
         self
     }
 
@@ -121,11 +187,16 @@ impl ScanBuilder {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
+        self.snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Scan)?;
+
         let state_info = StateInfo::try_new(
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            (), // No classifer, default is for scans
+            self.stats_columns,
+            (), // No classifier, default is for scans
         )?;
 
         Ok(Scan {
@@ -263,6 +334,35 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
+static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
+
+    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
+    StructType::new_unchecked(vec![StructField::nullable(
+        "add",
+        StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("partitionValues", partition_values),
+            StructField::not_null("size", DataType::LONG),
+            StructField::nullable("modificationTime", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable(
+                "tags",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+            StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+            StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
+        ]),
+    )])
+    .into()
+});
+
+pub(crate) fn restored_add_schema() -> &'static SchemaRef {
+    &RESTORED_ADD_SCHEMA
+}
+
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
@@ -374,6 +474,21 @@ impl Scan {
         }
     }
 
+    /// Get the logical schema for file statistics.
+    ///
+    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
+    /// contains file statistics read using physical column names (to handle column mapping).
+    /// This method returns the corresponding logical schema that maps those physical column
+    /// names back to the table's logical column names, enabling engines to interpret the stats
+    /// correctly.
+    ///
+    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
+        self.state_info.logical_stats_schema.as_ref()
+    }
+
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:
@@ -397,7 +512,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -450,29 +566,6 @@ impl Scan {
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
-        static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
-            let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            DataType::struct_type_unchecked(vec![StructField::nullable(
-                "add",
-                DataType::struct_type_unchecked(vec![
-                    StructField::not_null("path", DataType::STRING),
-                    StructField::not_null("partitionValues", partition_values),
-                    StructField::not_null("size", DataType::LONG),
-                    StructField::nullable("modificationTime", DataType::LONG),
-                    StructField::nullable("stats", DataType::STRING),
-                    StructField::nullable(
-                        "tags",
-                        MapType::new(DataType::STRING, DataType::STRING, true),
-                    ),
-                    StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-                    StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-                    StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-                ]),
-            )])
-        });
-
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
@@ -489,20 +582,30 @@ impl Scan {
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
-            RESTORED_ADD_SCHEMA.clone(),
+            restored_add_schema().clone().into(),
         )?;
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
 
+        let log_segment = self.snapshot.log_segment();
+
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Since we're only processing existing data (no checkpoint), we use the base schema
+        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+                actions: existing_data.into_iter().map(apply_transform),
+                checkpoint_info: CheckpointReadInfo {
+                    has_stats_parsed: false,
+                    checkpoint_read_schema: restored_add_schema().clone(),
+                },
+            };
+            return Ok(Box::new(
+                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+            ));
         }
-
-        let log_segment = self.snapshot.log_segment();
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -516,40 +619,60 @@ impl Scan {
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
-        let listed_log_files = ListedLogFiles {
+        let listed_log_files = ListedLogFilesBuilder {
             ascending_commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
             latest_commit_file: log_segment.latest_commit_file.clone(),
-        };
+            ..Default::default()
+        }
+        .build()?;
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
+            None, // No checkpoint in this incremental segment
         )?;
 
-        let it = new_log_segment
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
-                COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
-                None,
-            )?
-            .chain(existing_data.into_iter().map(apply_transform));
+        // For incremental reads, new_log_segment has no checkpoint but we use the
+        // checkpoint schema returned by the function for consistency.
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+            self.state_info
+                .physical_stats_schema
+                .as_ref()
+                .map(|s| s.as_ref()),
+        )?;
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .chain(existing_data.into_iter().map(apply_transform)),
+            checkpoint_info: result.checkpoint_info,
+        };
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            actions_with_checkpoint_info,
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
+            impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            actions_with_checkpoint_info.actions,
+            self.state_info.clone(),
+            actions_with_checkpoint_info.checkpoint_info,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -557,7 +680,9 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
@@ -567,7 +692,86 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
+    }
+
+    /// Start a parallel scan metadata processing for the table.
+    ///
+    /// This method returns a [`Phase1ScanMetadata`] iterator that processes commits and
+    /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
+    /// to determine if a distributed phase is needed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::{Engine, DeltaResult};
+    /// # use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+    /// # use delta_kernel::Snapshot;
+    /// # use url::Url;
+    /// # use delta_kernel::engine::default::DefaultEngineBuilder;
+    /// # use object_store::local::LocalFileSystem;
+    /// # fn main() -> DeltaResult<()> {
+    /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+    /// let table_root = Url::parse("file:///path/to/table")?;
+    ///
+    /// // Build a snapshot
+    /// let snapshot = Snapshot::builder_for(table_root.clone())
+    ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
+    ///     .build(engine.as_ref())?;
+    /// let scan = snapshot.scan_builder().build()?;
+    /// let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+    ///
+    /// // Process sequential phase
+    /// for result in phase1.by_ref() {
+    ///     let scan_metadata = result?;
+    ///     // Process scan metadata...
+    /// }
+    ///
+    /// // Check if distributed phase is needed
+    /// match phase1.finish()? {
+    ///     AfterPhase1ScanMetadata::Done(_) => {
+    ///         // All processing complete
+    ///     }
+    ///     AfterPhase1ScanMetadata::Parallel { processor, files } => {
+    ///         // Wrap processor in Arc for sharing across threads
+    ///         let processor = Arc::new(processor);
+    ///         // Distribute files for parallel processing (e.g., one file per worker)
+    ///         for file in files {
+    ///             let phase2 = Phase2ScanMetadata::try_new(
+    ///                 engine.clone(),
+    ///                 processor.clone(),
+    ///                 vec![file],
+    ///             )?;
+    ///             for result in phase2 {
+    ///                 let scan_metadata = result?;
+    ///                 // Process scan metadata...
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn parallel_scan_metadata(
+        &self,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<Phase1ScanMetadata> {
+        // For the sequential/parallel phase approach, we use a conservative checkpoint_info
+        // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
+        // currently support stats_parsed optimization.
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+        };
+        let processor =
+            ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone(), checkpoint_info)?;
+        SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
@@ -579,28 +783,9 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + use<'_>> {
-        struct ScanFile {
-            path: String,
-            size: i64,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-        }
-        fn scan_metadata_callback(
-            batches: &mut Vec<ScanFile>,
-            path: &str,
-            size: i64,
-            _: Option<Stats>,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-            _: HashMap<String, String>,
-        ) {
-            batches.push(ScanFile {
-                path: path.to_string(),
-                size,
-                dv_info,
-                transform,
-            });
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+        fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
+            batches.push(file);
         }
 
         debug!(
@@ -620,6 +805,8 @@ impl Scan {
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
 
+        let physical_schema = self.physical_schema().clone();
+        let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
@@ -643,19 +830,21 @@ impl Scan {
                 // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
-                    self.physical_schema().clone(),
+                    physical_schema.clone(),
                     None,
                 )?;
 
                 let engine = engine.clone(); // Arc clone
+                let physical_schema_inner = physical_schema.clone();
+                let logical_schema_inner = logical_schema.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        self.physical_schema(),
-                        self.logical_schema(),
+                        &physical_schema_inner,
+                        &logical_schema_inner,
                         scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
@@ -702,6 +891,7 @@ impl Scan {
 ///      tags: map<string, string>,
 ///      baseRowId: long,
 ///      defaultRowCommitVersion: long,
+///      clusteringProvider: string,
 ///    }
 /// }
 /// ```
@@ -717,674 +907,4 @@ pub fn selection_vector(
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
-}
-
-// some utils that are used in file_stream.rs and state.rs tests
-#[cfg(test)]
-pub(crate) mod test_utils {
-    use crate::arrow::array::StringArray;
-    use crate::scan::state_info::StateInfo;
-    use crate::schema::StructType;
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use itertools::Itertools;
-    use std::sync::Arc;
-
-    use crate::log_replay::ActionsBatch;
-    use crate::{
-        actions::get_commit_schema,
-        engine::{
-            arrow_data::ArrowEngineData,
-            sync::{json::SyncJsonHandler, SyncEngine},
-        },
-        scan::log_replay::scan_action_iter,
-        schema::SchemaRef,
-        JsonHandler,
-    };
-
-    use super::state::ScanCallback;
-    use super::PhysicalPredicate;
-    use crate::table_features::ColumnMappingMode;
-    use crate::transforms::TransformSpec;
-
-    // Generates a batch of sidecar actions with the given paths.
-    // The schema is provided as null columns affect equality checks.
-    pub(crate) fn sidecar_batch_with_given_paths(
-        paths: Vec<&str>,
-        output_schema: SchemaRef,
-    ) -> Box<ArrowEngineData> {
-        let handler = SyncJsonHandler {};
-
-        let mut json_strings: Vec<String> = paths
-        .iter()
-        .map(|path| {
-            format!(
-                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
-            )
-        })
-        .collect();
-        json_strings.push(r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#.to_string());
-
-        let json_strings_array: StringArray =
-            json_strings.iter().map(|s| s.as_str()).collect_vec().into();
-
-        let parsed = handler
-            .parse_json(
-                string_array_to_engine_data(json_strings_array),
-                output_schema,
-            )
-            .unwrap();
-
-        ArrowEngineData::try_from_engine_data(parsed).unwrap()
-    }
-
-    // Generates a batch with an add action.
-    // The schema is provided as null columns affect equality checks.
-    pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-        let handler = SyncJsonHandler {};
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-        ]
-        .into();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-        ArrowEngineData::try_from_engine_data(parsed).unwrap()
-    }
-
-    // Generates a batch with an add action.
-    // The schema is provided as null columns affect equality checks.
-    pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-        let handler = SyncJsonHandler {};
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId": 42, "tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col"},"createdTime":1677811175819}}"#,
-        ]
-        .into();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-        ArrowEngineData::try_from_engine_data(parsed).unwrap()
-    }
-
-    // An add batch with a removed file parsed with the schema provided
-    pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-        let handler = SyncJsonHandler {};
-        let json_strings: StringArray = vec![
-            r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-        ]
-        .into();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-        ArrowEngineData::try_from_engine_data(parsed).unwrap()
-    }
-
-    // add batch with a `date` partition col
-    pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
-        let handler = SyncJsonHandler {};
-        let json_strings: StringArray = vec![
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues": {"date": "2017-12-11"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
-        ]
-        .into();
-        let output_schema = get_commit_schema().clone();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-        ArrowEngineData::try_from_engine_data(parsed).unwrap()
-    }
-
-    /// Create a scan action iter and validate what's called back. If you pass `None` as
-    /// `logical_schema`, `transform` should also be `None`
-    #[allow(clippy::vec_box)]
-    pub(crate) fn run_with_validate_callback<T: Clone>(
-        batch: Vec<Box<ArrowEngineData>>,
-        logical_schema: Option<SchemaRef>,
-        transform_spec: Option<Arc<TransformSpec>>,
-        expected_sel_vec: &[bool],
-        context: T,
-        validate_callback: ScanCallback<T>,
-    ) {
-        let logical_schema =
-            logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
-        let state_info = Arc::new(StateInfo {
-            logical_schema: logical_schema.clone(),
-            physical_schema: logical_schema,
-            physical_predicate: PhysicalPredicate::None,
-            transform_spec,
-            column_mapping_mode: ColumnMappingMode::None,
-        });
-        let iter = scan_action_iter(
-            &SyncEngine::new(),
-            batch
-                .into_iter()
-                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            state_info,
-        )
-        .unwrap();
-        let mut batch_count = 0;
-        for res in iter {
-            let scan_metadata = res.unwrap();
-            assert_eq!(
-                scan_metadata.scan_files.selection_vector(),
-                expected_sel_vec
-            );
-            scan_metadata
-                .visit_scan_files(context.clone(), validate_callback)
-                .unwrap();
-            batch_count += 1;
-        }
-        assert_eq!(batch_count, 1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use crate::arrow::array::BooleanArray;
-    use crate::arrow::compute::filter_record_batch;
-    use crate::arrow::record_batch::RecordBatch;
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
-    use crate::schema::{ColumnMetadataKey, PrimitiveType, StructType};
-    use crate::Snapshot;
-
-    use super::*;
-
-    #[test]
-    fn test_static_skipping() {
-        const NULL: Pred = Pred::null_literal();
-        let test_cases = [
-            (false, column_pred!("a")),
-            (true, Pred::literal(false)),
-            (false, Pred::literal(true)),
-            (true, NULL),
-            (true, Pred::and(column_pred!("a"), Pred::literal(false))),
-            (false, Pred::or(column_pred!("a"), Pred::literal(true))),
-            (false, Pred::or(column_pred!("a"), Pred::literal(false))),
-            (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
-            (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
-            (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-            (true, Pred::and(NULL, column_pred!("a"))),
-        ];
-        for (should_skip, predicate) in test_cases {
-            assert_eq!(
-                can_statically_skip_all_files(&predicate),
-                should_skip,
-                "Failed for predicate: {predicate:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_physical_predicate() {
-        let logical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG).with_metadata([(
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                "phys_b",
-            )]),
-            StructField::nullable("phys_b", DataType::LONG).with_metadata([(
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                "phys_c",
-            )]),
-            StructField::nullable(
-                "nested",
-                StructType::new_unchecked(vec![
-                    StructField::nullable("x", DataType::LONG),
-                    StructField::nullable("y", DataType::LONG).with_metadata([(
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_y",
-                    )]),
-                ]),
-            ),
-            StructField::nullable(
-                "mapped",
-                StructType::new_unchecked(vec![StructField::nullable("n", DataType::LONG)
-                    .with_metadata([(
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_n",
-                    )])]),
-            )
-            .with_metadata([(
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                "phys_mapped",
-            )]),
-        ]);
-
-        // NOTE: We break several column mapping rules here because they don't matter for this
-        // test. For example, we do not provide field ids, and not all columns have physical names.
-        let test_cases = [
-            (Pred::literal(true), Some(PhysicalPredicate::None)),
-            (Pred::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
-            (column_pred!("x"), None), // no such column
-            (
-                column_pred!("a"),
-                Some(PhysicalPredicate::Some(
-                    column_pred!("a").into(),
-                    StructType::new_unchecked(vec![StructField::nullable("a", DataType::LONG)])
-                        .into(),
-                )),
-            ),
-            (
-                column_pred!("b"),
-                Some(PhysicalPredicate::Some(
-                    column_pred!("phys_b").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_b",
-                        DataType::LONG,
-                    )
-                    .with_metadata([(
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_b",
-                    )])])
-                    .into(),
-                )),
-            ),
-            (
-                column_pred!("nested.x"),
-                Some(PhysicalPredicate::Some(
-                    column_pred!("nested.x").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "nested",
-                        StructType::new_unchecked(vec![StructField::nullable("x", DataType::LONG)]),
-                    )])
-                    .into(),
-                )),
-            ),
-            (
-                column_pred!("nested.y"),
-                Some(PhysicalPredicate::Some(
-                    column_pred!("nested.phys_y").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "nested",
-                        StructType::new_unchecked(vec![StructField::nullable(
-                            "phys_y",
-                            DataType::LONG,
-                        )
-                        .with_metadata([(
-                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                            "phys_y",
-                        )])]),
-                    )])
-                    .into(),
-                )),
-            ),
-            (
-                column_pred!("mapped.n"),
-                Some(PhysicalPredicate::Some(
-                    column_pred!("phys_mapped.phys_n").into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_mapped",
-                        StructType::new_unchecked(vec![StructField::nullable(
-                            "phys_n",
-                            DataType::LONG,
-                        )
-                        .with_metadata([(
-                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                            "phys_n",
-                        )])]),
-                    )
-                    .with_metadata([(
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_mapped",
-                    )])])
-                    .into(),
-                )),
-            ),
-            (
-                Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
-                Some(PhysicalPredicate::Some(
-                    Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_mapped",
-                        StructType::new_unchecked(vec![StructField::nullable(
-                            "phys_n",
-                            DataType::LONG,
-                        )
-                        .with_metadata([(
-                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                            "phys_n",
-                        )])]),
-                    )
-                    .with_metadata([(
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_mapped",
-                    )])])
-                    .into(),
-                )),
-            ),
-            (
-                Pred::and(column_pred!("mapped.n"), Pred::literal(false)),
-                Some(PhysicalPredicate::StaticSkipAll),
-            ),
-        ];
-
-        for (predicate, expected) in test_cases {
-            let result =
-                PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name)
-                    .ok();
-            assert_eq!(
-                result, expected,
-                "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
-            );
-        }
-    }
-
-    fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
-        let scan_metadata_iter = scan.scan_metadata(engine)?;
-        fn scan_metadata_callback(
-            paths: &mut Vec<String>,
-            path: &str,
-            _size: i64,
-            _: Option<Stats>,
-            dv_info: DvInfo,
-            _transform: Option<ExpressionRef>,
-            _partition_values: HashMap<String, String>,
-        ) {
-            paths.push(path.to_string());
-            assert!(dv_info.deletion_vector.is_none());
-        }
-        let mut files = vec![];
-        for res in scan_metadata_iter {
-            let scan_metadata = res?;
-            files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
-        }
-        Ok(files)
-    }
-
-    #[test]
-    fn test_scan_metadata_paths() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let scan = snapshot.scan_builder().build().unwrap();
-        let files = get_files_for_scan(scan, &engine).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(
-            files[0],
-            "part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"
-        );
-    }
-
-    #[test_log::test]
-    fn test_scan_metadata() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = Arc::new(SyncEngine::new());
-
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-        let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<Box<dyn EngineData>> = scan.execute(engine).unwrap().try_collect().unwrap();
-
-        assert_eq!(files.len(), 1);
-        let num_rows = files[0].as_ref().len();
-        assert_eq!(num_rows, 10)
-    }
-
-    #[test_log::test]
-    fn test_scan_metadata_from_same_version() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = Arc::new(SyncEngine::new());
-
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-        let version = snapshot.version();
-        let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<_> = scan
-            .scan_metadata(engine.as_ref())
-            .unwrap()
-            .map_ok(|ScanMetadata { scan_files, .. }| {
-                let (underlying_data, selection_vector) = scan_files.into_parts();
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                    .unwrap()
-                    .into();
-                let filtered_batch =
-                    filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-                Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
-            })
-            .try_collect()
-            .unwrap();
-        let new_files: Vec<_> = scan
-            .scan_metadata_from(engine.as_ref(), version, files, None)
-            .unwrap()
-            .try_collect()
-            .unwrap();
-
-        assert_eq!(new_files.len(), 1);
-    }
-
-    // reading v0 with 3 files.
-    // updating to v1 with 3 more files added.
-    #[test_log::test]
-    fn test_scan_metadata_from_with_update() {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = Arc::new(SyncEngine::new());
-
-        let snapshot = Snapshot::builder_for(url.clone())
-            .at_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-        let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<_> = scan
-            .scan_metadata(engine.as_ref())
-            .unwrap()
-            .map_ok(|ScanMetadata { scan_files, .. }| {
-                let (underlying_data, selection_vector) = scan_files.into_parts();
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                    .unwrap()
-                    .into();
-                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
-            })
-            .try_collect()
-            .unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].num_rows(), 3);
-
-        let files: Vec<_> = files
-            .into_iter()
-            .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
-            .collect();
-        let snapshot = Snapshot::builder_for(url)
-            .at_version(1)
-            .build(engine.as_ref())
-            .unwrap();
-        let scan = snapshot.scan_builder().build().unwrap();
-        let new_files: Vec<_> = scan
-            .scan_metadata_from(engine.as_ref(), 0, files, None)
-            .unwrap()
-            .map_ok(|ScanMetadata { scan_files, .. }| {
-                let (underlying_data, selection_vector) = scan_files.into_parts();
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                    .unwrap()
-                    .into();
-                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
-            })
-            .try_collect()
-            .unwrap();
-        assert_eq!(new_files.len(), 2);
-        assert_eq!(new_files[0].num_rows(), 3);
-        assert_eq!(new_files[1].num_rows(), 3);
-    }
-
-    #[test]
-    fn test_get_partition_value() {
-        let cases = [
-            (
-                "string",
-                PrimitiveType::String,
-                Scalar::String("string".to_string()),
-            ),
-            ("123", PrimitiveType::Integer, Scalar::Integer(123)),
-            ("1234", PrimitiveType::Long, Scalar::Long(1234)),
-            ("12", PrimitiveType::Short, Scalar::Short(12)),
-            ("1", PrimitiveType::Byte, Scalar::Byte(1)),
-            ("1.1", PrimitiveType::Float, Scalar::Float(1.1)),
-            ("10.10", PrimitiveType::Double, Scalar::Double(10.1)),
-            ("true", PrimitiveType::Boolean, Scalar::Boolean(true)),
-            ("2024-01-01", PrimitiveType::Date, Scalar::Date(19723)),
-            ("1970-01-01", PrimitiveType::Date, Scalar::Date(0)),
-            (
-                "1970-01-01 00:00:00",
-                PrimitiveType::Timestamp,
-                Scalar::Timestamp(0),
-            ),
-            (
-                "1970-01-01 00:00:00.123456",
-                PrimitiveType::Timestamp,
-                Scalar::Timestamp(123456),
-            ),
-            (
-                "1970-01-01 00:00:00.123456789",
-                PrimitiveType::Timestamp,
-                Scalar::Timestamp(123456),
-            ),
-        ];
-
-        for (raw, data_type, expected) in &cases {
-            let value = crate::transforms::parse_partition_value_raw(
-                Some(&raw.to_string()),
-                &DataType::Primitive(data_type.clone()),
-            )
-            .unwrap();
-            assert_eq!(value, *expected);
-        }
-    }
-
-    #[test]
-    fn test_replay_for_scan_metadata() {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-        let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-        let engine = SyncEngine::new();
-
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let scan = snapshot.scan_builder().build().unwrap();
-        let data: Vec<_> = scan
-            .replay_for_scan_metadata(&engine)
-            .unwrap()
-            .try_collect()
-            .unwrap();
-        // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
-        // could be skipped when looking for adds/removes.
-        //
-        // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-        assert_eq!(data.len(), 5);
-    }
-
-    #[test]
-    fn test_data_row_group_skipping() {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-        let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-        let engine = Arc::new(SyncEngine::new());
-
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-        // No predicate pushdown attempted, so the one data file should be returned.
-        //
-        // NOTE: The data file contains only five rows -- near guaranteed to produce one row group.
-        let scan = snapshot.clone().scan_builder().build().unwrap();
-        let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 1);
-
-        // Ineffective predicate pushdown attempted, so the one data file should be returned.
-        let int_col = column_expr!("numeric.ints.int32");
-        let value = Expr::literal(1000i32);
-        let predicate = Arc::new(int_col.clone().gt(value.clone()));
-        let scan = snapshot
-            .clone()
-            .scan_builder()
-            .with_predicate(predicate)
-            .build()
-            .unwrap();
-        let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 1);
-
-        // TODO(#860): we disable predicate pushdown until we support row indexes. Update this test
-        // accordingly after support is reintroduced.
-        //
-        // Effective predicate pushdown, so no data files should be returned. BUT since we disabled
-        // predicate pushdown, the one data file is still returned.
-        let predicate = Arc::new(int_col.lt(value));
-        let scan = snapshot
-            .scan_builder()
-            .with_predicate(predicate)
-            .build()
-            .unwrap();
-        let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 1);
-    }
-
-    #[test]
-    fn test_missing_column_row_group_skipping() {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-        let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-        let engine = Arc::new(SyncEngine::new());
-
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-        // Predicate over a logically valid but physically missing column. No data files should be
-        // returned because the column is inferred to be all-null.
-        //
-        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
-        // optimization is currently disabled, so the one data file is still returned.
-        let predicate = Arc::new(column_expr!("missing").lt(Expr::literal(1000i64)));
-        let scan = snapshot
-            .clone()
-            .scan_builder()
-            .with_predicate(predicate)
-            .build()
-            .unwrap();
-        let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 1);
-
-        // Predicate over a logically missing column fails the scan
-        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(Expr::literal(1000)));
-        snapshot
-            .scan_builder()
-            .with_predicate(predicate)
-            .build()
-            .expect_err("unknown column");
-    }
-
-    #[test_log::test]
-    fn test_scan_with_checkpoint() -> DeltaResult<()> {
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/with_checkpoint_no_last_checkpoint/",
-        ))?;
-
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let scan = snapshot.scan_builder().build()?;
-        let files = get_files_for_scan(scan, &engine)?;
-        // test case:
-        //
-        // commit0:     P and M, no add/remove
-        // commit1:     add file-ad1
-        // commit2:     remove file-ad1, add file-a19
-        // checkpoint2: remove file-ad1, add file-a19
-        // commit3:     remove file-a19, add file-70b
-        //
-        // thus replay should produce only file-70b
-        assert_eq!(
-            files,
-            vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
-        );
-        Ok(())
-    }
 }

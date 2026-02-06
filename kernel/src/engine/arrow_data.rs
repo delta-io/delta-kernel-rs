@@ -30,6 +30,32 @@ pub struct ArrowEngineData {
     data: RecordBatch,
 }
 
+/// A trait to allow easy conversion from [`EngineData`] to an arrow [``RecordBatch`]. Returns an
+/// error if called on an `EngineData` that is not an `ArrowEngineData`.
+pub trait EngineDataArrowExt {
+    fn try_into_record_batch(self) -> DeltaResult<RecordBatch>;
+}
+
+impl EngineDataArrowExt for Box<dyn EngineData> {
+    fn try_into_record_batch(self) -> DeltaResult<RecordBatch> {
+        Ok(self
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+            .into())
+    }
+}
+
+impl EngineDataArrowExt for DeltaResult<Box<dyn EngineData>> {
+    fn try_into_record_batch(self) -> DeltaResult<RecordBatch> {
+        Ok(self?
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+            .into())
+    }
+}
+
 /// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
 pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
     let Some(arrow_data) = engine_data.any_ref().downcast_ref::<ArrowEngineData>() else {

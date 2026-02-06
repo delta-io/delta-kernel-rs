@@ -1,28 +1,24 @@
 //! Some utilities for working with arrow data types
 
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
-use std::ops::Range;
-use std::sync::{Arc, OnceLock};
-
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
-    engine::arrow_data::{extract_record_batch, ArrowEngineData},
+    engine::arrow_data::ArrowEngineData,
     schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::concat_batches;
-use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -168,15 +164,17 @@ impl RowIndexBuilder {
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
+/// `file_location` is used to populate file metadata columns if requested.
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
+    file_location: Option<&str>,
 ) -> DeltaResult<T>
 where
     StructArray: Into<T>,
 {
-    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes)?;
+    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     Ok(data.into())
 }
@@ -306,6 +304,8 @@ pub(crate) enum ReorderIndexTransform {
     Missing(ArrowFieldRef),
     /// Row index column requested, compute it
     RowIndex(ArrowFieldRef),
+    /// File path column requested, populate with file path
+    FilePath(ArrowFieldRef),
 }
 
 impl ReorderIndex {
@@ -333,14 +333,19 @@ impl ReorderIndex {
         ReorderIndex::new(index, ReorderIndexTransform::RowIndex(field))
     }
 
+    fn file_path(index: usize, field: ArrowFieldRef) -> Self {
+        ReorderIndex::new(index, ReorderIndexTransform::FilePath(field))
+    }
+
     /// Check if this reordering requires a transformation anywhere. See comment below on
     /// [`ordering_needs_transform`] to understand why this is needed.
     fn needs_transform(&self) -> bool {
         match self.transform {
-            // if we're casting, inserting null, or generating row index, we need to transform
+            // if we're casting, inserting null, or generating row index/file path, we need to transform
             ReorderIndexTransform::Cast(_)
             | ReorderIndexTransform::Missing(_)
-            | ReorderIndexTransform::RowIndex(_) => true,
+            | ReorderIndexTransform::RowIndex(_)
+            | ReorderIndexTransform::FilePath(_) => true,
             // if our nested ordering needs a transform, we need a transform
             ReorderIndexTransform::Nested(ref children) => ordering_needs_transform(children),
             // no transform needed
@@ -595,6 +600,13 @@ fn get_indices(
                             Arc::new(field.try_into_arrow()?),
                         ));
                     }
+                    Some(MetadataColumnSpec::FilePath) => {
+                        debug!("Inserting a file path column: {}", field.name());
+                        reorder_indices.push(ReorderIndex::file_path(
+                            requested_position,
+                            Arc::new(field.try_into_arrow()?),
+                        ));
+                    }
                     Some(metadata_spec) => {
                         return Err(Error::Generic(format!(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
@@ -765,10 +777,13 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 ///
 /// If the requested ordering contains a [`ReorderIndexTransform::RowIndex`], `row_indexes`
 /// must not be `None` to append a row index column to the output.
+/// If the requested ordering contains a [`ReorderIndexTransform::FilePath`], `file_location`
+/// must not be `None` to append a file path column to the output.
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
     mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
+    file_location: Option<&str>,
 ) -> DeltaResult<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
@@ -806,6 +821,7 @@ pub(crate) fn reorder_struct_array(
                                 struct_array,
                                 children,
                                 None, // Nested structures don't need row indexes since metadata columns can't be nested
+                                None, // No file_location passed since metadata columns can't be nested
                             )?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
@@ -866,6 +882,27 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] =
                         Some((Arc::clone(field), Arc::new(row_index_array)));
                 }
+                ReorderIndexTransform::FilePath(field) => {
+                    let Some(file_path) = file_location else {
+                        return Err(Error::generic(
+                            "File path column requested but file location not provided",
+                        ));
+                    };
+                    // Use run-end encoding for efficiency since the file path is constant for all rows
+                    // Run-end encoding stores: [run_ends: [num_rows], values: [file_path]]
+                    let run_ends = PrimitiveArray::<Int64Type>::from_iter_values([num_rows as i64]);
+                    let values = StringArray::from_iter_values([file_path]);
+                    let file_path_array = RunArray::try_new(&run_ends, &values)?;
+
+                    // Create a field with the RunEndEncoded data type to match the array
+                    let ree_field = Arc::new(ArrowField::new(
+                        field.name(),
+                        file_path_array.data_type().clone(),
+                        field.is_nullable(),
+                    ));
+                    final_fields_cols[reorder_index.index] =
+                        Some((ree_field, Arc::new(file_path_array)));
+                }
             }
         }
         let num_cols = final_fields_cols.len();
@@ -895,6 +932,7 @@ fn reorder_list<O: OffsetSizeTrait>(
             struct_array,
             children,
             None, // Nested structures don't need row indexes since metadata columns can't be nested
+            None, // No file_location passed since metadata columns can't be nested
         )?);
         let new_list_field = Arc::new(ArrowField::new_struct(
             list_field.name(),
@@ -930,6 +968,7 @@ fn reorder_map(
         struct_array,
         children,
         None, // Nested structures don't need row indexes since metadata columns can't be nested
+        None, // No file_location passed since metadata columns can't be nested
     )?;
     let result_fields = result_array.fields();
     let new_map_field = Arc::new(ArrowField::new_struct(
@@ -1004,8 +1043,10 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     unsafe { StructArray::new_unchecked(fields, columns, nulls) }
 }
 
-/// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
-/// JSON file reader does exactly the same thing. This function is a hack to work around that gap.
+/// Arrow lacks the functionality to json-parse a string column into a struct column, so we
+/// implement it here. This method is for json-parsing each string in a column of strings (add.stats
+/// to be specific) to produce a nested column of strongly typed values. We require that N rows in
+/// means N rows out.
 #[internal_api]
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
@@ -1025,53 +1066,58 @@ pub(crate) fn parse_json(
 }
 
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
-//
-// NOTE: This code is really inefficient because arrow lacks the native capability to perform robust
-// StringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
-// that shortcoming gets fixed upstream, this method can simplify or hopefully even disappear.
-fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+// Also used by ParseJson expression evaluation.
+pub(crate) fn parse_json_impl(
+    json_strings: &StringArray,
+    schema: ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
     if json_strings.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    // Use batch size of 1 to force one record per string input
     let mut decoder = ReaderBuilder::new(schema.clone())
-        .with_batch_size(1)
+        .with_batch_size(json_strings.len())
+        .with_coerce_primitive(true)
         .build_decoder()?;
-    let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
-        let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
-        // loop to fill + empty the buffer until end of input. note that we can't just one-shot
-        // attempt to decode the entire thing since the buffer might only contain part of the JSON.
-        // see: https://github.com/delta-io/delta-kernel-rs/pull/1244
-        loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
-            }
-            // from `decode` docs:
-            // > Read JSON objects from `buf`, returning the number of bytes read
-            // > This method returns once `batch_size` objects have been parsed since the last call
-            // > to [`Self::flush`], or `buf` is exhausted. Any remaining bytes should be included
-            // > in the next call to [`Self::decode`]
-            //
-            // if we attempt a `parse_one` of e.g. "{}{}", we will parse the first "{}" successfully
-            // then decode will always return immediately sinee we have read `batch_size = 1`,
-            // leading to an infinite loop. Since we always just want to parse one record here, we
-            // detect this by checking if we always consume the entire buffer, and error if not.
-            let consumed = decoder.decode(buf)?;
-            if consumed != buf.len() {
-                return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
-            }
-            reader.consume(consumed);
+
+    for (json, row_number) in json_strings.iter().zip(1..) {
+        let line = json.unwrap_or("{}");
+        let consumed = decoder.decode(line.as_bytes())?;
+        // did we fail to decode the whole line, or was the line partial
+        if consumed != line.len() || decoder.has_partial_record() {
+            return Err(Error::Generic(format!(
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
+            )));
         }
-        let Some(batch) = decoder.flush()? else {
-            return Err(Error::missing_data("Expected data"));
-        };
-        require!(batch.num_rows() == 1, Error::generic("Expected one row"));
-        Ok(batch)
-    };
-    let output: Vec<_> = json_strings.iter().map(parse_one).try_collect()?;
-    Ok(concat_batches(&schema, output.iter())?)
+        // did we decode exactly one record
+        if decoder.len() != row_number {
+            return Err(Error::Generic(format!(
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
+            )));
+        }
+    }
+    // Get the final batch out
+    if let Some(batch) = decoder.flush()? {
+        if batch.num_rows() != json_strings.len() {
+            return Err(Error::Generic(format!(
+                "Unexpected number of rows decoded. Got {}, expected{}",
+                batch.num_rows(),
+                json_strings.len()
+            )));
+        }
+        return Ok(batch);
+    }
+    Err(Error::generic(
+        "Malformed JSON: exited parse_json_impl without deserializing anything useful",
+    ))
+}
+
+pub(crate) fn filter_to_record_batch(
+    filtered_data: FilteredEngineData,
+) -> DeltaResult<RecordBatch> {
+    let filtered = filtered_data.apply_selection_vector()?;
+    let arrow_data = ArrowEngineData::try_from_engine_data(filtered)?;
+    Ok((*arrow_data).into())
 }
 
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
@@ -1082,26 +1128,8 @@ pub(crate) fn to_json_bytes(
 ) -> DeltaResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data {
-        let filtered_data = chunk?;
-        // Honor the new contract: if selection vector is shorter than the number of rows,
-        // then all rows not covered by the selection vector are assumed to be selected
-        let (underlying_data, mut selection_vector) = filtered_data.into_parts();
-        let batch = extract_record_batch(&*underlying_data)?;
-        let num_rows = batch.num_rows();
-
-        if selection_vector.is_empty() {
-            // If selection vector is empty, write all rows per contract.
-            writer.write(batch)?;
-        } else {
-            // Extend the selection vector with `true` for uncovered rows
-            if selection_vector.len() < num_rows {
-                selection_vector.resize(num_rows, true);
-            }
-
-            let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
-                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
-            writer.write(&filtered_batch)?
-        };
+        let batch = filter_to_record_batch(chunk?)?;
+        writer.write(&batch)?;
     }
     writer.finish()?;
     Ok(writer.into_inner())
@@ -1225,6 +1253,21 @@ mod tests {
 
     #[test]
     fn test_json_parsing() {
+        static EXPECTED_JSON_ERR_STR: &str = "Generic delta kernel error: Malformed JSON: Multiple, partial, or 0 JSON objects on row";
+        fn check_parse_fails(
+            input: Vec<Option<&str>>,
+            schema: ArrowSchemaRef,
+            expected_start: &str,
+        ) {
+            let result = parse_json_impl(&input.into(), schema);
+            let err = result.expect_err("Expected an error");
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(expected_start),
+                "Error message was not what was expected"
+            );
+        }
+
         let requested_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int32, true),
             ArrowField::new("b", ArrowDataType::Utf8, true),
@@ -1234,39 +1277,24 @@ mod tests {
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
-        let input: Vec<Option<&str>> = vec![Some("")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
+        for input in [
+            vec![Some("")],
+            vec![Some(" \n\t")],
+            vec![Some(r#"{ "a": 1"#)],
+            vec![Some("{}{}")],
+            vec![Some(r#"{} { "a": 1"#)],
+            vec![Some(r#"{} { "a": 1"#), Some("}")],
+            vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)],
+        ] {
+            check_parse_fails(input, requested_schema.clone(), EXPECTED_JSON_ERR_STR);
+        }
 
-        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
-
-        let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("invalid string");
-
-        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("incomplete object");
-
-        let input: Vec<Option<&str>> = vec![Some("{}{}")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
-        ));
-
-        let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
-        ));
-
-        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b"}"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("split object");
+        // this one is an error from within the tape decoder, so has a different format
+        check_parse_fails(
+            vec![Some(r#""a""#)],
+            requested_schema.clone(),
+            "Json error: expected { got \"a\"",
+        );
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
@@ -1793,7 +1821,7 @@ mod tests {
             ),
         ];
 
-        let result = reorder_struct_array(arry, &reorder, None);
+        let result = reorder_struct_array(arry, &reorder, None, None);
         assert_result_error_with_message(
             result,
             "Row index column requested but row index iterator not provided",
@@ -1816,7 +1844,7 @@ mod tests {
         #[allow(clippy::single_range_in_vec_init)]
         let mut row_indexes = vec![(0..4)].into_iter().flatten();
 
-        let ordered = reorder_struct_array(arry, &reorder, Some(&mut row_indexes)).unwrap();
+        let ordered = reorder_struct_array(arry, &reorder, Some(&mut row_indexes), None).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "row_idx"]);
 
         // Verify the row index column contains the expected values
@@ -1851,6 +1879,92 @@ mod tests {
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn simple_file_path_field() {
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::nullable("i2", DataType::INTEGER),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new("i2", ArrowDataType::Int32, true),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1];
+        let mut arrow_file_path_field = ArrowField::new("_file", ArrowDataType::Utf8, false);
+        arrow_file_path_field.set_metadata(HashMap::from([(
+            "delta.metadataSpec".to_string(),
+            "_file".to_string(),
+        )]));
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::identity(2),
+            ReorderIndex::file_path(1, Arc::new(arrow_file_path_field)),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn test_reorder_struct_array_with_file_path() {
+        // Test that file paths work when properly provided
+        let arry = make_struct_array();
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::file_path(
+                1,
+                Arc::new(ArrowField::new("_file", ArrowDataType::Utf8, false)),
+            ),
+        ];
+
+        let file_location = "s3://bucket/path/to/file.parquet";
+        let ordered = reorder_struct_array(arry, &reorder, None, Some(file_location)).unwrap();
+        assert_eq!(ordered.column_names(), vec!["b", "_file"]);
+
+        // Verify the file path column is run-end encoded and contains the expected value
+        let file_path_col = ordered.column(1);
+
+        // Check it's a RunArray<Int64Type, StringArray>
+        let run_array = file_path_col
+            .as_any()
+            .downcast_ref::<RunArray<Int64Type>>()
+            .expect("Expected RunArray");
+
+        // Verify it has 4 logical rows (same as input)
+        assert_eq!(run_array.len(), 4);
+
+        // Verify the physical representation is efficient: 1 run with value at end position 4
+        let run_ends = run_array.run_ends().values();
+        assert_eq!(run_ends.len(), 1, "Should have only 1 run");
+        assert_eq!(run_ends[0], 4, "Run should end at position 4");
+
+        // Verify the value
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.len(), 1, "Should have only 1 unique value");
+        assert_eq!(values.value(0), file_location);
+    }
+
+    #[test]
+    fn test_reorder_struct_array_missing_file_path() {
+        // Test that error occurs when file path is requested but not provided
+        let arry = make_struct_array();
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::file_path(
+                1,
+                Arc::new(ArrowField::new("_file", ArrowDataType::Utf8, false)),
+            ),
+        ];
+
+        let result = reorder_struct_array(arry, &reorder, None, None);
+        assert_result_error_with_message(
+            result,
+            "File path column requested but file location not provided",
+        );
     }
 
     #[test]
@@ -2530,7 +2644,7 @@ mod tests {
     fn simple_reorder_struct() {
         let arry = make_struct_array();
         let reorder = vec![ReorderIndex::identity(1), ReorderIndex::identity(0)];
-        let ordered = reorder_struct_array(arry, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(arry, &reorder, None, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["c", "b"]);
     }
 
@@ -2578,7 +2692,7 @@ mod tests {
                 ],
             ),
         ];
-        let ordered = reorder_struct_array(nested, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(nested, &reorder, None, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["struct2", "struct1"]);
         let ordered_s2 = ordered.column(0).as_struct();
         assert_eq!(ordered_s2.column_names(), vec!["b", "c", "s"]);
@@ -2625,7 +2739,7 @@ mod tests {
             0,
             vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
         )];
-        let ordered = reorder_struct_array(struct_array, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
         let ordered_list_col = ordered.column(0).as_list::<i32>();
         for i in 0..ordered_list_col.len() {
             let array_item = ordered_list_col.value(i);
@@ -2691,7 +2805,7 @@ mod tests {
                 ],
             ),
         ];
-        let ordered = reorder_struct_array(struct_array, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["map", "i"]);
         if let ArrowDataType::Map(field, _) = ordered.column(0).data_type() {
             if let ArrowDataType::Struct(fields) = field.data_type() {

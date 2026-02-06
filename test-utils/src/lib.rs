@@ -3,15 +3,17 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
 };
-
+use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
@@ -23,6 +25,9 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec};
+use std::sync::Mutex;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
 
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
@@ -238,7 +243,7 @@ pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngine::new(store)))
+    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -260,7 +265,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let engine = DefaultEngine::new(Arc::clone(&storage));
+    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
 
     (storage, engine, url)
 }
@@ -447,21 +452,10 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
-}
-
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|data| -> DeltaResult<_> {
-            let data = data?;
-            to_arrow(data)
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()
 }
 
@@ -511,5 +505,116 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
                 "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
             );
         }
+    }
+}
+
+/// Creates add file metadata for one or more files without partition values.
+/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+pub fn create_add_files_metadata(
+    add_files_schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+    let num_files = files.len();
+
+    // Build arrays for each file
+    let path_array = StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
+    let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
+    let num_records_array =
+        Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+
+    // Create empty map for partitionValues (repeated for each file)
+    let entries_field = Arc::new(Field::new(
+        "key_value",
+        ArrowDataType::Struct(
+            vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let empty_keys = StringArray::from(Vec::<&str>::new());
+    let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+    let empty_entries = StructArray::from(vec![
+        (
+            Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+            Arc::new(empty_keys) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            Arc::new(empty_values) as ArrayRef,
+        ),
+    ]);
+    let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+    let partition_values_array = Arc::new(MapArray::new(
+        entries_field,
+        offsets,
+        empty_entries,
+        None,
+        false,
+    ));
+
+    let stats_struct = StructArray::from(vec![(
+        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+        Arc::new(num_records_array) as ArrayRef,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        vec![
+            Arc::new(path_array) as ArrayRef,
+            partition_values_array as ArrayRef,
+            Arc::new(size_array) as ArrayRef,
+            Arc::new(mod_time_array) as ArrayRef,
+            Arc::new(stats_struct) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Box::new(ArrowEngineData::new(batch)))
+}
+
+// Writer that captures log output into a shared buffer for test assertions
+pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+// Test helper that sets up tracing to capture log output
+// The guard keeps the tracing subscriber active for the lifetime of the struct
+pub struct LoggingTest {
+    logs: Arc<Mutex<Vec<u8>>>,
+    _guard: DefaultGuard,
+}
+
+impl Default for LoggingTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoggingTest {
+    pub fn new() -> Self {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs_clone = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || LogWriter(logs_clone.clone()))
+                    .with_ansi(false),
+            ),
+        );
+        Self { logs, _guard }
+    }
+
+    pub fn logs(&self) -> String {
+        String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
     }
 }

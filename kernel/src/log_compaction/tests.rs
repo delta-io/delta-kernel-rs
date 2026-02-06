@@ -106,9 +106,10 @@ fn test_compaction_data() {
 
     let iterator = result.unwrap();
 
-    // Test iterator methods
-    assert_eq!(iterator.actions_count(), 0);
-    assert_eq!(iterator.add_actions_count(), 0);
+    // Test iterator stat initilize
+    let state = iterator.state();
+    assert_eq!(state.actions_count(), 0);
+    assert_eq!(state.add_actions_count(), 0);
 
     // Test debug implementation
     let debug_str = format!("{:?}", iterator);
@@ -149,23 +150,24 @@ fn test_compaction_data_with_actual_iterator() {
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
     let engine = SyncEngine::new();
 
-    let mut iterator = writer.compaction_data(&engine).unwrap();
+    let iterator = writer.compaction_data(&engine).unwrap();
 
+    let state = iterator.state();
     let mut batch_count = 0;
-    let initial_actions = iterator.actions_count();
-    let initial_add_actions = iterator.add_actions_count();
+    let initial_actions = state.actions_count();
+    let initial_add_actions = state.add_actions_count();
 
     // Both should start at 0
     assert_eq!(initial_actions, 0);
     assert_eq!(initial_add_actions, 0);
 
-    while let Some(batch_result) = iterator.next() {
+    for batch_result in iterator {
         batch_count += 1;
         assert!(batch_result.is_ok());
 
         // After processing some batches, the counts should be >= the initial counts
-        assert!(iterator.actions_count() >= initial_actions);
-        assert!(iterator.add_actions_count() >= initial_add_actions);
+        assert!(state.actions_count() >= initial_actions);
+        assert!(state.add_actions_count() >= initial_add_actions);
     }
 
     assert!(batch_count > 0, "Expected to process at least one batch");
@@ -223,21 +225,22 @@ fn test_version_filtering() {
         );
 
         let iterator = result.unwrap();
-        assert!(iterator.actions_count() >= 0);
-        assert!(iterator.add_actions_count() >= 0);
+        let state = iterator.state();
+        assert!(state.actions_count() >= 0);
+        assert!(state.add_actions_count() >= 0);
     }
 }
 
-#[test]
-fn test_no_compaction_staged_commits() {
+#[tokio::test]
+async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};
@@ -264,36 +267,30 @@ fn test_no_compaction_staged_commits() {
 
     // Write version 0
     let commit_0_path = Path::from("_delta_log/00000000000000000000.json");
-    futures::executor::block_on(async {
-        store
-            .put(
-                &commit_0_path,
-                format!("{}\n{}", metadata_action, protocol_action).into(),
-            )
-            .await
-            .unwrap();
-    });
+    store
+        .put(
+            &commit_0_path,
+            format!("{}\n{}", metadata_action, protocol_action).into(),
+        )
+        .await
+        .unwrap();
 
     // Write version 1
     let add_action = serde_json::to_string(&Action::Add(Add::default())).unwrap();
     let commit_1_path = Path::from("_delta_log/00000000000000000001.json");
-    futures::executor::block_on(async {
-        store
-            .put(&commit_1_path, add_action.clone().into())
-            .await
-            .unwrap();
-    });
+    store
+        .put(&commit_1_path, add_action.clone().into())
+        .await
+        .unwrap();
 
     // Write a staged commit (this would normally be filtered out during listing)
     let staged_commit_path = Path::from(
         "_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
     );
-    futures::executor::block_on(async {
-        store
-            .put(&staged_commit_path, add_action.into())
-            .await
-            .unwrap();
-    });
+    store
+        .put(&staged_commit_path, add_action.into())
+        .await
+        .unwrap();
 
     let table_root = url::Url::parse("memory:///").unwrap();
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
