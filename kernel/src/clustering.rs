@@ -7,7 +7,7 @@
 //! as a JSON object with a `clusteringColumns` field containing an array of column paths,
 //! where each path is an array of field names (to handle nested columns).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::expressions::ColumnName;
@@ -27,14 +27,14 @@ use crate::{DeltaResult, Engine};
 /// ```json
 /// {"clusteringColumns": [["col1"], ["user", "address", "city"]]}
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClusteringDomainMetadata {
-    clustering_columns: Vec<Vec<String>>,
+pub(crate) struct ClusteringDomainMetadata {
+    pub clustering_columns: Vec<Vec<String>>,
 }
 
 /// The domain name for clustering metadata.
-const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
+pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 
 /// Parses clustering columns from a JSON configuration string.
 ///
