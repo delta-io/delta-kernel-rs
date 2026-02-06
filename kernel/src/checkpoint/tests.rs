@@ -27,35 +27,22 @@ use tempfile::tempdir;
 use test_utils::delta_path_for_version;
 use url::Url;
 
-#[test]
-fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
-    const MILLIS_PER_SECOND: i64 = 1_000;
-
+#[rstest::rstest]
+#[case::default_retention(
+    None,
+    10_000_000 - (DEFAULT_RETENTION_SECS as i64 * 1_000)
+)]
+#[case::zero_retention(Some(Duration::from_secs(0)), 10_000_000)]
+#[case::custom_retention(Some(Duration::from_secs(2_000)), 10_000_000 - 2_000_000)]
+fn test_deleted_file_retention_timestamp(
+    #[case] retention: Option<Duration>,
+    #[case] expected_timestamp: i64,
+) -> DeltaResult<()> {
     let reference_time_secs = 10_000;
     let reference_time = Duration::from_secs(reference_time_secs);
-    let reference_time_millis = reference_time.as_millis() as i64;
 
-    // Retention scenarios:
-    // ( retention duration , expected_timestamp )
-    let test_cases = [
-        // None = Default retention (7 days)
-        (
-            None,
-            reference_time_millis - (DEFAULT_RETENTION_SECS as i64 * MILLIS_PER_SECOND),
-        ),
-        // Zero retention
-        (Some(Duration::from_secs(0)), reference_time_millis),
-        // Custom retention (e.g., 2000 seconds)
-        (
-            Some(Duration::from_secs(2_000)),
-            reference_time_millis - (2_000 * MILLIS_PER_SECOND),
-        ),
-    ];
-
-    for (retention, expected_timestamp) in test_cases {
-        let result = deleted_file_retention_timestamp_with_time(retention, reference_time)?;
-        assert_eq!(result, expected_timestamp);
-    }
+    let result = deleted_file_retention_timestamp_with_time(retention, reference_time)?;
+    assert_eq!(result, expected_timestamp);
 
     Ok(())
 }

@@ -543,51 +543,48 @@ fn table_for_letters(letters: &[char]) -> Vec<String> {
     res
 }
 
-#[test]
-fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
-    let cases = vec![
-        (
-            column_expr!("number").lt(Expr::literal(4i64)),
-            table_for_numbers(vec![1, 2, 3]),
-        ),
-        (
-            column_expr!("number").le(Expr::literal(4i64)),
-            table_for_numbers(vec![1, 2, 3, 4]),
-        ),
-        (
-            column_expr!("number").gt(Expr::literal(4i64)),
-            table_for_numbers(vec![5, 6]),
-        ),
-        (
-            column_expr!("number").ge(Expr::literal(4i64)),
-            table_for_numbers(vec![4, 5, 6]),
-        ),
-        (
-            column_expr!("number").eq(Expr::literal(4i64)),
-            table_for_numbers(vec![4]),
-        ),
-        (
-            column_expr!("number").ne(Expr::literal(4i64)),
-            table_for_numbers(vec![1, 2, 3, 5, 6]),
-        ),
-    ];
-
-    for (pred, expected) in cases.into_iter() {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["a_float", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+#[rstest::rstest]
+#[case::less_than(
+    column_expr!("number").lt(Expr::literal(4i64)),
+    table_for_numbers(vec![1, 2, 3])
+)]
+#[case::less_than_or_equal(
+    column_expr!("number").le(Expr::literal(4i64)),
+    table_for_numbers(vec![1, 2, 3, 4])
+)]
+#[case::greater_than(
+    column_expr!("number").gt(Expr::literal(4i64)),
+    table_for_numbers(vec![5, 6])
+)]
+#[case::greater_than_or_equal(
+    column_expr!("number").ge(Expr::literal(4i64)),
+    table_for_numbers(vec![4, 5, 6])
+)]
+#[case::equal(
+    column_expr!("number").eq(Expr::literal(4i64)),
+    table_for_numbers(vec![4])
+)]
+#[case::not_equal(
+    column_expr!("number").ne(Expr::literal(4i64)),
+    table_for_numbers(vec![1, 2, 3, 5, 6])
+)]
+fn predicate_on_number(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
-#[test]
-fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
-    // Test basic column pruning. Note that the actual predicate machinery is already well-tested,
-    // so we're just testing wiring here.
-    let null_row_table: Vec<String> = vec![
+#[rstest::rstest]
+#[case::is_null(
+    column_expr!("letter").is_null(),
+    vec![
         "+--------+--------+",
         "| letter | number |",
         "+--------+--------+",
@@ -596,56 +593,59 @@ fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     ]
     .into_iter()
     .map(String::from)
-    .collect();
-
-    let cases = vec![
-        (column_expr!("letter").is_null(), null_row_table),
-        (
-            column_expr!("letter").is_not_null(),
-            table_for_letters(&['a', 'b', 'c', 'e']),
-        ),
-        (
-            column_expr!("letter").lt(Expr::literal("c")),
-            table_for_letters(&['a', 'b']),
-        ),
-        (
-            column_expr!("letter").le(Expr::literal("c")),
-            table_for_letters(&['a', 'b', 'c']),
-        ),
-        (
-            column_expr!("letter").gt(Expr::literal("c")),
-            table_for_letters(&['e']),
-        ),
-        (
-            column_expr!("letter").ge(Expr::literal("c")),
-            table_for_letters(&['c', 'e']),
-        ),
-        (
-            column_expr!("letter").eq(Expr::literal("c")),
-            table_for_letters(&['c']),
-        ),
-        (
-            column_expr!("letter").ne(Expr::literal("c")),
-            table_for_letters(&['a', 'b', 'e']),
-        ),
-    ];
-
-    for (pred, expected) in cases {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["letter", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+    .collect()
+)]
+#[case::is_not_null(
+    column_expr!("letter").is_not_null(),
+    table_for_letters(&['a', 'b', 'c', 'e'])
+)]
+#[case::less_than(
+    column_expr!("letter").lt(Expr::literal("c")),
+    table_for_letters(&['a', 'b'])
+)]
+#[case::less_than_or_equal(
+    column_expr!("letter").le(Expr::literal("c")),
+    table_for_letters(&['a', 'b', 'c'])
+)]
+#[case::greater_than(
+    column_expr!("letter").gt(Expr::literal("c")),
+    table_for_letters(&['e'])
+)]
+#[case::greater_than_or_equal(
+    column_expr!("letter").ge(Expr::literal("c")),
+    table_for_letters(&['c', 'e'])
+)]
+#[case::equal(
+    column_expr!("letter").eq(Expr::literal("c")),
+    table_for_letters(&['c'])
+)]
+#[case::not_equal(
+    column_expr!("letter").ne(Expr::literal("c")),
+    table_for_letters(&['a', 'b', 'e'])
+)]
+fn predicate_on_letter(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Test basic column pruning. Note that the actual predicate machinery is already well-tested,
+    // so we're just testing wiring here.
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["letter", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
-#[test]
-fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
-    // Partition skipping and file skipping are currently implemented separately. Mixing them in an
-    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
-    let full_table: Vec<String> = vec![
+#[rstest::rstest]
+#[case::or_no_pruning(
+    Pred::or(
+        // No pruning power
+        column_expr!("letter").gt(Expr::literal("a")),
+        column_expr!("number").gt(Expr::literal(3i64)),
+    ),
+    vec![
         "+--------+--------+",
         "| letter | number |",
         "+--------+--------+",
@@ -659,84 +659,76 @@ fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     ]
     .into_iter()
     .map(String::from)
-    .collect();
-
-    let cases = vec![
-        (
-            Pred::or(
-                // No pruning power
-                column_expr!("letter").gt(Expr::literal("a")),
-                column_expr!("number").gt(Expr::literal(3i64)),
-            ),
-            full_table,
+    .collect()
+)]
+#[case::and_with_pruning(
+    Pred::and(
+        column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
+        column_expr!("number").gt(Expr::literal(3i64)), // letters a, e
+    ),
+    table_for_letters(&['e'])
+)]
+#[case::and_with_nested_or(
+    Pred::and(
+        column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
+        Pred::or(
+            // No pruning power
+            column_expr!("letter").eq(Expr::literal("c")),
+            column_expr!("number").eq(Expr::literal(3i64)),
         ),
-        (
-            Pred::and(
-                column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
-                column_expr!("number").gt(Expr::literal(3i64)), // letters a, e
-            ),
-            table_for_letters(&['e']),
-        ),
-        (
-            Pred::and(
-                column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
-                Pred::or(
-                    // No pruning power
-                    column_expr!("letter").eq(Expr::literal("c")),
-                    column_expr!("number").eq(Expr::literal(3i64)),
-                ),
-            ),
-            table_for_letters(&['b', 'c', 'e']),
-        ),
-    ];
-
-    for (pred, expected) in cases {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["letter", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+    ),
+    table_for_letters(&['b', 'c', 'e'])
+)]
+fn predicate_on_letter_and_number(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Partition skipping and file skipping are currently implemented separately. Mixing them in an
+    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["letter", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
-#[test]
-fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
-    let cases = vec![
-        (
-            Pred::not(column_expr!("number").lt(Expr::literal(4i64))),
-            table_for_numbers(vec![4, 5, 6]),
-        ),
-        (
-            Pred::not(column_expr!("number").le(Expr::literal(4i64))),
-            table_for_numbers(vec![5, 6]),
-        ),
-        (
-            Pred::not(column_expr!("number").gt(Expr::literal(4i64))),
-            table_for_numbers(vec![1, 2, 3, 4]),
-        ),
-        (
-            Pred::not(column_expr!("number").ge(Expr::literal(4i64))),
-            table_for_numbers(vec![1, 2, 3]),
-        ),
-        (
-            Pred::not(column_expr!("number").eq(Expr::literal(4i64))),
-            table_for_numbers(vec![1, 2, 3, 5, 6]),
-        ),
-        (
-            Pred::not(column_expr!("number").ne(Expr::literal(4i64))),
-            table_for_numbers(vec![4]),
-        ),
-    ];
-    for (pred, expected) in cases.into_iter() {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["a_float", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+#[rstest::rstest]
+#[case::not_less_than(
+    Pred::not(column_expr!("number").lt(Expr::literal(4i64))),
+    table_for_numbers(vec![4, 5, 6])
+)]
+#[case::not_less_than_or_equal(
+    Pred::not(column_expr!("number").le(Expr::literal(4i64))),
+    table_for_numbers(vec![5, 6])
+)]
+#[case::not_greater_than(
+    Pred::not(column_expr!("number").gt(Expr::literal(4i64))),
+    table_for_numbers(vec![1, 2, 3, 4])
+)]
+#[case::not_greater_than_or_equal(
+    Pred::not(column_expr!("number").ge(Expr::literal(4i64))),
+    table_for_numbers(vec![1, 2, 3])
+)]
+#[case::not_equal(
+    Pred::not(column_expr!("number").eq(Expr::literal(4i64))),
+    table_for_numbers(vec![1, 2, 3, 5, 6])
+)]
+#[case::not_not_equal(
+    Pred::not(column_expr!("number").ne(Expr::literal(4i64))),
+    table_for_numbers(vec![4])
+)]
+fn predicate_on_number_not(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
@@ -828,142 +820,138 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let cases = vec![
-        (
-            Pred::and(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                column_expr!("a_float").gt(Expr::literal(5.5)),
-            ),
-            table_for_numbers(vec![6]),
-        ),
-        (
-            Pred::and(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
-            ),
-            table_for_numbers(vec![5]),
-        ),
-        (
-            Pred::or(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                column_expr!("a_float").gt(Expr::literal(5.5)),
-            ),
-            table_for_numbers(vec![5, 6]),
-        ),
-        (
-            Pred::or(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
-            ),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-    ];
-    for (pred, expected) in cases.into_iter() {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["a_float", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+#[rstest::rstest]
+#[case::and_both_conditions(
+    Pred::and(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        column_expr!("a_float").gt(Expr::literal(5.5)),
+    ),
+    table_for_numbers(vec![6])
+)]
+#[case::and_with_negation(
+    Pred::and(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+    ),
+    table_for_numbers(vec![5])
+)]
+#[case::or_either_condition(
+    Pred::or(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        column_expr!("a_float").gt(Expr::literal(5.5)),
+    ),
+    table_for_numbers(vec![5, 6])
+)]
+#[case::or_with_negation(
+    Pred::or(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+    ),
+    table_for_numbers(vec![1, 2, 3, 4, 5, 6])
+)]
+fn and_or_predicates(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
-#[test]
-fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let cases = vec![
-        (
-            Pred::not(Pred::and(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                column_expr!("a_float").gt(Expr::literal(5.5)),
-            )),
-            table_for_numbers(vec![1, 2, 3, 4, 5]),
-        ),
-        (
-            Pred::not(Pred::and(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
-            )),
-            table_for_numbers(vec![1, 2, 3, 4, 6]),
-        ),
-        (
-            Pred::not(Pred::or(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                column_expr!("a_float").gt(Expr::literal(5.5)),
-            )),
-            table_for_numbers(vec![1, 2, 3, 4]),
-        ),
-        (
-            Pred::not(Pred::or(
-                column_expr!("number").gt(Expr::literal(4i64)),
-                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
-            )),
-            vec![],
-        ),
-    ];
-    for (pred, expected) in cases.into_iter() {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["a_float", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+#[rstest::rstest]
+#[case::not_and_both_conditions(
+    Pred::not(Pred::and(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        column_expr!("a_float").gt(Expr::literal(5.5)),
+    )),
+    table_for_numbers(vec![1, 2, 3, 4, 5])
+)]
+#[case::not_and_with_negation(
+    Pred::not(Pred::and(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+    )),
+    table_for_numbers(vec![1, 2, 3, 4, 6])
+)]
+#[case::not_or_either_condition(
+    Pred::not(Pred::or(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        column_expr!("a_float").gt(Expr::literal(5.5)),
+    )),
+    table_for_numbers(vec![1, 2, 3, 4])
+)]
+#[case::not_or_with_negation(
+    Pred::not(Pred::or(
+        column_expr!("number").gt(Expr::literal(4i64)),
+        Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+    )),
+    vec![]
+)]
+fn not_and_or_predicates(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
-#[test]
-fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
-    let cases = vec![
-        (Pred::literal(false), table_for_numbers(vec![])),
-        (
-            Pred::and(column_pred!("number"), Pred::literal(false)),
-            table_for_numbers(vec![]),
-        ),
-        (
-            Pred::literal(true),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-        (
-            Pred::from_expr(Expr::literal(3i64)),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-        (
-            column_expr!("number").distinct(Expr::literal(3i64)),
-            table_for_numbers(vec![1, 2, 4, 5, 6]),
-        ),
-        (
-            column_expr!("number").distinct(Expr::null_literal(DataType::LONG)),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-        (
-            Pred::not(column_expr!("number").distinct(Expr::literal(3i64))),
-            table_for_numbers(vec![3]),
-        ),
-        (
-            Pred::not(column_expr!("number").distinct(Expr::null_literal(DataType::LONG))),
-            table_for_numbers(vec![]),
-        ),
-        (
-            column_expr!("number").gt(empty_struct.clone()),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-        (
-            Pred::not(column_expr!("number").gt(empty_struct.clone())),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-    ];
-    for (pred, expected) in cases.into_iter() {
-        read_table_data(
-            "./tests/data/basic_partitioned",
-            Some(&["a_float", "number"]),
-            Some(pred),
-            expected,
-        )?;
-    }
+#[rstest::rstest]
+#[case::literal_false(Pred::literal(false), table_for_numbers(vec![]))]
+#[case::and_with_literal_false(
+    Pred::and(column_pred!("number"), Pred::literal(false)),
+    table_for_numbers(vec![])
+)]
+#[case::literal_true(
+    Pred::literal(true),
+    table_for_numbers(vec![1, 2, 3, 4, 5, 6])
+)]
+#[case::from_literal_expr(
+    Pred::from_expr(Expr::literal(3i64)),
+    table_for_numbers(vec![1, 2, 3, 4, 5, 6])
+)]
+#[case::distinct_value(
+    column_expr!("number").distinct(Expr::literal(3i64)),
+    table_for_numbers(vec![1, 2, 4, 5, 6])
+)]
+#[case::distinct_null(
+    column_expr!("number").distinct(Expr::null_literal(DataType::LONG)),
+    table_for_numbers(vec![1, 2, 3, 4, 5, 6])
+)]
+#[case::not_distinct_value(
+    Pred::not(column_expr!("number").distinct(Expr::literal(3i64))),
+    table_for_numbers(vec![3])
+)]
+#[case::not_distinct_null(
+    Pred::not(column_expr!("number").distinct(Expr::null_literal(DataType::LONG))),
+    table_for_numbers(vec![])
+)]
+#[case::gt_empty_struct(
+    column_expr!("number").gt(Expr::struct_from(Vec::<ExpressionRef>::new())),
+    table_for_numbers(vec![1, 2, 3, 4, 5, 6])
+)]
+#[case::not_gt_empty_struct(
+    Pred::not(column_expr!("number").gt(Expr::struct_from(Vec::<ExpressionRef>::new()))),
+    table_for_numbers(vec![1, 2, 3, 4, 5, 6])
+)]
+fn invalid_skips_none_predicates(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(pred),
+        expected,
+    )?;
     Ok(())
 }
 
