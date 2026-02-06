@@ -502,6 +502,20 @@ pub(crate) mod tests {
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
             parsed
         }
+
+        pub(crate) fn create_parsed_crc(table_root: &Url, version: Version) -> Self {
+            let filename = format!("{version:020}.crc");
+            let location = table_root
+                .join(DELTA_LOG_DIR_WITH_SLASH)
+                .unwrap()
+                .join(&filename)
+                .unwrap();
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+                .unwrap()
+                .unwrap();
+            assert!(parsed.file_type == LogPathFileType::Crc);
+            parsed
+        }
     }
 
     fn table_root_dir_url() -> Url {
