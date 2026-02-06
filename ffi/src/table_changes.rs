@@ -414,7 +414,7 @@ mod tests {
             storage,
             version,
             actions_to_string_with_metadata(
-                vec![TestAction::Metadata, TestAction::Add(file)],
+                vec![TestAction::AllMetadata, TestAction::Add(file)],
                 METADATA,
             ),
         )
@@ -430,7 +430,7 @@ mod tests {
             storage,
             version,
             actions_to_string_with_metadata(
-                vec![TestAction::Metadata, TestAction::Remove(file)],
+                vec![TestAction::AllMetadata, TestAction::Remove(file)],
                 METADATA,
             ),
         )
