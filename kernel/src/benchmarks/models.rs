@@ -43,10 +43,12 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info() {
-        let json_content = r#"{
-    "name": "basic_append",
-    "description": "A basic table with two append writes"
-}"#;
+        let json_content = r#"
+            {
+                "name": "basic_append",
+                "description": "A basic table with two append writes"
+            }
+        "#;
         let table_info: TableInfo = serde_json::from_str(json_content)
             .expect("Failed to deserialize basic_append table info");
 
@@ -59,9 +61,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_missing_description() {
-        let json_content = r#"{
-    "name": "table_without_description"
-}"#;
+        let json_content = r#"
+            {
+                "name": "table_without_description"
+            }
+        "#;
         let table_info: TableInfo = serde_json::from_str(json_content)
             .expect("Failed to deserialize table_without_description table info");
 
@@ -71,9 +75,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_missing_name() {
-        let json_content = r#"{
-    "description": "A table missing the required name field"
-}"#;
+        let json_content = r#"
+            {
+                "description": "A table missing the required name field"
+            }
+        "#;
         let result: Result<TableInfo, _> = serde_json::from_str(json_content);
 
         assert!(
@@ -84,15 +90,17 @@ mod tests {
 
     #[test]
     fn test_deserialize_table_info_extra_fields() {
-        let json_content = r#"{
-    "name": "table_with_extra_fields",
-    "description": "A table with extra fields",
-    "extra_field": "should be ignored"
-}"#;
+        let json_content = r#"
+            {
+                "name": "table_with_extra_fields",
+                "description": "A table with extra fields",
+                "extra_field": "should be ignored"
+            }
+        "#;
         let table_info: TableInfo = serde_json::from_str(json_content)
             .expect("Failed to deserialize table_with_extra_fields table info");
 
-        assert_eq!(table_info.name, "table_with_extras");
+        assert_eq!(table_info.name, "table_with_extra_fields");
         assert_eq!(
             table_info.description,
             Some("A table with extra fields".to_string())
