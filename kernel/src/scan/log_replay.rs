@@ -2,9 +2,6 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use delta_kernel_derive::internal_api;
-use serde::{Deserialize, Serialize};
-
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
@@ -27,6 +24,8 @@ use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -164,9 +163,26 @@ impl ScanLogReplayProcessor {
             _ => None,
         };
 
+        // Create data skipping filter that reads stats_parsed from the transformed batch.
+        // This avoids double JSON parsing - the transform parses JSON once, then data skipping
+        // reads the already-parsed stats_parsed column from the transform output.
+        let data_skipping_filter =
+            state_info
+                .physical_stats_schema
+                .as_ref()
+                .and_then(|physical_stats_schema| {
+                    DataSkippingFilter::new(
+                        engine,
+                        physical_predicate.as_ref().map(|(p, _)| p.clone()),
+                        physical_stats_schema.clone(),
+                        output_schema.clone(),
+                        column_expr_ref!("stats_parsed"),
+                    )
+                });
+
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(p, _)| p.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter,
             // Log transform: always parse JSON (no stats_parsed in JSON commit files)
             log_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema.clone(),
@@ -606,12 +622,17 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
         );
 
-        // Build an initial selection vector for the batch which has had the data skipping filter
-        // applied. The selection vector is further updated by the deduplication visitor to remove
-        // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
+        // This is done before data skipping so we can read the already-parsed stats.
+        let transformed = self.checkpoint_transform.evaluate(actions.as_ref())?;
+        assert_eq!(transformed.len(), actions.len());
+
+        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
+        // This avoids double JSON parsing - the transform already parsed the stats.
+        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         assert_eq!(selection_vector.len(), actions.len());
 
+        // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
@@ -625,11 +646,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
-        // Use checkpoint transform (parallel processor only handles checkpoint files)
-        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.checkpoint_transform.evaluate(actions.as_ref())?;
+        // Step 4: Return transformed batch with updated selection vector
         ScanMetadata::try_new(
-            result,
+            transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
         )
@@ -649,12 +668,25 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             actions,
             is_log_batch,
         } = actions_batch;
-        // Build an initial selection vector for the batch which has had the data skipping filter
-        // applied. The selection vector is further updated by the deduplication visitor to remove
-        // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+
+        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
+        // Use the correct transform based on batch type:
+        // - Log batches: use ParseJson (no stats_parsed in JSON commit files)
+        // - Checkpoint batches: use coalesce(stats_parsed, ParseJson) when available
+        let transform = if is_log_batch {
+            &self.log_transform
+        } else {
+            &self.checkpoint_transform
+        };
+        let transformed = transform.evaluate(actions.as_ref())?;
+        assert_eq!(transformed.len(), actions.len());
+
+        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
+        // This avoids double JSON parsing - the transform already parsed the stats.
+        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         assert_eq!(selection_vector.len(), actions.len());
 
+        // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
             is_log_batch,
@@ -671,18 +703,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
-        // Use the correct transform based on batch type:
-        // - Log batches: use ParseJson (no stats_parsed in JSON commit files)
-        // - Checkpoint batches: use coalesce(stats_parsed, ParseJson) when available
-        let transform = if is_log_batch {
-            &self.log_transform
-        } else {
-            &self.checkpoint_transform
-        };
-        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = transform.evaluate(actions.as_ref())?;
+        // Step 4: Return transformed batch with updated selection vector
         ScanMetadata::try_new(
-            result,
+            transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
         )
