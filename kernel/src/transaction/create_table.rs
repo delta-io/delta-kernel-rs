@@ -36,30 +36,16 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
 use crate::committer::Committer;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
-};
-use crate::table_properties::DELTA_PROPERTY_PREFIX;
+use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
+use crate::table_transformation::TransformationPipeline;
 use crate::transaction::Transaction;
-use crate::utils::{current_time_ms, try_parse_uri};
+use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
-
-/// Properties that are allowed to be set during create table.
-/// This list will expand as more features are supported (e.g., column mapping, clustering).
-/// The allow list will be deprecated once auto feature enablement is implemented
-/// like the Java Kernel.
-const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
-    // Empty for now - will add properties as features are implemented:
-    // - "delta.columnMapping.mode" (for column mapping)
-    // - etc.
-];
 
 /// Ensures that no Delta table exists at the given path.
 ///
@@ -112,35 +98,6 @@ fn ensure_table_does_not_exist(
             Err(e)
         }
     }
-}
-
-/// Validates that table properties are allowed during CREATE TABLE.
-///
-/// This function enforces an allow list for delta properties:
-/// - Feature override properties (`delta.feature.*`) are never allowed
-/// - Delta properties (`delta.*`) must be on the allow list
-/// - Non-delta properties (user/application properties) are always allowed
-fn validate_table_properties(properties: &HashMap<String, String>) -> DeltaResult<()> {
-    for key in properties.keys() {
-        // Block all delta.feature.* properties (feature override properties)
-        if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
-            return Err(Error::generic(format!(
-                "Setting feature override property '{}' is not supported during CREATE TABLE",
-                key
-            )));
-        }
-        // For delta.* properties, check against allow list
-        if key.starts_with(DELTA_PROPERTY_PREFIX)
-            && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
-        {
-            return Err(Error::generic(format!(
-                "Setting delta property '{}' is not supported during CREATE TABLE",
-                key
-            )));
-        }
-        // Non-delta properties (user/application properties) are always allowed
-    }
-    Ok(())
 }
 
 /// Creates a builder for creating a new Delta table.
@@ -200,6 +157,7 @@ pub struct CreateTableTransactionBuilder {
     schema: SchemaRef,
     engine_info: String,
     table_properties: HashMap<String, String>,
+    data_layout: super::data_layout::DataLayout,
 }
 
 impl CreateTableTransactionBuilder {
@@ -212,6 +170,7 @@ impl CreateTableTransactionBuilder {
             schema,
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
+            data_layout: super::data_layout::DataLayout::None,
         }
     }
 
@@ -257,6 +216,25 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Sets the data layout for the new Delta table.
+    ///
+    /// The data layout determines how data files are organized within the table:
+    ///
+    /// - [`DataLayout::None`]: No special organization (default)
+    /// - [`DataLayout::Partitioned`]: Data files are organized by partition column values
+    /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
+    ///
+    /// Note: Partitioning and clustering are mutually exclusive. A table can have one or the
+    /// other, but not both.
+    ///
+    /// [`DataLayout::None`]: super::data_layout::DataLayout::None
+    /// [`DataLayout::Partitioned`]: super::data_layout::DataLayout::Partitioned
+    /// [`DataLayout::Clustered`]: super::data_layout::DataLayout::Clustered
+    pub fn with_data_layout(mut self, layout: super::data_layout::DataLayout) -> Self {
+        self.data_layout = layout;
+        self
+    }
+
     /// Builds a [`Transaction`] that can be committed to create the table.
     ///
     /// This method performs validation:
@@ -284,37 +262,34 @@ impl CreateTableTransactionBuilder {
     ) -> DeltaResult<Transaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
+        // Check if table already exists by looking for _delta_log directory
+        let delta_log_url = table_url.join("_delta_log/")?;
+        let storage = engine.storage_handler();
+        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
 
         // Validate schema is non-empty
         if self.schema.fields().len() == 0 {
             return Err(Error::generic("Schema cannot be empty"));
         }
 
-        // Validate table properties against allow list
-        validate_table_properties(&self.table_properties)?;
-
-        // Check if table already exists by looking for _delta_log directory
-        let delta_log_url = table_url.join("_delta_log/")?;
-        let storage = engine.storage_handler();
-        ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
-
-        // Create Protocol action with table features support
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<String>::new()), // readerFeatures (empty for now)
-            Some(Vec::<String>::new()), // writerFeatures (empty for now)
-        )?;
-
-        // Create Metadata action
-        let metadata = Metadata::try_new(
-            None, // name
-            None, // description
+        // Create initial config with bare protocol and user properties only
+        // (delta.* properties are filtered out - transforms read them from TransformContext)
+        let config = TableProtocolMetadataConfig::new_base_for_create(
             (*self.schema).clone(),
             Vec::new(), // partition_columns - added with data layout support
-            current_time_ms()?,
-            self.table_properties,
+            self.table_properties.clone(),
         )?;
+
+        // Apply transforms based on properties and data layout (enables features, validates, etc.)
+        let output = TransformationPipeline::apply_transforms(
+            config,
+            &self.table_properties,
+            &self.data_layout,
+        )?;
+
+        // Extract protocol and metadata from final config
+        let protocol = output.config.protocol;
+        let metadata = output.config.metadata;
 
         // Create pre-commit snapshot from protocol/metadata
         let log_root = table_url.join("_delta_log/")?;
@@ -323,11 +298,12 @@ impl CreateTableTransactionBuilder {
             TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
 
         // Create Transaction with pre-commit snapshot
+        // Domain metadata from transforms is passed as system domain metadata
         Transaction::try_new_create_table(
             Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
-            vec![], // system_domain_metadata - not supported in base API
+            output.domain_metadata,
         )
     }
 }
@@ -336,7 +312,7 @@ impl CreateTableTransactionBuilder {
 mod tests {
     use super::*;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::table_properties::{MIN_READER_VERSION_PROP, MIN_WRITER_VERSION_PROP};
     use std::sync::Arc;
 
     fn test_schema() -> SchemaRef {
@@ -402,46 +378,320 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_supported_properties() {
-        // Empty properties are allowed
-        let properties = HashMap::new();
-        assert!(validate_table_properties(&properties).is_ok());
+    fn test_table_creation_config_parsing() {
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
 
-        // User/application properties are allowed
-        let mut properties = HashMap::new();
-        properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert("custom.setting".to_string(), "value".to_string());
-        assert!(validate_table_properties(&properties).is_ok());
+        // Empty properties are allowed - protocol is created with default features
+        let properties = HashMap::new();
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema.clone(), vec![], properties)
+                .unwrap();
+        assert!(config.metadata.configuration().is_empty());
+        // Protocol always has features (even if empty) at version 3/7
+        assert_eq!(config.protocol.min_reader_version(), 3);
+        assert_eq!(config.protocol.min_writer_version(), 7);
+        assert!(config.protocol.reader_features().unwrap().is_empty());
+        assert!(config.protocol.writer_features().unwrap().is_empty());
+
+        // User/application properties are passed through
+        let properties = HashMap::from([
+            ("myapp.version".to_string(), "1.0".to_string()),
+            ("custom.setting".to_string(), "value".to_string()),
+        ]);
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema.clone(), vec![], properties)
+                .unwrap();
+        assert_eq!(
+            config.metadata.configuration().get("myapp.version"),
+            Some(&"1.0".to_string())
+        );
+        assert_eq!(
+            config.metadata.configuration().get("custom.setting"),
+            Some(&"value".to_string())
+        );
+
+        // new_base_for_create creates bare protocol and filters delta.* properties
+        let properties = HashMap::from([
+            (MIN_READER_VERSION_PROP.to_string(), "3".to_string()),
+            (MIN_WRITER_VERSION_PROP.to_string(), "7".to_string()),
+            ("myapp.version".to_string(), "1.0".to_string()),
+        ]);
+        let config =
+            TableProtocolMetadataConfig::new_base_for_create(schema, vec![], properties).unwrap();
+        // Protocol is bare v3/v7 (transforms process version signals from TransformContext)
+        assert_eq!(config.protocol.min_reader_version(), 3);
+        assert_eq!(config.protocol.min_writer_version(), 7);
+        // delta.* properties are filtered out - only user properties remain
+        assert!(!config
+            .metadata
+            .configuration()
+            .contains_key(MIN_READER_VERSION_PROP));
+        assert!(!config
+            .metadata
+            .configuration()
+            .contains_key(MIN_WRITER_VERSION_PROP));
+        assert_eq!(
+            config.metadata.configuration().get("myapp.version"),
+            Some(&"1.0".to_string())
+        );
     }
 
+    // Note: Protocol version validation tests are pending implementation of
+    // ProtocolVersionTransform. Once implemented, add tests here for:
+    // - Valid versions (3, 7) succeed
+    // - Invalid reader version (not 3) fails
+    // - Invalid writer version (not 7) fails
+    // - Non-integer versions fail
+
+    /// Tests the end-to-end CTAS flow with column mapping enabled.
+    ///
+    /// This test validates that when creating a table with `delta.columnMapping.mode=name`:
+    /// 1. The schema gets column mapping metadata (IDs and physical names)
+    /// 2. `WriteContext.stats_columns()` returns physical column names
+    /// 3. `WriteContext.physical_schema()` has fields with physical names
+    /// 4. The transaction's `stats_schema()` uses physical column names
     #[test]
-    fn test_validate_unsupported_properties() {
-        // Delta properties not on allow list are rejected
-        let mut properties = HashMap::new();
-        properties.insert("delta.enableChangeDataFeed".to_string(), "true".to_string());
-        assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting delta property 'delta.enableChangeDataFeed' is not supported",
+    fn test_ctas_with_column_mapping_stats_use_physical_names() {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::schema::ColumnMetadataKey;
+        use crate::table_features::ColumnMappingMode;
+        use tempfile::tempdir;
+
+        // The constant for checking maxColumnId in configuration
+        const COLUMN_MAPPING_MAX_COLUMN_ID_KEY: &str = "delta.columnMapping.maxColumnId";
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create a schema with nested fields to test column mapping thoroughly
+        let inner_struct = StructType::new_unchecked([
+            StructField::new("x", DataType::INTEGER, false),
+            StructField::new("y", DataType::STRING, true),
+        ]);
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("nested", DataType::Struct(Box::new(inner_struct)), true),
+        ]));
+
+        // Create table with column mapping mode = name
+        let txn = create_table(table_path, schema.clone(), "TestEngine/1.0")
+            .with_table_properties([("delta.columnMapping.mode", "name")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .expect("Failed to create table with column mapping");
+
+        // === Verify 1: Schema has column mapping metadata ===
+        let table_config = txn.read_snapshot.table_configuration();
+        let logical_schema = table_config.schema();
+
+        // Check column mapping mode is enabled
+        assert_eq!(
+            table_config.column_mapping_mode(),
+            ColumnMappingMode::Name,
+            "Column mapping mode should be 'name'"
         );
 
-        // Feature override properties are rejected
-        let mut properties = HashMap::new();
-        properties.insert(
-            "delta.feature.domainMetadata".to_string(),
-            "supported".to_string(),
+        // Check each field has column mapping metadata
+        for field in logical_schema.fields() {
+            let col_id = field.get_config_value(&ColumnMetadataKey::ColumnMappingId);
+            let physical_name =
+                field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName);
+
+            assert!(
+                col_id.is_some(),
+                "Field '{}' should have column mapping ID",
+                field.name()
+            );
+            assert!(
+                physical_name.is_some(),
+                "Field '{}' should have physical name",
+                field.name()
+            );
+
+            // Physical name should be different from logical name (uuid-based)
+            if let Some(crate::schema::MetadataValue::String(phys)) = physical_name {
+                assert!(
+                    phys.starts_with("col-"),
+                    "Physical name '{}' should start with 'col-' prefix",
+                    phys
+                );
+                assert_ne!(
+                    phys,
+                    field.name(),
+                    "Physical name should differ from logical name"
+                );
+            }
+        }
+
+        // === Verify 2: WriteContext uses physical names ===
+        let write_context = txn.get_write_context();
+
+        // stats_columns should return physical column names
+        let stats_cols = write_context.stats_columns();
+        assert!(!stats_cols.is_empty(), "Stats columns should not be empty");
+
+        // Each stats column should be a physical name (starts with "col-")
+        // Check the path components directly since to_string() adds backtick escaping
+        for col_name in stats_cols {
+            let path = col_name.path();
+            // All path components should be physical names (col-* prefix)
+            for component in path {
+                assert!(
+                    component.starts_with("col-"),
+                    "Stats column path component '{}' should use physical name (col-* prefix)",
+                    component
+                );
+            }
+        }
+
+        // === Verify 3: Physical schema fields have column mapping metadata ===
+        // Note: WriteContext.physical_schema() uses logical field names but includes
+        // column mapping metadata. The engine should use this metadata to determine
+        // the physical column names to write to parquet files.
+        let physical_schema = write_context.physical_schema();
+
+        for field in physical_schema.fields() {
+            // Field names are logical, but they have column mapping metadata
+            let physical_name =
+                field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName);
+            assert!(
+                physical_name.is_some(),
+                "Physical schema field '{}' should have column mapping physical name metadata",
+                field.name()
+            );
+
+            // Verify the physical name metadata is a col-* name
+            if let Some(crate::schema::MetadataValue::String(phys)) = physical_name {
+                assert!(
+                    phys.starts_with("col-"),
+                    "Physical name metadata '{}' for field '{}' should have col-* prefix",
+                    phys,
+                    field.name()
+                );
+            }
+
+            // For nested structs, check inner fields too
+            if let DataType::Struct(inner) = field.data_type() {
+                for inner_field in inner.fields() {
+                    let inner_phys =
+                        inner_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName);
+                    assert!(
+                        inner_phys.is_some(),
+                        "Nested field '{}' should have physical name metadata",
+                        inner_field.name()
+                    );
+                }
+            }
+        }
+
+        // === Verify 4: Stats schema uses physical names ===
+        let stats_schema = txn.stats_schema().expect("Should get stats schema");
+
+        // Find minValues/maxValues fields and verify they use physical column names
+        if let Some(min_values_field) = stats_schema.field("minValues") {
+            if let DataType::Struct(min_struct) = min_values_field.data_type() {
+                for field in min_struct.fields() {
+                    assert!(
+                        field.name().starts_with("col-"),
+                        "Stats minValues field '{}' should use physical name",
+                        field.name()
+                    );
+                }
+            }
+        }
+
+        // === Verify 5: Logical schema still has logical names ===
+        let logical_schema_from_ctx = write_context.logical_schema();
+        let logical_field_names: Vec<&str> = logical_schema_from_ctx
+            .fields()
+            .map(|f| f.name().as_str())
+            .collect();
+
+        assert!(
+            logical_field_names.contains(&"id"),
+            "Logical schema should contain 'id'"
         );
-        assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting feature override property 'delta.feature.domainMetadata' is not supported",
+        assert!(
+            logical_field_names.contains(&"name"),
+            "Logical schema should contain 'name'"
+        );
+        assert!(
+            logical_field_names.contains(&"nested"),
+            "Logical schema should contain 'nested'"
         );
 
-        // Mixed properties with unsupported delta property are rejected
-        let mut properties = HashMap::new();
-        properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert("delta.appendOnly".to_string(), "true".to_string());
-        assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting delta property 'delta.appendOnly' is not supported",
+        // Verify maxColumnId was set in configuration
+        let config = table_config.metadata().configuration();
+        assert!(
+            config.contains_key(COLUMN_MAPPING_MAX_COLUMN_ID_KEY),
+            "Configuration should contain maxColumnId"
         );
+        let max_id: i64 = config
+            .get(COLUMN_MAPPING_MAX_COLUMN_ID_KEY)
+            .unwrap()
+            .parse()
+            .unwrap();
+        // We have 5 fields total: id, name, nested, nested.x, nested.y
+        assert!(
+            max_id >= 5,
+            "maxColumnId should be at least 5 for 5 fields, got {}",
+            max_id
+        );
+    }
+
+    /// Tests that CTAS without column mapping uses logical names for stats.
+    #[test]
+    fn test_ctas_without_column_mapping_stats_use_logical_names() {
+        use crate::committer::FileSystemCommitter;
+        use crate::engine::sync::SyncEngine;
+        use crate::table_features::ColumnMappingMode;
+        use tempfile::tempdir;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("value", DataType::STRING, true),
+        ]));
+
+        // Create table WITHOUT column mapping
+        let txn = create_table(table_path, schema, "TestEngine/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .expect("Failed to create table");
+
+        let table_config = txn.read_snapshot.table_configuration();
+
+        // Verify column mapping is NOT enabled
+        assert_eq!(
+            table_config.column_mapping_mode(),
+            ColumnMappingMode::None,
+            "Column mapping mode should be 'none'"
+        );
+
+        // WriteContext stats_columns should use logical names
+        let write_context = txn.get_write_context();
+        let stats_cols = write_context.stats_columns();
+
+        for col_name in stats_cols {
+            // Without column mapping, path components should be logical names (not col-* prefix)
+            for component in col_name.path() {
+                assert!(
+                    !component.starts_with("col-"),
+                    "Without column mapping, stats column component '{}' should use logical name",
+                    component
+                );
+            }
+        }
+
+        // Physical schema should use logical names (same as logical)
+        let physical_schema = write_context.physical_schema();
+        let field_names: Vec<&str> = physical_schema.fields().map(|f| f.name().as_str()).collect();
+        assert!(field_names.contains(&"id"), "Should have 'id' field");
+        assert!(field_names.contains(&"value"), "Should have 'value' field");
     }
 }
