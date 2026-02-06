@@ -96,9 +96,9 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
-    CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    Add, CheckpointMetadata, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar,
+    ADD_NAME, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
+    REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
@@ -143,13 +143,11 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-// Schema of the [`CheckpointMetadata`] action that is included in V2 checkpoints
-// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
-// we're not supporting yet due to the lack of map support TODO(#880).
+/// Schema of the [`CheckpointMetadata`] action that is included in V2 checkpoints.
 static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         CHECKPOINT_METADATA_NAME,
-        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
+        CheckpointMetadata::to_schema(),
     )]))
 });
 
@@ -328,12 +326,6 @@ impl CheckpointWriter {
     /// V2 spec checkpoint file. This action contains metadata about the checkpoint, particularly
     /// its version.
     ///
-    /// # Implementation Details
-    ///
-    /// The function creates a single-row [`EngineData`] batch containing only the
-    /// version field of the [`CheckpointMetadata`] action. Future implementations will
-    /// include the additional metadata field `tags` when map support is added.
-    ///
     /// # Returns:
     /// A [`ActionReconciliationBatch`] batch including the single-row [`EngineData`] batch along with
     /// an accompanying selection vector with a single `true` value, indicating the action in
@@ -342,9 +334,16 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationBatch> {
+        use crate::schema::MapType;
+        // Create a null value for the optional tags field (Map<String, String>)
+        let null_tags = Scalar::Null(DataType::Map(Box::new(MapType::new(
+            DataType::STRING,
+            DataType::STRING,
+            false,
+        ))));
         let checkpoint_metadata_batch = engine.evaluation_handler().create_one(
             CHECKPOINT_METADATA_ACTION_SCHEMA.clone(),
-            &[Scalar::from(self.version)],
+            &[Scalar::from(self.version), null_tags],
         )?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
