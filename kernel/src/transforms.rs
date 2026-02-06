@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
+use crate::engine_data::LazyMap;
 use crate::expressions::{
     BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
 };
@@ -83,6 +84,31 @@ pub(crate) fn parse_partition_value(
     Ok((field_idx, (name.to_string(), partition_value)))
 }
 
+/// Parse a single partition value from a LazyMap, only accessing the specific
+/// key needed for this field.
+fn parse_partition_value_lazy<'a>(
+    field_idx: usize,
+    logical_schema: &SchemaRef,
+    partition_values: &dyn LazyMap<'a>,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<(usize, (String, Scalar))> {
+    let Some(field) = logical_schema.field_at_index(field_idx) else {
+        return Err(Error::InternalError(format!(
+            "out of bounds partition column field index {field_idx}"
+        )));
+    };
+    let name = field.physical_name(column_mapping_mode);
+
+    // Only access the specific key we need from the lazy map
+    let partition_value_str = partition_values.get(name);
+    let partition_value = parse_partition_value_raw(
+        partition_value_str.map(|s| s.to_string()).as_ref(),
+        field.data_type()
+    )?;
+
+    Ok((field_idx, (name.to_string(), partition_value)))
+}
+
 /// Parse all partition values from a transform spec.
 pub(crate) fn parse_partition_values(
     logical_schema: &SchemaRef,
@@ -95,6 +121,34 @@ pub(crate) fn parse_partition_values(
         .filter_map(|field_transform| match field_transform {
             FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => {
                 Some(parse_partition_value(
+                    *field_index,
+                    logical_schema,
+                    partition_values,
+                    column_mapping_mode,
+                ))
+            }
+            FieldTransformSpec::DynamicColumn { .. }
+            | FieldTransformSpec::StaticInsert { .. }
+            | FieldTransformSpec::GenerateRowId { .. }
+            | FieldTransformSpec::StaticDrop { .. } => None,
+        })
+        .try_collect()
+}
+
+/// Parse partition values lazily, only accessing keys specified in the TransformSpec.
+/// This avoids materializing the entire partition values map when only a subset
+/// of columns are needed.
+pub(crate) fn parse_partition_values_lazy<'a>(
+    logical_schema: &SchemaRef,
+    transform_spec: &TransformSpec,
+    partition_values: &dyn LazyMap<'a>,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+    transform_spec
+        .iter()
+        .filter_map(|field_transform| match field_transform {
+            FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => {
+                Some(parse_partition_value_lazy(
                     *field_index,
                     logical_schema,
                     partition_values,

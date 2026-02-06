@@ -153,6 +153,19 @@ pub trait EngineMap {
     fn materialize(&self, row_index: usize) -> HashMap<String, String>;
 }
 
+/// Trait for lazy access to map data, avoiding full materialization when only
+/// a subset of keys are needed. This is particularly useful for partition values
+/// where typically only a few columns are accessed.
+pub trait LazyMap<'a> {
+    /// Get a value by key, returning borrowed str on success.
+    /// Returns None if the key doesn't exist or the value is null.
+    fn get(&self, key: &str) -> Option<&'a str>;
+
+    /// Materialize the full map if needed for cases requiring all values.
+    /// Note: Like EngineMap::materialize, this drops null values.
+    fn materialize(&self) -> HashMap<String, String>;
+}
+
 /// A map item is useful if the Engine needs to know what row of raw data it needs to access to
 /// implement the [`EngineMap`] trait. It simply wraps such a map, and the row.
 pub struct MapItem<'a> {
@@ -198,7 +211,8 @@ pub trait GetData<'a> {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_lazy_map, Box<dyn LazyMap<'a> + 'a>)
     );
 }
 
@@ -220,7 +234,8 @@ impl<'a> GetData<'a> for () {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_lazy_map, Box<dyn LazyMap<'a> + 'a>)
     );
 }
 
@@ -255,7 +270,8 @@ impl_typed_get_data!(
     (get_str, &'a str),
     (get_binary, &'a [u8]),
     (get_list, ListItem<'a>),
-    (get_map, MapItem<'a>)
+    (get_map, MapItem<'a>),
+    (get_lazy_map, Box<dyn LazyMap<'a> + 'a>)
 );
 
 impl<'a> TypedGetData<'a, String> for dyn GetData<'a> + '_ {

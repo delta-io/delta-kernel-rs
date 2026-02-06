@@ -7,14 +7,14 @@ use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{GetData, LazyMap, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values};
+use crate::transforms::{get_transform_expr, parse_partition_values_lazy};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -175,12 +175,12 @@ impl AddRemoveDedupVisitor<'_> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values =
+                let partition_values_lazy: Box<dyn LazyMap<'_>> =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
+                let partition_values = parse_partition_values_lazy(
                     &self.state_info.logical_schema,
                     transform,
-                    &partition_values,
+                    partition_values_lazy.as_ref(),
                     self.state_info.column_mapping_mode,
                 )?;
                 if self.is_file_partition_pruned(&partition_values) {

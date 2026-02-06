@@ -5,7 +5,8 @@ use crate::arrow::array::{
 };
 
 use crate::{
-    engine_data::{GetData, ListItem, MapItem},
+    engine::arrow_data::ArrowLazyMap,
+    engine_data::{GetData, LazyMap, ListItem, MapItem},
     DeltaResult,
 };
 
@@ -82,6 +83,18 @@ impl<'a> GetData<'a> for MapArray {
     fn get_map(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<MapItem<'a>>> {
         if self.is_valid(row_index) {
             Ok(Some(MapItem::new(self, row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_lazy_map(
+        &'a self,
+        row_index: usize,
+        _field_name: &str,
+    ) -> DeltaResult<Option<Box<dyn LazyMap<'a> + 'a>>> {
+        if self.is_valid(row_index) {
+            Ok(Some(Box::new(ArrowLazyMap::new(self, row_index))))
         } else {
             Ok(None)
         }

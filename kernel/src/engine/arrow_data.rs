@@ -14,7 +14,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
+use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, LazyMap, RowVisitor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, SchemaRef};
 use crate::{DeltaResult, Error};
@@ -143,6 +143,52 @@ impl EngineMap for MapArray {
             }
         }
         ret
+    }
+}
+
+/// Lazy map accessor for Arrow MapArray that avoids full materialization.
+/// Only accesses the specific keys requested via get().
+pub struct ArrowLazyMap<'a> {
+    map: &'a MapArray,
+    row: usize,
+}
+
+impl<'a> ArrowLazyMap<'a> {
+    pub fn new(map: &'a MapArray, row: usize) -> Self {
+        ArrowLazyMap { map, row }
+    }
+}
+
+impl<'a> LazyMap<'a> for ArrowLazyMap<'a> {
+    fn get(&self, key: &str) -> Option<&'a str> {
+        // Use backward iteration as requested - may be faster if recent
+        // values are more commonly accessed and stored at the end
+        let offsets = self.map.offsets();
+        let start_offset = offsets[self.row] as usize;
+        let end_offset = offsets[self.row + 1] as usize;
+        let keys = self.map.keys().as_string::<i32>();
+        let vals = self.map.values().as_string::<i32>();
+
+        // Iterate backwards: use Rust's .rev() which handles the iteration safely
+        // This iterates from (end_offset - 1) down to start_offset inclusive
+        for idx in (start_offset..end_offset).rev() {
+            if keys.is_valid(idx) {
+                let map_key = keys.value(idx);
+                if key == map_key {
+                    return if vals.is_valid(idx) {
+                        Some(vals.value(idx))
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    fn materialize(&self) -> HashMap<String, String> {
+        // Delegate to existing EngineMap implementation
+        self.map.materialize(self.row)
     }
 }
 
