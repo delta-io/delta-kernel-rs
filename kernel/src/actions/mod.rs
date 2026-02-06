@@ -349,6 +349,42 @@ impl Metadata {
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
+
+    /// Return a new Metadata with updated configuration.
+    #[internal_api]
+    #[allow(dead_code)] // Used by table_transformation module
+    pub(crate) fn with_configuration(mut self, configuration: HashMap<String, String>) -> Self {
+        self.configuration = configuration;
+        self
+    }
+
+    /// Return a new Metadata with updated partition columns.
+    #[internal_api]
+    pub(crate) fn with_partition_columns(mut self, partition_columns: Vec<String>) -> Self {
+        self.partition_columns = partition_columns;
+        self
+    }
+
+    /// Return a new Metadata with updated schema.
+    ///
+    /// This is used by transforms that need to modify the schema, such as the
+    /// column mapping transform which assigns IDs and physical names to fields.
+    #[internal_api]
+    #[allow(dead_code)] // Used by table_transformation module
+    pub(crate) fn with_schema(mut self, schema: StructType) -> DeltaResult<Self> {
+        self.schema_string = serde_json::to_string(&schema)?;
+        Ok(self)
+    }
+
+    /// Return a new Metadata with an additional configuration value.
+    ///
+    /// If the key already exists, its value will be updated.
+    #[internal_api]
+    #[allow(dead_code)] // Used by table_transformation module
+    pub(crate) fn with_configuration_value(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.configuration.insert(key.into(), value.into());
+        self
+    }
 }
 
 // NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
@@ -475,6 +511,79 @@ impl Protocol {
         // Since each reader features is a subset of writer features, we only check writer feature
         self.writer_features()
             .is_some_and(|features| features.contains(feature))
+    }
+
+    /// Create a new Protocol with the given feature added.
+    ///
+    /// If the feature is already present, returns the protocol unchanged.
+    /// If the feature is a ReaderWriter feature, it will be added to both
+    /// reader and writer feature lists.
+    ///
+    /// # Arguments
+    ///
+    /// * `feature` - The feature to add to the protocol
+    ///
+    /// # Returns
+    ///
+    /// A new Protocol with the feature added, or an error if the resulting
+    /// protocol would be invalid.
+    #[allow(dead_code)]
+    pub(crate) fn with_feature(self, feature: TableFeature) -> DeltaResult<Self> {
+        use crate::table_features::{
+            TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+        };
+
+        // Get current features as mutable vecs
+        let mut reader_features: Vec<_> =
+            self.reader_features.map(|f| f.to_vec()).unwrap_or_default();
+        let mut writer_features: Vec<_> =
+            self.writer_features.map(|f| f.to_vec()).unwrap_or_default();
+
+        // Add feature to writer features if not already present
+        if !writer_features.contains(&feature) {
+            writer_features.push(feature.clone());
+        }
+
+        // If it's a ReaderWriter feature, also add to reader features
+        if feature.is_reader_writer() && !reader_features.contains(&feature) {
+            reader_features.push(feature);
+        }
+
+        // Create new protocol with updated features
+        Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features.iter()),
+            Some(writer_features.iter()),
+        )
+    }
+
+    /// Create a new Protocol with specified versions, preserving existing features.
+    ///
+    /// This is used during table creation when the protocol version is determined
+    /// from user-specified properties.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_reader_version` - The minimum reader version
+    /// * `min_writer_version` - The minimum writer version
+    ///
+    /// # Returns
+    ///
+    /// A new Protocol with the specified versions, or an error if the resulting
+    /// protocol would be invalid.
+    #[allow(dead_code)]
+    pub(crate) fn with_versions(
+        self,
+        min_reader_version: i32,
+        min_writer_version: i32,
+    ) -> DeltaResult<Self> {
+        Protocol::try_new(
+            min_reader_version,
+            min_writer_version,
+            self.reader_features.as_ref().map(|f| f.iter()),
+            self.writer_features.as_ref().map(|f| f.iter()),
+        )
     }
 
     /// Validates the relationship between reader features and writer features in the protocol.

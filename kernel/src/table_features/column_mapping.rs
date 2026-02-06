@@ -8,9 +8,27 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
+use uuid::Uuid;
+
+// ============================================================================
+// Column Mapping Constants
+// ============================================================================
+
+/// Table property key for column mapping mode
+pub(crate) const COLUMN_MAPPING_MODE_KEY: &str = "delta.columnMapping.mode";
+
+/// Table property key for tracking the maximum column ID assigned
+pub(crate) const COLUMN_MAPPING_MAX_COLUMN_ID_KEY: &str = "delta.columnMapping.maxColumnId";
+
+/// Metadata key for the column mapping ID on a field
+pub(crate) const COLUMN_MAPPING_ID_KEY: &str = "delta.columnMapping.id";
+
+/// Metadata key for the physical name on a field
+pub(crate) const COLUMN_MAPPING_PHYSICAL_NAME_KEY: &str = "delta.columnMapping.physicalName";
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -158,6 +176,209 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
         // TODO: this changes with icebergcompat right? see issue#1125 for icebergcompat.
         None
     }
+}
+
+// ============================================================================
+// Write-side column mapping functions
+// ============================================================================
+
+/// Get the column mapping mode from a table properties map.
+///
+/// This is used during table creation when we have raw properties from the builder,
+/// not yet converted to [`TableProperties`].
+///
+/// Returns `ColumnMappingMode::None` if the property is not set.
+pub(crate) fn get_column_mapping_mode_from_properties(
+    properties: &HashMap<String, String>,
+) -> DeltaResult<ColumnMappingMode> {
+    match properties.get(COLUMN_MAPPING_MODE_KEY) {
+        Some(mode_str) => mode_str.parse::<ColumnMappingMode>().map_err(|_| {
+            Error::generic(format!(
+                "Invalid column mapping mode '{}'. Must be one of: none, name, id",
+                mode_str
+            ))
+        }),
+        None => Ok(ColumnMappingMode::None),
+    }
+}
+
+/// Assigns column mapping metadata (IDs and physical names) to all fields in a schema.
+///
+/// This function processes a schema recursively, assigning column mapping metadata to
+/// each field. For fields that already have metadata, it preserves them and updates
+/// `max_id` to track the highest ID seen. For fields without metadata, it assigns
+/// new sequential IDs (starting from `max_id + 1`) and generates UUID-based physical names.
+///
+/// # Arguments
+///
+/// * `schema` - The schema to process
+/// * `max_id` - Mutable reference to track the highest column ID. Will be updated to
+///   reflect the maximum ID seen or assigned.
+///
+/// # Returns
+///
+/// A new schema with column mapping metadata assigned to all fields.
+pub(crate) fn assign_column_mapping_metadata(
+    schema: &StructType,
+    max_id: &mut i64,
+) -> DeltaResult<StructType> {
+    let new_fields: Vec<StructField> = schema
+        .fields()
+        .map(|field| assign_field_column_mapping(field, max_id))
+        .collect::<DeltaResult<Vec<_>>>()?;
+
+    StructType::try_new(new_fields)
+}
+
+/// Assigns column mapping metadata to a single field, recursively processing nested types.
+///
+/// If the field already has column mapping metadata, updates `max_id` to track the highest
+/// ID seen. If the field doesn't have metadata, assigns a new ID (incrementing `max_id`).
+fn assign_field_column_mapping(field: &StructField, max_id: &mut i64) -> DeltaResult<StructField> {
+    let has_id = field.metadata.contains_key(COLUMN_MAPPING_ID_KEY);
+    let has_physical_name = field
+        .metadata
+        .contains_key(COLUMN_MAPPING_PHYSICAL_NAME_KEY);
+
+    // Validate: if one is present, both must be present
+    if has_id != has_physical_name {
+        return Err(Error::generic(format!(
+            "Field '{}' has incomplete column mapping metadata. \
+             Both delta.columnMapping.id and delta.columnMapping.physicalName must be present if one is present.",
+            field.name
+        )));
+    }
+
+    // Start with the existing field
+    let mut new_field = field.clone();
+
+    if has_id {
+        // Field already has an ID - update max_id to track the highest seen
+        if let Some(MetadataValue::Number(existing_id)) = field.metadata.get(COLUMN_MAPPING_ID_KEY)
+        {
+            *max_id = (*max_id).max(*existing_id);
+        }
+    } else {
+        // Assign new ID
+        *max_id += 1;
+        new_field.metadata.insert(
+            COLUMN_MAPPING_ID_KEY.to_string(),
+            MetadataValue::Number(*max_id),
+        );
+    }
+
+    // Assign physical name if missing
+    if !has_physical_name {
+        let physical_name = format!("col-{}", Uuid::new_v4());
+        new_field.metadata.insert(
+            COLUMN_MAPPING_PHYSICAL_NAME_KEY.to_string(),
+            MetadataValue::String(physical_name),
+        );
+    }
+
+    // Recursively process nested types
+    new_field.data_type = process_nested_data_type(&field.data_type, max_id)?;
+
+    Ok(new_field)
+}
+
+/// Process nested data types to assign column mapping metadata to any nested struct fields.
+fn process_nested_data_type(data_type: &DataType, max_id: &mut i64) -> DeltaResult<DataType> {
+    match data_type {
+        DataType::Struct(inner) => {
+            let new_inner = assign_column_mapping_metadata(inner, max_id)?;
+            Ok(DataType::Struct(Box::new(new_inner)))
+        }
+        DataType::Array(array_type) => {
+            let new_element_type = process_nested_data_type(array_type.element_type(), max_id)?;
+            Ok(DataType::Array(Box::new(crate::schema::ArrayType::new(
+                new_element_type,
+                array_type.contains_null(),
+            ))))
+        }
+        DataType::Map(map_type) => {
+            let new_key_type = process_nested_data_type(map_type.key_type(), max_id)?;
+            let new_value_type = process_nested_data_type(map_type.value_type(), max_id)?;
+            Ok(DataType::Map(Box::new(crate::schema::MapType::new(
+                new_key_type,
+                new_value_type,
+                map_type.value_contains_null(),
+            ))))
+        }
+        // Primitive types don't need processing
+        _ => Ok(data_type.clone()),
+    }
+}
+
+/// Get the physical name from a field's metadata, falling back to the logical name.
+pub(crate) fn get_physical_name(field: &StructField) -> &str {
+    match field.metadata.get(COLUMN_MAPPING_PHYSICAL_NAME_KEY) {
+        Some(MetadataValue::String(name)) => name.as_str(),
+        _ => &field.name,
+    }
+}
+
+/// Resolves a logical column path to physical names using column mapping metadata.
+///
+/// This function takes a column's logical field path (which may be nested, e.g.,
+/// `["address", "city"]`) and resolves each field name to its physical name using
+/// the schema's column mapping metadata.
+///
+/// When column mapping is disabled (`None` mode), the logical names are returned as-is.
+///
+/// # Arguments
+///
+/// * `logical_path` - The logical column path, e.g., `["address", "city"]` for `address.city`
+/// * `schema` - The table schema with column mapping metadata
+/// * `column_mapping_mode` - The column mapping mode (None, Name, or Id)
+///
+/// # Returns
+///
+/// A vector of physical column names corresponding to the logical path.
+pub(crate) fn resolve_logical_to_physical_path(
+    logical_path: &[String],
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<Vec<String>> {
+    if column_mapping_mode == ColumnMappingMode::None {
+        // No column mapping - use logical names as-is
+        return Ok(logical_path.to_vec());
+    }
+
+    // Column mapping enabled - resolve to physical names
+    let mut result = Vec::with_capacity(logical_path.len());
+    let mut current_schema = schema;
+    let last_field_index = logical_path.len() - 1;
+
+    for (field_index, field_name) in logical_path.iter().enumerate() {
+        let field = current_schema.field(field_name).ok_or_else(|| {
+            Error::generic(format!(
+                "Column '{}' not found in schema",
+                logical_path.join(".")
+            ))
+        })?;
+
+        // Get physical name (falls back to logical name if not present)
+        result.push(get_physical_name(field).to_string());
+
+        // If not the last element, we need to descend into a struct
+        if field_index < last_field_index {
+            match &field.data_type {
+                DataType::Struct(inner) => {
+                    current_schema = inner;
+                }
+                _ => {
+                    return Err(Error::generic(format!(
+                        "Cannot traverse into non-struct field '{}' in column path '{}'",
+                        field_name,
+                        logical_path.join(".")
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -353,5 +574,252 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field id");
         let schema = create_schema(None, None, None, "\"col-5f422f40\"");
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
+    }
+
+    // =========================================================================
+    // Tests for write-side column mapping functions
+    // =========================================================================
+
+    use crate::schema::{DataType, StructField};
+
+    #[test]
+    fn test_get_column_mapping_mode_from_properties() {
+        let mut props = HashMap::new();
+
+        // No mode property -> None
+        assert_eq!(
+            get_column_mapping_mode_from_properties(&props).unwrap(),
+            ColumnMappingMode::None
+        );
+
+        // Explicit none
+        props.insert("delta.columnMapping.mode".to_string(), "none".to_string());
+        assert_eq!(
+            get_column_mapping_mode_from_properties(&props).unwrap(),
+            ColumnMappingMode::None
+        );
+
+        // Name mode
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+        assert_eq!(
+            get_column_mapping_mode_from_properties(&props).unwrap(),
+            ColumnMappingMode::Name
+        );
+
+        // Id mode
+        props.insert("delta.columnMapping.mode".to_string(), "id".to_string());
+        assert_eq!(
+            get_column_mapping_mode_from_properties(&props).unwrap(),
+            ColumnMappingMode::Id
+        );
+
+        // Invalid mode
+        props.insert(
+            "delta.columnMapping.mode".to_string(),
+            "invalid".to_string(),
+        );
+        assert!(get_column_mapping_mode_from_properties(&props).is_err());
+    }
+
+    #[test]
+    fn test_assign_column_mapping_metadata_simple() {
+        let schema = StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("b", DataType::STRING, true),
+        ]);
+
+        let mut max_id = 0;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id).unwrap();
+
+        // Should have assigned IDs 1 and 2
+        assert_eq!(max_id, 2);
+        assert_eq!(result.fields().count(), 2);
+
+        // Check both fields have metadata
+        for (i, field) in result.fields().enumerate() {
+            let expected_id = (i + 1) as i64;
+            assert_eq!(
+                field.metadata.get(COLUMN_MAPPING_ID_KEY),
+                Some(&MetadataValue::Number(expected_id))
+            );
+            assert!(field
+                .metadata
+                .contains_key(COLUMN_MAPPING_PHYSICAL_NAME_KEY));
+
+            // Verify physical name format (col-{uuid})
+            if let Some(MetadataValue::String(name)) =
+                field.metadata.get(COLUMN_MAPPING_PHYSICAL_NAME_KEY)
+            {
+                assert!(
+                    name.starts_with("col-"),
+                    "Physical name should start with 'col-'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_assign_column_mapping_metadata_preserves_existing() {
+        let schema = StructType::new_unchecked([
+            // Field with existing column mapping
+            StructField::new("a", DataType::INTEGER, false).add_metadata([
+                (COLUMN_MAPPING_ID_KEY, MetadataValue::Number(100)),
+                (
+                    COLUMN_MAPPING_PHYSICAL_NAME_KEY,
+                    MetadataValue::String("existing-physical".to_string()),
+                ),
+            ]),
+            // Field without column mapping
+            StructField::new("b", DataType::STRING, true),
+        ]);
+
+        let mut max_id = 0;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id).unwrap();
+
+        // max_id should be 101: 'a' has ID 100, 'b' gets ID 101
+        assert_eq!(max_id, 101);
+
+        // Check field 'a' preserved its existing metadata
+        let field_a = result.field("a").unwrap();
+        assert_eq!(
+            field_a.metadata.get(COLUMN_MAPPING_ID_KEY),
+            Some(&MetadataValue::Number(100))
+        );
+        assert_eq!(
+            field_a.metadata.get(COLUMN_MAPPING_PHYSICAL_NAME_KEY),
+            Some(&MetadataValue::String("existing-physical".to_string()))
+        );
+
+        // Check field 'b' got new metadata (ID = 101, one more than the existing max of 100)
+        let field_b = result.field("b").unwrap();
+        assert_eq!(
+            field_b.metadata.get(COLUMN_MAPPING_ID_KEY),
+            Some(&MetadataValue::Number(101))
+        );
+    }
+
+    #[test]
+    fn test_assign_column_mapping_metadata_nested_struct() {
+        let inner = StructType::new_unchecked([
+            StructField::new("x", DataType::INTEGER, false),
+            StructField::new("y", DataType::STRING, true),
+        ]);
+
+        let schema = StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("nested", DataType::Struct(Box::new(inner)), true),
+        ]);
+
+        let mut max_id = 0;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id).unwrap();
+
+        // Should have assigned IDs to all 4 fields
+        assert_eq!(max_id, 4);
+
+        // Check outer field 'a'
+        let field_a = result.field("a").unwrap();
+        assert!(field_a.metadata.contains_key(COLUMN_MAPPING_ID_KEY));
+
+        // Check outer field 'nested'
+        let field_nested = result.field("nested").unwrap();
+        assert!(field_nested.metadata.contains_key(COLUMN_MAPPING_ID_KEY));
+
+        // Check nested fields
+        if let DataType::Struct(inner) = &field_nested.data_type {
+            let field_x = inner.field("x").unwrap();
+            assert!(field_x.metadata.contains_key(COLUMN_MAPPING_ID_KEY));
+            let field_y = inner.field("y").unwrap();
+            assert!(field_y.metadata.contains_key(COLUMN_MAPPING_ID_KEY));
+        } else {
+            panic!("Expected struct type for 'nested' field");
+        }
+    }
+
+    #[test]
+    fn test_resolve_logical_to_physical_path_no_mapping() {
+        let schema = StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("b", DataType::STRING, true),
+        ]);
+
+        let path = vec!["a".to_string()];
+        let result =
+            resolve_logical_to_physical_path(&path, &schema, ColumnMappingMode::None).unwrap();
+
+        // Should return logical names as-is
+        assert_eq!(result, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_logical_to_physical_path_with_mapping() {
+        let schema = StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false).add_metadata([
+                (COLUMN_MAPPING_ID_KEY, MetadataValue::Number(1)),
+                (
+                    COLUMN_MAPPING_PHYSICAL_NAME_KEY,
+                    MetadataValue::String("col-abc123".to_string()),
+                ),
+            ]),
+            StructField::new("b", DataType::STRING, true).add_metadata([
+                (COLUMN_MAPPING_ID_KEY, MetadataValue::Number(2)),
+                (
+                    COLUMN_MAPPING_PHYSICAL_NAME_KEY,
+                    MetadataValue::String("col-def456".to_string()),
+                ),
+            ]),
+        ]);
+
+        let path = vec!["a".to_string()];
+        let result =
+            resolve_logical_to_physical_path(&path, &schema, ColumnMappingMode::Name).unwrap();
+
+        // Should return physical name
+        assert_eq!(result, vec!["col-abc123".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_logical_to_physical_path_nested() {
+        let inner = StructType::new_unchecked([StructField::new("city", DataType::STRING, true)
+            .add_metadata([
+                (COLUMN_MAPPING_ID_KEY, MetadataValue::Number(2)),
+                (
+                    COLUMN_MAPPING_PHYSICAL_NAME_KEY,
+                    MetadataValue::String("col-city".to_string()),
+                ),
+            ])]);
+
+        let schema = StructType::new_unchecked([StructField::new(
+            "address",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([
+            (COLUMN_MAPPING_ID_KEY, MetadataValue::Number(1)),
+            (
+                COLUMN_MAPPING_PHYSICAL_NAME_KEY,
+                MetadataValue::String("col-address".to_string()),
+            ),
+        ])]);
+
+        let path = vec!["address".to_string(), "city".to_string()];
+        let result =
+            resolve_logical_to_physical_path(&path, &schema, ColumnMappingMode::Name).unwrap();
+
+        // Should return physical names for nested path
+        assert_eq!(
+            result,
+            vec!["col-address".to_string(), "col-city".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_logical_to_physical_path_column_not_found() {
+        let schema =
+            StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
+
+        let path = vec!["nonexistent".to_string()];
+        let result = resolve_logical_to_physical_path(&path, &schema, ColumnMappingMode::Name);
+
+        assert!(result.is_err());
     }
 }
