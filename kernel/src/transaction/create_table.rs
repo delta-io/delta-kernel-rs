@@ -511,9 +511,11 @@ mod tests {
 
     #[test]
     fn test_validate_unsupported_properties() {
+        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
+
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
-        properties.insert("delta.enableChangeDataFeed".to_string(), "true".to_string());
+        properties.insert(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
             "Setting delta property 'delta.enableChangeDataFeed' is not supported",
@@ -533,7 +535,7 @@ mod tests {
         // Mixed properties with unsupported delta property are rejected
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert("delta.appendOnly".to_string(), "true".to_string());
+        properties.insert(APPEND_ONLY.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
             "Setting delta property 'delta.appendOnly' is not supported",
