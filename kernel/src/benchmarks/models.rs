@@ -40,70 +40,43 @@ pub struct TableInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_deserialize_table_info() {
-        let json_content = r#"
-            {
-                "name": "basic_append",
-                "description": "A basic table with two append writes"
-            }
-        "#;
-        let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize basic_append table info");
+    #[rstest]
+    #[case(
+        r#"{"name": "basic_append", "description": "A basic table with two append writes"}"#,
+        "basic_append",
+        Some("A basic table with two append writes")
+    )]
+    #[case(
+        r#"{"name": "table_without_description"}"#,
+        "table_without_description",
+        None
+    )]
+    #[case(
+        r#"{"name": "table_with_extra_fields", "description": "A table with extra fields", "extra_field": "should be ignored"}"#,
+        "table_with_extra_fields",
+        Some("A table with extra fields")
+    )]
+    fn test_deserialize_table_info(
+        #[case] json: &str,
+        #[case] expected_name: &str,
+        #[case] expected_description: Option<&str>,
+    ) {
+        let table_info: TableInfo =
+            serde_json::from_str(json).expect("Failed to deserialize table info");
 
-        assert_eq!(table_info.name, "basic_append");
-        assert_eq!(
-            table_info.description,
-            Some("A basic table with two append writes".to_string())
-        );
+        assert_eq!(table_info.name, expected_name);
+        assert_eq!(table_info.description.as_deref(), expected_description);
     }
 
-    #[test]
-    fn test_deserialize_table_info_missing_description() {
-        let json_content = r#"
-            {
-                "name": "table_without_description"
-            }
-        "#;
-        let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_without_description table info");
-
-        assert_eq!(table_info.name, "table_without_description");
-        assert_eq!(table_info.description, None);
-    }
-
-    #[test]
-    fn test_deserialize_table_info_missing_name() {
-        let json_content = r#"
-            {
-                "description": "A table missing the required name field"
-            }
-        "#;
-        let result: Result<TableInfo, _> = serde_json::from_str(json_content);
-
-        assert!(
-            result.is_err(),
-            "Expected deserialization to fail when name is missing"
-        );
-    }
-
-    #[test]
-    fn test_deserialize_table_info_extra_fields() {
-        let json_content = r#"
-            {
-                "name": "table_with_extra_fields",
-                "description": "A table with extra fields",
-                "extra_field": "should be ignored"
-            }
-        "#;
-        let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_with_extra_fields table info");
-
-        assert_eq!(table_info.name, "table_with_extra_fields");
-        assert_eq!(
-            table_info.description,
-            Some("A table with extra fields".to_string())
-        );
+    #[rstest]
+    #[case(
+        r#"{"description": "A table missing the required name field"}"#,
+        "missing field"
+    )]
+    fn test_deserialize_table_info_errors(#[case] json: &str, #[case] expected_msg: &str) {
+        let error = serde_json::from_str::<TableInfo>(json).unwrap_err();
+        assert!(error.to_string().contains(expected_msg));
     }
 }
