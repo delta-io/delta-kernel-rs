@@ -3,7 +3,6 @@ use std::sync::{Arc, LazyLock};
 
 use tracing::{debug, error};
 
-use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
@@ -14,14 +13,10 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, SchemaRef, SchemaTransform, StructField, StructType};
-use crate::{
-    Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
-};
+use crate::schema::{DataType, SchemaRef};
+use crate::{Engine, EngineData, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
 pub(crate) mod stats_schema;
-
-use stats_schema::{NullCountStatsTransform, NullableStatsTransform};
 #[cfg(test)]
 mod tests;
 
@@ -56,126 +51,107 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
 
 #[internal_api]
 pub(crate) struct DataSkippingFilter {
-    stats_schema: SchemaRef,
-    select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
+    /// Evaluator that extracts file-level statistics from the input batch. The caller provides
+    /// the expression at construction time, which determines where stats come from:
+    /// - Scan path: `column_expr!("stats_parsed")` reads the already-parsed struct from
+    ///   a transformed batch (where `add.*` fields are flattened to top-level columns).
+    /// - Table changes path: `Expression::parse_json(column_expr!("add.stats"), schema)` parses
+    ///   JSON from a raw action batch (where stats are nested under `add.stats`).
+    stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
-    json_handler: Arc<dyn JsonHandler>,
 }
 
 impl DataSkippingFilter {
-    /// Creates a new data skipping filter. Returns None if there is no predicate, or the predicate
-    /// is ineligible for data skipping.
+    /// Creates a new data skipping filter. Returns `None` if there is no predicate, or the
+    /// predicate is ineligible for data skipping.
     ///
-    /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
-    /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
+    /// NOTE: `None` is equivalent to a trivial filter that always returns TRUE (= keeps all files),
+    /// but using an `Option` lets the engine easily avoid the overhead of applying trivial filters.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for creating evaluators
+    /// - `predicate`: Optional predicate for data skipping
+    /// - `stats_schema`: The stats schema (numRecords, nullCount, minValues, maxValues)
+    /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
+    /// - `stats_expr`: Expression to extract stats from the batch, producing output matching
+    ///   `stats_schema`. For example, `column_expr!("stats_parsed")` for pre-parsed stats, or
+    ///   `Expression::parse_json(column_expr!("add.stats"), stats_schema)` for JSON parsing.
     pub(crate) fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(PredicateRef, SchemaRef)>,
+        predicate: Option<PredicateRef>,
+        stats_schema: SchemaRef,
+        input_schema: SchemaRef,
+        stats_expr: ExpressionRef,
     ) -> Option<Self> {
-        static STATS_EXPR: LazyLock<ExpressionRef> =
-            LazyLock::new(|| Arc::new(column_expr!("add.stats")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
-        let (predicate, referenced_schema) = physical_predicate?;
+        let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
 
-        let stats_schema = NullableStatsTransform
-            .transform_struct(&referenced_schema)?
-            .into_owned();
-
-        let nullcount_schema = NullCountStatsTransform
-            .transform_struct(&stats_schema)?
-            .into_owned();
-        let stats_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", nullcount_schema),
-            StructField::nullable("minValues", stats_schema.clone()),
-            StructField::nullable("maxValues", stats_schema),
-        ]));
+        let stats_evaluator = engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                input_schema,
+                stats_expr,
+                stats_schema.as_ref().clone().into(),
+            )
+            .inspect_err(|e| error!("Failed to create stats evaluator: {e}"))
+            .ok()?;
 
         // Skipping happens in several steps:
         //
-        // 1. The stats selector fetches add.stats from the metadata
+        // 1. The stats evaluator extracts file-level statistics from the batch (the expression
+        //    provided by the caller determines how: reading a pre-parsed column, parsing JSON, etc.)
         //
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
         //    null means we could not determine whether the file is safe to skip, because its stats
         //    were missing/null.
         //
-        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
-        //    the predicate is true/null and false (= skip) when the predicate is false.
-        let select_stats_evaluator = engine
-            .evaluation_handler()
-            .new_expression_evaluator(
-                get_log_add_schema().clone(),
-                STATS_EXPR.clone(),
-                DataType::STRING,
-            )
-            // A stats expression failure here doesn't affect correctness
-            // as its a performance optimization so we log the error and continue.
-            .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
-            .ok()?;
-
+        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true
+        //    (= keep) when the predicate is true/null and false (= skip) when the predicate
+        //    is false.
         let skipping_evaluator = engine
             .evaluation_handler()
             .new_predicate_evaluator(
                 stats_schema.clone(),
                 Arc::new(as_sql_data_skipping_predicate(&predicate)?),
             )
-            // A skipping predicate expression failure here doesn't affect correctness
-            // as its a performance optimization so we log the error and continue.
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(stats_schema.clone(), FILTER_PRED.clone())
-            // A filter predicate expression failure here doesn't affect correctness
-            // as its a performance optimization so we log the error and continue.
+            .new_predicate_evaluator(stats_schema, FILTER_PRED.clone())
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
         Some(Self {
-            stats_schema,
-            select_stats_evaluator,
+            stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
-            json_handler: engine.json_handler(),
         })
     }
 
-    /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
-    /// which can be applied to the actions to find those that passed data skipping.
-    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        // retrieve and parse stats from actions data
-        let stats = self.select_stats_evaluator.evaluate(actions)?;
-        assert_eq!(stats.len(), actions.len());
-        let parsed_stats = self
-            .json_handler
-            .parse_json(stats, self.stats_schema.clone())?;
-        assert_eq!(parsed_stats.len(), actions.len());
+    /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
+    /// which can be applied to the batch to find rows that passed data skipping.
+    pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        let file_stats = self.stats_evaluator.evaluate(batch)?;
+        assert_eq!(file_stats.len(), batch.len());
 
-        // evaluate the predicate on the parsed stats, then convert to selection vector
-        let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
-        assert_eq!(skipping_predicate.len(), actions.len());
+        let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
+        assert_eq!(skipping_predicate.len(), batch.len());
+
         let selection_vector = self
             .filter_evaluator
             .evaluate(skipping_predicate.as_ref())?;
-        assert_eq!(selection_vector.len(), actions.len());
+        assert_eq!(selection_vector.len(), batch.len());
 
-        // visit the engine's selection vector to produce a Vec<bool>
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
         Ok(visitor.selection_vector)
-
-        // TODO(zach): add some debug info about data skipping that occurred
-        // let before_count = actions.length();
-        // debug!(
-        //     "number of actions before/after data skipping: {before_count} / {}",
-        //     filtered_actions.num_rows()
-        // );
     }
 }
 
