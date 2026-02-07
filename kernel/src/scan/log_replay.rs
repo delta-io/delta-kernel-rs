@@ -24,7 +24,7 @@ use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::transforms::{get_transform_expr, parse_partition_values_lazy, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -369,14 +369,19 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
-                    &self.state_info.logical_schema,
-                    transform,
-                    &partition_values,
-                    self.state_info.column_mapping_mode,
-                )?;
+                let partition_values_map = getters
+                    [ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                    .get_map(i, "add.partitionValues")?;
+                let partition_values = if let Some(map) = &partition_values_map {
+                    parse_partition_values_lazy(
+                        &self.state_info.logical_schema,
+                        transform,
+                        map,
+                        self.state_info.column_mapping_mode,
+                    )?
+                } else {
+                    Default::default()
+                };
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
