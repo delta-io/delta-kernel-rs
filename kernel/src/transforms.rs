@@ -352,18 +352,15 @@ mod tests {
     // Tests for parse_partition_value_raw function
     #[test]
     fn test_parse_partition_value_raw_string() {
-        let result =
-            parse_partition_value_raw(Some("test_string"), &DataType::STRING).unwrap();
+        let result = parse_partition_value_raw(Some("test_string"), &DataType::STRING).unwrap();
         assert_eq!(result, Scalar::String("test_string".to_string()));
     }
 
     #[test]
     fn test_parse_partition_value_raw_integer() {
-        let result = parse_partition_value_raw(
-            Some("42"),
-            &DataType::Primitive(PrimitiveType::Integer),
-        )
-        .unwrap();
+        let result =
+            parse_partition_value_raw(Some("42"), &DataType::Primitive(PrimitiveType::Integer))
+                .unwrap();
         assert_eq!(result, Scalar::Integer(42));
     }
 
