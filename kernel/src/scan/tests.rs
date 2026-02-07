@@ -371,7 +371,7 @@ fn test_get_partition_value() {
 
     for (raw, data_type, expected) in &cases {
         let value = crate::transforms::parse_partition_value_raw(
-            Some(&raw.to_string()),
+            Some(raw),
             &DataType::Primitive(data_type.clone()),
         )
         .unwrap();
