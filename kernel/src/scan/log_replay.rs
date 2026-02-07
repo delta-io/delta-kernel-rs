@@ -369,9 +369,9 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values_lazy: Box<dyn LazyMap<'_>> = getters
-                    [ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
+                let partition_values_lazy: Box<dyn LazyMap<'_>> =
+                    getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                        .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values_lazy(
                     &self.state_info.logical_schema,
                     transform,
