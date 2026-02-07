@@ -347,6 +347,8 @@ mod tests {
         // Create a TableConfiguration for testing
         use crate::actions::{Metadata, Protocol};
         use crate::table_configuration::TableConfiguration;
+        use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED};
+
         let metadata = Metadata::try_new(
             None,
             None,
@@ -354,8 +356,8 @@ mod tests {
             vec![],
             0,
             HashMap::from([
-                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
+                (COLUMN_MAPPING_MODE.to_string(), "none".to_string()),
             ]),
         )
         .unwrap();
