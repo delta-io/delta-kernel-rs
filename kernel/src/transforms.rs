@@ -79,10 +79,7 @@ pub(crate) fn parse_partition_value(
         )));
     };
     let name = field.physical_name(column_mapping_mode);
-    let partition_value = parse_partition_value_raw(
-        partition_values.get(name).map(|s| s.as_str()),
-        field.data_type(),
-    )?;
+    let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
     Ok((field_idx, (name.to_string(), partition_value)))
 }
 
@@ -103,7 +100,10 @@ fn parse_partition_value_lazy<'a>(
 
     // Only access the specific key we need from the lazy map
     let partition_value_str = partition_values.get(name);
-    let partition_value = parse_partition_value_raw(partition_value_str, field.data_type())?;
+    let partition_value = parse_partition_value_raw(
+        partition_value_str.map(|s| s.to_string()).as_ref(),
+        field.data_type()
+    )?;
 
     Ok((field_idx, (name.to_string(), partition_value)))
 }
@@ -251,7 +251,7 @@ pub(crate) fn get_transform_expr(
 
 /// Parse a partition value from the raw string representation
 pub(crate) fn parse_partition_value_raw(
-    raw: Option<&str>,
+    raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
     match (raw, data_type.as_primitive_opt()) {
