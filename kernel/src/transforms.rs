@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine_data::MapItem;
 use crate::expressions::{
-    BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
+    BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform,
 };
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
