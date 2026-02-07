@@ -209,6 +209,14 @@ impl StateInfo {
 
         let physical_schema = Arc::new(StructType::try_new(read_fields)?);
 
+        // Extract column names referenced by the predicate so we can include them
+        // in the stats schema when stats_columns is requested. This ensures the
+        // DataSkippingFilter has the stats it needs for data skipping.
+        let predicate_column_names: Vec<ColumnName> = predicate
+            .as_ref()
+            .map(|p| p.references().into_iter().cloned().collect())
+            .unwrap_or_default();
+
         let physical_predicate = match predicate {
             Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
@@ -217,9 +225,9 @@ impl StateInfo {
         // Build stats schemas:
         // - From stats_columns if specified (for outputting stats to the engine)
         // - From predicate columns otherwise (for data skipping only, no logical schema needed)
-        // When both stats_columns and a predicate are provided, we use expected_stats_schema
-        // (which is a superset of the predicate-derived schema) so the engine receives all
-        // stats AND the DataSkippingFilter can still perform data skipping.
+        // When both stats_columns and a predicate are provided, predicate-referenced columns
+        // are merged into the requested stats columns so the DataSkippingFilter has the stats
+        // it needs while also outputting the user-requested stats.
         let (physical_stats_schema, logical_stats_schema) =
             match (&stats_columns, &physical_predicate) {
                 // stats_columns = Some([]) means output all stats from expected_stats_schema.
@@ -233,10 +241,19 @@ impl StateInfo {
                         Some(expected_stats_schemas.logical),
                     )
                 }
-                // Non-empty stats_columns list - build the stats schemas for the requested columns
+                // Non-empty stats_columns list — include predicate-referenced columns
+                // alongside the user-requested stats columns so that the DataSkippingFilter
+                // has the stats it needs.
                 (Some(requested_columns), _) => {
+                    let existing: HashSet<&ColumnName> = requested_columns.iter().collect();
+                    let mut all_needed_stats_columns = requested_columns.clone();
+                    for col in &predicate_column_names {
+                        if !existing.contains(col) {
+                            all_needed_stats_columns.push(col.clone());
+                        }
+                    }
                     let expected_stats_schemas = table_configuration
-                        .build_expected_stats_schemas(None, Some(requested_columns))?;
+                        .build_expected_stats_schemas(None, Some(&all_needed_stats_columns))?;
                     (
                         Some(expected_stats_schemas.physical),
                         Some(expected_stats_schemas.logical),
@@ -757,6 +774,53 @@ pub(crate) mod tests {
             matches!(state_info.physical_predicate, PhysicalPredicate::Some(..)),
             "physical_predicate should be PhysicalPredicate::Some for data skipping"
         );
+    }
+
+    #[test]
+    fn stats_columns_with_predicate_merges_columns() {
+        // When specific stats_columns are requested alongside a predicate, the stats
+        // schema should include both the requested columns and predicate-referenced columns.
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+            StructField::nullable("extra", DataType::LONG),
+        ]));
+
+        let predicate = Arc::new(column_expr!("extra").gt(Expr::literal(5i64)));
+
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            HashMap::new(),
+            vec![],
+            Some(vec![column_name!("value")]), // request only 'value' stats
+        )
+        .unwrap();
+
+        let logical_stats = state_info
+            .logical_stats_schema
+            .expect("should have logical stats schema");
+
+        let min_values = logical_stats
+            .field("minValues")
+            .expect("should have minValues");
+        if let DataType::Struct(inner) = min_values.data_type() {
+            assert!(
+                inner.field("value").is_some(),
+                "minValues should have 'value' (requested)"
+            );
+            assert!(
+                inner.field("extra").is_some(),
+                "minValues should have 'extra' (from predicate)"
+            );
+            assert!(
+                inner.field("id").is_none(),
+                "minValues should not have 'id' (neither requested nor in predicate)"
+            );
+        } else {
+            panic!("minValues should be a struct");
+        }
     }
 
     #[test]

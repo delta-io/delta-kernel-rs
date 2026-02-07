@@ -634,8 +634,9 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that `include_stats_columns` and `with_predicate` can be used together.
-/// The scan should output stats_parsed AND perform data skipping via the predicate.
+/// Test that `with_stats_columns` with specific columns and `with_predicate` can be used
+/// together. The stats schema should be the union of the requested columns and the
+/// predicate-referenced columns, and data skipping should still be active.
 #[test]
 fn test_scan_metadata_stats_columns_with_predicate() {
     const STATS_PARSED_COL: &str = "stats_parsed";
@@ -646,12 +647,13 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    // Build scan with both a predicate and stats_columns
+    // Request stats for "name" only, but predicate references "id".
+    // The resulting stats_parsed should contain both "name" and "id".
     let predicate = Arc::new(column_expr!("id").gt(Expr::literal(0i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .include_stats_columns()
+        .with_stats_columns(vec![column_name!("name")])
         .build()
         .expect("Should succeed when using both predicate and stats_columns");
 
@@ -661,7 +663,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
         "Scan should have a physical predicate for data skipping"
     );
 
-    // Run scan_metadata and verify stats_parsed is present in the output
+    // Run scan_metadata and verify stats_parsed includes both requested and predicate columns
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
@@ -692,8 +694,29 @@ fn test_scan_metadata_stats_columns_with_predicate() {
             "stats_parsed should be a struct type"
         );
 
-        // Verify stats_parsed has data
         let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
+        let min_values = get_column!(stats_parsed, "minValues", StructArray);
+
+        // Stats should include both "name" (requested) and "id" (from predicate)
+        let names = field_names(min_values);
+        assert!(
+            names.contains(&"name".to_string()),
+            "minValues should contain 'name' (requested), got: {names:?}"
+        );
+        assert!(
+            names.contains(&"id".to_string()),
+            "minValues should contain 'id' (from predicate), got: {names:?}"
+        );
+        // "age" and "salary" should NOT be present
+        assert!(
+            !names.contains(&"age".to_string()),
+            "minValues should not contain 'age'"
+        );
+        assert!(
+            !names.contains(&"salary".to_string()),
+            "minValues should not contain 'salary'"
+        );
+
         let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
         for i in 0..filtered_batch.num_rows() {
             if !stats_parsed.is_null(i) {
