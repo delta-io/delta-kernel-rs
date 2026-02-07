@@ -678,14 +678,14 @@ mod test {
     use super::{InCommitTimestampEnablement, TableConfiguration};
 
     fn create_mock_table_config(
-        props_to_enable: &[&str],
+        props_to_enable: &[(&str, &str)],
         features: &[TableFeature],
     ) -> TableConfiguration {
         create_mock_table_config_with_version(props_to_enable, Some(features), 3, 7)
     }
 
     fn create_mock_table_config_with_version(
-        props_to_enable: &[&str],
+        props_to_enable: &[(&str, &str)],
         features_opt: Option<&[TableFeature]>,
         min_reader_version: i32,
         min_writer_version: i32,
@@ -700,7 +700,7 @@ mod test {
             HashMap::from_iter(
                 props_to_enable
                     .iter()
-                    .map(|key| (key.to_string(), "true".to_string())),
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
             ),
         )
         .unwrap();
@@ -757,6 +757,8 @@ mod test {
 
     #[test]
     fn dv_supported_not_enabled() {
+        use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -764,7 +766,7 @@ mod test {
             schema,
             vec![],
             0,
-            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -782,6 +784,8 @@ mod test {
 
     #[test]
     fn dv_enabled() {
+        use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -790,11 +794,8 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
-                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                (
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                ),
+                (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
+                (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
             ]),
         )
         .unwrap();
@@ -813,17 +814,18 @@ mod test {
 
     #[test]
     fn write_with_cdf() {
+        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
         use TableFeature::*;
         let cases = [
             (
                 // Writing to CDF-enabled table is supported for writes
-                create_mock_table_config(&["delta.enableChangeDataFeed"], &[ChangeDataFeed]),
+                create_mock_table_config(&[(ENABLE_CHANGE_DATA_FEED, "true")], &[ChangeDataFeed]),
                 Ok(()),
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
                 create_mock_table_config(
-                    &["delta.enableChangeDataFeed"],
+                    &[(ENABLE_CHANGE_DATA_FEED, "true")],
                     &[ChangeDataFeed, AppendOnly],
                 ),
                 Ok(()),
@@ -831,14 +833,19 @@ mod test {
             (
                 // Should succeed since AppendOnly is enabled
                 create_mock_table_config(
-                    &["delta.enableChangeDataFeed", "delta.appendOnly"],
+                    &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, AppendOnly],
                 ),
                 Ok(()),
             ),
             (
                 // Writer version > 7 is not supported
-                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"], None, 1, 8),
+                create_mock_table_config_with_version(
+                    &[(ENABLE_CHANGE_DATA_FEED, "true")],
+                    None,
+                    1,
+                    8,
+                ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
             // NOTE: The following cases should be updated if column mapping for writes is
@@ -847,7 +854,7 @@ mod test {
                 // Should fail since change data feed and column mapping features cannot both be
                 // present.
                 create_mock_table_config(
-                    &["delta.enableChangeDataFeed", "delta.appendOnly"],
+                    &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
                 Err(Error::unsupported(
@@ -857,7 +864,7 @@ mod test {
             (
                 // The table does not require writing CDC files, so it is safe to write to it.
                 create_mock_table_config(
-                    &["delta.appendOnly"],
+                    &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
                 Err(Error::unsupported(
@@ -866,7 +873,7 @@ mod test {
             ),
             (
                 // Should succeed since change data feed is not enabled
-                create_mock_table_config(&["delta.appendOnly"], &[AppendOnly]),
+                create_mock_table_config(&[(APPEND_ONLY, "true")], &[AppendOnly]),
                 Ok(()),
             ),
         ];
@@ -888,6 +895,8 @@ mod test {
     }
     #[test]
     fn ict_enabled_from_table_creation() {
+        use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -895,10 +904,7 @@ mod test {
             schema,
             vec![],
             0, // Table creation version
-            HashMap::from_iter([(
-                "delta.enableInCommitTimestamps".to_string(),
-                "true".to_string(),
-            )]),
+            HashMap::from_iter([(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -922,6 +928,11 @@ mod test {
     }
     #[test]
     fn ict_supported_and_enabled() {
+        use crate::table_properties::{
+            ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+            IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+        };
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -930,16 +941,13 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
+                (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
                 (
-                    "delta.enableInCommitTimestamps".to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION.to_string(),
                     "5".to_string(),
                 ),
                 (
-                    "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                    IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP.to_string(),
                     "100".to_string(),
                 ),
             ]),
@@ -966,6 +974,10 @@ mod test {
     }
     #[test]
     fn ict_enabled_with_partial_enablement_info() {
+        use crate::table_properties::{
+            ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+        };
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -974,12 +986,9 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
+                (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
                 (
-                    "delta.enableInCommitTimestamps".to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION.to_string(),
                     "5".to_string(),
                 ),
                 // Missing enablement timestamp
@@ -1033,6 +1042,8 @@ mod test {
     }
     #[test]
     fn dv_not_supported() {
+        use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -1040,7 +1051,7 @@ mod test {
             schema,
             vec![],
             0,
-            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -1058,6 +1069,8 @@ mod test {
 
     #[test]
     fn test_try_new_from() {
+        use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
+
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
             None,
@@ -1065,7 +1078,7 @@ mod test {
             schema,
             vec![],
             0,
-            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+            HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
         let protocol = Protocol::try_new(
@@ -1087,14 +1100,8 @@ mod test {
             vec![],
             0,
             HashMap::from_iter([
-                (
-                    "delta.enableChangeDataFeed".to_string(),
-                    "false".to_string(),
-                ),
-                (
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                ),
+                (ENABLE_CHANGE_DATA_FEED.to_string(), "false".to_string()),
+                (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
             ]),
         )
         .unwrap();
@@ -1348,6 +1355,8 @@ mod test {
 
     #[test]
     fn test_is_feature_info_enabled_with_custom_property_check() {
+        use crate::table_properties::APPEND_ONLY;
+
         // Create a custom feature with a property check function
         let custom_feature_info = FeatureInfo {
             name: "customPropertyFeature",
@@ -1367,7 +1376,7 @@ mod test {
         assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
 
         // Test when property check passes - should be both supported and enabled
-        let config = create_mock_table_config_with_version(&["delta.appendOnly"], None, 1, 2);
+        let config = create_mock_table_config_with_version(&[(APPEND_ONLY, "true")], None, 1, 2);
         assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
         assert!(config.is_feature_info_enabled(&feature, &custom_feature_info));
     }
@@ -1526,9 +1535,11 @@ mod test {
         schema: StructType,
         column_mapping_mode: &str,
     ) -> TableConfiguration {
+        use crate::table_properties::COLUMN_MAPPING_MODE;
+
         let mut props = HashMap::new();
         props.insert(
-            "delta.columnMapping.mode".to_string(),
+            COLUMN_MAPPING_MODE.to_string(),
             column_mapping_mode.to_string(),
         );
 
