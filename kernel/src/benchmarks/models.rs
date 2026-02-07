@@ -31,7 +31,7 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
 }
 
 //Table info JSON files are located at the root of each table directory and act as documentation for the table
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct TableInfo {
     pub name: String,
     pub description: Option<String>,
