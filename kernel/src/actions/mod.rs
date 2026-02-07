@@ -600,6 +600,8 @@ pub(crate) struct CommitInfo {
     /// Map of arbitrary string key-value pairs that provide additional information about the
     /// operation. This is specified by the engine. For now this is always empty on write.
     pub(crate) operation_parameters: Option<HashMap<String, String>>,
+    /// Whether this commit represents a blind append (only adding new data files).
+    pub(crate) is_blind_append: Option<bool>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
@@ -616,12 +618,14 @@ impl CommitInfo {
         in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
+        is_blind_append: bool,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
             in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
+            is_blind_append: if is_blind_append { Some(true) } else { None },
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -1197,6 +1201,7 @@ mod tests {
                     "operationParameters",
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
+                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
@@ -1492,7 +1497,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None, false);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1509,6 +1514,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
