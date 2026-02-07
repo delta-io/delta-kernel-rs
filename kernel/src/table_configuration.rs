@@ -200,6 +200,9 @@ impl TableConfiguration {
     ///   (default 32).
     /// - **Clustering columns**: Per the Delta protocol, clustering columns are always included
     ///   in statistics, regardless of the above settings.
+    /// - **Requested columns**: If provided, only these columns are included in the output.
+    ///   Column names should be logical names; they will be converted to physical names
+    ///   when column mapping is enabled.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
@@ -208,12 +211,14 @@ impl TableConfiguration {
     pub(crate) fn build_expected_stats_schemas(
         &self,
         clustering_columns: Option<&[ColumnName]>,
+        requested_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<ExpectedStatsSchemas> {
         let logical_data_schema = self.logical_data_schema();
         let logical_stats_schema = Arc::new(expected_stats_schema(
             &logical_data_schema,
             self.table_properties(),
             clustering_columns,
+            requested_columns,
         )?);
         let physical_stats_schema = match self.column_mapping_mode() {
             ColumnMappingMode::None => logical_stats_schema.clone(),
@@ -1554,7 +1559,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Both schemas should be identical (same Arc)
         assert!(Arc::ptr_eq(&stats_schemas.logical, &stats_schemas.physical));
@@ -1582,7 +1587,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Schemas should be different (not the same Arc)
         assert!(!Arc::ptr_eq(
