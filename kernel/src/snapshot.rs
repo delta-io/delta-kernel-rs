@@ -584,6 +584,7 @@ impl Snapshot {
     /// clustering metadata is malformed.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
+    #[internal_api]
     pub(crate) fn get_clustering_columns(
         &self,
         engine: &dyn Engine,

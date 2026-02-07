@@ -246,6 +246,33 @@ pub fn create_default_engine(
     Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
 }
 
+/// Test setup helper that creates a temporary directory and engine.
+///
+/// Returns `(temp_dir, table_path, engine)` for use in integration tests.
+/// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
+///
+/// # Example
+///
+/// ```ignore
+/// let (_temp_dir, table_path, engine) = test_table_setup()?;
+/// ```
+pub fn test_table_setup() -> DeltaResult<(
+    tempfile::TempDir,
+    String,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+)> {
+    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let table_path = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let table_url = url::Url::from_directory_path(&table_path)
+        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+    let engine = create_default_engine(&table_url)?;
+    Ok((temp_dir, table_path, engine))
+}
+
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
 pub fn engine_store_setup(
     table_name: &str,
