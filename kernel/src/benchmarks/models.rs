@@ -31,7 +31,7 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
 }
 
 //Table info JSON files are located at the root of each table directory and act as documentation for the table
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TableInfo {
     pub name: String,
     pub description: Option<String>,
@@ -39,7 +39,7 @@ pub struct TableInfo {
 
 // Specs define the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 // There will be multiple specs for a given table
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
     Read {
@@ -56,146 +56,65 @@ pub enum ReadOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_deserialize_table_info() {
-        let json_content = r#"
-            {
-                "name": "basic_append",
-                "description": "A basic table with two append writes"
-            }
-        "#;
-        let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize basic_append table info");
+    #[rstest]
+    #[case(
+        r#"{"name": "basic_append", "description": "A basic table with two append writes"}"#,
+        "basic_append",
+        Some("A basic table with two append writes")
+    )]
+    #[case(
+        r#"{"name": "table_without_description"}"#,
+        "table_without_description",
+        None
+    )]
+    #[case(
+        r#"{"name": "table_with_extra_fields", "description": "A table with extra fields", "extra_field": "should be ignored"}"#,
+        "table_with_extra_fields",
+        Some("A table with extra fields")
+    )]
+    fn test_deserialize_table_info(
+        #[case] json: &str,
+        #[case] expected_name: &str,
+        #[case] expected_description: Option<&str>,
+    ) {
+        let table_info: TableInfo =
+            serde_json::from_str(json).expect("Failed to deserialize table info");
 
-        assert_eq!(table_info.name, "basic_append");
-        assert_eq!(
-            table_info.description,
-            Some("A basic table with two append writes".to_string())
-        );
+        assert_eq!(table_info.name, expected_name);
+        assert_eq!(table_info.description.as_deref(), expected_description);
     }
 
-    #[test]
-    fn test_deserialize_table_info_missing_description() {
-        let json_content = r#"
-            {
-                "name": "table_without_description"
-            }
-        "#;
-        let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_without_description table info");
-
-        assert_eq!(table_info.name, "table_without_description");
-        assert_eq!(table_info.description, None);
+    #[rstest]
+    #[case(
+        r#"{"description": "A table missing the required name field"}"#,
+        "missing field"
+    )]
+    fn test_deserialize_table_info_errors(#[case] json: &str, #[case] expected_msg: &str) {
+        let error = serde_json::from_str::<TableInfo>(json).unwrap_err();
+        assert!(error.to_string().contains(expected_msg));
     }
 
-    #[test]
-    fn test_deserialize_table_info_missing_name() {
-        let json_content = r#"
-            {
-                "description": "A table missing the required name field"
-            }
-        "#;
-        let result: Result<TableInfo, _> = serde_json::from_str(json_content);
-
-        assert!(
-            result.is_err(),
-            "Expected deserialization to fail when name is missing"
-        );
-    }
-
-    #[test]
-    fn test_deserialize_table_info_extra_fields() {
-        let json_content = r#"
-            {
-                "name": "table_with_extra_fields",
-                "description": "A table with extra fields",
-                "extra_field": "should be ignored"
-            }
-        "#;
-        let table_info: TableInfo = serde_json::from_str(json_content)
-            .expect("Failed to deserialize table_with_extra_fields table info");
-
-        assert_eq!(table_info.name, "table_with_extra_fields");
-        assert_eq!(
-            table_info.description,
-            Some("A table with extra fields".to_string())
-        );
-    }
-
-    #[test]
-    fn test_deserialize_spec_read_with_version() {
-        let json_content = r#"
-            {
-                "type": "read",
-                "version": 5
-            }
-        "#;
-        let spec: Spec = serde_json::from_str(json_content)
-            .expect("Failed to deserialize read spec with version");
+    #[rstest]
+    #[case(r#"{"type": "read", "version": 5}"#, Some(5))]
+    #[case(r#"{"type": "read"}"#, None)]
+    #[case(
+        r#"{"type": "read", "version": 7, "extra_field": "should be ignored"}"#,
+        Some(7)
+    )]
+    fn test_deserialize_spec_read(#[case] json: &str, #[case] expected_version: Option<i64>) {
+        let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize read spec");
 
         let Spec::Read { version } = spec;
-        assert_eq!(version, Some(5));
+        assert_eq!(version, expected_version);
     }
 
-    #[test]
-    fn test_deserialize_spec_read_without_version() {
-        let json_content = r#"
-            {
-                "type": "read"
-            }
-        "#;
-        let spec: Spec = serde_json::from_str(json_content)
-            .expect("Failed to deserialize read spec without version");
-
-        let Spec::Read { version } = spec;
-        assert_eq!(version, None);
-    }
-
-    #[test]
-    fn test_deserialize_spec_missing_type() {
-        let json_content = r#"
-            {
-                "version": 10
-            }
-        "#;
-        let result: Result<Spec, _> = serde_json::from_str(json_content);
-
-        assert!(
-            result.is_err(),
-            "Expected deserialization to fail when type field is missing"
-        );
-    }
-
-    #[test]
-    fn test_deserialize_spec_invalid_type() {
-        let json_content = r#"
-            {
-                "type": "write",
-                "version": 3
-            }
-        "#;
-        let result: Result<Spec, _> = serde_json::from_str(json_content);
-
-        assert!(
-            result.is_err(),
-            "Expected deserialization to fail with invalid type value"
-        );
-    }
-
-    #[test]
-    fn test_deserialize_spec_extra_fields() {
-        let json_content = r#"
-            {
-                "type": "read",
-                "version": 7,
-                "extra_field": "should be ignored"
-            }
-        "#;
-        let spec: Spec = serde_json::from_str(json_content)
-            .expect("Failed to deserialize read spec with extra fields");
-
-        let Spec::Read { version } = spec;
-        assert_eq!(version, Some(7));
+    #[rstest]
+    #[case(r#"{"version": 10}"#, "missing field")]
+    #[case(r#"{"type": "write", "version": 3}"#, "unknown variant")]
+    fn test_deserialize_spec_errors(#[case] json: &str, #[case] expected_msg: &str) {
+        let error = serde_json::from_str::<Spec>(json).unwrap_err();
+        assert!(error.to_string().contains(expected_msg));
     }
 }
