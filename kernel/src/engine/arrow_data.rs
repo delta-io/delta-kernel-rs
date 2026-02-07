@@ -144,14 +144,20 @@ impl EngineMap for MapArray {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;
-        let count = offsets[row_index + 1] as usize - start_offset;
+        let end_offset = offsets[row_index + 1] as usize;
         let keys = self.keys().as_string::<i32>();
-        for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
-            if let Some(map_key) = map_key {
+        let vals = self.values().as_string::<i32>();
+
+        // Iterate backwards for potential cache locality benefits
+        for idx in (start_offset..end_offset).rev() {
+            if keys.is_valid(idx) {
+                let map_key = keys.value(idx);
                 if key == map_key {
-                    // found the item
-                    let vals = self.values().as_string::<i32>();
-                    return Some(vals.value(idx));
+                    return if vals.is_valid(idx) {
+                        Some(vals.value(idx))
+                    } else {
+                        None
+                    };
                 }
             }
         }
