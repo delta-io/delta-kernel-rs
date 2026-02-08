@@ -165,25 +165,7 @@ async fn list_from_impl(
         Path::from_iter(parts)
     };
 
-    // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
-    // local filesystem doesn't return a sorted list by default. Although the `object_store`
-    // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
-    // implementations actually do:
-    // - AWS:
-    //   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
-    //   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
-    //   order based on their key names." (Directory buckets are out of scope for now)
-    // - Azure: Docs state
-    //   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
-    //   "A listing operation returns an XML response that contains all or part of the requested
-    //   list. The operation returns entities in alphabetical order."
-    // - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
-    //   doesn't indicate order, but [this
-    //   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
-    //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
-    //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
-    // So we just need to know if we're local and then if so, we sort the returned file list
-    let has_ordered_listing = path.scheme() != "file";
+    let has_ordered_listing = supports_ordered_listing(&path);
 
     let stream = store
         .list_with_offset(Some(&prefix), &offset)
@@ -362,6 +344,37 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     }
 }
 
+/// Returns whether or not the [Url] can support ordered listing.
+///
+/// When this returns false the default engine will need to collect a stream before returning,
+/// which has a performance impact
+///
+/// The current known situations where there are unordered listings are with filesystems and AWS S3
+/// Express One Zone directory buckets
+///
+/// Although the `object_store` crate explicitly says it _does not_ return a sorted listing, in
+/// practice many implementations actually do:
+/// - AWS:
+///   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
+///   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
+///   order based on their key names."
+/// - Azure: Docs state
+///   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
+///   "A listing operation returns an XML response that contains all or part of the requested
+///   list. The operation returns entities in alphabetical order."
+/// - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
+///   doesn't indicate order, but [this
+///   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
+///   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
+///   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
+fn supports_ordered_listing(url: &Url) -> bool {
+    !((url.scheme() == "file")
+        // S3 Directory Buckets
+        || url.domain().map(|d| d.contains("--x-s3")).unwrap_or(false)
+        // S3 Directory Bucket Access Points
+        || url.domain().map(|d| d.contains("-xa-s3")).unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
@@ -379,6 +392,26 @@ mod tests {
     use crate::Engine as _;
 
     use super::*;
+
+    #[test]
+    fn test_ordered_listing_for_url() {
+        for (u, expected) in &[
+            (Url::parse("file:///dev/null").unwrap(), false),
+            (Url::parse("s3://robbert").unwrap(), true),
+            (Url::parse("s3://robbert/likes/paths").unwrap(), true),
+            (Url::parse("s3://robbie-one-zone--x-s3").unwrap(), false),
+            (
+                Url::parse("https://robbie-one-zone-xa-s3.us-east-2.amazonaws.biz").unwrap(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                *expected,
+                supports_ordered_listing(u),
+                "expected {expected} on {u:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_read_files() {

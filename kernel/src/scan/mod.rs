@@ -20,7 +20,9 @@ use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Sca
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::LogSegment;
+use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::parallel::parallel_phase::ParallelPhase;
+use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -38,6 +40,9 @@ pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
 
+// Re-export types for public API
+pub use log_replay::ScanLogReplayProcessor;
+
 #[cfg(test)]
 pub(crate) mod test_utils;
 
@@ -53,14 +58,41 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
-static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
+pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+
+/// Type alias for the sequential (Phase 1) scan metadata processing.
+///
+/// This phase processes commits and single-part checkpoint manifests sequentially.
+/// After exhaustion, call `finish()` to get the result which indicates whether
+/// a distributed phase is needed.
+#[internal_api]
+#[allow(unused)]
+pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
+
+/// Type alias for the distributed (Phase 2) scan metadata processing.
+///
+/// This phase processes checkpoint sidecars or multi-part checkpoint parts in parallel.
+/// Create this phase from the files contained in [`AfterPhase1ScanMetadata::Parallel`].
+#[internal_api]
+#[allow(unused)]
+pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
+
+/// Type alias for the result after Phase 1 scan metadata processing completes.
+///
+/// This enum indicates whether distributed processing is needed:
+/// - `Done`: All processing completed sequentially - no distributed phase needed.
+/// - `Parallel`: Contains processor and files for parallel processing.
+#[internal_api]
+#[allow(unused)]
+pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    stats_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -68,6 +100,7 @@ impl std::fmt::Debug for ScanBuilder {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
+            .field("stats_columns", &self.stats_columns)
             .finish()
     }
 }
@@ -79,6 +112,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            stats_columns: None,
         }
     }
 
@@ -111,8 +145,35 @@ impl ScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
+    ///
+    /// NOTE: This method cannot currently be used together with [`include_stats_columns`].
+    /// Using both will result in an error when calling [`build`]. See [#1751] for tracking.
+    ///
+    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
+    /// [`build`]: ScanBuilder::build
+    /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
+        self
+    }
+
+    /// Include all parsed statistics in scan metadata.
+    ///
+    /// When enabled, the scan will include a `stats_parsed` column in the scan metadata
+    /// containing pre-parsed file statistics (minValues, maxValues, nullCount, numRecords)
+    /// that integrations can use for their own data skipping logic.
+    ///
+    /// The statistics schema is determined by the table's configuration
+    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`).
+    ///
+    /// NOTE: This method cannot currently be used together with [`with_predicate`]. Using both
+    /// will result in an error when calling [`build`]. See [#1751] for tracking.
+    ///
+    /// [`with_predicate`]: ScanBuilder::with_predicate
+    /// [`build`]: ScanBuilder::build
+    /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
+    pub fn include_stats_columns(mut self) -> Self {
+        self.stats_columns = Some(Vec::new());
         self
     }
 
@@ -134,7 +195,8 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            (), // No classifer, default is for scans
+            self.stats_columns,
+            (), // No classifier, default is for scans
         )?;
 
         Ok(Scan {
@@ -412,6 +474,21 @@ impl Scan {
         }
     }
 
+    /// Get the logical schema for file statistics.
+    ///
+    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
+    /// contains file statistics read using physical column names (to handle column mapping).
+    /// This method returns the corresponding logical schema that maps those physical column
+    /// names back to the table's logical column names, enabling engines to interpret the stats
+    /// correctly.
+    ///
+    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
+        self.state_info.logical_stats_schema.as_ref()
+    }
+
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:
@@ -435,7 +512,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -510,14 +588,24 @@ impl Scan {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
 
+        let log_segment = self.snapshot.log_segment();
+
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Since we're only processing existing data (no checkpoint), we use the base schema
+        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+                actions: existing_data.into_iter().map(apply_transform),
+                checkpoint_info: CheckpointReadInfo {
+                    has_stats_parsed: false,
+                    checkpoint_read_schema: restored_add_schema().clone(),
+                },
+            };
+            return Ok(Box::new(
+                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+            ));
         }
-
-        let log_segment = self.snapshot.log_segment();
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -544,27 +632,47 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
-        let it = new_log_segment
-            .read_actions_with_projected_checkpoint_actions(
-                engine,
-                COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
-                None,
-            )?
-            .chain(existing_data.into_iter().map(apply_transform));
+        // For incremental reads, new_log_segment has no checkpoint but we use the
+        // checkpoint schema returned by the function for consistency.
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+            self.state_info
+                .physical_stats_schema
+                .as_ref()
+                .map(|s| s.as_ref()),
+        )?;
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .chain(existing_data.into_iter().map(apply_transform)),
+            checkpoint_info: result.checkpoint_info,
+        };
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            actions_with_checkpoint_info,
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
+            impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            actions_with_checkpoint_info.actions,
+            self.state_info.clone(),
+            actions_with_checkpoint_info.checkpoint_info,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -572,7 +680,9 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
@@ -582,7 +692,86 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
+    }
+
+    /// Start a parallel scan metadata processing for the table.
+    ///
+    /// This method returns a [`Phase1ScanMetadata`] iterator that processes commits and
+    /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
+    /// to determine if a distributed phase is needed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::{Engine, DeltaResult};
+    /// # use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+    /// # use delta_kernel::Snapshot;
+    /// # use url::Url;
+    /// # use delta_kernel::engine::default::DefaultEngineBuilder;
+    /// # use object_store::local::LocalFileSystem;
+    /// # fn main() -> DeltaResult<()> {
+    /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+    /// let table_root = Url::parse("file:///path/to/table")?;
+    ///
+    /// // Build a snapshot
+    /// let snapshot = Snapshot::builder_for(table_root.clone())
+    ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
+    ///     .build(engine.as_ref())?;
+    /// let scan = snapshot.scan_builder().build()?;
+    /// let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+    ///
+    /// // Process sequential phase
+    /// for result in phase1.by_ref() {
+    ///     let scan_metadata = result?;
+    ///     // Process scan metadata...
+    /// }
+    ///
+    /// // Check if distributed phase is needed
+    /// match phase1.finish()? {
+    ///     AfterPhase1ScanMetadata::Done(_) => {
+    ///         // All processing complete
+    ///     }
+    ///     AfterPhase1ScanMetadata::Parallel { processor, files } => {
+    ///         // Wrap processor in Arc for sharing across threads
+    ///         let processor = Arc::new(processor);
+    ///         // Distribute files for parallel processing (e.g., one file per worker)
+    ///         for file in files {
+    ///             let phase2 = Phase2ScanMetadata::try_new(
+    ///                 engine.clone(),
+    ///                 processor.clone(),
+    ///                 vec![file],
+    ///             )?;
+    ///             for result in phase2 {
+    ///                 let scan_metadata = result?;
+    ///                 // Process scan metadata...
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn parallel_scan_metadata(
+        &self,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<Phase1ScanMetadata> {
+        // For the sequential/parallel phase approach, we use a conservative checkpoint_info
+        // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
+        // currently support stats_parsed optimization.
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+        };
+        let processor =
+            ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone(), checkpoint_info)?;
+        SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

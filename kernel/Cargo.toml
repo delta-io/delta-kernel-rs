@@ -95,6 +95,8 @@ optional = true
 default = []
 # internal-api will make everything marked #[internal_api] public
 internal-api = []
+# test-utils exposes test-only constructors for downstream crate tests
+test-utils = []
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
@@ -110,6 +112,13 @@ arrow-expression = ["need-arrow"]
 # WARNING: experimental feature, still under active development
 # enables new experimental catalog-managed tables support
 catalog-managed = []
+
+# Schema diffing functionality (experimental)
+schema-diff = []
+
+# WARNING: experimental feature, still under active development
+# enables write support for clustered tables
+clustered-table = []
 
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
@@ -147,6 +156,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
+rstest = "0.23"
 
 [[bench]]
 name = "metadata_bench"

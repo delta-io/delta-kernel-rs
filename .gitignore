@@ -2,11 +2,14 @@
 .DS_Store
 
 # IDE
+.claude/
 .dir-locals.el
 .idea/
 .vscode/
 .vim
 .zed
+.cache/
+.clangd
 
 # Rust
 target/

@@ -95,7 +95,6 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
-pub(crate) mod parallel;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -110,10 +109,13 @@ pub use log_path::LogPath;
 
 mod row_tracking;
 
+pub(crate) mod clustering;
+
 mod arrow_compat;
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
 pub use arrow_compat::*;
 
+pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
 
@@ -151,6 +153,11 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
+#[cfg(feature = "internal-api")]
+pub mod parallel;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod parallel;
+
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
@@ -175,6 +182,11 @@ pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+
+/// Sentinel version indicating a pre-commit state (table does not exist yet).
+/// Used for create-table transactions before the first commit.
+pub const PRE_COMMIT_VERSION: Version = u64::MAX;
+
 pub type FileSize = u64;
 pub type FileIndex = u64;
 

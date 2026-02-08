@@ -13,9 +13,12 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
-use crate::scan::data_skipping::stats_schema::expected_stats_schema;
+use crate::expressions::ColumnName;
+use crate::scan::data_skipping::stats_schema::{
+    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
+};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
@@ -25,6 +28,22 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
+
+/// Expected schemas for file statistics.
+///
+/// Contains both logical and physical versions of the stats schema:
+/// - **Logical schema**: Uses original column names (matching table schema)
+/// - **Physical schema**: Uses physical column names (for column mapping)
+///
+/// When column mapping is disabled (`ColumnMappingMode::None`), both schemas are identical.
+#[allow(unused)]
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedStatsSchemas {
+    /// Stats schema using logical (user-facing) column names.
+    pub logical: SchemaRef,
+    /// Stats schema using physical column names (for storage).
+    pub physical: SchemaRef,
+}
 
 /// Information about in-commit timestamp enablement state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,49 +172,98 @@ impl TableConfiguration {
         }
     }
 
-    /// Generates the expected schema for file statistics.
+    /// Generates the expected schemas for file statistics (both logical and physical).
     ///
     /// Engines can provide statistics for files written to the delta table, enabling
-    /// data skipping and other optimizations. This method generates the expected schema
+    /// data skipping and other optimizations. This method generates the expected schemas
     /// for structured statistics based on the table configuration.
     ///
-    /// The returned schema uses physical column names (respecting column mapping mode) and
-    /// is structured as:
+    /// Returns a tuple of `(logical_stats_schema, physical_stats_schema)`:
+    /// - **Logical schema**: Uses original column names (matching table schema)
+    /// - **Physical schema**: Uses physical column names (respecting column mapping mode)
+    ///
+    /// Both schemas are structured as:
     /// ```text
     /// {
     ///   numRecords: long,
-    ///   nullCount: { <physical columns with LONG type> },
-    ///   minValues: { <physical columns with original types> },
-    ///   maxValues: { <physical columns with original types> },
+    ///   nullCount: { <columns with LONG type> },
+    ///   minValues: { <columns with original types> },
+    ///   maxValues: { <columns with original types> },
     /// }
     /// ```
     ///
-    /// The schema is affected by:
-    /// - **Column mapping mode**: Field names use physical names from column mapping metadata.
+    /// The schemas are affected by:
+    /// - **Column mapping mode**: Physical schema field names use physical names from column
+    ///   mapping metadata.
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
+    /// - **Clustering columns**: Per the Delta protocol, clustering columns are always included
+    ///   in statistics, regardless of the above settings.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
+    pub(crate) fn build_expected_stats_schemas(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> DeltaResult<ExpectedStatsSchemas> {
+        let logical_data_schema = self.logical_data_schema();
+        let logical_stats_schema = Arc::new(expected_stats_schema(
+            &logical_data_schema,
+            self.table_properties(),
+            clustering_columns,
+        )?);
+        let physical_stats_schema = match self.column_mapping_mode() {
+            ColumnMappingMode::None => logical_stats_schema.clone(),
+            _ => PhysicalStatsSchemaTransform {
+                column_mapping_mode: self.column_mapping_mode(),
+            }
+            .transform_struct(&logical_stats_schema)
+            .map(|s| Arc::new(s.into_owned()))
+            .unwrap_or_else(|| logical_stats_schema.clone()),
+        };
+        Ok(ExpectedStatsSchemas {
+            logical: logical_stats_schema,
+            physical: physical_stats_schema,
+        })
+    }
+
+    /// Returns the list of logical column names that should have statistics collected.
+    ///
+    /// Returns leaf column paths as [`ColumnName`] objects, which store path components
+    /// separately and handle escaping of special characters (dots, spaces) via backticks.
+    ///
+    /// Per the Delta protocol, clustering columns are always included in statistics,
+    /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
+    /// settings.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn stats_column_names(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> Vec<ColumnName> {
+        stats_column_names(
+            &self.logical_data_schema(),
+            self.table_properties(),
+            clustering_columns,
+        )
+    }
+
+    /// Returns the logical schema for data columns (excludes partition columns).
+    ///
+    /// Partition columns are excluded because statistics are only collected for data columns
+    /// that are physically stored in the parquet files. Partition values are stored in the
+    /// file path, not in the file content, so they don't have file-level statistics.
+    fn logical_data_schema(&self) -> StructType {
         let partition_columns = self.metadata().partition_columns();
-        let column_mapping_mode = self.column_mapping_mode();
-        // Partition columns are excluded because statistics are only collected for data columns
-        // that are physically stored in the parquet files. Partition values are stored in the
-        // file path, not in the file content, so they don't have file-level statistics.
-        let physical_schema = StructType::try_new(
+        StructType::new_unchecked(
             self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
-                .map(|field| field.make_physical(column_mapping_mode)),
-        )?;
-        Ok(Arc::new(expected_stats_schema(
-            &physical_schema,
-            self.table_properties(),
-        )?))
+                .cloned(),
+        )
     }
 
     /// The [`Metadata`] for this table at this version.
@@ -590,12 +658,16 @@ impl TableConfiguration {
 
 #[cfg(test)]
 mod test {
+
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
+    use crate::schema::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
     };
@@ -1417,5 +1489,188 @@ mod test {
 
         let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    /// Helper to create a schema with column mapping metadata using JSON deserialization
+    fn schema_with_column_mapping() -> StructType {
+        let field_a: StructField = serde_json::from_str(
+            r#"{
+                "name": "col_a",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "phys_col_a"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let field_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "col_b",
+                "type": "string",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 2,
+                    "delta.columnMapping.physicalName": "phys_col_b"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        StructType::new_unchecked([field_a, field_b])
+    }
+
+    fn create_table_config_with_column_mapping(
+        schema: StructType,
+        column_mapping_mode: &str,
+    ) -> TableConfiguration {
+        let mut props = HashMap::new();
+        props.insert(
+            "delta.columnMapping.mode".to_string(),
+            column_mapping_mode.to_string(),
+        );
+
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+
+        // Use reader version 2 which supports column mapping
+        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn test_build_expected_stats_schemas_no_column_mapping() {
+        // Without column mapping, logical and physical schemas should be identical
+        let schema = StructType::new_unchecked([
+            StructField::nullable("col_a", DataType::LONG),
+            StructField::nullable("col_b", DataType::STRING),
+        ]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
+
+        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+
+        // Both schemas should be identical (same Arc)
+        assert!(Arc::ptr_eq(&stats_schemas.logical, &stats_schemas.physical));
+
+        // Verify field names are logical names
+        let min_values = stats_schemas
+            .logical
+            .field("minValues")
+            .unwrap()
+            .data_type();
+        if let DataType::Struct(inner) = min_values {
+            assert!(inner.field("col_a").is_some());
+            assert!(inner.field("col_b").is_some());
+        } else {
+            panic!("Expected minValues to be a struct");
+        }
+    }
+
+    #[test]
+    fn test_build_expected_stats_schemas_with_column_mapping() {
+        // With column mapping, logical schema should have logical names,
+        // physical schema should have physical names
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "name");
+
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
+
+        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+
+        // Schemas should be different (not the same Arc)
+        assert!(!Arc::ptr_eq(
+            &stats_schemas.logical,
+            &stats_schemas.physical
+        ));
+
+        // Verify logical schema has logical names
+        let logical_min_values = stats_schemas
+            .logical
+            .field("minValues")
+            .unwrap()
+            .data_type();
+        if let DataType::Struct(inner) = logical_min_values {
+            assert!(
+                inner.field("col_a").is_some(),
+                "Logical schema should have col_a"
+            );
+            assert!(
+                inner.field("col_b").is_some(),
+                "Logical schema should have col_b"
+            );
+            assert!(inner.field("phys_col_a").is_none());
+        } else {
+            panic!("Expected minValues to be a struct");
+        }
+
+        // Verify physical schema has physical names
+        let physical_min_values = stats_schemas
+            .physical
+            .field("minValues")
+            .unwrap()
+            .data_type();
+        if let DataType::Struct(inner) = physical_min_values {
+            assert!(
+                inner.field("phys_col_a").is_some(),
+                "Physical schema should have phys_col_a"
+            );
+            assert!(
+                inner.field("phys_col_b").is_some(),
+                "Physical schema should have phys_col_b"
+            );
+            assert!(inner.field("col_a").is_none());
+        } else {
+            panic!("Expected minValues to be a struct");
+        }
+    }
+
+    #[test]
+    fn test_stats_column_names_returns_logical_names() {
+        // stats_column_names should return logical column names
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "name");
+
+        let column_names = config.stats_column_names(None);
+
+        // Should return logical names, not physical names
+        assert!(column_names.contains(&ColumnName::new(["col_a"])));
+        assert!(column_names.contains(&ColumnName::new(["col_b"])));
+        assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
+        assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
+    }
+
+    #[cfg(feature = "clustered-table")]
+    #[test]
+    fn test_clustered_table_writes() {
+        // ClusteredTable requires DomainMetadata to be supported
+        let config = create_mock_table_config(
+            &[],
+            &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
+        );
+        assert!(
+            config.ensure_operation_supported(Operation::Write).is_ok(),
+            "ClusteredTable with DomainMetadata should be supported for writes"
+        );
+    }
+
+    #[cfg(not(feature = "clustered-table"))]
+    #[test]
+    fn test_clustered_table_writes_not_supported() {
+        // Without the clustered-table feature, writes to clustered tables should fail
+        let config = create_mock_table_config(
+            &[],
+            &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
+        );
+        assert!(
+            config.ensure_operation_supported(Operation::Write).is_err(),
+            "ClusteredTable should not be supported for writes without feature flag"
+        );
     }
 }

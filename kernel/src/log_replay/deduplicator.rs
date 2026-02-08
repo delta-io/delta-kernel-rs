@@ -10,6 +10,8 @@
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
+use std::collections::HashSet;
+
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::FileActionKey;
@@ -19,7 +21,7 @@ pub(crate) trait Deduplicator {
     /// Extracts a file action key from the data. Returns `(key, is_add)` if found.
     ///
     /// TODO: Remove the skip_removes field in the future. The caller is responsible for using the
-    /// correct Deduplicator instance depeding on whether the batch belongs to a commit or to a
+    /// correct Deduplicator instance depending on whether the batch belongs to a commit or to a
     /// checkpoint.
     fn extract_file_action<'a>(
         &self,
@@ -61,5 +63,60 @@ pub(crate) trait Deduplicator {
             path_or_inline,
             offset,
         )))
+    }
+}
+
+/// Read-only deduplicator for checkpoint processing.
+///
+/// Unlike [`FileActionDeduplicator`] which mutably tracks files, this uses an immutable
+/// reference to filter checkpoint actions against files already seen from commits.
+/// Only handles add actions (no removes), and never modifies the seen set.
+///
+/// [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
+#[allow(unused)]
+pub(crate) struct CheckpointDeduplicator<'a> {
+    seen_file_keys: &'a HashSet<FileActionKey>,
+    add_path_index: usize,
+    add_dv_start_index: usize,
+}
+
+impl<'a> CheckpointDeduplicator<'a> {
+    #[allow(unused)]
+    pub(crate) fn try_new(
+        seen_file_keys: &'a HashSet<FileActionKey>,
+        add_path_index: usize,
+        add_dv_start_index: usize,
+    ) -> DeltaResult<Self> {
+        Ok(CheckpointDeduplicator {
+            seen_file_keys,
+            add_path_index,
+            add_dv_start_index,
+        })
+    }
+}
+
+impl Deduplicator for CheckpointDeduplicator<'_> {
+    /// Extracts add action key only (checkpoints skip removes). `skip_removes` is ignored.
+    fn extract_file_action<'b>(
+        &self,
+        i: usize,
+        getters: &[&'b dyn GetData<'b>],
+        _skip_removes: bool,
+    ) -> DeltaResult<Option<(FileActionKey, bool)>> {
+        let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? else {
+            return Ok(None);
+        };
+        let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+        Ok(Some((FileActionKey::new(path, dv_unique_id), true)))
+    }
+
+    /// Read-only check against seen set. Returns `true` if file should be filtered out.
+    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+        self.seen_file_keys.contains(&key)
+    }
+
+    /// Always `false` - checkpoint batches never update the seen set.
+    fn is_log_batch(&self) -> bool {
+        false
     }
 }
