@@ -47,6 +47,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
+    use test_utils::assert_result_error_with_message;
 
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();
@@ -124,6 +125,6 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        assert!(try_read_crc_file(&engine, &crc_path).is_err());
+        assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "Json error");
     }
 }

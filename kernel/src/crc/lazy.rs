@@ -99,6 +99,8 @@ impl LazyCrc {
 mod tests {
     use std::path::PathBuf;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -139,14 +141,11 @@ mod tests {
         assert_eq!(loaded.get().unwrap().table_size_bytes, 100);
     }
 
-    #[test]
-    fn test_crc_load_result_does_not_exist() {
-        assert!(CrcLoadResult::DoesNotExist.get().is_none());
-    }
-
-    #[test]
-    fn test_crc_load_result_corrupt() {
-        assert!(CrcLoadResult::CorruptOrFailed.get().is_none());
+    #[rstest]
+    #[case::does_not_exist(CrcLoadResult::DoesNotExist)]
+    #[case::corrupt(CrcLoadResult::CorruptOrFailed)]
+    fn test_crc_load_result(#[case] result: CrcLoadResult) {
+        assert!(result.get().is_none());
     }
 
     // ===== LazyCrc Tests =====
