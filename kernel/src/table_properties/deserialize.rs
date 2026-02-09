@@ -43,12 +43,12 @@ where
 /// the key — this preserves the existing behavior where some property types tolerate invalid values
 /// gracefully.
 macro_rules! generate_try_parse {
-    ($v:ident, $(($const_name:ident, $_key:expr, $field:ident, $($parse:tt)*)),* $(,)?) => {
+    ($v:ident, $(($const_name:ident, $_key:expr, $field:ident, $parse:block, $_help:expr)),* $(,)?) => {
         // Attempt to parse a key-value pair into a `TableProperties` struct. Returns Some(()) if
         // the key was successfully parsed, and None otherwise.
         fn try_parse(props: &mut TableProperties, k: &str, $v: &str) -> Option<()> {
             match k {
-                $($const_name => props.$field = $($parse)*,)*
+                $($const_name => props.$field = $parse,)*
                 _ => return None,
             }
             Some(())
@@ -57,6 +57,154 @@ macro_rules! generate_try_parse {
 }
 
 with_table_properties!(generate_try_parse, v);
+
+/// Generates the `property_help_message` function that returns the help message for a known
+/// table property key. Each help message describes what constitutes a valid value, inspired by
+/// Spark's `DeltaConfig[T].helpMessage`.
+macro_rules! generate_help_messages {
+    ($_v:ident, $(($const_name:ident, $_key:expr, $_field:ident, $_parse:block, $help:expr)),* $(,)?) => {
+        /// Returns the help message for a known table property key, or `None` for unknown keys.
+        fn property_help_message(key: &str) -> Option<&'static str> {
+            match key {
+                $($const_name => Some($help),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+with_table_properties!(generate_help_messages, v);
+
+/// Generates the `is_field_none_for_key` helper that checks whether the field corresponding to a
+/// given key is `None` in a [`TableProperties`] struct. This is used by [`validate_property_value`]
+/// to detect properties that use `.ok()` parsing (which silently consumes invalid values in
+/// `try_parse` — the key is accepted but the field stays `None`).
+macro_rules! generate_field_none_check {
+    ($_v:ident, $(($const_name:ident, $_key:expr, $field:ident, $_parse:block, $_help:expr)),* $(,)?) => {
+        /// Returns `true` if the field for the given key is `None` in the given properties.
+        fn is_field_none_for_key(props: &TableProperties, key: &str) -> bool {
+            match key {
+                $($const_name => props.$field.is_none(),)*
+                _ => false,
+            }
+        }
+    };
+}
+
+with_table_properties!(generate_field_none_check, v);
+
+/// Validates that a string value is valid for a given table property key, returning a descriptive
+/// error message (including the help message) on failure. This mirrors Spark's
+/// `DeltaConfig[T].validate()` method which combines `fromString` + `validationFunction` +
+/// `helpMessage`.
+///
+/// Validation happens in two phases:
+/// 1. **Type parsing**: Checks that the value can be parsed into the expected type (e.g., bool,
+///    integer, interval). This is analogous to Spark's `fromString`.
+/// 2. **Semantic validation**: For properties with additional constraints beyond type parsing
+///    (e.g., `isolationLevel` must be `Serializable`), a post-parse check is applied. This is
+///    analogous to Spark's `validationFunction`. Most properties use `_ => true` in Spark,
+///    meaning parsing alone is sufficient.
+///
+/// Intended for use in write paths (e.g., CREATE TABLE, ALTER TABLE) to validate property values
+/// before they are stored in the Delta log.
+///
+/// Returns `Ok(())` if:
+/// - The key is a known delta property and the value parses and validates successfully
+/// - The key is not a known delta property (unknown keys are always valid)
+///
+/// Returns `Err(message)` if:
+/// - The key is a known delta property but the value fails to parse or validate
+pub(crate) fn validate_property_value(key: &str, value: &str) -> Result<(), String> {
+    let mut temp = TableProperties::default();
+    if try_parse(&mut temp, key, value).is_none() {
+        // Key was not consumed — either it's unknown (always valid) or parsing failed via `?`
+        return match property_help_message(key) {
+            Some(help) => Err(format!(
+                "Invalid value '{}' for table property '{}': {}",
+                value, key, help
+            )),
+            None => Ok(()), // Unknown key, always valid
+        };
+    }
+
+    // Key was consumed by try_parse. For properties that use `.ok()` parsing (e.g. enum
+    // conversions), try_parse returns Some(()) even when the value is invalid — it just sets
+    // the field to None. Detect this by checking if the field is still None after parsing.
+    if is_field_none_for_key(&temp, key) {
+        return match property_help_message(key) {
+            Some(help) => Err(format!(
+                "Invalid value '{}' for table property '{}': {}",
+                value, key, help
+            )),
+            None => Ok(()),
+        };
+    }
+
+    // Phase 2: Post-parse semantic validation (Spark's validationFunction).
+    // Most properties use `_ => true` in Spark, meaning parsing alone is sufficient.
+    // The few exceptions are handled here.
+    validate_parsed_value(&temp, key, value)?;
+
+    Ok(())
+}
+
+/// Additional semantic validation beyond type parsing, matching Spark's `validationFunction`.
+///
+/// Most properties in Spark use `validationFunction = _ => true`, meaning that if the value
+/// parses successfully, it's valid. The following properties have stricter validation:
+///
+/// - `delta.isolationLevel`: Spark restricts to `Serializable` only (`_ == Serializable`)
+///
+/// Properties where Spark has validation but kernel already enforces via parsing:
+/// - `delta.checkpointInterval`: Spark validates `_ > 0`; kernel uses `parse_positive_int`
+/// - `delta.randomPrefixLength`: Spark validates `_ > 0`; kernel uses `parse_positive_int`
+/// - `delta.dataSkippingNumIndexedCols`: Spark validates `_ >= -1`; kernel uses `TryFrom`
+fn validate_parsed_value(props: &TableProperties, key: &str, value: &str) -> Result<(), String> {
+    if key == ISOLATION_LEVEL {
+        if let Some(level) = &props.isolation_level {
+            if *level != IsolationLevel::Serializable {
+                return Err(format!(
+                    "Invalid value '{}' for table property '{}': {}",
+                    value,
+                    key,
+                    property_help_message(key).unwrap_or("must be Serializable.")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates compatibility between related table properties, matching Spark's cross-property
+/// validation in `DeltaConfigs.validateTombstoneAndLogRetentionDurationCompatibility`.
+///
+/// Currently validates:
+/// - `delta.logRetentionDuration` must be >= `delta.deletedFileRetentionDuration`
+///
+/// This should be called after individual property values have been validated via
+/// [`validate_property_value`].
+pub(crate) fn validate_properties_compatibility(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let log_retention = properties
+        .get(LOG_RETENTION_DURATION)
+        .and_then(|v| parse_interval(v));
+    let tombstone_retention = properties
+        .get(DELETED_FILE_RETENTION_DURATION)
+        .and_then(|v| parse_interval(v));
+
+    if let (Some(log), Some(tombstone)) = (log_retention, tombstone_retention) {
+        if log < tombstone {
+            return Err(format!(
+                "The table property '{}' ({:?}) needs to be greater than or equal to '{}' ({:?}).",
+                LOG_RETENTION_DURATION, log, DELETED_FILE_RETENTION_DURATION, tombstone
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
 /// if successfully parses, and `None` otherwise.

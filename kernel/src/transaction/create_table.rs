@@ -46,7 +46,9 @@ use crate::table_features::{
     TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use crate::table_properties::DELTA_PROPERTY_PREFIX;
+use crate::table_properties::{
+    validate_properties_compatibility, validate_property_value, DELTA_PROPERTY_PREFIX,
+};
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
@@ -201,17 +203,22 @@ fn validate_extract_table_features_and_properties(
         }
     }
 
-    // Validate remaining delta.* properties against allow list
-    for key in properties.keys() {
-        if key.starts_with(DELTA_PROPERTY_PREFIX)
-            && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
-        {
-            return Err(Error::generic(format!(
-                "Setting delta property '{}' is not supported during CREATE TABLE",
-                key
-            )));
+    // Validate remaining delta.* properties against allow list and validate values
+    for (key, value) in &properties {
+        if key.starts_with(DELTA_PROPERTY_PREFIX) {
+            if !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str()) {
+                return Err(Error::generic(format!(
+                    "Setting delta property '{}' is not supported during CREATE TABLE",
+                    key
+                )));
+            }
+            // Validate the property value using the generated validation function
+            validate_property_value(key, value).map_err(Error::generic)?;
         }
     }
+
+    // Cross-property compatibility validation (e.g., log retention >= tombstone retention)
+    validate_properties_compatibility(&properties).map_err(Error::generic)?;
 
     Ok(ValidatedTableProperties {
         properties,

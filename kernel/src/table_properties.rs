@@ -27,93 +27,165 @@ use strum::EnumString;
 /// - `CONST_NAME`: The Rust constant identifier (e.g., `APPEND_ONLY`)
 /// - `"key.string"`: The Delta table property key (e.g., `"delta.appendOnly"`)
 /// - `field_name`: The corresponding field in [`TableProperties`]
-/// - `parse_expr`: An expression that parses the string value `$v` into the field's type.
+/// - `{ parse_expr }`: A block expression that parses the string value `$v` into the field's type.
 ///   Uses `$v` (not a literal `v`) to avoid macro hygiene issues — the caller passes the
 ///   identifier that names the value parameter.
+/// - `"help_message"`: A human-readable description of what constitutes a valid value, inspired
+///   by Spark's `DeltaConfig[T].helpMessage`. Used to produce descriptive error messages when
+///   validation fails.
 ///
 /// Consumers call this macro with their own callback macro name. Currently consumed by:
 /// - [`define_property_constants!`]: generates `pub(crate) const` key string constants
 /// - [`generate_try_parse!`] (in `deserialize.rs`): generates the `try_parse` deserialization
 ///   function
+/// - [`generate_validate_property!`] (in `deserialize.rs`): generates the
+///   [`validate_property_value`] function for pre-write validation
 ///
-/// To add a new table property, add a single entry here — the constant and parsing logic are
-/// generated automatically.
+/// To add a new table property, add a single entry here — the constant, parsing logic, and
+/// validation are generated automatically.
 macro_rules! with_table_properties {
     ($callback:ident, $v:ident) => {
         $callback! { $v,
             (APPEND_ONLY, "delta.appendOnly",
-                append_only, Some(parse_bool($v)?)),
+                append_only,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
+            // NOTE: Spark's autoCompact is `Option[String]` accepting values like "auto",
+            // while kernel uses `Option<bool>`. This type mismatch is out of scope.
             (AUTO_COMPACT, "delta.autoOptimize.autoCompact",
-                auto_compact, Some(parse_bool($v)?)),
+                auto_compact,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (OPTIMIZE_WRITE, "delta.autoOptimize.optimizeWrite",
-                optimize_write, Some(parse_bool($v)?)),
+                optimize_write,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (CHECKPOINT_INTERVAL, "delta.checkpointInterval",
-                checkpoint_interval, Some(parse_positive_int($v)?)),
+                checkpoint_interval,
+                { Some(parse_positive_int($v)?) },
+                "needs to be a positive integer."),
             (CHECKPOINT_WRITE_STATS_AS_JSON, "delta.checkpoint.writeStatsAsJson",
-                checkpoint_write_stats_as_json, Some(parse_bool($v)?)),
+                checkpoint_write_stats_as_json,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (CHECKPOINT_WRITE_STATS_AS_STRUCT, "delta.checkpoint.writeStatsAsStruct",
-                checkpoint_write_stats_as_struct, Some(parse_bool($v)?)),
+                checkpoint_write_stats_as_struct,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (COLUMN_MAPPING_MODE, "delta.columnMapping.mode",
-                column_mapping_mode, ColumnMappingMode::try_from($v).ok()),
+                column_mapping_mode,
+                { ColumnMappingMode::try_from($v).ok() },
+                "needs to be one of 'none', 'id', or 'name'."),
             (DATA_SKIPPING_NUM_INDEXED_COLS, "delta.dataSkippingNumIndexedCols",
-                data_skipping_num_indexed_cols, DataSkippingNumIndexedCols::try_from($v).ok()),
+                data_skipping_num_indexed_cols,
+                { DataSkippingNumIndexedCols::try_from($v).ok() },
+                "needs to be larger than or equal to -1."),
             (DATA_SKIPPING_STATS_COLUMNS, "delta.dataSkippingStatsColumns",
-                data_skipping_stats_columns, Some(parse_column_names($v)?)),
+                data_skipping_stats_columns,
+                { Some(parse_column_names($v)?) },
+                "needs to be a comma-separated list of column names."),
             (DELETED_FILE_RETENTION_DURATION, "delta.deletedFileRetentionDuration",
-                deleted_file_retention_duration, Some(parse_interval($v)?)),
+                deleted_file_retention_duration,
+                { Some(parse_interval($v)?) },
+                "needs to be provided as a calendar interval such as 'interval 2 weeks'. Months and years are not accepted. You may specify '365 days' for a year instead."),
             (ENABLE_CHANGE_DATA_FEED, "delta.enableChangeDataFeed",
-                enable_change_data_feed, Some(parse_bool($v)?)),
+                enable_change_data_feed,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (ENABLE_DELETION_VECTORS, "delta.enableDeletionVectors",
-                enable_deletion_vectors, Some(parse_bool($v)?)),
+                enable_deletion_vectors,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (ENABLE_TYPE_WIDENING, "delta.enableTypeWidening",
-                enable_type_widening, Some(parse_bool($v)?)),
+                enable_type_widening,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1",
-                enable_iceberg_compat_v1, Some(parse_bool($v)?)),
+                enable_iceberg_compat_v1,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2",
-                enable_iceberg_compat_v2, Some(parse_bool($v)?)),
+                enable_iceberg_compat_v2,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
+            // Spark restricts isolation level to Serializable only via validationFunction.
+            // The parse expression accepts all variants, but validate_property_value()
+            // performs a post-parse check to reject non-Serializable values.
             (ISOLATION_LEVEL, "delta.isolationLevel",
-                isolation_level, IsolationLevel::try_from($v).ok()),
+                isolation_level,
+                { IsolationLevel::try_from($v).ok() },
+                "must be Serializable."),
             (LOG_RETENTION_DURATION, "delta.logRetentionDuration",
-                log_retention_duration, Some(parse_interval($v)?)),
+                log_retention_duration,
+                { Some(parse_interval($v)?) },
+                "needs to be provided as a calendar interval such as 'interval 2 weeks'. Months and years are not accepted. You may specify '365 days' for a year instead."),
             (ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup",
-                enable_expired_log_cleanup, Some(parse_bool($v)?)),
+                enable_expired_log_cleanup,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (RANDOMIZE_FILE_PREFIXES, "delta.randomizeFilePrefixes",
-                randomize_file_prefixes, Some(parse_bool($v)?)),
+                randomize_file_prefixes,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (RANDOM_PREFIX_LENGTH, "delta.randomPrefixLength",
-                random_prefix_length, Some(parse_positive_int($v)?)),
+                random_prefix_length,
+                { Some(parse_positive_int($v)?) },
+                "needs to be greater than 0."),
             (SET_TRANSACTION_RETENTION_DURATION, "delta.setTransactionRetentionDuration",
-                set_transaction_retention_duration, Some(parse_interval($v)?)),
+                set_transaction_retention_duration,
+                { Some(parse_interval($v)?) },
+                "needs to be provided as a calendar interval such as 'interval 2 weeks'. Months and years are not accepted. You may specify '365 days' for a year instead."),
             (TARGET_FILE_SIZE, "delta.targetFileSize",
-                target_file_size, Some(parse_positive_int($v)?)),
+                target_file_size,
+                { Some(parse_positive_int($v)?) },
+                "needs to be a positive integer."),
             (TUNE_FILE_SIZES_FOR_REWRITES, "delta.tuneFileSizesForRewrites",
-                tune_file_sizes_for_rewrites, Some(parse_bool($v)?)),
+                tune_file_sizes_for_rewrites,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (CHECKPOINT_POLICY, "delta.checkpointPolicy",
-                checkpoint_policy, CheckpointPolicy::try_from($v).ok()),
+                checkpoint_policy,
+                { CheckpointPolicy::try_from($v).ok() },
+                "needs to be 'classic' or 'v2'."),
             (ENABLE_ROW_TRACKING, "delta.enableRowTracking",
-                enable_row_tracking, Some(parse_bool($v)?)),
+                enable_row_tracking,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (MATERIALIZED_ROW_ID_COLUMN_NAME,
                 "delta.rowTracking.materializedRowIdColumnName",
-                materialized_row_id_column_name, Some($v.to_string())),
+                materialized_row_id_column_name,
+                { Some($v.to_string()) },
+                "needs to be a string."),
             (MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
                 "delta.rowTracking.materializedRowCommitVersionColumnName",
-                materialized_row_commit_version_column_name, Some($v.to_string())),
+                materialized_row_commit_version_column_name,
+                { Some($v.to_string()) },
+                "needs to be a string."),
             (ROW_TRACKING_SUSPENDED, "delta.rowTrackingSuspended",
-                row_tracking_suspended, Some(parse_bool($v)?)),
+                row_tracking_suspended,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (ENABLE_IN_COMMIT_TIMESTAMPS, "delta.enableInCommitTimestamps",
-                enable_in_commit_timestamps, Some(parse_bool($v)?)),
+                enable_in_commit_timestamps,
+                { Some(parse_bool($v)?) },
+                "needs to be a boolean."),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
                 "delta.inCommitTimestampEnablementVersion",
-                in_commit_timestamp_enablement_version, Some(parse_non_negative($v)?)),
+                in_commit_timestamp_enablement_version,
+                { Some(parse_non_negative($v)?) },
+                "needs to be a non-negative integer."),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
                 "delta.inCommitTimestampEnablementTimestamp",
-                in_commit_timestamp_enablement_timestamp, Some(parse_non_negative($v)?)),
+                in_commit_timestamp_enablement_timestamp,
+                { Some(parse_non_negative($v)?) },
+                "needs to be a non-negative integer."),
         }
     };
 }
 
 /// Generates `pub(crate) const` key string constants from the table property definitions.
 macro_rules! define_property_constants {
-    ($_v:ident, $(($const_name:ident, $key:expr, $_field:ident, $($_parse:tt)*)),* $(,)?) => {
+    ($_v:ident, $(($const_name:ident, $key:expr, $_field:ident, $_parse:block, $_help:expr)),* $(,)?) => {
         $(pub(crate) const $const_name: &str = $key;)*
     };
 }
@@ -121,6 +193,8 @@ macro_rules! define_property_constants {
 with_table_properties!(define_property_constants, v);
 
 mod deserialize;
+pub(crate) use deserialize::validate_properties_compatibility;
+pub(crate) use deserialize::validate_property_value;
 pub use deserialize::ParseIntervalError;
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
@@ -503,5 +577,209 @@ mod tests {
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_validate_valid_property_values() {
+        // Booleans
+        assert!(validate_property_value(APPEND_ONLY, "true").is_ok());
+        assert!(validate_property_value(APPEND_ONLY, "false").is_ok());
+        assert!(validate_property_value(ENABLE_CHANGE_DATA_FEED, "true").is_ok());
+
+        // Positive integers
+        assert!(validate_property_value(CHECKPOINT_INTERVAL, "10").is_ok());
+        assert!(validate_property_value(RANDOM_PREFIX_LENGTH, "5").is_ok());
+
+        // Non-negative integers
+        assert!(validate_property_value(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "0").is_ok());
+        assert!(validate_property_value(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15").is_ok());
+
+        // Intervals
+        assert!(
+            validate_property_value(DELETED_FILE_RETENTION_DURATION, "interval 30 days").is_ok()
+        );
+        assert!(validate_property_value(LOG_RETENTION_DURATION, "interval 2 hours").is_ok());
+
+        // Enums
+        assert!(validate_property_value(COLUMN_MAPPING_MODE, "none").is_ok());
+        assert!(validate_property_value(COLUMN_MAPPING_MODE, "id").is_ok());
+        assert!(validate_property_value(COLUMN_MAPPING_MODE, "name").is_ok());
+        // Only Serializable is valid for validation (matching Spark)
+        assert!(validate_property_value(ISOLATION_LEVEL, "serializable").is_ok());
+        assert!(validate_property_value(CHECKPOINT_POLICY, "classic").is_ok());
+        assert!(validate_property_value(CHECKPOINT_POLICY, "v2").is_ok());
+
+        // Strings (always valid)
+        assert!(validate_property_value(MATERIALIZED_ROW_ID_COLUMN_NAME, "anything").is_ok());
+
+        // Unknown keys (always valid)
+        assert!(validate_property_value("unknown.key", "any_value").is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_property_values() {
+        // Invalid boolean
+        let result = validate_property_value(APPEND_ONLY, "wack");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("needs to be a boolean."), "got: {err}");
+        assert!(err.contains("delta.appendOnly"), "got: {err}");
+
+        // Invalid positive integer (zero)
+        let result = validate_property_value(CHECKPOINT_INTERVAL, "0");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("needs to be a positive integer."),
+            "got: {err}"
+        );
+
+        // Invalid positive integer (negative)
+        let result = validate_property_value(CHECKPOINT_INTERVAL, "-5");
+        assert!(result.is_err());
+
+        // Invalid positive integer (not a number)
+        let result = validate_property_value(CHECKPOINT_INTERVAL, "abc");
+        assert!(result.is_err());
+
+        // Invalid interval
+        let result = validate_property_value(DELETED_FILE_RETENTION_DURATION, "not-an-interval");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("needs to be provided as a calendar interval"),
+            "got: {err}"
+        );
+
+        // Invalid enum
+        let result = validate_property_value(COLUMN_MAPPING_MODE, "invalid_mode");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("needs to be one of 'none', 'id', or 'name'."),
+            "got: {err}"
+        );
+
+        // Invalid checkpoint policy
+        let result = validate_property_value(CHECKPOINT_POLICY, "v3");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("needs to be 'classic' or 'v2'."), "got: {err}");
+
+        // Invalid non-negative integer (negative)
+        let result = validate_property_value(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "-1");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("needs to be a non-negative integer."),
+            "got: {err}"
+        );
+
+        // Invalid random prefix length (Spark help: "needs to be greater than 0.")
+        let result = validate_property_value(RANDOM_PREFIX_LENGTH, "0");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("needs to be greater than 0."), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_isolation_level_semantic() {
+        // Serializable is the only allowed value (matching Spark's validationFunction)
+        assert!(validate_property_value(ISOLATION_LEVEL, "serializable").is_ok());
+
+        // WriteSerializable parses successfully but fails semantic validation
+        let result = validate_property_value(ISOLATION_LEVEL, "writeSerializable");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be Serializable."), "got: {err}");
+
+        // SnapshotIsolation parses successfully but fails semantic validation
+        let result = validate_property_value(ISOLATION_LEVEL, "snapshotIsolation");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be Serializable."), "got: {err}");
+
+        // Completely invalid values still fail at parse time
+        let result = validate_property_value(ISOLATION_LEVEL, "invalid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be Serializable."), "got: {err}");
+
+        // Note: try_parse (used for reading existing tables) still accepts all variants.
+        // Only validate_property_value (used for write paths) restricts to Serializable.
+        let properties =
+            HashMap::from([(ISOLATION_LEVEL.to_string(), "snapshotIsolation".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(
+            table_properties.isolation_level,
+            Some(IsolationLevel::SnapshotIsolation)
+        );
+    }
+
+    #[test]
+    fn test_validate_properties_compatibility() {
+        // Both present, log >= tombstone: OK
+        let mut props = HashMap::new();
+        props.insert(
+            LOG_RETENTION_DURATION.to_string(),
+            "interval 30 days".to_string(),
+        );
+        props.insert(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        );
+        assert!(validate_properties_compatibility(&props).is_ok());
+
+        // Both present, equal durations: OK
+        let mut props = HashMap::new();
+        props.insert(
+            LOG_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        );
+        props.insert(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        );
+        assert!(validate_properties_compatibility(&props).is_ok());
+
+        // Both present, log < tombstone: ERROR
+        let mut props = HashMap::new();
+        props.insert(
+            LOG_RETENTION_DURATION.to_string(),
+            "interval 1 days".to_string(),
+        );
+        props.insert(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        );
+        let result = validate_properties_compatibility(&props);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("needs to be greater than or equal to"),
+            "got: {err}"
+        );
+        assert!(err.contains(LOG_RETENTION_DURATION), "got: {err}");
+        assert!(err.contains(DELETED_FILE_RETENTION_DURATION), "got: {err}");
+
+        // Only log retention present: OK (no cross-property constraint)
+        let mut props = HashMap::new();
+        props.insert(
+            LOG_RETENTION_DURATION.to_string(),
+            "interval 1 days".to_string(),
+        );
+        assert!(validate_properties_compatibility(&props).is_ok());
+
+        // Only tombstone retention present: OK
+        let mut props = HashMap::new();
+        props.insert(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        );
+        assert!(validate_properties_compatibility(&props).is_ok());
+
+        // Neither present: OK
+        let props = HashMap::new();
+        assert!(validate_properties_compatibility(&props).is_ok());
     }
 }
