@@ -20,48 +20,111 @@ use crate::{Error, Version};
 
 use strum::EnumString;
 
+/// Invokes the given callback macro with the complete list of Delta table property definitions.
+///
+/// This is the **single source of truth** for all known Delta table properties. Each entry is a
+/// tuple of:
+/// - `CONST_NAME`: The Rust constant identifier (e.g., `APPEND_ONLY`)
+/// - `"key.string"`: The Delta table property key (e.g., `"delta.appendOnly"`)
+/// - `field_name`: The corresponding field in [`TableProperties`]
+/// - `parse_expr`: An expression that parses the string value `$v` into the field's type.
+///   Uses `$v` (not a literal `v`) to avoid macro hygiene issues — the caller passes the
+///   identifier that names the value parameter.
+///
+/// Consumers call this macro with their own callback macro name. Currently consumed by:
+/// - [`define_property_constants!`]: generates `pub(crate) const` key string constants
+/// - [`generate_try_parse!`] (in `deserialize.rs`): generates the `try_parse` deserialization
+///   function
+///
+/// To add a new table property, add a single entry here — the constant and parsing logic are
+/// generated automatically.
+macro_rules! with_table_properties {
+    ($callback:ident, $v:ident) => {
+        $callback! { $v,
+            (APPEND_ONLY, "delta.appendOnly",
+                append_only, Some(parse_bool($v)?)),
+            (AUTO_COMPACT, "delta.autoOptimize.autoCompact",
+                auto_compact, Some(parse_bool($v)?)),
+            (OPTIMIZE_WRITE, "delta.autoOptimize.optimizeWrite",
+                optimize_write, Some(parse_bool($v)?)),
+            (CHECKPOINT_INTERVAL, "delta.checkpointInterval",
+                checkpoint_interval, Some(parse_positive_int($v)?)),
+            (CHECKPOINT_WRITE_STATS_AS_JSON, "delta.checkpoint.writeStatsAsJson",
+                checkpoint_write_stats_as_json, Some(parse_bool($v)?)),
+            (CHECKPOINT_WRITE_STATS_AS_STRUCT, "delta.checkpoint.writeStatsAsStruct",
+                checkpoint_write_stats_as_struct, Some(parse_bool($v)?)),
+            (COLUMN_MAPPING_MODE, "delta.columnMapping.mode",
+                column_mapping_mode, ColumnMappingMode::try_from($v).ok()),
+            (DATA_SKIPPING_NUM_INDEXED_COLS, "delta.dataSkippingNumIndexedCols",
+                data_skipping_num_indexed_cols, DataSkippingNumIndexedCols::try_from($v).ok()),
+            (DATA_SKIPPING_STATS_COLUMNS, "delta.dataSkippingStatsColumns",
+                data_skipping_stats_columns, Some(parse_column_names($v)?)),
+            (DELETED_FILE_RETENTION_DURATION, "delta.deletedFileRetentionDuration",
+                deleted_file_retention_duration, Some(parse_interval($v)?)),
+            (ENABLE_CHANGE_DATA_FEED, "delta.enableChangeDataFeed",
+                enable_change_data_feed, Some(parse_bool($v)?)),
+            (ENABLE_DELETION_VECTORS, "delta.enableDeletionVectors",
+                enable_deletion_vectors, Some(parse_bool($v)?)),
+            (ENABLE_TYPE_WIDENING, "delta.enableTypeWidening",
+                enable_type_widening, Some(parse_bool($v)?)),
+            (ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1",
+                enable_iceberg_compat_v1, Some(parse_bool($v)?)),
+            (ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2",
+                enable_iceberg_compat_v2, Some(parse_bool($v)?)),
+            (ISOLATION_LEVEL, "delta.isolationLevel",
+                isolation_level, IsolationLevel::try_from($v).ok()),
+            (LOG_RETENTION_DURATION, "delta.logRetentionDuration",
+                log_retention_duration, Some(parse_interval($v)?)),
+            (ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup",
+                enable_expired_log_cleanup, Some(parse_bool($v)?)),
+            (RANDOMIZE_FILE_PREFIXES, "delta.randomizeFilePrefixes",
+                randomize_file_prefixes, Some(parse_bool($v)?)),
+            (RANDOM_PREFIX_LENGTH, "delta.randomPrefixLength",
+                random_prefix_length, Some(parse_positive_int($v)?)),
+            (SET_TRANSACTION_RETENTION_DURATION, "delta.setTransactionRetentionDuration",
+                set_transaction_retention_duration, Some(parse_interval($v)?)),
+            (TARGET_FILE_SIZE, "delta.targetFileSize",
+                target_file_size, Some(parse_positive_int($v)?)),
+            (TUNE_FILE_SIZES_FOR_REWRITES, "delta.tuneFileSizesForRewrites",
+                tune_file_sizes_for_rewrites, Some(parse_bool($v)?)),
+            (CHECKPOINT_POLICY, "delta.checkpointPolicy",
+                checkpoint_policy, CheckpointPolicy::try_from($v).ok()),
+            (ENABLE_ROW_TRACKING, "delta.enableRowTracking",
+                enable_row_tracking, Some(parse_bool($v)?)),
+            (MATERIALIZED_ROW_ID_COLUMN_NAME,
+                "delta.rowTracking.materializedRowIdColumnName",
+                materialized_row_id_column_name, Some($v.to_string())),
+            (MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+                "delta.rowTracking.materializedRowCommitVersionColumnName",
+                materialized_row_commit_version_column_name, Some($v.to_string())),
+            (ROW_TRACKING_SUSPENDED, "delta.rowTrackingSuspended",
+                row_tracking_suspended, Some(parse_bool($v)?)),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "delta.enableInCommitTimestamps",
+                enable_in_commit_timestamps, Some(parse_bool($v)?)),
+            (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+                "delta.inCommitTimestampEnablementVersion",
+                in_commit_timestamp_enablement_version, Some(parse_non_negative($v)?)),
+            (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+                "delta.inCommitTimestampEnablementTimestamp",
+                in_commit_timestamp_enablement_timestamp, Some(parse_non_negative($v)?)),
+        }
+    };
+}
+
+/// Generates `pub(crate) const` key string constants from the table property definitions.
+macro_rules! define_property_constants {
+    ($_v:ident, $(($const_name:ident, $key:expr, $_field:ident, $($_parse:tt)*)),* $(,)?) => {
+        $(pub(crate) const $const_name: &str = $key;)*
+    };
+}
+
+with_table_properties!(define_property_constants, v);
+
 mod deserialize;
 pub use deserialize::ParseIntervalError;
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
-
-// Table property key constants
-pub(crate) const APPEND_ONLY: &str = "delta.appendOnly";
-pub(crate) const AUTO_COMPACT: &str = "delta.autoOptimize.autoCompact";
-pub(crate) const OPTIMIZE_WRITE: &str = "delta.autoOptimize.optimizeWrite";
-pub(crate) const CHECKPOINT_INTERVAL: &str = "delta.checkpointInterval";
-pub(crate) const CHECKPOINT_WRITE_STATS_AS_JSON: &str = "delta.checkpoint.writeStatsAsJson";
-pub(crate) const CHECKPOINT_WRITE_STATS_AS_STRUCT: &str = "delta.checkpoint.writeStatsAsStruct";
-pub(crate) const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
-pub(crate) const DATA_SKIPPING_NUM_INDEXED_COLS: &str = "delta.dataSkippingNumIndexedCols";
-pub(crate) const DATA_SKIPPING_STATS_COLUMNS: &str = "delta.dataSkippingStatsColumns";
-pub(crate) const DELETED_FILE_RETENTION_DURATION: &str = "delta.deletedFileRetentionDuration";
-pub(crate) const ENABLE_CHANGE_DATA_FEED: &str = "delta.enableChangeDataFeed";
-pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
-pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
-pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
-pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
-pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
-pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
-pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
-pub(crate) const RANDOMIZE_FILE_PREFIXES: &str = "delta.randomizeFilePrefixes";
-pub(crate) const RANDOM_PREFIX_LENGTH: &str = "delta.randomPrefixLength";
-pub(crate) const SET_TRANSACTION_RETENTION_DURATION: &str = "delta.setTransactionRetentionDuration";
-pub(crate) const TARGET_FILE_SIZE: &str = "delta.targetFileSize";
-pub(crate) const TUNE_FILE_SIZES_FOR_REWRITES: &str = "delta.tuneFileSizesForRewrites";
-pub(crate) const CHECKPOINT_POLICY: &str = "delta.checkpointPolicy";
-pub(crate) const ENABLE_ROW_TRACKING: &str = "delta.enableRowTracking";
-pub(crate) const MATERIALIZED_ROW_ID_COLUMN_NAME: &str =
-    "delta.rowTracking.materializedRowIdColumnName";
-pub(crate) const MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str =
-    "delta.rowTracking.materializedRowCommitVersionColumnName";
-pub(crate) const ROW_TRACKING_SUSPENDED: &str = "delta.rowTrackingSuspended";
-pub(crate) const ENABLE_IN_COMMIT_TIMESTAMPS: &str = "delta.enableInCommitTimestamps";
-pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
-    "delta.inCommitTimestampEnablementVersion";
-pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
-    "delta.inCommitTimestampEnablementTimestamp";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
@@ -261,7 +324,7 @@ pub enum IsolationLevel {
     /// and all reads are Serializable. Operations are allowed as long as there
     /// exists a serial sequence of executing them one-at-a-time that generates
     /// the same outcome as that seen in the table. For the write operations,
-    /// the serial sequence is exactly the same as that seen in the table’s history.
+    /// the serial sequence is exactly the same as that seen in the table's history.
     #[default]
     Serializable,
 
