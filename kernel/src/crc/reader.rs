@@ -5,36 +5,81 @@ use std::sync::Arc;
 use super::{Crc, CrcVisitor};
 use crate::path::ParsedLogPath;
 use crate::schema::ToSchema as _;
-use crate::{DeltaResult, Engine, Error, RowVisitor as _};
+use crate::{Engine, Error, RowVisitor as _};
+
+/// Error from attempting to read a CRC file.
+///
+/// This distinguishes between read failures and corrupt content to support retry decisions:
+/// [`FailedToRead`] errors may be transient (network issues, throttling) and worth retrying,
+/// while [`Corrupt`] errors are permanent and should never be retried.
+///
+/// [`FailedToRead`]: CrcReadError::FailedToRead
+/// [`Corrupt`]: CrcReadError::Corrupt
+#[allow(unused)] // TODO: remove after we complete CRC support
+#[derive(Debug)]
+pub(crate) enum CrcReadError {
+    /// The engine could not produce data for this file (I/O error, file not found, malformed
+    /// JSON that the engine couldn't parse, etc.). This may be caused by a transient issue, so
+    /// callers may choose to retry. The inner error can be inspected for more details.
+    FailedToRead(Error),
+    /// The engine produced data, but it doesn't represent a valid CRC file (wrong number of rows,
+    /// missing required fields, etc.). This is a permanent error -- the file content is
+    /// fundamentally invalid, so retrying will not help.
+    Corrupt(Error),
+}
+
+impl std::fmt::Display for CrcReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CrcReadError::FailedToRead(e) => write!(f, "failed to read: {e}"),
+            CrcReadError::Corrupt(e) => write!(f, "corrupt content: {e}"),
+        }
+    }
+}
 
 /// Attempt to read and parse a CRC file.
 ///
-/// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON, missing
-/// required fields). The caller should handle errors gracefully by falling back to log replay.
+/// Returns `Ok(Crc)` on success, or a [`CrcReadError`] that indicates whether the failure was due
+/// to a read error or corrupt content. The caller should handle errors gracefully by falling back
+/// to log replay.
 #[allow(unused)] // TODO: remove after we complete CRC support
-pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
+pub(crate) fn try_read_crc_file(
+    engine: &dyn Engine,
+    crc_path: &ParsedLogPath,
+) -> Result<Crc, CrcReadError> {
     let json_handler = engine.json_handler();
     let file_meta = crc_path.location.clone();
     let output_schema = Arc::new(Crc::to_schema());
 
-    let mut batches = json_handler.read_json_files(&[file_meta], output_schema, None)?;
+    // Phase 1: Ask the engine to read the file into structured data.
+    // Any failure here (I/O, file not found, unparseable content) means the engine could not
+    // produce a data batch for this file.
+    let mut batches = json_handler
+        .read_json_files(&[file_meta], output_schema, None)
+        .map_err(CrcReadError::FailedToRead)?;
 
-    // CRC file should have exactly one batch with one row
     let batch = batches
         .next()
-        .ok_or_else(|| Error::generic("CRC file is empty"))??;
+        .ok_or_else(|| {
+            CrcReadError::FailedToRead(Error::generic("CRC file produced no data from engine"))
+        })?
+        .map_err(CrcReadError::FailedToRead)?;
 
+    // Phase 2: Validate and extract CRC fields from the engine data.
+    // The engine successfully read the file, so errors here mean the content doesn't conform
+    // to the CRC schema.
     if batch.len() != 1 {
-        return Err(Error::generic(format!(
+        return Err(CrcReadError::Corrupt(Error::generic(format!(
             "CRC file should have exactly 1 row, found {}",
             batch.len()
-        )));
+        ))));
     }
 
-    // Use visitor to extract CRC fields
     let mut visitor = CrcVisitor::default();
-    visitor.visit_rows_of(batch.as_ref())?;
-    visitor.into_crc()
+    visitor
+        .visit_rows_of(batch.as_ref())
+        .map_err(CrcReadError::Corrupt)?;
+    visitor.into_crc().map_err(CrcReadError::Corrupt)
 }
 
 #[cfg(test)]
@@ -119,11 +164,15 @@ mod tests {
     }
 
     #[test]
-    fn test_read_malformed_crc_file_fails() {
+    fn test_read_malformed_crc_file_fails_to_read() {
         let engine = SyncEngine::new();
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        assert!(try_read_crc_file(&engine, &crc_path).is_err());
+        // Malformed JSON -> engine can't produce structured data -> FailedToRead
+        assert!(matches!(
+            try_read_crc_file(&engine, &crc_path),
+            Err(CrcReadError::FailedToRead(_))
+        ));
     }
 }

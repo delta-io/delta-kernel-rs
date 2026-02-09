@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use tracing::warn;
 
+use super::reader::CrcReadError;
 use super::{try_read_crc_file, Crc};
 use crate::path::ParsedLogPath;
 use crate::{Engine, Version};
@@ -16,12 +17,13 @@ use crate::{Engine, Version};
 /// The "not yet loaded" state is represented by `OnceLock::get()` returning `None`, not as an enum
 /// variant.
 #[allow(unused)] // TODO: remove after we complete CRC support
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum CrcLoadResult {
     /// No CRC file exists for this log segment.
     DoesNotExist,
-    /// CRC file exists but failed to read/parse (corrupted or I/O error).
-    CorruptOrFailed,
+    /// CRC file exists but could not be loaded. See [`CrcReadError`] for whether this might be
+    /// transient (worth retrying) or permanent.
+    Failed(CrcReadError),
     /// CRC file was successfully loaded.
     Loaded(Arc<Crc>),
 }
@@ -32,7 +34,7 @@ impl CrcLoadResult {
     pub(crate) fn get(&self) -> Option<&Arc<Crc>> {
         match self {
             CrcLoadResult::Loaded(crc) => Some(crc),
-            _ => None,
+            CrcLoadResult::DoesNotExist | CrcLoadResult::Failed(_) => None,
         }
     }
 }
@@ -72,10 +74,10 @@ impl LazyCrc {
                 Ok(crc) => CrcLoadResult::Loaded(Arc::new(crc)),
                 Err(e) => {
                     warn!(
-                        "Failed to read CRC file {:?}: {}. Falling back to log replay.",
+                        "Failed to load CRC file {:?}: {}. Falling back to log replay.",
                         crc_path.location.location, e
                     );
-                    CrcLoadResult::CorruptOrFailed
+                    CrcLoadResult::Failed(e)
                 }
             },
         })
@@ -101,6 +103,7 @@ mod tests {
 
     use super::*;
     use crate::actions::{Metadata, Protocol};
+    use crate::Error;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use object_store::memory::InMemory;
@@ -145,8 +148,12 @@ mod tests {
     }
 
     #[test]
-    fn test_crc_load_result_corrupt() {
-        assert!(CrcLoadResult::CorruptOrFailed.get().is_none());
+    fn test_crc_load_result_failed() {
+        let failed = CrcLoadResult::Failed(CrcReadError::FailedToRead(Error::generic("test")));
+        assert!(failed.get().is_none());
+
+        let corrupt = CrcLoadResult::Failed(CrcReadError::Corrupt(Error::generic("test")));
+        assert!(corrupt.get().is_none());
     }
 
     // ===== LazyCrc Tests =====
@@ -174,7 +181,10 @@ mod tests {
         assert_eq!(lazy.crc_version(), Some(5));
 
         let result = lazy.get_or_load(&engine);
-        assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
+        assert!(matches!(
+            result,
+            CrcLoadResult::Failed(CrcReadError::FailedToRead(_))
+        ));
         assert!(result.get().is_none());
         assert!(lazy.is_loaded());
     }
@@ -209,8 +219,12 @@ mod tests {
         assert!(!lazy.is_loaded());
         assert_eq!(lazy.crc_version(), Some(0));
 
+        // Malformed JSON -> engine can't produce data -> FailedToRead
         let result = lazy.get_or_load(&engine);
-        assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
+        assert!(matches!(
+            result,
+            CrcLoadResult::Failed(CrcReadError::FailedToRead(_))
+        ));
         assert!(result.get().is_none());
         assert!(lazy.is_loaded());
     }
