@@ -706,49 +706,32 @@ mod test {
         .unwrap();
 
         let (reader_features_opt, writer_features_opt) = if let Some(features) = features_opt {
+            // This helper only handles known features. Unknown features would need
+            // explicit placement on reader vs writer lists.
+            assert!(
+                features
+                    .iter()
+                    .all(|f| f.feature_type() != FeatureType::Unknown),
+                "Test helper does not support unknown features"
+            );
             let reader_features = features
                 .iter()
-                .filter(|feature| matches!(feature.feature_type(), FeatureType::ReaderWriter))
-                .cloned()
-                .collect::<Vec<_>>();
-            let writer_features = features
-                .iter()
-                .filter(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::Writer | FeatureType::ReaderWriter
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
             (
                 // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                // Protocol requires Some (even if empty) when reader = 3
-                if min_reader_version >= 3 {
-                    Some(reader_features)
-                } else {
-                    None
-                },
+                (min_reader_version >= 3).then_some(reader_features),
                 // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                // Protocol requires Some (even if empty) when writer = 7
-                if min_writer_version >= 7 {
-                    Some(writer_features)
-                } else {
-                    None
-                },
+                (min_writer_version >= 7).then_some(features),
             )
         } else {
             (None, None)
         };
 
-        let reader_features_iter = reader_features_opt.as_ref().map(|f| f.iter());
-        let writer_features_iter = writer_features_opt.as_ref().map(|f| f.iter());
-
         let protocol = Protocol::try_new(
             min_reader_version,
             min_writer_version,
-            reader_features_iter,
-            writer_features_iter,
+            reader_features_opt,
+            writer_features_opt,
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -771,7 +754,7 @@ mod test {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -802,7 +785,7 @@ mod test {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1047,7 +1030,10 @@ mod test {
             3,
             7,
             Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+            Some([
+                TableFeature::TimestampWithoutTimezone,
+                TableFeature::ChangeDataFeed,
+            ]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1072,7 +1058,7 @@ mod test {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1106,6 +1092,7 @@ mod test {
                 TableFeature::DeletionVectors,
                 TableFeature::V2Checkpoint,
                 TableFeature::AppendOnly,
+                TableFeature::ChangeDataFeed,
             ]),
         )
         .unwrap();

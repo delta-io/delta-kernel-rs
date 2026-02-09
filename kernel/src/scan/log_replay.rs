@@ -651,7 +651,8 @@ mod tests {
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info,
+        assert_transform_spec, get_simple_state_info, get_state_info, get_state_info_with_features,
+        ROW_TRACKING_FEATURES,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
@@ -839,7 +840,7 @@ mod tests {
             DataType::INTEGER,
             true,
         )]));
-        let state_info = get_state_info(
+        let state_info = get_state_info_with_features(
             schema.clone(),
             vec![],
             None,
@@ -849,11 +850,16 @@ mod tests {
                     "delta.rowTracking.materializedRowIdColumnName",
                     "row_id_col",
                 ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "row_commit_version_col",
+                ),
             ]
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
             vec![("row_id", MetadataColumnSpec::RowId)],
+            ROW_TRACKING_FEATURES,
         )
         .unwrap();
 
@@ -1004,7 +1010,7 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ]));
         let state_info = Arc::new(
-            get_state_info(
+            get_state_info_with_features(
                 schema,
                 vec!["date".to_string()],
                 None,
@@ -1014,11 +1020,16 @@ mod tests {
                         "delta.rowTracking.materializedRowIdColumnName",
                         "row_id_col",
                     ),
+                    (
+                        "delta.rowTracking.materializedRowCommitVersionColumnName",
+                        "row_commit_version_col",
+                    ),
                 ]
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
                 vec![("row_id", MetadataColumnSpec::RowId)],
+                ROW_TRACKING_FEATURES,
             )
             .unwrap(),
         );
