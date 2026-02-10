@@ -356,7 +356,6 @@ impl ArrowEngineData {
                     }
                     ColumnState::AwaitingGetter(data_type) => {
                         // Leaf column - extract and transition to HasGetter
-                        let data_type = *data_type; // Copy the reference before mutating
                         let getter = if column.data_type() == &ArrowDataType::Null {
                             debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                             &() as &'a dyn GetData<'a>
@@ -1025,7 +1024,8 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 use std::sync::LazyLock;
-                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::INTEGER; 4]);
+                static TYPES: LazyLock<Vec<DataType>> =
+                    LazyLock::new(|| vec![DataType::INTEGER; 4]);
                 (&REQUESTED_COLUMNS, &TYPES)
             }
 
