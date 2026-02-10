@@ -41,6 +41,7 @@ use super::data_layout::DataLayout;
 use crate::actions::{Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
+use crate::crc::LazyCrc;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
@@ -502,7 +503,11 @@ impl CreateTableTransactionBuilder {
 
         // Create Transaction with pre-commit snapshot
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(log_segment, table_configuration)),
+            Arc::new(Snapshot::new(
+                log_segment,
+                table_configuration,
+                LazyCrc::new(None),
+            )),
             self.engine_info,
             committer,
             system_domain_metadata,
