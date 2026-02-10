@@ -772,6 +772,7 @@ mod tests {
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
+    use crate::table_features::TABLE_FEATURES_MIN_READER_VERSION;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use delta_kernel::actions::DomainMetadata;
 
@@ -803,8 +804,8 @@ mod tests {
                 }
             });
 
-            // Only include readerFeatures if minReaderVersion >= 3
-            if reader_version >= 3 {
+            // Only include readerFeatures if minReaderVersion >= table-features minimum.
+            if reader_version >= TABLE_FEATURES_MIN_READER_VERSION as u32 {
                 protocol["protocol"]["readerFeatures"] = json!([]);
             }
 
