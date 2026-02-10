@@ -409,7 +409,9 @@ mod tests {
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::Int32Type;
-    use crate::arrow::array::{Array, AsArray, Int32Array, MapArray, RecordBatch, StringArray, StructArray};
+    use crate::arrow::array::{
+        Array, AsArray, Int32Array, MapArray, RecordBatch, StringArray, StructArray,
+    };
     use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -939,8 +941,10 @@ mod tests {
             offsets.push(all_keys.len() as i32);
         }
 
-        let keys_array = Arc::new(StringArray::from(all_keys)) as Arc<dyn crate::arrow::array::Array>;
-        let values_array = Arc::new(StringArray::from(all_values)) as Arc<dyn crate::arrow::array::Array>;
+        let keys_array =
+            Arc::new(StringArray::from(all_keys)) as Arc<dyn crate::arrow::array::Array>;
+        let values_array =
+            Arc::new(StringArray::from(all_values)) as Arc<dyn crate::arrow::array::Array>;
 
         let entries_struct = StructArray::try_new(
             vec![
@@ -996,11 +1000,8 @@ mod tests {
     #[test]
     fn test_materialize_handles_nulls() -> DeltaResult<()> {
         // Create MapArray with null values
-        let map_array = create_map_array(vec![vec![
-            ("a", Some("1")),
-            ("b", None),
-            ("c", Some("3")),
-        ]]);
+        let map_array =
+            create_map_array(vec![vec![("a", Some("1")), ("b", None), ("c", Some("3"))]]);
 
         let result = map_array.materialize(0);
 
@@ -1050,9 +1051,9 @@ mod tests {
         let map_array = create_map_array(vec![vec![
             ("a", Some("1")),
             ("b", Some("2")),
-            ("a", Some("3")),  // Duplicate 'a' - should override first
+            ("a", Some("3")), // Duplicate 'a' - should override first
             ("c", Some("4")),
-            ("a", Some("5")),  // Another duplicate 'a' - should be final value
+            ("a", Some("5")), // Another duplicate 'a' - should be final value
         ]]);
 
         let materialized = map_array.materialize(0);
@@ -1075,15 +1076,17 @@ mod tests {
     fn test_materialize_null_map() -> DeltaResult<()> {
         // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in third
         let keys_array = Arc::new(StringArray::from(vec![
-            Some("a"), Some("b"),  // First element (2 entries)
-            Some("c"),              // Second element (1 entry, but element is null)
-            Some("d"),              // Third element (1 entry)
+            Some("a"),
+            Some("b"), // First element (2 entries)
+            Some("c"), // Second element (1 entry, but element is null)
+            Some("d"), // Third element (1 entry)
         ])) as Arc<dyn crate::arrow::array::Array>;
 
         let values_array = Arc::new(StringArray::from(vec![
-            Some("1"), Some("2"),  // First element values
-            Some("3"),              // Second element value (but element is null)
-            Some("4"),              // Third element value
+            Some("1"),
+            Some("2"), // First element values
+            Some("3"), // Second element value (but element is null)
+            Some("4"), // Third element value
         ])) as Arc<dyn crate::arrow::array::Array>;
 
         let entries_struct = StructArray::try_new(
@@ -1101,7 +1104,9 @@ mod tests {
         let offsets_buffer = OffsetBuffer::new(vec![0i32, 2, 3, 4].into());
 
         // Create null buffer with second element (index 1) null
-        let null_buffer = Some(crate::arrow::buffer::NullBuffer::from(vec![true, false, true]));
+        let null_buffer = Some(crate::arrow::buffer::NullBuffer::from(vec![
+            true, false, true,
+        ]));
 
         let map_array = MapArray::try_new(
             Arc::new(ArrowField::new_struct(
