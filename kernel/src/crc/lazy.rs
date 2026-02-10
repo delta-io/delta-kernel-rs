@@ -39,6 +39,22 @@ impl CrcLoadResult {
 /// Lazy loader for CRC info that ensures it's only read once.
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
+impl Clone for LazyCrc {
+    fn clone(&self) -> Self {
+        Self {
+            crc_file: self.crc_file.clone(),
+            cached: match self.cached.get() {
+                Some(result) => {
+                    let lock = OnceLock::new();
+                    let _ = lock.set(result.clone());
+                    lock
+                }
+                None => OnceLock::new(),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
@@ -76,6 +92,18 @@ impl LazyCrc {
                 }
             },
         })
+    }
+
+    /// Returns the CRC only if the CRC file is at the given version, loading if necessary.
+    pub(crate) fn get_or_load_if_at_version(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> Option<&Arc<Crc>> {
+        if self.crc_version() != Some(version) {
+            return None;
+        }
+        self.get_or_load(engine).get()
     }
 
     /// Check if CRC has been loaded (without triggering loading).

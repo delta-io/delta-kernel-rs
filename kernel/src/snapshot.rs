@@ -36,7 +36,7 @@ mod builder;
 pub use builder::SnapshotBuilder;
 
 use delta_kernel::actions::DomainMetadata;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
@@ -50,6 +50,7 @@ pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
+    lazy_crc: LazyCrc,
 }
 
 impl PartialEq for Snapshot {
@@ -110,7 +111,11 @@ impl Snapshot {
     }
 
     #[internal_api]
-    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+    pub(crate) fn new(
+        log_segment: LogSegment,
+        table_configuration: TableConfiguration,
+        lazy_crc: LazyCrc,
+    ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -122,6 +127,7 @@ impl Snapshot {
             span,
             log_segment,
             table_configuration,
+            lazy_crc,
         }
     }
 
@@ -282,9 +288,12 @@ impl Snapshot {
             // Preserve checkpoint schema from old segment
             old_log_segment.checkpoint_schema.clone(),
         )?;
+
+        let lazy_crc = LazyCrc::new(combined_log_segment.latest_crc_file.clone());
         Ok(Arc::new(Snapshot::new(
             combined_log_segment,
             table_configuration,
+            lazy_crc,
         )))
     }
 
@@ -360,7 +369,7 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new(log_segment, table_configuration))
+        Ok(Self::new(log_segment, table_configuration, lazy_crc))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -438,7 +447,11 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot::new(new_log_segment, new_table_configuration))
+        Ok(Snapshot::new(
+            new_log_segment,
+            new_table_configuration,
+            self.lazy_crc.clone(),
+        ))
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -670,6 +683,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
+            self.lazy_crc.clone(),
         )))
     }
 
@@ -734,7 +748,22 @@ impl Snapshot {
             }
         }
 
-        // Read the ICT from latest_commit_file
+        // Fast path: try reading ICT from CRC file (if it is at this snapshot version)
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            if let Some(ict) = crc.in_commit_timestamp_opt {
+                return Ok(Some(ict));
+            }
+            warn!(
+                "CRC file at version {} does not contain inCommitTimestamp, \
+                 falling back to commit file.",
+                self.version()
+            );
+        }
+
+        // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.latest_commit_file {
             Some(commit_file_meta) => {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
@@ -1722,7 +1751,7 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit = Snapshot::new(log_segment, table_config);
+        let snapshot_no_commit = Snapshot::new(log_segment, table_config, LazyCrc::new(None));
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
