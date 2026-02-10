@@ -341,9 +341,8 @@ impl ArrowEngineData {
         for (column, field) in data.columns().iter().zip(data.fields()) {
             path.push(field.name().to_string());
 
-            // Check if this path is in our column map
-            let path_key = path.clone();
-            if let Some(state) = column_map.get(&path_key) {
+            // Check if this path is in our column map and mutate state if needed
+            if let Some(state) = column_map.get_mut(path.as_slice()) {
                 match state {
                     ColumnState::Parent => {
                         // Parent path - recurse if it's a struct
@@ -357,13 +356,14 @@ impl ArrowEngineData {
                     }
                     ColumnState::AwaitingGetter(data_type) => {
                         // Leaf column - extract and transition to HasGetter
+                        let data_type = *data_type; // Copy the reference before mutating
                         let getter = if column.data_type() == &ArrowDataType::Null {
                             debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                             &() as &'a dyn GetData<'a>
                         } else {
                             Self::extract_leaf_column(path, data_type, column)?
                         };
-                        column_map.insert(path_key, ColumnState::HasGetter(getter));
+                        *state = ColumnState::HasGetter(getter);
                     }
                     ColumnState::HasGetter(_) => {
                         return Err(Error::internal_error(format!(
@@ -1006,6 +1006,17 @@ mod tests {
             ],
         )?;
 
+        // Column names requested in reverse order (not schema order)
+        use std::sync::LazyLock;
+        static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+            vec![
+                ColumnName::new(["nested", "y"]),
+                ColumnName::new(["field_b"]),
+                ColumnName::new(["nested", "x"]),
+                ColumnName::new(["field_a"]),
+            ]
+        });
+
         struct Visitor {
             values: Vec<(i32, i32, i32, i32)>,
         }
@@ -1014,19 +1025,8 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 use std::sync::LazyLock;
-                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
-                    LazyLock::new(|| {
-                        (
-                            vec![
-                                ColumnName::new(["nested", "y"]), // Reverse order
-                                ColumnName::new(["field_b"]),     // Reverse order
-                                ColumnName::new(["nested", "x"]), // Reverse order
-                                ColumnName::new(["field_a"]),     // Reverse order
-                            ],
-                            vec![DataType::INTEGER; 4],
-                        )
-                    });
-                (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::INTEGER; 4]);
+                (&REQUESTED_COLUMNS, &TYPES)
             }
 
             fn visit<'a>(
@@ -1047,15 +1047,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        ArrowEngineData::new(batch).visit_rows(
-            &[
-                ColumnName::new(["nested", "y"]),
-                ColumnName::new(["field_b"]),
-                ColumnName::new(["nested", "x"]),
-                ColumnName::new(["field_a"]),
-            ],
-            &mut visitor,
-        )?;
+        ArrowEngineData::new(batch).visit_rows(&REQUESTED_COLUMNS, &mut visitor)?;
 
         // Verify values match requested order, not schema order
         assert_eq!(visitor.values, vec![(1000, 10, 100, 1), (2000, 20, 200, 2)]);
