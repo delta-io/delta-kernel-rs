@@ -44,6 +44,16 @@ fn protocol_v2_dv_ntz() -> Protocol {
     .unwrap()
 }
 
+fn protocol_v2_ict() -> Protocol {
+    Protocol::try_new(
+        3,
+        7,
+        Some(["v2Checkpoint"]),
+        Some(["v2Checkpoint", "inCommitTimestamp"]),
+    )
+    .unwrap()
+}
+
 fn metadata_a() -> Metadata {
     Metadata::new_unchecked(
         "aaa",
@@ -68,16 +78,6 @@ fn metadata_b() -> Metadata {
         Some(1587968585495),
         HashMap::new(),
     )
-}
-
-fn protocol_ict() -> Protocol {
-    Protocol::try_new(
-        3,
-        7,
-        Some(["v2Checkpoint"]),
-        Some(["v2Checkpoint", "inCommitTimestamp"]),
-    )
-    .unwrap()
 }
 
 fn metadata_ict() -> Metadata {
@@ -568,24 +568,23 @@ async fn test_crc_before_checkpoint_is_ignored() {
 
 #[tokio::test]
 async fn test_ict_from_crc_at_snapshot_version() {
-    // CRC has ICT=1000, commit has ICT=2000. Should get 1000 (from CRC).
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_ict(), metadata_ict())
+        .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
         .delta_with_ict(1, 2000)
-        .crc(1, protocol_ict(), metadata_ict(), 1000) 
+        .crc(1, protocol_v2_ict(), metadata_ict(), 1000) // <-- ICT from here
         .build()
         .await
-        .assert_ict(1, Some(1000));
+        .assert_ict(None, Some(1000));
 }
 
 #[tokio::test]
 async fn test_ict_falls_back_to_commit_when_crc_has_no_ict() {
     // Note that in this case the CRC is corrupt. Nonetheless we try to handle this gracefully.
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_ict(), metadata_ict())
+        .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
         .delta_with_ict(1, 2000) // <-- ICT from here
-        .crc(1, protocol_ict(), metadata_ict(), None)
+        .crc(1, protocol_v2_ict(), metadata_ict(), None)
         .build()
         .await
-        .assert_ict(1, Some(2000));
+        .assert_ict(None, Some(2000));
 }
