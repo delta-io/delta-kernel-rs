@@ -221,14 +221,15 @@ impl EngineData for ArrowEngineData {
         // Build a map of column paths to their expected types.
         // - For parent paths (non-leaf), the value is None (used for traversal into nested structs)
         // - For leaf columns, the value is Some(&DataType) (used for type validation)
-        // This allows extract_columns to look up the expected type by column name instead of
-        // using positional indexing, which fixes bugs when columns are found in different order
-        // than they were requested.
+        // 
+        // This is used to guide our depth-first extraction. If the list contains any non-leaf,
+        // duplicate, or missing column references, the extracted column list will be too
+        // short (error out below).
         let mut column_map = HashMap::new();
 
         // Add all parent paths with None (for traversal)
         for column in leaf_columns {
-            for i in 0..(column.len()) {
+            for i in 0..column.len() {
                 column_map.entry(&column[..i + 1]).or_insert(None);
             }
         }
