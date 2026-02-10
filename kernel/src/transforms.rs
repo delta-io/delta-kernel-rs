@@ -78,10 +78,7 @@ pub(crate) fn parse_partition_value(
         )));
     };
     let name = field.physical_name(column_mapping_mode);
-    let partition_value = parse_partition_value_raw(
-        partition_values.get(name).map(|s| s.as_str()),
-        field.data_type(),
-    )?;
+    let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
     Ok((field_idx, (name.to_string(), partition_value)))
 }
 
@@ -200,7 +197,7 @@ pub(crate) fn get_transform_expr(
 
 /// Parse a partition value from the raw string representation
 pub(crate) fn parse_partition_value_raw(
-    raw: Option<&str>,
+    raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
     match (raw, data_type.as_primitive_opt()) {
@@ -302,15 +299,18 @@ mod tests {
     // Tests for parse_partition_value_raw function
     #[test]
     fn test_parse_partition_value_raw_string() {
-        let result = parse_partition_value_raw(Some("test_string"), &DataType::STRING).unwrap();
+        let result =
+            parse_partition_value_raw(Some(&"test_string".to_string()), &DataType::STRING).unwrap();
         assert_eq!(result, Scalar::String("test_string".to_string()));
     }
 
     #[test]
     fn test_parse_partition_value_raw_integer() {
-        let result =
-            parse_partition_value_raw(Some("42"), &DataType::Primitive(PrimitiveType::Integer))
-                .unwrap();
+        let result = parse_partition_value_raw(
+            Some(&"42".to_string()),
+            &DataType::Primitive(PrimitiveType::Integer),
+        )
+        .unwrap();
         assert_eq!(result, Scalar::Integer(42));
     }
 
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn test_parse_partition_value_raw_invalid_type() {
         let result = parse_partition_value_raw(
-            Some("value"),
+            Some(&"value".to_string()),
             &DataType::struct_type_unchecked(vec![]), // Non-primitive type
         );
         assert_result_error_with_message(result, "Unexpected partition column type");
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn test_parse_partition_value_raw_invalid_parse() {
         let result = parse_partition_value_raw(
-            Some("not_a_number"),
+            Some(&"not_a_number".to_string()),
             &DataType::Primitive(PrimitiveType::Integer),
         );
         assert_result_error_with_message(result, "Failed to parse value");
