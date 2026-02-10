@@ -219,6 +219,20 @@ pub struct TableProperties {
     pub unknown_properties: HashMap<String, String>,
 }
 
+impl TableProperties {
+    /// Returns whether to write file statistics as JSON in checkpoints.
+    /// Default: `true` per the Delta protocol.
+    pub fn should_write_stats_as_json(&self) -> bool {
+        self.checkpoint_write_stats_as_json.unwrap_or(true)
+    }
+
+    /// Returns whether to write file statistics as parsed structs in checkpoints.
+    /// Default: `false` per the Delta protocol.
+    pub fn should_write_stats_as_struct(&self) -> bool {
+        self.checkpoint_write_stats_as_struct.unwrap_or(false)
+    }
+}
+
 /// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
 /// is not specified.
 pub const DEFAULT_NUM_INDEXED_COLS: u64 = 32;
