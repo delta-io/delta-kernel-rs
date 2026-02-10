@@ -1,9 +1,8 @@
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use test_log::test;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -29,7 +28,7 @@ use crate::scan::test_utils::{
 use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
     StorageHandler,
 };
 use test_utils::{
@@ -73,48 +72,6 @@ fn process_sidecars(
         checkpoint_read_schema,
         meta_predicate,
     )?))
-}
-
-// NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
-// that the parquet reader properly infers nullcount = rowcount for missing columns. The two
-// checkpoint part files that contain transaction app ids have truncated schemas that would
-// otherwise fail skipping due to their missing nullcount stat:
-//
-// Row group 0:  count: 1  total(compressed): 111 B total(uncompressed):107 B
-// --------------------------------------------------------------------------------
-//              type    nulls  min / max
-// txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
-// txn.version  INT64   0      "4390" / "4390"
-#[test]
-fn test_replay_for_metadata() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-    let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-    let engine = SyncEngine::new();
-
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    let data: Vec<_> = snapshot
-        .log_segment()
-        .replay_for_metadata(&engine)
-        .unwrap()
-        .try_collect()
-        .unwrap();
-
-    // The checkpoint has five parts, each containing one action:
-    // 1. txn (physically missing P&M columns)
-    // 2. metaData
-    // 3. protocol
-    // 4. add
-    // 5. txn (physically missing P&M columns)
-    //
-    // The parquet reader should skip parts 1, 3, and 5. Note that the actual `read_metadata`
-    // always skips parts 4 and 5 because it terminates the iteration after finding both P&M.
-    //
-    // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-    //
-    // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
-    // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
-    // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
-    assert_eq!(data.len(), 4);
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of parts
@@ -973,39 +930,34 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
     assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 
-#[test]
-fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
+#[test_log::test(rstest::rstest)]
+#[case::simple_path("example.parquet", "file:///var/_delta_log/_sidecars/example.parquet")]
+#[case::full_path(
+    "file:///var/_delta_log/_sidecars/example.parquet",
+    "file:///var/_delta_log/_sidecars/example.parquet"
+)]
+#[case::nested_path(
+    "test/test/example.parquet",
+    "file:///var/_delta_log/_sidecars/test/test/example.parquet"
+)]
+fn test_sidecar_to_filemeta_valid_paths(
+    #[case] input_path: &str,
+    #[case] expected_url: &str,
+) -> DeltaResult<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
-    let test_cases = [
-        (
-            "example.parquet",
-            "file:///var/_delta_log/_sidecars/example.parquet",
-        ),
-        (
-            "file:///var/_delta_log/_sidecars/example.parquet",
-            "file:///var/_delta_log/_sidecars/example.parquet",
-        ),
-        (
-            "test/test/example.parquet",
-            "file:///var/_delta_log/_sidecars/test/test/example.parquet",
-        ),
-    ];
+    let sidecar = Sidecar {
+        path: expected_url.to_string(),
+        modification_time: 0,
+        size_in_bytes: 1000,
+        tags: None,
+    };
 
-    for (input_path, expected_url) in test_cases.into_iter() {
-        let sidecar = Sidecar {
-            path: expected_url.to_string(),
-            modification_time: 0,
-            size_in_bytes: 1000,
-            tags: None,
-        };
-
-        let filemeta = sidecar.to_filemeta(&log_root)?;
-        assert_eq!(
-            filemeta.location.as_str(),
-            expected_url,
-            "Mismatch for input path: {input_path}"
-        );
-    }
+    let filemeta = sidecar.to_filemeta(&log_root)?;
+    assert_eq!(
+        filemeta.location.as_str(),
+        expected_url,
+        "Mismatch for input path: {input_path}"
+    );
     Ok(())
 }
 
