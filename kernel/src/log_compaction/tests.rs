@@ -251,7 +251,10 @@ async fn test_no_compaction_staged_commits() {
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            StructType::new_unchecked([StructField::nullable("value", KernelDataType::INTEGER)]),
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                KernelDataType::INTEGER,
+            )])),
             vec![],
             0,
             std::collections::HashMap::new(),

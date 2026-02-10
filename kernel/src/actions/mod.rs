@@ -256,7 +256,7 @@ impl Metadata {
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
-        schema: StructType,
+        schema: SchemaRef,
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
@@ -1592,7 +1592,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1617,7 +1620,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1627,7 +1633,10 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1714,7 +1723,10 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1762,7 +1774,10 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),

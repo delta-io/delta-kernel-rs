@@ -339,10 +339,10 @@ mod tests {
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
                 .unwrap();
-        let table_schema = StructType::new_unchecked([
+        let table_schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
-        ]);
+        ]));
 
         // Create a TableConfiguration for testing
         use crate::actions::{Metadata, Protocol};
@@ -369,7 +369,7 @@ mod tests {
             Arc::new(engine),
             &table_config,
             log_segment.ascending_commit_files.clone(),
-            table_schema.into(),
+            table_schema,
             None,
         )
         .unwrap();

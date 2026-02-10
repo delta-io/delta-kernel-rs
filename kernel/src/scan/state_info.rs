@@ -319,7 +319,7 @@ pub(crate) mod tests {
         let metadata = Metadata::try_new(
             None,
             None,
-            schema.as_ref().clone(),
+            schema.clone(),
             partition_columns,
             10,
             metadata_configuration,
