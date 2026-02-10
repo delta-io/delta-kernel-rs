@@ -24,7 +24,7 @@ use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_expr, parse_partition_values_lazy, TransformSpec};
+use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -373,10 +373,11 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
                     [ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get_map(i, "add.partitionValues")?;
                 let partition_values = if let Some(map) = &partition_values_map {
-                    parse_partition_values_lazy(
+                    let materialized = map.materialize();
+                    parse_partition_values(
                         &self.state_info.logical_schema,
                         transform,
-                        map,
+                        &materialized,
                         self.state_info.column_mapping_mode,
                     )?
                 } else {

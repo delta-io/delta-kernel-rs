@@ -166,12 +166,20 @@ impl EngineMap for MapArray {
 
     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
         let mut ret = HashMap::new();
-        let map_val = self.value(row_index);
-        let keys = map_val.column(0).as_string::<i32>();
-        let values = map_val.column(1).as_string::<i32>();
-        for (key, value) in keys.iter().zip(values.iter()) {
-            if let (Some(key), Some(value)) = (key, value) {
-                ret.insert(key.into(), value.into());
+        let offsets = self.offsets();
+        let start_offset = offsets[row_index] as usize;
+        let end_offset = offsets[row_index + 1] as usize;
+        let keys = self.keys().as_string::<i32>();
+        let vals = self.values().as_string::<i32>();
+
+        // Use direct array access for better performance vs Arrow's high-level API
+        for idx in start_offset..end_offset {
+            if keys.is_valid(idx) {
+                let key = keys.value(idx);
+                if vals.is_valid(idx) {
+                    let value = vals.value(idx);
+                    ret.insert(key.to_string(), value.to_string());
+                }
             }
         }
         ret
@@ -903,5 +911,165 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Tests to verify correctness of different materialize implementations
+    mod materialize_correctness_tests {
+        use crate::arrow::array::{MapArray, StringArray, StructArray};
+        use crate::arrow::buffer::OffsetBuffer;
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
+        use crate::engine_data::EngineMap;
+        use std::sync::Arc;
+
+        /// Helper to create a MapArray from key-value pairs
+        fn create_map_array(entries: Vec<Vec<(&str, Option<&str>)>>) -> MapArray {
+            let mut all_keys = vec![];
+            let mut all_values = vec![];
+            let mut offsets = vec![0i32];
+
+            for entry_group in entries {
+                for (key, value) in entry_group {
+                    all_keys.push(Some(key));
+                    all_values.push(value);
+                }
+                offsets.push(all_keys.len() as i32);
+            }
+
+            let keys_array = Arc::new(StringArray::from(all_keys)) as Arc<dyn crate::arrow::array::Array>;
+            let values_array = Arc::new(StringArray::from(all_values)) as Arc<dyn crate::arrow::array::Array>;
+
+            let entries_struct = StructArray::try_new(
+                vec![
+                    Arc::new(Field::new("keys", ArrowDataType::Utf8, false)),
+                    Arc::new(Field::new("values", ArrowDataType::Utf8, true)),
+                ]
+                .into(),
+                vec![keys_array, values_array],
+                None,
+            )
+            .unwrap();
+
+            let offsets_buffer = OffsetBuffer::new(offsets.into());
+            MapArray::try_new(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", ArrowDataType::Utf8, false)),
+                        Arc::new(Field::new("values", ArrowDataType::Utf8, true)),
+                    ],
+                    false,
+                )),
+                offsets_buffer,
+                entries_struct,
+                None,
+                false,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn test_materialize_handles_duplicates() {
+            // Create MapArray with duplicate keys: a=1, b=2, a=3, c=4
+            // Expected: a=3 (last wins), b=2, c=4
+            let map_array = create_map_array(vec![vec![
+                ("a", Some("1")),
+                ("b", Some("2")),
+                ("a", Some("3")),
+                ("c", Some("4")),
+            ]]);
+
+            let result = map_array.materialize(0);
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result.get("a"), Some(&"3".to_string()));
+            assert_eq!(result.get("b"), Some(&"2".to_string()));
+            assert_eq!(result.get("c"), Some(&"4".to_string()));
+        }
+
+        #[test]
+        fn test_materialize_matches_get() {
+            // Create MapArray with various keys
+            let map_array = create_map_array(vec![vec![
+                ("key1", Some("value1")),
+                ("key2", Some("value2")),
+                ("key3", Some("value3")),
+            ]]);
+
+            let materialized = map_array.materialize(0);
+
+            // Verify that get(key) matches materialize()[key] for all keys
+            for (key, value) in &materialized {
+                let get_result = map_array.get(0, key);
+                assert_eq!(get_result, Some(value.as_str()));
+            }
+
+            // Verify count matches
+            assert_eq!(materialized.len(), 3);
+        }
+
+        #[test]
+        fn test_materialize_handles_nulls() {
+            // Create MapArray with null values
+            let map_array = create_map_array(vec![vec![
+                ("a", Some("1")),
+                ("b", None),
+                ("c", Some("3")),
+            ]]);
+
+            let result = map_array.materialize(0);
+
+            // Null values should be excluded from materialized map
+            assert_eq!(result.len(), 2);
+            assert_eq!(result.get("a"), Some(&"1".to_string()));
+            assert_eq!(result.get("b"), None);
+            assert_eq!(result.get("c"), Some(&"3".to_string()));
+        }
+
+        #[test]
+        fn test_materialize_empty_map() {
+            // Create MapArray with empty map
+            let map_array = create_map_array(vec![vec![]]);
+
+            let result = map_array.materialize(0);
+
+            assert_eq!(result.len(), 0);
+        }
+
+        #[test]
+        fn test_materialize_multiple_rows() {
+            // Create MapArray with multiple rows
+            let map_array = create_map_array(vec![
+                vec![("a", Some("1")), ("b", Some("2"))],
+                vec![("x", Some("10")), ("y", Some("20"))],
+            ]);
+
+            let result0 = map_array.materialize(0);
+            assert_eq!(result0.len(), 2);
+            assert_eq!(result0.get("a"), Some(&"1".to_string()));
+            assert_eq!(result0.get("b"), Some(&"2".to_string()));
+
+            let result1 = map_array.materialize(1);
+            assert_eq!(result1.len(), 2);
+            assert_eq!(result1.get("x"), Some(&"10".to_string()));
+            assert_eq!(result1.get("y"), Some(&"20".to_string()));
+        }
+
+        #[test]
+        fn test_get_vs_materialize_consistency_with_duplicates() {
+            // Test that get() returns the same value as materialize() for duplicate keys
+            // (should return the last occurrence)
+            let map_array = create_map_array(vec![vec![
+                ("dup", Some("first")),
+                ("unique", Some("value")),
+                ("dup", Some("last")),
+            ]]);
+
+            let materialized = map_array.materialize(0);
+            let get_result = map_array.get(0, "dup");
+
+            // Both should return "last" (the last occurrence)
+            assert_eq!(materialized.get("dup"), Some(&"last".to_string()));
+            assert_eq!(get_result, Some("last"));
+        }
     }
 }
