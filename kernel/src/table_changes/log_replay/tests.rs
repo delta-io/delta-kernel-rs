@@ -1170,7 +1170,7 @@ async fn test_timestamp_with_ict_enabled() {
 
     mock_table
         .commit([
-            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, false, None)),
+            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, None, false)),
             Action::Metadata(
                 Metadata::try_new(
                     None,
@@ -1228,7 +1228,7 @@ async fn test_timestamp_with_ict_disabled() {
 
     mock_table
         .commit([
-            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, false, None)),
+            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, None, false)),
             Action::Metadata(
                 Metadata::try_new(
                     None,
@@ -1311,7 +1311,7 @@ async fn test_timestamp_with_commit_info_not_first() {
                 )
                 .unwrap(),
             ),
-            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, false, None)),
+            Action::CommitInfo(CommitInfo::new(1000, Some(2000), None, None, false)),
         ])
         .await;
 
