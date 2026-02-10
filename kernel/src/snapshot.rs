@@ -757,8 +757,8 @@ impl Snapshot {
                 return Ok(Some(ict));
             }
             warn!(
-                "CRC file at version {} does not contain inCommitTimestamp, \
-                 falling back to commit file.",
+                "CRC file at version {} does not contain inCommitTimestamp \
+                 but ICT is enabled on this snapshot. Falling back to commit file.",
                 self.version()
             );
         }
