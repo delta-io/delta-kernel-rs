@@ -328,7 +328,6 @@ impl ArrowEngineData {
                     let getter = Self::extract_leaf_column(path, data_type, column)?;
                     getter_map.insert(path.clone(), getter);
                 }
-                // If type_option is None, it's a parent path with no leaf to extract - skip
             } else {
                 debug!("Skipping unmasked path {}", ColumnName::new(path.iter()));
             }
