@@ -325,7 +325,6 @@ impl ArrowEngineData {
                     debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                     getter_map.insert(path.clone(), &());
                 } else if let Some(data_type) = type_option {
-                    // Leaf column with expected type - look up type by name instead of position
                     let getter = Self::extract_leaf_column(path, data_type, column)?;
                     getter_map.insert(path.clone(), getter);
                 }
