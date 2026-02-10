@@ -1632,7 +1632,7 @@ mod tests {
             DataType::INTEGER,
         )]));
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
-        let m2 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
+        let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
     }
 

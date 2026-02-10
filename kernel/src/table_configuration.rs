@@ -259,7 +259,7 @@ impl TableConfiguration {
     fn logical_data_schema(&self) -> SchemaRef {
         let partition_columns = self.metadata().partition_columns();
         Arc::new(StructType::new_unchecked(
-            self.schema()
+            self.schema
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
@@ -493,7 +493,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.schema().as_ref())
+            && InvariantChecker::has_invariants(self.schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -1128,7 +1128,7 @@ mod test {
         let new_metadata = Metadata::try_new(
             None,
             None,
-            new_schema.clone(),
+            new_schema,
             vec![],
             0,
             HashMap::from_iter([
