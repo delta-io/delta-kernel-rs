@@ -24,11 +24,11 @@ use test_utils::delta_path_for_version;
 
 const SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"val","type":"string","nullable":true,"metadata":{}}]}"#;
 
-fn protocol_a() -> Protocol {
+fn protocol_v2() -> Protocol {
     Protocol::try_new(3, 7, Some(["v2Checkpoint"]), Some(["v2Checkpoint"])).unwrap()
 }
 
-fn protocol_b() -> Protocol {
+fn protocol_v2_dv() -> Protocol {
     Protocol::try_new(
         3,
         7,
@@ -38,7 +38,7 @@ fn protocol_b() -> Protocol {
     .unwrap()
 }
 
-fn protocol_c() -> Protocol {
+fn protocol_v2_dv_ntz() -> Protocol {
     Protocol::try_new(
         3,
         7,
@@ -50,7 +50,7 @@ fn protocol_c() -> Protocol {
 
 fn metadata_a() -> Metadata {
     Metadata::new_unchecked(
-        "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+        "aaa",
         None,
         None,
         Format::default(),
@@ -63,7 +63,7 @@ fn metadata_a() -> Metadata {
 
 fn metadata_b() -> Metadata {
     Metadata::new_unchecked(
-        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "bbb",
         None,
         None,
         Format::default(),
@@ -123,7 +123,7 @@ enum Op {
         metadata: Metadata,
     },
     Delta(u64),
-    DeltaWith {
+    DeltaWithPM {
         version: u64,
         protocol: Option<Protocol>,
         metadata: Option<Metadata>,
@@ -163,13 +163,13 @@ impl CrcReadTest {
     }
 
     /// Write a delta with optional protocol and/or metadata overrides.
-    fn delta_with(
+    fn delta_with_p_m(
         mut self,
         version: u64,
         protocol: impl Into<Option<Protocol>>,
         metadata: impl Into<Option<Metadata>>,
     ) -> Self {
-        self.ops.push(Op::DeltaWith {
+        self.ops.push(Op::DeltaWithPM {
             version,
             protocol: protocol.into(),
             metadata: metadata.into(),
@@ -193,13 +193,8 @@ impl CrcReadTest {
         self
     }
 
-    /// Execute all operations and assert the resulting P&M at the given version.
-    async fn build_and_assert(
-        self,
-        version: u64,
-        expected_protocol: &Protocol,
-        expected_metadata: &Metadata,
-    ) {
+    /// Execute all operations, returning a built test that can be asserted against.
+    async fn build(self) -> BuiltCrcTest {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///").unwrap();
         let engine = DefaultEngineBuilder::new(store.clone()).build();
@@ -222,7 +217,7 @@ impl CrcReadTest {
                 Op::Delta(v) => {
                     put(&store, v, "json", &commit_info_json().to_string()).await;
                 }
-                Op::DeltaWith {
+                Op::DeltaWithPM {
                     version: v,
                     protocol,
                     metadata,
@@ -249,7 +244,42 @@ impl CrcReadTest {
             }
         }
 
-        assert_pm(&engine, &url, version, expected_protocol, expected_metadata);
+        BuiltCrcTest { engine, url }
+    }
+}
+
+struct BuiltCrcTest {
+    engine: DefaultEngine<TokioBackgroundExecutor>,
+    url: Url,
+}
+
+impl BuiltCrcTest {
+    fn assert_p_m(
+        &self,
+        version: impl Into<Option<u64>>,
+        expected_protocol: &Protocol,
+        expected_metadata: &Metadata,
+    ) {
+        let version = version.into();
+        let mut builder = Snapshot::builder_for(self.url.clone());
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+        let snapshot = builder.build(&self.engine).unwrap();
+        let table_config = snapshot.table_configuration();
+
+        let version_label = version.map_or("latest".to_string(), |v| format!("v{v}"));
+        assert_eq!(
+            table_config.protocol(),
+            expected_protocol,
+            "Protocol mismatch at {version_label}"
+        );
+
+        assert_eq!(
+            table_config.metadata(),
+            expected_metadata,
+            "Metadata mismatch at {version_label}"
+        );
     }
 }
 
@@ -261,32 +291,6 @@ async fn put(store: &InMemory, version: u64, suffix: &str, content: &str) {
         )
         .await
         .unwrap();
-}
-
-fn assert_pm(
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
-    url: &Url,
-    version: u64,
-    expected_protocol: &Protocol,
-    expected_metadata: &Metadata,
-) {
-    let snapshot = Snapshot::builder_for(url.clone())
-        .at_version(version)
-        .build(engine)
-        .unwrap();
-    let table_config = snapshot.table_configuration();
-
-    assert_eq!(
-        table_config.protocol(),
-        expected_protocol,
-        "Protocol mismatch at v{version}"
-    );
-
-    assert_eq!(
-        table_config.metadata(),
-        expected_metadata,
-        "Metadata mismatch at v{version}"
-    );
 }
 
 // TODO: Time travel tests
@@ -301,41 +305,45 @@ fn assert_pm(
 #[tokio::test]
 async fn test_get_p_m_from_delta_no_checkpoint() {
     CrcReadTest::new()
-        .delta_with(0, protocol_a(), metadata_a()) // <-- P & M from here
+        .delta_with_p_m(0, protocol_v2(), metadata_a()) // <-- P & M from here
         .delta(1)
         .delta(2)
-        .build_and_assert(2, &protocol_a(), &metadata_a())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_get_p_and_m_from_different_deltas() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
-        .delta_with(1, protocol_b(), None) // <-- P from here
-        .delta_with(2, None, metadata_b()) // <-- M from here
-        .build_and_assert(2, &protocol_b(), &metadata_b())
-        .await;
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .delta_with_p_m(1, protocol_v2_dv(), None) // <-- P from here
+        .delta_with_p_m(2, None, metadata_b()) // <-- M from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_get_p_m_from_checkpoint() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
         .delta(1)
         .delta(2)
-        .build_and_assert(2, &protocol_a(), &metadata_a())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_get_p_m_from_delta_after_checkpoint() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
-        .delta_with(1, protocol_b(), metadata_b()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .delta_with_p_m(1, protocol_v2_dv(), metadata_b()) // <-- P & M from here
         .delta(2)
-        .build_and_assert(2, &protocol_b(), &metadata_b())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
 }
 
 // ============================================================================
@@ -345,12 +353,13 @@ async fn test_get_p_m_from_delta_after_checkpoint() {
 #[tokio::test]
 async fn test_get_p_m_from_crc_at_target() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
         .delta(2)
-        .crc(2, protocol_b(), metadata_b()) // <-- P & M from here
-        .build_and_assert(2, &protocol_b(), &metadata_b())
-        .await;
+        .crc(2, protocol_v2_dv(), metadata_b()) // <-- P & M from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
 }
 
 #[tokio::test]
@@ -358,23 +367,25 @@ async fn test_crc_preferred_over_delta_at_target() {
     // The P & M for the 002.crc and 002.json should NOT be different in practice.
     // We only do this for this test so we can differentiate which P & M is used.
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .delta_with(2, protocol_b(), metadata_a())
-        .crc(2, protocol_c(), metadata_b()) // <-- P & M from here
-        .build_and_assert(2, &protocol_c(), &metadata_b())
-        .await;
+        .delta_with_p_m(2, protocol_v2_dv(), metadata_a())
+        .crc(2, protocol_v2_dv_ntz(), metadata_b()) // <-- P & M from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_corrupt_crc_at_target_falls_back() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
         .delta(1)
         .delta(2)
         .corrupt_crc(2) // <-- Corrupt! Fall back to replay.
-        .build_and_assert(2, &protocol_a(), &metadata_a())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2(), &metadata_a());
 }
 
 #[tokio::test]
@@ -382,25 +393,27 @@ async fn test_crc_wins_over_checkpoint() {
     // The P & M for the 002.crc and the v2 checkpoint should NOT be different in practice.
     // We only do this for this test so we can differentiate which P & M is used.
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
         .delta(2)
-        .v2_checkpoint(2, protocol_a(), metadata_a())
-        .crc(2, protocol_b(), metadata_b()) // <-- P & M from here
-        .build_and_assert(2, &protocol_b(), &metadata_b())
-        .await;
+        .v2_checkpoint(2, protocol_v2(), metadata_a())
+        .crc(2, protocol_v2_dv(), metadata_b()) // <-- P & M from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_checkpoint_on_corrupt_crc() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
         .delta(2)
-        .v2_checkpoint(2, protocol_a(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(2, protocol_v2(), metadata_a()) // <-- P & M from here
         .corrupt_crc(2) // <-- Corrupt! Fall back to replay.
-        .build_and_assert(2, &protocol_a(), &metadata_a())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2(), &metadata_a());
 }
 
 // ============================================================================
@@ -410,56 +423,60 @@ async fn test_checkpoint_on_corrupt_crc() {
 #[tokio::test]
 async fn test_crc_at_earlier_version() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_b(), metadata_b()) // <-- P & M from here
+        .crc(1, protocol_v2_dv(), metadata_b()) // <-- P & M from here
         .delta(2)
-        .build_and_assert(2, &protocol_b(), &metadata_b())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_get_p_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_b(), metadata_b()) // <-- M from here
-        .delta_with(2, protocol_c(), None) // <-- P from here
-        .build_and_assert(2, &protocol_c(), &metadata_b())
-        .await;
+        .crc(1, protocol_v2_dv(), metadata_b()) // <-- M from here
+        .delta_with_p_m(2, protocol_v2_dv_ntz(), None) // <-- P from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_b());
 }
 
 #[tokio::test]
 async fn test_get_m_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_b(), metadata_b()) // <-- P from here
-        .delta_with(2, None, metadata_a()) // <-- M from here
-        .build_and_assert(2, &protocol_b(), &metadata_a())
-        .await;
+        .crc(1, protocol_v2_dv(), metadata_b()) // <-- P from here
+        .delta_with_p_m(2, None, metadata_a()) // <-- M from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_corrupt_crc_at_non_target_version_falls_back() {
     CrcReadTest::new()
-        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
+        .v2_checkpoint(0, protocol_v2(), metadata_a()) // <-- P & M from here
         .delta(1)
         .corrupt_crc(1) // <-- Corrupt! Fall back to replay.
         .delta(2)
-        .build_and_assert(2, &protocol_a(), &metadata_a())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2(), &metadata_a());
 }
 
 #[tokio::test]
 async fn test_crc_before_checkpoint_is_ignored() {
-    // CRC at v1 should be ignored because the checkpoint at v2 supersedes it.
     CrcReadTest::new()
-        .delta_with(0, protocol_a(), metadata_a())
+        .delta_with_p_m(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_c(), metadata_b())
-        .v2_checkpoint(2, protocol_b(), metadata_a()) // <-- P & M from here
+        .crc(1, protocol_v2_dv_ntz(), metadata_b())
+        .v2_checkpoint(2, protocol_v2_dv(), metadata_a()) // <-- P & M from here
         .delta(3)
-        .build_and_assert(3, &protocol_b(), &metadata_a())
-        .await;
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv(), &metadata_a());
 }
