@@ -389,7 +389,7 @@ impl CreateTableTransactionBuilder {
         let metadata = Metadata::try_new(
             None, // name
             None, // description
-            (*self.schema).clone(),
+            self.schema.clone(),
             Vec::new(), // partition_columns - added with data layout support
             current_time_ms()?,
             validated.properties,

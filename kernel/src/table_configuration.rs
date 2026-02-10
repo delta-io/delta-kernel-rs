@@ -256,14 +256,14 @@ impl TableConfiguration {
     /// Partition columns are excluded because statistics are only collected for data columns
     /// that are physically stored in the parquet files. Partition values are stored in the
     /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> StructType {
+    fn logical_data_schema(&self) -> SchemaRef {
         let partition_columns = self.metadata().partition_columns();
-        StructType::new_unchecked(
+        Arc::new(StructType::new_unchecked(
             self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
-        )
+        ))
     }
 
     /// The [`Metadata`] for this table at this version.
@@ -666,7 +666,7 @@ mod test {
 
     use crate::actions::{Metadata, Protocol};
     use crate::schema::ColumnName;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
@@ -690,7 +690,10 @@ mod test {
         min_reader_version: i32,
         min_writer_version: i32,
     ) -> TableConfiguration {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -759,7 +762,10 @@ mod test {
     fn dv_supported_not_enabled() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -786,7 +792,10 @@ mod test {
     fn dv_enabled() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -897,7 +906,10 @@ mod test {
     fn ict_enabled_from_table_creation() {
         use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -933,7 +945,10 @@ mod test {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -978,7 +993,10 @@ mod test {
             ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1013,7 +1031,10 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
@@ -1031,7 +1052,10 @@ mod test {
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1044,7 +1068,10 @@ mod test {
     fn dv_not_supported() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1071,7 +1098,10 @@ mod test {
     fn test_try_new_from() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1091,12 +1121,14 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
-        let new_schema =
-            StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let new_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let new_metadata = Metadata::try_new(
             None,
             None,
-            new_schema,
+            new_schema.clone(),
             vec![],
             0,
             HashMap::from_iter([
@@ -1147,8 +1179,10 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema =
-            StructType::new_unchecked([StructField::nullable("ts", DataType::TIMESTAMP_NTZ)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "ts",
+            DataType::TIMESTAMP_NTZ,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_ntz_features = Protocol::try_new(
@@ -1192,8 +1226,10 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema =
-            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "v",
+            DataType::unshredded_variant(),
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_variant_features = Protocol::try_new(
@@ -1451,7 +1487,10 @@ mod test {
 
     #[test]
     fn test_illegal_writer_feature_combination() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
@@ -1470,7 +1509,10 @@ mod test {
 
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
@@ -1501,7 +1543,7 @@ mod test {
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
-    fn schema_with_column_mapping() -> StructType {
+    fn schema_with_column_mapping() -> SchemaRef {
         let field_a: StructField = serde_json::from_str(
             r#"{
                 "name": "col_a",
@@ -1528,11 +1570,11 @@ mod test {
         )
         .unwrap();
 
-        StructType::new_unchecked([field_a, field_b])
+        Arc::new(StructType::new_unchecked([field_a, field_b]))
     }
 
     fn create_table_config_with_column_mapping(
-        schema: StructType,
+        schema: SchemaRef,
         column_mapping_mode: &str,
     ) -> TableConfiguration {
         use crate::table_properties::COLUMN_MAPPING_MODE;
@@ -1554,10 +1596,10 @@ mod test {
     #[test]
     fn test_build_expected_stats_schemas_no_column_mapping() {
         // Without column mapping, logical and physical schemas should be identical
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("col_a", DataType::LONG),
             StructField::nullable("col_b", DataType::STRING),
-        ]);
+        ]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
