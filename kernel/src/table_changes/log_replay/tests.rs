@@ -351,16 +351,29 @@ async fn unsupported_protocol_feature_midstream() {
 
 #[tokio::test]
 async fn incompatible_schemas_fail() {
-    async fn assert_incompatible_schema(commit_schema: StructType, cdf_schema: StructType) {
+    async fn assert_incompatible_schema(
+        commit_schema: StructType,
+        cdf_schema: StructType,
+        incompatible_version: u64,
+    ) {
         let engine = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
+
+        let commit_schema_str = format!("{commit_schema:?}");
+        let cdf_schema_str = format!("{cdf_schema:?}");
+
+        let initial_schema = if incompatible_version == 0 {
+            commit_schema.clone()
+        } else {
+            cdf_schema.clone()
+        };
 
         mock_table
             .commit([Action::Metadata(
                 Metadata::try_new(
                     None,
                     None,
-                    commit_schema,
+                    initial_schema,
                     vec![],
                     0,
                     HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
@@ -368,6 +381,37 @@ async fn incompatible_schemas_fail() {
                 .unwrap(),
             )])
             .await;
+
+        // Create intermediate commits with compatible schema
+        for i in 1..incompatible_version {
+            mock_table
+                .commit([Action::Add(Add {
+                    path: format!("fake_path_{}.parquet", i),
+                    data_change: true,
+                    ..Default::default()
+                })])
+                .await;
+        }
+
+        // Commit an incompatible schema on incompatible_version
+        if incompatible_version > 0 {
+            mock_table
+                .commit([Action::Metadata(
+                    Metadata::try_new(
+                        None,
+                        None,
+                        commit_schema,
+                        vec![],
+                        0,
+                        HashMap::from([(
+                            "delta.enableChangeDataFeed".to_string(),
+                            "true".to_string(),
+                        )]),
+                    )
+                    .unwrap(),
+                )])
+                .await;
+        }
 
         let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
             .unwrap()
@@ -380,10 +424,21 @@ async fn incompatible_schemas_fail() {
                 .unwrap()
                 .try_collect();
 
-        assert!(matches!(
-            res,
-            Err(Error::ChangeDataFeedIncompatibleSchema(_, _))
-        ));
+        let Err(Error::ChangeDataFeedIncompatibleSchema {
+            version,
+            expected,
+            actual,
+        }) = res
+        else {
+            unreachable!("Expected ChangeDataFeedIncompatibleSchema error")
+        };
+        assert_eq!(
+            version, incompatible_version,
+            "Expected error at version {}",
+            incompatible_version
+        );
+        assert_eq!(expected, cdf_schema_str, "Expected schema mismatch");
+        assert_eq!(actual, commit_schema_str, "Actual schema mismatch");
     }
 
     // The CDF schema has fields: `id: int` and `value: string`.
@@ -393,7 +448,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("value", DataType::STRING),
         StructField::nullable("year", DataType::INTEGER),
     ]);
-    assert_incompatible_schema(schema, get_schema()).await;
+    assert_incompatible_schema(schema, get_schema(), 0).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long` and `value: string`.
@@ -401,7 +456,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_incompatible_schema(schema, get_schema()).await;
+    assert_incompatible_schema(schema, get_schema(), 0).await;
 
     // NOTE: Once type widening is supported, this should not return an error.
     //
@@ -415,7 +470,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_incompatible_schema(cdf_schema, commit_schema).await;
+    assert_incompatible_schema(commit_schema, cdf_schema, 0).await;
 
     // Note: Once schema evolution is supported, this should not return an error.
     //
@@ -425,7 +480,7 @@ async fn incompatible_schemas_fail() {
         StructField::not_null("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_incompatible_schema(schema, get_schema()).await;
+    assert_incompatible_schema(schema, get_schema(), 0).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields:`id: string` and `value: string`.
@@ -433,13 +488,21 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("id", DataType::STRING),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_incompatible_schema(schema, get_schema()).await;
+    assert_incompatible_schema(schema, get_schema(), 0).await;
+
+    // The CDF schema has fields: `id: int` and `value: string`.
+    // This commit at version 5 has schema with fields: `id: string` and `value: string`.
+    let schema = StructType::new_unchecked([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    assert_incompatible_schema(schema, get_schema(), 5).await;
 
     // Note: Once schema evolution is supported, this should not return an error.
     // The CDF schema has fields: `id` (nullable) and `value` (nullable).
     // This commit has schema with fields: `id` (nullable).
     let schema = get_schema().project_as_struct(&["id"]).unwrap();
-    assert_incompatible_schema(schema, get_schema()).await;
+    assert_incompatible_schema(schema, get_schema(), 0).await;
 }
 
 // Helper function to test schema evolution scenarios.
@@ -508,10 +571,29 @@ async fn demonstration_schema_evolution_failures() {
         StructField::nullable("value", DataType::STRING),
         StructField::nullable("new_col", DataType::INTEGER),
     ]);
-    let res = test_schema_evolution(initial, evolved).await;
-    assert!(
-        matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
-        "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
+    let cdf_schema_str = format!("{evolved:?}");
+    let commit_schema_str = format!("{initial:?}");
+    let res: Result<Vec<TableChangesScanMetadata>, Error> =
+        test_schema_evolution(initial, evolved).await;
+    let Err(Error::ChangeDataFeedIncompatibleSchema {
+        version,
+        expected,
+        actual,
+    }) = res
+    else {
+        unreachable!("Expected ChangeDataFeedIncompatibleSchema error for adding nullable column");
+    };
+    assert_eq!(
+        version, 0,
+        "Schema incompatibility should be detected at version 0"
+    );
+    assert_eq!(
+        expected, cdf_schema_str,
+        "Expected schema should match CDF schema (evolved)"
+    );
+    assert_eq!(
+        actual, commit_schema_str,
+        "Actual schema should match commit schema (initial)"
     );
 
     // Scenario 2: Type widening (int -> long) - supported by type widening feature
@@ -525,10 +607,28 @@ async fn demonstration_schema_evolution_failures() {
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
+    let cdf_schema_str = format!("{evolved:?}");
+    let commit_schema_str = format!("{initial:?}");
     let res = test_schema_evolution(initial, evolved).await;
-    assert!(
-        matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
-        "Expected ChangeDataFeedIncompatibleSchema error for type widening"
+    let Err(Error::ChangeDataFeedIncompatibleSchema {
+        version,
+        expected,
+        actual,
+    }) = res
+    else {
+        unreachable!("Expected ChangeDataFeedIncompatibleSchema error for type widening");
+    };
+    assert_eq!(
+        version, 0,
+        "Schema incompatibility should be detected at version 0"
+    );
+    assert_eq!(
+        expected, cdf_schema_str,
+        "Expected schema should match CDF schema (evolved)"
+    );
+    assert_eq!(
+        actual, commit_schema_str,
+        "Actual schema should match commit schema (initial)"
     );
 
     // Scenario 3: Changing nullability from non-null to nullable (safe evolution)
@@ -542,10 +642,28 @@ async fn demonstration_schema_evolution_failures() {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("value", DataType::STRING),
     ]);
+    let cdf_schema_str = format!("{evolved:?}");
+    let commit_schema_str = format!("{initial:?}");
     let res = test_schema_evolution(initial, evolved).await;
-    assert!(
-        matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
-        "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
+    let Err(Error::ChangeDataFeedIncompatibleSchema {
+        version,
+        expected,
+        actual,
+    }) = res
+    else {
+        unreachable!("Expected ChangeDataFeedIncompatibleSchema error for nullability change");
+    };
+    assert_eq!(
+        version, 0,
+        "Schema incompatibility should be detected at version 0"
+    );
+    assert_eq!(
+        expected, cdf_schema_str,
+        "Expected schema should match CDF schema (evolved)"
+    );
+    assert_eq!(
+        actual, commit_schema_str,
+        "Actual schema should match commit schema (initial)"
     );
 }
 
