@@ -934,50 +934,39 @@ mod tests {
         use crate::engine_data::{GetData, TypedGetData};
         use crate::schema::ColumnName;
 
-        // Create a struct with fields in a specific order: field_a, field_b, field_c
-        let field_a = Int32Array::from(vec![1, 2, 3]);
-        let field_b = Int32Array::from(vec![10, 20, 30]);
-        let field_c = Int32Array::from(vec![100, 200, 300]);
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("field_a", ArrowDataType::Int32, false),
-            ArrowField::new("field_b", ArrowDataType::Int32, false),
-            ArrowField::new("field_c", ArrowDataType::Int32, false),
-        ]));
-
+        // Schema has columns: field_a, field_b, field_c
         let batch = RecordBatch::try_new(
-            schema,
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("field_a", ArrowDataType::Int32, false),
+                ArrowField::new("field_b", ArrowDataType::Int32, false),
+                ArrowField::new("field_c", ArrowDataType::Int32, false),
+            ])),
             vec![
-                Arc::new(field_a.clone()),
-                Arc::new(field_b.clone()),
-                Arc::new(field_c.clone()),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
             ],
         )?;
 
-        let arrow_data = ArrowEngineData::new(batch);
-
-        // Create a visitor that requests columns in a different order: field_c, field_a, field_b
-        struct ReorderedVisitor {
+        struct Visitor {
             values: Vec<(i32, i32, i32)>,
         }
-
-        impl crate::engine_data::RowVisitor for ReorderedVisitor {
+        impl crate::engine_data::RowVisitor for Visitor {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 use std::sync::LazyLock;
-                static NAMES_AND_TYPES: LazyLock<
-                    (Vec<ColumnName>, Vec<DataType>),
-                > = LazyLock::new(|| {
-                    (
-                        vec![
-                            ColumnName::new(["field_c"]),
-                            ColumnName::new(["field_a"]),
-                            ColumnName::new(["field_b"]),
-                        ],
-                        vec![DataType::INTEGER, DataType::INTEGER, DataType::INTEGER],
-                    )
-                });
+                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                    LazyLock::new(|| {
+                        (
+                            vec![
+                                ColumnName::new(["field_c"]),
+                                ColumnName::new(["field_a"]),
+                                ColumnName::new(["field_b"]),
+                            ],
+                            vec![DataType::INTEGER; 3],
+                        )
+                    });
                 (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
             }
 
@@ -986,24 +975,19 @@ mod tests {
                 row_count: usize,
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
-                assert_eq!(getters.len(), 3, "Expected 3 getters");
-
                 for i in 0..row_count {
-                    // The getters should return values in the order we requested:
-                    // field_c, field_a, field_b
-                    let c_val: i32 = getters[0].get(i, "field_c")?;
-                    let a_val: i32 = getters[1].get(i, "field_a")?;
-                    let b_val: i32 = getters[2].get(i, "field_b")?;
-                    self.values.push((c_val, a_val, b_val));
+                    self.values.push((
+                        getters[0].get(i, "field_c")?,
+                        getters[1].get(i, "field_a")?,
+                        getters[2].get(i, "field_b")?,
+                    ));
                 }
                 Ok(())
             }
         }
 
-        let mut visitor = ReorderedVisitor { values: vec![] };
-
-        // Request columns in non-schema order
-        arrow_data.visit_rows(
+        let mut visitor = Visitor { values: vec![] };
+        ArrowEngineData::new(batch).visit_rows(
             &[
                 ColumnName::new(["field_c"]),
                 ColumnName::new(["field_a"]),
@@ -1012,12 +996,8 @@ mod tests {
             &mut visitor,
         )?;
 
-        // Verify we got the correct values in the requested order
-        assert_eq!(visitor.values.len(), 3);
-        assert_eq!(visitor.values[0], (100, 1, 10)); // field_c=100, field_a=1, field_b=10
-        assert_eq!(visitor.values[1], (200, 2, 20)); // field_c=200, field_a=2, field_b=20
-        assert_eq!(visitor.values[2], (300, 3, 30)); // field_c=300, field_a=3, field_b=30
-
+        // Requested order (c, a, b) not schema order (a, b, c)
+        assert_eq!(visitor.values, vec![(100, 1, 10), (200, 2, 20)]);
         Ok(())
     }
 
@@ -1027,51 +1007,45 @@ mod tests {
         use crate::engine_data::{GetData, TypedGetData};
         use crate::schema::ColumnName;
 
-        // Create nested struct: outer.inner_x, outer.inner_y
-        // Then request them in reverse order: outer.inner_y, outer.inner_x
-        let inner_x = Int32Array::from(vec![1, 2]);
-        let inner_y = Int32Array::from(vec![10, 20]);
-
-        let inner_schema = Arc::new(ArrowSchema::new(vec![
+        // Schema has nested struct: outer.inner_x, outer.inner_y
+        let inner_fields = vec![
             ArrowField::new("inner_x", ArrowDataType::Int32, false),
             ArrowField::new("inner_y", ArrowDataType::Int32, false),
-        ]));
-
-        let struct_array = StructArray::try_new(
-            inner_schema.fields.clone(),
-            vec![Arc::new(inner_x), Arc::new(inner_y)],
-            None,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "outer",
+                ArrowDataType::Struct(inner_fields.clone().into()),
+                false,
+            )])),
+            vec![Arc::new(StructArray::try_new(
+                inner_fields.into(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int32Array::from(vec![10, 20])),
+                ],
+                None,
+            )?)],
         )?;
 
-        let outer_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "outer",
-            ArrowDataType::Struct(inner_schema.fields.clone()),
-            false,
-        )]));
-
-        let batch = RecordBatch::try_new(outer_schema, vec![Arc::new(struct_array)])?;
-        let arrow_data = ArrowEngineData::new(batch);
-
-        struct NestedVisitor {
+        struct Visitor {
             values: Vec<(i32, i32)>,
         }
-
-        impl crate::engine_data::RowVisitor for NestedVisitor {
+        impl crate::engine_data::RowVisitor for Visitor {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 use std::sync::LazyLock;
-                static NAMES_AND_TYPES: LazyLock<
-                    (Vec<ColumnName>, Vec<DataType>),
-                > = LazyLock::new(|| {
-                    (
-                        vec![
-                            ColumnName::new(["outer", "inner_y"]),
-                            ColumnName::new(["outer", "inner_x"]),
-                        ],
-                        vec![DataType::INTEGER, DataType::INTEGER],
-                    )
-                });
+                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+                    LazyLock::new(|| {
+                        (
+                            vec![
+                                ColumnName::new(["outer", "inner_y"]),
+                                ColumnName::new(["outer", "inner_x"]),
+                            ],
+                            vec![DataType::INTEGER; 2],
+                        )
+                    });
                 (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
             }
 
@@ -1080,21 +1054,16 @@ mod tests {
                 row_count: usize,
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
-                assert_eq!(getters.len(), 2, "Expected 2 getters");
-
                 for i in 0..row_count {
-                    // Values should be in requested order: inner_y, inner_x
-                    let y_val: i32 = getters[0].get(i, "outer.inner_y")?;
-                    let x_val: i32 = getters[1].get(i, "outer.inner_x")?;
-                    self.values.push((y_val, x_val));
+                    self.values
+                        .push((getters[0].get(i, "y")?, getters[1].get(i, "x")?));
                 }
                 Ok(())
             }
         }
 
-        let mut visitor = NestedVisitor { values: vec![] };
-
-        arrow_data.visit_rows(
+        let mut visitor = Visitor { values: vec![] };
+        ArrowEngineData::new(batch).visit_rows(
             &[
                 ColumnName::new(["outer", "inner_y"]),
                 ColumnName::new(["outer", "inner_x"]),
@@ -1102,11 +1071,8 @@ mod tests {
             &mut visitor,
         )?;
 
-        // Verify values are in the requested order
-        assert_eq!(visitor.values.len(), 2);
-        assert_eq!(visitor.values[0], (10, 1)); // inner_y=10, inner_x=1
-        assert_eq!(visitor.values[1], (20, 2)); // inner_y=20, inner_x=2
-
+        // Requested order (y, x) not schema order (x, y)
+        assert_eq!(visitor.values, vec![(10, 1), (20, 2)]);
         Ok(())
     }
 }
