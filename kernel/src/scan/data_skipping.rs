@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock};
 
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
@@ -14,7 +14,8 @@ use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, SchemaRef};
-use crate::{Engine, EngineData, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
+use crate::utils::require;
+use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
 pub(crate) mod stats_schema;
 #[cfg(test)]
@@ -138,19 +139,55 @@ impl DataSkippingFilter {
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
     pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        let batch_len = batch.len();
+
         let file_stats = self.stats_evaluator.evaluate(batch)?;
-        assert_eq!(file_stats.len(), batch.len());
+        debug_assert_eq!(file_stats.len(), batch_len);
+        require!(
+            file_stats.len() == batch_len,
+            Error::internal_error(format!(
+                "stats evaluator output length {} != batch length {}",
+                file_stats.len(),
+                batch_len
+            ))
+        );
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
-        assert_eq!(skipping_predicate.len(), batch.len());
+        debug_assert_eq!(skipping_predicate.len(), batch_len);
+        require!(
+            skipping_predicate.len() == batch_len,
+            Error::internal_error(format!(
+                "skipping evaluator output length {} != batch length {}",
+                skipping_predicate.len(),
+                batch_len
+            ))
+        );
 
         let selection_vector = self
             .filter_evaluator
             .evaluate(skipping_predicate.as_ref())?;
-        assert_eq!(selection_vector.len(), batch.len());
+        debug_assert_eq!(selection_vector.len(), batch_len);
+        require!(
+            selection_vector.len() == batch_len,
+            Error::internal_error(format!(
+                "filter evaluator output length {} != batch length {}",
+                selection_vector.len(),
+                batch_len
+            ))
+        );
 
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
+
+        let skipped = visitor
+            .selection_vector
+            .iter()
+            .filter(|&&kept| !kept)
+            .count();
+        if skipped > 0 {
+            info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
+        }
+
         Ok(visitor.selection_vector)
     }
 }

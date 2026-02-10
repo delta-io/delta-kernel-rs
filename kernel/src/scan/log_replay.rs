@@ -173,6 +173,7 @@ impl ScanLogReplayProcessor {
                 .and_then(|physical_stats_schema| {
                     DataSkippingFilter::new(
                         engine,
+                        // these are all cheap arc clones
                         physical_predicate.as_ref().map(|(p, _)| p.clone()),
                         physical_stats_schema.clone(),
                         output_schema.clone(),
@@ -622,15 +623,32 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
         );
 
-        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
+        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed).
         // This is done before data skipping so we can read the already-parsed stats.
+        // We use the checkpoint_transform because we checked above that we're reading a checkpoint.
         let transformed = self.checkpoint_transform.evaluate(actions.as_ref())?;
-        assert_eq!(transformed.len(), actions.len());
+        debug_assert_eq!(transformed.len(), actions.len());
+        require!(
+            transformed.len() == actions.len(),
+            Error::internal_error(format!(
+                "checkpoint transform output length {} != actions length {}",
+                transformed.len(),
+                actions.len()
+            ))
+        );
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
         // This avoids double JSON parsing - the transform already parsed the stats.
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
-        assert_eq!(selection_vector.len(), actions.len());
+        debug_assert_eq!(selection_vector.len(), actions.len());
+        require!(
+            selection_vector.len() == actions.len(),
+            Error::internal_error(format!(
+                "selection vector length {} != actions length {}",
+                selection_vector.len(),
+                actions.len()
+            ))
+        );
 
         // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = CheckpointDeduplicator::try_new(
@@ -679,12 +697,28 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &self.checkpoint_transform
         };
         let transformed = transform.evaluate(actions.as_ref())?;
-        assert_eq!(transformed.len(), actions.len());
+        debug_assert_eq!(transformed.len(), actions.len());
+        require!(
+            transformed.len() == actions.len(),
+            Error::internal_error(format!(
+                "transform output length {} != actions length {}",
+                transformed.len(),
+                actions.len()
+            ))
+        );
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
         // This avoids double JSON parsing - the transform already parsed the stats.
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
-        assert_eq!(selection_vector.len(), actions.len());
+        debug_assert_eq!(selection_vector.len(), actions.len());
+        require!(
+            selection_vector.len() == actions.len(),
+            Error::internal_error(format!(
+                "selection vector length {} != actions length {}",
+                selection_vector.len(),
+                actions.len()
+            ))
+        );
 
         // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
