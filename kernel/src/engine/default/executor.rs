@@ -409,14 +409,14 @@ pub mod tokio {
 
         #[test]
         fn test_block_on_works_outside_tokio_runtime() {
+            let executor = TokioMultiThreadExecutor::new_owned_runtime(None, None)
+                .expect("Failed to create executor");
+
             // Verify we're not inside a Tokio runtime
             assert!(
                 tokio::runtime::Handle::try_current().is_err(),
                 "Test must run outside of a Tokio runtime"
             );
-
-            let executor = TokioMultiThreadExecutor::new_owned_runtime(None, None)
-                .expect("Failed to create executor");
 
             // block_on should work even though we're not inside a Tokio runtime
             let result = executor.block_on(async {
