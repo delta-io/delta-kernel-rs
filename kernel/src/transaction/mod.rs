@@ -3,6 +3,7 @@ use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
+use tracing::{info, instrument};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -20,7 +21,9 @@ use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
-use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::row_tracking::{
+    RowTrackingDomainMetadata, RowTrackingVisitor, ROW_TRACKING_DOMAIN_NAME,
+};
 use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -44,6 +47,11 @@ use delta_kernel_derive::internal_api;
 pub mod create_table;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod create_table;
+
+#[cfg(feature = "internal-api")]
+pub mod data_layout;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod data_layout;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -244,6 +252,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 /// txn.commit(&engine)?;
 /// ```
 pub struct Transaction {
+    span: tracing::Span,
     // The snapshot this transaction is based on. For create-table transactions,
     // this is a pre-commit snapshot with PRE_COMMIT_VERSION.
     read_snapshot: SnapshotRef,
@@ -261,11 +270,16 @@ pub struct Transaction {
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
-    // Domain metadata additions for this transaction.
-    domain_metadata_additions: Vec<DomainMetadata>,
+    // User-provided domain metadata additions (via with_domain_metadata API).
+    user_domain_metadata_additions: Vec<DomainMetadata>,
+    // System-generated domain metadata (from transforms, e.g., clustering).
+    // TODO(#1779): Currently only populated during CREATE TABLE. For inserts, row tracking
+    // domain metadata is handled separately via `row_tracking_high_watermark` parameter in
+    // `generate_domain_metadata_actions`. Consider unifying system domain handling.
+    system_domain_metadata_additions: Vec<DomainMetadata>,
     // Domain names to remove in this transaction. The configuration values are fetched during
     // commit from the log to preserve the pre-image in tombstones.
-    domain_removals: Vec<String>,
+    user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
@@ -315,7 +329,14 @@ impl Transaction {
 
         let commit_timestamp = current_time_ms()?;
 
+        let span = tracing::info_span!(
+            "txn",
+            path = %read_snapshot.table_root(),
+            read_version = read_snapshot.version(),
+        );
+
         Ok(Transaction {
+            span,
             read_snapshot,
             committer,
             operation: None,
@@ -324,8 +345,9 @@ impl Transaction {
             remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
-            domain_metadata_additions: vec![],
-            domain_removals: vec![],
+            user_domain_metadata_additions: vec![],
+            system_domain_metadata_additions: vec![],
+            user_domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
             clustering_columns,
@@ -346,12 +368,20 @@ impl Transaction {
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
+        clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
         // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
         // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
         // the was read vs the effective snapshot we will use for the commit.
+        let span = tracing::info_span!(
+            "txn",
+            path = %pre_commit_snapshot.table_root(),
+            operation = "CREATE",
+        );
+
         Ok(Transaction {
+            span,
             read_snapshot: pre_commit_snapshot,
             committer,
             operation: Some("CREATE TABLE".to_string()),
@@ -360,14 +390,12 @@ impl Transaction {
             remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp: current_time_ms()?,
-            domain_metadata_additions: system_domain_metadata,
-            domain_removals: vec![],
+            user_domain_metadata_additions: vec![],
+            system_domain_metadata_additions: system_domain_metadata,
+            user_domain_removals: vec![],
             data_change: true,
             dv_matched_files: vec![],
-            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
-            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
-            // return the correct columns for the new table.
-            clustering_columns: None,
+            clustering_columns,
         })
     }
 
@@ -390,7 +418,21 @@ impl Transaction {
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    #[instrument(
+        parent = &self.span,
+        name = "txn.commit",
+        skip_all,
+        fields(
+            commit_version = self.get_commit_version(),
+        ),
+        err
+    )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+        info!(
+            num_add_files = self.add_files_metadata.len(),
+            num_remove_files = self.remove_files_metadata.len(),
+            num_dv_updates = self.dv_matched_files.len(),
+        );
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -593,7 +635,7 @@ impl Transaction {
     /// fail (that is, we don't eagerly check domain validity here).
     /// Setting metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
-        self.domain_metadata_additions
+        self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
         self
     }
@@ -608,7 +650,7 @@ impl Transaction {
     /// fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
-        self.domain_removals.push(domain);
+        self.user_domain_removals.push(domain);
         self
     }
 
@@ -659,19 +701,47 @@ impl Transaction {
         // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
         self.read_snapshot.version().wrapping_add(1)
     }
-    /// Validate that user domains don't conflict with system domains or each other.
-    fn validate_user_domain_operations(&self) -> DeltaResult<()> {
+    /// Validate domain metadata operations for both create-table and existing-table transactions.
+    ///
+    /// Enforces the following rules:
+    /// - DomainMetadata feature must be supported if any domain operations are present
+    /// - System domains (in system_domain_metadata_additions) must correspond to a known feature
+    /// - User domains cannot use the delta.* prefix (system-reserved)
+    /// - Domain removals are not allowed in create-table transactions
+    /// - No duplicate domains within a single transaction (across both user and system)
+    fn validate_domain_metadata_operations(&self) -> DeltaResult<()> {
+        // Feature validation (applies to all transactions with domain operations)
+        let has_domain_ops = !self.system_domain_metadata_additions.is_empty()
+            || !self.user_domain_metadata_additions.is_empty()
+            || !self.user_domain_removals.is_empty();
+
+        // Early return if no domain operations to validate
+        if !has_domain_ops {
+            return Ok(());
+        }
+
+        if !self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_supported(&TableFeature::DomainMetadata)
+        {
+            return Err(Error::unsupported(
+                "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+            ));
+        }
+
+        let is_create = self.is_create_table();
         let mut seen_domains = HashSet::new();
 
-        // Validate domain additions
-        for dm in &self.domain_metadata_additions {
+        // Validate SYSTEM domain additions (from transforms, e.g., clustering)
+        // System domains are only populated during create-table
+        for dm in &self.system_domain_metadata_additions {
             let domain = dm.domain();
-            if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(Error::generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled",
-                ));
-            }
 
+            // Validate the system domain corresponds to a known feature
+            self.validate_system_domain_feature(domain)?;
+
+            // Check for duplicates
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
                     "Metadata for domain {} already specified in this transaction",
@@ -680,18 +750,83 @@ impl Transaction {
             }
         }
 
-        // Validate domain removals
-        for domain in &self.domain_removals {
+        // Validate USER domain additions (via with_domain_metadata API)
+        for dm in &self.user_domain_metadata_additions {
+            let domain = dm.domain();
+
+            // Users cannot add system domains via the public API
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
                 return Err(Error::generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled",
                 ));
             }
 
+            // Check for duplicates (spans both system and user domains)
+            if !seen_domains.insert(domain) {
+                return Err(Error::generic(format!(
+                    "Metadata for domain {} already specified in this transaction",
+                    domain
+                )));
+            }
+        }
+
+        // No removals allowed for create-table.
+        // TODO(#1768): The public API with_domain_metadata_removals
+        // should be updated to disallow removals for create-table transactions.
+        // Its ok for now as create table is not a public API
+        if is_create && !self.user_domain_removals.is_empty() {
+            return Err(Error::unsupported(
+                "Domain metadata removals are not supported in create-table transactions",
+            ));
+        }
+
+        // Validate domain removals (for non-create-table)
+        for domain in &self.user_domain_removals {
+            // Cannot remove system domains
+            if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
+                return Err(Error::generic(
+                    "Cannot modify domains that start with 'delta.' as those are system controlled",
+                ));
+            }
+
+            // Check for duplicates
             if !seen_domains.insert(domain.as_str()) {
                 return Err(Error::generic(format!(
                     "Metadata for domain {} already specified in this transaction",
                     domain
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that a system domain corresponds to a known feature and that the feature is supported.
+    ///
+    /// This prevents arbitrary `delta.*` domains from being added during table creation.
+    /// Each known system domain must have its corresponding feature enabled in the protocol.
+    fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
+        let table_config = self.read_snapshot.table_configuration();
+
+        // Map domain to its required feature
+        let required_feature = match domain {
+            ROW_TRACKING_DOMAIN_NAME => Some(TableFeature::RowTracking),
+            // Will be changed to a constant in a follow up clustering create table feature PR
+            "delta.clustering" => Some(TableFeature::ClusteredTable),
+            _ => {
+                return Err(Error::generic(format!(
+                    "Unknown system domain '{}'. Only known system domains are allowed.",
+                    domain
+                )));
+            }
+        };
+
+        // If the domain requires a feature, validate it's supported
+        if let Some(feature) = required_feature {
+            if !table_config.is_feature_supported(&feature) {
+                return Err(Error::generic(format!(
+                    "System domain '{}' requires the '{}' feature to be enabled",
+                    domain, feature
                 )));
             }
         }
@@ -763,6 +898,12 @@ impl Transaction {
     /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[instrument(
+        name = "txn.update_dvs",
+        skip_all,
+        fields(num_dv_updates = new_dv_descriptors.len()),
+        err
+    )]
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
@@ -837,6 +978,36 @@ impl Transaction {
         Ok(())
     }
 
+    /// Generate removal actions for user domain metadata by scanning the log.
+    ///
+    /// This performs an expensive log replay operation to fetch the previous configuration
+    /// value for each domain being removed, as required by the Delta spec for tombstones.
+    /// Returns an empty vector if there are no domain removals.
+    fn generate_user_domain_removal_actions(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
+        if self.user_domain_removals.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Scan log to fetch existing configurations for tombstones
+        let existing_domains =
+            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
+
+        // Create removal tombstones with pre-image configurations
+        Ok(self
+            .user_domain_removals
+            .iter()
+            .filter_map(|domain| {
+                // If domain doesn't exist in the log, this is a no-op (filter it out)
+                existing_domains.get(domain).map(|existing| {
+                    DomainMetadata::remove(domain.clone(), existing.configuration().to_owned())
+                })
+            })
+            .collect())
+    }
+
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     ///
     /// This function may perform an expensive log replay operation if there are any domain removals.
@@ -847,66 +1018,41 @@ impl Transaction {
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<EngineDataResultIterator<'a>> {
-        // For create-table transactions, domain metadata will be added in
-        // a subsequent code commit
-        if self.is_create_table() {
-            if !self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty() {
-                return Err(Error::unsupported(
-                    "Domain metadata operations are not supported in create-table transactions",
+        let is_create = self.is_create_table();
+
+        // Validate domain operations (includes feature validation)
+        self.validate_domain_metadata_operations()?;
+
+        // TODO(sanuj) Create-table must not have row tracking or removals
+        // Defensive. Needs to be updated when row tracking support is added.
+        if is_create {
+            if row_tracking_high_watermark.is_some() {
+                return Err(Error::internal_error(
+                    "CREATE TABLE cannot have row tracking domain metadata",
                 ));
             }
-            return Ok(Box::new(iter::empty()));
+            // user_domain_removals already validated above, but be explicit
+            debug_assert!(self.user_domain_removals.is_empty());
         }
 
-        // Validate feature support for user domain operations
-        if (!self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty())
-            && !self
-                .read_snapshot
-                .table_configuration()
-                .is_feature_supported(&TableFeature::DomainMetadata)
-        {
-            return Err(Error::unsupported("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
-        }
+        // Generate removal actions (empty for create-table due to validation above)
+        let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
-        // Validate user domain operations
-        self.validate_user_domain_operations()?;
-
-        // Generate user domain removals via log replay (expensive if non-empty)
-        let removal_actions = if !self.domain_removals.is_empty() {
-            // Scan log to fetch existing configurations for tombstones
-            let existing_domains =
-                scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
-
-            // Create removal tombstones with pre-image configurations
-            let removals: Vec<_> = self
-                .domain_removals
-                .iter()
-                .filter_map(|domain| {
-                    // If domain doesn't exist in the log, this is a no-op (filter it out)
-                    existing_domains.get(domain).map(|existing| {
-                        DomainMetadata::remove(domain.clone(), existing.configuration().to_owned())
-                    })
-                })
-                .collect();
-
-            removals
-        } else {
-            vec![]
-        };
-
-        // Generate system domain actions (row tracking)
-        let system_domain_actions = row_tracking_high_watermark
+        // Generate row tracking domain action (None for create-table)
+        let row_tracking_domain_action = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?
             .into_iter();
 
         // Chain all domain actions and convert to EngineData
+        // System domains first, then row tracking, then user domains, then removals
         Ok(Box::new(
-            self.domain_metadata_additions
+            self.system_domain_metadata_additions
                 .clone()
                 .into_iter()
+                .chain(row_tracking_domain_action)
+                .chain(self.user_domain_metadata_additions.clone())
                 .chain(removal_actions)
-                .chain(system_domain_actions)
                 .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)),
         ))
     }
@@ -1053,6 +1199,7 @@ impl Transaction {
     }
 
     /// Generate add actions, handling row tracking internally if needed
+    #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
         engine: &dyn Engine,
@@ -1286,6 +1433,7 @@ impl Transaction {
     ///
     /// [`remove_files`]: Transaction::remove_files
     /// [`update_deletion_vectors`]: Transaction::update_deletion_vectors
+    #[instrument(name = "txn.gen_removes", skip_all, err)]
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,

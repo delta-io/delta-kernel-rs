@@ -36,14 +36,18 @@ use std::sync::Arc;
 
 use url::Url;
 
+use super::data_layout::DataLayout;
+
 use crate::actions::{Metadata, Protocol};
+use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, TABLE_FEATURES_MIN_READER_VERSION,
+    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::DELTA_PROPERTY_PREFIX;
@@ -51,7 +55,25 @@ use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
 
-/// Properties that are allowed to be set during create table.
+/// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
+///
+/// Feature signals (`delta.feature.X=supported`) are validated against this list.
+/// Only features in this list can be enabled via feature signals.
+///
+/// This list will expand as more features are supported (e.g., column mapping).
+const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
+    // DomainMetadata is required for clustering and other system domain operations
+    TableFeature::DomainMetadata,
+    // Note: Clustering is NOT included here. Users should not enable clustering via
+    // `delta.feature.clustering = supported`. Instead, clustering is enabled by
+    // specifying clustering columns via `with_data_layout()`.
+    // As features are supported, add them here:
+    // TableFeature::ColumnMapping,
+    // TableFeature::DeletionVectors,
+];
+
+/// Delta properties allowed to be set during CREATE TABLE.
+///
 /// This list will expand as more features are supported (e.g., column mapping, clustering).
 /// The allow list will be deprecated once auto feature enablement is implemented
 /// like the Java Kernel.
@@ -114,22 +136,127 @@ fn ensure_table_does_not_exist(
     }
 }
 
-/// Validates that table properties are allowed during CREATE TABLE.
+/// Result of validating and transforming table properties.
+struct ValidatedTableProperties {
+    /// Table properties with feature signals removed (to be stored in metadata)
+    properties: HashMap<String, String>,
+    /// Reader features extracted from feature signals (for ReaderWriter features)
+    reader_features: Vec<TableFeature>,
+    /// Writer features extracted from feature signals (for all features)
+    writer_features: Vec<TableFeature>,
+}
+
+/// Adds a feature to the appropriate reader/writer feature lists based on its type.
 ///
-/// This function enforces an allow list for delta properties:
-/// - Feature override properties (`delta.feature.*`) are never allowed
-/// - Delta properties (`delta.*`) must be on the allow list
-/// - Non-delta properties (user/application properties) are always allowed
-fn validate_table_properties(properties: &HashMap<String, String>) -> DeltaResult<()> {
-    for key in properties.keys() {
-        // Block all delta.feature.* properties (feature override properties)
-        if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
+/// - ReaderWriter features are added to both reader and writer lists
+/// - Writer and Unknown features are added only to the writer list
+///
+/// This function is idempotent - it won't add duplicate features.
+fn add_feature_to_lists(
+    feature: TableFeature,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    match feature.feature_type() {
+        FeatureType::ReaderWriter => {
+            if !reader_features.contains(&feature) {
+                reader_features.push(feature.clone());
+            }
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+        FeatureType::Writer | FeatureType::Unknown => {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+}
+
+/// Configures clustering support for table creation.
+///
+/// Validates clustering columns, adds required features (DomainMetadata, ClusteredTable),
+/// and creates the domain metadata action.
+fn apply_clustering_for_table_create(
+    logical_schema: &SchemaRef,
+    logical_columns: &[crate::expressions::ColumnName],
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) -> DeltaResult<crate::actions::DomainMetadata> {
+    validate_clustering_columns(logical_schema, logical_columns)?;
+
+    // Add required features
+    // DomainMetadata is required by ClusteredTable per the Delta protocol
+    add_feature_to_lists(
+        TableFeature::DomainMetadata,
+        reader_features,
+        writer_features,
+    );
+    add_feature_to_lists(
+        TableFeature::ClusteredTable,
+        reader_features,
+        writer_features,
+    );
+
+    Ok(create_clustering_domain_metadata(logical_columns))
+}
+
+/// Validates and transforms table properties for CREATE TABLE.
+///
+/// This function:
+/// 1. Validates feature signals (`delta.feature.*`) against `ALLOWED_DELTA_FEATURES`
+/// 2. Validates delta properties (`delta.*`) against `ALLOWED_DELTA_PROPERTIES`
+/// 3. Removes feature signals from properties (they shouldn't be stored in metadata)
+/// 4. Extracts reader/writer features from validated feature signals
+///
+/// Non-delta properties (user/application properties) are always allowed.
+fn validate_extract_table_features_and_properties(
+    properties: HashMap<String, String>,
+) -> DeltaResult<ValidatedTableProperties> {
+    let mut reader_features = Vec::new();
+    let mut writer_features = Vec::new();
+
+    // Partition properties into feature signals and regular properties
+    // Feature signals (delta.feature.X=supported) are processed but not stored in metadata
+    // Feature signals are removed from the properties map.
+    let (feature_signals, properties): (HashMap<_, _>, HashMap<_, _>) = properties
+        .into_iter()
+        .partition(|(k, _)| k.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX));
+
+    // Process and validate feature signals
+    for (key, value) in &feature_signals {
+        // Safe: we partitioned for keys starting with this prefix above
+        let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
+            continue;
+        };
+
+        // Validate that the value is "supported"
+        if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
             return Err(Error::generic(format!(
-                "Setting feature override property '{}' is not supported during CREATE TABLE",
-                key
+                "Invalid value '{}' for '{}'. Only '{}' is allowed.",
+                value, key, SET_TABLE_FEATURE_SUPPORTED_VALUE
             )));
         }
-        // For delta.* properties, check against allow list
+
+        // Parse feature name to TableFeature (unknown features become TableFeature::Unknown)
+        let feature: TableFeature = feature_name
+            .parse()
+            .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
+
+        if !ALLOWED_DELTA_FEATURES.contains(&feature) {
+            return Err(Error::generic(format!(
+                "Enabling feature '{}' via '{}' is not supported during CREATE TABLE",
+                feature_name, key
+            )));
+        }
+
+        // Add to appropriate feature lists based on feature type
+        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+    }
+
+    // Validate remaining delta.* properties against allow list
+    for key in properties.keys() {
         if key.starts_with(DELTA_PROPERTY_PREFIX)
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
@@ -138,9 +265,13 @@ fn validate_table_properties(properties: &HashMap<String, String>) -> DeltaResul
                 key
             )));
         }
-        // Non-delta properties (user/application properties) are always allowed
     }
-    Ok(())
+
+    Ok(ValidatedTableProperties {
+        properties,
+        reader_features,
+        writer_features,
+    })
 }
 
 /// Creates a builder for creating a new Delta table.
@@ -200,6 +331,7 @@ pub struct CreateTableTransactionBuilder {
     schema: SchemaRef,
     engine_info: String,
     table_properties: HashMap<String, String>,
+    data_layout: DataLayout,
 }
 
 impl CreateTableTransactionBuilder {
@@ -212,6 +344,7 @@ impl CreateTableTransactionBuilder {
             schema,
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
+            data_layout: DataLayout::None,
         }
     }
 
@@ -257,6 +390,35 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Sets the data layout for the new Delta table.
+    ///
+    /// The data layout determines how data files are organized within the table:
+    ///
+    /// - [`DataLayout::None`]: No special organization (default)
+    /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use delta_kernel::transaction::create_table::create_table;
+    /// # use delta_kernel::transaction::data_layout::DataLayout;
+    /// # use delta_kernel::schema::{StructType, DataType, StructField};
+    /// # use std::sync::Arc;
+    /// # fn example() -> delta_kernel::DeltaResult<()> {
+    /// # let schema = Arc::new(StructType::try_new(vec![
+    /// #     StructField::new("id", DataType::INTEGER, false),
+    /// #     StructField::new("date", DataType::STRING, false),
+    /// # ])?);
+    /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
+    ///     .with_data_layout(DataLayout::clustered(["id"]));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
+        self.data_layout = layout;
+        self
+    }
+
     /// Builds a [`Transaction`] that can be committed to create the table.
     ///
     /// This method performs validation:
@@ -289,31 +451,47 @@ impl CreateTableTransactionBuilder {
         if self.schema.fields().len() == 0 {
             return Err(Error::generic("Schema cannot be empty"));
         }
-
-        // Validate table properties against allow list
-        validate_table_properties(&self.table_properties)?;
-
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
         let storage = engine.storage_handler();
         ensure_table_does_not_exist(storage.as_ref(), &delta_log_url, &self.path)?;
 
+        // Validate and transform table properties
+        // - Extracts and validates feature signals
+        // - Removes feature signals from properties (they shouldn't be stored in metadata)
+        // - Returns reader/writer features to add to protocol
+        let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
+
+        // Handle clustering if specified
+        let (system_domain_metadata, clustering_columns) = match &self.data_layout {
+            DataLayout::Clustered { columns } => {
+                let dm = apply_clustering_for_table_create(
+                    &self.schema,
+                    columns,
+                    &mut validated.reader_features,
+                    &mut validated.writer_features,
+                )?;
+                (vec![dm], Some(columns.clone()))
+            }
+            DataLayout::None => (vec![], None),
+        };
+
         // Create Protocol action with table features support
         let protocol = Protocol::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<String>::new()), // readerFeatures (empty for now)
-            Some(Vec::<String>::new()), // writerFeatures (empty for now)
+            Some(validated.reader_features),
+            Some(validated.writer_features),
         )?;
 
-        // Create Metadata action
+        // Create Metadata action with filtered properties (feature signals removed)
         let metadata = Metadata::try_new(
             None, // name
             None, // description
             (*self.schema).clone(),
             Vec::new(), // partition_columns - added with data layout support
             current_time_ms()?,
-            self.table_properties,
+            validated.properties,
         )?;
 
         // Create pre-commit snapshot from protocol/metadata
@@ -327,7 +505,8 @@ impl CreateTableTransactionBuilder {
             Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
-            vec![], // system_domain_metadata - not supported in base API
+            system_domain_metadata,
+            clustering_columns,
         )
     }
 }
@@ -405,43 +584,209 @@ mod tests {
     fn test_validate_supported_properties() {
         // Empty properties are allowed
         let properties = HashMap::new();
-        assert!(validate_table_properties(&properties).is_ok());
+        let result = validate_extract_table_features_and_properties(properties);
+        assert!(result.is_ok());
+        let validated = result.unwrap();
+        assert!(validated.properties.is_empty());
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
 
-        // User/application properties are allowed
+        // User/application properties are allowed and preserved
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
         properties.insert("custom.setting".to_string(), "value".to_string());
-        assert!(validate_table_properties(&properties).is_ok());
+        let result = validate_extract_table_features_and_properties(properties);
+        assert!(result.is_ok());
+        let validated = result.unwrap();
+        assert_eq!(validated.properties.len(), 2);
+        assert_eq!(
+            validated.properties.get("myapp.version"),
+            Some(&"1.0".to_string())
+        );
+        assert_eq!(
+            validated.properties.get("custom.setting"),
+            Some(&"value".to_string())
+        );
+
+        // Feature signal for domainMetadata IS allowed (it's in ALLOWED_DELTA_FEATURES)
+        let properties = HashMap::from([(
+            "delta.feature.domainMetadata".to_string(),
+            "supported".to_string(),
+        )]);
+        let result = validate_extract_table_features_and_properties(properties);
+        assert!(result.is_ok());
+        let validated = result.unwrap();
+        // Feature signals are removed from properties (not stored in metadata)
+        assert!(validated.properties.is_empty());
+        // DomainMetadata is a writer-only feature
+        assert!(validated.reader_features.is_empty());
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::DomainMetadata));
     }
 
     #[test]
     fn test_validate_unsupported_properties() {
+        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
+
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
-        properties.insert("delta.enableChangeDataFeed".to_string(), "true".to_string());
+        properties.insert(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string());
         assert_result_error_with_message(
-            validate_table_properties(&properties),
+            validate_extract_table_features_and_properties(properties),
             "Setting delta property 'delta.enableChangeDataFeed' is not supported",
         );
 
-        // Feature override properties are rejected
-        let mut properties = HashMap::new();
-        properties.insert(
-            "delta.feature.domainMetadata".to_string(),
+        // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected
+        let properties = HashMap::from([(
+            "delta.feature.deletionVectors".to_string(),
             "supported".to_string(),
-        );
+        )]);
         assert_result_error_with_message(
-            validate_table_properties(&properties),
-            "Setting feature override property 'delta.feature.domainMetadata' is not supported",
+            validate_extract_table_features_and_properties(properties),
+            "Enabling feature 'deletionVectors' via 'delta.feature.deletionVectors' is not supported",
+        );
+
+        // Clustering feature signal is rejected - users must use with_clustering_columns() instead
+        let properties = HashMap::from([(
+            "delta.feature.clustering".to_string(),
+            "supported".to_string(),
+        )]);
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Enabling feature 'clustering' via 'delta.feature.clustering' is not supported",
         );
 
         // Mixed properties with unsupported delta property are rejected
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert("delta.appendOnly".to_string(), "true".to_string());
+        properties.insert(APPEND_ONLY.to_string(), "true".to_string());
         assert_result_error_with_message(
-            validate_table_properties(&properties),
+            validate_extract_table_features_and_properties(properties),
             "Setting delta property 'delta.appendOnly' is not supported",
         );
+    }
+
+    #[test]
+    fn test_clustering_support_valid() {
+        use crate::clustering::CLUSTERING_DOMAIN_NAME;
+        use crate::expressions::ColumnName;
+
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ]));
+
+        let mut reader_features = vec![];
+        let mut writer_features = vec![];
+
+        let dm = apply_clustering_for_table_create(
+            &schema,
+            &[ColumnName::new(["id"])],
+            &mut reader_features,
+            &mut writer_features,
+        )
+        .unwrap();
+
+        assert_eq!(dm.domain(), CLUSTERING_DOMAIN_NAME);
+        assert!(writer_features.contains(&TableFeature::DomainMetadata));
+        assert!(writer_features.contains(&TableFeature::ClusteredTable));
+        // DomainMetadata is a writer-only feature, ClusteredTable is also writer-only
+        // So reader_features should be empty
+        assert!(reader_features.is_empty());
+    }
+
+    #[test]
+    fn test_clustering_support_multiple_columns() {
+        use crate::expressions::ColumnName;
+
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("date", DataType::STRING, true),
+            StructField::new("region", DataType::STRING, true),
+        ]));
+
+        let mut reader_features = vec![];
+        let mut writer_features = vec![];
+
+        let dm = apply_clustering_for_table_create(
+            &schema,
+            &[ColumnName::new(["id"]), ColumnName::new(["date"])],
+            &mut reader_features,
+            &mut writer_features,
+        )
+        .unwrap();
+
+        // Verify domain metadata contains both columns with correct names
+        let config: serde_json::Value = serde_json::from_str(dm.configuration()).unwrap();
+        let clustering_cols = config["clusteringColumns"].as_array().unwrap();
+        assert_eq!(clustering_cols.len(), 2);
+        assert_eq!(clustering_cols[0], serde_json::json!(["id"]));
+        assert_eq!(clustering_cols[1], serde_json::json!(["date"]));
+    }
+
+    #[test]
+    fn test_clustering_column_not_in_schema() {
+        use crate::expressions::ColumnName;
+
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "id",
+            DataType::INTEGER,
+            false,
+        )]));
+
+        let mut reader_features = vec![];
+        let mut writer_features = vec![];
+
+        let result = apply_clustering_for_table_create(
+            &schema,
+            &[ColumnName::new(["nonexistent"])],
+            &mut reader_features,
+            &mut writer_features,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Clustering column 'nonexistent' not found in schema"));
+    }
+
+    #[test]
+    fn test_clustering_nested_column_rejected() {
+        use crate::expressions::ColumnName;
+
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("nested", DataType::STRING, true),
+        ]));
+
+        let mut reader_features = vec![];
+        let mut writer_features = vec![];
+
+        // Create a nested column path
+        let nested_col = ColumnName::new(["nested", "field"]);
+        let result = apply_clustering_for_table_create(
+            &schema,
+            &[nested_col],
+            &mut reader_features,
+            &mut writer_features,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be a top-level column"));
+    }
+
+    #[test]
+    fn test_with_data_layout() {
+        let schema = test_schema();
+
+        let builder = CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["id"]));
+
+        assert!(builder.data_layout.is_clustered());
     }
 }
