@@ -249,8 +249,7 @@ impl EngineData for ArrowEngineData {
         // Reorder getters according to the requested column order
         let mut getters = vec![];
         for column in leaf_columns {
-            let key: Vec<String> = column.as_ref().iter().map(|s| s.to_string()).collect();
-            match getter_map.remove(&key) {
+            match getter_map.remove(&column.as_ref().to_vec()) {
                 Some(getter) => getters.push(getter),
                 None => {
                     return Err(Error::MissingColumn(format!(
