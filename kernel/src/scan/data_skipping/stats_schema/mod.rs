@@ -329,12 +329,14 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 
 /// Checks if a data type is eligible for min/max file skipping.
 ///
+/// This is also used to validate clustering column types, since clustering requires
+/// per-file statistics on clustering columns.
+///
 /// Note: Boolean and Binary are intentionally excluded as min/max statistics provide minimal
 /// skipping benefit for low-cardinality or opaque data types.
 ///
 /// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
-#[allow(unused)]
-fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
+pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
         data_type,
         &PrimitiveType::Byte
