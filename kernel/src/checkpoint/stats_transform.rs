@@ -31,8 +31,8 @@ pub(crate) struct StatsTransformConfig {
 impl StatsTransformConfig {
     pub(super) fn from_table_properties(properties: &TableProperties) -> Self {
         Self {
-            write_stats_as_json: properties.checkpoint_write_stats_as_json.unwrap_or(true),
-            write_stats_as_struct: properties.checkpoint_write_stats_as_struct.unwrap_or(false),
+            write_stats_as_json: properties.should_write_stats_as_json(),
+            write_stats_as_struct: properties.should_write_stats_as_struct(),
         }
     }
 }
@@ -100,9 +100,61 @@ pub(crate) fn build_stats_transform(
     Arc::new(Expression::transform(outer_transform))
 }
 
+/// Builds a read schema that includes `stats_parsed` in the Add action.
+///
+/// The read schema must include `stats_parsed` for ALL reads (checkpoints + commits)
+/// even though commits don't have `stats_parsed`. This ensures the column exists
+/// (as nulls) so COALESCE can operate correctly.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The `add` field is not found or is not a struct type
+/// - The `stats_parsed` field already exists in the Add schema
+pub(crate) fn build_checkpoint_read_schema_with_stats(
+    base_schema: &StructType,
+    stats_schema: &StructType,
+) -> DeltaResult<SchemaRef> {
+    transform_add_schema(base_schema, |add_struct| {
+        // Validate stats_parsed isn't already present
+        if add_struct.field(STATS_PARSED_FIELD).is_some() {
+            return Err(Error::generic(
+                "stats_parsed field already exists in Add schema",
+            ));
+        }
+        Ok(add_stats_parsed_to_add_schema(add_struct, stats_schema))
+    })
+}
+
+/// Builds the output schema based on configuration.
+///
+/// The output schema determines which fields are included in the checkpoint:
+/// - If `writeStatsAsJson=false`: `stats` field is excluded
+/// - If `writeStatsAsStruct=true`: `stats_parsed` field is included
+///
+/// # Errors
+///
+/// Returns an error if the `add` field is not found or is not a struct type.
+pub(crate) fn build_checkpoint_output_schema(
+    config: &StatsTransformConfig,
+    base_schema: &StructType,
+    stats_schema: &StructType,
+) -> DeltaResult<SchemaRef> {
+    transform_add_schema(base_schema, |add_struct| {
+        Ok(build_add_output_schema(config, add_struct, stats_schema))
+    })
+}
+
+// ========================
+// Private helpers
+// ========================
+
 /// Builds expression: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats, schema))`
 ///
 /// This expression prefers existing stats_parsed, falling back to parsing JSON stats.
+/// If `stats_parsed` is non-null, the data originated from a checkpoint (commits only
+/// contain JSON stats, so `stats_parsed` will be null for commit-sourced rows).
+///
 /// Column paths are relative to the full batch (not the nested Add struct), so we use
 /// ["add", "stats"] instead of just ["stats"].
 fn build_stats_parsed_expr(stats_schema: SchemaRef) -> ExpressionRef {
@@ -132,9 +184,8 @@ static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
 /// This helper applies a transformation function to the Add struct and returns
 /// a new schema with the modified Add field.
 ///
-// TODO: Consider adding StructType helper methods (e.g., with_field_inserted,
-// with_field_removed) to reduce boilerplate. Schemas are Arc-shared so cloning
-// is necessary, but dedicated methods would be more ergonomic.
+// TODO(https://github.com/delta-io/delta-kernel-rs/issues/1820): Replace manual field
+// iteration with StructType helper methods (e.g., with_field_inserted, with_field_removed).
 ///
 /// # Errors
 ///
@@ -177,32 +228,6 @@ fn transform_add_schema(
     Ok(Arc::new(StructType::new_unchecked(fields)))
 }
 
-/// Builds a read schema that includes `stats_parsed` in the Add action.
-///
-/// The read schema must include `stats_parsed` for ALL reads (checkpoints + commits)
-/// even though commits don't have `stats_parsed`. This ensures the column exists
-/// (as nulls) so COALESCE can operate correctly.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The `add` field is not found or is not a struct type
-/// - The `stats_parsed` field already exists in the Add schema
-pub(crate) fn build_checkpoint_read_schema_with_stats(
-    base_schema: &StructType,
-    stats_schema: &StructType,
-) -> DeltaResult<SchemaRef> {
-    transform_add_schema(base_schema, |add_struct| {
-        // Validate stats_parsed isn't already present
-        if add_struct.field(STATS_PARSED_FIELD).is_some() {
-            return Err(Error::generic(
-                "stats_parsed field already exists in Add schema",
-            ));
-        }
-        Ok(add_stats_parsed_to_add_schema(add_struct, stats_schema))
-    })
-}
-
 /// Adds `stats_parsed` field after `stats` in the Add action schema.
 fn add_stats_parsed_to_add_schema(
     add_schema: &StructType,
@@ -222,25 +247,6 @@ fn add_stats_parsed_to_add_schema(
     }
 
     StructType::new_unchecked(fields)
-}
-
-/// Builds the output schema based on configuration.
-///
-/// The output schema determines which fields are included in the checkpoint:
-/// - If `writeStatsAsJson=false`: `stats` field is excluded
-/// - If `writeStatsAsStruct=true`: `stats_parsed` field is included
-///
-/// # Errors
-///
-/// Returns an error if the `add` field is not found or is not a struct type.
-pub(crate) fn build_checkpoint_output_schema(
-    config: &StatsTransformConfig,
-    base_schema: &StructType,
-    stats_schema: &StructType,
-) -> DeltaResult<SchemaRef> {
-    transform_add_schema(base_schema, |add_struct| {
-        Ok(build_add_output_schema(config, add_struct, stats_schema))
-    })
 }
 
 fn build_add_output_schema(
