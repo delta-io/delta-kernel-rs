@@ -1365,6 +1365,7 @@ mod tests {
         }
     }
 
+    // Verify that the `assert_stats_match` test helper correctly accepts equivalent values.
     #[test]
     fn test_assert_stats_match_accepts_equivalent_values() {
         // Extra kernel keys are ignored
@@ -1393,6 +1394,7 @@ mod tests {
         assert_stats_match(&spark, &kernel, "");
     }
 
+    // Verify that the `assert_stats_match` test helper correctly rejects mismatched values.
     #[test]
     fn test_assert_stats_match_rejects_mismatches() {
         let result = std::panic::catch_unwind(|| {
@@ -1425,13 +1427,12 @@ mod tests {
     /// numRecords/nullCount/minValues/maxValues against Spark's stats from the delta log.
     #[test]
     fn test_collect_stats_matches_spark() {
-        let test_dir = test_utils::load_test_data("tests/data", "stats-writing-all-types").unwrap();
-        let test_path = test_dir
-            .path()
-            .join("stats-writing-all-types")
-            .join("delta");
+        // ===== GIVEN =====
+        // Load a PySpark-generated Delta table containing all supported stat types
+        // and extract Spark's reference stats from the commit log.
+        let test_path =
+            std::fs::canonicalize("./tests/data/stats-writing-all-types/delta").unwrap();
 
-        // Read commit 1 JSON to get Spark's stats and parquet file path
         let commit_path = test_path
             .join("_delta_log")
             .join("00000000000000000001.json");
@@ -1464,7 +1465,8 @@ mod tests {
         let spark_stats: serde_json::Value =
             serde_json::from_str(&spark_stats_json).expect("parse Spark stats JSON");
 
-        // Read parquet file directly
+        // ===== WHEN =====
+        // Read the same parquet file and compute stats using kernel's collect_stats.
         let parquet_file_path = test_path.join(&parquet_path);
         let file = std::fs::File::open(&parquet_file_path).expect("open parquet file");
         let builder =
@@ -1487,7 +1489,8 @@ mod tests {
         let kernel_stats: serde_json::Value =
             serde_json::from_str(kernel_stats_json_str).expect("parse kernel stats JSON");
 
-        // Compare numRecords
+        // ===== THEN =====
+        // Kernel stats must match Spark's numRecords, nullCount, minValues, and maxValues.
         assert_eq!(
             spark_stats["numRecords"], kernel_stats["numRecords"],
             "numRecords mismatch"
