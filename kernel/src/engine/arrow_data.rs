@@ -257,21 +257,9 @@ impl EngineData for ArrowEngineData {
         for column in leaf_columns {
             match column_map.get(column.as_ref()) {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
-                Some(ColumnState::AwaitingGetter(_)) => {
+                _ => {
                     return Err(Error::MissingColumn(format!(
                         "Column {} not found in the data",
-                        column
-                    )));
-                }
-                Some(ColumnState::Parent) => {
-                    return Err(Error::internal_error(format!(
-                        "Column {} is a parent path, not a leaf column",
-                        column
-                    )));
-                }
-                None => {
-                    return Err(Error::internal_error(format!(
-                        "Column {} disappeared from column map",
                         column
                     )));
                 }
@@ -1051,6 +1039,55 @@ mod tests {
 
         // Verify values match requested order, not schema order
         assert_eq!(visitor.values, vec![(1000, 10, 100, 1), (2000, 20, 200, 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_visit_duplicate_column_error() -> DeltaResult<()> {
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create batch with simple columns
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("field_a", ArrowDataType::Int32, false),
+                ArrowField::new("field_a", ArrowDataType::Int32, false), // Duplicate column name
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+
+        // Request the duplicate column
+        static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> =
+            LazyLock::new(|| vec![ColumnName::new(["field_a"])]);
+
+        struct DummyVisitor;
+        impl RowVisitor for DummyVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::INTEGER]);
+                (&REQUESTED_COLUMNS, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                _row_count: usize,
+                _getters: &[&'a dyn crate::engine_data::GetData<'a>],
+            ) -> DeltaResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut visitor = DummyVisitor;
+        let result = ArrowEngineData::new(batch).visit_rows(&REQUESTED_COLUMNS, &mut visitor);
+
+        assert_result_error_with_message(
+            result,
+            "Column field_a already has a getter - duplicate column?",
+        );
         Ok(())
     }
 }
