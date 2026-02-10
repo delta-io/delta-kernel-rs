@@ -117,6 +117,10 @@ pub enum Error {
     #[error("Selection vector is larger than data length: {0}")]
     InvalidSelectionVector(String),
 
+    /// Transaction state is invalid for the requested operation
+    #[error("Invalid transaction state: {0}")]
+    InvalidTransactionState(String),
+
     /// A specified URL was invalid
     #[error("Invalid url: {0}")]
     InvalidUrl(#[from] url::ParseError),
@@ -273,6 +277,10 @@ impl Error {
 
     pub fn invalid_protocol(msg: impl ToString) -> Self {
         Self::InvalidProtocol(msg.to_string())
+    }
+
+    pub fn invalid_transaction_state(msg: impl ToString) -> Self {
+        Self::InvalidTransactionState(msg.to_string())
     }
 
     pub fn unsupported(msg: impl ToString) -> Self {
