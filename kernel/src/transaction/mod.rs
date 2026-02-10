@@ -48,6 +48,11 @@ pub mod create_table;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod create_table;
 
+#[cfg(feature = "internal-api")]
+pub mod data_layout;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod data_layout;
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -366,6 +371,7 @@ impl Transaction {
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
+        clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
         // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
@@ -393,10 +399,7 @@ impl Transaction {
             data_change: true,
             is_blind_append: false,
             dv_matched_files: vec![],
-            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
-            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
-            // return the correct columns for the new table.
-            clustering_columns: None,
+            clustering_columns,
         })
     }
 
