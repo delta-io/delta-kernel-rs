@@ -533,11 +533,14 @@ pub(crate) fn collect_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{Array, Int32Array, Int64Array, StringArray};
+    use crate::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
     use crate::arrow::buffer::NullBuffer;
+    use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::{Fields, Schema};
     use crate::arrow::datatypes::{Int32Type, Int64Type};
+    use crate::engine::arrow_expression::evaluate_expression::to_json;
     use crate::expressions::column_name;
+    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     #[test]
     fn test_collect_stats_single_batch() {
@@ -1274,5 +1277,233 @@ mod tests {
             .unwrap()
             .as_primitive::<T>()
             .value(0)
+    }
+
+    /// Recursively extracts leaf column names from an Arrow schema for stats collection.
+    fn extract_leaf_columns(fields: &Fields, prefix: &[String]) -> Vec<ColumnName> {
+        let mut columns = Vec::new();
+        for field in fields.iter() {
+            let mut path = prefix.to_vec();
+            path.push(field.name().clone());
+            match field.data_type() {
+                DataType::Struct(sub_fields) => {
+                    columns.extend(extract_leaf_columns(sub_fields, &path));
+                }
+                _ => {
+                    columns.push(ColumnName::new(path));
+                }
+            }
+        }
+        columns
+    }
+
+    /// Recursively compares Spark stats JSON against kernel stats JSON.
+    /// Only checks keys present in `spark_val`; kernel may have extra keys.
+    fn assert_stats_match(
+        spark_val: &serde_json::Value,
+        kernel_val: &serde_json::Value,
+        path: &str,
+    ) {
+        match (spark_val, kernel_val) {
+            (serde_json::Value::Object(spark_map), serde_json::Value::Object(kernel_map)) => {
+                for (key, spark_child) in spark_map {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let kernel_child = kernel_map
+                        .get(key)
+                        .unwrap_or_else(|| panic!("Kernel stats missing key: {child_path}"));
+                    assert_stats_match(spark_child, kernel_child, &child_path);
+                }
+            }
+            (serde_json::Value::Number(s), serde_json::Value::Number(k)) => {
+                let sv = s.as_f64().unwrap();
+                let kv = k.as_f64().unwrap();
+                assert!(
+                    (sv - kv).abs() < 1e-6,
+                    "Numeric mismatch at {path}: spark={sv}, kernel={kv}"
+                );
+            }
+            (serde_json::Value::String(s), serde_json::Value::String(k)) => {
+                // Spark uses "Z" suffix for TZ timestamps and no suffix for NTZ.
+                let s_normalized = s.trim_end_matches('Z').trim_end_matches("+00:00");
+                let k_normalized = k.trim_end_matches('Z').trim_end_matches("+00:00");
+
+                // Spark (Jackson) always includes fractional seconds (e.g., ".000") while Arrow's
+                // JSON encoder omits them when they are zero. Strip zero-only fractional parts
+                // so both formats compare equal.
+                if s_normalized.contains('T') && k_normalized.contains('T') {
+                    let normalize_ts = |ts: &str| -> String {
+                        if let Some(dot_pos) = ts.rfind('.') {
+                            let frac = &ts[dot_pos + 1..];
+                            if frac.chars().all(|c| c == '0') {
+                                return ts[..dot_pos].to_string();
+                            }
+                            let trimmed = frac.trim_end_matches('0');
+                            return format!("{}.{trimmed}", &ts[..dot_pos]);
+                        }
+                        ts.to_string()
+                    };
+                    let s_norm = normalize_ts(s_normalized);
+                    let k_norm = normalize_ts(k_normalized);
+                    assert_eq!(
+                        s_norm, k_norm,
+                        "Timestamp mismatch at {path}: spark={s}, kernel={k}"
+                    );
+                } else {
+                    assert_eq!(s, k, "String mismatch at {path}: spark={s}, kernel={k}");
+                }
+            }
+            _ => {
+                assert_eq!(
+                    spark_val, kernel_val,
+                    "Value mismatch at {path}: spark={spark_val}, kernel={kernel_val}"
+                );
+            }
+        }
+    }
+
+    // Verify that the `assert_stats_match` test helper correctly accepts equivalent values.
+    #[test]
+    fn test_assert_stats_match_accepts_equivalent_values() {
+        // Extra kernel keys are ignored
+        let spark = serde_json::json!({"a": 1, "b": "hello"});
+        let kernel = serde_json::json!({"a": 1, "b": "hello", "extra": true});
+        assert_stats_match(&spark, &kernel, "");
+
+        // Nested objects with extra kernel keys
+        let spark = serde_json::json!({"outer": {"inner": 42}});
+        let kernel = serde_json::json!({"outer": {"inner": 42, "extra": 0}});
+        assert_stats_match(&spark, &kernel, "");
+
+        // Timestamp with trailing ".000Z" vs no fractional part
+        let spark = serde_json::json!({"ts": "2023-06-15T12:30:00.000Z"});
+        let kernel = serde_json::json!({"ts": "2023-06-15T12:30:00Z"});
+        assert_stats_match(&spark, &kernel, "");
+
+        // Timestamp NTZ (no Z suffix) with trailing ".000"
+        let spark = serde_json::json!({"ts": "2023-06-15T12:30:00.000"});
+        let kernel = serde_json::json!({"ts": "2023-06-15T12:30:00"});
+        assert_stats_match(&spark, &kernel, "");
+
+        // Non-zero fractional seconds with different trailing zeros
+        let spark = serde_json::json!({"ts": "2023-06-15T12:30:00.500Z"});
+        let kernel = serde_json::json!({"ts": "2023-06-15T12:30:00.5Z"});
+        assert_stats_match(&spark, &kernel, "");
+    }
+
+    // Verify that the `assert_stats_match` test helper correctly rejects mismatched values.
+    #[test]
+    fn test_assert_stats_match_rejects_mismatches() {
+        let result = std::panic::catch_unwind(|| {
+            let spark = serde_json::json!({"a": 1});
+            let kernel = serde_json::json!({"b": 1});
+            assert_stats_match(&spark, &kernel, "");
+        });
+        assert!(result.is_err(), "should panic on missing key");
+
+        let result = std::panic::catch_unwind(|| {
+            let spark = serde_json::json!({"val": 1.0});
+            let kernel = serde_json::json!({"val": 2.0});
+            assert_stats_match(&spark, &kernel, "");
+        });
+        assert!(result.is_err(), "should panic on numeric mismatch");
+
+        let result = std::panic::catch_unwind(|| {
+            let spark = serde_json::json!({"s": "alpha"});
+            let kernel = serde_json::json!({"s": "beta"});
+            assert_stats_match(&spark, &kernel, "");
+        });
+        assert!(result.is_err(), "should panic on string mismatch");
+    }
+
+    /// Validates that kernel's `collect_stats()` produces file statistics matching Spark's output.
+    ///
+    /// Uses test data generated by PySpark containing all supported stat types: integers, floats,
+    /// date, timestamp, timestamp_ntz, string, decimal, boolean, binary, array, map, and nested
+    /// structs. Reads the parquet data, recomputes stats with kernel, and compares
+    /// numRecords/nullCount/minValues/maxValues against Spark's stats from the delta log.
+    #[test]
+    fn test_collect_stats_matches_spark() {
+        // ===== GIVEN =====
+        // Load a PySpark-generated Delta table containing all supported stat types
+        // and extract Spark's reference stats from the commit log.
+        let test_path =
+            std::fs::canonicalize("./tests/data/stats-writing-all-types/delta").unwrap();
+
+        let commit_path = test_path
+            .join("_delta_log")
+            .join("00000000000000000001.json");
+        let commit_data = std::fs::read_to_string(&commit_path).expect("read commit 1 json");
+
+        let mut spark_stats_json = None;
+        let mut parquet_path = None;
+
+        for line in commit_data.lines() {
+            let action: serde_json::Value = serde_json::from_str(line).expect("parse JSON line");
+            if let Some(add) = action.get("add") {
+                spark_stats_json = Some(
+                    add["stats"]
+                        .as_str()
+                        .expect("stats should be a string")
+                        .to_string(),
+                );
+                parquet_path = Some(
+                    add["path"]
+                        .as_str()
+                        .expect("path should be a string")
+                        .to_string(),
+                );
+                break;
+            }
+        }
+
+        let spark_stats_json = spark_stats_json.expect("should find add action with stats");
+        let parquet_path = parquet_path.expect("should find add action with path");
+        let spark_stats: serde_json::Value =
+            serde_json::from_str(&spark_stats_json).expect("parse Spark stats JSON");
+
+        // ===== WHEN =====
+        // Read the same parquet file and compute stats using kernel's collect_stats.
+        let parquet_file_path = test_path.join(&parquet_path);
+        let file = std::fs::File::open(&parquet_file_path).expect("open parquet file");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("create parquet reader builder");
+        let schema = builder.schema().clone();
+        let reader = builder.build().expect("build parquet reader");
+
+        let batches: Vec<RecordBatch> = reader.map(|b| b.expect("read batch")).collect();
+        let record_batch = concat_batches(&schema, &batches).expect("concat batches");
+
+        // Build stats_columns from all leaf columns in the parquet schema
+        let stats_columns = extract_leaf_columns(schema.fields(), &[]);
+        let stats_struct = collect_stats(&record_batch, &stats_columns).expect("collect stats");
+
+        // Convert kernel stats to JSON
+        let json_array = to_json(&stats_struct).expect("convert stats to JSON");
+        let json_strings = json_array.as_string::<i32>();
+        assert_eq!(json_strings.len(), 1, "should have exactly one stats row");
+        let kernel_stats_json_str = json_strings.value(0);
+        let kernel_stats: serde_json::Value =
+            serde_json::from_str(kernel_stats_json_str).expect("parse kernel stats JSON");
+
+        // ===== THEN =====
+        // Kernel stats must match Spark's numRecords, nullCount, minValues, and maxValues.
+        assert_eq!(
+            spark_stats["numRecords"], kernel_stats["numRecords"],
+            "numRecords mismatch"
+        );
+
+        // Compare nullCount, minValues, maxValues (only keys present in Spark's stats)
+        for section in &["nullCount", "minValues", "maxValues"] {
+            if let Some(spark_section) = spark_stats.get(*section) {
+                let kernel_section = kernel_stats
+                    .get(*section)
+                    .unwrap_or_else(|| panic!("Kernel stats missing {section}"));
+                assert_stats_match(spark_section, kernel_section, section);
+            }
+        }
     }
 }
