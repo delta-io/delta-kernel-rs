@@ -60,6 +60,9 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         "delta.dataSkippingStatsColumns" => {
             props.data_skipping_stats_columns = Some(parse_column_names(v)?)
         }
+        "delta.dataSkippingStringPrefixLength" => {
+            props.data_skipping_string_prefix_length = Some(parse_non_negative(v)?)
+        }
         "delta.deletedFileRetentionDuration" => {
             props.deleted_file_retention_duration = Some(parse_interval(v)?)
         }

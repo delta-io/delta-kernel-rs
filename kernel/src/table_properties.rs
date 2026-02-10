@@ -73,6 +73,10 @@ pub struct TableProperties {
     /// `delta.dataSkippingNumIndexedCols`.
     pub data_skipping_stats_columns: Option<Vec<ColumnName>>,
 
+    /// For string columns, the prefix length to store in the data skipping index. When set,
+    /// overrides the default prefix length of 32 characters.
+    pub data_skipping_string_prefix_length: Option<u64>,
+
     /// The shortest duration for Delta Lake to keep logically deleted data files before deleting
     /// them physically. This is to prevent failures in stale readers after compactions or partition
     /// overwrites.
@@ -307,6 +311,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_data_skipping_string_prefix_length() {
+        let properties = HashMap::from([(
+            "delta.dataSkippingStringPrefixLength".to_string(),
+            "64".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(
+            table_properties.data_skipping_string_prefix_length,
+            Some(64)
+        );
+    }
+
+    #[test]
     fn known_key_unknown_val() {
         let properties = HashMap::from([("delta.appendOnly".to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
@@ -350,6 +367,7 @@ mod tests {
             ("delta.columnMapping.mode", "id"),
             ("delta.dataSkippingNumIndexedCols", "-1"),
             ("delta.dataSkippingStatsColumns", "col1,col2"),
+            ("delta.dataSkippingStringPrefixLength", "64"),
             ("delta.deletedFileRetentionDuration", "interval 1 second"),
             ("delta.enableChangeDataFeed", "true"),
             ("delta.enableDeletionVectors", "true"),
@@ -393,6 +411,7 @@ mod tests {
             column_mapping_mode: Some(ColumnMappingMode::Id),
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
             data_skipping_stats_columns: Some(vec![column_name!("col1"), column_name!("col2")]),
+            data_skipping_string_prefix_length: Some(64),
             deleted_file_retention_duration: Some(Duration::new(1, 0)),
             enable_change_data_feed: Some(true),
             enable_deletion_vectors: Some(true),

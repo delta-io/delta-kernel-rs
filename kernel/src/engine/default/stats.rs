@@ -22,11 +22,8 @@ use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::expressions::ColumnName;
 use crate::{DeltaResult, Error};
 
-/// Maximum prefix length for string statistics (Delta protocol requirement).
-const STRING_PREFIX_LENGTH: usize = 32;
-
-/// Maximum expansion when searching for a valid max truncation point.
-const STRING_EXPANSION_LIMIT: usize = STRING_PREFIX_LENGTH * 2;
+/// Default prefix length for string statistics (Delta protocol requirement).
+pub(crate) const DEFAULT_STRING_PREFIX_LENGTH: usize = 32;
 
 /// ASCII DEL character (0x7F) - used as tie-breaker for max values when truncated char is ASCII.
 const ASCII_MAX_CHAR: char = '\x7F';
@@ -44,24 +41,17 @@ const UTF8_MAX_CHAR: char = '\u{10FFFF}';
 /// be <= the original, which is correct for min statistics.
 ///
 /// Returns the original string if it's already within the limit.
-fn truncate_min_string(s: &str) -> &str {
-    if s.len() <= STRING_PREFIX_LENGTH {
+fn truncate_min_string(s: &str, string_prefix_length: usize) -> &str {
+    if s.chars().count() <= string_prefix_length {
         return s;
     }
-    // Find char boundary at or before STRING_PREFIX_LENGTH
-    let end = s
-        .char_indices()
-        .take(STRING_PREFIX_LENGTH + 1)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
 
-    // Take exactly STRING_PREFIX_LENGTH chars
+    // Take exactly `string_prefix_length` chars.
     let truncated_end = s
         .char_indices()
-        .nth(STRING_PREFIX_LENGTH)
+        .nth(string_prefix_length)
         .map(|(i, _)| i)
-        .unwrap_or(end);
+        .unwrap_or(s.len());
 
     &s[..truncated_end]
 }
@@ -78,19 +68,20 @@ fn truncate_min_string(s: &str) -> &str {
 ///
 /// Returns `Cow::Borrowed` if no truncation needed (avoiding allocation), `Cow::Owned` when
 /// truncation is performed, or `None` if the string is too long to truncate safely.
-fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
-    if s.len() <= STRING_PREFIX_LENGTH {
+fn truncate_max_string(s: &str, string_prefix_length: usize) -> Option<Cow<'_, str>> {
+    if s.chars().count() <= string_prefix_length {
         return Some(Cow::Borrowed(s));
     }
 
-    // Start at STRING_PREFIX_LENGTH chars
+    // Start at `string_prefix_length` chars.
     let char_indices: Vec<(usize, char)> = s.char_indices().collect();
 
-    // We can expand up to STRING_EXPANSION_LIMIT chars looking for a valid truncation point
-    let max_chars = char_indices.len().min(STRING_EXPANSION_LIMIT);
+    // We can expand up to 2x prefix chars looking for a valid truncation point.
+    let string_expansion_limit = string_prefix_length.saturating_mul(2);
+    let max_chars = char_indices.len().min(string_expansion_limit);
 
-    // Start from STRING_PREFIX_LENGTH and look for a valid truncation point
-    for len in STRING_PREFIX_LENGTH..=max_chars {
+    // Start from `string_prefix_length` and look for a valid truncation point.
+    for len in string_prefix_length..=max_chars {
         if len >= char_indices.len() {
             // Reached end of string - return original
             return Some(Cow::Borrowed(s));
@@ -204,7 +195,11 @@ fn agg_decimal(
 }
 
 /// Compute aggregation for a string array with truncation.
-fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
+fn agg_string(
+    column: &ArrayRef,
+    agg: Agg,
+    string_prefix_length: usize,
+) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_string_opt::<i32>()
         .ok_or_else(|| Error::generic("Failed to downcast column to StringArray"))?;
@@ -214,12 +209,12 @@ fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
     };
     match (result, agg) {
         (Some(s), Agg::Min) => {
-            let truncated = truncate_min_string(s);
+            let truncated = truncate_min_string(s, string_prefix_length);
             Ok(Some(
                 Arc::new(StringArray::from(vec![Some(truncated)])) as ArrayRef
             ))
         }
-        (Some(s), Agg::Max) => Ok(truncate_max_string(s)
+        (Some(s), Agg::Max) => Ok(truncate_max_string(s, string_prefix_length)
             .map(|t| Arc::new(StringArray::from(vec![Some(&*t)])) as ArrayRef)),
         (None, _) => Ok(None),
     }
@@ -230,7 +225,11 @@ fn agg_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
 /// Unlike StringArray, Arrow's compute kernels don't provide min/max for LargeStringArray,
 /// so we iterate manually. `iter()` yields `Option<&str>` per element (None for nulls),
 /// and `flatten()` filters out nulls so we only compare non-null values.
-fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
+fn agg_large_string(
+    column: &ArrayRef,
+    agg: Agg,
+    string_prefix_length: usize,
+) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_string_opt::<i64>()
         .ok_or_else(|| Error::generic("Failed to downcast column to LargeStringArray"))?;
@@ -240,12 +239,12 @@ fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
     };
     match (result, agg) {
         (Some(s), Agg::Min) => {
-            let truncated = truncate_min_string(s);
+            let truncated = truncate_min_string(s, string_prefix_length);
             Ok(Some(
                 Arc::new(LargeStringArray::from(vec![Some(truncated)])) as ArrayRef,
             ))
         }
-        (Some(s), Agg::Max) => Ok(truncate_max_string(s)
+        (Some(s), Agg::Max) => Ok(truncate_max_string(s, string_prefix_length)
             .map(|t| Arc::new(LargeStringArray::from(vec![Some(&*t)])) as ArrayRef)),
         (None, _) => Ok(None),
     }
@@ -255,7 +254,11 @@ fn agg_large_string(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
 ///
 /// Like LargeStringArray, Arrow's compute kernels don't provide min/max for StringViewArray.
 /// See `agg_large_string` for explanation of `iter().flatten()`.
-fn agg_string_view(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
+fn agg_string_view(
+    column: &ArrayRef,
+    agg: Agg,
+    string_prefix_length: usize,
+) -> DeltaResult<Option<ArrayRef>> {
     let array = column
         .as_string_view_opt()
         .ok_or_else(|| Error::generic("Failed to downcast column to StringViewArray"))?;
@@ -265,19 +268,23 @@ fn agg_string_view(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>>
     };
     match (result, agg) {
         (Some(s), Agg::Min) => {
-            let truncated = truncate_min_string(s);
+            let truncated = truncate_min_string(s, string_prefix_length);
             Ok(Some(
                 Arc::new(StringViewArray::from(vec![Some(truncated)])) as ArrayRef
             ))
         }
-        (Some(s), Agg::Max) => Ok(truncate_max_string(s)
+        (Some(s), Agg::Max) => Ok(truncate_max_string(s, string_prefix_length)
             .map(|t| Arc::new(StringViewArray::from(vec![Some(&*t)])) as ArrayRef)),
         (None, _) => Ok(None),
     }
 }
 
 /// Compute min or max for a leaf column based on its data type.
-fn compute_leaf_agg(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>> {
+fn compute_leaf_agg(
+    column: &ArrayRef,
+    agg: Agg,
+    string_prefix_length: usize,
+) -> DeltaResult<Option<ArrayRef>> {
     match column.data_type() {
         // Integer types
         DataType::Int8 => agg_primitive::<Int8Type>(column, agg),
@@ -315,9 +322,9 @@ fn compute_leaf_agg(column: &ArrayRef, agg: Agg) -> DeltaResult<Option<ArrayRef>
         DataType::Decimal128(p, s) => agg_decimal(column, *p, *s, agg),
 
         // String types (with truncation)
-        DataType::Utf8 => agg_string(column, agg),
-        DataType::LargeUtf8 => agg_large_string(column, agg),
-        DataType::Utf8View => agg_string_view(column, agg),
+        DataType::Utf8 => agg_string(column, agg, string_prefix_length),
+        DataType::LargeUtf8 => agg_large_string(column, agg, string_prefix_length),
+        DataType::Utf8View => agg_string_view(column, agg, string_prefix_length),
 
         // Unsupported types (structs handled separately, others return no min/max)
         _ => Ok(None),
@@ -345,6 +352,7 @@ fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
     filter: &ColumnTrie<'_>,
+    string_prefix_length: usize,
 ) -> DeltaResult<ColumnStats> {
     match column.data_type() {
         DataType::Struct(fields) => {
@@ -366,7 +374,12 @@ fn compute_column_stats(
             for (i, field) in fields.iter().enumerate() {
                 path.push(field.name().to_string());
 
-                let child_stats = compute_column_stats(fixed_struct.column(i), path, filter)?;
+                let child_stats = compute_column_stats(
+                    fixed_struct.column(i),
+                    path,
+                    filter,
+                    string_prefix_length,
+                )?;
 
                 if let Some(arr) = child_stats.null_count {
                     null_fields.push(Field::new(field.name(), arr.data_type().clone(), true));
@@ -427,8 +440,8 @@ fn compute_column_stats(
 
             Ok(ColumnStats {
                 null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: compute_leaf_agg(column, Agg::Min)?,
-                max_value: compute_leaf_agg(column, Agg::Max)?,
+                min_value: compute_leaf_agg(column, Agg::Min, string_prefix_length)?,
+                max_value: compute_leaf_agg(column, Agg::Max, string_prefix_length)?,
             })
         }
     }
@@ -480,9 +493,11 @@ impl StatsAccumulator {
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist).
 ///   Only these columns will appear in nullCount/minValues/maxValues.
+/// * `string_prefix_length` - Maximum number of chars for string min/max truncation.
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
+    string_prefix_length: usize,
 ) -> DeltaResult<StructArray> {
     let filter = ColumnTrie::from_columns(stats_columns);
     let schema = batch.schema();
@@ -497,7 +512,7 @@ pub(crate) fn collect_stats(
         let column = batch.column(col_idx);
 
         // Single traversal computes all three stats
-        let stats = compute_column_stats(column, &mut path, &filter)?;
+        let stats = compute_column_stats(column, &mut path, &filter, string_prefix_length)?;
 
         if let Some(arr) = stats.null_count {
             null_counts.push(field.name(), arr);
@@ -546,7 +561,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("id")]).unwrap();
+        let stats =
+            collect_stats(&batch, &[column_name!("id")], DEFAULT_STRING_PREFIX_LENGTH).unwrap();
 
         assert_eq!(stats.len(), 1);
         let num_records = stats
@@ -574,7 +590,12 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("value")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("id"), column_name!("value")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // Check nullCount struct
         let null_count = stats
@@ -620,7 +641,8 @@ mod tests {
         .unwrap();
 
         // Only collect stats for "id", not "value"
-        let stats = collect_stats(&batch, &[column_name!("id")]).unwrap();
+        let stats =
+            collect_stats(&batch, &[column_name!("id")], DEFAULT_STRING_PREFIX_LENGTH).unwrap();
 
         let null_count = stats
             .column_by_name("nullCount")
@@ -655,7 +677,12 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("number"), column_name!("name")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("number"), column_name!("name")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // Check minValues
         let min_values = stats
@@ -724,7 +751,12 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("value")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("value")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // numRecords should be 3
         let num_records = stats
@@ -765,7 +797,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
 
         // No stats columns requested
-        let stats = collect_stats(&batch, &[]).unwrap();
+        let stats = collect_stats(&batch, &[], DEFAULT_STRING_PREFIX_LENGTH).unwrap();
 
         // Should still have numRecords and tightBounds
         assert!(stats.column_by_name("numRecords").is_some());
@@ -789,7 +821,12 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("text")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // Check minValues - should be truncated to exactly 32 chars
         let min_values = stats
@@ -842,7 +879,12 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("text")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // Check maxValues - should use UTF8_MAX_CHAR since 'À' (the truncated char) >= 0x7F
         let max_values = stats
@@ -876,7 +918,12 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("text")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         let min_values = stats
             .column_by_name("minValues")
@@ -912,38 +959,97 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_stats_string_custom_prefix_length() {
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+
+        let long_string = "a".repeat(50);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![long_string.as_str()]))],
+        )
+        .unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("text")], 8).unwrap();
+
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let text_min = min_values
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(text_min.value(0), "a".repeat(8));
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let text_max = max_values
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(text_max.value(0), format!("{}\x7F", "a".repeat(8)));
+    }
+
+    #[test]
     fn test_truncate_min_string() {
         // Short string - no truncation
-        assert_eq!(truncate_min_string("hello"), "hello");
+        assert_eq!(
+            truncate_min_string("hello", DEFAULT_STRING_PREFIX_LENGTH),
+            "hello"
+        );
 
         // Exactly 32 chars - no truncation
         let s32 = "a".repeat(32);
-        assert_eq!(truncate_min_string(&s32), s32);
+        assert_eq!(truncate_min_string(&s32, DEFAULT_STRING_PREFIX_LENGTH), s32);
 
         // Long string - truncated to 32 chars
         let s50 = "a".repeat(50);
-        assert_eq!(truncate_min_string(&s50), "a".repeat(32));
+        assert_eq!(
+            truncate_min_string(&s50, DEFAULT_STRING_PREFIX_LENGTH),
+            "a".repeat(32)
+        );
 
         // Multi-byte characters
         let multi = format!("{}À", "a".repeat(35)); // 'À' is 2 bytes in UTF-8
-        assert_eq!(truncate_min_string(&multi).chars().count(), 32);
+        assert_eq!(
+            truncate_min_string(&multi, DEFAULT_STRING_PREFIX_LENGTH)
+                .chars()
+                .count(),
+            32
+        );
     }
 
     #[test]
     fn test_truncate_max_string() {
         // Short string - no truncation, returns Cow::Borrowed
-        assert_eq!(truncate_max_string("hello").as_deref(), Some("hello"));
+        assert_eq!(
+            truncate_max_string("hello", DEFAULT_STRING_PREFIX_LENGTH).as_deref(),
+            Some("hello")
+        );
 
         // Exactly 32 chars - no truncation
         let s32 = "a".repeat(32);
-        assert_eq!(truncate_max_string(&s32).as_deref(), Some(s32.as_str()));
+        assert_eq!(
+            truncate_max_string(&s32, DEFAULT_STRING_PREFIX_LENGTH).as_deref(),
+            Some(s32.as_str())
+        );
 
         // Long ASCII string - truncated with 0x7F tie-breaker
         // The 33rd char ('a') is < 0x7F, so we use 0x7F
         let s50 = "a".repeat(50);
         let expected = format!("{}\x7F", "a".repeat(32));
         assert_eq!(
-            truncate_max_string(&s50).as_deref(),
+            truncate_max_string(&s50, DEFAULT_STRING_PREFIX_LENGTH).as_deref(),
             Some(expected.as_str())
         );
 
@@ -952,7 +1058,7 @@ mod tests {
         let non_ascii = format!("{}À{}", "a".repeat(32), "b".repeat(20));
         let expected = format!("{}\u{10FFFF}", "a".repeat(32));
         assert_eq!(
-            truncate_max_string(&non_ascii).as_deref(),
+            truncate_max_string(&non_ascii, DEFAULT_STRING_PREFIX_LENGTH).as_deref(),
             Some(expected.as_str())
         );
 
@@ -962,7 +1068,7 @@ mod tests {
         let with_max_char = format!("{}\u{10FFFF}b{}", "a".repeat(32), "c".repeat(10));
         let expected = format!("{}\u{10FFFF}\x7F", "a".repeat(32)); // 'b' < 0x7F
         assert_eq!(
-            truncate_max_string(&with_max_char).as_deref(),
+            truncate_max_string(&with_max_char, DEFAULT_STRING_PREFIX_LENGTH).as_deref(),
             Some(expected.as_str())
         );
     }
@@ -993,7 +1099,12 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(nested_struct) as ArrayRef]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("nested")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("nested")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // Check nullCount.nested.a = 0, nullCount.nested.b = 1
         let null_count = stats
@@ -1124,7 +1235,12 @@ mod tests {
         .unwrap();
 
         // Request stats for both columns
-        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("list_col")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("id"), column_name!("list_col")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         let null_count = stats
             .column_by_name("nullCount")
@@ -1204,7 +1320,12 @@ mod tests {
 
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("my_struct")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("my_struct")],
+            DEFAULT_STRING_PREFIX_LENGTH,
+        )
+        .unwrap();
 
         // Visualizing the data:
         // Row 0: struct=NULL,  (a=1, b=None are "invisible")

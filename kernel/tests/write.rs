@@ -1073,6 +1073,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            Some(write_context.string_prefix_length()),
         )
         .await?;
 
@@ -1247,6 +1248,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            Some(write_context.string_prefix_length()),
         )
         .await?;
 
