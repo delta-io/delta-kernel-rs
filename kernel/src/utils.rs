@@ -57,6 +57,23 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     Ok(url)
 }
 
+/// Normalize a table root URL to behave like a directory for `Url::join`.
+///
+/// Without a trailing slash, `Url::join` replaces the last segment instead of appending.
+pub(crate) fn normalize_table_root_url(mut table_root: Url) -> Url {
+    let path = table_root.path();
+    if !path.ends_with('/') {
+        if path.is_empty() {
+            table_root.set_path("/");
+        } else {
+            let mut new_path = path.to_string();
+            new_path.push('/');
+            table_root.set_path(&new_path);
+        }
+    }
+    table_root
+}
+
 #[allow(unused)]
 #[derive(Debug)]
 enum UriType {

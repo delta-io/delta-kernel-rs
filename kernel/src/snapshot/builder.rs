@@ -3,6 +3,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
+use crate::utils::normalize_table_root_url;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use tracing::{info, instrument};
@@ -39,25 +40,9 @@ pub struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new_for(mut table_root: Url) -> Self {
-        // Ensure `table_root` behaves like a directory for `Url::join`.
-        // Without a trailing slash, `join` replaces the last path segment instead of appending.
-        //
-        // Example:
-        // "s3://bucket/path/to/table".join("_delta_log/") -> "s3://bucket/path/to/_delta_log/" (wrong)
-        // "s3://bucket/path/to/table/".join("_delta_log/") -> "s3://bucket/path/to/table/_delta_log/" (correct)
-        let path = table_root.path();
-        if !path.ends_with('/') {
-            if path.is_empty() {
-                table_root.set_path("/");
-            } else {
-                let mut new_path = path.to_string();
-                new_path.push('/');
-                table_root.set_path(&new_path);
-            }
-        }
+    pub(crate) fn new_for(table_root: Url) -> Self {
         Self {
-            table_root: Some(table_root),
+            table_root: Some(normalize_table_root_url(table_root)),
             existing_snapshot: None,
             version: None,
             log_tail: Vec::new(),
@@ -183,6 +168,7 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
     use serde_json::json;
+    use test_utils::delta_path_for_version_at;
 
     use super::*;
 
@@ -197,7 +183,7 @@ mod tests {
         (engine, store, table_root)
     }
 
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &Url) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<dyn ObjectStore>, table_root: &Url) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -234,17 +220,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let table_prefix = _table_root
-            .path()
-            .trim_start_matches('/')
-            .trim_end_matches('/');
-        let log_prefix = if table_prefix.is_empty() {
-            "_delta_log".to_string()
-        } else {
-            format!("{table_prefix}/_delta_log")
-        };
-
-        let path = object_store::path::Path::from(format!("{log_prefix}/{:020}.json", 0).as_str());
+        let path = delta_path_for_version_at(table_root, 0, "json");
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -267,7 +243,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("{log_prefix}/{:020}.json", 1).as_str());
+        let path = delta_path_for_version_at(table_root, 1, "json");
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())

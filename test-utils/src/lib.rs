@@ -195,6 +195,19 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+/// get an ObjectStore path for a delta file rooted at a specific table URL
+pub fn delta_path_for_version_at(table_root: &Url, version: u64, suffix: &str) -> Path {
+    let table_prefix = table_root
+        .path()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    if table_prefix.is_empty() {
+        Path::from(format!("_delta_log/{version:020}.{suffix}").as_str())
+    } else {
+        Path::from(format!("{table_prefix}/_delta_log/{version:020}.{suffix}").as_str())
+    }
+}
+
 pub fn staged_commit_path_for_version(version: u64) -> Path {
     let uuid = uuid::Uuid::new_v4();
     let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");
@@ -214,6 +227,18 @@ pub async fn add_commit(
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = delta_path_for_version(version, "json");
+    store.put(&path, data.into()).await?;
+    Ok(())
+}
+
+/// put a commit file into the specified object store for a given table root URL.
+pub async fn add_commit_at(
+    store: &dyn ObjectStore,
+    table_root: &Url,
+    version: u64,
+    data: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = delta_path_for_version_at(table_root, version, "json");
     store.put(&path, data.into()).await?;
     Ok(())
 }
