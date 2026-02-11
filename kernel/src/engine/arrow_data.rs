@@ -1285,7 +1285,7 @@ mod tests {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
-                static NAMES: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
+                static COLUMNS: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
                     [
                         ColumnName::new(["s"]),
                         ColumnName::new(["i"]),
@@ -1301,7 +1301,7 @@ mod tests {
                     DataType::BOOLEAN,
                     DataType::BINARY,
                 ];
-                (&*NAMES, TYPES)
+                (&*COLUMNS, TYPES)
             }
 
             fn visit<'a>(
@@ -1323,16 +1323,7 @@ mod tests {
         }
 
         let mut visitor = TestVisitor { data: vec![] };
-        arrow_data.visit_rows(
-            &[
-                ColumnName::new(["s"]),
-                ColumnName::new(["i"]),
-                ColumnName::new(["l"]),
-                ColumnName::new(["b"]),
-                ColumnName::new(["bin"]),
-            ],
-            &mut visitor,
-        )?;
+        visitor.visit_rows_of(&arrow_data)?;
 
         // Verify RLE decompression: [val1, val1, val2, val2]
         let expected = vec![
