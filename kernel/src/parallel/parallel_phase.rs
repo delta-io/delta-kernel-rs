@@ -123,9 +123,11 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
+    use crate::log_segment::CheckpointReadInfo;
     use crate::parallel::sequential_phase::AfterSequential;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
@@ -191,7 +193,17 @@ mod tests {
             .map(|path| FileActionKey::new(*path, None))
             .collect();
 
-        ScanLogReplayProcessor::new_with_seen_files(engine, state_info, seen_file_keys)
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
+
+        ScanLogReplayProcessor::new_with_seen_files(
+            engine,
+            state_info,
+            checkpoint_info,
+            seen_file_keys,
+        )
     }
 
     // ============================================================
@@ -398,7 +410,13 @@ mod tests {
             AfterSequential::Done(_) => {}
             AfterSequential::Parallel { processor, files } => {
                 let processor = if with_serde {
-                    let serialized_state = processor.into_serializable_state()?;
+                    // TODO: Properly integrate checkpoint_info from parallel_scan_metadata API
+                    // For now, use a default checkpoint_info for serialization tests
+                    let checkpoint_info = CheckpointReadInfo {
+                        has_stats_parsed: false,
+                        checkpoint_read_schema: get_log_add_schema().clone(),
+                    };
+                    let serialized_state = processor.into_serializable_state(checkpoint_info)?;
                     ScanLogReplayProcessor::from_serializable_state(
                         engine.as_ref(),
                         serialized_state,

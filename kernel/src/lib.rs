@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -108,6 +109,8 @@ pub(crate) mod transforms;
 pub use log_path::LogPath;
 
 mod row_tracking;
+
+pub(crate) mod clustering;
 
 mod arrow_compat;
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]

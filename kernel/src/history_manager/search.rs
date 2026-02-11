@@ -170,49 +170,32 @@ mod tests {
         Ok(*x)
     }
 
-    #[test]
-    fn test_exact_match() {
+    #[rstest::rstest]
+    #[case::exact_least_upper(5, Bound::LeastUpper, 2)]
+    #[case::exact_greatest_lower(5, Bound::GreatestLower, 2)]
+    #[case::no_match_least_upper(4, Bound::LeastUpper, 2)]
+    #[case::no_match_greatest_lower(6, Bound::GreatestLower, 2)]
+    fn test_binary_search(
+        #[case] search_key: i32,
+        #[case] bound: Bound,
+        #[case] expected_index: usize,
+    ) {
         let values = vec![1, 3, 5, 7, 9];
-
-        // LeastUpper bound with exact match
-        let result =
-            binary_search_by_key_with_bounds(&values, 5, get_val, Bound::LeastUpper).unwrap();
-        assert_eq!(result, 2);
-
-        // GreatestLower bound with exact match
-        let result =
-            binary_search_by_key_with_bounds(&values, 5, get_val, Bound::GreatestLower).unwrap();
-        assert_eq!(result, 2);
+        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
+        assert_eq!(result, expected_index);
     }
 
-    #[test]
-    fn test_no_exact_match() {
-        let values = vec![1, 3, 5, 7, 9];
-
-        // LeastUpper bound (find element >= key)
-        let result =
-            binary_search_by_key_with_bounds(&values, 4, get_val, Bound::LeastUpper).unwrap();
-        assert_eq!(result, 2); // Index of 5
-
-        // GreatestLower bound (find element <= key)
-        let result =
-            binary_search_by_key_with_bounds(&values, 6, get_val, Bound::GreatestLower).unwrap();
-        assert_eq!(result, 2); // Index of 5
-    }
-
-    #[test]
-    fn test_duplicate_values() {
+    #[rstest::rstest]
+    #[case::least_upper_first_occurrence(5, Bound::LeastUpper, 2)]
+    #[case::greatest_lower_last_occurrence(5, Bound::GreatestLower, 4)]
+    fn test_duplicate_values(
+        #[case] search_key: i32,
+        #[case] bound: Bound,
+        #[case] expected_index: usize,
+    ) {
         let values = vec![1, 3, 5, 5, 5, 7, 9];
-
-        // LeastUpper should find first occurrence
-        let result =
-            binary_search_by_key_with_bounds(&values, 5, get_val, Bound::LeastUpper).unwrap();
-        assert_eq!(result, 2); // First index of 5
-
-        // GreatestLower should find last occurrence
-        let result =
-            binary_search_by_key_with_bounds(&values, 5, get_val, Bound::GreatestLower).unwrap();
-        assert_eq!(result, 4); // Last index of 5
+        let result = binary_search_by_key_with_bounds(&values, search_key, get_val, bound).unwrap();
+        assert_eq!(result, expected_index);
     }
 
     #[test]
