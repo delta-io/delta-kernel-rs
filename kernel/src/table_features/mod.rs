@@ -286,9 +286,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
-    enablement_check: EnablementCheck::EnabledIf(|props| {
-        props.enable_change_data_feed == Some(true)
-    }),
+    enablement_check: EnablementCheck::EnabledIf(|props| props.is_change_data_feed_enabled()),
 };
 
 #[allow(dead_code)]
@@ -337,7 +335,7 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
-        props.enable_row_tracking == Some(true) && props.row_tracking_suspended != Some(true)
+        props.is_row_tracking_enabled() && !props.is_row_tracking_suspended()
     }),
 };
 

@@ -231,6 +231,30 @@ impl TableProperties {
     pub fn should_write_stats_as_struct(&self) -> bool {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
     }
+
+    /// Returns the number of columns to collect statistics for data skipping.
+    /// Default: [`DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEXED_COLS)`].
+    pub fn data_skipping_num_indexed_cols(&self) -> DataSkippingNumIndexedCols {
+        self.data_skipping_num_indexed_cols.unwrap_or_default()
+    }
+
+    /// Returns whether Change Data Feed is enabled.
+    /// Default: `false` per the Delta protocol.
+    pub fn is_change_data_feed_enabled(&self) -> bool {
+        self.enable_change_data_feed.unwrap_or(false)
+    }
+
+    /// Returns whether row tracking is enabled.
+    /// Default: `false` per the Delta protocol.
+    pub fn is_row_tracking_enabled(&self) -> bool {
+        self.enable_row_tracking.unwrap_or(false)
+    }
+
+    /// Returns whether row tracking is suspended.
+    /// Default: `false` per the Delta protocol.
+    pub fn is_row_tracking_suspended(&self) -> bool {
+        self.row_tracking_suspended.unwrap_or(false)
+    }
 }
 
 /// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
@@ -309,6 +333,44 @@ mod tests {
 
     use crate::expressions::column_name;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_resolved_table_property_defaults() {
+        let props = TableProperties::default();
+
+        assert!(props.should_write_stats_as_json());
+        assert!(!props.should_write_stats_as_struct());
+        assert_eq!(
+            props.data_skipping_num_indexed_cols(),
+            DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEXED_COLS)
+        );
+        assert!(!props.is_change_data_feed_enabled());
+        assert!(!props.is_row_tracking_enabled());
+        assert!(!props.is_row_tracking_suspended());
+    }
+
+    #[test]
+    fn test_resolved_table_property_overrides() {
+        let props = TableProperties {
+            checkpoint_write_stats_as_json: Some(false),
+            checkpoint_write_stats_as_struct: Some(true),
+            data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
+            enable_change_data_feed: Some(true),
+            enable_row_tracking: Some(true),
+            row_tracking_suspended: Some(true),
+            ..Default::default()
+        };
+
+        assert!(!props.should_write_stats_as_json());
+        assert!(props.should_write_stats_as_struct());
+        assert_eq!(
+            props.data_skipping_num_indexed_cols(),
+            DataSkippingNumIndexedCols::AllColumns
+        );
+        assert!(props.is_change_data_feed_enabled());
+        assert!(props.is_row_tracking_enabled());
+        assert!(props.is_row_tracking_suspended());
+    }
 
     #[test]
     fn test_property_key_constants() {
