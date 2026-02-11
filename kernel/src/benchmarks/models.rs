@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 // ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReadConfig {
     pub name: String,
     pub parallel_scan: ParallelScan,
