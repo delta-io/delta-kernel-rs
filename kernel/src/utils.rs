@@ -477,4 +477,39 @@ mod tests {
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
     }
+
+    #[test]
+    fn normalize_table_root_url_adds_trailing_slash() {
+        let table_root = Url::parse("memory:///tables/demo").unwrap();
+
+        let normalized = normalize_table_root_url(table_root);
+
+        assert_eq!(normalized.path(), "/tables/demo/");
+        assert_eq!(
+            normalized
+                .join("_delta_log/00000000000000000000.json")
+                .unwrap()
+                .to_string(),
+            "memory:///tables/demo/_delta_log/00000000000000000000.json"
+        );
+    }
+
+    #[test]
+    fn normalize_table_root_url_keeps_existing_trailing_slash() {
+        let table_root = Url::parse("memory:///tables/demo/").unwrap();
+
+        let normalized = normalize_table_root_url(table_root);
+
+        assert_eq!(normalized.path(), "/tables/demo/");
+    }
+
+    #[test]
+    fn normalize_table_root_url_handles_empty_path() {
+        let table_root = Url::parse("memory:").unwrap();
+        assert!(table_root.path().is_empty());
+
+        let normalized = normalize_table_root_url(table_root);
+
+        assert_eq!(normalized.path(), "%2F");
+    }
 }

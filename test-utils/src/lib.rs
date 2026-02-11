@@ -643,3 +643,32 @@ impl LoggingTest {
         String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_path_for_version_at_with_table_prefix() {
+        let table_root = Url::parse("memory:///tables/demo/").unwrap();
+
+        let path = delta_path_for_version_at(&table_root, 7, "json");
+
+        assert_eq!(
+            path.as_ref(),
+            "tables/demo/_delta_log/00000000000000000007.json"
+        );
+    }
+
+    #[test]
+    fn delta_path_for_version_at_root_table() {
+        let table_root = Url::parse("memory:///").unwrap();
+
+        let path = delta_path_for_version_at(&table_root, 11, "checkpoint.parquet");
+
+        assert_eq!(
+            path.as_ref(),
+            "_delta_log/00000000000000000011.checkpoint.parquet"
+        );
+    }
+}
