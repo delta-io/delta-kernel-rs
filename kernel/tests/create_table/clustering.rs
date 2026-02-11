@@ -7,9 +7,11 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
+use delta_kernel::table_properties::DEFAULT_NUM_INDEXED_COLS;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
+use rstest::rstest;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
 use super::simple_schema;
@@ -106,59 +108,66 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
     Ok(())
 }
 
-#[tokio::test]
-async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // Build schema with 10 columns (cluster on column 5, within default 32 limit)
-    let fields: Vec<StructField> = (0..10)
-        .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, true))
-        .collect();
-    let schema = Arc::new(StructType::try_new(fields)?);
-
-    // Create clustered table on col5
-    let txn = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::clustered(["col5"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-
-    // Verify stats_columns includes the clustering column
-    let stats_cols = txn.stats_columns();
-    assert!(
-        stats_cols.iter().any(|c| c.to_string() == "col5"),
-        "Clustering column col5 should be in stats columns"
-    );
-
-    Ok(())
+#[derive(Debug)]
+struct ClusteringStatsCase {
+    description: &'static str,
+    num_schema_columns: usize,
+    clustering_column: &'static str,
+    expected_stats_cols_len: usize,
 }
 
+#[rstest]
+#[case(ClusteringStatsCase {
+    description: "clustering column within the default indexed-column range",
+    num_schema_columns: 10,
+    clustering_column: "col5",
+    expected_stats_cols_len: 10,
+})]
+#[case(ClusteringStatsCase {
+    description: "clustering column just beyond default indexed-column range",
+    num_schema_columns: 40,
+    clustering_column: "col32",
+    expected_stats_cols_len: DEFAULT_NUM_INDEXED_COLS as usize + 1,
+})]
+#[case(ClusteringStatsCase {
+    description: "clustering column far beyond default indexed-column range",
+    num_schema_columns: 40,
+    clustering_column: "col35",
+    // Default stats include first 32 leaf columns; clustering column must be appended.
+    expected_stats_cols_len: DEFAULT_NUM_INDEXED_COLS as usize + 1,
+})]
 #[tokio::test]
-async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
+async fn test_stats_columns_selected_when_adding_clustering_columns(
+    #[case] case: ClusteringStatsCase,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
-    let fields: Vec<StructField> = (0..40)
+    let fields: Vec<StructField> = (0..case.num_schema_columns)
         .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, true))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 
-    // Create clustered table on col35 (position > 32)
+    // Create clustered table.
     let txn = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::clustered(["col35"]))
+        .with_data_layout(DataLayout::clustered([case.clustering_column]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    // Verify stats_columns includes the clustering column even beyond limit
+    // Verify stats_columns includes the clustering column.
     let stats_cols = txn.stats_columns();
     assert!(
-        stats_cols.iter().any(|c| c.to_string() == "col35"),
-        "Clustering column col35 should be in stats columns even beyond DEFAULT_NUM_INDEXED_COLS"
+        stats_cols
+            .iter()
+            .any(|c| c.to_string() == case.clustering_column),
+        "case={}: clustering column {} should be in stats columns",
+        case.description,
+        case.clustering_column,
     );
 
-    // Verify we have exactly 33 stats columns: first 32 + col35
-    // (col35 is added in Pass 2 of collect_columns)
     assert_eq!(
         stats_cols.len(),
-        33,
-        "Should have 32 indexed cols + 1 clustering col"
+        case.expected_stats_cols_len,
+        "case={}: expected stats column count mismatch",
+        case.description,
     );
 
     Ok(())
