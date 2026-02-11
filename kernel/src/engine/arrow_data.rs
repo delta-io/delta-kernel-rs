@@ -158,11 +158,7 @@ impl EngineMap for MapArray {
             if keys.is_valid(idx) {
                 let map_key = keys.value(idx);
                 if key == map_key {
-                    return if vals.is_valid(idx) {
-                        Some(vals.value(idx))
-                    } else {
-                        None
-                    };
+                    return vals.is_valid(idx).then(|| vals.value(idx));
                 }
             }
         }
