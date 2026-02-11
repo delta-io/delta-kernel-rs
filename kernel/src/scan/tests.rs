@@ -628,6 +628,52 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
+/// Test that data skipping works correctly with pre-parsed stats from a checkpoint.
+///
+/// The parsed-stats test table has a checkpoint at version 3 (containing stats_parsed) and
+/// JSON commits at versions 4-5. This test exercises both code paths:
+/// - Checkpoint batches: stats_parsed is read directly from the transformed batch
+/// - JSON log batches: stats are parsed from JSON via the transform expression
+///
+/// Table layout (6 files, each 100 records):
+///   File 1: id [1-100],   File 2: id [101-200], File 3: id [201-300]
+///   File 4: id [301-400], File 5: id [401-500], File 6: id [501-600]
+#[test]
+fn test_data_skipping_with_parsed_stats() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Predicate: id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(
+        selected_file_count, 2,
+        "Data skipping with parsed stats should keep only 2 files (id [401-500] and [501-600])"
+    );
+}
+
 /// Test that `with_stats_columns` cannot be used with `with_predicate`.
 /// See [#1751] for tracking.
 /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
