@@ -275,17 +275,16 @@ impl EngineData for ArrowEngineData {
     }
 }
 
-/// Helper function to validate row index and get physical index for RunArray.
+/// Validates row index and returns physical index into the values array.
 ///
-/// Returns:
-/// - `Ok(Some(physical_idx))` if the row is valid and not null
-/// - `Ok(None)` if the row is null
-/// - `Err(...)` if the row index is out of bounds
+/// Per Arrow spec, REE parent array has no validity bitmap (null_count = 0).
+/// Nulls are encoded in the values child array, so null checking must be done
+/// on the values array in each get_* method, not here on the parent array.
 fn validate_and_get_physical_index(
     run_array: &crate::arrow::array::RunArray<Int64Type>,
     row_index: usize,
     field_name: &str,
-) -> DeltaResult<Option<usize>> {
+) -> DeltaResult<usize> {
     if row_index >= run_array.len() {
         return Err(Error::generic(format!(
             "Row index {} out of bounds for field '{}'",
@@ -293,12 +292,8 @@ fn validate_and_get_physical_index(
         )));
     }
 
-    if !run_array.is_valid(row_index) {
-        return Ok(None);
-    }
-
     let physical_idx = run_array.run_ends().get_physical_index(row_index);
-    Ok(Some(physical_idx))
+    Ok(physical_idx)
 }
 
 /// Implement GetData for RunArray directly, so we can return it as a trait object
@@ -308,10 +303,7 @@ fn validate_and_get_physical_index(
 /// by runtime downcasting of the values array.
 impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
     fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
             .as_any()
@@ -322,10 +314,7 @@ impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
     }
 
     fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
             .as_primitive_opt::<Int32Type>()
@@ -335,10 +324,7 @@ impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
     }
 
     fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
             .as_primitive_opt::<Int64Type>()
@@ -348,10 +334,7 @@ impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
     }
 
     fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
             .as_boolean_opt()
@@ -361,10 +344,7 @@ impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
     }
 
     fn get_binary(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
-        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
         let values = self
             .values()
             .as_any()
@@ -1058,7 +1038,8 @@ mod tests {
 
     #[test]
     fn test_run_array_get_str_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls: ["a", "a", null, null, "b"]
+        // Create a RunArray with nulls in child values: ["a", "a", null, null, "b"]
+        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
         let run_ends = Int64Array::from(vec![2, 4, 5]);
         let values = StringArray::from(vec![Some("a"), None, Some("b")]);
         let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
@@ -1091,7 +1072,8 @@ mod tests {
 
     #[test]
     fn test_run_array_get_int_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls: [1, null, null, 2]
+        // Create a RunArray with nulls in child values: [1, null, null, 2]
+        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
         let run_ends = Int64Array::from(vec![1, 3, 4]);
         let values = Int32Array::from(vec![Some(1), None, Some(2)]);
         let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
@@ -1139,7 +1121,8 @@ mod tests {
 
     #[test]
     fn test_run_array_get_bool_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls: [true, null, false]
+        // Create a RunArray with nulls in child values: [true, null, false]
+        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
         let run_ends = Int64Array::from(vec![1, 2, 3]);
         let values = BooleanArray::from(vec![Some(true), None, Some(false)]);
         let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
@@ -1201,7 +1184,8 @@ mod tests {
 
     #[test]
     fn test_run_array_get_binary_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls: [data, null, more]
+        // Create a RunArray with nulls in child values: [data, null, more]
+        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
         let run_ends = Int64Array::from(vec![1, 2, 3]);
         let values = BinaryArray::from(vec![Some(b"data".as_ref()), None, Some(b"more".as_ref())]);
         let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
@@ -1223,8 +1207,9 @@ mod tests {
         use crate::schema::ColumnName;
         use std::sync::LazyLock;
 
-        // Create RunArray columns with pattern: [val1, val1, val2, val2]
-        let run_ends = Int64Array::from(vec![2, 4]);
+        // Create RunArray columns with pattern: [val1, val1, null, null, val2]
+        // Per Arrow spec: nulls are encoded as runs in the values child array
+        let run_ends = Int64Array::from(vec![2, 4, 5]);
         let mk_field = |name, dt| {
             ArrowField::new(
                 name,
@@ -1239,23 +1224,23 @@ mod tests {
         let columns: Vec<Arc<dyn Array>> = vec![
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &StringArray::from(vec!["a", "b"]),
+                &StringArray::from(vec![Some("a"), None, Some("b")]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &Int32Array::from(vec![1, 2]),
+                &Int32Array::from(vec![Some(1), None, Some(2)]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &Int64Array::from(vec![10i64, 20]),
+                &Int64Array::from(vec![Some(10i64), None, Some(20)]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &BooleanArray::from(vec![true, false]),
+                &BooleanArray::from(vec![Some(true), None, Some(false)]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &BinaryArray::from(vec![b"x".as_ref(), b"y".as_ref()]),
+                &BinaryArray::from(vec![Some(b"x".as_ref()), None, Some(b"y".as_ref())]),
             )?),
         ];
 
@@ -1325,7 +1310,7 @@ mod tests {
         let mut visitor = TestVisitor { data: vec![] };
         visitor.visit_rows_of(&arrow_data)?;
 
-        // Verify RLE decompression: [val1, val1, val2, val2]
+        // Verify decompression including nulls: [val1, val1, null, null, val2]
         let expected = vec![
             (
                 Some("a".into()),
@@ -1341,13 +1326,8 @@ mod tests {
                 Some(true),
                 Some(b"x".to_vec()),
             ),
-            (
-                Some("b".into()),
-                Some(2),
-                Some(20),
-                Some(false),
-                Some(b"y".to_vec()),
-            ),
+            (None, None, None, None, None),
+            (None, None, None, None, None),
             (
                 Some("b".into()),
                 Some(2),
