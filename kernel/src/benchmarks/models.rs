@@ -252,7 +252,6 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
-            engine_info: None,
             table_path: None,
             table_info_dir: PathBuf::from("/tmp"),
         };
@@ -302,7 +301,6 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
-            engine_info: None,
             table_path: None,
             table_info_dir: PathBuf::from("/tmp"),
         };
@@ -335,7 +333,6 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
-            engine_info: None,
             table_path: None,
             table_info_dir: PathBuf::from("/tmp"),
         };
@@ -373,7 +370,6 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
-            engine_info: None,
             table_path,
             table_info_dir,
         };
