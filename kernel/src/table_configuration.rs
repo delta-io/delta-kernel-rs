@@ -18,7 +18,7 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
+use crate::schema::{DataType, InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
@@ -240,7 +240,7 @@ impl TableConfiguration {
     /// settings.
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn stats_column_names(
+    pub(crate) fn stats_column_names_logical(
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
@@ -249,6 +249,46 @@ impl TableConfiguration {
             self.table_properties(),
             clustering_columns,
         )
+    }
+
+    /// Returns the list of physical column names that should have statistics collected.
+    ///
+    /// Similar to [`stats_column_names_logical`], but returns physical column names.
+    pub(crate) fn stats_column_names_physical(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> Vec<ColumnName> {
+        let logical_names = self.stats_column_names_logical(clustering_columns);
+        let column_mapping_mode = self.column_mapping_mode();
+        logical_names
+            .into_iter()
+            .map(|col_name| self.translate_column_name_to_physical(&col_name, column_mapping_mode))
+            .collect()
+    }
+
+    /// Translates a logical column name path to physical column name path.
+    ///
+    /// # Panics
+    /// Panics if the column path cannot be resolved in the schema. This should never happen
+    /// since logical column names are derived from the schema itself.
+    fn translate_column_name_to_physical(
+        &self,
+        col_name: &ColumnName,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> ColumnName {
+        let mut physical_path = Vec::new();
+        let mut current_type: &DataType = &DataType::Struct(Box::new(self.schema.as_ref().clone()));
+
+        for segment in col_name.path() {
+            let DataType::Struct(s) = current_type else {
+                unreachable!("Column path segment must be in a struct")
+            };
+            let field = s.field(segment).expect("Column must exist in schema");
+            physical_path.push(field.physical_name(column_mapping_mode).to_string());
+            current_type = field.data_type();
+        }
+
+        ColumnName::new(physical_path)
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
@@ -1573,6 +1613,59 @@ mod test {
         Arc::new(StructType::new_unchecked([field_a, field_b]))
     }
 
+    fn nested_schema_with_column_mapping() -> SchemaRef {
+        Arc::new(
+            serde_json::from_str(
+                r#"{
+                    "type": "struct",
+                    "fields": [
+                        {
+                            "name": "id",
+                            "type": "long",
+                            "nullable": false,
+                            "metadata": {
+                                "delta.columnMapping.id": 1,
+                                "delta.columnMapping.physicalName": "phys_id"
+                            }
+                        },
+                        {
+                            "name": "info",
+                            "type": {
+                                "type": "struct",
+                                "fields": [
+                                    {
+                                        "name": "name",
+                                        "type": "string",
+                                        "nullable": true,
+                                        "metadata": {
+                                            "delta.columnMapping.id": 3,
+                                            "delta.columnMapping.physicalName": "phys_name"
+                                        }
+                                    },
+                                    {
+                                        "name": "age",
+                                        "type": "integer",
+                                        "nullable": true,
+                                        "metadata": {
+                                            "delta.columnMapping.id": 4,
+                                            "delta.columnMapping.physicalName": "phys_age"
+                                        }
+                                    }
+                                ]
+                            },
+                            "nullable": true,
+                            "metadata": {
+                                "delta.columnMapping.id": 2,
+                                "delta.columnMapping.physicalName": "phys_info"
+                            }
+                        }
+                    ]
+                }"#,
+            )
+            .unwrap(),
+        )
+    }
+
     fn create_table_config_with_column_mapping(
         schema: SchemaRef,
         column_mapping_mode: &str,
@@ -1743,18 +1836,63 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_returns_logical_names() {
-        // stats_column_names should return logical column names
+    fn test_stats_column_names_logical_returns_logical_names() {
+        // stats_column_names_logical should return logical column names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names(None);
+        let column_names = config.stats_column_names_logical(None);
 
         // Should return logical names, not physical names
         assert!(column_names.contains(&ColumnName::new(["col_a"])));
         assert!(column_names.contains(&ColumnName::new(["col_b"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_returns_physical_names() {
+        // stats_column_names_physical should return physical column names
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "name");
+
+        let column_names = config.stats_column_names_physical(None);
+
+        // Should return physical names, not logical names
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["phys_col_a"]),
+                ColumnName::new(["phys_col_b"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_nested_schema() {
+        // Test nested schema with column mapping
+        let schema = nested_schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "name");
+
+        let logical_names = config.stats_column_names_logical(None);
+        assert_eq!(
+            logical_names,
+            vec![
+                ColumnName::new(["id"]),
+                ColumnName::new(["info", "name"]),
+                ColumnName::new(["info", "age"]),
+            ]
+        );
+
+        let physical_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            physical_names,
+            vec![
+                ColumnName::new(["phys_id"]),
+                ColumnName::new(["phys_info", "phys_name"]),
+                ColumnName::new(["phys_info", "phys_age"]),
+            ]
+        );
     }
 
     #[cfg(feature = "clustered-table")]
