@@ -639,5 +639,4 @@ mod tests {
         let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
         assert_eq!(test_map, final_map);
     }
-
 }
