@@ -23,6 +23,7 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 /// Metrics are emitted either when the iterator is exhausted or when dropped.
 struct MetricsIterator<I, T> {
     inner: I,
+    name: &'static str,
     reporter: Option<Arc<dyn MetricsReporter>>,
     start: Instant,
     num_files: u64,
@@ -34,12 +35,14 @@ struct MetricsIterator<I, T> {
 impl<I, T> MetricsIterator<I, T> {
     fn new(
         inner: I,
+        name: &'static str,
         reporter: Option<Arc<dyn MetricsReporter>>,
         start: Instant,
         event_fn: fn(Duration, u64, u64) -> MetricEvent,
     ) -> Self {
         Self {
             inner,
+            name,
             reporter,
             start,
             num_files: 0,
@@ -50,13 +53,19 @@ impl<I, T> MetricsIterator<I, T> {
     }
 
     fn emit_metrics_once(&mut self) {
+        let duration = self.start.elapsed();
         if let Some(r) = self.reporter.take() {
-            r.report((self.event_fn)(
-                self.start.elapsed(),
-                self.num_files,
-                self.bytes_read,
-            ));
+            r.report((self.event_fn)(duration, self.num_files, self.bytes_read));
         }
+        let _span = tracing::span!(
+            tracing::Level::INFO,
+            "storage",
+            report = tracing::field::Empty,
+            name = self.name,
+            num_files = self.num_files,
+            bytes_read = self.bytes_read,
+            duration = duration.as_millis(),
+        ); // when this is dropped we emit
     }
 }
 
@@ -202,10 +211,18 @@ async fn list_from_impl(
         // Local filesystem doesn't return sorted list - need to collect and sort
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
-
+        let duration = start.elapsed();
+        let _span = tracing::span!(
+            tracing::Level::INFO,
+            "storage",
+            report = tracing::field::Empty,
+            name = "list_completed",
+            num_files = items.len() as u64,
+            duration = duration.as_millis(),
+        );
         if let Some(r) = reporter {
             r.report(MetricEvent::StorageListCompleted {
-                duration: start.elapsed(),
+                duration,
                 num_files: items.len() as u64,
             });
         }
@@ -213,6 +230,7 @@ async fn list_from_impl(
     } else {
         let stream = MetricsIterator::new(
             stream,
+            "list_completed",
             reporter,
             start,
             |duration, num_files, _bytes_read| MetricEvent::StorageListCompleted {
@@ -264,6 +282,7 @@ async fn read_files_impl(
     // buffer the results. This allows us to achieve async concurrency.
     Ok(Box::pin(MetricsIterator::new(
         files.buffered(readahead),
+        "read_completed",
         reporter,
         start,
         |duration, num_files, bytes_read| MetricEvent::StorageReadCompleted {
@@ -290,11 +309,17 @@ async fn copy_atomic_impl(
     let result = store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
         .await;
+    let duration = start.elapsed();
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        "storage",
+        report = tracing::field::Empty,
+        name = "copy_completed",
+        duration = duration.as_millis(),
+    );
 
     if let Some(r) = reporter {
-        r.report(MetricEvent::StorageCopyCompleted {
-            duration: start.elapsed(),
-        });
+        r.report(MetricEvent::StorageCopyCompleted { duration });
     }
 
     result.map_err(|e| match e {

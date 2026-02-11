@@ -181,7 +181,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                None,
+                metrics_reporter.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),

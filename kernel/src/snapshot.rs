@@ -33,7 +33,7 @@ mod builder;
 pub use builder::SnapshotBuilder;
 
 use delta_kernel::actions::DomainMetadata;
-use tracing::debug;
+use tracing::{debug, instrument};
 use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
@@ -106,6 +106,7 @@ impl Snapshot {
     }
 
     /// Implementation of snapshot creation from existing snapshot.
+    #[instrument(name = "snap.completed", fields(report), skip(engine, version))]
     fn try_new_from_impl(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -312,6 +313,7 @@ impl Snapshot {
     /// Implementation of snapshot creation from log segment.
     ///
     /// Reports metrics: `ProtocolMetadataLoaded`.
+    #[instrument(err, name = "snap.completed", fields(report), skip(engine))]
     fn try_new_from_log_segment_impl(
         location: Url,
         log_segment: LogSegment,

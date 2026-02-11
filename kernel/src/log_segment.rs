@@ -31,7 +31,7 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
 use itertools::Itertools;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -212,6 +212,11 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
+    #[instrument(
+        name = "segment.for_snapshot",
+        skip(storage, reporter, operation_id, time_travel_version),
+        fields(report, num_commit_files, num_checkpoint_files, num_compaction_files)
+    )]
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
@@ -237,6 +242,18 @@ impl LogSegment {
 
         match result {
             Ok(log_segment) => {
+                tracing::Span::current().record(
+                    "num_commit_files",
+                    log_segment.ascending_commit_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "num_checkpoint_files",
+                    log_segment.checkpoint_parts.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "num_compaction_files",
+                    log_segment.ascending_compaction_files.len() as u64,
+                );
                 reporter.inspect(|r| {
                     r.report(MetricEvent::LogSegmentLoaded {
                         operation_id,
@@ -847,6 +864,7 @@ impl LogSegment {
     }
 
     // Get the most up-to-date Protocol and Metadata actions
+    #[instrument(name = "segment.read_metadata", fields(report), skip(engine))]
     pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
         match self.protocol_and_metadata(engine)? {
             (Some(m), Some(p)) => Ok((m, p)),

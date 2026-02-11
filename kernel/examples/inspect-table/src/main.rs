@@ -13,6 +13,8 @@ use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{DeltaResult, Error, Snapshot};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -50,7 +52,14 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
+     tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_span_events(tracing_subscriber::fmt::format::FmtSpan::NONE))
+        .with(delta_kernel::metrics::ReportGeneratorLayer::new(
+            std::sync::Arc::new(delta_kernel::metrics::LoggingMetricsReporter::new(tracing::Level::INFO))
+        ))
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    //env_logger::init();
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

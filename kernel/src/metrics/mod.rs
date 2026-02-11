@@ -71,4 +71,4 @@ mod events;
 mod reporter;
 
 pub use events::{MetricEvent, MetricId};
-pub use reporter::MetricsReporter;
+pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};

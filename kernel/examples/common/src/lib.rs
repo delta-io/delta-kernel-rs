@@ -4,10 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::{
-    arrow::array::RecordBatch, engine::default::executor::tokio::TokioBackgroundExecutor,
-    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine,
-    engine::default::DefaultEngineBuilder, scan::Scan, schema::MetadataColumnSpec, DeltaResult,
-    SnapshotRef,
+    arrow::array::RecordBatch, engine::default::{executor::tokio::TokioBackgroundExecutor, storage::store_from_url_opts, DefaultEngine, DefaultEngineBuilder}, scan::Scan, schema::MetadataColumnSpec, DeltaResult, SnapshotRef
 };
 
 use object_store::{
@@ -127,7 +124,7 @@ pub fn get_engine(
     url: &Url,
     args: &LocationArgs,
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
-    if args.env_creds {
+    let builder = if args.env_creds {
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
             delta_kernel::Error::Generic(format!("Object store could not parse url: {}", e))
         })?;
@@ -157,13 +154,13 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
+        DefaultEngineBuilder::new(Arc::new(store))
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, opts)?).build())
+        DefaultEngineBuilder::new(store_from_url_opts(url, opts)?)
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -173,8 +170,10 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, options)?).build())
-    }
+        DefaultEngineBuilder::new(store_from_url_opts(url, options)?)
+    };
+    //let builder = builder.with_metrics_reporter(Arc::new(delta_kernel::metrics::LoggingMetricsReporter::new(tracing::Level::INFO)));
+    Ok(builder.build())
 }
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
