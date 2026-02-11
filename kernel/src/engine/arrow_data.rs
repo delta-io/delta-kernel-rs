@@ -155,11 +155,9 @@ impl EngineMap for MapArray {
 
         // Iterate backwards for potential cache locality benefits
         for idx in (start_offset..end_offset).rev() {
-            if keys.is_valid(idx) {
-                let map_key = keys.value(idx);
-                if key == map_key {
-                    return vals.is_valid(idx).then(|| vals.value(idx));
-                }
+            let map_key = keys.value(idx);
+            if key == map_key {
+                return vals.is_valid(idx).then(|| vals.value(idx));
             }
         }
         None
@@ -171,21 +169,19 @@ impl EngineMap for MapArray {
             return HashMap::new();
         }
 
-        let mut ret = HashMap::new();
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;
         let end_offset = offsets[row_index + 1] as usize;
         let keys = self.keys().as_string::<i32>();
         let vals = self.values().as_string::<i32>();
+        let mut ret = HashMap::with_capacity(end_offset - start_offset);
 
         // Use direct array access for better performance vs Arrow's high-level API
         for idx in start_offset..end_offset {
-            if keys.is_valid(idx) {
-                let key = keys.value(idx);
-                if vals.is_valid(idx) {
-                    let value = vals.value(idx);
-                    ret.insert(key.to_string(), value.to_string());
-                }
+            let key = keys.value(idx);
+            if vals.is_valid(idx) {
+                let value = vals.value(idx);
+                ret.insert(key.to_string(), value.to_string());
             }
         }
         ret
