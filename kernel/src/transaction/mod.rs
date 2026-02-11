@@ -1170,8 +1170,10 @@ impl<S> Transaction<S> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
+        let column_mapping_mode = self.read_snapshot.table_configuration().column_mapping_mode();
 
-        // Compute physical schema: exclude partition columns since they're stored in the path
+        // Compute physical schema: exclude partition columns since they're stored in the path,
+        // and apply column mapping to transform logical field names to physical names
         let partition_columns: Vec<String> = self
             .read_snapshot
             .table_configuration()
@@ -1181,7 +1183,7 @@ impl<S> Transaction<S> {
         let physical_fields = snapshot_schema
             .fields()
             .filter(|f| !partition_columns.contains(&f.name().to_string()))
-            .cloned();
+            .map(|f| f.make_physical(column_mapping_mode));
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
