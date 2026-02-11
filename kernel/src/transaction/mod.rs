@@ -1173,7 +1173,7 @@ impl Transaction {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
