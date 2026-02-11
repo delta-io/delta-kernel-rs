@@ -89,12 +89,13 @@ pub struct WorkloadSpecVariant {
 
 impl WorkloadSpecVariant {
     // Validates that this variant is ready to run - ensures that config and operation (operation required for read specs only) are set
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.config.is_none() {
             return Err(format!(
                 "Invalid workload variant specification: '{}' must have config specified",
                 self.case_name
-            ));
+            )
+            .into());
         }
         match &self.spec {
             Spec::Read { .. } => {
@@ -102,34 +103,32 @@ impl WorkloadSpecVariant {
                     return Err(format!(
                        "Invalid workload variant specification: '{}' must have read operation specified",
                        self.case_name
-                   ));
+                   ).into());
                 }
             }
         }
         Ok(())
     }
 
-    pub fn name(&self) -> Result<String, String> {
+    pub fn name(&self) -> Result<String, Box<dyn std::error::Error>> {
         // For Read specs, use the operation (read_data vs read_metadata)
         // For other specs, use the spec type name itself (e.g. write) - this will be added when other specs are implemented
         let workload_str = match &self.spec {
             Spec::Read { .. } => self
                 .operation
                 .as_ref()
-                .ok_or(format!(
-                    "Workload '{}' must have read operation set",
-                    self.case_name
-                ))?
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    format!("Workload '{}' must have read operation set", self.case_name).into()
+                })?
                 .as_str(),
         };
 
         let config_str = self
             .config
             .as_ref()
-            .ok_or(format!(
-                "Workload '{}' must have config set",
-                self.case_name
-            ))?
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!("Workload '{}' must have config set", self.case_name).into()
+            })?
             .name();
 
         Ok(format!(
@@ -221,7 +220,7 @@ mod tests {
         false,
         "must have config specified"
     )]
-    #[case(Some("serial"), None, false, "must have operation specified")]
+    #[case(Some("serial"), None, false, "must have read operation specified")]
     #[case(Some("serial"), Some(ReadOperation::ReadMetadata), true, "")]
     fn test_workload_spec_variant_validate(
         #[case] config_name: Option<&str>,
@@ -251,7 +250,7 @@ mod tests {
             assert!(result.is_ok());
         } else {
             assert!(result.is_err());
-            assert!(result.unwrap_err().contains(expected_error_msg));
+            assert!(result.unwrap_err().to_string().contains(expected_error_msg));
         }
     }
 
@@ -269,7 +268,7 @@ mod tests {
     #[case(
         Some("serial"),
         None,
-        Err("Read spec 'append_10k' must have operation set")
+        Err("Workload 'append_10k' must have read operation set")
     )]
     fn test_workload_spec_variant_name(
         #[case] config_name: Option<&str>,
@@ -299,7 +298,7 @@ mod tests {
             }
             Err(expected_error) => {
                 let error = variant.name().unwrap_err();
-                assert_eq!(error, expected_error);
+                assert_eq!(error.to_string(), expected_error);
             }
         }
     }
