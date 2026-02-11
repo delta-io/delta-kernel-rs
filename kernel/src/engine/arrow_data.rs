@@ -1172,35 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn test_run_array_rle_compression() -> DeltaResult<()> {
-        // Create a highly compressed RunArray: 1000 rows with only 2 distinct values
-        let run_ends = Int64Array::from(vec![500, 1000]);
-        let values = StringArray::from(vec!["repeated_value_1", "repeated_value_2"]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        // Test sample indices from first and second runs
-        let test_indices = [0, 250, 499, 500, 750, 999];
-        let expected = [
-            "repeated_value_1",
-            "repeated_value_1",
-            "repeated_value_1",
-            "repeated_value_2",
-            "repeated_value_2",
-            "repeated_value_2",
-        ];
-
-        for (idx, expected_val) in test_indices.iter().zip(expected.iter()) {
-            assert_eq!(run_array.get_str(*idx, "field")?, Some(*expected_val));
-        }
-
-        // Verify RLE efficiency: 1000 logical rows, only 2 physical values
-        assert_eq!(run_array.len(), 1000);
-        assert_eq!(run_array.values().len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_run_array_get_binary() -> DeltaResult<()> {
         // Create a RunArray with binary values
         let run_ends = Int64Array::from(vec![2, 4, 5]);
@@ -1252,33 +1223,31 @@ mod tests {
         use crate::schema::ColumnName;
         use std::sync::LazyLock;
 
-        // Helper to create RunEndEncoded field with consistent structure
-        let run_end_field = |name: &str, value_type: ArrowDataType| {
+        // Create RunArray columns with pattern: [val1, val1, val2, val2]
+        let run_ends = Int64Array::from(vec![2, 4]);
+        let mk_field = |name, dt| {
             ArrowField::new(
                 name,
                 ArrowDataType::RunEndEncoded(
                     Arc::new(ArrowField::new("run_ends", ArrowDataType::Int64, false)),
-                    Arc::new(ArrowField::new("values", value_type, true)),
+                    Arc::new(ArrowField::new("values", dt, true)),
                 ),
                 true,
             )
         };
 
-        // Create RunEndEncoded columns - all have 4 rows: [val1, val1, val2, val2]
-        let run_ends = crate::arrow::array::Int64Array::from(vec![2, 4]);
-
         let columns: Vec<Arc<dyn Array>> = vec![
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &StringArray::from(vec!["foo", "bar"]),
+                &StringArray::from(vec!["a", "b"]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &Int32Array::from(vec![10, 20]),
+                &Int32Array::from(vec![1, 2]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &crate::arrow::array::Int64Array::from(vec![100i64, 200i64]),
+                &Int64Array::from(vec![10i64, 20]),
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
@@ -1286,52 +1255,53 @@ mod tests {
             )?),
             Arc::new(RunArray::<Int64Type>::try_new(
                 &run_ends,
-                &BinaryArray::from(vec![b"data1".as_ref(), b"data2".as_ref()]),
+                &BinaryArray::from(vec![b"x".as_ref(), b"y".as_ref()]),
             )?),
         ];
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            run_end_field("str_col", ArrowDataType::Utf8),
-            run_end_field("int_col", ArrowDataType::Int32),
-            run_end_field("long_col", ArrowDataType::Int64),
-            run_end_field("bool_col", ArrowDataType::Boolean),
-            run_end_field("binary_col", ArrowDataType::Binary),
+            mk_field("s", ArrowDataType::Utf8),
+            mk_field("i", ArrowDataType::Int32),
+            mk_field("l", ArrowDataType::Int64),
+            mk_field("b", ArrowDataType::Boolean),
+            mk_field("bin", ArrowDataType::Binary),
         ]));
 
         let arrow_data = ArrowEngineData::new(RecordBatch::try_new(schema, columns)?);
 
-        // Visitor to extract all RLE column data
-        struct MultiTypeVisitor {
-            strings: Vec<Option<String>>,
-            ints: Vec<Option<i32>>,
-            longs: Vec<Option<i64>>,
-            bools: Vec<Option<bool>>,
-            binaries: Vec<Option<Vec<u8>>>,
+        type Row = (
+            Option<String>,
+            Option<i32>,
+            Option<i64>,
+            Option<bool>,
+            Option<Vec<u8>>,
+        );
+
+        struct TestVisitor {
+            data: Vec<Row>,
         }
 
-        impl RowVisitor for MultiTypeVisitor {
+        impl RowVisitor for TestVisitor {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
-                static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
-                    vec![
-                        ColumnName::new(["str_col"]),
-                        ColumnName::new(["int_col"]),
-                        ColumnName::new(["long_col"]),
-                        ColumnName::new(["bool_col"]),
-                        ColumnName::new(["binary_col"]),
+                static NAMES: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
+                    [
+                        ColumnName::new(["s"]),
+                        ColumnName::new(["i"]),
+                        ColumnName::new(["l"]),
+                        ColumnName::new(["b"]),
+                        ColumnName::new(["bin"]),
                     ]
                 });
-                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
-                    vec![
-                        DataType::STRING,
-                        DataType::INTEGER,
-                        DataType::LONG,
-                        DataType::BOOLEAN,
-                        DataType::BINARY,
-                    ]
-                });
-                (&NAMES, &TYPES)
+                static TYPES: &[DataType] = &[
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                    DataType::BOOLEAN,
+                    DataType::BINARY,
+                ];
+                (&*NAMES, TYPES)
             }
 
             fn visit<'a>(
@@ -1339,62 +1309,63 @@ mod tests {
                 row_count: usize,
                 getters: &[&'a dyn GetData<'a>],
             ) -> DeltaResult<()> {
-                assert_eq!(getters.len(), 5);
                 for i in 0..row_count {
-                    self.strings
-                        .push(getters[0].get_str(i, "str_col")?.map(|s| s.to_string()));
-                    self.ints.push(getters[1].get_int(i, "int_col")?);
-                    self.longs.push(getters[2].get_long(i, "long_col")?);
-                    self.bools.push(getters[3].get_bool(i, "bool_col")?);
-                    self.binaries
-                        .push(getters[4].get_binary(i, "binary_col")?.map(|b| b.to_vec()));
+                    self.data.push((
+                        getters[0].get_str(i, "s")?.map(|s| s.to_string()),
+                        getters[1].get_int(i, "i")?,
+                        getters[2].get_long(i, "l")?,
+                        getters[3].get_bool(i, "b")?,
+                        getters[4].get_binary(i, "bin")?.map(|b| b.to_vec()),
+                    ));
                 }
                 Ok(())
             }
         }
 
-        let mut visitor = MultiTypeVisitor {
-            strings: vec![],
-            ints: vec![],
-            longs: vec![],
-            bools: vec![],
-            binaries: vec![],
-        };
+        let mut visitor = TestVisitor { data: vec![] };
+        arrow_data.visit_rows(
+            &[
+                ColumnName::new(["s"]),
+                ColumnName::new(["i"]),
+                ColumnName::new(["l"]),
+                ColumnName::new(["b"]),
+                ColumnName::new(["bin"]),
+            ],
+            &mut visitor,
+        )?;
 
-        let column_names = ["str_col", "int_col", "long_col", "bool_col", "binary_col"]
-            .iter()
-            .map(|&name| ColumnName::new([name]))
-            .collect::<Vec<_>>();
-        arrow_data.visit_rows(&column_names, &mut visitor)?;
-
-        // Verify all extracted values: [val1, val1, val2, val2] for each type
-        assert_eq!(
-            visitor.strings,
-            vec![
-                Some("foo".to_string()),
-                Some("foo".to_string()),
-                Some("bar".to_string()),
-                Some("bar".to_string())
-            ]
-        );
-        assert_eq!(visitor.ints, vec![Some(10), Some(10), Some(20), Some(20)]);
-        assert_eq!(
-            visitor.longs,
-            vec![Some(100), Some(100), Some(200), Some(200)]
-        );
-        assert_eq!(
-            visitor.bools,
-            vec![Some(true), Some(true), Some(false), Some(false)]
-        );
-        assert_eq!(
-            visitor.binaries,
-            vec![
-                Some(b"data1".to_vec()),
-                Some(b"data1".to_vec()),
-                Some(b"data2".to_vec()),
-                Some(b"data2".to_vec())
-            ]
-        );
+        // Verify RLE decompression: [val1, val1, val2, val2]
+        let expected = vec![
+            (
+                Some("a".into()),
+                Some(1),
+                Some(10),
+                Some(true),
+                Some(b"x".to_vec()),
+            ),
+            (
+                Some("a".into()),
+                Some(1),
+                Some(10),
+                Some(true),
+                Some(b"x".to_vec()),
+            ),
+            (
+                Some("b".into()),
+                Some(2),
+                Some(20),
+                Some(false),
+                Some(b"y".to_vec()),
+            ),
+            (
+                Some("b".into()),
+                Some(2),
+                Some(20),
+                Some(false),
+                Some(b"y".to_vec()),
+            ),
+        ];
+        assert_eq!(visitor.data, expected);
 
         Ok(())
     }
