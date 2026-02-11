@@ -3231,6 +3231,9 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 
     let through = seg.segment_through_crc(case.crc_version);
     assert_eq!(extract_commit_versions(&through), case.through_commits);
-    assert_eq!(extract_compaction_ranges(&through), case.through_compactions);
+    assert_eq!(
+        extract_compaction_ranges(&through),
+        case.through_compactions
+    );
     assert_eq!(through.checkpoint_version, case.checkpoint);
 }
