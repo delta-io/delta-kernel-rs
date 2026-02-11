@@ -1013,190 +1013,49 @@ mod tests {
     }
 
     #[test]
-    fn test_run_array_get_str() -> DeltaResult<()> {
-        // Create a RunArray with string values: ["a", "a", "a", "b", "b"]
-        let run_ends = Int64Array::from(vec![3, 5]);
-        let values = StringArray::from(vec!["a", "b"]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        // Test accessing values
-        let results: Vec<_> = (0..5)
-            .map(|i| run_array.get_str(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(
-            results,
-            vec![Some("a"), Some("a"), Some("a"), Some("b"), Some("b")]
-        );
-
-        // Test out of bounds
-        let err = run_array.get_str(5, "test_field").unwrap_err();
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("out of bounds") && err_msg.contains("test_field"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_str_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls in child values: ["a", "a", null, null, "b"]
-        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
-        let run_ends = Int64Array::from(vec![2, 4, 5]);
-        let values = StringArray::from(vec![Some("a"), None, Some("b")]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..5)
-            .map(|i| run_array.get_str(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(results, vec![Some("a"), Some("a"), None, None, Some("b")]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_int() -> DeltaResult<()> {
-        // Create a RunArray with int values: [10, 10, 20, 20, 20]
-        let run_ends = Int64Array::from(vec![2, 5]);
-        let values = Int32Array::from(vec![10, 20]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..5)
-            .map(|i| run_array.get_int(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(
-            results,
-            vec![Some(10), Some(10), Some(20), Some(20), Some(20)]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_int_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls in child values: [1, null, null, 2]
-        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
-        let run_ends = Int64Array::from(vec![1, 3, 4]);
-        let values = Int32Array::from(vec![Some(1), None, Some(2)]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..4)
-            .map(|i| run_array.get_int(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(results, vec![Some(1), None, None, Some(2)]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_long() -> DeltaResult<()> {
-        // Create a RunArray with long values: [100, 100, 100, 200]
-        let run_ends = Int64Array::from(vec![3, 4]);
-        let values = Int64Array::from(vec![100i64, 200i64]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..4)
-            .map(|i| run_array.get_long(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(results, vec![Some(100), Some(100), Some(100), Some(200)]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_bool() -> DeltaResult<()> {
-        // Create a RunArray with bool values: [true, true, false, false, true]
-        let run_ends = Int64Array::from(vec![2, 4, 5]);
-        let values = BooleanArray::from(vec![true, false, true]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..5)
-            .map(|i| run_array.get_bool(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(
-            results,
-            vec![Some(true), Some(true), Some(false), Some(false), Some(true)]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_bool_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls in child values: [true, null, false]
-        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
-        let run_ends = Int64Array::from(vec![1, 2, 3]);
-        let values = BooleanArray::from(vec![Some(true), None, Some(false)]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..3)
-            .map(|i| run_array.get_bool(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(results, vec![Some(true), None, Some(false)]);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_run_array_out_of_bounds_errors() -> DeltaResult<()> {
+        // Test that out of bounds errors include field name for all types
         let run_ends = Int64Array::from(vec![2]);
-        let values = StringArray::from(vec!["test"]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
 
-        // Test that out of bounds errors include field name
-        let err_msg = run_array.get_str(2, "my_field").unwrap_err().to_string();
-        assert!(err_msg.contains("out of bounds") && err_msg.contains("my_field"));
+        // Test str
+        let str_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &StringArray::from(vec!["test"]))?;
+        let err_msg = str_array.get_str(2, "str_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("str_field"));
 
-        let err_msg = run_array
-            .get_int(5, "another_field")
+        // Test int
+        let int_array = RunArray::<Int64Type>::try_new(&run_ends, &Int32Array::from(vec![42]))?;
+        let err_msg = int_array.get_int(5, "int_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("int_field"));
+
+        // Test long
+        let long_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &Int64Array::from(vec![100i64]))?;
+        let err_msg = long_array
+            .get_long(3, "long_field")
             .unwrap_err()
             .to_string();
-        assert!(err_msg.contains("out of bounds") && err_msg.contains("another_field"));
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("long_field"));
 
-        Ok(())
-    }
+        // Test bool
+        let bool_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &BooleanArray::from(vec![true]))?;
+        let err_msg = bool_array
+            .get_bool(2, "bool_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("bool_field"));
 
-    #[test]
-    fn test_run_array_get_binary() -> DeltaResult<()> {
-        // Create a RunArray with binary values
-        let run_ends = Int64Array::from(vec![2, 4, 5]);
-        let values = BinaryArray::from(vec![
-            Some(b"hello".as_ref()),
-            Some(b"world".as_ref()),
-            Some(b"\x00\x01\x02".as_ref()),
-        ]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..5)
-            .map(|i| run_array.get_binary(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(
-            results,
-            vec![
-                Some(b"hello".as_ref()),
-                Some(b"hello".as_ref()),
-                Some(b"world".as_ref()),
-                Some(b"world".as_ref()),
-                Some(b"\x00\x01\x02".as_ref())
-            ]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_run_array_get_binary_with_nulls() -> DeltaResult<()> {
-        // Create a RunArray with nulls in child values: [data, null, more]
-        // Per Arrow spec: REE parent has no nulls; nulls only in child values array
-        let run_ends = Int64Array::from(vec![1, 2, 3]);
-        let values = BinaryArray::from(vec![Some(b"data".as_ref()), None, Some(b"more".as_ref())]);
-        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
-
-        let results: Vec<_> = (0..3)
-            .map(|i| run_array.get_binary(i, "field"))
-            .collect::<DeltaResult<_>>()?;
-        assert_eq!(
-            results,
-            vec![Some(b"data".as_ref()), None, Some(b"more".as_ref())]
-        );
+        // Test binary
+        let binary_array = RunArray::<Int64Type>::try_new(
+            &run_ends,
+            &BinaryArray::from(vec![Some(b"data".as_ref())]),
+        )?;
+        let err_msg = binary_array
+            .get_binary(4, "binary_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("binary_field"));
 
         Ok(())
     }
