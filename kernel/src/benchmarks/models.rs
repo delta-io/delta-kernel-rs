@@ -78,6 +78,10 @@ impl ReadOperation {
 }
 
 // Complete workload specification - for a given table, spec, operation, and config
+//
+// Created from JSON with table_info, case_name, and spec populated
+// with_read_operation and with_config are used to set the operation and config
+// validate is then used to ensure that the workload spec variant is ready to run
 #[derive(Clone)]
 pub struct WorkloadSpecVariant {
     pub table_info: TableInfo,
