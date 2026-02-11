@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use std::path::PathBuf;
+
 // ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
 #[derive(Clone, Debug)]
@@ -41,6 +43,22 @@ pub enum ParallelScan {
 pub struct TableInfo {
     pub name: String,                //Table name used for identifying the table
     pub description: Option<String>, //Human-readable description of the table
+    pub engine_info: Option<String>, //Info about the engine used to create the table
+    pub table_path: Option<String>,  //Path or URL to the table
+    #[serde(skip, default)]
+    pub table_info_dir: PathBuf, //Path to the directory containing the table info JSON file
+}
+
+impl TableInfo {
+    pub fn resolved_table_root(&self) -> String {
+        //If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
+        self.table_path.clone().unwrap_or_else(|| {
+            self.table_info_dir
+                .join("delta")
+                .to_string_lossy()
+                .to_string()
+        })
+    }
 }
 
 // Specs define the operation performed on a table - defines what operation at what version (e.g. read at version 0)
@@ -49,7 +67,7 @@ pub struct TableInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
     Read {
-        version: Option<i64>, //If version is None, read at latest version
+        version: Option<u64>, //If version is None, read at latest version
     },
 }
 
@@ -202,7 +220,7 @@ mod tests {
         r#"{"type": "read", "version": 7, "extra_field": "should be ignored"}"#,
         Some(7)
     )]
-    fn test_deserialize_spec_read(#[case] json: &str, #[case] expected_version: Option<i64>) {
+    fn test_deserialize_spec_read(#[case] json: &str, #[case] expected_version: Option<u64>) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize read spec");
 
         let Spec::Read { version } = spec;
@@ -235,6 +253,9 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
+            engine_info: None,
+            table_path: None,
+            table_info_dir: PathBuf::from("/tmp"),
         };
         let spec = Spec::Read { version: Some(1) };
         let config = config_name.map(|name| ReadConfig {
@@ -282,6 +303,9 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
+            engine_info: None,
+            table_path: None,
+            table_info_dir: PathBuf::from("/tmp"),
         };
         let spec = Spec::Read { version: Some(1) };
         let config = config_name.map(|name| ReadConfig {
@@ -312,6 +336,9 @@ mod tests {
         let table_info = TableInfo {
             name: "test_table".into(),
             description: None,
+            engine_info: None,
+            table_path: None,
+            table_info_dir: PathBuf::from("/tmp"),
         };
         let spec = Spec::Read { version: Some(1) };
         let config = ReadConfig {
@@ -334,5 +361,24 @@ mod tests {
             variant.name().unwrap(),
             "test_table/test_case/read_metadata/parallel_4"
         );
+    }
+
+    #[rstest]
+    #[case(Some("/path/to/table".to_string()), PathBuf::from("/some/dir"), "/path/to/table")]
+    #[case(None, PathBuf::from("/tmp"), "/tmp/delta")]
+    fn test_resolved_table_root(
+        #[case] table_path: Option<String>,
+        #[case] table_info_dir: PathBuf,
+        #[case] expected: &str,
+    ) {
+        let table_info = TableInfo {
+            name: "test_table".into(),
+            description: None,
+            engine_info: None,
+            table_path,
+            table_info_dir,
+        };
+
+        assert_eq!(table_info.resolved_table_root(), expected);
     }
 }
