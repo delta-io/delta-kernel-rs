@@ -275,6 +275,108 @@ impl EngineData for ArrowEngineData {
     }
 }
 
+/// Helper function to validate row index and get physical index for RunArray.
+///
+/// Returns:
+/// - `Ok(Some(physical_idx))` if the row is valid and not null
+/// - `Ok(None)` if the row is null
+/// - `Err(...)` if the row index is out of bounds
+fn validate_and_get_physical_index(
+    run_array: &crate::arrow::array::RunArray<Int64Type>,
+    row_index: usize,
+    field_name: &str,
+) -> DeltaResult<Option<usize>> {
+    if row_index >= run_array.len() {
+        return Err(Error::generic(format!(
+            "Row index {} out of bounds for field '{}'",
+            row_index, field_name
+        )));
+    }
+
+    if !run_array.is_valid(row_index) {
+        return Ok(None);
+    }
+
+    let physical_idx = run_array.run_ends().get_physical_index(row_index);
+    Ok(Some(physical_idx))
+}
+
+/// Implement GetData for RunArray directly, so we can return it as a trait object
+/// without needing a wrapper struct or Box::leak.
+///
+/// This implementation supports multiple value types (strings, integers, booleans, etc.)
+/// by runtime downcasting of the values array.
+impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
+    fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let values = self
+            .values()
+            .as_any()
+            .downcast_ref::<crate::arrow::array::StringArray>()
+            .ok_or_else(|| Error::generic("Expected StringArray values in RunArray"))?;
+
+        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
+    }
+
+    fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let values = self
+            .values()
+            .as_primitive_opt::<Int32Type>()
+            .ok_or_else(|| Error::generic("Expected Int32Array values in RunArray"))?;
+
+        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
+    }
+
+    fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let values = self
+            .values()
+            .as_primitive_opt::<Int64Type>()
+            .ok_or_else(|| Error::generic("Expected Int64Array values in RunArray"))?;
+
+        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
+    }
+
+    fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let values = self
+            .values()
+            .as_boolean_opt()
+            .ok_or_else(|| Error::generic("Expected BooleanArray values in RunArray"))?;
+
+        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
+    }
+
+    fn get_binary(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
+        let physical_idx = match validate_and_get_physical_index(self, row_index, field_name)? {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let values = self
+            .values()
+            .as_any()
+            .downcast_ref::<crate::arrow::array::GenericByteArray<
+                crate::arrow::array::types::GenericBinaryType<i32>,
+            >>()
+            .ok_or_else(|| Error::generic("Expected BinaryArray values in RunArray"))?;
+
+        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
+    }
+}
+
 impl ArrowEngineData {
     fn extract_columns<'a>(
         path: &mut Vec<String>,
@@ -308,6 +410,22 @@ impl ArrowEngineData {
         Ok(())
     }
 
+    /// Helper function to extract a column, supporting both direct arrays and RLE-encoded (RunEndEncoded) arrays.
+    /// This reduces boilerplate by handling the common pattern of trying direct access first,
+    /// then falling back to RunArray if the column is RLE-encoded.
+    fn try_extract_with_rle<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
+        use crate::arrow::array::RunArray;
+        use crate::arrow::datatypes::DataType as ArrowDataType;
+
+        match col.data_type() {
+            ArrowDataType::RunEndEncoded(_, _) => col
+                .as_any()
+                .downcast_ref::<RunArray<Int64Type>>()
+                .map(|run_array| run_array as &'a dyn GetData<'a>),
+            _ => None,
+        }
+    }
+
     fn extract_leaf_column<'a>(
         path: &[String],
         data_type: &DataType,
@@ -331,26 +449,37 @@ impl ArrowEngineData {
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
             &DataType::BOOLEAN => {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
-                col.as_boolean_opt().map(|a| a as _).ok_or("bool")
+                col.as_boolean_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_rle(col))
+                    .ok_or("bool")
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt().map(|a| a as _).ok_or("string")
+                col.as_string_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_rle(col))
+                    .ok_or("string")
             }
             &DataType::BINARY => {
                 debug!("Pushing binary array for {}", ColumnName::new(path));
-                col.as_binary_opt().map(|a| a as _).ok_or("binary")
+                col.as_binary_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_rle(col))
+                    .ok_or("binary")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
                     .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_rle(col))
                     .ok_or("int")
             }
             &DataType::LONG => {
                 debug!("Pushing int64 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int64Type>()
                     .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_rle(col))
                     .ok_or("long")
             }
             DataType::Array(_) => {
@@ -384,12 +513,16 @@ mod tests {
     use std::sync::Arc;
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
-    use crate::arrow::array::types::Int32Type;
-    use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
+    use crate::arrow::array::types::{Int32Type, Int64Type};
+    use crate::arrow::array::{
+        Array, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatch, RunArray,
+        StringArray,
+    };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::GetData;
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
@@ -894,6 +1027,373 @@ mod tests {
         assert_result_error_with_message(
             result,
             "Type mismatch on data: expected binary, got Int32",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_str() -> DeltaResult<()> {
+        // Create a RunArray with string values: ["a", "a", "a", "b", "b"]
+        let run_ends = Int64Array::from(vec![3, 5]);
+        let values = StringArray::from(vec!["a", "b"]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        // Test accessing values
+        let results: Vec<_> = (0..5)
+            .map(|i| run_array.get_str(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(
+            results,
+            vec![Some("a"), Some("a"), Some("a"), Some("b"), Some("b")]
+        );
+
+        // Test out of bounds
+        let err = run_array.get_str(5, "test_field").unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("test_field"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_str_with_nulls() -> DeltaResult<()> {
+        // Create a RunArray with nulls: ["a", "a", null, null, "b"]
+        let run_ends = Int64Array::from(vec![2, 4, 5]);
+        let values = StringArray::from(vec![Some("a"), None, Some("b")]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..5)
+            .map(|i| run_array.get_str(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(results, vec![Some("a"), Some("a"), None, None, Some("b")]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_int() -> DeltaResult<()> {
+        // Create a RunArray with int values: [10, 10, 20, 20, 20]
+        let run_ends = Int64Array::from(vec![2, 5]);
+        let values = Int32Array::from(vec![10, 20]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..5)
+            .map(|i| run_array.get_int(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(
+            results,
+            vec![Some(10), Some(10), Some(20), Some(20), Some(20)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_int_with_nulls() -> DeltaResult<()> {
+        // Create a RunArray with nulls: [1, null, null, 2]
+        let run_ends = Int64Array::from(vec![1, 3, 4]);
+        let values = Int32Array::from(vec![Some(1), None, Some(2)]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..4)
+            .map(|i| run_array.get_int(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(results, vec![Some(1), None, None, Some(2)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_long() -> DeltaResult<()> {
+        // Create a RunArray with long values: [100, 100, 100, 200]
+        let run_ends = Int64Array::from(vec![3, 4]);
+        let values = Int64Array::from(vec![100i64, 200i64]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..4)
+            .map(|i| run_array.get_long(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(results, vec![Some(100), Some(100), Some(100), Some(200)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_bool() -> DeltaResult<()> {
+        // Create a RunArray with bool values: [true, true, false, false, true]
+        let run_ends = Int64Array::from(vec![2, 4, 5]);
+        let values = BooleanArray::from(vec![true, false, true]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..5)
+            .map(|i| run_array.get_bool(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(
+            results,
+            vec![Some(true), Some(true), Some(false), Some(false), Some(true)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_bool_with_nulls() -> DeltaResult<()> {
+        // Create a RunArray with nulls: [true, null, false]
+        let run_ends = Int64Array::from(vec![1, 2, 3]);
+        let values = BooleanArray::from(vec![Some(true), None, Some(false)]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..3)
+            .map(|i| run_array.get_bool(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(results, vec![Some(true), None, Some(false)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_out_of_bounds_errors() -> DeltaResult<()> {
+        let run_ends = Int64Array::from(vec![2]);
+        let values = StringArray::from(vec!["test"]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        // Test that out of bounds errors include field name
+        let err_msg = run_array.get_str(2, "my_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("my_field"));
+
+        let err_msg = run_array
+            .get_int(5, "another_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("another_field"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_rle_compression() -> DeltaResult<()> {
+        // Create a highly compressed RunArray: 1000 rows with only 2 distinct values
+        let run_ends = Int64Array::from(vec![500, 1000]);
+        let values = StringArray::from(vec!["repeated_value_1", "repeated_value_2"]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        // Test sample indices from first and second runs
+        let test_indices = [0, 250, 499, 500, 750, 999];
+        let expected = [
+            "repeated_value_1",
+            "repeated_value_1",
+            "repeated_value_1",
+            "repeated_value_2",
+            "repeated_value_2",
+            "repeated_value_2",
+        ];
+
+        for (idx, expected_val) in test_indices.iter().zip(expected.iter()) {
+            assert_eq!(run_array.get_str(*idx, "field")?, Some(*expected_val));
+        }
+
+        // Verify RLE efficiency: 1000 logical rows, only 2 physical values
+        assert_eq!(run_array.len(), 1000);
+        assert_eq!(run_array.values().len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_binary() -> DeltaResult<()> {
+        // Create a RunArray with binary values
+        let run_ends = Int64Array::from(vec![2, 4, 5]);
+        let values = BinaryArray::from(vec![
+            Some(b"hello".as_ref()),
+            Some(b"world".as_ref()),
+            Some(b"\x00\x01\x02".as_ref()),
+        ]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..5)
+            .map(|i| run_array.get_binary(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(
+            results,
+            vec![
+                Some(b"hello".as_ref()),
+                Some(b"hello".as_ref()),
+                Some(b"world".as_ref()),
+                Some(b"world".as_ref()),
+                Some(b"\x00\x01\x02".as_ref())
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_get_binary_with_nulls() -> DeltaResult<()> {
+        // Create a RunArray with nulls: [data, null, more]
+        let run_ends = Int64Array::from(vec![1, 2, 3]);
+        let values = BinaryArray::from(vec![Some(b"data".as_ref()), None, Some(b"more".as_ref())]);
+        let run_array = RunArray::<Int64Type>::try_new(&run_ends, &values)?;
+
+        let results: Vec<_> = (0..3)
+            .map(|i| run_array.get_binary(i, "field"))
+            .collect::<DeltaResult<_>>()?;
+        assert_eq!(
+            results,
+            vec![Some(b"data".as_ref()), None, Some(b"more".as_ref())]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_extraction_via_visitor() -> DeltaResult<()> {
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Helper to create RunEndEncoded field with consistent structure
+        let run_end_field = |name: &str, value_type: ArrowDataType| {
+            ArrowField::new(
+                name,
+                ArrowDataType::RunEndEncoded(
+                    Arc::new(ArrowField::new("run_ends", ArrowDataType::Int64, false)),
+                    Arc::new(ArrowField::new("values", value_type, true)),
+                ),
+                true,
+            )
+        };
+
+        // Create RunEndEncoded columns - all have 4 rows: [val1, val1, val2, val2]
+        let run_ends = crate::arrow::array::Int64Array::from(vec![2, 4]);
+
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &StringArray::from(vec!["foo", "bar"]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &Int32Array::from(vec![10, 20]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &crate::arrow::array::Int64Array::from(vec![100i64, 200i64]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &BooleanArray::from(vec![true, false]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &BinaryArray::from(vec![b"data1".as_ref(), b"data2".as_ref()]),
+            )?),
+        ];
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            run_end_field("str_col", ArrowDataType::Utf8),
+            run_end_field("int_col", ArrowDataType::Int32),
+            run_end_field("long_col", ArrowDataType::Int64),
+            run_end_field("bool_col", ArrowDataType::Boolean),
+            run_end_field("binary_col", ArrowDataType::Binary),
+        ]));
+
+        let arrow_data = ArrowEngineData::new(RecordBatch::try_new(schema, columns)?);
+
+        // Visitor to extract all RLE column data
+        struct MultiTypeVisitor {
+            strings: Vec<Option<String>>,
+            ints: Vec<Option<i32>>,
+            longs: Vec<Option<i64>>,
+            bools: Vec<Option<bool>>,
+            binaries: Vec<Option<Vec<u8>>>,
+        }
+
+        impl RowVisitor for MultiTypeVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+                    vec![
+                        ColumnName::new(["str_col"]),
+                        ColumnName::new(["int_col"]),
+                        ColumnName::new(["long_col"]),
+                        ColumnName::new(["bool_col"]),
+                        ColumnName::new(["binary_col"]),
+                    ]
+                });
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+                    vec![
+                        DataType::STRING,
+                        DataType::INTEGER,
+                        DataType::LONG,
+                        DataType::BOOLEAN,
+                        DataType::BINARY,
+                    ]
+                });
+                (&NAMES, &TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                assert_eq!(getters.len(), 5);
+                for i in 0..row_count {
+                    self.strings
+                        .push(getters[0].get_str(i, "str_col")?.map(|s| s.to_string()));
+                    self.ints.push(getters[1].get_int(i, "int_col")?);
+                    self.longs.push(getters[2].get_long(i, "long_col")?);
+                    self.bools.push(getters[3].get_bool(i, "bool_col")?);
+                    self.binaries
+                        .push(getters[4].get_binary(i, "binary_col")?.map(|b| b.to_vec()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = MultiTypeVisitor {
+            strings: vec![],
+            ints: vec![],
+            longs: vec![],
+            bools: vec![],
+            binaries: vec![],
+        };
+
+        let column_names = ["str_col", "int_col", "long_col", "bool_col", "binary_col"]
+            .iter()
+            .map(|&name| ColumnName::new([name]))
+            .collect::<Vec<_>>();
+        arrow_data.visit_rows(&column_names, &mut visitor)?;
+
+        // Verify all extracted values: [val1, val1, val2, val2] for each type
+        assert_eq!(
+            visitor.strings,
+            vec![
+                Some("foo".to_string()),
+                Some("foo".to_string()),
+                Some("bar".to_string()),
+                Some("bar".to_string())
+            ]
+        );
+        assert_eq!(visitor.ints, vec![Some(10), Some(10), Some(20), Some(20)]);
+        assert_eq!(
+            visitor.longs,
+            vec![Some(100), Some(100), Some(200), Some(200)]
+        );
+        assert_eq!(
+            visitor.bools,
+            vec![Some(true), Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            visitor.binaries,
+            vec![
+                Some(b"data1".to_vec()),
+                Some(b"data1".to_vec()),
+                Some(b"data2".to_vec()),
+                Some(b"data2".to_vec())
+            ]
         );
 
         Ok(())
