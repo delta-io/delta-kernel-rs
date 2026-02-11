@@ -56,7 +56,9 @@ impl ReadMetadataRunner {
             .spec_variant
             .config
             .as_ref()
-            .expect("Config should be set, call validate() before executing")
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "Config should be set, call validate() before executing".into()
+            })?
             .parallel_scan
         {
             ParallelScan::Disabled => {
@@ -107,7 +109,9 @@ impl ReadMetadataRunner {
                             .collect();
 
                         for handle in handles {
-                            handle.join().expect("Worker thread panicked")?;
+                            handle.join().map_err(|_| -> Box<dyn std::error::Error> {
+                                "Worker thread panicked".into()
+                            })??;
                         }
                     }
                 }
