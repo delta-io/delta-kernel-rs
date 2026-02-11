@@ -2,12 +2,14 @@
 mod transaction_id;
 mod write_context;
 
+use std::sync::Arc;
+
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
+use crate::{KernelStringSlice, SharedSnapshot};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -58,23 +60,22 @@ fn transaction_impl(
 /// Caller is responsible for passing valid handles
 #[no_mangle]
 pub unsafe extern "C" fn transaction_with_committer(
-    path: KernelStringSlice,
+    snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     committer: Handle<MutableCommitter>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
     let committer = unsafe { committer.into_inner() };
-    transaction_with_committer_impl(url, engine, committer).into_extern_result(&engine)
+    transaction_with_committer_impl(snapshot, engine, committer).into_extern_result(&engine)
 }
 
 fn transaction_with_committer_impl(
-    url: DeltaResult<Url>,
+    snapshot: Arc<Snapshot>,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
-    let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
@@ -516,6 +517,13 @@ mod tests {
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
 
+            let snapshot = unsafe {
+                ok_or_panic(crate::snapshot(
+                    kernel_string_slice!(table_path_str),
+                    engine.shallow_copy(),
+                ))
+            };
+
             let uc_client =
                 unsafe { get_uc_commit_client(None, test_uc_get_commits, test_uc_commit) };
             let table_id = "foo";
@@ -528,11 +536,7 @@ mod tests {
             };
 
             let txn = ok_or_panic(unsafe {
-                transaction_with_committer(
-                    kernel_string_slice!(table_path_str),
-                    engine.shallow_copy(),
-                    uc_committer,
-                )
+                transaction_with_committer(snapshot, engine.shallow_copy(), uc_committer)
             });
             unsafe { set_data_change(txn.shallow_copy(), false) };
 

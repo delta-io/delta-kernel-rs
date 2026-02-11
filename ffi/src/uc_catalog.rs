@@ -283,7 +283,7 @@ fn get_uc_committer_impl(
 ///
 /// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
 #[no_mangle]
-pub unsafe extern "C" fn free_uc_commiter(commit_client: Handle<MutableCommitter>) {
+pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
     debug!("released uc committer");
     commit_client.drop_handle();
 }
@@ -636,7 +636,7 @@ mod tests {
 
         unsafe {
             free_uc_commit_client(client);
-            free_uc_commiter(committer);
+            free_uc_committer(committer);
         }
     }
 }
