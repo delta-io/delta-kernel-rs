@@ -52,7 +52,13 @@ impl ReadMetadataRunner {
     pub fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         let scan = self.snapshot.clone().scan_builder().build()?;
 
-        match &self.spec_variant.config.as_ref().unwrap().parallel_scan {
+        match &self
+            .spec_variant
+            .config
+            .as_ref()
+            .expect("Config should be set, call validate() before executing")
+            .parallel_scan
+        {
             ParallelScan::Disabled => {
                 let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
                 for result in metadata_iter {
@@ -69,7 +75,7 @@ impl ReadMetadataRunner {
                     AfterSequential::Done(_) => {}
                     AfterSequential::Parallel { processor, files } => {
                         let num_workers = *num_threads;
-                        let files_per_worker = (files.len() + num_workers - 1) / num_workers; //ceil division
+                        let files_per_worker = files.len().div_ceil(num_workers);
 
                         let partitions: Vec<_> = files
                             .chunks(files_per_worker)
@@ -101,10 +107,7 @@ impl ReadMetadataRunner {
                             .collect();
 
                         for handle in handles {
-                            handle
-                                .join()
-                                .expect("Worker thread panicked")
-                                .map_err(|e: crate::Error| e.to_string())?;
+                            handle.join().expect("Worker thread panicked")?;
                         }
                     }
                 }
