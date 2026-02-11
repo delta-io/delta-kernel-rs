@@ -453,7 +453,7 @@ mod tests {
             free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
             CommitsRequest, ExclusiveCommitsResponse,
         };
-        use crate::{Handle, OptionalValue};
+        use crate::{Handle, NullableCvoid, OptionalValue};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Mutex;
 
@@ -465,6 +465,7 @@ mod tests {
         // LCOV_EXCL_START
         #[no_mangle]
         extern "C" fn test_uc_get_commits(
+            _context: NullableCvoid,
             _request: CommitsRequest,
         ) -> Handle<ExclusiveCommitsResponse> {
             panic!("Shouldn't be called");
@@ -473,6 +474,7 @@ mod tests {
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
+            _context: NullableCvoid,
             request: CommitRequest,
         ) -> OptionalValue<Handle<crate::ExclusiveRustString>> {
             UC_COMMIT_CALLED.store(true, Ordering::SeqCst);
@@ -514,7 +516,8 @@ mod tests {
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
 
-            let uc_client = unsafe { get_uc_commit_client(test_uc_get_commits, test_uc_commit) };
+            let uc_client =
+                unsafe { get_uc_commit_client(None, test_uc_get_commits, test_uc_commit) };
             let table_id = "foo";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
