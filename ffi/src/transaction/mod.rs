@@ -463,7 +463,6 @@ mod tests {
         static LAST_COMMIT_TABLE_ID: Mutex<Option<String>> = Mutex::new(None);
         static STAGED_COMMIT_FILE_NAME: Mutex<Option<String>> = Mutex::new(None);
 
-        // LCOV_EXCL_START
         #[no_mangle]
         extern "C" fn test_uc_get_commits(
             _context: NullableCvoid,
@@ -471,7 +470,6 @@ mod tests {
         ) -> Handle<ExclusiveCommitsResponse> {
             panic!("Shouldn't be called");
         }
-        // LCOV_EXCL_STOP
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
