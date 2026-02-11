@@ -1004,6 +1004,7 @@ mod tests {
         schema::{ArrayType, DataType, MapType, StructField},
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
+    use rstest::rstest;
     use serde_json::json;
 
     // duplicated
@@ -1315,53 +1316,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_validate_table_features_invalid() {
-        // (reader_feature, writer_feature)
-        let invalid_features = [
-            // ReaderWriter feature not present in writer features
-            (
-                vec![TableFeature::DeletionVectors],
-                vec![TableFeature::AppendOnly],
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
-            ),
-            (
-                vec![TableFeature::DeletionVectors],
-                vec![],
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
-            ),
-            // ReaderWriter feature not present in reader features
-            (
-                vec![],
-                vec![TableFeature::DeletionVectors],
-                "Writer features must be Writer-only or also listed in reader features",
-            ),
-            (
-                vec![TableFeature::VariantType],
-                vec![
-                    TableFeature::VariantType,
-                    TableFeature::DeletionVectors,
-                ],
-                "Writer features must be Writer-only or also listed in reader features",
-            ),
-            // WriterOnly feature present in reader features
-            (
-                vec![TableFeature::AppendOnly],
-                vec![TableFeature::AppendOnly],
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
-            ),
-        ];
+    #[derive(Debug)]
+    struct InvalidTableFeatureCase {
+        description: &'static str,
+        reader_features: Vec<TableFeature>,
+        writer_features: Vec<TableFeature>,
+        error_msg: &'static str,
+    }
 
-        for (reader_features, writer_features, error_msg) in invalid_features {
-            let res = Protocol::try_new_modern(reader_features, writer_features);
-            assert!(
-                matches!(
-                    &res,
-                    Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
-                ),
-                "Expected:\t{error_msg}\nBut got:{res:?}\n"
-            );
-        }
+    #[rstest]
+    #[case(InvalidTableFeatureCase {
+        description: "reader-writer feature appears in reader but not writer list",
+        reader_features: vec![TableFeature::DeletionVectors],
+        writer_features: vec![TableFeature::AppendOnly],
+        error_msg: "Reader features must contain only ReaderWriter features that are also listed in writer features",
+    })]
+    #[case(InvalidTableFeatureCase {
+        description: "reader-writer feature appears in reader but writer list is empty",
+        reader_features: vec![TableFeature::DeletionVectors],
+        writer_features: vec![],
+        error_msg: "Reader features must contain only ReaderWriter features that are also listed in writer features",
+    })]
+    #[case(InvalidTableFeatureCase {
+        description: "reader-writer feature appears in writer but not reader list",
+        reader_features: vec![],
+        writer_features: vec![TableFeature::DeletionVectors],
+        error_msg: "Writer features must be Writer-only or also listed in reader features",
+    })]
+    #[case(InvalidTableFeatureCase {
+        description: "writer list contains unmatched reader-writer feature alongside matched one",
+        reader_features: vec![TableFeature::VariantType],
+        writer_features: vec![TableFeature::VariantType, TableFeature::DeletionVectors],
+        error_msg: "Writer features must be Writer-only or also listed in reader features",
+    })]
+    #[case(InvalidTableFeatureCase {
+        description: "writer-only feature incorrectly appears in reader list",
+        reader_features: vec![TableFeature::AppendOnly],
+        writer_features: vec![TableFeature::AppendOnly],
+        error_msg: "Reader features must contain only ReaderWriter features that are also listed in writer features",
+    })]
+    fn test_validate_table_features_invalid(#[case] case: InvalidTableFeatureCase) {
+        let res = Protocol::try_new_modern(case.reader_features, case.writer_features);
+        assert!(
+            matches!(
+                &res,
+                Err(Error::InvalidProtocol(error)) if error.to_string().eq(case.error_msg)
+            ),
+            "case={}\nExpected:\t{}\nBut got:{res:?}\n",
+            case.description,
+            case.error_msg,
+        );
     }
 
     #[test]
@@ -1384,103 +1388,109 @@ mod tests {
         assert!(protocol.is_ok());
     }
 
-    #[test]
-    fn test_validate_table_features_valid() {
-        // (reader_feature, writer_feature)
-        let valid_features = [
-            // ReaderWriter feature present in both reader/writer features,
-            // WriterOnly feature present in writer feature
-            (
-                vec![TableFeature::DeletionVectors],
-                vec![TableFeature::DeletionVectors],
-            ),
-            (vec![], vec![TableFeature::AppendOnly]),
-            (
-                vec![TableFeature::VariantType],
-                vec![TableFeature::VariantType, TableFeature::AppendOnly],
-            ),
-            // Unknown feature may be ReaderWriter or WriterOnly (for forward compatibility)
-            (
-                vec![TableFeature::Unknown("rw".to_string())],
-                vec![
-                    TableFeature::Unknown("rw".to_string()),
-                    TableFeature::Unknown("w".to_string()),
-                ],
-            ),
-            // Empty feature set is valid
-            (vec![], vec![]),
-        ];
-
-        for (reader_features, writer_features) in valid_features {
-            assert!(Protocol::try_new_modern(reader_features, writer_features).is_ok());
-        }
+    #[derive(Debug)]
+    struct ValidTableFeatureCase {
+        description: &'static str,
+        reader_features: Vec<TableFeature>,
+        writer_features: Vec<TableFeature>,
     }
 
-    #[test]
-    fn test_validate_legacy_column_mapping_valid() {
-        // Valid: ColumnMapping with reader v2
-        // Reader version 2 implies columnMapping support (no explicit reader_features)
-        // Writer version 7 requires explicit writer_features list
-        let protocol = Protocol::try_new(
-            2,
-            7,
-            TableFeature::NO_LIST,
-            Some(vec![TableFeature::ColumnMapping]),
+    #[rstest]
+    #[case(ValidTableFeatureCase {
+        description: "reader-writer feature appears in both reader and writer lists",
+        reader_features: vec![TableFeature::DeletionVectors],
+        writer_features: vec![TableFeature::DeletionVectors],
+    })]
+    #[case(ValidTableFeatureCase {
+        description: "writer-only feature appears only in writer list",
+        reader_features: vec![],
+        writer_features: vec![TableFeature::AppendOnly],
+    })]
+    #[case(ValidTableFeatureCase {
+        description: "reader-writer and writer-only features coexist with valid placement",
+        reader_features: vec![TableFeature::VariantType],
+        writer_features: vec![TableFeature::VariantType, TableFeature::AppendOnly],
+    })]
+    #[case(ValidTableFeatureCase {
+        description: "unknown features remain forward-compatible when placements are valid",
+        reader_features: vec![TableFeature::Unknown("rw".to_string())],
+        writer_features: vec![
+            TableFeature::Unknown("rw".to_string()),
+            TableFeature::Unknown("w".to_string()),
+        ],
+    })]
+    #[case(ValidTableFeatureCase {
+        description: "empty reader and writer feature lists are valid",
+        reader_features: vec![],
+        writer_features: vec![],
+    })]
+    fn test_validate_table_features_valid(#[case] case: ValidTableFeatureCase) {
+        assert!(
+            Protocol::try_new_modern(case.reader_features, case.writer_features).is_ok(),
+            "case={}",
+            case.description
         );
-        assert!(protocol.is_ok());
     }
 
-    #[test]
-    fn test_validate_legacy_writer_only_features_valid() {
-        // Valid: Writer-only features with reader v1
-        let protocol = Protocol::try_new(
-            1,
-            7,
-            TableFeature::NO_LIST,
-            Some(vec![TableFeature::AppendOnly]),
-        );
-        assert!(protocol.is_ok());
+    #[derive(Debug)]
+    struct LegacyTableFeatureCase {
+        description: &'static str,
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<Vec<TableFeature>>,
+        writer_features: Option<Vec<TableFeature>>,
+        should_be_valid: bool,
     }
 
-    #[test]
-    fn test_validate_legacy_column_mapping_with_writer_features_valid() {
-        // Valid: Mix of Writer-only and ColumnMapping with reader v2
-        let protocol = Protocol::try_new(
-            2,
-            7,
-            TableFeature::NO_LIST,
-            Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
+    #[rstest]
+    #[case(LegacyTableFeatureCase {
+        description: "legacy columnMapping is valid with reader v2 and explicit writer feature",
+        min_reader_version: 2,
+        min_writer_version: 7,
+        reader_features: None,
+        writer_features: Some(vec![TableFeature::ColumnMapping]),
+        should_be_valid: true,
+    })]
+    #[case(LegacyTableFeatureCase {
+        description: "writer-only appendOnly is valid with reader v1",
+        min_reader_version: 1,
+        min_writer_version: 7,
+        reader_features: None,
+        writer_features: Some(vec![TableFeature::AppendOnly]),
+        should_be_valid: true,
+    })]
+    #[case(LegacyTableFeatureCase {
+        description: "legacy columnMapping can coexist with writer-only appendOnly",
+        min_reader_version: 2,
+        min_writer_version: 7,
+        reader_features: None,
+        writer_features: Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
+        should_be_valid: true,
+    })]
+    #[case(LegacyTableFeatureCase {
+        description: "columnMapping is invalid with reader v1 legacy protocol",
+        min_reader_version: 1,
+        min_writer_version: 7,
+        reader_features: None,
+        writer_features: Some(vec![TableFeature::ColumnMapping]),
+        should_be_valid: false,
+    })]
+    #[case(LegacyTableFeatureCase {
+        description: "reader-writer deletionVectors cannot appear with legacy reader v2",
+        min_reader_version: 2,
+        min_writer_version: 7,
+        reader_features: None,
+        writer_features: Some(vec![TableFeature::ColumnMapping, TableFeature::DeletionVectors]),
+        should_be_valid: false,
+    })]
+    fn test_validate_legacy_table_features(#[case] case: LegacyTableFeatureCase) {
+        let result = Protocol::try_new(
+            case.min_reader_version,
+            case.min_writer_version,
+            case.reader_features,
+            case.writer_features,
         );
-        assert!(protocol.is_ok());
-    }
-
-    #[test]
-    fn test_validate_column_mapping_reader_v1_invalid() {
-        // Invalid: ColumnMapping with reader v1
-        // Reader v1 doesn't imply any ReaderWriter features
-        let protocol = Protocol::try_new(
-            1,
-            7,
-            TableFeature::NO_LIST,
-            Some(vec![TableFeature::ColumnMapping]),
-        );
-        assert!(protocol.is_err());
-    }
-
-    #[test]
-    fn test_validate_multiple_readerwriter_features_reader_v2_invalid() {
-        // Invalid: Multiple ReaderWriter features with reader v2
-        // Only ColumnMapping alone is allowed with reader v2
-        let protocol = Protocol::try_new(
-            2,
-            7,
-            TableFeature::NO_LIST,
-            Some(vec![
-                TableFeature::ColumnMapping,
-                TableFeature::DeletionVectors,
-            ]),
-        );
-        assert!(protocol.is_err());
+        assert_eq!(result.is_ok(), case.should_be_valid, "case={}", case.description);
     }
 
     #[test]
