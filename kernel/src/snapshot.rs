@@ -236,7 +236,7 @@ impl Snapshot {
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
         let lazy_crc = LazyCrc::new(new_log_segment.latest_crc_file.clone());
         let (new_metadata, new_protocol) =
-            new_log_segment.read_protocol_metadata_unchecked(engine, &lazy_crc)?;
+            new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -347,7 +347,7 @@ impl Snapshot {
 
         // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
-        let (metadata, protocol) = log_segment.read_protocol_metadata_checked(engine, &lazy_crc)?;
+        let (metadata, protocol) = log_segment.read_protocol_metadata(engine, &lazy_crc)?;
         let read_metadata_duration = start.elapsed();
 
         reporter.as_ref().inspect(|r| {
