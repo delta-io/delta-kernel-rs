@@ -361,7 +361,7 @@ mod tests {
 
     #[rstest]
     #[case(Some("/path/to/table".to_string()), PathBuf::from("/some/dir"), "/path/to/table")]
-    #[case(None, PathBuf::from("/tmp"), "/tmp/delta")]
+    #[case(None, PathBuf::from("/some/dir"), "/some/dir/delta")]
     fn test_resolved_table_root(
         #[case] table_path: Option<String>,
         #[case] table_info_dir: PathBuf,
