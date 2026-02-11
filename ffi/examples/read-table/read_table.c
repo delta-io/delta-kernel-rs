@@ -53,20 +53,17 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
 
 // Kernel will call this function for each file that should be scanned. The arguments include enough
 // context to construct the correct logical data from the physically read parquet
-void scan_row_callback(
+bool scan_row_callback(
   void* engine_context,
   KernelStringSlice path,
   int64_t size,
   int64_t mod_time,
   const Stats* stats,
-  const CDvInfo* cdv_info,
-  const Expression* transform,
+  HandleSharedDvInfo dv_info,
+  OptionalValueHandleSharedExpression transform,
   const CStringMap* partition_values)
 {
   (void)mod_time; // not using this at the moment
-#ifndef PRINT_ARROW_DATA
-  (void)transform; // only used when PRINT_ARROW_DATA is defined
-#endif
   struct EngineContext* context = engine_context;
   print_diag("Called back to read file: %.*s. (size: %" PRIu64 ", num records: ", (int)path.len, path.ptr, size);
   if (stats) {
@@ -77,11 +74,15 @@ void scan_row_callback(
   KernelStringSlice table_root_slice = { context->table_root, strlen(context->table_root) };
   KernelBoolSlice selection_vector;
 
-  if (cdv_info->has_vector) {
+  if (dv_info_has_vector(dv_info)) {
     ExternResultKernelBoolSlice selection_vector_res =
-      selection_vector_from_dv(cdv_info->info, context->engine, table_root_slice);
+      selection_vector_from_dv(dv_info, context->engine, table_root_slice);
     if (selection_vector_res.tag != OkKernelBoolSlice) {
       printf("Could not get selection vector from kernel\n");
+      free_kernel_dv_info(dv_info);
+      if (transform.tag == SomeHandleSharedExpression) {
+        free_kernel_expression(transform.some);
+      }
       exit(-1);
     }
     selection_vector = selection_vector_res.ok;
@@ -93,15 +94,26 @@ void scan_row_callback(
     }
   } else {
     print_diag("  No selection vector for this file\n");
-    selection_vector.len = 0;
+    selection_vector = (KernelBoolSlice){ .ptr = NULL, .len = 0 };
   }
   context->partition_values = partition_values;
   print_partition_info(context, partition_values);
 #ifdef PRINT_ARROW_DATA
-  c_read_parquet_file(context, path, selection_vector, transform);
+  const Expression* transform_expr = NULL;
+  if (transform.tag == SomeHandleSharedExpression) {
+    transform_expr = (const Expression*)transform.some;
+  }
+  c_read_parquet_file(context, path, selection_vector, transform_expr);
 #endif
   free_bool_slice(selection_vector);
   context->partition_values = NULL;
+
+  free_kernel_dv_info(dv_info);
+  if (transform.tag == SomeHandleSharedExpression) {
+    free_kernel_expression(transform.some);
+  }
+
+  return true; // Continue iteration
 }
 
 // For each chunk of scan metadata (which may contain multiple files to scan), kernel will call this

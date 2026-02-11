@@ -133,7 +133,7 @@ pub struct ScanFile {
     pub partition_values: HashMap<String, String>,
 }
 
-pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile);
+pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile) -> bool;
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
 /// scan.
@@ -227,7 +227,10 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     transform: get_transform_for_row(row_index, self.transforms),
                     partition_values,
                 };
-                (self.callback)(&mut self.context, scan_file)
+                let should_continue = (self.callback)(&mut self.context, scan_file);
+                if !should_continue {
+                    return Ok(());
+                }
             }
         }
         Ok(())
@@ -245,7 +248,7 @@ mod tests {
         id: usize,
     }
 
-    fn validate_visit(context: &mut TestContext, scan_file: ScanFile) {
+    fn validate_visit(context: &mut TestContext, scan_file: ScanFile) -> bool {
         assert_eq!(
             scan_file.path,
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
@@ -264,6 +267,7 @@ mod tests {
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
         assert!(scan_file.transform.is_none());
         assert_eq!(context.id, 2);
+        true
     }
 
     #[test]
