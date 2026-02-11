@@ -226,7 +226,7 @@ impl StateInfo {
                         "Cannot use both predicate and stats_columns in the same scan",
                     ));
                 }
-                // stats_columns = Some([]) means output all stats from expected_stats_schema.
+                // stats_columns = Some([]) meaats_schema.
                 // Clustering columns parameter is not needed here - that's for ensuring columns
                 // are included when writing stats. For reading, we use the table properties.
                 (Some(columns), _) if columns.is_empty() => {
