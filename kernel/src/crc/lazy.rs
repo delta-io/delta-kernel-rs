@@ -69,7 +69,7 @@ impl LazyCrc {
                 Ok(crc) => CrcLoadResult::Loaded(Arc::new(crc)),
                 Err(e) => {
                     warn!(
-                        "Failed to read CRC file {:?}: {}. Falling back to log replay.",
+                        "Failed to read CRC file {:?}: {}.",
                         crc_path.location.location, e
                     );
                     CrcLoadResult::CorruptOrFailed
