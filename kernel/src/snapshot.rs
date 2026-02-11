@@ -50,7 +50,7 @@ pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
-    lazy_crc: LazyCrc,
+    lazy_crc: Arc<LazyCrc>,
 }
 
 impl PartialEq for Snapshot {
@@ -114,7 +114,7 @@ impl Snapshot {
     pub(crate) fn new(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
-        lazy_crc: LazyCrc,
+        lazy_crc: Arc<LazyCrc>,
     ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -240,7 +240,7 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let lazy_crc = LazyCrc::new(new_log_segment.latest_crc_file.clone());
+        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.latest_crc_file.clone()));
         let (new_metadata, new_protocol) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
@@ -289,7 +289,7 @@ impl Snapshot {
             old_log_segment.checkpoint_schema.clone(),
         )?;
 
-        let lazy_crc = LazyCrc::new(combined_log_segment.latest_crc_file.clone());
+        let lazy_crc = Arc::new(LazyCrc::new(combined_log_segment.latest_crc_file.clone()));
         Ok(Arc::new(Snapshot::new(
             combined_log_segment,
             table_configuration,
@@ -352,7 +352,7 @@ impl Snapshot {
         let reporter = engine.get_metrics_reporter();
 
         // Create lazy CRC loader for P&M optimization
-        let lazy_crc = LazyCrc::new(log_segment.latest_crc_file.clone());
+        let lazy_crc = Arc::new(LazyCrc::new(log_segment.latest_crc_file.clone()));
 
         // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
@@ -1751,7 +1751,7 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit = Snapshot::new(log_segment, table_config, LazyCrc::new(None));
+        let snapshot_no_commit = Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
