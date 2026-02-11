@@ -544,7 +544,7 @@ impl Snapshot {
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
-        self: Arc<Self>,
+        &self,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
@@ -584,6 +584,7 @@ impl Snapshot {
     /// clustering metadata is malformed.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
+    #[internal_api]
     pub(crate) fn get_clustering_columns(
         &self,
         engine: &dyn Engine,
