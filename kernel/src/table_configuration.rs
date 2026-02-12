@@ -1685,6 +1685,64 @@ mod test {
     }
 
     #[test]
+    fn test_build_expected_stats_schemas_id_mode_has_no_parquet_field_ids() {
+        // With column mapping mode `id`, make_physical() injects ParquetFieldId metadata for
+        // data file reading. But the physical stats schema must NOT contain these field IDs
+        // because stats are read from JSON commit files or checkpoint Parquet files, neither of
+        // which use parquet field IDs.
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "id");
+
+        assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
+
+        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+
+        // Verify physical schema has physical names
+        let physical_min_values = stats_schemas
+            .physical
+            .field("minValues")
+            .unwrap()
+            .data_type();
+        let DataType::Struct(inner) = physical_min_values else {
+            panic!("Expected minValues to be a struct");
+        };
+        assert!(
+            inner.field("phys_col_a").is_some(),
+            "Physical schema should have phys_col_a"
+        );
+        assert!(
+            inner.field("phys_col_b").is_some(),
+            "Physical schema should have phys_col_b"
+        );
+        assert!(inner.field("col_a").is_none());
+
+        // Verify no field has ParquetFieldId metadata
+        for field in inner.fields() {
+            assert!(
+                field
+                    .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                    .is_none(),
+                "Physical stats schema field '{}' should not have ParquetFieldId metadata",
+                field.name()
+            );
+        }
+
+        // Verify that make_physical on the same schema DOES produce ParquetFieldId (sanity check)
+        let data_schema = schema_with_column_mapping();
+        let physical_data = data_schema.make_physical(ColumnMappingMode::Id);
+        let data_field = physical_data.field("phys_col_a").unwrap();
+        assert!(
+            matches!(
+                data_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                Some(MetadataValue::Number(_))
+            ),
+            "make_physical should inject ParquetFieldId for data schemas in Id mode"
+        );
+    }
+
+    #[test]
     fn test_stats_column_names_returns_logical_names() {
         // stats_column_names should return logical column names
         let schema = schema_with_column_mapping();
