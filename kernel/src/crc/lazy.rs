@@ -36,6 +36,9 @@ impl CrcLoadResult {
     }
 }
 
+/// Lazy loader for CRC info that ensures it's only read once.
+///
+/// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.

@@ -1751,7 +1751,8 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit = Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
+        let snapshot_no_commit =
+            Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
