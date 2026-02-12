@@ -203,9 +203,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Miri
         run: |
-          rustup toolchain install nightly --component miri
-          rustup override set nightly
+          # Pin nightly to work around https://github.com/rust-lang/miri/issues/4855
+          rustup toolchain install nightly-2026-02-11 --component miri
+          rustup override set nightly-2026-02-11
           cargo miri setup
+      - uses: Swatinem/rust-cache@v2
       - name: Test with Miri
         run: |
           pushd ffi
