@@ -7,12 +7,15 @@ use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
 use delta_kernel::DeltaResult;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
 use delta_kernel_ffi::{
     handle::Handle, kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use uc_catalog::UCCommitter;
 
+use uc_client::UCCommitsClient;
 use uc_client::models::{
     Commit as ClientCommit, CommitRequest as ClientCommitRequest,
     CommitsRequest as ClientCommitsRequest, CommitsResponse as ClientCommitsResponse,
@@ -48,6 +51,7 @@ pub struct ExclusiveCommitsResponse;
 /// # Safety
 ///
 ///  Caller is responsible for passing a valid i64 as the table version
+#[no_mangle]
 pub unsafe extern "C" fn init_commits_response(
     latest_table_version: i64,
 ) -> Handle<ExclusiveCommitsResponse> {
@@ -65,6 +69,7 @@ pub unsafe extern "C" fn init_commits_response(
 ///
 ///  Caller is responsible for passing a valid pointer to a response, valid `Commit` data, and a
 ///  valid error callback
+#[no_mangle]
 pub unsafe extern "C" fn add_commit_to_response(
     response: Handle<ExclusiveCommitsResponse>,
     commit: Commit,
@@ -248,6 +253,38 @@ pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUC
     commit_client.drop_handle();
 }
 
+// we need our own struct here because we want to override the calls to enter the tokio runtime
+// before calling into the standard committer
+struct FFIUCCommitter<C: UCCommitsClient> {
+    inner: UCCommitter<C>,
+}
+
+impl<C: UCCommitsClient + 'static> Committer for FFIUCCommitter<C> {
+    fn commit(
+        &self,
+        engine: &dyn delta_kernel::Engine,
+        actions: Box<dyn Iterator<Item = DeltaResult<delta_kernel::FilteredEngineData>> + Send + '_>,
+        commit_metadata: delta_kernel::committer::CommitMetadata,
+    ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
+        let mut guard = (engine as &dyn std::any::Any).downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>().map(|e| e.enter());
+        if guard.is_none() {
+            guard = (engine as &dyn std::any::Any).downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>().map(|e| e.enter());
+        }
+        if guard.is_none() {
+            return Err(delta_kernel::Error::generic("FFIUCCommitter can only be used with the default engine"));
+        }
+        self.inner.commit(engine, actions, commit_metadata)
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        self.inner.is_catalog_committer()
+    }
+
+    fn publish(&self, engine: &dyn delta_kernel::Engine, publish_metadata: delta_kernel::committer::PublishMetadata) -> DeltaResult<()> {
+        self.inner.publish(engine, publish_metadata)
+    }
+}
+
 /// Get a commit client that will call the passed callbacks when it wants to request commits or to
 /// make a commit.
 ///
@@ -271,7 +308,9 @@ fn get_uc_committer_impl(
 ) -> DeltaResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitsClient> = unsafe { commit_client.clone_as_arc() };
     let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
-    let committer: Box<dyn Committer> = Box::new(UCCommitter::new(client, table_id_str));
+    let committer: Box<dyn Committer> = Box::new(FFIUCCommitter {
+        inner: UCCommitter::new(client, table_id_str),
+    });
     Ok(committer.into())
 }
 
