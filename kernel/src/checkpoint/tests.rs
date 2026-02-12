@@ -4,18 +4,21 @@ use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
+use crate::arrow::array::Int32Array;
 use crate::arrow::datatypes::DataType;
 use crate::arrow::{
     array::{create_array, RecordBatch},
     datatypes::{Field, Schema},
 };
-use crate::checkpoint::create_last_checkpoint_data;
+use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
 use crate::committer::FileSystemCommitter;
+use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
+use crate::transaction::CommitResult;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
@@ -48,8 +51,6 @@ fn test_deleted_file_retention_timestamp(
 
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
-    use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V2;
-
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -750,7 +751,41 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 /// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // TODO(#1844): Replace with `create_table` once it supports v2 checkpoints.
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["v2Checkpoint"],
+                "writerFeatures": ["v2Checkpoint"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    let store = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
@@ -758,29 +793,36 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
         .with_task_executor(executor)
         .build();
 
-    // Protocol with v2Checkpoint feature
-    write_commit_to_store(
-        &store,
-        vec![
-            create_v2_checkpoint_protocol_action(),
-            create_metadata_action(),
-        ],
-        0,
-    )
-    .await?;
+    // Commit an add action via the transaction API so the checkpoint has action + metadata batches
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let arrow_schema: Schema = snapshot.schema().as_ref().try_into_arrow()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .with_data_change(true);
+    let data = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+    let write_context = Arc::new(txn.get_write_context());
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_files_metadata);
+    let result = txn.commit(&engine)?;
+    assert!(matches!(result, CommitResult::CommittedTransaction(_)));
 
-    // Add a file so the checkpoint has action batches + metadata batch
-    write_commit_to_store(&store, vec![create_add_action("file1.parquet")], 1).await?;
-
-    let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     // This writes to parquet — will fail if the checkpointMetadata batch has a different
     // schema than the action batches.
     snapshot.checkpoint(&engine)?;
 
     // Verify the checkpoint was written and is readable
-    let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot2 = Snapshot::builder_for(table_url).build(&engine)?;
     assert_eq!(snapshot2.version(), 1);
 
     Ok(())
