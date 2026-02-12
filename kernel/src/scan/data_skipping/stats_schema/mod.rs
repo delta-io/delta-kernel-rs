@@ -404,10 +404,16 @@ impl<'a> SchemaTransform<'a> for MakePhysicalStatsNames {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         let field = self.recurse_into_struct_field(field)?;
         let name = field.physical_name(self.column_mapping_mode).to_owned();
-        let mut metadata = field.metadata.clone();
-        metadata.remove(ColumnMetadataKey::ColumnMappingId.as_ref());
-        metadata.remove(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref());
-        metadata.remove(ColumnMetadataKey::ParquetFieldId.as_ref());
+        let metadata = field
+            .metadata
+            .iter()
+            .filter(|(k, _)| {
+                k.as_str() != ColumnMetadataKey::ColumnMappingId.as_ref()
+                    && k.as_str() != ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
+                    && k.as_str() != ColumnMetadataKey::ParquetFieldId.as_ref()
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         Some(Cow::Owned(StructField {
             name,
             data_type: field.data_type.clone(),
