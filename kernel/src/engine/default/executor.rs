@@ -22,7 +22,9 @@ use crate::DeltaResult;
 /// could be a single-threaded runtime on a background thread.
 pub trait TaskExecutor: Send + Sync + 'static {
     /// The type of guard returned for `enter`
-    type Guard<'a> where Self: 'a;
+    type Guard<'a>
+    where
+        Self: 'a;
 
     /// Block on the given future, returning its output.
     ///
@@ -447,6 +449,33 @@ pub mod tokio {
                 42
             });
             assert_eq!(result, 42);
+        }
+
+        #[rstest::rstest]
+        #[case::multithreaded(
+            TokioMultiThreadExecutor::new_owned_runtime(None, None).expect("Couldn't create multithreaded executor")
+        )]
+        #[case::background(TokioBackgroundExecutor::new())]
+        fn can_enter_a_runtime<T: TaskExecutor>(#[case] executor: T) {
+            // Verify we're not inside a Tokio runtime
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Test must run outside of a Tokio runtime"
+            );
+
+            let guard = executor.enter();
+
+            assert!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "Should have entered runtime"
+            );
+
+            drop(guard);
+
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Should have exited runtime"
+            );
         }
     }
 }
