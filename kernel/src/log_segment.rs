@@ -487,6 +487,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -498,6 +499,7 @@ impl LogSegment {
             checkpoint_read_schema,
             meta_predicate,
             stats_schema,
+            partition_schema,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -519,6 +521,7 @@ impl LogSegment {
             action_schema.clone(),
             action_schema,
             meta_predicate,
+            None,
             None,
         )?;
         Ok(result.actions)
@@ -677,6 +680,7 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -699,6 +703,26 @@ impl LogSegment {
                 .is_some_and(|(stats, file_schema)| {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
+
+        // Gate the partition meta-predicate on checkpoint compatibility.
+        // If the checkpoint lacks a compatible `partitionValues_parsed`, drop the
+        // partition meta-predicate (row-level partition pruning in log_replay still applies).
+        // Only apply this gate when partition_schema is provided, meaning the meta-predicate
+        // was built for partition pruning. Non-partition meta-predicates (e.g. txn.appId
+        // filtering) are passed through unchanged.
+        let meta_predicate = match partition_schema {
+            Some(ps) => {
+                let has_partition_values_parsed = file_actions_schema
+                    .as_ref()
+                    .is_some_and(|fs| Self::schema_has_compatible_partition_values_parsed(fs, ps));
+                if has_partition_values_parsed {
+                    meta_predicate
+                } else {
+                    None
+                }
+            }
+            None => meta_predicate,
+        };
 
         // Build final schema with any additional fields needed (stats_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
@@ -1038,6 +1062,52 @@ impl LogSegment {
                 }
             }
         }
+        true
+    }
+
+    /// Checks if a checkpoint schema contains a usable `add.partitionValues_parsed` field.
+    ///
+    /// Validates that:
+    /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
+    /// 2. The types for partition columns present in both schemas are compatible
+    ///
+    /// Missing partition columns in the checkpoint are OK (they simply won't contribute
+    /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
+    /// or has incompatible types for any shared column.
+    pub(crate) fn schema_has_compatible_partition_values_parsed(
+        checkpoint_schema: &StructType,
+        partition_schema: &StructType,
+    ) -> bool {
+        let Some(partition_parsed) =
+            checkpoint_schema
+                .field("add")
+                .and_then(|f| match f.data_type() {
+                    DataType::Struct(s) => s.field("partitionValues_parsed"),
+                    _ => None,
+                })
+        else {
+            debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
+            return false;
+        };
+
+        let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
+            debug!(
+                "partitionValues_parsed not compatible: add.partitionValues_parsed is not a Struct, got {:?}",
+                partition_parsed.data_type()
+            );
+            return false;
+        };
+
+        // Flat struct: reuse the recursive type checker (trivial case with no nesting)
+        if !Self::structs_have_compatible_types(
+            partition_struct,
+            partition_schema,
+            "partitionValues_parsed",
+        ) {
+            return false;
+        }
+
+        debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
 }
