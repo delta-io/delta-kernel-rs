@@ -1061,3 +1061,157 @@ fn test_checkpoint_row_group_skipping(
         }
     }
 }
+
+// ============================================================================
+// Partition meta-predicate rewriting tests
+// ============================================================================
+
+mod partition_meta_predicate_tests {
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+
+    use crate::expressions::transforms::ExpressionTransform;
+    use crate::expressions::{
+        column_expr, column_name, ColumnName, Expression as Expr, Predicate as Pred,
+    };
+    use crate::scan::RewriteToPartitionParsed;
+
+    fn partition_set(names: &[&str]) -> HashSet<ColumnName> {
+        names.iter().map(|n| ColumnName::new([*n])).collect()
+    }
+
+    #[test]
+    fn rewrite_partition_column() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        let col = column_name!("date");
+        let result = rewriter.transform_expr_column(&col);
+        assert!(matches!(result, Some(Cow::Owned(_))));
+        let rewritten = result.unwrap().into_owned();
+        assert_eq!(
+            rewritten,
+            ColumnName::new(["add", "partitionValues_parsed", "date"])
+        );
+    }
+
+    #[test]
+    fn non_partition_column_returns_none() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        let col = column_name!("value");
+        let result = rewriter.transform_expr_column(&col);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pure_partition_predicate_fully_rewritten() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        let pred = Pred::eq(column_expr!("date"), Expr::literal("2024-01-01"));
+        let result = rewriter.transform_pred(&pred);
+        assert!(result.is_some());
+        // The rewritten predicate should reference the partition parsed path
+        let rewritten = result.unwrap().into_owned();
+        let refs = rewritten.references();
+        assert!(refs
+            .iter()
+            .any(|r| r.path() == ["add", "partitionValues_parsed", "date"]));
+    }
+
+    #[test]
+    fn and_with_non_partition_drops_non_partition_conjuncts() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        // AND(date = '2024-01-01', value > 10)
+        let pred = Pred::and(
+            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
+            Pred::gt(column_expr!("value"), Expr::literal(10)),
+        );
+        let result = rewriter.transform_pred(&pred);
+        // The non-partition conjunct (value > 10) should be dropped, leaving just date =
+        assert!(result.is_some());
+        let rewritten = result.unwrap().into_owned();
+        let refs = rewritten.references();
+        // Should only have the partition column reference
+        assert!(refs
+            .iter()
+            .all(|r| r.path() == ["add", "partitionValues_parsed", "date"]));
+    }
+
+    #[test]
+    fn or_with_non_partition_drops_entire_or() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        // OR(date = '2024-01-01', value > 10)
+        let pred = Pred::or(
+            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
+            Pred::gt(column_expr!("value"), Expr::literal(10)),
+        );
+        let result = rewriter.transform_pred(&pred);
+        // Cannot safely drop an OR branch — must drop the entire OR
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn or_with_all_partition_columns_preserved() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date", "region"]),
+        };
+        // OR(date = '2024-01-01', region = 'us')
+        let pred = Pred::or(
+            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
+            Pred::eq(column_expr!("region"), Expr::literal("us")),
+        );
+        let result = rewriter.transform_pred(&pred);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn and_or_mixed_drops_or_keeps_and() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        // AND(date = '2024-01-01', OR(date = '2024-01-02', value > 10))
+        // The OR has a non-partition branch, so the whole OR gets dropped.
+        // The AND keeps the partition conjunct.
+        let pred = Pred::and(
+            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
+            Pred::or(
+                Pred::eq(column_expr!("date"), Expr::literal("2024-01-02")),
+                Pred::gt(column_expr!("value"), Expr::literal(10)),
+            ),
+        );
+        let result = rewriter.transform_pred(&pred);
+        assert!(result.is_some());
+        let rewritten = result.unwrap().into_owned();
+        let refs = rewritten.references();
+        assert!(refs
+            .iter()
+            .all(|r| r.path() == ["add", "partitionValues_parsed", "date"]));
+    }
+
+    #[test]
+    fn no_partition_columns_returns_none() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: HashSet::new(),
+        };
+        let pred = Pred::eq(column_expr!("date"), Expr::literal("2024-01-01"));
+        let result = rewriter.transform_pred(&pred);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn only_non_partition_predicate_returns_none() {
+        let mut rewriter = RewriteToPartitionParsed {
+            partition_columns: partition_set(&["date"]),
+        };
+        let pred = Pred::gt(column_expr!("value"), Expr::literal(10));
+        let result = rewriter.transform_pred(&pred);
+        assert!(result.is_none());
+    }
+}

@@ -17,7 +17,10 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{
+    ColumnName, ExpressionRef, JunctionPredicate, JunctionPredicateOp, Predicate, PredicateRef,
+    Scalar,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
@@ -346,6 +349,62 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
+/// Rewrites column references for partition columns to point to `add.partitionValues_parsed.<col>`.
+/// Non-partition column references return `None`, which causes them to be dropped from AND
+/// conjuncts (safe — makes the filter weaker) but causes the entire OR to be dropped if any
+/// branch references a non-partition column (required — dropping OR branches would be unsafe).
+struct RewriteToPartitionParsed {
+    partition_columns: HashSet<ColumnName>,
+}
+
+static PARTITION_VALUES_PARSED_PREFIX: LazyLock<ColumnName> =
+    LazyLock::new(|| ColumnName::new(["add", "partitionValues_parsed"]));
+
+impl<'a> ExpressionTransform<'a> for RewriteToPartitionParsed {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        if self.partition_columns.contains(name) {
+            Some(Cow::Owned(PARTITION_VALUES_PARSED_PREFIX.join(name)))
+        } else {
+            None
+        }
+    }
+
+    /// Override junction handling for correctness:
+    /// - AND: delegate to default recursion — safe to drop non-partition conjuncts
+    /// - OR: if ANY child returns None (non-partition reference), return None for the
+    ///   entire OR. Dropping disjuncts would make the filter stronger, causing false negatives.
+    fn transform_pred_junction(
+        &mut self,
+        pred: &'a JunctionPredicate,
+    ) -> Option<Cow<'a, JunctionPredicate>> {
+        match pred.op {
+            JunctionPredicateOp::And => self.recurse_into_pred_junction(pred),
+            JunctionPredicateOp::Or => {
+                let mut any_changed = false;
+                let mut new_preds = Vec::with_capacity(pred.preds.len());
+                for child in &pred.preds {
+                    match self.transform_pred(child) {
+                        Some(Cow::Borrowed(p)) => new_preds.push(p.clone()),
+                        Some(Cow::Owned(p)) => {
+                            any_changed = true;
+                            new_preds.push(p);
+                        }
+                        None => return None,
+                    }
+                }
+                if any_changed {
+                    Some(Cow::Owned(JunctionPredicate {
+                        op: pred.op,
+                        preds: new_preds,
+                    }))
+                } else {
+                    Some(Cow::Borrowed(pred))
+                }
+            }
+        }
+    }
+}
+
 static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
 
@@ -501,6 +560,29 @@ impl Scan {
         self.state_info.logical_stats_schema.as_ref()
     }
 
+    /// Build a meta-predicate for checkpoint `partitionValues_parsed` row group skipping.
+    ///
+    /// Extracts partition-only conjuncts from the physical predicate and rewrites column
+    /// references to point at `add.partitionValues_parsed.<col>`. Returns `None` if no
+    /// partition predicate can be constructed (no predicate, no partition columns, or the
+    /// predicate only references non-partition columns).
+    fn build_partition_meta_predicate(&self) -> Option<PredicateRef> {
+        let partition_schema = self.state_info.physical_partition_schema.as_ref()?;
+        let predicate = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(pred, _) => pred,
+            _ => return None,
+        };
+
+        let partition_columns: HashSet<ColumnName> = partition_schema
+            .fields()
+            .map(|f| ColumnName::new([f.name()]))
+            .collect();
+
+        let mut rewriter = RewriteToPartitionParsed { partition_columns };
+        let rewritten = rewriter.transform_pred(predicate)?;
+        Some(Arc::new(rewritten.into_owned()))
+    }
+
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:
@@ -646,7 +728,7 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let meta_predicate = self.build_actions_meta_predicate();
+        let meta_predicate = self.combine_meta_predicates();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
@@ -696,7 +778,7 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let meta_predicate = self.build_actions_meta_predicate();
+        let meta_predicate = self.combine_meta_predicates();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -741,6 +823,23 @@ impl Scan {
         };
         let prefixed = prefixer.transform_pred(&skipping_pred)?;
         Some(Arc::new(prefixed.into_owned()))
+    }
+
+    /// Combines the stats-based and partition-based meta predicates into a single predicate
+    /// using AND. Both predicates target different checkpoint columns (`add.stats_parsed.*` and
+    /// `add.partitionValues_parsed.*`), so combining them maximizes row group filtering.
+    fn combine_meta_predicates(&self) -> Option<PredicateRef> {
+        match (
+            self.build_actions_meta_predicate(),
+            self.build_partition_meta_predicate(),
+        ) {
+            (Some(stats), Some(partition)) => Some(Arc::new(Predicate::and(
+                (*stats).clone(),
+                (*partition).clone(),
+            ))),
+            (Some(pred), None) | (None, Some(pred)) => Some(pred),
+            (None, None) => None,
+        }
     }
 
     /// Start a parallel scan metadata processing for the table.
