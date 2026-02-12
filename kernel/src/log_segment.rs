@@ -34,6 +34,8 @@ use url::Url;
 mod protocol_metadata_replay;
 
 #[cfg(test)]
+mod crc_tests;
+#[cfg(test)]
 mod tests;
 
 /// Information about checkpoint reading for data skipping optimization.
@@ -87,7 +89,7 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file
+    /// Latest CRC (checksum) file, only if version >= checkpoint version.
     pub latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
@@ -850,6 +852,80 @@ impl LogSegment {
             .iter()
             .map(|sidecar| sidecar.to_filemeta(&self.log_root))
             .try_collect()
+    }
+
+    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
+    ///
+    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
+    /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
+    /// in `(start_v_exclusive, end_version]` are retained.
+    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: None,
+            log_root: self.log_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: None,
+            max_published_version: None,
+        }
+    }
+
+    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
+    ///
+    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
+    /// checkpoint-based replay, so checkpoint files and schema are preserved. Only commits
+    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
+    /// needed for this replay path (CRC file, latest commit file) are dropped.
+    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: self.checkpoint_version,
+            log_root: self.log_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: self.checkpoint_parts.clone(),
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: self.checkpoint_schema.clone(),
+            max_published_version: None,
+        }
+    }
+
+    /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
+    /// If `lo_exclusive` is `None`, there is no lower bound.
+    fn filtered_commits_and_compactions(
+        &self,
+        lo_exclusive: Option<Version>,
+        hi_inclusive: Version,
+    ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
+        let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
+        let commits = self
+            .ascending_commit_files
+            .iter()
+            .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
+            .cloned()
+            .collect();
+        let compactions = self
+            .ascending_compaction_files
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.file_type,
+                    LogPathFileType::CompactedCommit { hi }
+                        if above_lo(c.version) && hi <= hi_inclusive
+                )
+            })
+            .cloned()
+            .collect();
+        (commits, compactions)
     }
 
     /// How many commits since a checkpoint, according to this log segment.

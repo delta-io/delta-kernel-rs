@@ -146,12 +146,11 @@ impl ScanBuilder {
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
     ///
-    /// NOTE: This method cannot currently be used together with [`include_stats_columns`].
-    /// Using both will result in an error when calling [`build`]. See [#1751] for tracking.
+    /// This method can be combined with [`include_stats_columns`]. When both are used, the kernel
+    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
+    /// engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
-    /// [`build`]: ScanBuilder::build
-    /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
@@ -166,12 +165,11 @@ impl ScanBuilder {
     /// The statistics schema is determined by the table's configuration
     /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`).
     ///
-    /// NOTE: This method cannot currently be used together with [`with_predicate`]. Using both
-    /// will result in an error when calling [`build`]. See [#1751] for tracking.
+    /// This method can be combined with [`with_predicate`]. When both are used, the kernel
+    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
+    /// engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`with_predicate`]: ScanBuilder::with_predicate
-    /// [`build`]: ScanBuilder::build
-    /// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
     pub fn include_stats_columns(mut self) -> Self {
         self.stats_columns = Some(Vec::new());
         self
