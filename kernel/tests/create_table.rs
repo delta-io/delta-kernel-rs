@@ -10,6 +10,7 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::DeltaResult;
+use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
@@ -392,64 +393,45 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
     Ok(())
 }
 
+#[rstest]
+#[case(10, "col5", None)]
+#[case(40, "col35", Some(33))]
 #[tokio::test]
-async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
+async fn test_clustering_stats_columns(
+    #[case] num_columns: usize,
+    #[case] clustering_column: &str,
+    #[case] expected_stats_cols_len: Option<usize>,
+) -> DeltaResult<()> {
     use delta_kernel::transaction::data_layout::DataLayout;
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    // Build schema with 10 columns (cluster on column 5, within default 32 limit)
-    let fields: Vec<StructField> = (0..10)
+    let fields: Vec<StructField> = (0..num_columns)
         .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, true))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 
-    // Create clustered table on col5
+    // Create clustered table
     let txn = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::clustered(["col5"]))
+        .with_data_layout(DataLayout::clustered([clustering_column]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Verify stats_columns includes the clustering column
     let stats_cols = txn.stats_columns();
     assert!(
-        stats_cols.iter().any(|c| c.to_string() == "col5"),
-        "Clustering column col5 should be in stats columns"
+        stats_cols
+            .iter()
+            .any(|c| c.to_string() == clustering_column),
+        "Clustering column {clustering_column} should be in stats columns"
     );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
-    use delta_kernel::transaction::data_layout::DataLayout;
-
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
-    let fields: Vec<StructField> = (0..40)
-        .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, true))
-        .collect();
-    let schema = Arc::new(StructType::try_new(fields)?);
-
-    // Create clustered table on col35 (position > 32)
-    let txn = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::clustered(["col35"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-
-    // Verify stats_columns includes the clustering column even beyond limit
-    let stats_cols = txn.stats_columns();
-    assert!(
-        stats_cols.iter().any(|c| c.to_string() == "col35"),
-        "Clustering column col35 should be in stats columns even beyond DEFAULT_NUM_INDEXED_COLS"
-    );
-
-    // Verify we have exactly 33 stats columns: first 32 + col35
-    // (col35 is added in Pass 2 of collect_columns)
-    assert_eq!(
-        stats_cols.len(),
-        33,
-        "Should have 32 indexed cols + 1 clustering col"
-    );
+    if let Some(expected_len) = expected_stats_cols_len {
+        assert_eq!(
+            stats_cols.len(),
+            expected_len,
+            "Expected stats column count should match for {clustering_column}"
+        );
+    }
 
     Ok(())
 }
