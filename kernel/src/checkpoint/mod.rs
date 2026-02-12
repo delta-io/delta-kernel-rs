@@ -101,7 +101,7 @@ use crate::actions::{
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::Scalar;
+use crate::expressions::{Expression, Scalar, StructData, Transform};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
@@ -132,9 +132,9 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
-/// Schema for extracting relevant actions from log files for checkpoint creation
-static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
+/// Action fields shared by V1 and V2 checkpoint schemas.
+fn base_checkpoint_action_fields() -> Vec<StructField> {
+    vec![
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -142,17 +142,28 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-    ]))
-});
+    ]
+}
 
-// Schema of the [`CheckpointMetadata`] action that is included in V2 checkpoints
-// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
-// we're not supporting yet due to the lack of map support TODO(#880).
-static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
+/// Schema for V1 checkpoints (without checkpointMetadata action)
+static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(StructType::new_unchecked(base_checkpoint_action_fields())));
+
+/// Schema for the checkpointMetadata field in V2 checkpoints.
+/// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
+/// we're not supporting yet due to the lack of map support TODO(#880).
+fn checkpoint_metadata_field() -> StructField {
+    StructField::nullable(
         CHECKPOINT_METADATA_NAME,
         DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
-    )]))
+    )
+}
+
+/// Schema for V2 checkpoints (includes checkpointMetadata action)
+static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let mut fields = base_checkpoint_action_fields();
+    fields.push(checkpoint_metadata_field());
+    Arc::new(StructType::new_unchecked(fields))
 });
 
 /// Orchestrates the process of creating a checkpoint for a table.
@@ -244,23 +255,29 @@ impl CheckpointWriter {
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
 
-        let actions = self.snapshot.log_segment().read_actions(
-            engine,
-            CHECKPOINT_ACTIONS_SCHEMA.clone(),
-            None,
-        )?;
+        let schema = if is_v2_checkpoints_supported {
+            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
+        } else {
+            CHECKPOINT_ACTIONS_SCHEMA_V1.clone()
+        };
 
-        // Create iterator over actions for checkpoint data
+        let actions = self
+            .snapshot
+            .log_segment()
+            .read_actions(engine, schema.clone(), None)?;
+
+        // Deduplicate actions for the checkpoint
         let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
         )
         .process_actions_iter(actions);
 
-        let checkpoint_metadata =
-            is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));
+        // For V2 checkpoints, chain the checkpoint metadata batch. The metadata batch uses
+        // the same schema as action batches so all batches can be written to one parquet file.
+        let checkpoint_metadata = is_v2_checkpoints_supported
+            .then(|| self.create_checkpoint_metadata_batch(engine, &schema));
 
-        // Wrap the iterator to track action counts
         Ok(ActionReconciliationIterator::new(Box::new(
             checkpoint_data.chain(checkpoint_metadata),
         )))
@@ -332,22 +349,42 @@ impl CheckpointWriter {
     ///
     /// # Implementation Details
     ///
-    /// The function creates a single-row [`EngineData`] batch containing only the
-    /// version field of the [`CheckpointMetadata`] action. Future implementations will
-    /// include the additional metadata field `tags` when map support is added.
+    /// The function creates a single-row [`EngineData`] batch using the full checkpoint schema,
+    /// with all action fields (add, remove, etc.) set to null except for the `checkpointMetadata`
+    /// field. This ensures the checkpoint metadata batch has the same schema as other action
+    /// batches, allowing them to be written to the same parquet file.
     ///
     /// # Returns:
-    /// A [`ActionReconciliationBatch`] batch including the single-row [`EngineData`] batch along with
+    /// An [`ActionReconciliationBatch`] including the single-row [`EngineData`] batch along with
     /// an accompanying selection vector with a single `true` value, indicating the action in
-    /// batch should be included in the checkpoint.
+    /// the batch should be included in the checkpoint.
     fn create_checkpoint_metadata_batch(
         &self,
         engine: &dyn Engine,
+        schema: &SchemaRef,
     ) -> DeltaResult<ActionReconciliationBatch> {
-        let checkpoint_metadata_batch = engine.evaluation_handler().create_one(
-            CHECKPOINT_METADATA_ACTION_SCHEMA.clone(),
-            &[Scalar::from(self.version)],
+        // Start with an all-null row
+        let null_row = engine.evaluation_handler().null_row(schema.clone())?;
+
+        // Build the checkpointMetadata struct value
+        let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
+            vec![StructField::not_null("version", DataType::LONG)],
+            vec![Scalar::from(self.version)],
+        )?);
+
+        // Use a Transform to set just the checkpointMetadata field, keeping others null
+        let transform = Transform::new_top_level().with_replaced_field(
+            CHECKPOINT_METADATA_NAME,
+            Arc::new(Expression::literal(checkpoint_metadata_value)),
+        );
+
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            schema.clone(),
+            Arc::new(Expression::transform(transform)),
+            schema.clone().into(),
         )?;
+
+        let checkpoint_metadata_batch = evaluator.evaluate(null_row.as_ref())?;
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
