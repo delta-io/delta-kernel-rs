@@ -29,7 +29,7 @@ use url::Url;
 /// - `ascending_commit_files`: All commit and staged commit files found, sorted by version. May contain gaps.
 /// - `ascending_compaction_files`: All compaction commit files found, sorted by version.
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
-/// - `latest_crc_file`: The CRC file with the highest version, if any.
+/// - `latest_crc_file`: The CRC file with the highest version, only if version >= checkpoint version.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
 /// - `max_published_version`: The highest published commit file version, or `None` if no published commits were found.
 #[derive(Debug)]
@@ -430,6 +430,14 @@ impl ListedLogFiles {
                     // Log replay only uses commits/compactions after a complete checkpoint
                     self.ascending_commit_files.clear();
                     self.ascending_compaction_files.clear();
+                    // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
+                    if self
+                        .latest_crc_file
+                        .as_ref()
+                        .is_some_and(|crc| crc.version < version)
+                    {
+                        self.latest_crc_file = None;
+                    }
                 }
             }
         }
