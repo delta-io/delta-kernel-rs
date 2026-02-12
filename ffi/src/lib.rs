@@ -970,7 +970,7 @@ mod tests {
         add_commit(
             storage.as_ref(),
             0,
-            actions_to_string(vec![TestAction::Metadata]),
+            actions_to_string(vec![TestAction::AllMetadata]),
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
@@ -1091,7 +1091,7 @@ mod tests {
         add_commit(
             storage.as_ref(),
             0,
-            actions_to_string_partitioned(vec![TestAction::Metadata]),
+            actions_to_string_partitioned(vec![TestAction::AllMetadata]),
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
@@ -1127,7 +1127,7 @@ mod tests {
         add_commit(
             storage.as_ref(),
             0,
-            actions_to_string(vec![TestAction::Metadata]),
+            actions_to_string(vec![TestAction::AllMetadata]),
         )
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
