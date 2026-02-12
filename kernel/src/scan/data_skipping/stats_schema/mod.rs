@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::{
     schema::{
-        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
-        SchemaTransform, StructField, StructType,
+        ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, PrimitiveType, Schema,
+        SchemaRef, SchemaTransform, StructField, StructType,
     },
     table_features::ColumnMappingMode,
     table_properties::TableProperties,
@@ -353,11 +353,21 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     )
 }
 
-/// Converts a stats schema's nested data fields to use physical column names.
+/// Converts a stats schema's nested data fields to use physical column names without injecting
+/// parquet field IDs.
 ///
 /// The stats schema has wrapper fields (`numRecords`, `nullCount`, `minValues`, `maxValues`,
 /// `tightBounds`) that don't have column mapping metadata. Only the nested struct fields inside
 /// `nullCount`, `minValues`, and `maxValues` need physical name conversion.
+///
+/// Unlike [`StructField::make_physical`], this transform does not inject `parquet.field.id`
+/// metadata. The physical stats schema is used to read stats from JSON commit files and from
+/// `stats_parsed` in checkpoint Parquet files. Neither format uses parquet field IDs: JSON doesn't
+/// use them at all, and checkpoint files are written without them. Injecting field IDs would cause
+/// engines to attempt field-ID-based column matching against checkpoint files that have no field
+/// IDs.
+///
+/// [`StructField::make_physical`]: crate::schema::StructField::make_physical
 pub(crate) struct PhysicalStatsSchemaTransform {
     pub column_mapping_mode: ColumnMappingMode,
 }
@@ -366,8 +376,11 @@ impl<'a> SchemaTransform<'a> for PhysicalStatsSchemaTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         match field.data_type() {
             DataType::Struct(inner) => {
-                // Convert nested data fields to physical names
-                let physical_inner = inner.make_physical(self.column_mapping_mode);
+                let physical_inner = MakePhysicalStatsNames {
+                    column_mapping_mode: self.column_mapping_mode,
+                }
+                .transform_struct(inner)?
+                .into_owned();
                 Some(Cow::Owned(StructField {
                     name: field.name.clone(),
                     data_type: DataType::Struct(Box::new(physical_inner)),
@@ -378,6 +391,29 @@ impl<'a> SchemaTransform<'a> for PhysicalStatsSchemaTransform {
             // Primitive fields (numRecords, tightBounds) don't need conversion
             _ => Some(Cow::Borrowed(field)),
         }
+    }
+}
+
+/// Recursively converts fields to physical names, stripping all column mapping metadata
+/// (including `parquet.field.id`).
+struct MakePhysicalStatsNames {
+    column_mapping_mode: ColumnMappingMode,
+}
+
+impl<'a> SchemaTransform<'a> for MakePhysicalStatsNames {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        let field = self.recurse_into_struct_field(field)?;
+        let name = field.physical_name(self.column_mapping_mode).to_owned();
+        let mut metadata = field.metadata.clone();
+        metadata.remove(ColumnMetadataKey::ColumnMappingId.as_ref());
+        metadata.remove(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref());
+        metadata.remove(ColumnMetadataKey::ParquetFieldId.as_ref());
+        Some(Cow::Owned(StructField {
+            name,
+            data_type: field.data_type.clone(),
+            nullable: field.nullable,
+            metadata,
+        }))
     }
 }
 
