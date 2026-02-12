@@ -1114,8 +1114,14 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let path = "memory:///";
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                OptionalValue::Some(kernel_string_slice!(path)),
+                engine.shallow_copy(),
+                OptionalValue::None,
+                OptionalValue::None,
+            ))
+        };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
