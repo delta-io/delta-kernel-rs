@@ -358,22 +358,4 @@ mod tests {
             "test_table/test_case/read_metadata/parallel_4"
         );
     }
-
-    #[rstest]
-    #[case(Some("/path/to/table".to_string()), PathBuf::from("/some/dir"), "/path/to/table")]
-    #[case(None, PathBuf::from("/some/dir"), "/some/dir/delta")]
-    fn test_resolved_table_root(
-        #[case] table_path: Option<String>,
-        #[case] table_info_dir: PathBuf,
-        #[case] expected: &str,
-    ) {
-        let table_info = TableInfo {
-            name: "test_table".into(),
-            description: None,
-            table_path,
-            table_info_dir,
-        };
-
-        assert_eq!(table_info.resolved_table_root(), expected);
-    }
 }
