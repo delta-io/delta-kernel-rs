@@ -16,7 +16,7 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use crate::Snapshot;
 
-use test_utils::delta_path_for_version;
+use test_utils::{assert_result_error_with_message, delta_path_for_version};
 
 // ============================================================================
 // Expected values
@@ -578,13 +578,22 @@ async fn test_ict_from_crc_at_snapshot_version() {
 }
 
 #[tokio::test]
-async fn test_ict_falls_back_to_commit_when_crc_has_no_ict() {
-    // Note that in this case the CRC is corrupt. Nonetheless we try to handle this gracefully.
-    CrcReadTest::new()
+async fn test_ict_errors_when_crc_has_no_ict() {
+    let setup = CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
-        .delta_with_ict(1, 2000) // <-- ICT from here
+        .delta_with_ict(1, 2000)
         .crc(1, protocol_v2_ict(), metadata_ict(), None)
         .build()
-        .await
-        .assert_ict(None, Some(2000));
+        .await;
+
+    let snapshot = Snapshot::builder_for(setup.url.clone())
+        .build(&setup.engine)
+        .unwrap();
+
+    let result = snapshot.get_in_commit_timestamp(&setup.engine);
+
+    assert_result_error_with_message(
+        result,
+        "In-Commit Timestamp not found in CRC file at version 1",
+    );
 }

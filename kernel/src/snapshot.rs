@@ -36,7 +36,7 @@ mod builder;
 pub use builder::SnapshotBuilder;
 
 use delta_kernel::actions::DomainMetadata;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
@@ -753,14 +753,15 @@ impl Snapshot {
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())
         {
-            if let Some(ict) = crc.in_commit_timestamp_opt {
-                return Ok(Some(ict));
+            match crc.in_commit_timestamp_opt {
+                Some(ict) => return Ok(Some(ict)),
+                None => {
+                    return Err(Error::generic(format!(
+                        "In-Commit Timestamp not found in CRC file at version {}",
+                        self.version()
+                    )));
+                }
             }
-            warn!(
-                "CRC file at version {} does not contain inCommitTimestamp \
-                 but ICT is enabled on this snapshot. Falling back to commit file.",
-                self.version()
-            );
         }
 
         // Fallback: read the ICT from latest_commit_file

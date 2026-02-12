@@ -564,7 +564,11 @@ impl CreateTableTransactionBuilder {
 
         // Create Transaction<CreateTable> with pre-commit snapshot
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(log_segment, table_configuration, LazyCrc::new(None))),
+            Arc::new(Snapshot::new(
+                log_segment,
+                table_configuration,
+                Arc::new(LazyCrc::new(None)),
+            )),
             self.engine_info,
             committer,
             system_domain_metadata,
