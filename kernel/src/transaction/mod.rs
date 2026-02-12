@@ -607,8 +607,9 @@ impl Transaction {
     ///
     /// Blind append transactions should only add new files and avoid write operations that
     /// depend on existing table state.
-    pub fn set_is_blind_append(&mut self) {
+    pub fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
+        self
     }
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
@@ -2277,7 +2278,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_success() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         txn.validate_blind_append_semantics()?;
         Ok(())
@@ -2286,7 +2287,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_requires_adds() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())
@@ -2295,7 +2296,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_requires_data_change() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         txn.set_data_change(false);
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
@@ -2306,7 +2307,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_rejects_removes() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         let remove_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["remove"]),
@@ -2320,7 +2321,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_rejects_dv_updates() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["dv"]),
@@ -2346,7 +2347,7 @@ mod tests {
             "test_engine",
         )
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
@@ -2366,7 +2367,7 @@ mod tests {
     #[test]
     fn test_blind_append_commit_rejects_no_adds() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         // No files added — commit should fail with blind append validation
         let err = txn
             .commit(_engine.as_ref())
@@ -2382,7 +2383,7 @@ mod tests {
     #[test]
     fn test_blind_append_commit_success() -> DeltaResult<()> {
         let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         // Blind append with add files should pass validation and proceed to commit.
         // The commit itself may fail due to schema mismatch with the dummy data,
