@@ -762,6 +762,31 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     snapshot.drop_handle();
 }
 
+/// Perform a full checkpoint of the specified snapshot using the supplied engine.
+///
+/// This writes the checkpoint parquet file and the `_last_checkpoint` file.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles.
+#[no_mangle]
+pub unsafe extern "C" fn checkpoint_snapshot(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<bool> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    snapshot_checkpoint_impl(snapshot, engine_ref).into_extern_result(&engine_ref)
+}
+
+fn snapshot_checkpoint_impl(
+    snapshot: Arc<Snapshot>,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<bool> {
+    snapshot.checkpoint(extern_engine.engine().as_ref())?;
+    Ok(true)
+}
+
 /// Get the version of the specified snapshot
 ///
 /// # Safety
@@ -945,9 +970,15 @@ mod tests {
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
+    use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use object_store::memory::InMemory;
-    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+    use object_store::path::Path;
+    use object_store::ObjectStore;
+    use serde_json::Value;
+    use test_utils::{
+        actions_to_string, actions_to_string_partitioned, add_commit, TestAction, METADATA,
+    };
 
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
@@ -1038,6 +1069,81 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_snapshot_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+
+        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
+        // add/remove commits.
+        let protocol_and_metadata = METADATA
+            .lines()
+            .skip(1) // skip commitInfo
+            .collect::<Vec<_>>()
+            .join("\n");
+        add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
+        add_commit(
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![
+                TestAction::Add("file1.parquet".into()),
+                TestAction::Add("file2.parquet".into()),
+            ]),
+        )
+        .await?;
+        add_commit(
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![
+                TestAction::Add("file3.parquet".into()),
+                TestAction::Remove("file1.parquet".into()),
+            ]),
+        )
+        .await?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = DefaultEngineBuilder::new(storage.clone())
+            .with_task_executor(executor)
+            .build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+
+        let path = "memory:///";
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let did_checkpoint = unsafe {
+            ok_or_panic(checkpoint_snapshot(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        assert!(did_checkpoint);
+
+        // Verify `_last_checkpoint` exists and looks sane.
+        let last_checkpoint = storage
+            .get(&Path::from("_delta_log/_last_checkpoint"))
+            .await?;
+        let last_checkpoint_bytes = last_checkpoint.bytes().await?;
+        let v: Value = serde_json::from_slice(last_checkpoint_bytes.as_ref())?;
+        assert_eq!(v["version"].as_u64(), Some(2));
+        // Here file1 was removed, so only file2 and
+        // file3 remain.
+        assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
+        // size = 1 protocol + 1 metadata + 2 live adds
+        assert_eq!(v["size"].as_u64(), Some(4));
+
+        // Cross-check checkpoint file size against `_last_checkpoint.sizeInBytes`.
+        let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
+        let checkpoint_size = storage.head(&checkpoint_path).await?.size;
+        assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
+
+        unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
     }

@@ -57,13 +57,16 @@
 //! let checkpoint_path = writer.checkpoint_path()?;
 //! let checkpoint_data = writer.checkpoint_data(engine)?;
 //!
+//! // Get the iterator state
+//! let state = checkpoint_data.state();
+//!
 //! // Write the checkpoint data to the object store and collect metadata
 //! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &checkpoint_data)?;
 //!
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // Finalize the checkpoint by passing the metadata and exhausted data iterator
-//! writer.finalize(engine, &metadata, checkpoint_data)?;
+//! // Finalize the checkpoint by passing the metadata and state handle
+//! writer.finalize(engine, &metadata, &state)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -89,10 +92,13 @@ use std::sync::{Arc, LazyLock};
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
-use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
+use crate::action_reconciliation::{
+    ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
+};
 use crate::actions::{
-    Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
+    CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
@@ -106,6 +112,8 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
 use url::Url;
+
+mod stats_transform;
 
 #[cfg(test)]
 mod tests;
@@ -132,6 +140,7 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
         StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     ]))
 });
@@ -186,9 +195,9 @@ impl CheckpointWriter {
             ))
         })?;
 
-        // We disallow checkpointing if the LogSegment contains any unpublished commits. (could
-        // create gaps in the version history, thereby breaking old readers)
-        snapshot.log_segment().validate_no_staged_commits()?;
+        // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
+        // create gaps in the version history, thereby breaking old readers.
+        snapshot.log_segment().validate_published()?;
 
         Ok(Self { snapshot, version })
     }
@@ -267,7 +276,7 @@ impl CheckpointWriter {
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `metadata`: The metadata of the written checkpoint file
-    /// - `checkpoint_data`: The exhausted checkpoint data iterator
+    /// - `checkpoint_iter_state`: The state of the checkpoint data iterator
     ///
     /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
@@ -278,10 +287,10 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        checkpoint_data: ActionReconciliationIterator,
+        checkpoint_iter_state: &ActionReconciliationIteratorState,
     ) -> DeltaResult<()> {
         // Ensure the checkpoint data iterator is fully exhausted
-        if !checkpoint_data.is_exhausted() {
+        if !checkpoint_iter_state.is_exhausted() {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
@@ -297,8 +306,8 @@ impl CheckpointWriter {
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            checkpoint_data.actions_count(),
-            checkpoint_data.add_actions_count(),
+            checkpoint_iter_state.actions_count(),
+            checkpoint_iter_state.add_actions_count(),
             size_in_bytes,
         );
 

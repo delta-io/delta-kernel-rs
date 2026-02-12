@@ -25,6 +25,9 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec};
+use std::sync::Mutex;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
 
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
@@ -241,6 +244,33 @@ pub fn create_default_engine(
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
     Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+}
+
+/// Test setup helper that creates a temporary directory and engine.
+///
+/// Returns `(temp_dir, table_path, engine)` for use in integration tests.
+/// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
+///
+/// # Example
+///
+/// ```ignore
+/// let (_temp_dir, table_path, engine) = test_table_setup()?;
+/// ```
+pub fn test_table_setup() -> DeltaResult<(
+    tempfile::TempDir,
+    String,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+)> {
+    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let table_path = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let table_url = url::Url::from_directory_path(&table_path)
+        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+    let engine = create_default_engine(&table_url)?;
+    Ok((temp_dir, table_path, engine))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -570,4 +600,48 @@ pub fn create_add_files_metadata(
     )?;
 
     Ok(Box::new(ArrowEngineData::new(batch)))
+}
+
+// Writer that captures log output into a shared buffer for test assertions
+pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+// Test helper that sets up tracing to capture log output
+// The guard keeps the tracing subscriber active for the lifetime of the struct
+pub struct LoggingTest {
+    logs: Arc<Mutex<Vec<u8>>>,
+    _guard: DefaultGuard,
+}
+
+impl Default for LoggingTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoggingTest {
+    pub fn new() -> Self {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs_clone = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || LogWriter(logs_clone.clone()))
+                    .with_ansi(false),
+            ),
+        );
+        Self { logs, _guard }
+    }
+
+    pub fn logs(&self) -> String {
+        String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
+    }
 }

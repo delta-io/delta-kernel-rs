@@ -21,6 +21,8 @@ use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
+#[cfg(feature = "schema-diff")]
+pub(crate) mod diff;
 
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
@@ -1330,6 +1332,11 @@ impl PrimitiveType {
                 | (Integer, Long)
                 // Float widening: float can be read as double
                 | (Float, Double)
+                // Timestamp equivalence: both are i64 microseconds since epoch, differing only
+                // in timezone semantics. The parquet representation is identical, so reading
+                // one as the other is safe at the data layer.
+                | (Timestamp, TimestampNtz)
+                | (TimestampNtz, Timestamp)
         )
     }
 }
