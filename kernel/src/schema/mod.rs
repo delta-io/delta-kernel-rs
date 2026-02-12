@@ -114,7 +114,7 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
-            Self::ParquetFieldId => "parquet.field.id",
+            Self::ParquetFieldId => "PARQUET:field_id",
             Self::GenerationExpression => "delta.generationExpression",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
