@@ -209,7 +209,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test with Miri
         run: |
-          cargo clean
+          cargo miri clean
           pushd ffi
           MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls
 
