@@ -1409,8 +1409,9 @@ mod tests {
         use crate::schema::ColumnMetadataKey;
 
         // Write parquet file with field ID
-        let field = Field::new("value", ArrowDataType::Int64, false)
-            .with_metadata(HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())]));
+        let field = Field::new("value", ArrowDataType::Int64, false).with_metadata(HashMap::from(
+            [(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())],
+        ));
         let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1418,7 +1419,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let file = std::fs::File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
@@ -1436,7 +1438,11 @@ mod tests {
         };
 
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
-        let field = footer.schema.fields().find(|f| f.name() == "value").unwrap();
+        let field = footer
+            .schema
+            .fields()
+            .find(|f| f.name() == "value")
+            .unwrap();
 
         // Field ID is preserved under parquet crate's key
         assert_eq!(
@@ -1467,12 +1473,14 @@ mod tests {
 
         // Write parquet with field IDs using ColumnMetadataKey::ParquetFieldId format
         let fields = vec![
-            Field::new("id", ArrowDataType::Int64, false).with_metadata(
-                HashMap::from([(ColumnMetadataKey::ParquetFieldId.as_ref().to_string(), "1".to_string())])
-            ),
-            Field::new("name", ArrowDataType::Utf8, false).with_metadata(
-                HashMap::from([(ColumnMetadataKey::ParquetFieldId.as_ref().to_string(), "2".to_string())])
-            ),
+            Field::new("id", ArrowDataType::Int64, false).with_metadata(HashMap::from([(
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", ArrowDataType::Utf8, false).with_metadata(HashMap::from([(
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                "2".to_string(),
+            )])),
         ];
         let arrow_schema = Arc::new(ArrowSchema::new(fields));
 
@@ -1484,7 +1492,8 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
                 Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let file = std::fs::File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
@@ -1492,12 +1501,22 @@ mod tests {
         writer.close().unwrap();
 
         // Create kernel schema with DIFFERENT names but SAME field IDs
-        let kernel_schema = Arc::new(StructType::try_new(vec![
-            StructField::new("user_id", crate::schema::DataType::LONG, false)
-                .with_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), MetadataValue::Number(1))]),
-            StructField::new("user_name", crate::schema::DataType::STRING, false)
-                .with_metadata([(ColumnMetadataKey::ParquetFieldId.as_ref(), MetadataValue::Number(2))]),
-        ]).unwrap());
+        let kernel_schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::new("user_id", crate::schema::DataType::LONG, false).with_metadata([
+                    (
+                        ColumnMetadataKey::ParquetFieldId.as_ref(),
+                        MetadataValue::Number(1),
+                    ),
+                ]),
+                StructField::new("user_name", crate::schema::DataType::STRING, false)
+                    .with_metadata([(
+                        ColumnMetadataKey::ParquetFieldId.as_ref(),
+                        MetadataValue::Number(2),
+                    )]),
+            ])
+            .unwrap(),
+        );
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());
@@ -1520,10 +1539,18 @@ mod tests {
         assert_eq!(data.len(), 1);
         let batch = &data[0];
 
-        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(id_col.values(), &[1, 2, 3], "Should match by field ID 1");
 
-        let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let name_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(name_col.value(0), "alice", "Should match by field ID 2");
         assert_eq!(name_col.value(1), "bob");
         assert_eq!(name_col.value(2), "charlie");
