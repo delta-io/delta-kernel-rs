@@ -178,8 +178,9 @@ impl EngineMap for MapArray {
 
         // Use direct array access for better performance vs Arrow's high-level API
         for idx in start_offset..end_offset {
-            let key = keys.value(idx);
             if vals.is_valid(idx) {
+                // Arrow maps always have non-null keys.
+                let key = keys.value(idx);
                 let value = vals.value(idx);
                 ret.insert(key.to_string(), value.to_string());
             }
