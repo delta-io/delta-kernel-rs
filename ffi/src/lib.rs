@@ -547,7 +547,7 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
 ) {
     let worker_threads = (worker_threads != 0).then_some(worker_threads);
     let max_blocking_threads = (max_blocking_threads != 0).then_some(max_blocking_threads);
-    
+
     builder.multithreaded_executor_config = Some(MultithreadedExecutorConfig {
         worker_threads,
         max_blocking_threads,
