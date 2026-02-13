@@ -9,7 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::data_skipping::as_data_skipping_predicate;
+use self::data_skipping::as_sql_data_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -724,7 +724,7 @@ impl Scan {
         };
         self.state_info.physical_stats_schema.as_ref()?;
 
-        let skipping_pred = as_data_skipping_predicate(predicate)?;
+        let skipping_pred = as_sql_data_skipping_predicate(predicate)?;
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
