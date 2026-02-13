@@ -150,9 +150,11 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
         logical_stats_schema: None,
+        physical_partition_schema: None,
     });
     let checkpoint_info = CheckpointReadInfo {
         has_stats_parsed: false,
+        has_partition_values_parsed: false,
         checkpoint_read_schema: get_log_add_schema().clone(),
     };
     let iter = scan_action_iter(

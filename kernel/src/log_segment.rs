@@ -47,6 +47,10 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
+    /// Whether the checkpoint has compatible `partitionValues_parsed` for row-group filtering.
+    /// When `true`, per-row partition pruning can be skipped for checkpoint batches.
+    #[allow(unused)]
+    pub has_partition_values_parsed: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -489,6 +493,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -500,6 +505,7 @@ impl LogSegment {
             checkpoint_read_schema,
             meta_predicate,
             stats_schema,
+            partition_schema,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -521,6 +527,7 @@ impl LogSegment {
             action_schema.clone(),
             action_schema,
             meta_predicate,
+            None,
             None,
         )?;
         Ok(result.actions)
@@ -679,6 +686,7 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -701,6 +709,32 @@ impl LogSegment {
                 .is_some_and(|(stats, file_schema)| {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
+
+        // Check whether the checkpoint has compatible `partitionValues_parsed` for row-group
+        // filtering. When true, the meta-predicate is applied as a row-group filter and
+        // per-row partition pruning in log_replay can be skipped.
+        let has_partition_values_parsed = partition_schema
+            .as_ref()
+            .and_then(|ps| {
+                file_actions_schema
+                    .as_ref()
+                    .map(|fs| Self::schema_has_compatible_partition_values_parsed(fs, ps))
+            })
+            .unwrap_or(false);
+
+        // Gate the partition meta-predicate on checkpoint compatibility.
+        // If the checkpoint lacks a compatible `partitionValues_parsed`, drop the
+        // partition meta-predicate (row-level partition pruning in log_replay still applies).
+        // Only apply this gate when partition_schema is provided, meaning the meta-predicate
+        // was built for partition pruning. Non-partition meta-predicates (e.g. txn.appId
+        // filtering) are passed through unchanged.
+        let meta_predicate = if has_partition_values_parsed {
+            meta_predicate
+        } else if partition_schema.is_some() {
+            None
+        } else {
+            meta_predicate
+        };
 
         // Build final schema with any additional fields needed (stats_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
@@ -810,6 +844,7 @@ impl LogSegment {
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
+            has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
@@ -1114,6 +1149,52 @@ impl LogSegment {
                 }
             }
         }
+        true
+    }
+
+    /// Checks if a checkpoint schema contains a usable `add.partitionValues_parsed` field.
+    ///
+    /// Validates that:
+    /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
+    /// 2. The types for partition columns present in both schemas are compatible
+    ///
+    /// Missing partition columns in the checkpoint are OK (they simply won't contribute
+    /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
+    /// or has incompatible types for any shared column.
+    pub(crate) fn schema_has_compatible_partition_values_parsed(
+        checkpoint_schema: &StructType,
+        partition_schema: &StructType,
+    ) -> bool {
+        let Some(partition_parsed) =
+            checkpoint_schema
+                .field("add")
+                .and_then(|f| match f.data_type() {
+                    DataType::Struct(s) => s.field("partitionValues_parsed"),
+                    _ => None,
+                })
+        else {
+            debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
+            return false;
+        };
+
+        let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
+            debug!(
+                "partitionValues_parsed not compatible: add.partitionValues_parsed is not a Struct, got {:?}",
+                partition_parsed.data_type()
+            );
+            return false;
+        };
+
+        // Flat struct: reuse the recursive type checker (trivial case with no nesting)
+        if !Self::structs_have_compatible_types(
+            partition_struct,
+            partition_schema,
+            "partitionValues_parsed",
+        ) {
+            return false;
+        }
+
+        debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
 }

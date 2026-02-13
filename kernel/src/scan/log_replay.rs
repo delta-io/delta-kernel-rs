@@ -41,6 +41,8 @@ struct InternalScanState {
     physical_stats_schema: Option<SchemaRef>,
     /// Logical stats schema for the file statistics.
     logical_stats_schema: Option<SchemaRef>,
+    /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
+    physical_partition_schema: Option<SchemaRef>,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -150,6 +152,7 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
+            has_partition_values_parsed: _,
             checkpoint_read_schema,
         } = checkpoint_info;
 
@@ -228,6 +231,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
+            physical_partition_schema,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -245,6 +249,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
+            physical_partition_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
@@ -301,6 +306,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             logical_stats_schema: internal_state.logical_stats_schema,
+            physical_partition_schema: internal_state.physical_partition_schema,
         });
 
         let processor = Self::new_with_seen_files(
@@ -406,6 +412,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
+
         let base_row_id: Option<i64> =
             getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
@@ -811,6 +818,7 @@ mod tests {
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema: get_log_add_schema().clone(),
         }
     }
@@ -906,6 +914,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            physical_partition_schema: None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -1211,6 +1220,7 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 logical_stats_schema: None,
+                physical_partition_schema: None,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor =
@@ -1242,6 +1252,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            physical_partition_schema: None,
         });
         let processor =
             ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone()).unwrap();
@@ -1285,6 +1296,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            physical_partition_schema: None,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1316,6 +1328,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            physical_partition_schema: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
