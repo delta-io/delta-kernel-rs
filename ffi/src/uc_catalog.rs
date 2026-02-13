@@ -270,11 +270,13 @@ impl<C: UCCommitsClient + 'static> Committer for FFIUCCommitter<C> {
         >,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
-        let mut guard = (engine as &dyn std::any::Any)
+        let mut guard = engine
+            .any_ref()
             .downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>()
             .map(|e| e.enter());
         if guard.is_none() {
-            guard = (engine as &dyn std::any::Any)
+            guard = engine
+                .any_ref()
                 .downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>()
                 .map(|e| e.enter());
         }
