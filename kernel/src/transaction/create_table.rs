@@ -2,7 +2,8 @@
 //!
 //! This module provides a type-safe API for creating Delta tables.
 //! Use the [`create_table`] function to get a [`CreateTableTransactionBuilder`] that can be
-//! configured with table properties and other options before building the [`Transaction`].
+//! configured with table properties and other options before building a
+//! [`CreateTableTransaction`].
 //!
 //! # Example
 //!
@@ -56,7 +57,7 @@ use crate::table_features::{
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
 };
-use crate::transaction::Transaction;
+use crate::transaction::{CreateTableTransaction, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
 
@@ -409,7 +410,7 @@ fn validate_extract_table_features_and_properties(
 /// Creates a builder for creating a new Delta table.
 ///
 /// This function returns a [`CreateTableTransactionBuilder`] that can be configured with table
-/// properties and other options before building the transaction.
+/// properties and other options before building a [`CreateTableTransaction`].
 ///
 /// # Arguments
 ///
@@ -551,7 +552,11 @@ impl CreateTableTransactionBuilder {
         self
     }
 
-    /// Builds a [`Transaction`] that can be committed to create the table.
+    /// Builds a [`CreateTableTransaction`] that can be committed to create the table.
+    ///
+    /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
+    /// table creation. Operations like removing files, removing domain metadata, or updating
+    /// deletion vectors are not available, preventing misuse at compile time.
     ///
     /// This method performs validation:
     /// - Checks that the table path is valid
@@ -575,7 +580,7 @@ impl CreateTableTransactionBuilder {
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
-    ) -> DeltaResult<Transaction> {
+    ) -> DeltaResult<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
@@ -631,7 +636,7 @@ impl CreateTableTransactionBuilder {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
 
-        // Create Transaction with pre-commit snapshot
+        // Create Transaction<CreateTable> with pre-commit snapshot
         Transaction::try_new_create_table(
             Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
