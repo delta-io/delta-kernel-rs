@@ -6,14 +6,17 @@
 // we re-allow panics in tests
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-#[cfg(feature = "default-engine-base")]
-use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
+#[cfg(feature = "default-engine-base")]
+use {
+    delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    std::collections::HashMap,
+};
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
@@ -476,6 +479,17 @@ pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
+    /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
+    /// If None, use the default single-threaded background executor.
+    multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+}
+
+#[cfg(feature = "default-engine-base")]
+struct MultithreadedExecutorConfig {
+    /// Number of worker threads for the tokio runtime. `None` uses Tokio's default.
+    worker_threads: Option<usize>,
+    /// Maximum number of threads for blocking operations. `None` uses Tokio's default.
+    max_blocking_threads: Option<usize>,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -510,6 +524,7 @@ fn get_engine_builder_impl(
         url: url?,
         allocate_fn,
         options: HashMap::default(),
+        multithreaded_executor_config: None,
     });
     Ok(Box::into_raw(builder))
 }
@@ -540,6 +555,33 @@ fn set_builder_option_impl(
     Ok(true)
 }
 
+/// Configure the builder to use a multi-threaded executor instead of the default
+/// single-threaded background executor.
+///
+/// # Parameters
+/// - `builder`: The engine builder to configure.
+/// - `worker_threads`: Number of worker threads. Pass 0 to use Tokio's default.
+/// - `max_blocking_threads`: Maximum number of blocking threads. Pass 0 to use Tokio's default.
+///
+/// # Safety
+///
+/// Caller must pass a valid EngineBuilder pointer.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
+    builder: &mut EngineBuilder,
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) {
+    let worker_threads = (worker_threads != 0).then_some(worker_threads);
+    let max_blocking_threads = (max_blocking_threads != 0).then_some(max_blocking_threads);
+
+    builder.multithreaded_executor_config = Some(MultithreadedExecutorConfig {
+        worker_threads,
+        max_blocking_threads,
+    });
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -557,6 +599,7 @@ pub unsafe extern "C" fn builder_build(
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
+        builder_box.multithreaded_executor_config,
         builder_box.allocate_fn,
     )
     .into_extern_result(&builder_box.allocate_fn)
@@ -581,7 +624,7 @@ fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(url?, Default::default(), allocate_error)
+    get_default_engine_impl(url?, Default::default(), None, allocate_error)
 }
 
 /// Safety
@@ -599,17 +642,37 @@ fn engine_to_handle(
     engine.into()
 }
 
+/// Build the default engine
+///
+/// If `executor_config` is `Some`, uses a multi-threaded executor that owns its runtime. Otherwise,
+/// uses the default single-threaded background executor.
 #[cfg(feature = "default-engine-base")]
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
+    executor_config: Option<MultithreadedExecutorConfig>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::storage::store_from_url_opts;
     use delta_kernel::engine::default::DefaultEngineBuilder;
+
     let store = store_from_url_opts(&url, options)?;
-    let engine = DefaultEngineBuilder::new(store).build();
-    Ok(engine_to_handle(Arc::new(engine), allocate_error))
+
+    let engine: Arc<dyn Engine> = if let Some(config) = executor_config {
+        let executor = TokioMultiThreadExecutor::new_owned_runtime(
+            config.worker_threads,
+            config.max_blocking_threads,
+        )?;
+        Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_task_executor(Arc::new(executor))
+                .build(),
+        )
+    } else {
+        Arc::new(DefaultEngineBuilder::new(store).build())
+    };
+
+    Ok(engine_to_handle(engine, allocate_error))
 }
 
 /// # Safety
@@ -1107,6 +1170,78 @@ mod tests {
         let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
         let checkpoint_size = storage.head(&checkpoint_path).await?.size;
         assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test checkpoint using FFI engine builder APIs with multithreaded executor.
+    // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to build engine without existing tokio runtime.
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
+        use object_store::local::LocalFileSystem;
+        use tempfile::tempdir;
+
+        let tmp_dir = tempdir()?;
+        let tmp_path = tmp_dir.path();
+        let storage = Arc::new(LocalFileSystem::new_with_prefix(tmp_path)?);
+
+        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
+        // add/remove commits.
+        let protocol_and_metadata = METADATA
+            .lines()
+            .skip(1) // skip commitInfo
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let table_url = url::Url::from_directory_path(tmp_path).unwrap();
+
+        // Use a temporary runtime for async setup, then drop it before FFI calls
+        {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
+                add_commit(
+                    storage.as_ref(),
+                    1,
+                    actions_to_string(vec![
+                        TestAction::Add("file1.parquet".into()),
+                        TestAction::Add("file2.parquet".into()),
+                    ]),
+                )
+                .await?;
+                add_commit(
+                    storage.as_ref(),
+                    2,
+                    actions_to_string(vec![
+                        TestAction::Add("file3.parquet".into()),
+                        TestAction::Remove("file1.parquet".into()),
+                    ]),
+                )
+                .await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        } // runtime dropped here, before FFI calls
+
+        // Build engine using FFI APIs
+        let path = table_url.as_str();
+        let builder =
+            unsafe { ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err)) };
+        unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
+        let engine = unsafe { ok_or_panic(builder_build(builder)) };
+
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let did_checkpoint = unsafe {
+            ok_or_panic(checkpoint_snapshot(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        assert!(did_checkpoint);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
