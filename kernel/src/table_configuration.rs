@@ -545,9 +545,7 @@ impl TableConfiguration {
     /// - Row tracking can be _supported_ and _suspended_ at the same time.
     /// - Row tracking cannot be _enabled_ while _suspended_.
     pub(crate) fn is_row_tracking_suspended(&self) -> bool {
-        self.table_properties()
-            .row_tracking_suspended
-            .unwrap_or(false)
+        self.table_properties().is_row_tracking_suspended()
     }
 
     /// Returns `true` if row tracking information should be written for this table.

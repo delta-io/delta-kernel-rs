@@ -470,8 +470,7 @@ impl Transaction {
                 .read_snapshot
                 .table_configuration()
                 .table_properties()
-                .enable_change_data_feed
-                .unwrap_or(false);
+                .is_change_data_feed_enabled();
             require!(
                 !cdf_enabled,
                 Error::generic(

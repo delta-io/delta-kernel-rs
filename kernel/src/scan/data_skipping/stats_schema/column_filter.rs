@@ -77,7 +77,7 @@ impl<'col> StatsColumnFilter<'col> {
                 path: Vec::new(),
             }
         } else {
-            let n_cols = props.data_skipping_num_indexed_cols.unwrap_or_default();
+            let n_cols = props.data_skipping_num_indexed_cols();
             let clustering_trie = clustering_columns.map(ColumnTrie::from_columns);
             Self {
                 n_columns: Some(n_cols),
