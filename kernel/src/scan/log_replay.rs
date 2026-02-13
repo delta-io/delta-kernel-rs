@@ -152,6 +152,7 @@ impl ScanLogReplayProcessor {
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
+            has_partition_values_parsed: _,
             checkpoint_read_schema,
         } = checkpoint_info;
 
@@ -411,6 +412,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
+
         let base_row_id: Option<i64> =
             getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
@@ -816,6 +818,7 @@ mod tests {
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema: get_log_add_schema().clone(),
         }
     }

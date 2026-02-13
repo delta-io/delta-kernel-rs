@@ -45,6 +45,10 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
+    /// Whether the checkpoint has compatible `partitionValues_parsed` for row-group filtering.
+    /// When `true`, per-row partition pruning can be skipped for checkpoint batches.
+    #[allow(unused)]
+    pub has_partition_values_parsed: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -704,24 +708,30 @@ impl LogSegment {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
 
+        // Check whether the checkpoint has compatible `partitionValues_parsed` for row-group
+        // filtering. When true, the meta-predicate is applied as a row-group filter and
+        // per-row partition pruning in log_replay can be skipped.
+        let has_partition_values_parsed = partition_schema
+            .as_ref()
+            .and_then(|ps| {
+                file_actions_schema
+                    .as_ref()
+                    .map(|fs| Self::schema_has_compatible_partition_values_parsed(fs, ps))
+            })
+            .unwrap_or(false);
+
         // Gate the partition meta-predicate on checkpoint compatibility.
         // If the checkpoint lacks a compatible `partitionValues_parsed`, drop the
         // partition meta-predicate (row-level partition pruning in log_replay still applies).
         // Only apply this gate when partition_schema is provided, meaning the meta-predicate
         // was built for partition pruning. Non-partition meta-predicates (e.g. txn.appId
         // filtering) are passed through unchanged.
-        let meta_predicate = match partition_schema {
-            Some(ps) => {
-                let has_partition_values_parsed = file_actions_schema
-                    .as_ref()
-                    .is_some_and(|fs| Self::schema_has_compatible_partition_values_parsed(fs, ps));
-                if has_partition_values_parsed {
-                    meta_predicate
-                } else {
-                    None
-                }
-            }
-            None => meta_predicate,
+        let meta_predicate = if has_partition_values_parsed {
+            meta_predicate
+        } else if partition_schema.is_some() {
+            None
+        } else {
+            meta_predicate
         };
 
         // Build final schema with any additional fields needed (stats_parsed, sidecar)
@@ -832,6 +842,7 @@ impl LogSegment {
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
+            has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
