@@ -22,7 +22,9 @@ use crate::DeltaResult;
 /// could be a single-threaded runtime on a background thread.
 pub trait TaskExecutor: Send + Sync + 'static {
     /// The type of guard returned for `enter`
-    type Guard<'a> where Self: 'a;
+    type Guard<'a>
+    where
+        Self: 'a;
 
     /// Block on the given future, returning its output.
     ///
