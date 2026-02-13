@@ -46,7 +46,7 @@ pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
 
 /// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
 /// instead of [`KernelPredicateEvaluator::eval`].
-pub(crate) fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
@@ -192,6 +192,27 @@ impl DataSkippingFilter {
     }
 }
 
+/// Rewrites a predicate for parquet row group skipping in checkpoint/sidecar files.
+/// Returns `None` if the predicate is not eligible for data skipping.
+///
+/// Similar to [`as_data_skipping_predicate`], but adds IS NULL guards on each stat column
+/// reference. This is necessary because parquet footer min/max statistics ignore null values:
+/// if a stat column (e.g., `maxValues.col_a`) is null for some files (meaning stats were not
+/// collected), the footer min/max won't reflect those files. The IS NULL guard ensures the
+/// row group filter conservatively keeps any row group containing files with missing stats.
+///
+/// For example, `col_a > 100` becomes:
+/// ```text
+/// OR(maxValues.col_a IS NULL, maxValues.col_a > 100)
+/// ```
+///
+/// At the parquet row group level:
+/// - If any file has null `maxValues.col_a` (null_count > 0): IS NULL is satisfiable, keep
+/// - If all files have non-null stats (null_count = 0): evaluate comparison using footer stats
+pub(crate) fn as_checkpoint_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    GuardedDataSkippingPredicateCreator.eval(pred)
+}
+
 struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
@@ -294,6 +315,165 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         // don't want to "just" try_collect inputs for OR, because that can cause OR to produce NULL
         // where FALSE would otherwise be expected. So, we filter out all nulls except the first,
         // observing that one NULL is enough to produce the correct behavior during predicate eval.
+        let mut keep_null = true;
+        let preds: Vec<_> = preds
+            .flat_map(|p| match p {
+                Some(pred) => Some(pred),
+                None => keep_null.then(|| {
+                    keep_null = false;
+                    Pred::null_literal()
+                }),
+            })
+            .collect();
+        Some(Pred::junction(op, preds))
+    }
+}
+
+/// A data-skipping predicate creator that adds IS NULL guards on stat column references,
+/// making the output safe for parquet row group filtering where null stats are invisible
+/// to footer min/max statistics.
+struct GuardedDataSkippingPredicateCreator;
+
+impl DataSkippingPredicateEvaluator for GuardedDataSkippingPredicateCreator {
+    type Output = Pred;
+    type ColumnStat = Expr;
+
+    // The get_*_stat methods delegate to DataSkippingPredicateCreator — same stat columns,
+    // just used in guarded comparisons downstream.
+
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        DataSkippingPredicateCreator.get_min_stat(col, data_type)
+    }
+
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        DataSkippingPredicateCreator.get_max_stat(col, data_type)
+    }
+
+    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
+        DataSkippingPredicateCreator.get_nullcount_stat(col)
+    }
+
+    fn get_rowcount_stat(&self) -> Option<Expr> {
+        DataSkippingPredicateCreator.get_rowcount_stat()
+    }
+
+    /// Produces a comparison between a stat column and a literal, wrapped in an IS NULL guard.
+    /// The guard ensures that row groups containing files with missing stats (null stat values)
+    /// are not incorrectly pruned, since parquet footer min/max statistics ignore nulls.
+    ///
+    /// Example: `col_a > 100` → `eval_partial_cmp(Greater, maxValues.col_a, 100, false)` →
+    /// ```text
+    /// OR(maxValues.col_a IS NULL, maxValues.col_a > 100)
+    /// ```
+    ///
+    /// Example: `col_a = 100` calls this twice (min and max):
+    /// ```text
+    /// AND(
+    ///   OR(minValues.col_a IS NULL, minValues.col_a <= 100),
+    ///   OR(maxValues.col_a IS NULL, maxValues.col_a >= 100)
+    /// )
+    /// ```
+    fn eval_partial_cmp(
+        &self,
+        ord: Ordering,
+        col: Expr,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let pred_fn = match (ord, inverted) {
+            (Ordering::Less, false) => Pred::lt,
+            (Ordering::Less, true) => Pred::ge,
+            (Ordering::Equal, false) => Pred::eq,
+            (Ordering::Equal, true) => Pred::ne,
+            (Ordering::Greater, false) => Pred::gt,
+            (Ordering::Greater, true) => Pred::le,
+        };
+        let comparison = pred_fn(col.clone(), val.clone());
+        Some(Pred::or(Pred::is_null(col), comparison))
+    }
+
+    /// Evaluates a scalar predicate (e.g., `TRUE`, `FALSE`). No guard needed since there
+    /// is no stat column reference.
+    ///
+    /// Example: `TRUE` → `Some(Pred::literal(true))`
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Pred::literal)
+    }
+
+    /// Evaluates `literal IS [NOT] NULL`. No guard needed since there is no stat column reference.
+    ///
+    /// Example: `NULL IS NULL` → `Some(Pred::literal(true))`
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
+    }
+
+    /// Produces a nullCount-based check for IS [NOT] NULL, wrapped in an IS NULL guard on the
+    /// nullCount stat itself.
+    ///
+    /// Example: `col_a IS NULL` →
+    /// ```text
+    /// OR(nullCount.col_a IS NULL, nullCount.col_a != 0)
+    /// ```
+    ///
+    /// Example: `col_a IS NOT NULL` →
+    /// ```text
+    /// OR(nullCount.col_a IS NULL, nullCount.col_a != numRecords)
+    /// ```
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
+        let nullcount = self.get_nullcount_stat(col)?;
+        let safe_to_skip = match inverted {
+            true => self.get_rowcount_stat()?, // IS NOT NULL: all-null
+            false => Expr::literal(0i64),      // IS NULL: no-null
+        };
+        let comparison = Pred::ne(nullcount.clone(), safe_to_skip);
+        Some(Pred::or(Pred::is_null(nullcount), comparison))
+    }
+
+    /// Evaluates a comparison between two scalar literals. No guard needed since there are
+    /// no stat column references.
+    ///
+    /// Example: `5 < 10` → `Some(Pred::literal(true))`
+    fn eval_pred_binary_scalars(
+        &self,
+        op: BinaryPredicateOp,
+        left: &Scalar,
+        right: &Scalar,
+        inverted: bool,
+    ) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+            .map(Pred::literal)
+    }
+
+    /// Delegates to the opaque predicate's own data skipping implementation, passing `self`
+    /// so that any recursive evaluations also use guarded comparisons.
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Pred> {
+        op.as_data_skipping_predicate(self, exprs, inverted)
+    }
+
+    /// Combines sub-predicates with AND/OR. Unsupported sub-predicates (None) are replaced
+    /// with a single NULL literal to preserve correct three-valued logic.
+    ///
+    /// Example: `col_a > 100 AND col_b < 50` →
+    /// ```text
+    /// AND(
+    ///   OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
+    ///   OR(minValues.col_b IS NULL, minValues.col_b < 50)
+    /// )
+    /// ```
+    fn finish_eval_pred_junction(
+        &self,
+        mut op: JunctionPredicateOp,
+        preds: &mut dyn Iterator<Item = Option<Pred>>,
+        inverted: bool,
+    ) -> Option<Pred> {
+        if inverted {
+            op = op.invert();
+        }
         let mut keep_null = true;
         let preds: Vec<_> = preds
             .flat_map(|p| match p {

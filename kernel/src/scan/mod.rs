@@ -9,7 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::data_skipping::as_sql_data_skipping_predicate;
+use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -713,18 +713,23 @@ impl Scan {
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is first transformed into a data-skipping form (e.g., `x > 100`
-    /// becomes `maxValues.x > 100`), then column references are prefixed with
-    /// `add.stats_parsed` to match the physical column layout of checkpoint/sidecar files.
-    /// The parquet reader's row group filter can then use parquet-level statistics on these
-    /// nested columns to skip entire row groups that cannot contain matching files.
+    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
+    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
+    /// references are prefixed with `add.stats_parsed` to match the physical column layout
+    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
+    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
+    /// contain matching files.
+    ///
+    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
+    /// values. Without them, row groups containing files with missing stats (null stat columns)
+    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
         self.state_info.physical_stats_schema.as_ref()?;
 
-        let skipping_pred = as_sql_data_skipping_predicate(predicate)?;
+        let skipping_pred = as_checkpoint_skipping_predicate(predicate)?;
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),

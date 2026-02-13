@@ -163,6 +163,11 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn read_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use delta_kernel::expressions::{column_expr, Scalar};
+        use delta_kernel::scan::ScanBuilder;
+        use delta_kernel::Predicate;
+        use std::time::Instant;
+
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
@@ -205,10 +210,56 @@ mod tests {
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;
-        // or time travel
-        // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
 
-        println!("🎉 loaded snapshot: {snapshot:?}");
+        println!(
+            "🎉 loaded snapshot version {} (not printing full snapshot - too big)",
+            snapshot.version()
+        );
+
+        // Predicate: merchant.id = '100021'
+        let predicate = Arc::new(Predicate::eq(
+            column_expr!("merchant.id"),
+            Scalar::from("100021"),
+        ));
+        println!("🔍 Predicate: merchant.id = '100021'");
+
+        // Build scan once (this is just setup, not where data skipping happens)
+        let scan = ScanBuilder::new(snapshot)
+            .with_predicate(predicate)
+            .build()?;
+
+        // Run scan_metadata 10 times and calculate mean (only timing stats pruning)
+        const ITERATIONS: usize = 10;
+        let mut durations = Vec::with_capacity(ITERATIONS);
+
+        for i in 0..ITERATIONS {
+            // Only time scan_metadata - this is where stats pruning happens
+            let start = Instant::now();
+            let scan_metadata = scan.scan_metadata(&engine)?;
+            let (batches, files) = scan_metadata
+                .map(|res| res.unwrap().scan_files.data().len())
+                .fold((0, 0), |(batches, rows), len| (batches + 1, rows + len));
+            let elapsed = start.elapsed();
+            durations.push(elapsed);
+
+            println!(
+                "  Run {}: {:?} ({} batches, {} files)",
+                i + 1,
+                elapsed,
+                batches,
+                files
+            );
+        }
+
+        let total: std::time::Duration = durations.iter().sum();
+        let mean = total / ITERATIONS as u32;
+        let min = durations.iter().min().unwrap();
+        let max = durations.iter().max().unwrap();
+
+        println!("\n📊 Results over {} iterations:", ITERATIONS);
+        println!("   Mean: {:?}", mean);
+        println!("   Min:  {:?}", min);
+        println!("   Max:  {:?}", max);
 
         Ok(())
     }
