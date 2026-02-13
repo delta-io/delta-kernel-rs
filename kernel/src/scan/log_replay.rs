@@ -855,7 +855,7 @@ mod tests {
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
-    fn validate_simple(_: &mut (), scan_file: ScanFile) {
+    fn validate_simple(_: &mut (), scan_file: ScanFile) -> bool {
         assert_eq!(
             scan_file.path,
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
@@ -868,6 +868,7 @@ mod tests {
             Some(&"2017-12-10".to_string())
         );
         assert_eq!(scan_file.partition_values.get("non-existent"), None);
+        true
     }
 
     #[test]

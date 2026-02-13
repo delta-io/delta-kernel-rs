@@ -55,7 +55,7 @@ pub(crate) struct CdfScanFile {
     pub commit_timestamp: i64,
 }
 
-pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
+pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile) -> bool;
 
 /// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
@@ -65,8 +65,10 @@ pub(crate) fn scan_metadata_to_scan_file(
     scan_metadata
         .map(|scan_metadata| -> DeltaResult<_> {
             let scan_metadata = scan_metadata?;
-            let callback: CdfScanCallback<Vec<CdfScanFile>> =
-                |context, scan_file| context.push(scan_file);
+            let callback: CdfScanCallback<Vec<CdfScanFile>> = |context, scan_file| {
+                context.push(scan_file);
+                true
+            };
             Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
         }) // Iterator-Result-Iterator
         .flatten_ok() // Iterator-Result
@@ -170,7 +172,10 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 commit_timestamp: getters[16].get(row_index, "scanFile.timestamp")?,
                 commit_version: getters[17].get(row_index, "scanFile.commit_version")?,
             };
-            (self.callback)(&mut self.context, scan_file)
+            let should_continue = (self.callback)(&mut self.context, scan_file);
+            if !should_continue {
+                return Ok(());
+            }
         }
         Ok(())
     }

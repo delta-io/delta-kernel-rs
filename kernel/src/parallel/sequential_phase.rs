@@ -226,6 +226,7 @@ mod tests {
             file_paths =
                 metadata.visit_scan_files(file_paths, |ps: &mut Vec<String>, file_stat| {
                     ps.push(file_stat.path);
+                    true
                 })?;
         }
 
