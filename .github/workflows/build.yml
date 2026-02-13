@@ -203,8 +203,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Miri
         run: |
-          rustup toolchain install nightly --component miri
-          rustup override set nightly
+          rustup toolchain install nightly-2026-02-05 --component miri
+          rustup override set nightly-2026-02-05
           cargo miri setup
       - name: Test with Miri
         run: |
