@@ -1127,6 +1127,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1197,6 +1198,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1262,6 +1264,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1311,8 +1314,13 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let checkpoint_result =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None, None)?;
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema,
+        None,
+        None,
+        None,
+    )?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1403,6 +1411,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
+        None,
         None,
         None,
     )?;
@@ -2972,6 +2981,136 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     assert!(!LogSegment::schema_has_compatible_stats_parsed(
         &checkpoint_schema,
         &stats_schema
+    ));
+}
+
+// ============================================================================
+// schema_has_compatible_partition_values_parsed tests
+// ============================================================================
+
+/// Helper to create a checkpoint schema with `add.partitionValues_parsed` for testing.
+fn create_checkpoint_schema_with_partition_parsed(
+    partition_fields: Vec<StructField>,
+) -> StructType {
+    let partition_parsed = StructType::new_unchecked(partition_fields);
+    let add_struct = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("partitionValues_parsed", partition_parsed),
+    ]);
+    StructType::new_unchecked([StructField::nullable("add", add_struct)])
+}
+
+/// Helper to create a checkpoint schema without `partitionValues_parsed`.
+fn create_checkpoint_schema_without_partition_parsed() -> StructType {
+    let add_struct = StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
+    StructType::new_unchecked([StructField::nullable("add", add_struct)])
+}
+
+#[test]
+fn test_partition_values_parsed_compatible_basic() {
+    let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
+        StructField::nullable("date", DataType::DATE),
+        StructField::nullable("region", DataType::STRING),
+    ]);
+    let partition_schema = StructType::new_unchecked([
+        StructField::nullable("date", DataType::DATE),
+        StructField::nullable("region", DataType::STRING),
+    ]);
+    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[test]
+fn test_partition_values_parsed_missing_field() {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
+            "date",
+            DataType::DATE,
+        )]);
+    // Partition schema expects both date and region, but checkpoint only has date.
+    // Missing fields are OK — they just won't contribute to row group skipping.
+    let partition_schema = StructType::new_unchecked([
+        StructField::nullable("date", DataType::DATE),
+        StructField::nullable("region", DataType::STRING),
+    ]);
+    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[test]
+fn test_partition_values_parsed_extra_field() {
+    // Checkpoint has extra fields beyond what partition schema needs — fine
+    let checkpoint_schema = create_checkpoint_schema_with_partition_parsed(vec![
+        StructField::nullable("date", DataType::DATE),
+        StructField::nullable("region", DataType::STRING),
+        StructField::nullable("extra", DataType::INTEGER),
+    ]);
+    let partition_schema =
+        StructType::new_unchecked([StructField::nullable("date", DataType::DATE)]);
+    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[test]
+fn test_partition_values_parsed_type_mismatch() {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
+            "date",
+            DataType::STRING,
+        )]);
+    let partition_schema =
+        StructType::new_unchecked([StructField::nullable("date", DataType::DATE)]);
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[test]
+fn test_partition_values_parsed_not_present() {
+    let checkpoint_schema = create_checkpoint_schema_without_partition_parsed();
+    let partition_schema =
+        StructType::new_unchecked([StructField::nullable("date", DataType::DATE)]);
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[test]
+fn test_partition_values_parsed_not_a_struct() {
+    // partitionValues_parsed is a string instead of a struct
+    let add_struct = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("partitionValues_parsed", DataType::STRING),
+    ]);
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_struct)]);
+    let partition_schema =
+        StructType::new_unchecked([StructField::nullable("date", DataType::DATE)]);
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
+    ));
+}
+
+#[test]
+fn test_partition_values_parsed_empty_partition_schema() {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_partition_parsed(vec![StructField::nullable(
+            "date",
+            DataType::DATE,
+        )]);
+    // Empty partition schema — any partitionValues_parsed is compatible
+    let partition_schema = StructType::new_unchecked(Vec::<StructField>::new());
+    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+        &checkpoint_schema,
+        &partition_schema,
     ));
 }
 

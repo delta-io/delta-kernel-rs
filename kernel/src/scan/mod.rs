@@ -641,6 +641,7 @@ impl Scan {
                 .physical_stats_schema
                 .as_ref()
                 .map(|s| s.as_ref()),
+            None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -681,8 +682,6 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
-        // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -694,6 +693,7 @@ impl Scan {
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                None,
             )
     }
 
