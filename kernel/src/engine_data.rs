@@ -191,16 +191,15 @@ macro_rules! impl_default_get {
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
 pub trait GetData<'a> {
-    /// Check if the value at `row_index` is valid (non-null).
-    ///
-    /// This allows checking for null values without knowing the column's type,
-    /// which is useful for validation scenarios where presence matters more than value.
-    fn is_valid(&self, row_index: usize) -> bool;
-
     impl_default_get!(
         (get_bool, bool),
         (get_int, i32),
         (get_long, i64),
+        (get_float, f32),
+        (get_double, f64),
+        (get_date, i32),
+        (get_timestamp, i64),
+        (get_decimal, i128),
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
@@ -219,14 +218,15 @@ macro_rules! impl_null_get {
 }
 
 impl<'a> GetData<'a> for () {
-    fn is_valid(&self, _row_index: usize) -> bool {
-        false // Null getter always returns invalid
-    }
-
     impl_null_get!(
         (get_bool, bool),
         (get_int, i32),
         (get_long, i64),
+        (get_float, f32),
+        (get_double, f64),
+        (get_date, i32),
+        (get_timestamp, i64),
+        (get_decimal, i128),
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
@@ -262,6 +262,9 @@ impl_typed_get_data!(
     (get_bool, bool),
     (get_int, i32),
     (get_long, i64),
+    (get_float, f32),
+    (get_double, f64),
+    (get_decimal, i128),
     (get_str, &'a str),
     (get_binary, &'a [u8]),
     (get_list, ListItem<'a>),

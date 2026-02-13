@@ -160,13 +160,6 @@ mod tests {
     }
 
     impl<'a> GetData<'a> for MockGetData {
-        fn is_valid(&self, row_index: usize) -> bool {
-            self.num_records_values
-                .get(row_index)
-                .map(|v| v.is_some())
-                .unwrap_or(false)
-        }
-
         fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
             if field_name == "numRecords" {
                 Ok(self.num_records_values.get(row_index).copied().flatten())

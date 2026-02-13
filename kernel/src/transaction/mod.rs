@@ -1278,8 +1278,7 @@ impl Transaction {
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
                     .iter()
                     .map(|col| {
-                        let data_type =
-                            stats_verifier::resolve_column_type(&schema, col)?;
+                        let data_type = stats_verifier::resolve_column_type(&schema, col)?;
                         Ok((col.clone(), data_type))
                     })
                     .collect::<DeltaResult<_>>()?;
@@ -2461,7 +2460,7 @@ mod tests {
     // Stats validation tests for clustering columns
     // =========================================================================
 
-    use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
+    use crate::arrow::array::{ArrayRef, Int64Array, MapArray, StructArray};
     use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,

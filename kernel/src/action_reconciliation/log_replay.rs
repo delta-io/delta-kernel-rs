@@ -1142,10 +1142,6 @@ mod tests {
         }
 
         impl<'a> GetData<'a> for MockErrorGetData {
-            fn is_valid(&self, _row_index: usize) -> bool {
-                true
-            }
-
             fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
                 if field_name == self.error_on_field && self.error_type == "str" {
                     Err(
@@ -1175,10 +1171,6 @@ mod tests {
         }
 
         impl<'a> GetData<'a> for FlexibleMock {
-            fn is_valid(&self, _row_index: usize) -> bool {
-                true
-            }
-
             fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
                 if field_name == "txn.appId" {
                     Ok(Some("test_app"))

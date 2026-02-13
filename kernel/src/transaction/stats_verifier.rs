@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
-use crate::schema::{ColumnNamesAndTypes, DataType, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType, StructType};
 use crate::utils::require;
 use crate::DeltaResult;
 
@@ -74,7 +74,7 @@ impl StatsVerifier {
         let mut invalid_files: Vec<String> = Vec::new();
 
         for batch in add_files {
-            let mut visitor = StatsPresenceVisitor::new(&mut invalid_files, types);
+            let mut visitor = StatsPresenceVisitor::new(&mut invalid_files, types, stat_type);
             batch.visit_rows(&column_names, &mut visitor)?;
         }
 
@@ -143,23 +143,67 @@ define_stat_types!(TYPES_INT, DataType::INTEGER);
 define_stat_types!(TYPES_LONG, DataType::LONG);
 define_stat_types!(TYPES_STRING, DataType::STRING);
 define_stat_types!(TYPES_BINARY, DataType::BINARY);
+define_stat_types!(TYPES_FLOAT, DataType::FLOAT);
+define_stat_types!(TYPES_DOUBLE, DataType::DOUBLE);
+define_stat_types!(TYPES_DATE, DataType::DATE);
+define_stat_types!(TYPES_TIMESTAMP, DataType::TIMESTAMP);
+define_stat_types!(TYPES_TIMESTAMP_NTZ, DataType::TIMESTAMP_NTZ);
+// Precision and scale don't affect physical layout; any valid DecimalType works here.
+#[allow(clippy::unwrap_used)]
+static TYPES_DECIMAL: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    let names = vec![column_name!("path"), column_name!("stat")];
+    let types = vec![
+        DataType::STRING,
+        DataType::Primitive(PrimitiveType::Decimal(DecimalType::try_new(38, 0).unwrap())),
+    ];
+    (names, types).into()
+});
 
 /// Select the predefined static type array matching the given data type.
 fn types_for_data_type(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> {
-    if *dt == DataType::BOOLEAN {
-        Ok(&TYPES_BOOL)
-    } else if *dt == DataType::INTEGER {
-        Ok(&TYPES_INT)
-    } else if *dt == DataType::LONG {
-        Ok(&TYPES_LONG)
-    } else if *dt == DataType::STRING {
-        Ok(&TYPES_STRING)
-    } else if *dt == DataType::BINARY {
-        Ok(&TYPES_BINARY)
-    } else {
-        Err(Error::internal_error(format!(
+    match dt {
+        &DataType::BOOLEAN => Ok(&TYPES_BOOL),
+        &DataType::INTEGER => Ok(&TYPES_INT),
+        &DataType::LONG => Ok(&TYPES_LONG),
+        &DataType::STRING => Ok(&TYPES_STRING),
+        &DataType::BINARY => Ok(&TYPES_BINARY),
+        &DataType::FLOAT => Ok(&TYPES_FLOAT),
+        &DataType::DOUBLE => Ok(&TYPES_DOUBLE),
+        &DataType::DATE => Ok(&TYPES_DATE),
+        &DataType::TIMESTAMP => Ok(&TYPES_TIMESTAMP),
+        &DataType::TIMESTAMP_NTZ => Ok(&TYPES_TIMESTAMP_NTZ),
+        DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&TYPES_DECIMAL),
+        _ => Err(Error::internal_error(format!(
             "Unsupported data type for stats validation: {dt}"
-        )))
+        ))),
+    }
+}
+
+/// Check if a stat value is present (non-null) using the appropriate typed getter.
+fn is_stat_present<'b>(
+    getter: &'b dyn GetData<'b>,
+    row_idx: usize,
+    stat_type: &DataType,
+) -> DeltaResult<bool> {
+    let field_name = "stat";
+    match stat_type {
+        &DataType::BOOLEAN => Ok(getter.get_bool(row_idx, field_name)?.is_some()),
+        &DataType::INTEGER => Ok(getter.get_int(row_idx, field_name)?.is_some()),
+        &DataType::LONG => Ok(getter.get_long(row_idx, field_name)?.is_some()),
+        &DataType::FLOAT => Ok(getter.get_float(row_idx, field_name)?.is_some()),
+        &DataType::DOUBLE => Ok(getter.get_double(row_idx, field_name)?.is_some()),
+        &DataType::DATE => Ok(getter.get_date(row_idx, field_name)?.is_some()),
+        &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
+            Ok(getter.get_timestamp(row_idx, field_name)?.is_some())
+        }
+        &DataType::STRING => Ok(getter.get_str(row_idx, field_name)?.is_some()),
+        &DataType::BINARY => Ok(getter.get_binary(row_idx, field_name)?.is_some()),
+        DataType::Primitive(PrimitiveType::Decimal(_)) => {
+            Ok(getter.get_decimal(row_idx, field_name)?.is_some())
+        }
+        _ => Err(Error::internal_error(format!(
+            "Unsupported data type for stats presence check: {stat_type}"
+        ))),
     }
 }
 
@@ -167,13 +211,19 @@ fn types_for_data_type(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndType
 struct StatsPresenceVisitor<'a> {
     invalid_files: &'a mut Vec<String>,
     types: &'static ColumnNamesAndTypes,
+    stat_type: &'a DataType,
 }
 
 impl<'a> StatsPresenceVisitor<'a> {
-    fn new(invalid_files: &'a mut Vec<String>, types: &'static ColumnNamesAndTypes) -> Self {
+    fn new(
+        invalid_files: &'a mut Vec<String>,
+        types: &'static ColumnNamesAndTypes,
+        stat_type: &'a DataType,
+    ) -> Self {
         Self {
             invalid_files,
             types,
+            stat_type,
         }
     }
 }
@@ -194,7 +244,7 @@ impl RowVisitor for StatsPresenceVisitor<'_> {
 
         for row_idx in 0..row_count {
             let path: String = getters[0].get(row_idx, "path")?;
-            if !getters[1].is_valid(row_idx) {
+            if !is_stat_present(getters[1], row_idx, self.stat_type)? {
                 self.invalid_files.push(path);
             }
         }
@@ -375,12 +425,8 @@ mod tests {
             vec![Some(1)],
             vec![Some(100)],
         );
-        let batch2 = create_add_file_batch(
-            vec!["bad_file.parquet"],
-            vec![None],
-            vec![None],
-            vec![None],
-        );
+        let batch2 =
+            create_add_file_batch(vec!["bad_file.parquet"], vec![None], vec![None], vec![None]);
 
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
         let verifier = StatsVerifier::new(columns);
@@ -394,12 +440,8 @@ mod tests {
 
     #[test]
     fn test_verify_no_required_columns() {
-        let batch = create_add_file_batch(
-            vec!["file1.parquet"],
-            vec![None],
-            vec![None],
-            vec![None],
-        );
+        let batch =
+            create_add_file_batch(vec!["file1.parquet"], vec![None], vec![None], vec![None]);
 
         let verifier = StatsVerifier::new(vec![]);
         let result = verifier.verify(&[batch]);
@@ -441,8 +483,7 @@ mod tests {
 
     #[test]
     fn test_resolve_column_type_not_found() {
-        let schema =
-            StructType::try_new([StructField::new("id", DataType::LONG, false)]).unwrap();
+        let schema = StructType::try_new([StructField::new("id", DataType::LONG, false)]).unwrap();
         assert!(resolve_column_type(&schema, &ColumnName::new(["missing"])).is_err());
     }
 }
