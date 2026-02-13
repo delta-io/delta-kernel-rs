@@ -217,18 +217,14 @@ impl StateInfo {
         // Build stats schemas:
         // - From stats_columns if specified (for outputting stats to the engine)
         // - From predicate columns otherwise (for data skipping only, no logical schema needed)
-        // Returns (physical_stats_schema, logical_stats_schema) tuple
+        // When both stats_columns and a predicate are provided, we use expected_stats_schema
+        // (which is a superset of the predicate-derived schema) so the engine receives all
+        // stats AND the DataSkippingFilter can still perform data skipping.
         let (physical_stats_schema, logical_stats_schema) =
             match (&stats_columns, &physical_predicate) {
-                // stats_columns + predicate not supported together
-                (Some(_), PhysicalPredicate::Some(..)) => {
-                    return Err(Error::generic(
-                        "Cannot use both predicate and stats_columns in the same scan",
-                    ));
-                }
                 // stats_columns = Some([]) means output all stats from expected_stats_schema.
-                // Clustering columns parameter is not needed here - that's for ensuring columns
-                // are included when writing stats. For reading, we use the table properties.
+                // This works both with and without a predicate — the DataSkippingFilter
+                // reads stats_parsed from the transformed batch, which uses this schema.
                 (Some(columns), _) if columns.is_empty() => {
                     let expected_stats_schemas =
                         table_configuration.build_expected_stats_schemas(None)?;
@@ -319,7 +315,7 @@ pub(crate) mod tests {
         let metadata = Metadata::try_new(
             None,
             None,
-            schema.as_ref().clone(),
+            schema.clone(),
             partition_columns,
             10,
             metadata_configuration,
@@ -726,7 +722,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stats_columns_with_predicate_errors() {
+    fn stats_columns_with_predicate() {
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("value", DataType::LONG),
@@ -734,18 +730,30 @@ pub(crate) mod tests {
 
         let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
 
-        let res = get_state_info_with_stats(
+        let state_info = get_state_info_with_stats(
             schema,
             vec![],
             Some(predicate),
             HashMap::new(),
             vec![],
             Some(vec![]), // empty stats_columns = include all stats
-        );
+        )
+        .unwrap();
 
-        assert_result_error_with_message(
-            res,
-            "Cannot use both predicate and stats_columns in the same scan",
+        // physical_stats_schema should be set (from expected_stats_schema)
+        assert!(
+            state_info.physical_stats_schema.is_some(),
+            "physical_stats_schema should be Some when stats_columns is set"
+        );
+        // logical_stats_schema should be set for mapping physical->logical column names
+        assert!(
+            state_info.logical_stats_schema.is_some(),
+            "logical_stats_schema should be Some when stats_columns is set"
+        );
+        // physical_predicate should still be active for data skipping
+        assert!(
+            matches!(state_info.physical_predicate, PhysicalPredicate::Some(..)),
+            "physical_predicate should be PhysicalPredicate::Some for data skipping"
         );
     }
 

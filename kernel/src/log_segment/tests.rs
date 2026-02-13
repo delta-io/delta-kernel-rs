@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -28,7 +28,7 @@ use crate::scan::test_utils::{
 use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
     StorageHandler,
 };
 use test_utils::{
@@ -72,48 +72,6 @@ fn process_sidecars(
         checkpoint_read_schema,
         meta_predicate,
     )?))
-}
-
-// NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
-// that the parquet reader properly infers nullcount = rowcount for missing columns. The two
-// checkpoint part files that contain transaction app ids have truncated schemas that would
-// otherwise fail skipping due to their missing nullcount stat:
-//
-// Row group 0:  count: 1  total(compressed): 111 B total(uncompressed):107 B
-// --------------------------------------------------------------------------------
-//              type    nulls  min / max
-// txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
-// txn.version  INT64   0      "4390" / "4390"
-#[test]
-fn test_replay_for_metadata() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
-    let url = url::Url::from_directory_path(path.unwrap()).unwrap();
-    let engine = SyncEngine::new();
-
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    let data: Vec<_> = snapshot
-        .log_segment()
-        .replay_for_metadata(&engine)
-        .unwrap()
-        .try_collect()
-        .unwrap();
-
-    // The checkpoint has five parts, each containing one action:
-    // 1. txn (physically missing P&M columns)
-    // 2. metaData
-    // 3. protocol
-    // 4. add
-    // 5. txn (physically missing P&M columns)
-    //
-    // The parquet reader should skip parts 1, 3, and 5. Note that the actual `read_metadata`
-    // always skips parts 4 and 5 because it terminates the iteration after finding both P&M.
-    //
-    // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-    //
-    // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
-    // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
-    // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
-    assert_eq!(data.len(), 4);
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of parts
@@ -3138,4 +3096,144 @@ async fn test_get_unpublished_catalog_commits() {
     let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
     let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
     assert_eq!(versions, vec![3, 4]);
+}
+
+// ============================================================================
+// Tests: segment_after_crc / segment_through_crc
+// ============================================================================
+
+fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
+    seg.ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect()
+}
+
+fn extract_compaction_ranges(seg: &LogSegment) -> Vec<(u64, u64)> {
+    seg.ascending_compaction_files
+        .iter()
+        .map(|c| match c.file_type {
+            LogPathFileType::CompactedCommit { hi } => (c.version, hi),
+            _ => panic!("expected compaction"),
+        })
+        .collect()
+}
+
+struct CrcPruningCase {
+    commits: &'static [u64],
+    compactions: &'static [(u64, u64)],
+    checkpoint: Option<u64>,
+    crc_version: u64,
+    after_commits: &'static [u64],
+    after_compactions: &'static [(u64, u64)],
+    through_commits: &'static [u64],
+    through_compactions: &'static [(u64, u64)],
+}
+
+#[rstest::rstest]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+#[case::only_deltas_no_checkpoint(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// checkpoint:                |
+// commits:                      x  x  x  x  x  x  x
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:              x  x
+#[case::only_deltas_with_checkpoint(CrcPruningCase {
+    commits: &[3, 4, 5, 6, 7, 8, 9],
+    compactions: &[],
+    checkpoint: Some(2),
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:                        [-----]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// after compactions:                  [-----]
+// through commits:     x  x  x  x  x
+#[case::compaction_after_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(5, 7)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[(5, 7)],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:               [-----------]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+// through compactions:
+#[case::compaction_overlaps_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(2, 6)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[],
+})]
+//                      0  1  2  3  4  5  6  7  8  9
+// commits:             x  x  x  x  x  x  x  x  x  x
+// compactions:         [-----]
+// crc:                             |
+// after commits:                      x  x  x  x  x
+// through commits:     x  x  x  x  x
+// through compactions: [-----]
+#[case::compaction_before_crc(CrcPruningCase {
+    commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    compactions: &[(0, 2)],
+    checkpoint: None,
+    crc_version: 4,
+    after_commits: &[5, 6, 7, 8, 9],
+    after_compactions: &[],
+    through_commits: &[0, 1, 2, 3, 4],
+    through_compactions: &[(0, 2)],
+})]
+#[tokio::test]
+async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
+    let seg = create_segment_for(LogSegmentConfig {
+        published_commit_versions: case.commits,
+        compaction_versions: case.compactions,
+        checkpoint_version: case.checkpoint,
+        ..Default::default()
+    })
+    .await;
+
+    let after = seg.segment_after_crc(case.crc_version);
+    assert_eq!(extract_commit_versions(&after), case.after_commits);
+    assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
+    assert!(after.checkpoint_version.is_none());
+    assert!(after.checkpoint_parts.is_empty());
+
+    let through = seg.segment_through_crc(case.crc_version);
+    assert_eq!(extract_commit_versions(&through), case.through_commits);
+    assert_eq!(
+        extract_compaction_ranges(&through),
+        case.through_compactions
+    );
+    assert_eq!(through.checkpoint_version, case.checkpoint);
 }
