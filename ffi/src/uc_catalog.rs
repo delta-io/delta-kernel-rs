@@ -6,20 +6,22 @@ use crate::{ExclusiveRustString, NullableCvoid};
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::DeltaResult;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+use delta_kernel::DeltaResult;
 use delta_kernel_ffi::{
     handle::Handle, kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use uc_catalog::UCCommitter;
 
-use uc_client::UCCommitsClient;
 use uc_client::models::{
     Commit as ClientCommit, CommitRequest as ClientCommitRequest,
     CommitsRequest as ClientCommitsRequest, CommitsResponse as ClientCommitsResponse,
 };
+use uc_client::UCCommitsClient;
 
 use tracing::debug;
 
@@ -263,15 +265,23 @@ impl<C: UCCommitsClient + 'static> Committer for FFIUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
-        actions: Box<dyn Iterator<Item = DeltaResult<delta_kernel::FilteredEngineData>> + Send + '_>,
+        actions: Box<
+            dyn Iterator<Item = DeltaResult<delta_kernel::FilteredEngineData>> + Send + '_,
+        >,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
-        let mut guard = (engine as &dyn std::any::Any).downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>().map(|e| e.enter());
+        let mut guard = (engine as &dyn std::any::Any)
+            .downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>()
+            .map(|e| e.enter());
         if guard.is_none() {
-            guard = (engine as &dyn std::any::Any).downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>().map(|e| e.enter());
+            guard = (engine as &dyn std::any::Any)
+                .downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>()
+                .map(|e| e.enter());
         }
         if guard.is_none() {
-            return Err(delta_kernel::Error::generic("FFIUCCommitter can only be used with the default engine"));
+            return Err(delta_kernel::Error::generic(
+                "FFIUCCommitter can only be used with the default engine",
+            ));
         }
         self.inner.commit(engine, actions, commit_metadata)
     }
@@ -280,7 +290,11 @@ impl<C: UCCommitsClient + 'static> Committer for FFIUCCommitter<C> {
         self.inner.is_catalog_committer()
     }
 
-    fn publish(&self, engine: &dyn delta_kernel::Engine, publish_metadata: delta_kernel::committer::PublishMetadata) -> DeltaResult<()> {
+    fn publish(
+        &self,
+        engine: &dyn delta_kernel::Engine,
+        publish_metadata: delta_kernel::committer::PublishMetadata,
+    ) -> DeltaResult<()> {
         self.inner.publish(engine, publish_metadata)
     }
 }
