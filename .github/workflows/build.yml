@@ -177,7 +177,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine-rustls,test-ffi,tracing
+          cargo b --features default-engine-rustls,test-ffi,tracing,uc-catalog
           popd
       - name: build and run read-table test
         run: |
@@ -195,7 +195,14 @@ jobs:
           cmake ..
           make
           make test
-
+      - name: build and run uc-catalog-ffi test
+        run: |
+          pushd ffi/examples/uc-catalog-example
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri"
     runs-on: ubuntu-latest

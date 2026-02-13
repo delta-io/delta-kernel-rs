@@ -20,3 +20,9 @@ else()
   target_compile_options(uc_catalog_example PRIVATE -Wall -Wextra -Wpedantic -Werror -g -fsanitize=address)
   target_link_options(uc_catalog_example PRIVATE -g -fsanitize=address)
 endif()
+
+# Testing
+include(CTest)
+set(ExprTestRunner "../../../tests/test-uc-catalog-ffi/run_test.sh")
+set(ExprExpectedPath "../../../tests/test-uc-catalog-ffi/expected.txt")
+add_test(NAME test_uc_catalog_ffi COMMAND ${ExprTestRunner} ${ExprExpectedPath})
