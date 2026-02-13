@@ -148,6 +148,10 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    PrimitiveType::TimestampNanos => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some("UTC".into()),
+                    )),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(

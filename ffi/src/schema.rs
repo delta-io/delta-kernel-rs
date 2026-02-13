@@ -174,7 +174,7 @@ pub struct EngineSchemaVisitor {
         metadata: &CStringMap,
     ),
 
-    /// Visit a `timestamp` belonging to the list identified by `sibling_list_id`.
+    /// Visit a microsecond `timestamp` belonging to the list identified by `sibling_list_id`.
     pub visit_timestamp: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -185,6 +185,15 @@ pub struct EngineSchemaVisitor {
 
     /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
     pub visit_timestamp_ntz: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CStringMap,
+    ),
+
+    /// Visit a nanosecond `timestamp` belonging to the list identified by `sibling_list_id`.
+    pub visit_timestamp_nanos: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
         name: KernelStringSlice,
@@ -328,6 +337,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            &DataType::TIMESTAMP_NANOS => call!(visit_timestamp_nanos),
         }
     }
 
