@@ -40,7 +40,7 @@
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: &ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: &mut ActionReconciliationIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -114,6 +114,11 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 use url::Url;
 
 mod stats_transform;
+
+use stats_transform::{
+    build_checkpoint_output_schema, build_checkpoint_read_schema_with_stats, build_stats_transform,
+    StatsTransformConfig,
+};
 
 #[cfg(test)]
 mod tests;
@@ -231,55 +236,110 @@ impl CheckpointWriter {
     }
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
-    /// This method reads the actions from the log segment and processes them
-    /// to create the checkpoint data.
+    /// This method reads actions from the log segment, processes them for checkpoint creation,
+    /// and applies stats transforms based on table properties:
+    /// - `delta.checkpoint.writeStatsAsJson` (default: true)
+    /// - `delta.checkpoint.writeStatsAsStruct` (default: false)
     ///
-    /// # Parameters
-    /// - `engine`: Implementation of [`Engine`] APIs.
+    /// The returned [`ActionReconciliationIterator`] yields [`FilteredEngineData`] batches with
+    /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
+    /// shared state for passing to [`CheckpointWriter::finalize`].
     ///
-    /// # Returns: [`ActionReconciliationIterator`] containing the checkpoint data
-    // This method is the core of the checkpoint generation process. It:
-    // 1. Determines whether to write a V1 or V2 checkpoint based on the table's
-    //    `v2Checkpoints` feature support
-    // 2. Reads actions from the log segment using the checkpoint read schema
-    // 3. Filters and deduplicates actions for the checkpoint
-    // 4. Chains the checkpoint metadata action if writing a V2 spec checkpoint
-    //    (i.e., if `v2Checkpoints` feature is supported by table)
-    // 5. Generates the appropriate checkpoint path
+    /// # Engine Usage
+    ///
+    /// ```ignore
+    /// let mut checkpoint_data = writer.checkpoint_data(&engine)?;
+    /// let state = checkpoint_data.state();
+    /// while let Some(batch) = checkpoint_data.next() {
+    ///     let data = batch?.apply_selection_vector()?;
+    ///     parquet_writer.write(&data).await?;
+    /// }
+    /// writer.finalize(&engine, &metadata, &state)?;
+    /// ```
+    // Implementation overview:
+    // 1. Determines whether to write a V1 or V2 checkpoint based on `v2Checkpoints` feature
+    // 2. Builds a read schema with stats_parsed for COALESCE expressions
+    // 3. Reads actions from the log segment and deduplicates via reconciliation
+    // 4. Applies stats transforms (COALESCE/drop) to each reconciled batch
+    // 5. Chains the checkpoint metadata action for V2 checkpoints
     pub fn checkpoint_data(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+
+        // Get clustering columns so they are always included in stats per the Delta protocol.
+        let clustering_columns = self.snapshot.get_clustering_columns(engine)?;
+
+        // Get stats schema from table configuration.
+        // This already excludes partition columns and applies column mapping.
+        let stats_schema = self
+            .snapshot
+            .table_configuration()
+            .build_expected_stats_schemas(clustering_columns.as_deref())?
+            .physical;
+
+        // Select schema based on V2 checkpoint support
         let is_v2_checkpoints_supported = self
             .snapshot
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
 
-        let schema = if is_v2_checkpoints_supported {
-            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
+        let base_schema = if is_v2_checkpoints_supported {
+            &CHECKPOINT_ACTIONS_SCHEMA_V2
         } else {
-            CHECKPOINT_ACTIONS_SCHEMA_V1.clone()
+            &CHECKPOINT_ACTIONS_SCHEMA_V1
         };
 
-        let actions = self
-            .snapshot
-            .log_segment()
-            .read_actions(engine, schema.clone(), None)?;
+        // Read schema includes stats_parsed so COALESCE expressions can operate on it.
+        // For commits, stats_parsed will be read as nulls (column doesn't exist in source).
+        let read_schema = build_checkpoint_read_schema_with_stats(base_schema, &stats_schema)?;
 
-        // Deduplicate actions for the checkpoint
+        // Read actions from log segment
+        let actions =
+            self.snapshot
+                .log_segment()
+                .read_actions(engine, read_schema.clone(), None)?;
+
+        // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
         )
         .process_actions_iter(actions);
 
-        // For V2 checkpoints, chain the checkpoint metadata batch. The metadata batch uses
-        // the same schema as action batches so all batches can be written to one parquet file.
+        // Build output schema based on stats config (determines which fields are included)
+        let output_schema = build_checkpoint_output_schema(&config, base_schema, &stats_schema)?;
+
+        // Build transform expression and create expression evaluator.
+        // The transform is applied to reconciled action batches only (not checkpoint metadata).
+        let transform_expr = build_stats_transform(&config, &stats_schema);
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            read_schema,
+            transform_expr,
+            output_schema.clone().into(),
+        )?;
+
+        // Apply stats transform to each reconciled batch
+        let transformed = checkpoint_data.map(move |batch_result| {
+            let batch = batch_result?;
+            let (data, sv) = batch.filtered_data.into_parts();
+            let transformed = evaluator.evaluate(data.as_ref())?;
+            Ok(ActionReconciliationBatch {
+                filtered_data: FilteredEngineData::try_new(transformed, sv)?,
+                actions_count: batch.actions_count,
+                add_actions_count: batch.add_actions_count,
+            })
+        });
+
+        // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
+        // action stream. The metadata batch is created with the output schema directly,
+        // bypassing the stats transform (it has no add actions to transform).
         let checkpoint_metadata = is_v2_checkpoints_supported
-            .then(|| self.create_checkpoint_metadata_batch(engine, &schema));
+            .then(|| self.create_checkpoint_metadata_batch(engine, &output_schema));
 
         Ok(ActionReconciliationIterator::new(Box::new(
-            checkpoint_data.chain(checkpoint_metadata),
+            transformed.chain(checkpoint_metadata),
         )))
     }
 
@@ -349,10 +409,13 @@ impl CheckpointWriter {
     ///
     /// # Implementation Details
     ///
-    /// The function creates a single-row [`EngineData`] batch using the full checkpoint schema,
-    /// with all action fields (add, remove, etc.) set to null except for the `checkpointMetadata`
-    /// field. This ensures the checkpoint metadata batch has the same schema as other action
-    /// batches, allowing them to be written to the same parquet file.
+    /// The function creates a single-row [`EngineData`] batch using the output checkpoint
+    /// schema, with all action fields (add, remove, etc.) set to null except for the
+    /// `checkpointMetadata` field. This ensures the checkpoint metadata batch has the same
+    /// schema as other action batches, allowing them to be written to the same Parquet file.
+    ///
+    /// The batch is created directly with the output schema and does not go through the stats
+    /// transform pipeline, since it contains no `add` actions to transform.
     ///
     /// # Returns:
     /// An [`ActionReconciliationBatch`] including the single-row [`EngineData`] batch along with
