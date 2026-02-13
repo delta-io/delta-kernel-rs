@@ -1386,18 +1386,17 @@ mod tests {
 
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
 
-        // Verify field IDs are preserved
+        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
+        // The field IDs should be accessible using get_config_value (the documented API)
         let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        assert_eq!(
-            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"1".into())
-        );
+        let id_value = id_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
+        assert!(id_value.is_some(), "Field ID should be present");
+        assert_eq!(id_value.unwrap().to_string(), "1");
 
         let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        assert_eq!(
-            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"2".into())
-        );
+        let name_value = name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
+        assert!(name_value.is_some(), "Field ID should be present");
+        assert_eq!(name_value.unwrap().to_string(), "2");
     }
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.

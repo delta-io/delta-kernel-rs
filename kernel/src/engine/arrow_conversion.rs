@@ -7,11 +7,13 @@ use crate::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use itertools::Itertools;
 
 use crate::error::Error;
 use crate::schema::{
-    ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+    StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -73,9 +75,18 @@ impl TryFromKernel<&StructField> for ArrowField {
         let metadata = f
             .metadata()
             .iter()
-            .map(|(key, val)| match &val {
-                &MetadataValue::String(val) => Ok((key.clone(), val.clone())),
-                _ => Ok((key.clone(), serde_json::to_string(val)?)),
+            .map(|(key, val)| {
+                // Transform "parquet.field.id" to "PARQUET:field_id" for Parquet writer
+                let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
+                    PARQUET_FIELD_ID_META_KEY.to_string()
+                } else {
+                    key.clone()
+                };
+
+                match &val {
+                    &MetadataValue::String(val) => Ok((transformed_key, val.clone())),
+                    _ => Ok((transformed_key, serde_json::to_string(val)?)),
+                }
             })
             .collect::<Result<_, serde_json::Error>>()
             .map_err(|err| ArrowError::JsonError(err.to_string()))?;
@@ -204,7 +215,15 @@ impl TryFromArrow<&ArrowField> for StructField {
             DataType::try_from_arrow(arrow_field.data_type())?,
             arrow_field.is_nullable(),
         )
-        .with_metadata(arrow_field.metadata().iter().map(|(k, v)| (k.clone(), v))))
+        .with_metadata(arrow_field.metadata().iter().map(|(k, v)| {
+            // Transform "PARQUET:field_id" to "parquet.field.id" when reading from Parquet
+            let transformed_key = if k == PARQUET_FIELD_ID_META_KEY {
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string()
+            } else {
+                k.clone()
+            };
+            (transformed_key, v)
+        })))
     }
 }
 
