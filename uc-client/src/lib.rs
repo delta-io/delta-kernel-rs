@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use uc_client::{ClientConfig, UCCommitsRestClient, UCCommitsClient, models::CommitsRequest};
+//! use uc_client::{ClientConfig, UCCommitsRestClient, UCGetCommitsClient, models::CommitsRequest};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@ pub mod models;
 mod tests;
 
 pub use client::UCClient;
-pub use commits_client::{UCCommitsClient, UCCommitsRestClient};
+pub use commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 
@@ -40,7 +40,7 @@ pub use commits_client::InMemoryCommitsClient;
 #[doc(hidden)]
 pub mod prelude {
     pub use crate::client::UCClient;
-    pub use crate::commits_client::{UCCommitsClient, UCCommitsRestClient};
+    pub use crate::commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
     pub use crate::models::{
         commits::{Commit, CommitsRequest, CommitsResponse},
         credentials::{Operation, TemporaryTableCredentials},

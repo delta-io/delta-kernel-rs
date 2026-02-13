@@ -14,12 +14,12 @@ use tracing::debug;
 use url::Url;
 
 /// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
-/// Catalog. For now this is a lightweight wrapper around a [UCCommitsClient].
-pub struct UCCatalog<'a, C: UCCommitsClient> {
+/// Catalog. For now this is a lightweight wrapper around a [UCGetCommitsClient].
+pub struct UCCatalog<'a, C: UCGetCommitsClient> {
     client: &'a C,
 }
 
-impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
+impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
     /// Create a new [UCCatalog] instance with the provided client.
     pub fn new(client: &'a C) -> Self {
         UCCatalog { client }
