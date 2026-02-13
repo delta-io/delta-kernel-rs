@@ -706,6 +706,51 @@ impl StructType {
         Self::try_new(self.fields.values().cloned().chain(fields))
     }
 
+    /// Inserts a field immediately after an existing field name.
+    ///
+    /// Returns an error if the `after` field does not exist or if the resulting schema is invalid
+    /// (for example, duplicate field names).
+    pub fn with_field_inserted(&self, after: &str, field: StructField) -> DeltaResult<Self> {
+        let mut inserted = false;
+        let mut fields = Vec::with_capacity(self.num_fields() + 1);
+
+        for existing in self.fields() {
+            fields.push(existing.clone());
+            if existing.name() == after {
+                fields.push(field.clone());
+                inserted = true;
+            }
+        }
+
+        require!(inserted, Error::missing_column(after));
+        Self::try_new(fields)
+    }
+
+    /// Removes a field by name and returns the resulting schema.
+    ///
+    /// Returns an error if the target field does not exist.
+    pub fn with_field_removed(&self, name: &str) -> DeltaResult<Self> {
+        require!(self.contains(name), Error::missing_column(name));
+        Ok(Self::new_unchecked(
+            self.fields().filter(|field| field.name() != name).cloned(),
+        ))
+    }
+
+    /// Replaces a field by name and returns the resulting schema.
+    ///
+    /// Returns an error if the target field does not exist or if the resulting schema is invalid
+    /// (for example, duplicate field names).
+    pub fn with_field_replaced(&self, name: &str, field: StructField) -> DeltaResult<Self> {
+        require!(self.contains(name), Error::missing_column(name));
+        Self::try_new(self.fields().map(|existing| {
+            if existing.name() == name {
+                field.clone()
+            } else {
+                existing.clone()
+            }
+        }))
+    }
+
     /// Adds a predefined metadata column to this [`StructType`], returning a new [`StructType`].
     pub fn add_metadata_column(
         &self,
@@ -3317,5 +3362,87 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_inserted() -> DeltaResult<()> {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])?;
+
+        let updated =
+            schema.with_field_inserted("id", StructField::new("email", DataType::STRING, true))?;
+
+        let names: Vec<_> = updated.field_names().cloned().collect();
+        assert_eq!(names, vec!["id", "email", "name"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_field_inserted_missing_anchor_errors() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+
+        assert_result_error_with_message(
+            schema
+                .with_field_inserted("missing", StructField::new("email", DataType::STRING, true)),
+            "missing",
+        );
+    }
+
+    #[test]
+    fn test_with_field_removed() -> DeltaResult<()> {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("age", DataType::INTEGER, true),
+        ])?;
+
+        let updated = schema.with_field_removed("name")?;
+        let names: Vec<_> = updated.field_names().cloned().collect();
+        assert_eq!(names, vec!["id", "age"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_field_removed_missing_field_errors() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+
+        assert_result_error_with_message(schema.with_field_removed("missing"), "missing");
+    }
+
+    #[test]
+    fn test_with_field_replaced() -> DeltaResult<()> {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])?;
+
+        let updated =
+            schema.with_field_replaced("name", StructField::new("name", DataType::LONG, true))?;
+
+        let replaced = updated.field("name").unwrap();
+        assert_eq!(replaced.data_type(), &DataType::LONG);
+        assert_eq!(
+            updated.field_names().cloned().collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_field_replaced_duplicate_name_errors() {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+
+        assert_result_error_with_message(
+            schema.with_field_replaced("id", StructField::new("name", DataType::INTEGER, false)),
+            "Duplicate field name: name",
+        );
     }
 }

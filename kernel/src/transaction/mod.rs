@@ -100,14 +100,11 @@ static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
 /// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
 static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
-    let len = fields.len();
-    let insert_position = fields
-        .iter()
-        .position(|f| f.name() == "modificationTime")
-        .unwrap_or(len);
-    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
-    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
+    Arc::new(
+        BASE_ADD_FILES_SCHEMA
+            .with_field_inserted("modificationTime", (*DATA_CHANGE_COLUMN).clone())
+            .expect("BASE_ADD_FILES_SCHEMA should always contain modificationTime"),
+    )
 });
 
 /// Extend a schema with a statistics column and return a new SchemaRef.
