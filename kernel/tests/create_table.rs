@@ -1,20 +1,27 @@
 //! Integration tests for the CreateTable API
 
+#[path = "create_table/column_mapping.rs"]
+mod column_mapping;
+
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
+use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
 /// Helper to create a simple two-column schema for tests.
-fn simple_schema() -> DeltaResult<Arc<StructType>> {
+/// Shared with sub-modules.
+pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, false),
         StructField::new("value", DataType::STRING, true),
@@ -61,7 +68,6 @@ async fn test_create_simple_table() -> DeltaResult<()> {
     assert!(protocol.writer_features().is_some_and(|f| f.is_empty()));
 
     // Verify no table properties are set via public API
-    use delta_kernel::table_properties::TableProperties;
     assert_eq!(snapshot.table_properties(), &TableProperties::default());
 
     // Verify schema field names
@@ -103,7 +109,6 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
     // Verify domainMetadata feature is enabled in protocol
-    use delta_kernel::table_features::TableFeature;
     assert!(
         snapshot
             .table_configuration()
@@ -292,12 +297,12 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
     Ok(())
 }
 
+// =============================================================================
+// Clustering Integration Tests
+// =============================================================================
+
 #[tokio::test]
 async fn test_create_clustered_table() -> DeltaResult<()> {
-    use delta_kernel::expressions::ColumnName;
-    use delta_kernel::table_features::TableFeature;
-    use delta_kernel::transaction::data_layout::DataLayout;
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema for a clustered table
@@ -350,10 +355,6 @@ async fn test_create_clustered_table() -> DeltaResult<()> {
 /// only have it once in the feature lists.
 #[tokio::test]
 async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaResult<()> {
-    use delta_kernel::expressions::ColumnName;
-    use delta_kernel::table_features::TableFeature;
-    use delta_kernel::transaction::data_layout::DataLayout;
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
@@ -394,8 +395,6 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
 
 #[tokio::test]
 async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
-    use delta_kernel::transaction::data_layout::DataLayout;
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
@@ -421,8 +420,6 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
-    use delta_kernel::transaction::data_layout::DataLayout;
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
@@ -456,8 +453,6 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_clustering_column_not_in_schema() -> DeltaResult<()> {
-    use delta_kernel::transaction::data_layout::DataLayout;
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = simple_schema()?;
