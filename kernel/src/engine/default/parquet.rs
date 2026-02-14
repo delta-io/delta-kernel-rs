@@ -1394,7 +1394,8 @@ mod tests {
         assert_eq!(id_value.unwrap().to_string(), "1");
 
         let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        let name_value = name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
+        let name_value =
+            name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
         assert!(name_value.is_some(), "Field ID should be present");
         assert_eq!(name_value.unwrap().to_string(), "2");
     }
@@ -1443,13 +1444,15 @@ mod tests {
             .find(|f| f.name() == "value")
             .unwrap();
 
-        // Field ID is preserved under parquet crate's key
+        // Field ID is transformed to kernel key when reading
         assert_eq!(
-            field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            field
+                .metadata()
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
             Some(&"42".into())
         );
 
-        // Field ID should be accessible via documented API (currently fails)
+        // Field ID should be accessible via documented API
         let field_id = field.get_config_value(&ColumnMetadataKey::ParquetFieldId)
             .expect("Field ID should be accessible via ColumnMetadataKey::ParquetFieldId per lib.rs:836-837");
 
@@ -1470,14 +1473,15 @@ mod tests {
     fn test_read_parquet_with_field_id_matching() {
         use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
 
-        // Write parquet with field IDs using ColumnMetadataKey::ParquetFieldId format
+        // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
+        // The kernel will transform these to parquet.field.id when reading
         let fields = vec![
             Field::new("id", ArrowDataType::Int64, false).with_metadata(HashMap::from([(
-                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                PARQUET_FIELD_ID_META_KEY.to_string(),
                 "1".to_string(),
             )])),
             Field::new("name", ArrowDataType::Utf8, false).with_metadata(HashMap::from([(
-                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                PARQUET_FIELD_ID_META_KEY.to_string(),
                 "2".to_string(),
             )])),
         ];

@@ -581,6 +581,8 @@ mod tests {
 
     #[test]
     fn test_sync_read_parquet_footer_preserves_field_ids() {
+        use crate::schema::ColumnMetadataKey;
+
         // Create Arrow schema with field IDs in metadata
         let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
@@ -624,13 +626,19 @@ mod tests {
         // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
         // The field IDs should be accessible using get_config_value (the documented API)
         let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        let id_value = id_field.get_config_value(&ColumnMetadataKey::ParquetFieldId);
-        assert!(id_value.is_some(), "Field ID should be present");
-        assert_eq!(id_value.unwrap().to_string(), "1");
+        assert_eq!(
+            id_field
+                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                .map(|v| v.to_string()),
+            Some("1".to_string())
+        );
 
         let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        let name_value = name_field.get_config_value(&ColumnMetadataKey::ParquetFieldId);
-        assert!(name_value.is_some(), "Field ID should be present");
-        assert_eq!(name_value.unwrap().to_string(), "2");
+        assert_eq!(
+            name_field
+                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+                .map(|v| v.to_string()),
+            Some("2".to_string())
+        );
     }
 }
