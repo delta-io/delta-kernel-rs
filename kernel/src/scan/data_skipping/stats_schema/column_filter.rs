@@ -3,9 +3,11 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
+#[cfg(test)]
+use crate::schema::StructType;
 use crate::{
     column_trie::ColumnTrie,
-    schema::{ColumnName, DataType, Schema, StructField, StructType},
+    schema::{ColumnName, DataType, Schema, StructField},
     table_properties::{DataSkippingNumIndexedCols, TableProperties},
 };
 
@@ -111,7 +113,7 @@ impl<'col> StatsColumnFilter<'col> {
                     continue;
                 }
                 // Verify the clustering column exists in schema before adding
-                if lookup_column_type(schema, col).is_some() {
+                if schema.lookup_column_type(col).is_some() {
                     tracing::warn!(
                         "Clustering column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
@@ -202,34 +204,6 @@ impl<'col> StatsColumnFilter<'col> {
 
         self.path.pop();
     }
-}
-
-/// Looks up a column by path in the schema, returning its data type if found.
-///
-/// Navigates through nested structs following the path components.
-/// For example, `lookup_column_type(schema, "user.address.city")` will:
-/// 1. Find field "user" in schema
-/// 2. Find field "address" in user's struct type
-/// 3. Find field "city" in address's struct type
-/// 4. Return city's data type
-fn lookup_column_type<'a>(schema: &'a StructType, column: &ColumnName) -> Option<&'a DataType> {
-    let mut parts = column.iter();
-
-    // Get the first part to start navigation
-    let first = parts.next()?;
-    let mut current_field = schema.field(first)?;
-
-    // Navigate through remaining parts
-    for part in parts {
-        match current_field.data_type() {
-            DataType::Struct(struct_type) => {
-                current_field = struct_type.field(part)?;
-            }
-            _ => return None, // Path continues but current field is not a struct
-        }
-    }
-
-    Some(current_field.data_type())
 }
 
 #[cfg(test)]
