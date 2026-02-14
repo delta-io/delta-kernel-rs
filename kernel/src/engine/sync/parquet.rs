@@ -140,6 +140,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::ColumnMetadataKey;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -581,8 +582,6 @@ mod tests {
 
     #[test]
     fn test_sync_read_parquet_footer_preserves_field_ids() {
-        use crate::schema::ColumnMetadataKey;
-
         // Create Arrow schema with field IDs in metadata
         let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
