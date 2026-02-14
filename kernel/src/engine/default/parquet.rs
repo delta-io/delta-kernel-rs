@@ -1402,7 +1402,7 @@ mod tests {
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.
     ///
-    /// Per lib.rs:835-837, field IDs should be accessible via StructField::get_config_value
+    /// Per trait definitions in lib.rs, field IDs should be accessible via StructField::get_config_value
     /// with ColumnMetadataKey::ParquetFieldId.
     #[test]
     fn test_parquet_footer_read_with_field_id() {
