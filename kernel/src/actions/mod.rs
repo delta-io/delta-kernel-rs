@@ -986,6 +986,12 @@ impl DomainMetadata {
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
     }
+
+    /// Returns true if this domain metadata action is a removal tombstone.
+    #[allow(dead_code)] // Used in CRC write path (Phase 3+)
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
+    }
 }
 
 #[cfg(test)]
