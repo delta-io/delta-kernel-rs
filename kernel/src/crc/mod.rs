@@ -7,6 +7,7 @@
 
 mod lazy;
 mod reader;
+pub(crate) mod writer;
 
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
@@ -16,10 +17,14 @@ use std::sync::LazyLock;
 use crate::actions::visitors::{visit_metadata_at, visit_protocol_at};
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction, PROTOCOL_NAME};
 use crate::engine_data::{GetData, TypedGetData};
+use crate::expressions::{ArrayData, Scalar, StructData};
+use crate::schema::derive_macro_utils::ToDataType as _;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{ArrayType, ColumnName, ColumnNamesAndTypes, DataType, StructField};
 use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{
+    DeltaResult, Engine, Error, EvaluationHandlerExtension as _, IntoEngineData, RowVisitor,
+};
 use delta_kernel_derive::ToSchema;
 
 /// Parsed content of a CRC (version checksum) file.
@@ -163,6 +168,128 @@ impl Crc {
         }
 
         domain_map.into_values().collect()
+    }
+}
+
+/// Convert an `Option<Vec<DomainMetadata>>` to a `Scalar` value for serialization.
+///
+/// - `None` produces a null array scalar
+/// - `Some(vec)` produces a `Scalar::Array` of `Scalar::Struct` elements
+fn domain_metadata_to_scalar(dm_opt: Option<Vec<DomainMetadata>>) -> DeltaResult<Scalar> {
+    let dm_data_type = DomainMetadata::to_data_type();
+    let array_type = ArrayType::new(dm_data_type.clone(), false);
+    match dm_opt {
+        None => Ok(Scalar::Null(DataType::Array(Box::new(array_type)))),
+        Some(domains) => {
+            let DataType::Struct(ref struct_type) = dm_data_type else {
+                return Err(Error::internal_error(
+                    "DomainMetadata::to_data_type() should return a Struct",
+                ));
+            };
+            let dm_fields: Vec<StructField> = struct_type.fields().cloned().collect();
+            let elements: DeltaResult<Vec<Scalar>> = domains
+                .into_iter()
+                .map(|dm| {
+                    Ok(Scalar::Struct(StructData::try_new(
+                        dm_fields.clone(),
+                        vec![
+                            Scalar::String(dm.domain().to_owned()),
+                            Scalar::String(dm.configuration().to_owned()),
+                            Scalar::Boolean(dm.is_removed()),
+                        ],
+                    )?))
+                })
+                .collect();
+            let array_data = ArrayData::try_new(array_type, elements?)?;
+            Ok(Scalar::Array(array_data))
+        }
+    }
+}
+
+/// Helper to create a null Scalar for an array-of-struct type.
+fn null_array_scalar<T: crate::schema::ToSchema>() -> Scalar {
+    Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+        T::to_data_type(),
+        false,
+    ))))
+}
+
+/// Helper to create a null Scalar for an array of a primitive type.
+fn null_prim_array_scalar(elem_type: DataType) -> Scalar {
+    Scalar::Null(DataType::Array(Box::new(ArrayType::new(elem_type, false))))
+}
+
+// NOTE: We can't derive IntoEngineData for Crc because it contains nested Metadata and Protocol
+// structs whose fields are private. We flatten them into leaf-level scalars using into_leaf_scalars.
+impl IntoEngineData for Crc {
+    fn into_engine_data(
+        self,
+        schema: crate::schema::SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn crate::EngineData>> {
+        let domain_metadata_scalar = domain_metadata_to_scalar(self.domain_metadata)?;
+
+        // Flatten all leaf values in schema traversal order. Struct fields are recursed into
+        // (providing leaf scalars for each sub-field), while Array/Map fields are single leaves.
+        let mut values: Vec<Scalar> = Vec::with_capacity(30);
+
+        // Required scalars
+        values.push(self.table_size_bytes.into());
+        values.push(self.num_files.into());
+        values.push(self.num_metadata.into());
+        values.push(self.num_protocol.into());
+
+        // Metadata (9 leaf values: id, name, description, format.provider, format.options,
+        // schema_string, partition_columns, created_time, configuration)
+        values.extend(self.metadata.into_leaf_scalars()?);
+
+        // Protocol (4 leaf values: min_reader_version, min_writer_version,
+        // reader_features, writer_features)
+        values.extend(self.protocol.into_leaf_scalars()?);
+
+        // Optional simple scalars
+        values.push(self.txn_id.into());
+        values.push(self.in_commit_timestamp_opt.into());
+
+        // set_transactions: nullable array of struct (always None for SIMPLE path)
+        values.push(null_array_scalar::<SetTransaction>());
+
+        // domain_metadata: nullable array of struct
+        values.push(domain_metadata_scalar);
+
+        // file_size_histogram: nullable struct with 3 non-nullable array<long> fields.
+        // When None, provide null scalars for each leaf -> all-null triggers null-struct logic.
+        match self.file_size_histogram {
+            None => {
+                values.push(null_prim_array_scalar(DataType::LONG)); // sorted_bin_boundaries
+                values.push(null_prim_array_scalar(DataType::LONG)); // file_counts
+                values.push(null_prim_array_scalar(DataType::LONG)); // total_bytes
+            }
+            Some(h) => {
+                values.push(h.sorted_bin_boundaries.try_into()?);
+                values.push(h.file_counts.try_into()?);
+                values.push(h.total_bytes.try_into()?);
+            }
+        }
+
+        // all_files: nullable array of struct (always None for SIMPLE path)
+        values.push(null_array_scalar::<Add>());
+
+        // Optional DV stats
+        values.push(self.num_deleted_records_opt.into());
+        values.push(self.num_deletion_vectors_opt.into());
+
+        // deleted_record_counts_histogram_opt: nullable struct with 1 non-nullable array<long>
+        match self.deleted_record_counts_histogram_opt {
+            None => {
+                values.push(null_prim_array_scalar(DataType::LONG));
+            }
+            Some(h) => {
+                values.push(h.deleted_record_counts.try_into()?);
+            }
+        }
+
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -401,7 +528,6 @@ impl RowVisitor for FileSizeAccumulator {
 mod tests {
     use super::*;
 
-    use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
 
     #[test]
@@ -564,5 +690,60 @@ mod tests {
         let merged = Crc::merge_domain_metadata(None, &actions);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].domain(), "domain.a");
+    }
+
+    // ===== Phase 4: IntoEngineData serialization tests =====
+
+    #[test]
+    fn test_crc_into_engine_data_basic() {
+        use crate::engine::sync::SyncEngine;
+        use crate::IntoEngineData as _;
+        let crc = make_test_crc(1000, 10);
+        let schema = std::sync::Arc::new(Crc::to_schema());
+        let engine = SyncEngine::new();
+        let engine_data = crc.into_engine_data(schema, &engine);
+        assert!(
+            engine_data.is_ok(),
+            "Failed to serialize CRC: {:?}",
+            engine_data.err()
+        );
+        assert_eq!(engine_data.unwrap().len(), 1); // single row
+    }
+
+    #[test]
+    fn test_crc_into_engine_data_with_domain_metadata() {
+        use crate::engine::sync::SyncEngine;
+        use crate::IntoEngineData as _;
+        let mut crc = make_test_crc(500, 5);
+        crc.domain_metadata = Some(vec![
+            DomainMetadata::new("delta.rowTracking".to_string(), "config1".to_string()),
+            DomainMetadata::new("user.domain".to_string(), "config2".to_string()),
+        ]);
+        crc.in_commit_timestamp_opt = Some(99999);
+        let schema = std::sync::Arc::new(Crc::to_schema());
+        let engine = SyncEngine::new();
+        let engine_data = crc.into_engine_data(schema, &engine);
+        assert!(
+            engine_data.is_ok(),
+            "Failed to serialize CRC with DM: {:?}",
+            engine_data.err()
+        );
+        assert_eq!(engine_data.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_crc_into_engine_data_empty_domain_metadata() {
+        use crate::engine::sync::SyncEngine;
+        use crate::IntoEngineData as _;
+        let mut crc = make_test_crc(0, 0);
+        crc.domain_metadata = Some(vec![]); // empty but present
+        let schema = std::sync::Arc::new(Crc::to_schema());
+        let engine = SyncEngine::new();
+        let engine_data = crc.into_engine_data(schema, &engine);
+        assert!(
+            engine_data.is_ok(),
+            "Failed to serialize CRC with empty DM: {:?}",
+            engine_data.err()
+        );
     }
 }

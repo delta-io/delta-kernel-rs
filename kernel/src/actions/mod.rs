@@ -382,8 +382,17 @@ impl IntoEngineData for Metadata {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // For format, we need to provide individual scalars for provider and options
-        let values = [
+        let values = self.into_leaf_scalars()?;
+        engine.evaluation_handler().create_one(schema, &values)
+    }
+}
+
+impl Metadata {
+    /// Convert this Metadata into its flattened leaf-level Scalar values, in schema order.
+    /// Used by parent structs (like Crc) that need to inline Metadata's scalars.
+    pub(crate) fn into_leaf_scalars(self) -> DeltaResult<Vec<Scalar>> {
+        // For format, we provide individual scalars for provider and options
+        Ok(vec![
             self.id.into(),
             self.name.into(),
             self.description.into(),
@@ -393,9 +402,7 @@ impl IntoEngineData for Metadata {
             self.partition_columns.try_into()?,
             self.created_time.into(),
             self.configuration.try_into()?,
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
+        ])
     }
 }
 
