@@ -15,6 +15,7 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::crc::CommitStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
@@ -322,10 +323,13 @@ impl<S> Transaction<S> {
             .into_iter()
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
+        // Compute ICT once (used in both commit info and CRC stats delta)
+        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
+
         // Step 2: Construct commit info with ICT if enabled
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
-            self.get_in_commit_timestamp(engine)?,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
@@ -350,10 +354,21 @@ impl<S> Transaction<S> {
             (None, None)
         };
 
+        // Accumulate commit stats for CRC writing. Visit add/remove file metadata
+        // to count files and sum sizes before iterators consume the data.
+        let mut stats_delta = self.accumulate_commit_stats(engine, in_commit_timestamp)?;
+
         // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.get_commit_version();
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
+
+        // Add row tracking domain metadata to CRC stats (only available after generate_adds)
+        if let Some(ref rt) = row_tracking_domain_metadata {
+            if let Ok(dm) = DomainMetadata::try_from((*rt).clone()) {
+                stats_delta.domain_metadata_actions.push(dm);
+            }
+        }
 
         // Step 4b: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions =
@@ -407,7 +422,7 @@ impl<S> Transaction<S> {
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(file_meta)?,
+                self.into_committed(file_meta, stats_delta)?,
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -545,6 +560,64 @@ impl<S> Transaction<S> {
         } else {
             Ok(None)
         }
+    }
+
+    /// Accumulate file counts and sizes from add/remove file metadata for CRC computation.
+    ///
+    /// This must be called before action generation iterators are created, since those
+    /// iterators borrow self and prevent further mutation. Domain metadata actions are
+    /// collected separately after `generate_adds` returns the row tracking data.
+    fn accumulate_commit_stats(
+        &self,
+        _engine: &dyn Engine,
+        in_commit_timestamp: Option<i64>,
+    ) -> DeltaResult<CommitStatsDelta> {
+        use crate::crc::FileSizeAccumulator;
+
+        let mut stats_delta = CommitStatsDelta {
+            in_commit_timestamp,
+            ..Default::default()
+        };
+
+        // Accumulate add file stats (size is the 3rd field in MANDATORY_ADD_FILE_SCHEMA)
+        {
+            let mut add_acc = FileSizeAccumulator::new(0);
+            for batch in &self.add_files_metadata {
+                add_acc.visit_rows_of(batch.deref())?;
+            }
+            stats_delta.num_add_files = add_acc.file_count;
+            stats_delta.total_add_file_size_bytes = add_acc.total_size_bytes;
+        }
+
+        // Accumulate remove file stats
+        {
+            let mut remove_acc = FileSizeAccumulator::new(0);
+            for filtered in &self.remove_files_metadata {
+                remove_acc.visit_rows_of(filtered.data())?;
+            }
+            stats_delta.num_remove_files = remove_acc.file_count;
+            stats_delta.total_remove_file_size_bytes = remove_acc.total_size_bytes;
+        }
+
+        // DV updates produce remove+add pairs of the same file (same size), so they
+        // cancel out in terms of net file count and byte changes for the CRC.
+
+        // Collect domain metadata from all sources for CRC tracking.
+        // Note: row tracking domain metadata is added later (after generate_adds returns it).
+        stats_delta
+            .domain_metadata_actions
+            .extend(self.system_domain_metadata_additions.clone());
+        stats_delta
+            .domain_metadata_actions
+            .extend(self.user_domain_metadata_additions.clone());
+        // User removals: for CRC purposes we just need domain name + removed=true
+        for domain in &self.user_domain_removals {
+            stats_delta
+                .domain_metadata_actions
+                .push(DomainMetadata::remove(domain.clone(), String::new()));
+        }
+
+        Ok(stats_delta)
     }
 
     /// Returns the commit version for this transaction.
@@ -703,9 +776,15 @@ impl<S> Transaction<S> {
             return Ok(vec![]);
         }
 
-        // Scan log to fetch existing configurations for tombstones
-        let existing_domains =
-            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
+        // Scan log for existing domain configurations (needed for tombstones).
+        // Uses CRC when available to avoid or reduce log replay, following the same
+        // pattern as protocol_metadata_replay.rs.
+        let existing_domains = scan_domain_metadatas_with_crc(
+            self.read_snapshot.log_segment(),
+            None,
+            engine,
+            self.read_snapshot.lazy_crc(),
+        )?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
@@ -1057,7 +1136,11 @@ impl<S> Transaction<S> {
         }
     }
 
-    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+    fn into_committed(
+        self,
+        file_meta: FileMeta,
+        _stats_delta: CommitStatsDelta,
+    ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1071,6 +1154,9 @@ impl<S> Transaction<S> {
                 .commits_since_log_compaction_or_checkpoint()
                 + 1,
         };
+
+        // TODO(Phase 5): Use stats_delta + previous CRC to compute new CRC and inject
+        // into post-commit snapshot via new_post_commit(parsed_commit, Some(new_crc)).
 
         Ok(CommittedTransaction {
             commit_version,

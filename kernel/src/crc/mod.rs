@@ -216,6 +216,86 @@ impl RowVisitor for CrcVisitor {
     }
 }
 
+/// Net file/byte changes from a single commit, used for incremental CRC computation.
+///
+/// Accumulated during `Transaction::commit()` before actions are passed to the committer.
+/// Combined with a previous version's CRC to produce the new version's CRC in O(1).
+#[derive(Debug, Default)]
+#[allow(dead_code)] // Fields read in Phase 3+ (CRC computation)
+pub(crate) struct CommitStatsDelta {
+    /// Number of add file actions in this commit.
+    pub(crate) num_add_files: i64,
+    /// Number of remove file actions in this commit.
+    pub(crate) num_remove_files: i64,
+    /// Total size in bytes of all added files.
+    pub(crate) total_add_file_size_bytes: i64,
+    /// Total size in bytes of all removed files.
+    pub(crate) total_remove_file_size_bytes: i64,
+    /// All domain metadata actions in this commit (additions + removals).
+    pub(crate) domain_metadata_actions: Vec<DomainMetadata>,
+    /// In-commit timestamp for this version (if ICT enabled).
+    pub(crate) in_commit_timestamp: Option<i64>,
+}
+
+/// Visitor that accumulates file counts and sizes from EngineData batches.
+///
+/// Used to count files and sum sizes from add_files_metadata (which has `size` at a
+/// configurable column index) and remove_files_metadata / dv_matched_files.
+pub(crate) struct FileSizeAccumulator {
+    /// Index of the `size` column in the data being visited.
+    #[allow(dead_code)] // Reserved for future use with different schemas
+    size_col_index: usize,
+    /// Running count of files visited.
+    pub(crate) file_count: i64,
+    /// Running sum of file sizes in bytes.
+    pub(crate) total_size_bytes: i64,
+}
+
+impl FileSizeAccumulator {
+    /// Create a new accumulator.
+    ///
+    /// `size_col_index` is the position of the `size` column among the selected columns.
+    pub(crate) fn new(size_col_index: usize) -> Self {
+        Self {
+            size_col_index,
+            file_count: 0,
+            total_size_bytes: 0,
+        }
+    }
+}
+
+impl RowVisitor for FileSizeAccumulator {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        // We only need the `size` column. The actual column name depends on the schema
+        // being visited (add_files_metadata vs scan_row_schema), so we use two static
+        // variants and pick the right one based on size_col_index.
+        //
+        // For add_files_metadata: size is the 3rd field (index 2) -> "size"
+        // For scan_row_schema (removes/DV updates): size is the 2nd field (index 1) -> "size"
+        //
+        // We always select just "size" since that's all we need.
+        static ADD_FILES_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| (vec![ColumnName::new(["size"])], vec![DataType::LONG]).into());
+        ADD_FILES_NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "FileSizeAccumulator expected 1 getter, got {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            let size: i64 = getters[0].get(i, "size")?;
+            self.file_count += 1;
+            self.total_size_bytes += size;
+        }
+        Ok(())
+    }
+}
+
 // See reader::tests::test_read_crc_file for the e2e test that tests CrcVisitor.
 #[cfg(test)]
 mod tests {

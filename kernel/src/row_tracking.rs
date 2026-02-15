@@ -9,7 +9,7 @@ use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Snapshot};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RowTrackingDomainMetadata {
     // NB: The Delta spec does not rule out negative high water marks

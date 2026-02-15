@@ -513,6 +513,11 @@ impl Snapshot {
         &self.log_segment
     }
 
+    /// Lazy CRC loader for this snapshot.
+    pub(crate) fn lazy_crc(&self) -> &LazyCrc {
+        &self.lazy_crc
+    }
+
     pub fn table_root(&self) -> &Url {
         self.table_configuration.table_root()
     }
