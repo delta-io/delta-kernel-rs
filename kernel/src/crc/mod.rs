@@ -71,7 +71,6 @@ pub(crate) struct Crc {
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
-#[allow(dead_code)] // Methods used in Phase 5 (post-commit CRC injection)
 impl Crc {
     /// Compute a new CRC from a previous CRC + commit stats delta (SIMPLE path).
     ///
@@ -466,44 +465,53 @@ pub(crate) struct CommitStatsDelta {
 
 /// Visitor that accumulates file counts and sizes from EngineData batches.
 ///
-/// Used to count files and sum sizes from add_files_metadata (which has `size` at a
-/// configurable column index) and remove_files_metadata / dv_matched_files.
-pub(crate) struct FileSizeAccumulator {
-    /// Index of the `size` column in the data being visited.
-    #[allow(dead_code)] // Reserved for future use with different schemas
-    size_col_index: usize,
+/// Used to count files and sum sizes from add_files_metadata and remove_files_metadata.
+///
+/// When visiting `remove_files_metadata` (from `scan_metadata()`), the underlying batches may
+/// contain non-file rows (commitInfo, protocol, metadata) alongside actual file rows. A
+/// selection vector marks which rows are file rows. Set the selection vector via
+/// [`FileSizeAccumulator::with_selection_vector`] to skip non-file rows. Without a selection
+/// vector, all rows are visited (appropriate for add_files_metadata where every row is a file).
+pub(crate) struct FileSizeAccumulator<'a> {
+    /// Optional selection vector: when set, only rows where `selection_vector[i] == true`
+    /// are accumulated. Rows outside the selection vector range are assumed selected.
+    selection_vector: Option<&'a [bool]>,
     /// Running count of files visited.
     pub(crate) file_count: i64,
     /// Running sum of file sizes in bytes.
     pub(crate) total_size_bytes: i64,
 }
 
-impl FileSizeAccumulator {
-    /// Create a new accumulator.
-    ///
-    /// `size_col_index` is the position of the `size` column among the selected columns.
-    pub(crate) fn new(size_col_index: usize) -> Self {
+impl<'a> FileSizeAccumulator<'a> {
+    /// Create a new accumulator that visits all rows.
+    pub(crate) fn new() -> Self {
         Self {
-            size_col_index,
+            selection_vector: None,
             file_count: 0,
             total_size_bytes: 0,
         }
     }
+
+    /// Set a selection vector to skip non-file rows.
+    pub(crate) fn with_selection_vector(mut self, sv: &'a [bool]) -> Self {
+        self.selection_vector = Some(sv);
+        self
+    }
+
+    /// Returns true if row `i` is selected (should be visited).
+    fn is_selected(&self, i: usize) -> bool {
+        match self.selection_vector {
+            Some(sv) => i < sv.len() && sv[i],
+            None => true,
+        }
+    }
 }
 
-impl RowVisitor for FileSizeAccumulator {
+impl RowVisitor for FileSizeAccumulator<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        // We only need the `size` column. The actual column name depends on the schema
-        // being visited (add_files_metadata vs scan_row_schema), so we use two static
-        // variants and pick the right one based on size_col_index.
-        //
-        // For add_files_metadata: size is the 3rd field (index 2) -> "size"
-        // For scan_row_schema (removes/DV updates): size is the 2nd field (index 1) -> "size"
-        //
-        // We always select just "size" since that's all we need.
-        static ADD_FILES_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| (vec![ColumnName::new(["size"])], vec![DataType::LONG]).into());
-        ADD_FILES_NAMES_AND_TYPES.as_ref()
+        NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
@@ -515,6 +523,9 @@ impl RowVisitor for FileSizeAccumulator {
             ))
         );
         for i in 0..row_count {
+            if !self.is_selected(i) {
+                continue;
+            }
             let size: i64 = getters[0].get(i, "size")?;
             self.file_count += 1;
             self.total_size_bytes += size;

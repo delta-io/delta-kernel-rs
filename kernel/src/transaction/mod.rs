@@ -579,9 +579,10 @@ impl<S> Transaction<S> {
             ..Default::default()
         };
 
-        // Accumulate add file stats (size is the 3rd field in MANDATORY_ADD_FILE_SCHEMA)
+        // Accumulate add file stats. Every row in add_files_metadata is a file (no selection
+        // vector needed) with a required `size` field.
         {
-            let mut add_acc = FileSizeAccumulator::new(0);
+            let mut add_acc = FileSizeAccumulator::new();
             for batch in &self.add_files_metadata {
                 add_acc.visit_rows_of(batch.deref())?;
             }
@@ -589,14 +590,20 @@ impl<S> Transaction<S> {
             stats_delta.total_add_file_size_bytes = add_acc.total_size_bytes;
         }
 
-        // Accumulate remove file stats
+        // Accumulate remove file stats. remove_files_metadata comes from scan_metadata()
+        // where batches may contain non-file rows (commitInfo, protocol, metadata). The
+        // selection vector marks which rows are actual file rows. We use it to skip
+        // non-file rows. Selected rows are active Add files with required non-null `size`.
+        // TODO: A write-intent scan should produce pre-filtered batches containing only
+        // file rows, so callers don't need to carry selection vectors for stats accumulation.
         {
-            let mut remove_acc = FileSizeAccumulator::new(0);
             for filtered in &self.remove_files_metadata {
+                let mut remove_acc =
+                    FileSizeAccumulator::new().with_selection_vector(filtered.selection_vector());
                 remove_acc.visit_rows_of(filtered.data())?;
+                stats_delta.num_remove_files += remove_acc.file_count;
+                stats_delta.total_remove_file_size_bytes += remove_acc.total_size_bytes;
             }
-            stats_delta.num_remove_files = remove_acc.file_count;
-            stats_delta.total_remove_file_size_bytes = remove_acc.total_size_bytes;
         }
 
         // DV updates produce remove+add pairs of the same file (same size), so they
@@ -1139,7 +1146,7 @@ impl<S> Transaction<S> {
     fn into_committed(
         self,
         file_meta: FileMeta,
-        _stats_delta: CommitStatsDelta,
+        stats_delta: CommitStatsDelta,
     ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
@@ -1155,14 +1162,14 @@ impl<S> Transaction<S> {
                 + 1,
         };
 
-        // TODO(Phase 5): Use stats_delta + previous CRC to compute new CRC and inject
-        // into post-commit snapshot via new_post_commit(parsed_commit, Some(new_crc)).
-
+        // Pass stats_delta to the post-commit snapshot. The snapshot stores it and lazily
+        // computes the CRC when write_crc() is called.
         Ok(CommittedTransaction {
             commit_version,
             post_commit_stats,
             post_commit_snapshot: Some(Arc::new(
-                self.read_snapshot.new_post_commit(parsed_commit)?,
+                self.read_snapshot
+                    .new_post_commit(parsed_commit, stats_delta)?,
             )),
         })
     }
@@ -1446,6 +1453,20 @@ impl CommittedTransaction {
     /// The [`SnapshotRef`] of the table after this transaction was committed.
     pub fn post_commit_snapshot(&self) -> Option<&SnapshotRef> {
         self.post_commit_snapshot.as_ref()
+    }
+
+    /// Write the CRC file for this committed version.
+    ///
+    /// Delegates to [`Snapshot::write_crc`] on the post-commit snapshot. The CRC is computed
+    /// lazily from the previous version's CRC + this commit's stats delta.
+    ///
+    /// Returns `Ok(true)` if the CRC was written, `Ok(false)` if no CRC could be computed
+    /// (e.g., no previous CRC existed for the SIMPLE path, or no post-commit snapshot).
+    pub fn write_crc(&self, engine: &dyn Engine) -> DeltaResult<bool> {
+        match &self.post_commit_snapshot {
+            Some(s) => s.write_crc(engine),
+            None => Ok(false),
+        }
     }
 }
 

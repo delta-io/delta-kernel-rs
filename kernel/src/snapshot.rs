@@ -15,7 +15,7 @@ use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::LazyCrc;
+use crate::crc::{CommitStatsDelta, Crc, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
@@ -51,6 +51,10 @@ pub struct Snapshot {
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
     lazy_crc: Arc<LazyCrc>,
+    /// Stats from the transaction that created this post-commit snapshot.
+    /// Present only for snapshots created via `new_post_commit()`.
+    /// Used to lazily compute CRC files on demand via `write_crc()`.
+    post_commit_stats: Option<CommitStatsDelta>,
 }
 
 impl PartialEq for Snapshot {
@@ -128,6 +132,7 @@ impl Snapshot {
             log_segment,
             table_configuration,
             lazy_crc,
+            post_commit_stats: None,
         }
     }
 
@@ -423,7 +428,11 @@ impl Snapshot {
     /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
     /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
     #[allow(unused)]
-    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+    pub(crate) fn new_post_commit(
+        &self,
+        commit: ParsedLogPath,
+        stats_delta: CommitStatsDelta,
+    ) -> DeltaResult<Self> {
         require!(
             commit.is_commit(),
             Error::internal_error(format!(
@@ -447,11 +456,73 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot::new(
+        // Carry forward the parent's lazy_crc (at version N-1). This is the "previous CRC"
+        // needed for SIMPLE CRC computation when write_crc() is called.
+        let mut snapshot = Snapshot::new(
             new_log_segment,
             new_table_configuration,
             self.lazy_crc.clone(),
-        ))
+        );
+        snapshot.post_commit_stats = Some(stats_delta);
+        Ok(snapshot)
+    }
+
+    /// Write a CRC file for this snapshot version if we have the data needed to compute it.
+    ///
+    /// This is available on post-commit snapshots that carry a `CommitStatsDelta` from the
+    /// transaction. The CRC is computed lazily from the previous version's CRC + the delta.
+    ///
+    /// Returns `Ok(true)` if the CRC was written, `Ok(false)` if no CRC could be computed
+    /// (e.g., no previous CRC existed, or this is not a post-commit snapshot).
+    ///
+    /// The write is idempotent - writing the same CRC twice will not error.
+    pub fn write_crc(&self, engine: &dyn Engine) -> DeltaResult<bool> {
+        let stats_delta = match &self.post_commit_stats {
+            Some(delta) => delta,
+            None => return Ok(false),
+        };
+
+        let table_config = self.table_configuration();
+        let new_crc = if self.version() == 0 {
+            // Create-table: CRC fully determined by the commit (no previous CRC)
+            Crc::compute_from_create_table(
+                stats_delta,
+                table_config.metadata().clone(),
+                table_config.protocol().clone(),
+            )
+        } else {
+            // Existing table: try to load previous CRC at version N-1
+            let prev_version = self.version() - 1;
+            match self
+                .lazy_crc
+                .get_or_load_if_at_version(engine, prev_version)
+            {
+                Some(old_crc) => Crc::compute_post_commit(
+                    old_crc,
+                    stats_delta,
+                    table_config.metadata().clone(),
+                    table_config.protocol().clone(),
+                ),
+                None => return Ok(false),
+            }
+        };
+
+        crate::crc::writer::write_crc_file(
+            engine,
+            table_config.table_root(),
+            &new_crc,
+            self.version(),
+        )?;
+        Ok(true)
+    }
+
+    /// Whether this snapshot has the data needed to write a CRC file.
+    ///
+    /// Returns `true` for post-commit snapshots that carry transaction stats. Note that even
+    /// when this returns `true`, `write_crc()` may still return `Ok(false)` if no previous
+    /// CRC is available at the prior version (the SIMPLE path requires a previous CRC).
+    pub fn has_post_commit_stats(&self) -> bool {
+        self.post_commit_stats.is_some()
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -2012,7 +2083,9 @@ mod tests {
 
         // WHEN
         let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+        let post_commit_snapshot = base_snapshot
+            .new_post_commit(fake_new_commit, CommitStatsDelta::default())
+            .unwrap();
 
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
