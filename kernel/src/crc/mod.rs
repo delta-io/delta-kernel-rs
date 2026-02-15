@@ -66,6 +66,106 @@ pub(crate) struct Crc {
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
+#[allow(dead_code)] // Methods used in Phase 5 (post-commit CRC injection)
+impl Crc {
+    /// Compute a new CRC from a previous CRC + commit stats delta (SIMPLE path).
+    ///
+    /// This is an O(1) operation that combines the previous version's CRC with the changes
+    /// from the current commit to produce the new version's CRC.
+    pub(crate) fn compute_post_commit(
+        old_crc: &Crc,
+        delta: &CommitStatsDelta,
+        metadata: Metadata,
+        protocol: Protocol,
+    ) -> Crc {
+        Crc {
+            table_size_bytes: old_crc.table_size_bytes + delta.total_add_file_size_bytes
+                - delta.total_remove_file_size_bytes,
+            num_files: old_crc.num_files + delta.num_add_files - delta.num_remove_files,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata,
+            protocol,
+            txn_id: None,
+            in_commit_timestamp_opt: delta.in_commit_timestamp,
+            set_transactions: None,
+            domain_metadata: Some(Self::merge_domain_metadata(
+                old_crc.domain_metadata.as_deref(),
+                &delta.domain_metadata_actions,
+            )),
+            // Fields not tracked incrementally
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
+
+    /// Compute a CRC for a newly created table (version 0, no previous CRC).
+    ///
+    /// All values come directly from the commit's stats delta and the new table configuration.
+    pub(crate) fn compute_from_create_table(
+        delta: &CommitStatsDelta,
+        metadata: Metadata,
+        protocol: Protocol,
+    ) -> Crc {
+        // For create-table, filter domain metadata to only keep non-removed entries
+        let active_domains: Vec<DomainMetadata> = delta
+            .domain_metadata_actions
+            .iter()
+            .filter(|dm| !dm.is_removed())
+            .cloned()
+            .collect();
+
+        Crc {
+            table_size_bytes: delta.total_add_file_size_bytes,
+            num_files: delta.num_add_files,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata,
+            protocol,
+            txn_id: None,
+            in_commit_timestamp_opt: delta.in_commit_timestamp,
+            set_transactions: None,
+            domain_metadata: Some(active_domains),
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
+
+    /// Merge old domain metadata with new domain metadata actions.
+    ///
+    /// - Additions (removed=false): insert or replace by domain name
+    /// - Removals (removed=true): remove the entry for that domain name
+    /// - Result: only active (non-removed) domains
+    fn merge_domain_metadata(
+        old_domains: Option<&[DomainMetadata]>,
+        actions: &[DomainMetadata],
+    ) -> Vec<DomainMetadata> {
+        use std::collections::HashMap;
+        let mut domain_map: HashMap<String, DomainMetadata> = old_domains
+            .unwrap_or_default()
+            .iter()
+            .filter(|dm| !dm.is_removed())
+            .map(|dm| (dm.domain().to_owned(), dm.clone()))
+            .collect();
+
+        for action in actions {
+            if action.is_removed() {
+                domain_map.remove(action.domain());
+            } else {
+                domain_map.insert(action.domain().to_owned(), action.clone());
+            }
+        }
+
+        domain_map.into_values().collect()
+    }
+}
+
 /// The [FileSizeHistogram] object represents a histogram tracking file counts and total bytes
 /// across different size ranges.
 ///
@@ -357,5 +457,112 @@ mod tests {
             ),
         ]);
         assert_eq!(schema, expected);
+    }
+
+    // ===== Phase 3: CRC computation tests =====
+
+    fn make_test_crc(table_size_bytes: i64, num_files: i64) -> Crc {
+        Crc {
+            table_size_bytes,
+            num_files,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata: Metadata::default(),
+            protocol: Protocol::default(),
+            txn_id: None,
+            in_commit_timestamp_opt: None,
+            set_transactions: None,
+            domain_metadata: None,
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
+
+    #[test]
+    fn test_compute_post_commit_basic() {
+        let old_crc = make_test_crc(1000, 10);
+        let delta = CommitStatsDelta {
+            num_add_files: 3,
+            num_remove_files: 1,
+            total_add_file_size_bytes: 300,
+            total_remove_file_size_bytes: 100,
+            domain_metadata_actions: vec![],
+            in_commit_timestamp: Some(12345),
+        };
+        let new_crc =
+            Crc::compute_post_commit(&old_crc, &delta, Metadata::default(), Protocol::default());
+        assert_eq!(new_crc.table_size_bytes, 1200); // 1000 + 300 - 100
+        assert_eq!(new_crc.num_files, 12); // 10 + 3 - 1
+        assert_eq!(new_crc.in_commit_timestamp_opt, Some(12345));
+        assert_eq!(new_crc.num_metadata, 1);
+        assert_eq!(new_crc.num_protocol, 1);
+    }
+
+    #[test]
+    fn test_compute_from_create_table() {
+        let delta = CommitStatsDelta {
+            num_add_files: 5,
+            total_add_file_size_bytes: 500,
+            domain_metadata_actions: vec![DomainMetadata::new(
+                "user.domain".to_string(),
+                "config1".to_string(),
+            )],
+            ..Default::default()
+        };
+        let crc = Crc::compute_from_create_table(&delta, Metadata::default(), Protocol::default());
+        assert_eq!(crc.table_size_bytes, 500);
+        assert_eq!(crc.num_files, 5);
+        let domains = crc.domain_metadata.unwrap();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].domain(), "user.domain");
+    }
+
+    #[test]
+    fn test_merge_domain_metadata_additions() {
+        let old_domains = vec![DomainMetadata::new(
+            "domain.a".to_string(),
+            "old_config".to_string(),
+        )];
+        let actions = vec![
+            DomainMetadata::new("domain.b".to_string(), "new_config".to_string()),
+            DomainMetadata::new("domain.a".to_string(), "updated_config".to_string()),
+        ];
+        let merged = Crc::merge_domain_metadata(Some(&old_domains), &actions);
+        assert_eq!(merged.len(), 2);
+        let map: std::collections::HashMap<_, _> = merged
+            .iter()
+            .map(|dm| (dm.domain(), dm.configuration()))
+            .collect();
+        assert_eq!(map["domain.a"], "updated_config");
+        assert_eq!(map["domain.b"], "new_config");
+    }
+
+    #[test]
+    fn test_merge_domain_metadata_removals() {
+        let old_domains = vec![
+            DomainMetadata::new("domain.a".to_string(), "config_a".to_string()),
+            DomainMetadata::new("domain.b".to_string(), "config_b".to_string()),
+        ];
+        let actions = vec![DomainMetadata::remove(
+            "domain.a".to_string(),
+            String::new(),
+        )];
+        let merged = Crc::merge_domain_metadata(Some(&old_domains), &actions);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].domain(), "domain.b");
+    }
+
+    #[test]
+    fn test_merge_domain_metadata_none_old() {
+        let actions = vec![DomainMetadata::new(
+            "domain.a".to_string(),
+            "config".to_string(),
+        )];
+        let merged = Crc::merge_domain_metadata(None, &actions);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].domain(), "domain.a");
     }
 }
