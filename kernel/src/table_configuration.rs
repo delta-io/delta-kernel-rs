@@ -268,9 +268,11 @@ impl TableConfiguration {
 
     /// Translates a logical column name path to physical column name path.
     ///
+    /// The `col_name` parameter must be a [`ColumnName`] derived from `self.schema`.
+    ///
     /// # Panics
-    /// Panics if the column path cannot be resolved in the schema. This should never happen
-    /// since logical column names are derived from the schema itself.
+    /// Panics if the column path cannot be resolved in `self.schema`. This should never happen
+    /// since logical column names are derived from `self.schema` itself.
     fn translate_column_name_to_physical(
         &self,
         col_name: &ColumnName,
@@ -283,6 +285,8 @@ impl TableConfiguration {
             let DataType::Struct(s) = current_type else {
                 unreachable!("Column path segment must be in a struct")
             };
+            #[allow(clippy::expect_used)]
+            // column must exist in schema, as it was derived from the schema itself
             let field = s.field(segment).expect("Column must exist in schema");
             physical_path.push(field.physical_name(column_mapping_mode).to_string());
             current_type = field.data_type();
@@ -1851,13 +1855,14 @@ mod test {
             vec![
                 ColumnName::new(["phys_col_a"]),
                 ColumnName::new(["phys_col_b"]),
-            ]
+            ],
+            "Expected physical column names, not logical names"
         );
     }
 
     #[test]
-    fn test_stats_column_names_physical_nested_schema() {
-        // Test nested schema with column mapping
+    fn test_stats_column_names_physical_nested_schema_name_mode() {
+        // Test nested schema with column mapping in Name mode
         let schema = nested_schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
@@ -1868,7 +1873,8 @@ mod test {
                 ColumnName::new(["id"]),
                 ColumnName::new(["info", "name"]),
                 ColumnName::new(["info", "age"]),
-            ]
+            ],
+            "Expected logical column names"
         );
 
         let physical_names = config.stats_column_names_physical(None);
@@ -1878,10 +1884,28 @@ mod test {
                 ColumnName::new(["phys_id"]),
                 ColumnName::new(["phys_info", "phys_name"]),
                 ColumnName::new(["phys_info", "phys_age"]),
-            ]
+            ],
+            "Expected physical column names"
         );
     }
 
+    #[test]
+    fn test_stats_column_names_physical_nested_schema_id_mode() {
+        // Test nested schema with column mapping in Id mode
+        let schema = nested_schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "id");
+
+        let column_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["phys_id"]),
+                ColumnName::new(["phys_info", "phys_name"]),
+                ColumnName::new(["phys_info", "phys_age"]),
+            ],
+            "Expected physical column names"
+        );
+    }
     #[cfg(feature = "clustered-table")]
     #[test]
     fn test_clustered_table_writes() {
