@@ -84,14 +84,12 @@ impl StorageHandler for SyncStorageHandler {
 mod tests {
     use std::fs::File;
     use std::io::Write;
-    use std::time::Duration;
 
     use bytes::{BufMut, BytesMut};
     use itertools::Itertools;
     use url::Url;
 
     use super::SyncStorageHandler;
-    use crate::utils::current_time_duration;
     use crate::StorageHandler;
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
@@ -104,7 +102,7 @@ mod tests {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
 
-        let begin_time = current_time_duration()?;
+        let begin_time = chrono::Utc::now();
 
         let path = tmp_dir.path().join(get_json_filename(1));
         let mut f = File::create(path)?;
@@ -117,8 +115,8 @@ mod tests {
 
         assert!(!files.is_empty());
         for meta in files.iter() {
-            let meta_time = Duration::from_millis(meta.last_modified.try_into()?);
-            assert!(meta_time.abs_diff(begin_time) < Duration::from_secs(10));
+            let meta_time = chrono::DateTime::from_timestamp_millis(meta.last_modified).unwrap();
+            assert!((meta_time - begin_time) < chrono::TimeDelta::seconds(10));
         }
         Ok(())
     }
