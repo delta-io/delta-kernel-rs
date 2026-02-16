@@ -500,6 +500,9 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
+                // Void has no dedicated tag; engines should not receive void-typed literal nulls
+                // across the FFI boundary, so we map it to NonPrimitive.
+                PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
             },
             _ => (Self::NonPrimitive, 0, 0),
         }
