@@ -1170,7 +1170,10 @@ impl<S> Transaction<S> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-        let column_mapping_mode = self.read_snapshot.table_configuration().column_mapping_mode();
+        let column_mapping_mode = self
+            .read_snapshot
+            .table_configuration()
+            .column_mapping_mode();
 
         // Compute physical schema: exclude partition columns since they're stored in the path,
         // and apply column mapping to transform logical field names to physical names
@@ -1932,7 +1935,8 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::MapType;
+    use crate::schema::{ColumnMetadataKey, MapType};
+    use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
     use crate::Snapshot;
@@ -2472,5 +2476,121 @@ mod tests {
             "Existing table debug should not contain create_table: {debug_str}"
         );
         Ok(())
+    }
+
+    /// Helper: create a table with the given column mapping mode and return the
+    /// pre-commit transaction using an in-memory store.
+    fn setup_column_mapping_txn(
+        mode: ColumnMappingMode,
+    ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
+        let mode_str = match mode {
+            ColumnMappingMode::Name => "name",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::None => "none",
+        };
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let engine: Arc<dyn Engine> =
+            Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::nullable("value", DataType::STRING),
+        ])?);
+
+        // Build the create-table transaction (pre-commit). Its snapshot already has
+        // column mapping metadata applied, so we can test get_write_context() directly.
+        let txn = create_table("memory:///test_table", schema, "test/1.0")
+            .with_table_properties([("delta.columnMapping.mode", mode_str)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        Ok((engine, txn))
+    }
+
+    /// Shared validation for column mapping physical schema (both Name and Id modes).
+    /// Iterates logical fields to extract expected physical name / id, then checks
+    /// the physical schema matches.
+    fn validate_physical_schema_column_mapping(mode: ColumnMappingMode) -> DeltaResult<()> {
+        use crate::schema::MetadataValue;
+
+        let (_engine, txn) = setup_column_mapping_txn(mode)?;
+        let write_context = txn.get_write_context();
+        let logical_schema = write_context.logical_schema();
+        let physical_schema = write_context.physical_schema();
+
+        assert_eq!(
+            physical_schema.fields().count(),
+            logical_schema.fields().count()
+        );
+
+        // Collect expected (physical_name, field_id) from logical schema
+        let expected: Vec<_> = logical_schema
+            .fields()
+            .map(|f| {
+                let physical_name =
+                    match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                        Some(MetadataValue::String(name)) => name.clone(),
+                        _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
+                    };
+                let field_id = match f.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                    Some(MetadataValue::Number(id)) => *id,
+                    _ => panic!(
+                        "Logical field '{}' missing columnMapping.id metadata",
+                        f.name()
+                    ),
+                };
+                (physical_name, field_id)
+            })
+            .collect();
+
+        // Validate each physical field against expected values
+        for (physical_field, (expected_name, expected_id)) in
+            physical_schema.fields().zip(expected.iter())
+        {
+            // Physical field name should be the physical name from logical metadata
+            assert_eq!(
+                physical_field.name(),
+                expected_name,
+                "Physical field name mismatch"
+            );
+
+            // Should carry physicalName metadata matching the field name
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+                Some(&MetadataValue::String(expected_name.clone())),
+                "physicalName metadata mismatch for '{}'",
+                physical_field.name()
+            );
+
+            // Should carry columnMapping.id
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "columnMapping.id mismatch for '{}'",
+                physical_field.name()
+            );
+
+            // Should carry parquet.field.id matching columnMapping.id
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "parquet.field.id mismatch for '{}'",
+                physical_field.name()
+            );
+        }
+
+        // Logical schema should still use original names
+        assert!(logical_schema.field("id").is_some());
+        assert!(logical_schema.field("value").is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_physical_schema_column_mapping_name_mode() -> DeltaResult<()> {
+        validate_physical_schema_column_mapping(ColumnMappingMode::Name)
+    }
+
+    #[test]
+    fn test_physical_schema_column_mapping_id_mode() -> DeltaResult<()> {
+        validate_physical_schema_column_mapping(ColumnMappingMode::Id)
     }
 }

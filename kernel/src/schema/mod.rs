@@ -511,9 +511,18 @@ impl StructField {
                 debug_assert!(base_metadata.contains_key(physical_name_key));
                 debug_assert!(base_metadata.contains_key(field_id_key));
 
-                // Remove all id mode related metadata keys
-                base_metadata.remove(field_id_key);
-                base_metadata.remove(parquet_field_id_key);
+                // Retain column mapping id and insert parquet field id so that
+                // Parquet files carry field IDs in Name mode as well (matching
+                // the Delta protocol requirement and Delta Spark behaviour).
+                let Some(MetadataValue::Number(fid)) = field_id else {
+                    warn!("StructField with name {} is missing field id in the Name column mapping mode", self.name());
+                    debug_assert!(false);
+                    return base_metadata;
+                };
+                base_metadata.insert(
+                    parquet_field_id_key.to_string(),
+                    MetadataValue::Number(*fid),
+                );
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
             ColumnMappingMode::None => {
@@ -2137,12 +2146,14 @@ mod tests {
                         ));
                     }
                     ColumnMappingMode::Name => {
-                        assert!(physical_field
-                            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                            .is_none());
-                        assert!(physical_field
-                            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                            .is_none(),);
+                        assert!(matches!(
+                            physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                            Some(MetadataValue::Number(4))
+                        ));
+                        assert!(matches!(
+                            physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                            Some(MetadataValue::Number(4))
+                        ));
                     }
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
@@ -2177,12 +2188,14 @@ mod tests {
                         ));
                     }
                     ColumnMappingMode::Name => {
-                        assert!(struct_field
-                            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                            .is_none());
-                        assert!(struct_field
-                            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                            .is_none());
+                        assert!(matches!(
+                            struct_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                            Some(MetadataValue::Number(5))
+                        ));
+                        assert!(matches!(
+                            struct_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                            Some(MetadataValue::Number(5))
+                        ));
                     }
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
