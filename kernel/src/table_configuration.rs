@@ -1010,10 +1010,8 @@ mod test {
     #[test]
     fn test_timestamp_nanos_validation_integration() {
         // Schema with TIMESTAMP_NANOS column
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "ts",
-            DataType::TIMESTAMP_NANOS,
-        )]));
+        let schema =
+            StructType::new_unchecked([StructField::nullable("ts", DataType::TIMESTAMP_NANOS)]);
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_nanos_features = Protocol::try_new(
