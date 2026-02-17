@@ -11,8 +11,10 @@ use delta_kernel_derive::internal_api;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
+pub(crate) use timestamp_nanos::validate_timestamp_nanos_feature_support;
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
+mod timestamp_nanos;
 mod timestamp_ntz;
 
 /// Table features represent protocol capabilities required to correctly read or write a given table.
@@ -88,6 +90,10 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
+    /// Nanosecond resolution timestamps
+    #[strum(serialize = "timestampNanos")]
+    #[serde(rename = "timestampNanos")]
+    TimestampNanos,
     /// timestamps without timezone support
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
@@ -494,6 +500,17 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
 };
 
 #[allow(dead_code)]
+static TIMESTAMP_NANOSECOND_INFO: FeatureInfo = FeatureInfo {
+    name: "timestampNanos",
+    min_reader_version: 3,
+    min_writer_version: 7,
+    feature_type: FeatureType::ReaderWriter,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+#[allow(dead_code)]
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     name: "timestampNtz",
     min_reader_version: 3,
@@ -598,6 +615,7 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
+            | TableFeature::TimestampNanos
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -648,6 +666,7 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => Some(&CATALOG_OWNED_PREVIEW_INFO),
             TableFeature::ColumnMapping => Some(&COLUMN_MAPPING_INFO),
             TableFeature::DeletionVectors => Some(&DELETION_VECTORS_INFO),
+            TableFeature::TimestampNanos => Some(&TIMESTAMP_NANOSECOND_INFO),
             TableFeature::TimestampWithoutTimezone => Some(&TIMESTAMP_WITHOUT_TIMEZONE_INFO),
             TableFeature::TypeWidening => Some(&TYPE_WIDENING_INFO),
             TableFeature::TypeWideningPreview => Some(&TYPE_WIDENING_PREVIEW_INFO),
@@ -727,6 +746,7 @@ mod tests {
             (TableFeature::CatalogOwnedPreview, "catalogOwned-preview"),
             (TableFeature::ColumnMapping, "columnMapping"),
             (TableFeature::DeletionVectors, "deletionVectors"),
+            (TableFeature::TimestampNanos, "timestampNanos"),
             (TableFeature::TimestampWithoutTimezone, "timestampNtz"),
             (TableFeature::TypeWidening, "typeWidening"),
             (TableFeature::TypeWideningPreview, "typeWidening-preview"),
@@ -769,6 +789,7 @@ mod tests {
             (TableFeature::InCommitTimestamp, "inCommitTimestamp"),
             (TableFeature::DeletionVectors, "deletionVectors"),
             (TableFeature::RowTracking, "rowTracking"),
+            (TableFeature::TimestampNanos, "timestampNanos"),
             (TableFeature::TimestampWithoutTimezone, "timestampNtz"),
             (TableFeature::TypeWidening, "typeWidening"),
             (TableFeature::TypeWideningPreview, "typeWidening-preview"),

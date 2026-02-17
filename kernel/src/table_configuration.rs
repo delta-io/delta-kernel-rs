@@ -87,12 +87,16 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
+        use crate::table_features::validate_timestamp_nanos_feature_support;
+
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         // validate column mapping mode -- all schema fields should be correctly (un)annotated
         validate_schema_column_mapping(&schema, column_mapping_mode)?;
+
+        validate_timestamp_nanos_feature_support(&schema, &protocol)?;
 
         validate_timestamp_ntz_feature_support(&schema, &protocol)?;
 
@@ -1001,6 +1005,53 @@ mod test {
             table_config.column_mapping_mode()
         );
         assert_eq!(new_table_config.table_root(), table_config.table_root());
+    }
+
+    #[test]
+    fn test_timestamp_nanos_validation_integration() {
+        // Schema with TIMESTAMP_NANOS column
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "ts",
+            DataType::TIMESTAMP_NANOS,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        let protocol_without_timestamp_nanos_features = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        )
+        .unwrap();
+
+        let protocol_with_timestamp_nanos_features = Protocol::try_new(
+            3,
+            7,
+            Some([TableFeature::TimestampNanos]),
+            Some([TableFeature::TimestampNanos]),
+        )
+        .unwrap();
+
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(
+            metadata.clone(),
+            protocol_without_timestamp_nanos_features,
+            table_root.clone(),
+            0,
+        );
+        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NANOS columns but does not have the required 'timestampNanos' feature in reader and writer features");
+
+        let result = TableConfiguration::try_new(
+            metadata,
+            protocol_with_timestamp_nanos_features,
+            table_root,
+            0,
+        );
+        assert!(
+            result.is_ok(),
+            "Should succeed when TIMESTAMP_NANOS is used with required features"
+        );
     }
 
     #[test]
