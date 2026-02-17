@@ -122,6 +122,9 @@ pub struct ScanLogReplayProcessor {
     #[allow(dead_code)]
     checkpoint_info: CheckpointReadInfo,
     metrics: Arc<ScanMetrics>,
+    /// Information about checkpoint reading for stats optimization
+    #[allow(dead_code)]
+    checkpoint_info: CheckpointReadInfo,
 }
 
 impl ScanLogReplayProcessor {
@@ -231,6 +234,7 @@ impl ScanLogReplayProcessor {
             skip_stats,
             checkpoint_info,
             metrics: Default::default(),
+            checkpoint_info,
         })
     }
 
