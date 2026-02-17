@@ -31,8 +31,7 @@ impl ReadMetadataRunner {
 
         let table_root = spec_variant.table_info.resolved_table_root();
 
-        let url = crate::try_parse_uri(table_root.clone())
-            .map_err(|e| format!("Failed to parse URI '{}': {}", table_root, e))?;
+        let url = crate::try_parse_uri(table_root)?;
 
         let version = match &spec_variant.spec {
             Spec::Read { version } => version,
@@ -43,9 +42,7 @@ impl ReadMetadataRunner {
             builder = builder.at_version(*version);
         }
 
-        let snapshot = builder
-            .build(engine.as_ref())
-            .map_err(|e| format!("Failed to build snapshot: {}", e))?;
+        let snapshot = builder.build(engine.as_ref())?;
 
         Ok(Self {
             snapshot,
