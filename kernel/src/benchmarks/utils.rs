@@ -11,7 +11,7 @@ const DONE_FILE: &str = "tests/data/workloads/.done";
 const TABLE_INFO_FILE: &str = "table_info.json";
 const SPECS_DIR: &str = "specs";
 
-/// Loads all workload specifications from tests/data/workloads.
+/// Loads all workload specifications from OUTPUT_FOLDER
 /// On first run, extracts from WORKLOAD_TAR if it exists.
 /// Uses a .done file to avoid re-extracting on subsequent runs
 pub fn load_all_workloads() -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::error::Error>> {
@@ -26,10 +26,7 @@ pub fn load_all_workloads() -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::err
     let mut all_specs = Vec::new();
 
     for table_dir in table_directories {
-        match load_specs_from_table(&table_dir) {
-            Ok(specs) => all_specs.extend(specs),
-            Err(e) => return Err(e),
-        }
+        all_specs.extend(load_specs_from_table(&table_dir)?);
     }
 
     Ok(all_specs)
@@ -117,40 +114,26 @@ fn load_specs_from_table(
         )
     })?;
 
-    validate_table_data_exists(table_dir, &table_info)?;
+    if table_info.table_path.is_none() {
+        let delta_dir = table_dir.join("delta");
+        if !delta_dir.exists() || !delta_dir.is_dir() {
+            return Err(format!(
+                "Table data not found for '{}'. Expected a 'delta' directory in {}",
+                table_info.name,
+                table_dir.display()
+            )
+            .into());
+        }
+    }
 
     let spec_files = find_spec_files(&specs_dir)?;
 
     let mut all_specs = Vec::new();
     for spec_file in spec_files {
-        match load_single_spec(&spec_file, table_info.clone()) {
-            Ok(spec) => all_specs.push(spec),
-            Err(e) => return Err(e),
-        }
+        all_specs.push(load_single_spec(&spec_file, table_info.clone())?);
     }
 
     Ok(all_specs)
-}
-
-fn validate_table_data_exists(
-    table_dir: &Path,
-    table_info: &TableInfo,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if table_info.table_path.is_some() {
-        return Ok(());
-    }
-
-    let delta_dir = table_dir.join("delta");
-    if !delta_dir.exists() || !delta_dir.is_dir() {
-        return Err(format!(
-            "Table data not found for '{}'. Expected a 'delta' directory in {}",
-            table_info.name,
-            table_dir.display()
-        )
-        .into());
-    }
-
-    Ok(())
 }
 
 fn find_spec_files(specs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
