@@ -889,6 +889,63 @@ impl StructType {
 
         Ok(())
     }
+
+    /// Returns a new StructType with `new_field` inserted after the field named `after`.
+    /// If `after` is not found, `new_field` is appended to the end.
+    pub fn with_field_inserted(&self, after: &str, new_field: StructField) -> Self {
+        let index_of_after = self
+            .fields
+            .get_index_of(after)
+            .unwrap_or(self.fields.len().saturating_sub(1));
+
+        let before = self
+            .fields
+            .iter()
+            .take(index_of_after + 1)
+            .map(|(_, v)| v.clone());
+
+        let after = self
+            .fields
+            .iter()
+            .skip(index_of_after + 1)
+            .map(|(_, v)| v.clone());
+        let new_fields = before.chain(std::iter::once(new_field)).chain(after);
+
+        Self::new_unchecked(new_fields)
+    }
+
+    /// Returns a new StructType with the named field removed.
+    /// Returns self unchanged if field doesn't exist.
+    pub fn with_field_removed(&self, name: &str) -> Self {
+        let new_fields = self
+            .fields
+            .iter()
+            .filter(|(k, _)| *k != name)
+            .map(|(_, v)| v.clone());
+        Self::new_unchecked(new_fields)
+    }
+
+    /// Returns a new StructType with the named field replaced.
+    /// Returns an error if field doesn't exist.
+    pub fn with_field_replaced(
+        &self,
+        name: &str,
+        new_field: StructField,
+    ) -> DeltaResult<StructType> {
+        let pos = self
+            .fields
+            .get_index_of(name)
+            .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
+
+        let new_fields = self.fields.iter().enumerate().map(|(i, (_, v))| {
+            if i == pos {
+                new_field.clone()
+            } else {
+                v.clone()
+            }
+        });
+        Ok(Self::new_unchecked(new_fields))
+    }
 }
 
 fn write_indent(f: &mut Formatter<'_>, levels: &[bool]) -> std::fmt::Result {
@@ -3317,5 +3374,73 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_inserted() {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        let schema =
+            schema.with_field_inserted("id", StructField::new("age", DataType::STRING, true));
+        assert_eq!(schema.num_fields(), 3);
+        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
+        assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_inserted_after_non_existent_field() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let new_schema = schema.with_field_inserted(
+            "nonexistent",
+            StructField::new("name", DataType::STRING, true),
+        );
+        assert_eq!(new_schema.num_fields(), 2);
+        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(new_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_removed() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let new_schema = schema.with_field_removed("id");
+        assert_eq!(new_schema.num_fields(), 0);
+    }
+
+    #[test]
+    fn test_with_field_removed_non_existent_field() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let new_schema = schema.with_field_removed("nonexistent");
+        assert_eq!(new_schema.num_fields(), 1);
+        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "id");
+    }
+
+    #[test]
+    fn test_with_field_replaced() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let new_schema = schema
+            .with_field_replaced("id", StructField::new("name", DataType::STRING, true))
+            .unwrap();
+
+        assert_eq!(new_schema.num_fields(), 1);
+        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_replaced_non_existent_field() {
+        let schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+        let new_schema = schema.with_field_replaced(
+            "nonexistent",
+            StructField::new("name", DataType::STRING, true),
+        );
+        assert!(new_schema.is_err(), "Expected error for non-existent field");
     }
 }

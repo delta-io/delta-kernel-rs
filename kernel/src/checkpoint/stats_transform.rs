@@ -211,23 +211,18 @@ fn transform_add_schema(
     };
 
     let modified_add = transform_fn(add_struct)?;
-    let fields: Vec<StructField> = base_schema
-        .fields()
-        .map(|field| {
-            if field.name == ADD_NAME {
-                StructField {
-                    name: field.name.clone(),
-                    data_type: DataType::Struct(Box::new(modified_add.clone())),
-                    nullable: field.nullable,
-                    metadata: field.metadata.clone(),
-                }
-            } else {
-                field.clone()
-            }
-        })
-        .collect();
+    //TODO: replace with StructType::with_field_replaced
+    let new_schema = base_schema.with_field_replaced(
+        ADD_NAME,
+        StructField {
+            name: ADD_NAME.to_string(),
+            data_type: DataType::Struct(Box::new(modified_add)),
+            nullable: add_field.nullable,
+            metadata: add_field.metadata.clone(),
+        },
+    )?;
 
-    Ok(Arc::new(StructType::new_unchecked(fields)))
+    Ok(Arc::new(new_schema))
 }
 
 /// Adds `stats_parsed` field after `stats` in the Add action schema.
@@ -235,51 +230,37 @@ fn add_stats_parsed_to_add_schema(
     add_schema: &StructType,
     stats_schema: &StructType,
 ) -> StructType {
-    let mut fields: Vec<StructField> = Vec::with_capacity(add_schema.num_fields() + 1);
-
-    for field in add_schema.fields() {
-        fields.push(field.clone());
-        if field.name == STATS_FIELD {
-            // Insert stats_parsed right after stats
-            fields.push(StructField::nullable(
-                STATS_PARSED_FIELD,
-                DataType::Struct(Box::new(stats_schema.clone())),
-            ));
-        }
-    }
-
-    StructType::new_unchecked(fields)
+    add_schema.with_field_inserted(
+        STATS_FIELD,
+        StructField::nullable(
+            STATS_PARSED_FIELD,
+            DataType::Struct(Box::new(stats_schema.clone())),
+        ),
+    )
 }
 
 fn build_add_output_schema(
     config: &StatsTransformConfig,
-    add_schema: &StructType,
+    add_schema: &StructType, // add_schema is the previous checkpoint add schema?
     stats_schema: &StructType,
 ) -> StructType {
-    let capacity = add_schema.num_fields()
-        - if config.write_stats_as_json { 0 } else { 1 } // dropping stats?
-        + if config.write_stats_as_struct { 1 } else { 0 }; // adding stats_parsed?
-    let mut fields: Vec<StructField> = Vec::with_capacity(capacity);
+    let new_schema = if config.write_stats_as_struct {
+        add_schema.with_field_inserted(
+            STATS_FIELD,
+            StructField::nullable(
+                STATS_PARSED_FIELD,
+                DataType::Struct(Box::new(stats_schema.clone())),
+            ),
+        )
+    } else {
+        add_schema.clone()
+    };
 
-    for field in add_schema.fields() {
-        if field.name == STATS_FIELD {
-            // Include stats if writing as JSON
-            if config.write_stats_as_json {
-                fields.push(field.clone());
-            }
-            // Add stats_parsed after stats position if writing as struct
-            if config.write_stats_as_struct {
-                fields.push(StructField::nullable(
-                    STATS_PARSED_FIELD,
-                    DataType::Struct(Box::new(stats_schema.clone())),
-                ));
-            }
-        } else {
-            fields.push(field.clone());
-        }
+    if config.write_stats_as_json {
+        new_schema
+    } else {
+        new_schema.with_field_removed(STATS_FIELD)
     }
-
-    StructType::new_unchecked(fields)
 }
 
 #[cfg(test)]
