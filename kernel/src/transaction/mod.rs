@@ -1935,7 +1935,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{ArrayType, ColumnMetadataKey, MapType};
+    use crate::schema::{ArrayType, ColumnMetadataKey, MapType, MetadataValue};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
@@ -2522,8 +2522,6 @@ mod tests {
     /// Iterates logical fields to extract expected physical name / id, then checks
     /// the physical schema matches.
     fn validate_physical_schema_column_mapping(mode: ColumnMappingMode) -> DeltaResult<()> {
-        use crate::schema::MetadataValue;
-
         let (_engine, txn) = setup_column_mapping_txn(mode)?;
         let write_context = txn.get_write_context();
         let logical_schema = write_context.logical_schema();
