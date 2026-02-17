@@ -219,7 +219,7 @@ pub(crate) fn as_checkpoint_skipping_predicate(
     partition_columns: &[String],
 ) -> Option<Pred> {
     let partition_columns: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
-    GuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
+    NullGuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
 }
 
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.
@@ -352,11 +352,11 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
 /// making the output safe for parquet row group filtering where null stats are invisible
 /// to footer min/max statistics. Partition columns are excluded since their values are
 /// stored in `add.partitionValues_parsed`, not `add.stats_parsed`.
-struct GuardedDataSkippingPredicateCreator<'a> {
+struct NullGuardedDataSkippingPredicateCreator<'a> {
     partition_columns: HashSet<&'a str>,
 }
 
-impl GuardedDataSkippingPredicateCreator<'_> {
+impl NullGuardedDataSkippingPredicateCreator<'_> {
     /// Returns true if the column is a partition column (no stats in `stats_parsed`).
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
@@ -364,7 +364,7 @@ impl GuardedDataSkippingPredicateCreator<'_> {
     }
 }
 
-impl DataSkippingPredicateEvaluator for GuardedDataSkippingPredicateCreator<'_> {
+impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<'_> {
     type Output = Pred;
     type ColumnStat = Expr;
 
