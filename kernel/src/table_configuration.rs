@@ -266,13 +266,13 @@ impl TableConfiguration {
             .collect()
     }
 
-    /// Translates a logical column name path to physical column name path.
+    /// Translates a logical [`ColumnName`] to physical.
     ///
     /// The `col_name` parameter must be a [`ColumnName`] derived from `self.schema`.
     ///
     /// # Panics
-    /// Panics if the column path cannot be resolved in `self.schema`. This should never happen
-    /// since logical column names are derived from `self.schema` itself.
+    /// Panics if the `col_name` cannot be resolved in `self.schema`. This should never happen
+    /// since `col_name` was derived from `self.schema` itself.
     fn translate_column_name_to_physical(
         &self,
         col_name: &ColumnName,
@@ -1657,6 +1657,19 @@ mod test {
         )
     }
 
+    fn nested_schema_without_column_mapping() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::nullable(
+                "info",
+                StructType::new_unchecked([
+                    StructField::nullable("name", DataType::STRING),
+                    StructField::nullable("age", DataType::INTEGER),
+                ]),
+            ),
+        ]))
+    }
+
     fn create_table_config_with_column_mapping(
         schema: SchemaRef,
         column_mapping_mode: &str,
@@ -1862,7 +1875,7 @@ mod test {
 
     #[test]
     fn test_stats_column_names_physical_nested_schema_name_mode() {
-        // Test nested schema with column mapping in Name mode
+        // Test nested schema with column mapping in name mode
         let schema = nested_schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
@@ -1906,6 +1919,25 @@ mod test {
             "Expected physical column names"
         );
     }
+
+    #[test]
+    fn test_stats_column_names_physical_nested_schema_none_mode() {
+        // Test nested schema with column mapping in none mode
+        let schema = nested_schema_without_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "none");
+
+        let column_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["id"]),
+                ColumnName::new(["info", "name"]),
+                ColumnName::new(["info", "age"]),
+            ],
+            "Expected logical column names"
+        );
+    }
+
     #[cfg(feature = "clustered-table")]
     #[test]
     fn test_clustered_table_writes() {
