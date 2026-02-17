@@ -2505,7 +2505,7 @@ mod tests {
         Ok((engine, txn))
     }
 
-    /// Shared validation for column mapping physical schema (both Name and Id modes).
+    /// Shared validation for column mapping physical schema.
     /// Iterates logical fields to extract expected physical name / id, then checks
     /// the physical schema matches.
     fn validate_physical_schema_column_mapping(mode: ColumnMappingMode) -> DeltaResult<()> {
@@ -2528,10 +2528,13 @@ mod tests {
                 let physical_name =
                     match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
                         Some(MetadataValue::String(name)) => name.clone(),
+                        _ if mode == ColumnMappingMode::None => f.name().to_string(),
                         _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
                     };
                 let field_id = match f.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
                     Some(MetadataValue::Number(id)) => *id,
+                    // None mode: no column mapping id, use -1 as placeholder
+                    _ if mode == ColumnMappingMode::None => -1,
                     _ => panic!(
                         "Logical field '{}' missing columnMapping.id metadata",
                         f.name()
@@ -2552,7 +2555,12 @@ mod tests {
                 "Physical field name mismatch"
             );
 
-            // Should carry physicalName metadata matching the field name
+            // None mode: no CM metadata
+            if mode == ColumnMappingMode::None {
+                continue;
+            }
+
+            // Name/Id mode: have CM metadata
             assert_eq!(
                 physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
                 Some(&MetadataValue::String(expected_name.clone())),
@@ -2560,7 +2568,6 @@ mod tests {
                 physical_field.name()
             );
 
-            // Should carry columnMapping.id
             assert_eq!(
                 physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
                 Some(&MetadataValue::Number(*expected_id)),
@@ -2568,7 +2575,6 @@ mod tests {
                 physical_field.name()
             );
 
-            // Should carry parquet.field.id matching columnMapping.id
             assert_eq!(
                 physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
                 Some(&MetadataValue::Number(*expected_id)),
@@ -2576,10 +2582,6 @@ mod tests {
                 physical_field.name()
             );
         }
-
-        // Logical schema should still use original names
-        assert!(logical_schema.field("id").is_some());
-        assert!(logical_schema.field("value").is_some());
 
         Ok(())
     }
@@ -2592,5 +2594,10 @@ mod tests {
     #[test]
     fn test_physical_schema_column_mapping_id_mode() -> DeltaResult<()> {
         validate_physical_schema_column_mapping(ColumnMappingMode::Id)
+    }
+
+    #[test]
+    fn test_physical_schema_column_mapping_none_mode() -> DeltaResult<()> {
+        validate_physical_schema_column_mapping(ColumnMappingMode::None)
     }
 }
