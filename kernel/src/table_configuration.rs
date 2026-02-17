@@ -262,37 +262,33 @@ impl TableConfiguration {
         let column_mapping_mode = self.column_mapping_mode();
         logical_names
             .into_iter()
-            .map(|col_name| self.translate_column_name_to_physical(&col_name, column_mapping_mode))
+            .filter_map(|col_name| {
+                self.translate_column_name_to_physical(&col_name, column_mapping_mode)
+            })
             .collect()
     }
 
     /// Translates a logical [`ColumnName`] to physical.
     ///
-    /// The `col_name` parameter must be a [`ColumnName`] derived from `self.schema`.
-    ///
-    /// # Panics
-    /// Panics if the `col_name` cannot be resolved in `self.schema`. This should never happen
-    /// since `col_name` was derived from `self.schema` itself.
+    /// Returns `None` if the column name cannot be resolved in the schema.
     fn translate_column_name_to_physical(
         &self,
         col_name: &ColumnName,
         column_mapping_mode: ColumnMappingMode,
-    ) -> ColumnName {
+    ) -> Option<ColumnName> {
         let mut physical_path = Vec::new();
-        let mut current_type: &DataType = &DataType::Struct(Box::new(self.schema.as_ref().clone()));
+        let mut current_struct: Option<&StructType> = Some(self.schema.as_ref());
 
         for segment in col_name.path() {
-            let DataType::Struct(s) = current_type else {
-                unreachable!("Column path segment must be in a struct")
-            };
-            #[allow(clippy::expect_used)]
-            // column must exist in schema, as it was derived from the schema itself
-            let field = s.field(segment).expect("Column must exist in schema");
+            let field = current_struct?.field(segment)?;
             physical_path.push(field.physical_name(column_mapping_mode).to_string());
-            current_type = field.data_type();
+            current_struct = match field.data_type() {
+                DataType::Struct(s) => Some(s),
+                _ => None,
+            };
         }
 
-        ColumnName::new(physical_path)
+        Some(ColumnName::new(physical_path))
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
