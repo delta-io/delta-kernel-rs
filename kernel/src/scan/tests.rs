@@ -1,15 +1,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
-use crate::arrow::datatypes::DataType as ArrowDataType;
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
 };
+use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::file::properties::WriterProperties;
+use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, Snapshot};
@@ -837,5 +844,128 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     assert!(
         scan.build_actions_meta_predicate().is_none(),
         "StaticSkipAll predicate should return None"
+    );
+}
+
+/// Tests that checkpoint row group skipping works end-to-end with the parquet row group filter.
+///
+/// We create a parquet file with the nested `add.stats_parsed.*` structure that checkpoint files
+/// have, forced into 3 row groups (1 row each). Each row represents one add action:
+///   - Row group 0: maxValues.id = 100 (should be skipped for `id > 200`)
+///   - Row group 1: maxValues.id = 300 (should be kept for `id > 200`)
+///   - Row group 2: maxValues.id = NULL (should be kept — IS NULL guard fires)
+///
+/// The generated meta predicate is:
+///   `OR(add.stats_parsed.maxValues.id IS NULL, add.stats_parsed.maxValues.id > 200)`
+///
+/// The parquet reader's row group filter uses footer stats on the nested column to decide:
+///   - Row group 0: footer max = 100, null_count = 0 → OR(false, false) → skip
+///   - Row group 1: footer max = 300, null_count = 0 → OR(false, true) → keep
+///   - Row group 2: footer max = NULL, null_count = 1 → OR(true, ...) → keep
+#[test]
+fn test_checkpoint_row_group_skipping_end_to_end() {
+    // Build the nested Arrow schema matching a checkpoint's add.stats_parsed structure.
+    let id_fields = Fields::from(vec![Field::new("id", ArrowDataType::Int64, true)]);
+    let stats_fields = Fields::from(vec![
+        Field::new("maxValues", ArrowDataType::Struct(id_fields.clone()), true),
+        Field::new("minValues", ArrowDataType::Struct(id_fields.clone()), true),
+        Field::new("numRecords", ArrowDataType::Int64, true),
+    ]);
+    let add_fields = Fields::from(vec![Field::new(
+        "stats_parsed",
+        ArrowDataType::Struct(stats_fields.clone()),
+        true,
+    )]);
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "add",
+        ArrowDataType::Struct(add_fields.clone()),
+        true,
+    )]));
+
+    // Helper to build a single-row RecordBatch with the given stats.
+    let make_batch = |max_id: Option<i64>, min_id: Option<i64>, num_records: i64| -> RecordBatch {
+        let max_values = StructArray::from(vec![(
+            Arc::new(Field::new("id", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![max_id])) as Arc<dyn Array>,
+        )]);
+        let min_values = StructArray::from(vec![(
+            Arc::new(Field::new("id", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![min_id])) as Arc<dyn Array>,
+        )]);
+        let stats_parsed = StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "maxValues",
+                    ArrowDataType::Struct(id_fields.clone()),
+                    true,
+                )),
+                Arc::new(max_values) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new(
+                    "minValues",
+                    ArrowDataType::Struct(id_fields.clone()),
+                    true,
+                )),
+                Arc::new(min_values) as Arc<dyn Array>,
+            ),
+            (
+                Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![num_records])) as Arc<dyn Array>,
+            ),
+        ]);
+        let add = StructArray::from(vec![(
+            Arc::new(Field::new(
+                "stats_parsed",
+                ArrowDataType::Struct(stats_fields.clone()),
+                true,
+            )),
+            Arc::new(stats_parsed) as Arc<dyn Array>,
+        )]);
+        RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(add)]).unwrap()
+    };
+
+    // Write 3 rows as 3 separate row groups (max_row_group_size = 1).
+    let props = WriterProperties::builder()
+        .set_max_row_group_size(1)
+        .build();
+    let mut buffer = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema.clone(), Some(props)).unwrap();
+    writer.write(&make_batch(Some(100), Some(1), 100)).unwrap(); // RG 0: max_id=100
+    writer
+        .write(&make_batch(Some(300), Some(201), 100))
+        .unwrap(); // RG 1: max_id=300
+    writer.write(&make_batch(None, None, 100)).unwrap(); // RG 2: max_id=NULL
+    writer.close().unwrap();
+
+    let parquet_bytes = Bytes::from(buffer);
+
+    // Verify we have 3 row groups.
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone()).unwrap();
+    assert_eq!(builder.metadata().num_row_groups(), 3);
+
+    // Build the checkpoint meta predicate for `id > 200`.
+    let pred = Pred::gt(column_expr!("id"), Expr::literal(200i64));
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    let mut prefixer = PrefixColumns {
+        prefix: ColumnName::new(["add", "stats_parsed"]),
+    };
+    let meta_predicate = prefixer
+        .transform_pred(&skipping_pred)
+        .unwrap()
+        .into_owned();
+
+    // Apply the row group filter and read back — only row groups 1 and 2 should survive.
+    let filtered_builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
+        .unwrap()
+        .with_row_group_filter(&meta_predicate, None);
+    let total_rows: usize = filtered_builder
+        .build()
+        .unwrap()
+        .map(|b| b.unwrap().num_rows())
+        .sum();
+    assert_eq!(
+        total_rows, 2,
+        "Should skip row group 0 (max_id=100) and keep row groups 1 (max_id=300) and 2 (max_id=NULL)"
     );
 }
