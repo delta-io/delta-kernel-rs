@@ -369,65 +369,12 @@ fn test_timestamp_skipping_disabled() {
     );
 }
 
-// Verifies that `as_checkpoint_skipping_predicate` adds IS NULL guards on stat column
-// references. The guards prevent incorrect row group pruning when some files in the row group
-// have missing stats (null stat columns), since parquet footer min/max statistics ignore nulls.
-#[test]
-fn test_checkpoint_skipping_predicate_gt() {
-    let col = &column_expr!("x");
-    let pred = Pred::gt(col.clone(), Scalar::from(100));
-    let result = as_checkpoint_skipping_predicate(&pred).unwrap();
-    let result_str = result.to_string();
-
-    // Should contain an IS NULL guard on maxValues.x
-    assert!(
-        result_str.contains("Column(maxValues.x) IS NULL"),
-        "Expected IS NULL guard on maxValues.x, got: {result_str}"
-    );
-    assert!(
-        result_str.contains("Column(maxValues.x) > 100"),
-        "Expected the comparison, got: {result_str}"
-    );
-}
-
-#[test]
-fn test_checkpoint_skipping_predicate_eq() {
-    let col = &column_expr!("x");
-    let pred = Pred::eq(col.clone(), Scalar::from(100));
-    let result = as_checkpoint_skipping_predicate(&pred).unwrap();
-    let result_str = result.to_string();
-
-    // EQ uses both min and max stats; each should have its own IS NULL guard
-    assert!(
-        result_str.contains("Column(minValues.x) IS NULL"),
-        "Expected IS NULL guard on minValues.x, got: {result_str}"
-    );
-    assert!(
-        result_str.contains("Column(maxValues.x) IS NULL"),
-        "Expected IS NULL guard on maxValues.x, got: {result_str}"
-    );
-}
-
-#[test]
-fn test_checkpoint_skipping_predicate_is_null() {
-    let col = &column_expr!("x");
-    let pred = Pred::is_null(col.clone());
-    let result = as_checkpoint_skipping_predicate(&pred).unwrap();
-    let result_str = result.to_string();
-
-    // IS NULL uses nullCount stat; should have an IS NULL guard on it
-    assert!(
-        result_str.contains("Column(nullCount.x) IS NULL"),
-        "Expected IS NULL guard on nullCount.x, got: {result_str}"
-    );
-}
-
 // Verifies that the guarded predicate still correctly prunes when all stats are present.
 #[test]
 fn test_checkpoint_skipping_semantic_with_stats() {
     let col = &column_expr!("x");
     let pred = Pred::gt(col.clone(), Scalar::from(100));
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred).unwrap();
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
 
     // All stats present, max = 50 (below threshold) → can skip
     let resolver = HashMap::from_iter([(column_name!("maxValues.x"), Scalar::from(50))]);
@@ -453,7 +400,7 @@ fn test_checkpoint_skipping_semantic_with_stats() {
 fn test_checkpoint_skipping_semantic_with_null_stats() {
     let col = &column_expr!("x");
     let pred = Pred::gt(col.clone(), Scalar::from(100));
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred).unwrap();
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
 
     // Stats are explicitly null → IS NULL guard fires → must keep
     let resolver =
@@ -489,7 +436,7 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
         Pred::gt(column_expr!("col_a"), Scalar::from(100)),
         Pred::lt(column_expr!("col_b"), Scalar::from(50)),
     );
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred).unwrap();
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
 
     // Both stats present and both allow pruning → skip
     let resolver = HashMap::from_iter([

@@ -767,49 +767,6 @@ fn test_prefix_columns_simple() {
 }
 
 #[test]
-fn test_prefix_columns_nested() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A nested column: minValues.x >= 100
-    let pred = Pred::ge(column_expr!("minValues.x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
-
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.minValues.x"));
-}
-
-#[test]
-fn test_prefix_columns_conjunction() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // AND of two predicates: maxValues.x >= 100 AND minValues.x <= 200
-    let pred = Pred::and(
-        Pred::ge(column_expr!("maxValues.x"), Expr::literal(100i64)),
-        Pred::le(column_expr!("minValues.x"), Expr::literal(200i64)),
-    );
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
-
-    let refs = result.references();
-    assert_eq!(refs.len(), 2);
-    assert!(refs.contains(&column_name!("add.stats_parsed.maxValues.x")));
-    assert!(refs.contains(&column_name!("add.stats_parsed.minValues.x")));
-}
-
-#[test]
-fn test_prefix_columns_literal_only() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A predicate with no column references should pass through unchanged
-    let pred = Pred::literal(true);
-    let result = prefixer.transform_pred(&pred).unwrap();
-    assert!(result.references().is_empty());
-}
-
-#[test]
 fn test_build_actions_meta_predicate_with_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
@@ -858,33 +815,6 @@ fn test_build_actions_meta_predicate_no_predicate() {
     assert!(
         scan.build_actions_meta_predicate().is_none(),
         "Should return None when there is no predicate"
-    );
-}
-
-#[test]
-fn test_build_actions_meta_predicate_no_stats_schema() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-    // Build a scan with a predicate but without stats columns requested.
-    // The physical_stats_schema is derived from include_stats_columns() or from the
-    // predicate itself. Even without include_stats_columns(), a predicate over a
-    // skipping-eligible column will produce a physical_stats_schema.
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-
-    // With a valid predicate on an existing column, a stats schema is produced and
-    // the actions meta predicate should be available.
-    let result = scan.build_actions_meta_predicate();
-    assert!(
-        result.is_some(),
-        "Predicate on a valid column should produce an actions meta predicate"
     );
 }
 

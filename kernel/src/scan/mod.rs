@@ -729,7 +729,12 @@ impl Scan {
         };
         self.state_info.physical_stats_schema.as_ref()?;
 
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate)?;
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),

@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use tracing::{debug, error, info};
@@ -209,8 +210,16 @@ impl DataSkippingFilter {
 /// At the parquet row group level:
 /// - If any file has null `maxValues.col_a` (null_count > 0): IS NULL is satisfiable, keep
 /// - If all files have non-null stats (null_count = 0): evaluate comparison using footer stats
-pub(crate) fn as_checkpoint_skipping_predicate(pred: &Pred) -> Option<Pred> {
-    GuardedDataSkippingPredicateCreator.eval(pred)
+///
+/// Partition columns are excluded because their values live in `add.partitionValues_parsed`,
+/// not in `add.stats_parsed`. Predicates on partition columns would reference non-existent
+/// columns in the checkpoint and be ignored by the parquet reader.
+pub(crate) fn as_checkpoint_skipping_predicate(
+    pred: &Pred,
+    partition_columns: &[String],
+) -> Option<Pred> {
+    let partition_columns: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
+    GuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
 }
 
 struct DataSkippingPredicateCreator;
@@ -331,25 +340,45 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
 
 /// A data-skipping predicate creator that adds IS NULL guards on stat column references,
 /// making the output safe for parquet row group filtering where null stats are invisible
-/// to footer min/max statistics.
-struct GuardedDataSkippingPredicateCreator;
+/// to footer min/max statistics. Partition columns are excluded since their values are
+/// stored in `add.partitionValues_parsed`, not `add.stats_parsed`.
+struct GuardedDataSkippingPredicateCreator<'a> {
+    partition_columns: HashSet<&'a str>,
+}
 
-impl DataSkippingPredicateEvaluator for GuardedDataSkippingPredicateCreator {
+impl GuardedDataSkippingPredicateCreator<'_> {
+    /// Returns true if the column is a partition column (no stats in `stats_parsed`).
+    fn is_partition_column(&self, col: &ColumnName) -> bool {
+        let path = col.path();
+        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+    }
+}
+
+impl DataSkippingPredicateEvaluator for GuardedDataSkippingPredicateCreator<'_> {
     type Output = Pred;
     type ColumnStat = Expr;
 
-    // The get_*_stat methods delegate to DataSkippingPredicateCreator — same stat columns,
-    // just used in guarded comparisons downstream.
+    // The get_*_stat methods delegate to DataSkippingPredicateCreator but return None for
+    // partition columns, which don't have stats in stats_parsed.
 
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        if self.is_partition_column(col) {
+            return None;
+        }
         DataSkippingPredicateCreator.get_min_stat(col, data_type)
     }
 
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        if self.is_partition_column(col) {
+            return None;
+        }
         DataSkippingPredicateCreator.get_max_stat(col, data_type)
     }
 
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
+        if self.is_partition_column(col) {
+            return None;
+        }
         DataSkippingPredicateCreator.get_nullcount_stat(col)
     }
 
