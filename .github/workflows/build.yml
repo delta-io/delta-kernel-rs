@@ -206,6 +206,7 @@ jobs:
           rustup toolchain install nightly-2026-02-05 --component miri
           rustup override set nightly-2026-02-05
           cargo miri setup
+      - uses: Swatinem/rust-cache@v2
       - name: Test with Miri
         run: |
           pushd ffi
