@@ -1175,17 +1175,24 @@ impl<S> Transaction<S> {
             .table_configuration()
             .column_mapping_mode();
 
-        // Compute physical schema: exclude partition columns since they're stored in the path,
-        // and apply column mapping to transform logical field names to physical names
+        // Compute physical schema: exclude partition columns since they're stored in the path
+        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
+        // logical field names to physical names.
         let partition_columns: Vec<String> = self
             .read_snapshot
             .table_configuration()
             .metadata()
             .partition_columns()
             .to_vec();
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
         let physical_fields = snapshot_schema
             .fields()
-            .filter(|f| !partition_columns.contains(&f.name().to_string()))
+            .filter(|f| {
+                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
+            })
             .map(|f| f.make_physical(column_mapping_mode));
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
@@ -2227,6 +2234,33 @@ mod tests {
             expr_str_with
         );
 
+        Ok(())
+    }
+
+    /// Physical schema should include partition columns when materializePartitionColumns is on.
+    #[test]
+    fn test_physical_schema_includes_partition_columns_when_materialized(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/partitioned_with_materialize_feature/",
+        ))
+        .unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let write_context = txn.get_write_context();
+        let physical_schema = write_context.physical_schema();
+
+        assert!(
+            physical_schema.contains("letter"),
+            "Partition column 'letter' should be in physical schema when materialized"
+        );
+        assert!(
+            physical_schema.contains("number"),
+            "Non-partition column 'number' should be in physical schema"
+        );
         Ok(())
     }
 
