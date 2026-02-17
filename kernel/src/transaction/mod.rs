@@ -45,6 +45,11 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 #[cfg(feature = "internal-api")]
+pub mod builder;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod builder;
+
+#[cfg(feature = "internal-api")]
 pub mod create_table;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod create_table;
@@ -252,51 +257,14 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-/// A type alias for create-table transactions.
-///
-/// This provides a restricted API surface that only exposes operations valid during table
-/// creation. Operations like removing files, removing domain metadata, updating deletion
-/// vectors, and setting blind append are not available at compile time.
-///
-/// # Operations NOT available on create-table transactions
-///
-/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table
-///   that doesn't exist yet.
-/// - **`remove_files()`** — Cannot remove files from a table that has no files.
-/// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
-/// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
-/// - **`with_transaction_id()`** — Transaction ID (app_id) tracking is for existing tables.
-/// - **`with_operation()`** — The operation is fixed to `"CREATE TABLE"`.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use delta_kernel::transaction::create_table::create_table;
-/// use delta_kernel::schema::{StructType, StructField, DataType};
-/// use delta_kernel::committer::FileSystemCommitter;
-/// use std::sync::Arc;
-/// # use delta_kernel::Engine;
-/// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
-///
-/// let schema = Arc::new(StructType::try_new(vec![
-///     StructField::new("id", DataType::INTEGER, false),
-/// ])?);
-///
-/// let result = create_table("/path/to/table", schema, "MyApp/1.0")
-///     .build(engine, Box::new(FileSystemCommitter::new()))?
-///     .commit(engine)?;
-/// # Ok(())
-/// # }
-/// ```
-pub type CreateTableTransaction = Transaction<CreateTable>;
-
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
 ///
 /// The type parameter `S` controls which operations are available:
 /// - [`ExistingTable`] (default): Full API for modifying existing tables.
-/// - [`CreateTable`]: Restricted API for table creation (see [`CreateTableTransaction`]).
+/// - [`CreateTable`]: Restricted API for table creation (see
+///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
 ///
 /// # Examples
 ///
@@ -412,58 +380,6 @@ impl Transaction {
             commit_timestamp,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
-            user_domain_removals: vec![],
-            data_change: true,
-            is_blind_append: false,
-            dv_matched_files: vec![],
-            clustering_columns,
-            _state: PhantomData,
-        })
-    }
-}
-
-// =============================================================================
-// Constructor for create-table transactions
-// =============================================================================
-impl Transaction<CreateTable> {
-    /// Create a new transaction for creating a new table. This is used when the table doesn't
-    /// exist yet and we need to create it with Protocol and Metadata actions.
-    ///
-    /// The `pre_commit_snapshot` is a synthetic snapshot created from the protocol and metadata
-    /// that will be committed. It uses `PRE_COMMIT_VERSION` as a sentinel to indicate no
-    /// version exists yet on disk.
-    ///
-    /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
-    #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn try_new_create_table(
-        pre_commit_snapshot: SnapshotRef,
-        engine_info: String,
-        committer: Box<dyn Committer>,
-        system_domain_metadata: Vec<DomainMetadata>,
-        clustering_columns: Option<Vec<ColumnName>>,
-    ) -> DeltaResult<Self> {
-        // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
-        // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
-        // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
-        // the was read vs the effective snapshot we will use for the commit.
-        let span = tracing::info_span!(
-            "txn",
-            path = %pre_commit_snapshot.table_root(),
-            operation = "CREATE",
-        );
-
-        Ok(Transaction {
-            span,
-            read_snapshot: pre_commit_snapshot,
-            committer,
-            operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
-            set_transactions: vec![],
-            commit_timestamp: current_time_ms()?,
-            user_domain_metadata_additions: vec![],
-            system_domain_metadata_additions: system_domain_metadata,
             user_domain_removals: vec![],
             data_change: true,
             is_blind_append: false,
@@ -675,6 +591,17 @@ impl<S> Transaction<S> {
     /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
+    /// `last_updated` timestamp).
+    /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
+    /// different versions are disallowed in a single transaction. If a duplicate app_id is
+    /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
+    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
+        let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
+        self.set_transactions.push(set_transaction);
         self
     }
 
@@ -1666,17 +1593,6 @@ impl Transaction {
         self
     }
 
-    /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
-    /// `last_updated` timestamp).
-    /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
-    /// different versions are disallowed in a single transaction. If a duplicate app_id is
-    /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
-    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
-        let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
-        self.set_transactions.push(set_transaction);
-        self
-    }
-
     /// Remove domain metadata from the Delta log.
     /// If the domain exists in the Delta log, this creates a tombstone to logically delete
     /// the domain. The tombstone preserves the previous configuration value.
@@ -2447,61 +2363,25 @@ mod tests {
 
     #[test]
     fn test_validate_blind_append_rejects_create_table() -> DeltaResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let store = Arc::new(object_store::local::LocalFileSystem::new());
+        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let mut txn = create_table(
+            tempdir.path().to_str().expect("valid temp path"),
+            schema,
+            "test_engine",
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         // CreateTableTransaction does not expose with_blind_append() (compile-time
-        // prevention per #1768). This test verifies the defense-in-depth runtime check
-        // by directly setting the field on the Transaction<CreateTable>.
-        let tempdir = tempfile::tempdir()?;
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])
-                .expect("valid schema"),
-        );
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
-        let mut create_txn = create_table(
-            tempdir.path().to_str().expect("valid temp path"),
-            schema,
-            "test_engine",
-        )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        // Directly set blind append flag (tests have access to private fields)
-        create_txn.is_blind_append = true;
-        add_dummy_file(&mut create_txn);
-        let result = create_txn.validate_blind_append_semantics();
+        // prevention per #1768). Directly set the field to test the runtime check.
+        txn.is_blind_append = true;
+        add_dummy_file(&mut txn);
+        let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_rejects_domain_metadata_removal() -> DeltaResult<()> {
-        // CreateTableTransaction does not expose with_domain_metadata_removed() (compile-time
-        // prevention per #1768). This test verifies the defense-in-depth runtime check
-        // by directly adding a domain removal to the Transaction<CreateTable>.
-        let tempdir = tempfile::tempdir()?;
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])
-                .expect("valid schema"),
-        );
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
-        let mut create_txn = create_table(
-            tempdir.path().to_str().expect("valid temp path"),
-            schema,
-            "test_engine",
-        )
-        .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        // Directly add a domain removal (tests have access to private fields)
-        create_txn.user_domain_removals.push("some.domain".into());
-        let result = create_txn.commit(engine.as_ref());
-        assert!(
-            result.is_err(),
-            "Domain removal on create-table should fail"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Domain metadata removals are not supported in create-table"),
-            "Expected domain removal rejection, got: {err_msg}"
-        );
         Ok(())
     }
 
@@ -2576,174 +2456,6 @@ mod tests {
     }
 
     #[test]
-    fn test_io_error_committer_mock_methods() {
-        use crate::committer::CatalogCommit;
-        // Verify the mock's is_catalog_committer returns false
-        assert!(!IoErrorCommitter.is_catalog_committer());
-        // Verify the mock's publish returns Ok (it's never reached in practice
-        // since commit() always fails first, but the trait requires it)
-        let url = url::Url::parse("memory:///test").unwrap();
-        let commit = CatalogCommit::new_unchecked(1, url.clone(), url.clone());
-        let publish_metadata = PublishMetadata::try_new(1, vec![commit]).unwrap();
-        let engine = SyncEngine::new();
-        assert!(IoErrorCommitter.publish(&engine, publish_metadata).is_ok());
-    }
-
-    #[cfg(feature = "catalog-managed")]
-    #[test]
-    fn test_with_committer() -> DeltaResult<()> {
-        let (_engine, txn, _tempdir) = create_existing_table_txn()?;
-        // Verify with_committer replaces the committer (consumes and returns self)
-        let _txn = txn.with_committer(Box::new(FileSystemCommitter::new()));
-        Ok(())
-    }
-
-    // ============================================================================
-    // CreateTableTransaction delegation tests
-    // ============================================================================
-
-    /// Helper to create a `CreateTableTransaction` for unit tests.
-    fn create_test_create_table_txn(
-    ) -> DeltaResult<(Arc<dyn Engine>, CreateTableTransaction, tempfile::TempDir)> {
-        let tempdir = tempfile::tempdir()?;
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::nullable("name", DataType::STRING),
-            ])
-            .expect("valid schema"),
-        );
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
-        let engine: Arc<dyn Engine> =
-            Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
-        let txn = create_table(
-            tempdir.path().to_str().expect("valid temp path"),
-            schema,
-            "test_engine",
-        )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        Ok((engine, txn, tempdir))
-    }
-
-    #[test]
-    fn test_create_table_txn_with_engine_info() -> DeltaResult<()> {
-        let (engine, txn, _tempdir) = create_test_create_table_txn()?;
-        // with_engine_info should return self for chaining and override the default
-        let txn = txn.with_engine_info("OverriddenEngine/2.0");
-        // Verify it still commits successfully (engine info is written to commit info)
-        let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::CommittedTransaction(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_with_data_change() -> DeltaResult<()> {
-        let (engine, txn, _tempdir) = create_test_create_table_txn()?;
-        // with_data_change should return self for chaining
-        let txn = txn.with_data_change(false);
-        let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::CommittedTransaction(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_set_data_change() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_test_create_table_txn()?;
-        // set_data_change is the internal mutable setter
-        txn.set_data_change(false);
-        let result = txn.commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::CommittedTransaction(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_get_write_context() -> DeltaResult<()> {
-        let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-        let write_context = txn.get_write_context();
-
-        // Verify the write context has the expected schema
-        let logical_schema = write_context.logical_schema();
-        assert!(logical_schema.contains("id"), "Should contain 'id' column");
-        assert!(
-            logical_schema.contains("name"),
-            "Should contain 'name' column"
-        );
-
-        // Physical schema should match logical for non-partitioned table
-        let physical_schema = write_context.physical_schema();
-        assert!(physical_schema.contains("id"));
-        assert!(physical_schema.contains("name"));
-
-        // Target dir should be set
-        let target_dir = write_context.target_dir();
-        assert!(!target_dir.as_str().is_empty(), "Target dir should be set");
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_add_files_schema() -> DeltaResult<()> {
-        let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-        let schema = txn.add_files_schema();
-        // The add_files schema should have path, partitionValues, size, modificationTime
-        assert!(
-            schema.contains("path"),
-            "add_files_schema should contain 'path'"
-        );
-        assert!(
-            schema.contains("size"),
-            "add_files_schema should contain 'size'"
-        );
-        assert!(
-            schema.contains("modificationTime"),
-            "add_files_schema should contain 'modificationTime'"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_add_files() -> DeltaResult<()> {
-        let (_engine, mut txn, _tempdir) = create_test_create_table_txn()?;
-        // add_files should accept engine data without panicking
-        let data = string_array_to_engine_data(StringArray::from(vec!["dummy_file"]));
-        txn.add_files(data);
-        // No assertion needed beyond "it doesn't panic" — commit validation
-        // will check the data format in integration tests.
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_stats_columns() -> DeltaResult<()> {
-        let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-        let stats_cols = txn.stats_columns();
-        // For a simple non-clustered table, stats_columns should include schema columns
-        // up to the default limit (DEFAULT_NUM_INDEXED_COLS = 32)
-        assert!(
-            !stats_cols.is_empty(),
-            "stats_columns should not be empty for a table with columns"
-        );
-        // Should include both columns since we're well under the 32-column limit
-        let col_names: Vec<String> = stats_cols.iter().map(|c| c.to_string()).collect();
-        assert!(col_names.contains(&"id".to_string()), "Should include 'id'");
-        assert!(
-            col_names.contains(&"name".to_string()),
-            "Should include 'name'"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_stats_schema() -> DeltaResult<()> {
-        let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-        let stats_schema = txn.stats_schema()?;
-        // Stats schema should contain numRecords and column-level stats
-        assert!(
-            stats_schema.contains("numRecords"),
-            "stats_schema should contain 'numRecords'"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn test_existing_table_txn_debug() -> DeltaResult<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
         let debug_str = format!("{:?}", txn);
@@ -2757,63 +2469,6 @@ mod tests {
             !debug_str.contains("create_table"),
             "Existing table debug should not contain create_table: {debug_str}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_debug() -> DeltaResult<()> {
-        let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-        let debug_str = format!("{:?}", txn);
-        assert!(
-            debug_str.contains("Transaction") && debug_str.contains("create_table"),
-            "Debug output should contain Transaction info: {debug_str}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_txn_method_chaining() -> DeltaResult<()> {
-        let (engine, txn, _tempdir) = create_test_create_table_txn()?;
-        // Verify fluent API chaining works across multiple methods
-        let result = txn
-            .with_engine_info("ChainedEngine/1.0")
-            .with_data_change(true)
-            .commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::CommittedTransaction(_)));
-        Ok(())
-    }
-
-    /// Helper to create a `CreateTableTransaction` with domainMetadata feature enabled.
-    fn create_test_create_table_txn_with_domain_metadata(
-    ) -> DeltaResult<(Arc<dyn Engine>, CreateTableTransaction, tempfile::TempDir)> {
-        let tempdir = tempfile::tempdir()?;
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])
-                .expect("valid schema"),
-        );
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
-        let engine: Arc<dyn Engine> =
-            Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
-        let txn = create_table(
-            tempdir.path().to_str().expect("valid temp path"),
-            schema,
-            "test_engine",
-        )
-        .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        Ok((engine, txn, tempdir))
-    }
-
-    #[test]
-    fn test_create_table_txn_chaining_with_domain_metadata() -> DeltaResult<()> {
-        let (engine, txn, _tempdir) = create_test_create_table_txn_with_domain_metadata()?;
-        // Verify chaining with domain metadata when feature is enabled
-        let result = txn
-            .with_engine_info("ChainedEngine/1.0")
-            .with_data_change(true)
-            .with_domain_metadata("test.domain".into(), r#"{"key":"value"}"#.into())
-            .commit(engine.as_ref())?;
-        assert!(matches!(result, CommitResult::CommittedTransaction(_)));
         Ok(())
     }
 }
