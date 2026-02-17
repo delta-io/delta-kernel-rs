@@ -225,8 +225,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                             "Partition column '{logical_name}' not found in table schema"
                         ))
                     })?;
-                let physical_name =
-                    field.physical_name(write_context.column_mapping_mode()).to_string();
+                let physical_name = field
+                    .physical_name(write_context.column_mapping_mode())
+                    .to_string();
                 Ok((physical_name, value))
             })
             .collect::<DeltaResult<HashMap<_, _>>>()?;
