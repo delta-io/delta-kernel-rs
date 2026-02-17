@@ -855,15 +855,16 @@ fn create_metadata_with_stats_config(
     write_stats_as_json: bool,
     write_stats_as_struct: bool,
 ) -> Action {
-    let mut config = HashMap::new();
-    config.insert(
-        "delta.checkpoint.writeStatsAsJson".to_string(),
-        write_stats_as_json.to_string(),
-    );
-    config.insert(
-        "delta.checkpoint.writeStatsAsStruct".to_string(),
-        write_stats_as_struct.to_string(),
-    );
+    let config = HashMap::from([
+        (
+            "delta.checkpoint.writeStatsAsJson".to_string(),
+            write_stats_as_json.to_string(),
+        ),
+        (
+            "delta.checkpoint.writeStatsAsStruct".to_string(),
+            write_stats_as_struct.to_string(),
+        ),
+    ]);
     Action::Metadata(
         Metadata::try_new(
             Some("test-table".into()),
@@ -921,95 +922,70 @@ fn verify_checkpoint_schema(
 /// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths
 ///    (e.g., recovering stats from stats_parsed via ToJson, or vice versa)
 /// 4. Verifies checkpoint 2 schema matches (json2, struct2)
+#[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_all_stats_config_combinations() -> DeltaResult<()> {
-    let test_cases: Vec<(bool, bool, bool, bool)> = vec![
-        // (json1, struct1, json2, struct2)
-        (true, true, true, true),
-        (true, true, true, false),
-        (true, true, false, true),
-        (true, true, false, false),
-        (true, false, true, true),
-        (true, false, true, false),
-        (true, false, false, true),
-        (true, false, false, false),
-        (false, true, true, true),
-        (false, true, true, false),
-        (false, true, false, true),
-        (false, true, false, false),
-        (false, false, true, true),
-        (false, false, true, false),
-        (false, false, false, true),
-        (false, false, false, false),
-    ];
+async fn test_stats_config_round_trip(
+    #[values(true, false)] json1: bool,
+    #[values(true, false)] struct1: bool,
+    #[values(true, false)] json2: bool,
+    #[values(true, false)] struct2: bool,
+) -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+    let table_root = Url::parse("memory:///")?;
 
-    for (i, (json1, struct1, json2, struct2)) in test_cases.iter().enumerate() {
-        let (store, _) = new_in_memory_store();
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = DefaultEngineBuilder::new(store.clone())
-            .with_task_executor(executor)
-            .build();
-        let table_root = Url::parse("memory:///")?;
+    // Commit 0: protocol + metadata with initial settings
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_with_stats_config(json1, struct1),
+        ],
+        0,
+    )
+    .await?;
 
-        // Commit 0: protocol + metadata with initial settings
-        write_commit_to_store(
-            &store,
-            vec![
-                create_basic_protocol_action(),
-                create_metadata_with_stats_config(*json1, *struct1),
-            ],
-            0,
-        )
-        .await?;
+    // Commit 1: add action with JSON stats
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("file1.parquet", 100)],
+        1,
+    )
+    .await?;
 
-        // Commit 1: add action with JSON stats
-        write_commit_to_store(
-            &store,
-            vec![create_add_action_with_stats("file1.parquet", 100)],
-            1,
-        )
-        .await?;
+    // Write checkpoint 1 to parquet with (json1, struct1) settings
+    let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    snapshot1.checkpoint(&engine)?;
 
-        // Write checkpoint 1 to parquet with (json1, struct1) settings
-        let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        snapshot1.checkpoint(&engine)?;
+    // Commit 2: update metadata with new settings
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_with_stats_config(json2, struct2)],
+        2,
+    )
+    .await?;
 
-        // Commit 2: update metadata with new settings
-        write_commit_to_store(
-            &store,
-            vec![create_metadata_with_stats_config(*json2, *struct2)],
-            2,
-        )
-        .await?;
+    // Build snapshot that reads from checkpoint 1 + commit 2.
+    // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
+    // expressions must recover stats across format changes.
+    let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer2 = snapshot2.create_checkpoint_writer()?;
+    let mut result2 = writer2.checkpoint_data(&engine)?;
 
-        // Build snapshot that reads from checkpoint 1 + commit 2.
-        // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
-        // expressions must recover stats across format changes.
-        let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-        let writer2 = snapshot2.create_checkpoint_writer()?;
-        let mut result2 = writer2.checkpoint_data(&engine)?;
+    // Verify checkpoint 2 schema matches new settings
+    let first_batch = result2.next().expect("should have at least one batch")?;
+    let data = first_batch.apply_selection_vector()?;
+    let record_batch = data.try_into_record_batch()?;
+    verify_checkpoint_schema(&record_batch.schema(), json2, struct2)?;
 
-        // Verify checkpoint 2 schema matches new settings
-        let first_batch = result2.next().expect("should have at least one batch")?;
-        let data = first_batch.apply_selection_vector()?;
-        let record_batch = data.try_into_record_batch()?;
-        verify_checkpoint_schema(&record_batch.schema(), *json2, *struct2)?;
-
-        // Consume remaining batches (verifies COALESCE doesn't error)
-        for batch in result2 {
-            let _ = batch?;
-        }
-
-        println!(
-            "Case {}: json1={}, struct1={}, json2={}, struct2={} - PASS",
-            i + 1,
-            json1,
-            struct1,
-            json2,
-            struct2
-        );
+    // Consume remaining batches (verifies COALESCE doesn't error)
+    for batch in result2 {
+        let _ = batch?;
     }
 
     Ok(())

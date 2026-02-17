@@ -291,8 +291,15 @@ impl CheckpointWriter {
             &CHECKPOINT_ACTIONS_SCHEMA_V1
         };
 
-        // Read schema includes stats_parsed so COALESCE expressions can operate on it.
-        // For commits, stats_parsed will be read as nulls (column doesn't exist in source).
+        // The read schema and output schema differ because the transform needs access to
+        // both stats formats as input, but may only write one format as output.
+        //
+        // read_schema: Always includes both `stats` and `stats_parsed` fields in the Add
+        // action, so COALESCE expressions can read from either source. For commit files,
+        // `stats_parsed` doesn't exist and is read as nulls.
+        //
+        // output_schema: Only includes the stats fields that the table config requests
+        // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
         let read_schema = build_checkpoint_read_schema_with_stats(base_schema, &stats_schema)?;
 
         // Read actions from log segment
@@ -308,7 +315,6 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        // Build output schema based on stats config (determines which fields are included)
         let output_schema = build_checkpoint_output_schema(&config, base_schema, &stats_schema)?;
 
         // Build transform expression and create expression evaluator.
