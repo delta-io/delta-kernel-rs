@@ -30,7 +30,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::TableFeature;
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -911,6 +911,7 @@ impl<S> Transaction<S> {
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            column_mapping_mode,
             stats_columns,
         )
     }
@@ -1202,6 +1203,7 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
 }
@@ -1212,6 +1214,7 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
@@ -1219,6 +1222,7 @@ impl WriteContext {
             logical_schema,
             physical_schema,
             logical_to_physical,
+            column_mapping_mode,
             stats_columns,
         }
     }
@@ -1237,6 +1241,11 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// The [`ColumnMappingMode`] for this table.
+    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
+        self.column_mapping_mode
     }
 
     /// Returns the column names that should have statistics collected during writes.
