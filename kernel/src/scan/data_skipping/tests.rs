@@ -2,6 +2,7 @@ use super::*;
 
 use crate::expressions::column_name;
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
+use rstest::rstest;
 use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
@@ -369,55 +370,51 @@ fn test_timestamp_skipping_disabled() {
     );
 }
 
-// Verifies that the guarded predicate still correctly prunes when all stats are present.
-#[test]
-fn test_checkpoint_skipping_semantic_with_stats() {
-    let col = &column_expr!("x");
-    let pred = Pred::gt(col.clone(), Scalar::from(100));
+// Verifies the guarded checkpoint skipping predicate:
+// - Prunes when stats are present and below threshold
+// - Keeps when stats are present and above threshold
+// - Conservatively keeps when stats are null (IS NULL guard fires)
+#[rstest]
+#[case::stats_below_threshold(Scalar::from(50), FALSE, "max=50, col>100 should skip")]
+#[case::stats_above_threshold(Scalar::from(150), TRUE, "max=150, col>100 should keep")]
+#[case::stats_null(
+    Scalar::Null(DataType::INTEGER),
+    TRUE,
+    "null max should keep (IS NULL guard)"
+)]
+fn test_checkpoint_skipping_semantic(
+    #[case] max_val: Scalar,
+    #[case] expected: Option<bool>,
+    #[case] description: &str,
+) {
+    let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-
-    // All stats present, max = 50 (below threshold) → can skip
-    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), Scalar::from(50))]);
+    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), max_val)]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        FALSE,
-        "max=50, col>100 should allow skipping"
-    );
-
-    // All stats present, max = 150 (above threshold) → must keep
-    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), Scalar::from(150))]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        TRUE,
-        "max=150, col>100 should keep"
-    );
+    expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
 }
 
-// Verifies that the guarded predicate conservatively keeps when stats are null (missing).
+// Verifies that the IS NULL guard changes behavior compared to a regular data skipping predicate:
+// without the guard, null stats produce NULL (unknown); with the guard, they produce TRUE (keep).
 #[test]
-fn test_checkpoint_skipping_semantic_with_null_stats() {
-    let col = &column_expr!("x");
-    let pred = Pred::gt(col.clone(), Scalar::from(100));
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-
-    // Stats are explicitly null → IS NULL guard fires → must keep
+fn test_checkpoint_skipping_null_guard_vs_regular() {
+    let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
     let resolver =
         HashMap::from_iter([(column_name!("maxValues.x"), Scalar::Null(DataType::INTEGER))]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
+
+    let guarded = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
     expect_eq!(
-        filter.eval(&skipping_pred),
+        filter.eval(&guarded),
         TRUE,
-        "null maxValues.x should be kept (IS NULL guard)"
+        "guarded pred with null stats → TRUE (keep)"
     );
 
-    // Compare with regular data skipping predicate (no IS NULL guard) → returns NULL
-    let regular_pred = as_data_skipping_predicate(&pred).unwrap();
+    let regular = as_data_skipping_predicate(&pred).unwrap();
     expect_eq!(
-        filter.eval(&regular_pred),
+        filter.eval(&regular),
         NULL,
-        "regular pred with null maxValues.x returns NULL (no guard)"
+        "regular pred with null stats → NULL (unknown)"
     );
 }
 
