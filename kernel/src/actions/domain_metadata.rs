@@ -13,6 +13,7 @@ use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as
 use delta_kernel_derive::internal_api;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+use tracing::instrument;
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
@@ -48,6 +49,7 @@ pub(crate) fn all_domain_metadata_configuration(
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
 /// is provided. Note that this returns the latest domain metadata for each domain, accounting for
 /// tombstones (removed=true) - that is, removed domain metadatas will _never_ be returned.
+#[instrument(name = "domain_metadata.scan", skip_all, fields(domain = ?domain), err)]
 pub(crate) fn scan_domain_metadatas(
     log_segment: &LogSegment,
     domain: Option<&str>,

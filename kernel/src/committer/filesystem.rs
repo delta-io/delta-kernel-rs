@@ -3,6 +3,7 @@
 use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
 
 use super::commit_types::{CommitMetadata, CommitResponse};
+use super::publish_types::PublishMetadata;
 use super::Committer;
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
@@ -49,6 +50,21 @@ impl Committer for FileSystemCommitter {
             Err(e) => Err(e),
         }
     }
+
+    fn is_catalog_committer(&self) -> bool {
+        false
+    }
+
+    /// The FileSystemCommitter should never be invoked to publish catalog commits. If it is,
+    /// something has gone wrong upstream.
+    fn publish(&self, _engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
+        if !publish_metadata.commits_to_publish().is_empty() {
+            return Err(Error::generic(
+                "The FilesystemCommitter does not support publishing catalog commits.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -86,13 +102,13 @@ mod tests {
         // Try to commit a transaction with FileSystemCommitter
         let committer = Box::new(FileSystemCommitter::new());
         let err = snapshot
-            .transaction(committer)
+            .transaction(committer, &engine)
             .unwrap()
             .commit(&engine)
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
+            crate::Error::Generic(e) if e.contains("A catalog committer must be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
         ));
     }
 
