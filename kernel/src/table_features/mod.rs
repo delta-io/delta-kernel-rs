@@ -17,6 +17,8 @@ pub(crate) use column_mapping::{
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
+#[cfg(test)]
+mod feature_tests;
 mod timestamp_ntz;
 
 /// Minimum reader version for tables that use table features.
@@ -185,7 +187,7 @@ pub(crate) enum EnablementCheck {
 
 /// Represents the type of operation being performed on a table
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub(crate) enum Operation {
     /// Read operations on regular table data
     Scan,

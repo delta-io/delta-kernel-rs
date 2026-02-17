@@ -184,7 +184,11 @@ pub struct TableProperties {
     /// (bytes) or 100mb.
     pub tune_file_sizes_for_rewrites: Option<bool>,
 
-    /// 'classic' for classic Delta Lake checkpoints. 'v2' for v2 checkpoints.
+    /// Writer-side checkpoint policy (`delta.checkpointPolicy`). Controls what kind of
+    /// checkpoints writers produce (`classic` vs `v2`). Readers discover checkpoint format from
+    /// the checkpoint files themselves, not from this property.
+    ///
+    /// NOTE: This property comes from delta-spark and is not part of the Delta spec.
     pub checkpoint_policy: Option<CheckpointPolicy>,
 
     /// Whether to enable row tracking for the table.
@@ -293,7 +297,11 @@ pub enum IsolationLevel {
     SnapshotIsolation,
 }
 
-/// The checkpoint policy applied when writing checkpoints
+/// The checkpoint policy applied when writing checkpoints. This is a writer-side configuration;
+/// readers discover checkpoint format from the checkpoint files themselves (UUID-named vs classic,
+/// presence of checkpoint metadata and sidecars), not from this property.
+///
+/// NOTE: This property comes from delta-spark and is not part of the Delta spec.
 #[derive(Debug, EnumString, Default, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]
 pub enum CheckpointPolicy {

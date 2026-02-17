@@ -512,6 +512,39 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
     }
 
+    /// Column mapping mode=none: feature is supported (in protocol) but not enabled.
+    /// Requires a plain schema without CM annotations.
+    #[test]
+    fn test_column_mapping_mode_none_not_enabled() {
+        use std::collections::HashMap;
+
+        use url::Url;
+
+        use crate::actions::{Metadata, Protocol};
+        use crate::schema::{DataType, StructField, StructType};
+        use crate::table_configuration::TableConfiguration;
+        use crate::table_features::TableFeature;
+
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            std::sync::Arc::new(schema),
+            vec![],
+            0,
+            HashMap::from_iter([("delta.columnMapping.mode".to_string(), "none".to_string())]),
+        )
+        .unwrap();
+        let protocol =
+            Protocol::try_new(3, 7, Some(["columnMapping"]), Some(["columnMapping"])).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let feature = TableFeature::ColumnMapping;
+        assert!(tc.is_feature_supported(&feature));
+        assert!(!tc.is_feature_enabled(&feature));
+    }
+
     // =========================================================================
     // Tests for write-side column mapping functions
     // =========================================================================
