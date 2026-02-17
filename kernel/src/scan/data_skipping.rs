@@ -222,6 +222,43 @@ pub(crate) fn as_checkpoint_skipping_predicate(
     GuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
 }
 
+/// Maps an ordering and inversion flag to the corresponding comparison predicate.
+fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) -> Pred {
+    let pred_fn = match (ord, inverted) {
+        (Ordering::Less, false) => Pred::lt,
+        (Ordering::Less, true) => Pred::ge,
+        (Ordering::Equal, false) => Pred::eq,
+        (Ordering::Equal, true) => Pred::ne,
+        (Ordering::Greater, false) => Pred::gt,
+        (Ordering::Greater, true) => Pred::le,
+    };
+    pred_fn(col, val.clone())
+}
+
+/// Collects sub-predicates into a junction (AND/OR), replacing unsupported sub-predicates (None)
+/// with a single NULL literal to preserve correct three-valued logic. One NULL is enough to
+/// produce the correct behavior during predicate evaluation; additional NULLs are redundant.
+fn collect_junction_preds(
+    mut op: JunctionPredicateOp,
+    preds: &mut dyn Iterator<Item = Option<Pred>>,
+    inverted: bool,
+) -> Pred {
+    if inverted {
+        op = op.invert();
+    }
+    let mut keep_null = true;
+    let preds: Vec<_> = preds
+        .flat_map(|p| match p {
+            Some(pred) => Some(pred),
+            None => keep_null.then(|| {
+                keep_null = false;
+                Pred::null_literal()
+            }),
+        })
+        .collect();
+    Pred::junction(op, preds)
+}
+
 struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
@@ -260,15 +297,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        let pred_fn = match (ord, inverted) {
-            (Ordering::Less, false) => Pred::lt,
-            (Ordering::Less, true) => Pred::ge,
-            (Ordering::Equal, false) => Pred::eq,
-            (Ordering::Equal, true) => Pred::ne,
-            (Ordering::Greater, false) => Pred::gt,
-            (Ordering::Greater, true) => Pred::le,
-        };
-        Some(pred_fn(col, val.clone()))
+        Some(comparison_predicate(ord, col, val, inverted))
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
@@ -311,30 +340,11 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
 
     fn finish_eval_pred_junction(
         &self,
-        mut op: JunctionPredicateOp,
+        op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        if inverted {
-            op = op.invert();
-        }
-        // NOTE: We can potentially see a LOT of NULL inputs in a big WHERE clause with lots of
-        // unsupported data skipping operations. We can't "just" flatten them all away for AND,
-        // because that could produce TRUE where NULL would otherwise be expected. Similarly, we
-        // don't want to "just" try_collect inputs for OR, because that can cause OR to produce NULL
-        // where FALSE would otherwise be expected. So, we filter out all nulls except the first,
-        // observing that one NULL is enough to produce the correct behavior during predicate eval.
-        let mut keep_null = true;
-        let preds: Vec<_> = preds
-            .flat_map(|p| match p {
-                Some(pred) => Some(pred),
-                None => keep_null.then(|| {
-                    keep_null = false;
-                    Pred::null_literal()
-                }),
-            })
-            .collect();
-        Some(Pred::junction(op, preds))
+        Some(collect_junction_preds(op, preds, inverted))
     }
 }
 
@@ -409,15 +419,7 @@ impl DataSkippingPredicateEvaluator for GuardedDataSkippingPredicateCreator<'_> 
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        let pred_fn = match (ord, inverted) {
-            (Ordering::Less, false) => Pred::lt,
-            (Ordering::Less, true) => Pred::ge,
-            (Ordering::Equal, false) => Pred::eq,
-            (Ordering::Equal, true) => Pred::ne,
-            (Ordering::Greater, false) => Pred::gt,
-            (Ordering::Greater, true) => Pred::le,
-        };
-        let comparison = pred_fn(col.clone(), val.clone());
+        let comparison = comparison_predicate(ord, col.clone(), val, inverted);
         Some(Pred::or(Pred::is_null(col), comparison))
     }
 
@@ -496,23 +498,10 @@ impl DataSkippingPredicateEvaluator for GuardedDataSkippingPredicateCreator<'_> 
     /// ```
     fn finish_eval_pred_junction(
         &self,
-        mut op: JunctionPredicateOp,
+        op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        if inverted {
-            op = op.invert();
-        }
-        let mut keep_null = true;
-        let preds: Vec<_> = preds
-            .flat_map(|p| match p {
-                Some(pred) => Some(pred),
-                None => keep_null.then(|| {
-                    keep_null = false;
-                    Pred::null_literal()
-                }),
-            })
-            .collect();
-        Some(Pred::junction(op, preds))
+        Some(collect_junction_preds(op, preds, inverted))
     }
 }
