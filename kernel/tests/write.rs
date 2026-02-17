@@ -2974,8 +2974,13 @@ async fn test_write_parquet_translates_logical_partition_names(
         StructField::nullable("letter", DataType::STRING),
     ])?);
 
-    for (table_url, engine, _store, _table_name) in
-        setup_test_tables(schema.clone(), &["letter"], None, "test_partition_translate").await?
+    for (table_url, engine, _store, _table_name) in setup_test_tables(
+        schema.clone(),
+        &["letter"],
+        None,
+        "test_partition_translate",
+    )
+    .await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
@@ -3040,7 +3045,9 @@ async fn test_write_parquet_rejects_unknown_partition_column(
                 HashMap::from([("nonexistent".to_string(), "val".to_string())]),
             )
             .await;
-        let err = result.err().expect("write_parquet should fail with unknown partition column");
+        let err = result
+            .err()
+            .expect("write_parquet should fail with unknown partition column");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("Partition column 'nonexistent' not found in table schema"),
