@@ -1935,7 +1935,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{ColumnMetadataKey, MapType};
+    use crate::schema::{ArrayType, ColumnMetadataKey, MapType};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
@@ -2493,13 +2493,26 @@ mod tests {
             Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
 
         let schema = Arc::new(StructType::try_new(vec![
-            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("id", DataType::LONG, false),
             StructField::nullable("value", DataType::STRING),
+            StructField::nullable("score", DataType::DOUBLE),
+            StructField::nullable(
+                "address",
+                StructType::try_new(vec![
+                    StructField::new("street", DataType::STRING, false),
+                    StructField::nullable("city", DataType::STRING),
+                    StructField::nullable("zip", DataType::INTEGER),
+                ])?,
+            ),
+            StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
+            StructField::nullable(
+                "metadata",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
         ])?);
 
-        // Build the create-table transaction (pre-commit). Its snapshot already has
-        // column mapping metadata applied, so we can test get_write_context() directly.
-        let txn = create_table("memory:///test_table", schema, "test/1.0")
+        // Build the create-table transaction.
+        let txn = create_table("memory:///test_table", schema, "DefaultEngine")
             .with_table_properties([("delta.columnMapping.mode", mode_str)])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         Ok((engine, txn))
@@ -2564,7 +2577,7 @@ mod tests {
             assert_eq!(
                 physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
                 Some(&MetadataValue::String(expected_name.clone())),
-                "physicalName metadata mismatch for '{}'",
+                "columnMapping.physicalName mismatch for '{}'",
                 physical_field.name()
             );
 
