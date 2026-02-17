@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
+use crate::actions::{get_log_add_schema, schema_contains_file_actions, Sidecar, SIDECAR_NAME};
 use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -53,6 +53,15 @@ pub(crate) struct CheckpointReadInfo {
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
+}
+
+impl Default for CheckpointReadInfo {
+    fn default() -> Self {
+        Self {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        }
+    }
 }
 
 /// Result of reading actions from a log segment, containing both the actions iterator

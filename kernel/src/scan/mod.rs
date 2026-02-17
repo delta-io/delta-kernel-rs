@@ -22,8 +22,6 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
-use crate::parallel::parallel_phase::ParallelPhase;
-use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -40,9 +38,6 @@ pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
-
-// Re-export types for public API
-pub use log_replay::ScanLogReplayProcessor;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -78,31 +73,10 @@ static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-/// Type alias for the sequential (Phase 1) scan metadata processing.
-///
-/// This phase processes commits and single-part checkpoint manifests sequentially.
-/// After exhaustion, call `finish()` to get the result which indicates whether
-/// a distributed phase is needed.
-#[internal_api]
 #[allow(unused)]
-pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
-
-/// Type alias for the distributed (Phase 2) scan metadata processing.
-///
-/// This phase processes checkpoint sidecars or multi-part checkpoint parts in parallel.
-/// Create this phase from the files contained in [`AfterPhase1ScanMetadata::Parallel`].
-#[internal_api]
-#[allow(unused)]
-pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
-
-/// Type alias for the result after Phase 1 scan metadata processing completes.
-///
-/// This enum indicates whether distributed processing is needed:
-/// - `Done`: All processing completed sequentially - no distributed phase needed.
-/// - `Parallel`: Contains processor and files for parallel processing.
-#[internal_api]
-#[allow(unused)]
-pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
+pub use crate::parallel::scan_metadata::{
+    AfterPhase1 as AfterPhase1ScanMetadata, Phase1ScanMetadata, Phase2ScanMetadata, Phase2State,
+};
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -842,17 +816,15 @@ impl Scan {
     ///
     /// // Check if distributed phase is needed
     /// match phase1.finish()? {
-    ///     AfterPhase1ScanMetadata::Done(_) => {
+    ///     AfterPhase1ScanMetadata::Done => {
     ///         // All processing complete
     ///     }
-    ///     AfterPhase1ScanMetadata::Parallel { processor, files } => {
-    ///         // Wrap processor in Arc for sharing across threads
-    ///         let processor = Arc::new(processor);
+    ///     AfterPhase1ScanMetadata::Phase2 { state, files } => {
     ///         // Distribute files for parallel processing (e.g., one file per worker)
     ///         for file in files {
     ///             let phase2 = Phase2ScanMetadata::try_new(
     ///                 engine.clone(),
-    ///                 processor.clone(),
+    ///                 &state,
     ///                 vec![file],
     ///             )?;
     ///             for result in phase2 {
@@ -864,15 +836,18 @@ impl Scan {
     /// }
     /// # Ok(())
     /// # }
-    #[internal_api]
     #[allow(unused)]
-    pub(crate) fn parallel_scan_metadata(
+    pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
+
+        use crate::parallel::sequential_phase::SequentialPhase;
+        use crate::scan::log_replay::ScanLogReplayProcessor;
+
         let checkpoint_read_schema = if self.skip_stats {
             CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
         } else {
@@ -888,7 +863,9 @@ impl Scan {
             checkpoint_info,
             self.skip_stats,
         )?;
-        SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
+        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+
+        Ok(Phase1ScanMetadata::new(sequential))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

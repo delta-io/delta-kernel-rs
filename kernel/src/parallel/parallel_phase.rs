@@ -128,7 +128,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
-    use crate::parallel::sequential_phase::AfterSequential;
+    use crate::parallel::scan_metadata::AfterPhase1;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -408,22 +408,18 @@ mod tests {
         })?;
 
         match phase1.finish()? {
-            AfterSequential::Done(_) => {}
-            AfterSequential::Parallel { processor, files } => {
+            AfterPhase1::Done => {}
+            AfterPhase1::Phase2 { state, files } => {
+                use crate::parallel::scan_metadata::{Phase2ScanMetadata, Phase2State};
+
                 let processor = if with_serde {
-                    // TODO: Properly integrate checkpoint_info from parallel_scan_metadata API
-                    // For now, use a default checkpoint_info for serialization tests
-                    let checkpoint_info = CheckpointReadInfo {
-                        has_stats_parsed: false,
-                        checkpoint_read_schema: get_log_add_schema().clone(),
-                    };
-                    let serialized_state = processor.into_serializable_state(checkpoint_info)?;
-                    ScanLogReplayProcessor::from_serializable_state(
-                        engine.as_ref(),
-                        serialized_state,
-                    )?
+                    // Serialize and then deserialize to test the serde path
+                    let serialized_bytes = state.into_bytes()?;
+                    let deserialized_state = Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?;
+                    deserialized_state.processor().clone()
                 } else {
-                    Arc::new(processor)
+                    // Non-serde: just extract the processor directly
+                    state.processor().clone()
                 };
 
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
@@ -440,13 +436,14 @@ mod tests {
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
-                            let mut parallel = ParallelPhase::try_new(
+
+                            let mut phase2 = Phase2ScanMetadata::from_processor(
                                 engine.clone(),
-                                processor.clone(),
+                                processor,
                                 partition_files,
                             )?;
 
-                            parallel.try_fold(Vec::new(), |acc, metadata_res| {
+                            phase2.try_fold(Vec::new(), |acc, metadata_res| {
                                 metadata_res?.visit_scan_files(
                                     acc,
                                     |ps: &mut Vec<String>, scan_file| {
