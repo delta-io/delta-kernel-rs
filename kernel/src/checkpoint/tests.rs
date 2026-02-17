@@ -19,7 +19,7 @@ use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
-use crate::transaction::CommitResult;
+use crate::transaction::{create_table::create_table, CommitResult};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
@@ -777,35 +777,6 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     let table_url = Url::from_directory_path(table_path).unwrap();
     std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
 
-    // TODO(#1844): Replace with `create_table` once it supports v2 checkpoints.
-    let commit0 = [
-        json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": ["v2Checkpoint"],
-                "writerFeatures": ["v2Checkpoint"]
-            }
-        }),
-        json!({
-            "metaData": {
-                "id": "test-table-id",
-                "format": { "provider": "parquet", "options": {} },
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 1587968585495i64
-            }
-        }),
-    ]
-    .map(|j| j.to_string())
-    .join("\n");
-    std::fs::write(
-        table_path.join("_delta_log/00000000000000000000.json"),
-        commit0,
-    )
-    .unwrap();
-
     let store = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -813,6 +784,15 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     let engine = DefaultEngineBuilder::new(store.clone())
         .with_task_executor(executor)
         .build();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        crate::DataType::INTEGER,
+    )])?);
+    let _ = create_table(table_url.path(), schema, "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?;
 
     // Commit an add action via the transaction API so the checkpoint has action + metadata batches
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
