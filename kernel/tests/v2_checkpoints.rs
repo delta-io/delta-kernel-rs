@@ -1,13 +1,23 @@
-use delta_kernel::arrow::array::RecordBatch;
+use std::collections::HashMap;
+use std::sync::Arc;
 
+use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
 
-use test_utils::load_test_data;
-
 use itertools::Itertools;
-use test_utils::read_scan;
+use object_store::local::LocalFileSystem;
+use test_utils::{load_test_data, read_scan};
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
@@ -221,4 +231,74 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
         "v2-checkpoints-parquet-with-last-checkpoint",
         get_simple_id_table(),
     )
+}
+
+/// Tests that writing a V2 checkpoint to parquet succeeds.
+///
+/// V2 checkpoints include a checkpointMetadata batch in addition to the regular action
+/// batches. All batches in a parquet file must share the same schema. This test verifies
+/// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
+    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let table_path = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(executor)
+            .build(),
+    );
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Commit an add action via the transaction API so the checkpoint has action + metadata batches
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("INSERT".to_string())
+        .with_engine_info("Test/1.0")
+        .with_data_change(true);
+    let write_context = Arc::new(txn.get_write_context());
+    let arrow_schema: ArrowSchema = write_context.physical_schema().as_ref().try_into_arrow()?;
+    let data = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_files_metadata);
+    let result = txn.commit(engine.as_ref())?;
+    assert!(matches!(result, CommitResult::CommittedTransaction(_)));
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    // This writes to parquet — will fail if the checkpointMetadata batch has a different
+    // schema than the action batches.
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Verify the checkpoint was written and is readable
+    let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot2.version(), 1);
+
+    Ok(())
 }
