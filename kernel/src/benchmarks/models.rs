@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 // ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReadConfig {
     pub name: String,
     pub parallel_scan: ParallelScan,
@@ -30,7 +30,7 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
     ]
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ParallelScan {
     Disabled,
     Enabled { num_threads: usize },
@@ -62,7 +62,7 @@ impl Spec {
 }
 
 //For Read specs, we will either run a read data operation or a read metadata operation
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ReadOperation {
     ReadData,
     ReadMetadata,
@@ -82,7 +82,7 @@ impl ReadOperation {
 // Created from JSON with table_info, case_name, and spec populated
 // with_read_operation and with_config are used to set the operation and config
 // validate is then used to ensure that the workload spec variant is ready to run
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorkloadSpecVariant {
     pub table_info: TableInfo,
     pub case_name: String, //Name of the spec JSON file
