@@ -129,7 +129,7 @@ struct StorageEventTypeVisitor {
     typ: StorageEventType,
     num_files: u64,
     bytes_read: u64,
-    duration: u64,
+    duration: u128,
 }
 
 impl tracing::field::Visit for StorageEventTypeVisitor {
@@ -148,6 +148,12 @@ impl tracing::field::Visit for StorageEventTypeVisitor {
         match field.name() {
             "num_files" => self.num_files = value,
             "bytes_read" => self.bytes_read = value,
+            _ => {}
+        }
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        match field.name() {
             "duration" => self.duration = value,
             _ => {}
         }
@@ -193,14 +199,14 @@ where
                 match storage_visitor.typ {
                     StorageEventType::None => None,
                     StorageEventType::Copy => Some(MetricEvent::StorageCopyCompleted {
-                        duration: std::time::Duration::from_millis(storage_visitor.duration),
+                        duration: std::time::Duration::from_nanos_u128(storage_visitor.duration),
                     }),
                     StorageEventType::List => Some(MetricEvent::StorageListCompleted {
-                        duration: std::time::Duration::from_millis(storage_visitor.duration),
+                        duration: std::time::Duration::from_nanos_u128(storage_visitor.duration),
                         num_files: storage_visitor.num_files,
                     }),
                     StorageEventType::Read => Some(MetricEvent::StorageReadCompleted {
-                        duration: std::time::Duration::from_millis(storage_visitor.duration),
+                        duration: std::time::Duration::from_nanos_u128(storage_visitor.duration),
                         num_files: storage_visitor.num_files,
                         bytes_read: storage_visitor.bytes_read,
                     }),

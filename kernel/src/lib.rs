@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -152,6 +153,10 @@ pub(crate) mod listed_log_files;
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
+
+// Benchmarking infrastructure (only public for benchmarks and tests)
+#[cfg(any(test, feature = "internal-api"))]
+pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
