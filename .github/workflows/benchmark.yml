@@ -1,0 +1,20 @@
+name: benchmark pull requests
+
+on: [pull_request]
+
+jobs:
+  runBenchmark:
+    name: run benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimal stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - uses: boa-dev/criterion-compare-action@v3
+        with:
+          cwd: kernel
+          package: delta_kernel
+          benchName: workload_bench
+          features: default-engine-rustls,internal-api
+          branchName: ${{ github.base_ref }}
