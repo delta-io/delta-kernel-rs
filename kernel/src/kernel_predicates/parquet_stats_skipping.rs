@@ -1,11 +1,13 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
 use crate::expressions::{
-    BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+    column_name, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
+    OpaquePredicateOpRef, Predicate, Scalar,
 };
 use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests;
@@ -77,6 +79,129 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
             false => Scalar::from(0i64),       // no-null
         };
         Some(self.get_nullcount_stat(col)? != safe_to_skip)
+    }
+
+    fn eval_pred_binary_scalars(
+        &self,
+        op: BinaryPredicateOp,
+        left: &Scalar,
+        right: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+    }
+
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expression],
+        inverted: bool,
+    ) -> Option<bool> {
+        op.eval_as_data_skipping_predicate(self, exprs, inverted)
+    }
+
+    fn finish_eval_pred_junction(
+        &self,
+        op: JunctionPredicateOp,
+        preds: &mut dyn Iterator<Item = Option<bool>>,
+        inverted: bool,
+    ) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::finish_eval_pred_junction(op, preds, inverted)
+    }
+}
+
+/// A data skipping filter for checkpoint/sidecar metadata pruning over `add.stats_parsed`.
+///
+/// It evaluates the original predicate with direct data-skipping semantics, resolving column
+/// `x` as:
+/// - min-stat: footer min of `add.stats_parsed.minValues.x`
+/// - max-stat: footer max of `add.stats_parsed.maxValues.x`
+///
+/// To prevent unsound pruning when nested stat entries are NULL/missing, min/max are only exposed
+/// if parquet footer nullcount for the nested stat column exists and is exactly 0.
+pub(crate) struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
+    inner: T,
+    min_stats: HashMap<ColumnName, ColumnName>,
+    max_stats: HashMap<ColumnName, ColumnName>,
+}
+
+impl<T: ParquetStatsProvider> CheckpointMetaSkippingFilter<T> {
+    pub(crate) fn new(inner: T, predicate: &Predicate) -> Self {
+        let refs = predicate.references();
+        let min_prefix = column_name!("add.stats_parsed.minValues");
+        let max_prefix = column_name!("add.stats_parsed.maxValues");
+
+        Self {
+            inner,
+            min_stats: refs
+                .iter()
+                .map(|col| ((*col).clone(), min_prefix.join(col)))
+                .collect(),
+            max_stats: refs
+                .iter()
+                .map(|col| ((*col).clone(), max_prefix.join(col)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn apply(inner: T, predicate: &Predicate) -> bool {
+        use crate::kernel_predicates::KernelPredicateEvaluator as _;
+        CheckpointMetaSkippingFilter::new(inner, predicate).eval_sql_where(predicate) != Some(false)
+    }
+}
+
+impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for CheckpointMetaSkippingFilter<T> {
+    type Output = bool;
+    type ColumnStat = Scalar;
+
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        let nested_col = self.min_stats.get(col)?;
+        match self.inner.get_parquet_nullcount_stat(nested_col) {
+            Some(0) => self.inner.get_parquet_min_stat(nested_col, data_type),
+            _ => None, // Can't prove the min-stat is present for all files
+        }
+    }
+
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        let nested_col = self.max_stats.get(col)?;
+        match self.inner.get_parquet_nullcount_stat(nested_col) {
+            Some(0) => self.inner.get_parquet_max_stat(nested_col, data_type),
+            _ => None, // Can't prove the max-stat is present for all files
+        }
+    }
+
+    // Delta nullcount semantics are not safely derivable from checkpoint footer stats.
+    fn get_nullcount_stat(&self, _col: &ColumnName) -> Option<Scalar> {
+        None
+    }
+
+    // Delta rowcount semantics are not safely derivable from checkpoint footer stats.
+    fn get_rowcount_stat(&self) -> Option<Scalar> {
+        None
+    }
+
+    fn eval_partial_cmp(
+        &self,
+        ord: std::cmp::Ordering,
+        col: Scalar,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
+    }
+
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
+    }
+
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
+    }
+
+    // Delta IS [NOT] NULL semantics rely on file-level nullcount/rowcount stats, which are not
+    // safely derivable from checkpoint footer stats.
+    fn eval_pred_is_null(&self, _col: &ColumnName, _inverted: bool) -> Option<bool> {
+        None
     }
 
     fn eval_pred_binary_scalars(

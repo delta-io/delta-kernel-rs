@@ -1,22 +1,18 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
 use crate::engine::arrow_utils::RowIndexBuilder;
-use crate::expressions::{
-    BinaryPredicateOp, ColumnName, DecimalData, Expression, JunctionPredicateOp,
-    OpaquePredicateOpRef, Predicate, Scalar,
+use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
+use crate::kernel_predicates::parquet_stats_skipping::{
+    CheckpointMetaSkippingFilter, ParquetStatsProvider,
 };
-use crate::kernel_predicates::{
-    parquet_stats_skipping::ParquetStatsProvider, DataSkippingPredicateEvaluator,
-    KernelPredicateEvaluator as _, KernelPredicateEvaluatorDefaults,
-};
+use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
-use crate::schema::column_name;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
 use crate::FilePredicate;
 use chrono::{DateTime, Days};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::debug;
 
 #[cfg(test)]
@@ -58,7 +54,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .filter_map(|(ordinal, row_group)| {
                 // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
                 if has_checkpoint_stats_layout(row_group) {
-                    CheckpointStatsRowGroupFilter::apply(row_group, predicate).then_some(ordinal)
+                    apply_checkpoint_meta_skipping_filter(row_group, predicate).then_some(ordinal)
                 } else {
                     RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
                 }
@@ -88,6 +84,15 @@ fn has_checkpoint_stats_layout(row_group: &RowGroupMetaData) -> bool {
         let parts = col.path().parts();
         parts.len() >= 3 && parts[0] == "add" && parts[1] == "stats_parsed"
     })
+}
+
+// Convenience wrapper since unit tests add a lot of call sites
+fn apply_checkpoint_meta_skipping_filter(
+    row_group: &RowGroupMetaData,
+    predicate: &Predicate,
+) -> bool {
+    let inner = RowGroupFilter::new(row_group, predicate);
+    CheckpointMetaSkippingFilter::apply(inner, predicate)
 }
 
 /// A ParquetStatsSkippingFilter for row group skipping. It obtains stats from a parquet
@@ -135,148 +140,6 @@ impl<'a> RowGroupFilter<'a> {
         let timestamp = DateTime::UNIX_EPOCH.checked_add_days(Days::new(days))?;
         let timestamp = timestamp.signed_duration_since(DateTime::UNIX_EPOCH);
         Some(Scalar::TimestampNtz(timestamp.num_microseconds()?))
-    }
-}
-
-/// A row-group filter for checkpoint/sidecar metadata pruning over `add.stats_parsed`.
-///
-/// It evaluates the original predicate with direct data-skipping semantics, resolving column
-/// `x` as:
-/// - min-stat: footer min of `add.stats_parsed.minValues.x`
-/// - max-stat: footer max of `add.stats_parsed.maxValues.x`
-///
-/// To prevent unsound pruning when nested stat entries are NULL/missing, min/max are only exposed
-/// if parquet footer nullcount for the nested stat column exists and is exactly 0.
-struct CheckpointStatsRowGroupFilter<'a> {
-    inner: RowGroupFilter<'a>,
-    min_stats: HashMap<ColumnName, ColumnName>,
-    max_stats: HashMap<ColumnName, ColumnName>,
-}
-
-impl<'a> CheckpointStatsRowGroupFilter<'a> {
-    fn new(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> Self {
-        let refs = predicate.references();
-        let min_prefix = column_name!("add.stats_parsed.minValues");
-        let max_prefix = column_name!("add.stats_parsed.maxValues");
-
-        // Build lookup map over nested stats columns actually needed by the predicate.
-        let requested_columns: HashSet<ColumnName> = refs
-            .iter()
-            .flat_map(|col| [min_prefix.join(col), max_prefix.join(col)])
-            .collect();
-        let field_indices = row_group
-            .schema_descr()
-            .columns()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| {
-                let path = ColumnName::new(f.path().parts());
-                requested_columns.contains(&path).then_some((path, i))
-            })
-            .collect();
-
-        Self {
-            inner: RowGroupFilter {
-                row_group,
-                field_indices,
-            },
-            min_stats: refs
-                .iter()
-                .map(|col| ((*col).clone(), min_prefix.join(col)))
-                .collect(),
-            max_stats: refs
-                .iter()
-                .map(|col| ((*col).clone(), max_prefix.join(col)))
-                .collect(),
-        }
-    }
-
-    fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
-        CheckpointStatsRowGroupFilter::new(row_group, predicate).eval_sql_where(predicate)
-            != Some(false)
-    }
-}
-
-impl DataSkippingPredicateEvaluator for CheckpointStatsRowGroupFilter<'_> {
-    type Output = bool;
-    type ColumnStat = Scalar;
-
-    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        let nested_col = self.min_stats.get(col)?;
-        match self.inner.get_parquet_nullcount_stat(nested_col) {
-            Some(0) => self.inner.get_parquet_min_stat(nested_col, data_type),
-            _ => None, // Can't prove the min-stat is present for all files
-        }
-    }
-
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        let nested_col = self.max_stats.get(col)?;
-        match self.inner.get_parquet_nullcount_stat(nested_col) {
-            Some(0) => self.inner.get_parquet_max_stat(nested_col, data_type),
-            _ => None, // Can't prove the max-stat is present for all files
-        }
-    }
-
-    // Delta nullcount semantics are not safely derivable from checkpoint footer stats.
-    fn get_nullcount_stat(&self, _col: &ColumnName) -> Option<Scalar> {
-        None
-    }
-
-    // Delta rowcount semantics are not safely derivable from checkpoint footer stats.
-    fn get_rowcount_stat(&self) -> Option<Scalar> {
-        None
-    }
-
-    fn eval_partial_cmp(
-        &self,
-        ord: std::cmp::Ordering,
-        col: Scalar,
-        val: &Scalar,
-        inverted: bool,
-    ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
-    }
-
-    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
-    }
-
-    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
-    }
-
-    // Delta IS [NOT] NULL semantics rely on file-level nullcount/rowcount stats, which are not
-    // safely derivable from checkpoint footer stats.
-    fn eval_pred_is_null(&self, _col: &ColumnName, _inverted: bool) -> Option<bool> {
-        None
-    }
-
-    fn eval_pred_binary_scalars(
-        &self,
-        op: BinaryPredicateOp,
-        left: &Scalar,
-        right: &Scalar,
-        inverted: bool,
-    ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
-    }
-
-    fn eval_pred_opaque(
-        &self,
-        op: &OpaquePredicateOpRef,
-        exprs: &[Expression],
-        inverted: bool,
-    ) -> Option<bool> {
-        op.eval_as_data_skipping_predicate(self, exprs, inverted)
-    }
-
-    fn finish_eval_pred_junction(
-        &self,
-        op: JunctionPredicateOp,
-        preds: &mut dyn Iterator<Item = Option<bool>>,
-        inverted: bool,
-    ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::finish_eval_pred_junction(op, preds, inverted)
     }
 }
 
