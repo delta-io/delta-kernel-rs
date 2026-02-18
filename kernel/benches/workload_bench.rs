@@ -38,7 +38,7 @@ fn workload_benchmarks(c: &mut Criterion) {
         match &spec_variant.spec {
             Spec::Read { .. } => {
                 for operation in [ReadOperation::ReadMetadata] {
-                    let configs = choose_config(&spec_variant.table_info);
+                    let configs = choose_config();
                     for config in configs {
                         let variant = spec_variant
                             .clone()
@@ -69,8 +69,9 @@ fn run_benchmark(
     });
 }
 
-fn choose_config(table_info: &TableInfo) -> Vec<ReadConfig> {
+fn choose_config() -> Vec<ReadConfig> {
     //Choose which benchmark configurations to run for a given table
+    //This function will take in table info to return the appropriate configs
     default_read_configs()
 }
 
