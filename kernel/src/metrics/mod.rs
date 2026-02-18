@@ -1,8 +1,8 @@
 //! Metrics collection for Delta Kernel operations.
 //!
 //! This module provides metrics tracking for various Delta operations including
-//! snapshot creation, scans, and transactions. Metrics are collected during operations
-//! and reported as events via the `MetricsReporter` trait.
+//! snapshot creation, scans, transactions, and checkpoint writes. Metrics are collected
+//! during operations and reported as events via the `MetricsReporter` trait.
 //!
 //! Each operation (Snapshot, Transaction, Scan) is assigned a unique operation ID ([`MetricId`])
 //! when it starts, and all subsequent events for that operation reference this ID.
