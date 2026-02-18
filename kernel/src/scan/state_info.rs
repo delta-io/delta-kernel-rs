@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
@@ -28,9 +29,13 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
-    /// The stats schema for data skipping (built from predicate columns).
+    /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
-    pub(crate) stats_schema: Option<SchemaRef>,
+    pub(crate) physical_stats_schema: Option<SchemaRef>,
+    /// Logical stats schema for the file statistics. When `stats_columns` is requested,
+    /// the engine receives stats with physical column names (for column mapping). This
+    /// logical schema maps those stats back to the table's logical column names.
+    pub(crate) logical_stats_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -104,11 +109,13 @@ impl StateInfo {
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
+    /// `stats_columns` - Optional list of columns to include in parsed stats output
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
+        stats_columns: Option<Vec<ColumnName>>,
         classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.metadata().partition_columns();
@@ -207,11 +214,38 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build stats schema from predicate columns for data skipping
-        let stats_schema = match &physical_predicate {
-            PhysicalPredicate::Some(_, schema) => build_stats_schema(schema),
-            _ => None,
-        };
+        // Build stats schemas:
+        // - From stats_columns if specified (for outputting stats to the engine)
+        // - From predicate columns otherwise (for data skipping only, no logical schema needed)
+        // When both stats_columns and a predicate are provided, we use expected_stats_schema
+        // (which is a superset of the predicate-derived schema) so the engine receives all
+        // stats AND the DataSkippingFilter can still perform data skipping.
+        let (physical_stats_schema, logical_stats_schema) =
+            match (&stats_columns, &physical_predicate) {
+                // stats_columns = Some([]) means output all stats from expected_stats_schema.
+                // This works both with and without a predicate — the DataSkippingFilter
+                // reads stats_parsed from the transformed batch, which uses this schema.
+                (Some(columns), _) if columns.is_empty() => {
+                    let expected_stats_schemas =
+                        table_configuration.build_expected_stats_schemas(None)?;
+                    (
+                        Some(expected_stats_schemas.physical),
+                        Some(expected_stats_schemas.logical),
+                    )
+                }
+                // Non-empty stats_columns list not supported yet
+                (Some(_), _) => {
+                    return Err(Error::generic(
+                        "Only empty stats_columns is supported (outputs all stats). \
+                         Specifying specific columns is not yet implemented.",
+                    ));
+                }
+                // No stats_columns, but has predicate - use predicate columns for data skipping
+                // (no logical stats schema needed for internal data skipping)
+                (None, PhysicalPredicate::Some(_, schema)) => (build_stats_schema(schema), None),
+                // No stats_columns and no predicate
+                (None, _) => (None, None),
+            };
 
         let transform_spec =
             if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
@@ -226,7 +260,8 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
-            stats_schema,
+            physical_stats_schema,
+            logical_stats_schema,
         })
     }
 }
@@ -238,7 +273,7 @@ pub(crate) mod tests {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::expressions::{column_expr, Expression as Expr};
+    use crate::expressions::{column_expr, column_name, ColumnName, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -250,41 +285,43 @@ pub(crate) mod tests {
         schema: SchemaRef,
         partition_columns: Vec<String>,
     ) -> DeltaResult<StateInfo> {
-        get_state_info(schema, partition_columns, None, HashMap::new(), vec![])
+        get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
+    /// When features are non-empty, uses protocol (3,7) with explicit feature lists.
+    /// When features are empty, uses legacy protocol (2,5).
     pub(crate) fn get_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
+        features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
     ) -> DeltaResult<StateInfo> {
-        get_state_info_with_features(
+        get_state_info_with_stats(
             schema,
             partition_columns,
             predicate,
+            features,
             metadata_configuration,
             metadata_cols,
-            &[],
+            None,
         )
     }
 
-    /// Like `get_state_info`, but also includes the given table features in the protocol.
-    /// When features are non-empty, uses protocol (3,7) with explicit feature lists.
-    /// When features are empty, uses legacy protocol (2,5).
-    pub(crate) fn get_state_info_with_features(
+    pub(crate) fn get_state_info_with_stats(
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
+        features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-        features: &[TableFeature],
+        stats_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<StateInfo> {
         let metadata = Metadata::try_new(
             None,
             None,
-            schema.as_ref().clone(),
+            schema.clone(),
             partition_columns,
             10,
             metadata_configuration,
@@ -321,7 +358,13 @@ pub(crate) mod tests {
             );
         }
 
-        StateInfo::try_new(schema.clone(), &table_configuration, predicate, ())
+        StateInfo::try_new(
+            schema.clone(),
+            &table_configuration,
+            predicate,
+            stats_columns,
+            (),
+        )
     }
 
     pub(crate) fn assert_transform_spec(
@@ -480,6 +523,7 @@ pub(crate) mod tests {
             schema.clone(),
             vec![], // no partition columns
             Some(predicate),
+            &[],            // no table features
             HashMap::new(), // no extra metadata
             vec![],         // no metadata
         )
@@ -539,10 +583,11 @@ pub(crate) mod tests {
             DataType::STRING,
         )]));
 
-        let state_info = get_state_info_with_features(
+        let state_info = get_state_info(
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
@@ -555,7 +600,6 @@ pub(crate) mod tests {
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
-            ROW_TRACKING_FEATURES,
         )
         .unwrap();
 
@@ -576,10 +620,11 @@ pub(crate) mod tests {
             DataType::STRING,
         )]));
 
-        let state_info = get_state_info_with_features(
+        let state_info = get_state_info(
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
@@ -592,7 +637,6 @@ pub(crate) mod tests {
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
-            ROW_TRACKING_FEATURES,
         )
         .unwrap();
 
@@ -613,10 +657,11 @@ pub(crate) mod tests {
             DataType::STRING,
         )]));
 
-        let state_info = get_state_info_with_features(
+        let state_info = get_state_info(
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
@@ -632,7 +677,6 @@ pub(crate) mod tests {
                 ("row_id", MetadataColumnSpec::RowId),
                 ("row_index", MetadataColumnSpec::RowIndex),
             ],
-            ROW_TRACKING_FEATURES,
         )
         .unwrap();
 
@@ -658,19 +702,20 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
+            &[], // no table features
             HashMap::new(),
             vec![("row_id", MetadataColumnSpec::RowId)],
         );
         assert_result_error_with_message(res, "Unsupported: Row ids are not enabled on this table");
 
         // Row tracking enabled but missing materializedRowIdColumnName → error
-        let res = get_state_info_with_features(
+        let res = get_state_info(
             schema,
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[("delta.enableRowTracking", "true")]),
             vec![("row_id", MetadataColumnSpec::RowId)],
-            ROW_TRACKING_FEATURES,
         );
         assert_result_error_with_message(
             res,
@@ -688,6 +733,7 @@ pub(crate) mod tests {
             schema.clone(),
             vec!["part_col".to_string()],
             None,
+            &[], // no table features
             HashMap::new(),
             vec![("part_col", MetadataColumnSpec::RowId)],
         );
@@ -719,12 +765,73 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
+            &[], // no table features
             get_string_map(&[("delta.columnMapping.mode", "name")]),
             vec![("other", MetadataColumnSpec::RowIndex)],
         );
         assert_result_error_with_message(
             res,
             "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'"
+        );
+    }
+
+    #[test]
+    fn stats_columns_with_predicate() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            &[], // no table features
+            HashMap::new(),
+            vec![],
+            Some(vec![]), // empty stats_columns = include all stats
+        )
+        .unwrap();
+
+        // physical_stats_schema should be set (from expected_stats_schema)
+        assert!(
+            state_info.physical_stats_schema.is_some(),
+            "physical_stats_schema should be Some when stats_columns is set"
+        );
+        // logical_stats_schema should be set for mapping physical->logical column names
+        assert!(
+            state_info.logical_stats_schema.is_some(),
+            "logical_stats_schema should be Some when stats_columns is set"
+        );
+        // physical_predicate should still be active for data skipping
+        assert!(
+            matches!(state_info.physical_predicate, PhysicalPredicate::Some(..)),
+            "physical_predicate should be PhysicalPredicate::Some for data skipping"
+        );
+    }
+
+    #[test]
+    fn non_empty_stats_columns_errors() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let res = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[], // no table features
+            HashMap::new(),
+            vec![],
+            Some(vec![column_name!("value")]), // non-empty stats_columns not yet supported
+        );
+
+        assert_result_error_with_message(
+            res,
+            "Only empty stats_columns is supported (outputs all stats)",
         );
     }
 }

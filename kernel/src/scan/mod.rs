@@ -9,6 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -20,7 +21,7 @@ use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Sca
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, LogSegment};
+use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
@@ -92,6 +93,7 @@ pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    stats_columns: Option<Vec<ColumnName>>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -99,6 +101,7 @@ impl std::fmt::Debug for ScanBuilder {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
+            .field("stats_columns", &self.stats_columns)
             .finish()
     }
 }
@@ -110,6 +113,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            stats_columns: None,
         }
     }
 
@@ -142,8 +146,33 @@ impl ScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
+    ///
+    /// This method can be combined with [`include_stats_columns`]. When both are used, the kernel
+    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
+    /// engine via the `stats_parsed` column in scan metadata.
+    ///
+    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
+        self
+    }
+
+    /// Include all parsed statistics in scan metadata.
+    ///
+    /// When enabled, the scan will include a `stats_parsed` column in the scan metadata
+    /// containing pre-parsed file statistics (minValues, maxValues, nullCount, numRecords)
+    /// that integrations can use for their own data skipping logic.
+    ///
+    /// The statistics schema is determined by the table's configuration
+    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`).
+    ///
+    /// This method can be combined with [`with_predicate`]. When both are used, the kernel
+    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
+    /// engine via the `stats_parsed` column in scan metadata.
+    ///
+    /// [`with_predicate`]: ScanBuilder::with_predicate
+    pub fn include_stats_columns(mut self) -> Self {
+        self.stats_columns = Some(Vec::new());
         self
     }
 
@@ -165,7 +194,8 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            (), // No classifer, default is for scans
+            self.stats_columns,
+            (), // No classifier, default is for scans
         )?;
 
         Ok(Scan {
@@ -287,6 +317,19 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         self.logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
+    }
+}
+
+/// Prefixes all column references in a predicate with a fixed path.
+/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
+/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+struct PrefixColumns {
+    prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixColumns {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Owned(self.prefix.join(name)))
     }
 }
 
@@ -443,6 +486,21 @@ impl Scan {
         }
     }
 
+    /// Get the logical schema for file statistics.
+    ///
+    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
+    /// contains file statistics read using physical column names (to handle column mapping).
+    /// This method returns the corresponding logical schema that maps those physical column
+    /// names back to the table's logical column names, enabling engines to interpret the stats
+    /// correctly.
+    ///
+    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
+        self.state_info.logical_stats_schema.as_ref()
+    }
+
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:
@@ -466,8 +524,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        let result = self.replay_for_scan_metadata(engine)?;
-        self.scan_metadata_inner(engine, result.actions)
+        let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -542,14 +600,24 @@ impl Scan {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
 
+        let log_segment = self.snapshot.log_segment();
+
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Since we're only processing existing data (no checkpoint), we use the base schema
+        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
-            let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+                actions: existing_data.into_iter().map(apply_transform),
+                checkpoint_info: CheckpointReadInfo {
+                    has_stats_parsed: false,
+                    checkpoint_read_schema: restored_add_schema().clone(),
+                },
+            };
+            return Ok(Box::new(
+                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+            ));
         }
-
-        let log_segment = self.snapshot.log_segment();
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -576,29 +644,48 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
+        // For incremental reads, new_log_segment has no checkpoint but we use the
+        // checkpoint schema returned by the function for consistency.
+        let meta_predicate = self.build_actions_meta_predicate();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
-            None,
-            None,
+            meta_predicate,
+            self.state_info
+                .physical_stats_schema
+                .as_ref()
+                .map(|s| s.as_ref()),
         )?;
-        let it = result
-            .actions
-            .chain(existing_data.into_iter().map(apply_transform));
+        let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+            actions: result
+                .actions
+                .chain(existing_data.into_iter().map(apply_transform)),
+            checkpoint_info: result.checkpoint_info,
+        };
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            actions_with_checkpoint_info,
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
+            impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            actions_with_checkpoint_info.actions,
+            self.state_info.clone(),
+            actions_with_checkpoint_info.checkpoint_info,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -609,17 +696,51 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
-        // when ~every checkpoint file will contain the adds and removes we are looking for.
+        let meta_predicate = self.build_actions_meta_predicate();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
-                None,
-                self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
+                meta_predicate,
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
+    }
+
+    /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
+    ///
+    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
+    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
+    /// references are prefixed with `add.stats_parsed` to match the physical column layout
+    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
+    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
+    /// contain matching files.
+    ///
+    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
+    /// values. Without them, row groups containing files with missing stats (null stat columns)
+    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+            return None;
+        };
+        self.state_info.physical_stats_schema.as_ref()?;
+
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+
+        let mut prefixer = PrefixColumns {
+            prefix: ColumnName::new(["add", "stats_parsed"]),
+        };
+        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        Some(Arc::new(prefixed.into_owned()))
     }
 
     /// Start a parallel scan metadata processing for the table.
@@ -685,7 +806,15 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Phase1ScanMetadata> {
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone())?;
+        // For the sequential/parallel phase approach, we use a conservative checkpoint_info
+        // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
+        // currently support stats_parsed optimization.
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+        };
+        let processor =
+            ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone(), checkpoint_info)?;
         SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
     }
 

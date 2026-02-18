@@ -753,13 +753,14 @@ mod tests {
         let data = action_batch();
         let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
 
+        use crate::table_properties::{
+            COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+        };
+
         let configuration = HashMap::from_iter([
-            (
-                "delta.enableDeletionVectors".to_string(),
-                "true".to_string(),
-            ),
-            ("delta.columnMapping.mode".to_string(), "none".to_string()),
-            ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+            (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
+            (COLUMN_MAPPING_MODE.to_string(), "none".to_string()),
+            (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
         ]);
         let expected = Metadata {
             id: "testId".into(),

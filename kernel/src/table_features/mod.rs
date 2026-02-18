@@ -10,7 +10,10 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
-pub(crate) use column_mapping::column_mapping_mode;
+pub(crate) use column_mapping::{
+    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
+    get_top_level_column_physical_name,
+};
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
@@ -420,13 +423,15 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    #[cfg(feature = "clustered-table")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "clustered-table"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
