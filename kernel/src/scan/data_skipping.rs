@@ -196,24 +196,15 @@ impl DataSkippingFilter {
 /// Rewrites a predicate for parquet row group skipping in checkpoint/sidecar files.
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
-/// Similar to [`as_data_skipping_predicate`], but adds IS NULL guards on each stat column
-/// reference. This is necessary because parquet footer min/max statistics ignore null values:
-/// if a stat column (e.g., `maxValues.col_a`) is null for some files (meaning stats were not
-/// collected), the footer min/max won't reflect those files. The IS NULL guard ensures the
-/// row group filter conservatively keeps any row group containing files with missing stats.
-///
-/// For example, `col_a > 100` becomes:
+/// Adds IS NULL guards on each stat column reference so the parquet RowGroupFilter
+/// conservatively keeps row groups containing files with missing stats (null stat values
+/// are invisible to footer min/max). For example, `col_a > 100` becomes:
 /// ```text
 /// OR(maxValues.col_a IS NULL, maxValues.col_a > 100)
 /// ```
 ///
-/// At the parquet row group level:
-/// - If any file has null `maxValues.col_a` (null_count > 0): IS NULL is satisfiable, keep
-/// - If all files have non-null stats (null_count = 0): evaluate comparison using footer stats
-///
-/// Partition columns are excluded because their values live in `add.partitionValues_parsed`,
-/// not in `add.stats_parsed`. Predicates on partition columns would reference non-existent
-/// columns in the checkpoint and be ignored by the parquet reader.
+/// Partition columns are excluded since their values live in `add.partitionValues_parsed`,
+/// not `add.stats_parsed`.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     partition_columns: &[String],
@@ -348,10 +339,9 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     }
 }
 
-/// A data-skipping predicate creator that adds IS NULL guards on stat column references,
-/// making the output safe for parquet row group filtering where null stats are invisible
-/// to footer min/max statistics. Partition columns are excluded since their values are
-/// stored in `add.partitionValues_parsed`, not `add.stats_parsed`.
+/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references
+/// for safe parquet row group filtering. Partition columns are excluded (no stats in
+/// `stats_parsed`).
 struct NullGuardedDataSkippingPredicateCreator<'a> {
     partition_columns: HashSet<&'a str>,
 }
@@ -396,20 +386,15 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         DataSkippingPredicateCreator.get_rowcount_stat()
     }
 
-    /// Produces a comparison between a stat column and a literal, wrapped in an IS NULL guard.
-    /// The guard ensures that row groups containing files with missing stats (null stat values)
-    /// are not incorrectly pruned, since parquet footer min/max statistics ignore nulls.
+    /// Wraps a stat column comparison with an IS NULL guard.
     ///
-    /// Example: `col_a > 100` → `eval_partial_cmp(Greater, maxValues.col_a, 100, false)` →
-    /// ```text
-    /// OR(maxValues.col_a IS NULL, maxValues.col_a > 100)
-    /// ```
+    /// `col > 100` → `OR(maxValues.col IS NULL, maxValues.col > 100)`
     ///
-    /// Example: `col_a = 100` calls this twice (min and max):
+    /// `col = 100` (calls this twice, once per stat):
     /// ```text
     /// AND(
-    ///   OR(minValues.col_a IS NULL, minValues.col_a <= 100),
-    ///   OR(maxValues.col_a IS NULL, maxValues.col_a >= 100)
+    ///   OR(minValues.col IS NULL, minValues.col <= 100),
+    ///   OR(maxValues.col IS NULL, maxValues.col >= 100)
     /// )
     /// ```
     fn eval_partial_cmp(
@@ -423,40 +408,24 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         Some(Pred::or(Pred::is_null(col), comparison))
     }
 
-    /// Evaluates a scalar predicate (e.g., `TRUE`, `FALSE`). No guard needed since there
-    /// is no stat column reference.
-    ///
-    /// Example: `TRUE` → `Some(Pred::literal(true))`
+    /// No guard needed — no stat column reference. `TRUE` → `Some(true)`.
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Pred::literal)
     }
 
-    /// Evaluates `literal IS [NOT] NULL`. No guard needed since there is no stat column reference.
-    ///
-    /// Example: `NULL IS NULL` → `Some(Pred::literal(true))`
+    /// No guard needed — no stat column reference. `NULL IS NULL` → `Some(true)`.
     fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    /// Produces a nullCount-based check for IS [NOT] NULL, wrapped in an IS NULL guard on the
-    /// nullCount stat itself.
+    /// IS NULL guard on nullCount stat.
     ///
-    /// **IS NULL** (`col_a IS NULL`) →
-    /// ```text
-    /// OR(nullCount.col_a IS NULL, nullCount.col_a != 0)
-    /// ```
-    /// The comparison `nullCount.col_a != 0` is **column vs literal**, which the parquet
-    /// RowGroupFilter can evaluate using footer min/max stats for `nullCount.col_a`.
+    /// `IS NULL` → `OR(nullCount.col IS NULL, nullCount.col != 0)`:
+    /// column vs literal — RowGroupFilter can evaluate via footer stats.
     ///
-    /// **IS NOT NULL** (`col_a IS NOT NULL`) →
-    /// ```text
-    /// OR(nullCount.col_a IS NULL, nullCount.col_a != numRecords)
-    /// ```
-    /// The comparison `nullCount.col_a != numRecords` is **column vs column**. The parquet
-    /// RowGroupFilter can only resolve a single column to a scalar from footer stats, so it
-    /// cannot evaluate cross-column comparisons and conservatively keeps the row group. This
-    /// is safe (no false pruning) but means IS NOT NULL predicates do not enable row group
-    /// skipping at the checkpoint level.
+    /// `IS NOT NULL` → `OR(nullCount.col IS NULL, nullCount.col != numRecords)`:
+    /// column vs column — RowGroupFilter cannot evaluate (it resolves one column at a
+    /// time), so it conservatively keeps the row group. Safe but no pruning benefit.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let nullcount = self.get_nullcount_stat(col)?;
         let safe_to_skip = match inverted {
@@ -467,10 +436,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         Some(Pred::or(Pred::is_null(nullcount), comparison))
     }
 
-    /// Evaluates a comparison between two scalar literals. No guard needed since there are
-    /// no stat column references.
-    ///
-    /// Example: `5 < 10` → `Some(Pred::literal(true))`
+    /// No guard needed — no stat column reference. `5 < 10` → `Some(true)`.
     fn eval_pred_binary_scalars(
         &self,
         op: BinaryPredicateOp,
@@ -482,11 +448,9 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
             .map(Pred::literal)
     }
 
-    /// Delegates to the opaque predicate's own data skipping implementation, passing `self`
-    /// so that any recursive evaluations also use guarded comparisons.
-    /// Opaque predicates are not supported for checkpoint row group skipping. The double-layer
-    /// data skipping (our predicate generation + parquet RowGroupFilter) makes it difficult to
-    /// reason about correctness for arbitrary opaque predicates.
+    /// Unsupported. Opaque predicates can construct stat column references directly,
+    /// bypassing IS NULL guards and risking false pruning. Returns `None` to conservatively
+    /// drop these from the skipping predicate.
     fn eval_pred_opaque(
         &self,
         _op: &OpaquePredicateOpRef,
@@ -496,10 +460,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         None
     }
 
-    /// Combines sub-predicates with AND/OR. Unsupported sub-predicates (None) are replaced
-    /// with a single NULL literal to preserve correct three-valued logic.
-    ///
-    /// Example: `col_a > 100 AND col_b < 50` →
+    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` →
     /// ```text
     /// AND(
     ///   OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
