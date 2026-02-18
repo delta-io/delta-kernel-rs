@@ -1779,7 +1779,7 @@ mod test {
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_logical(None);
+        let column_names = config.stats_column_names_logical(None /* clustering_columns */);
 
         // Should return logical names, not physical names
         assert!(column_names.contains(&ColumnName::new(["col_a"])));
@@ -1794,7 +1794,7 @@ mod test {
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_physical(None);
+        let column_names = config.stats_column_names_physical(None /* clustering_columns */);
 
         // Should return physical names, not logical names
         assert_eq!(
