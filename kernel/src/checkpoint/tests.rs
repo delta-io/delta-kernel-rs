@@ -789,7 +789,11 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
         "value",
         crate::DataType::INTEGER,
     )])?);
-    let _ = create_table(table_url.path(), schema, "Test/1.0")
+    let parsed_table_path = table_path
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let _ = create_table(parsed_table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;
