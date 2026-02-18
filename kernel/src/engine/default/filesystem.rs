@@ -64,7 +64,7 @@ impl<I, T> MetricsIterator<I, T> {
             name = self.name,
             num_files = self.num_files,
             bytes_read = self.bytes_read,
-            duration = duration.as_nanos(),
+            duration = duration.as_nanos() as u64,
         ); // when this is dropped we emit
     }
 }
@@ -200,7 +200,7 @@ async fn list_from_impl(
             report = tracing::field::Empty,
             name = "list_completed",
             num_files = items.len() as u64,
-            duration = duration.as_nanos(),
+            duration = duration.as_nanos() as u64,
         );
         if let Some(r) = reporter {
             r.report(MetricEvent::StorageListCompleted {
@@ -297,7 +297,7 @@ async fn copy_atomic_impl(
         "storage",
         report = tracing::field::Empty,
         name = "copy_completed",
-        duration = duration.as_millis(),
+        duration = duration.as_nanos() as u64,
     );
 
     if let Some(r) = reporter {
