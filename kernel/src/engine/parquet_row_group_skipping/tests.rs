@@ -2,6 +2,7 @@ use super::*;
 use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::expressions::{column_expr, column_name, column_pred, Expression};
+use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::file::properties::WriterProperties;
@@ -591,24 +592,24 @@ fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
 
     let pred_gt = Predicate::gt(column_expr!("value"), Expression::literal(50i64));
     // GT relies on maxValues. With max missing in row group 0, pruning fails (group is kept).
-    assert!(CheckpointStatsRowGroupFilter::apply(
+    assert!(apply_checkpoint_meta_skipping_filter(
         metadata.metadata().row_group(0),
         &pred_gt
     ));
     // maxValues is complete in row group 1 and max=10 proves no row can satisfy value > 50.
-    assert!(!CheckpointStatsRowGroupFilter::apply(
+    assert!(!apply_checkpoint_meta_skipping_filter(
         metadata.metadata().row_group(1),
         &pred_gt
     ));
 
     let pred_lt = Predicate::lt(column_expr!("value"), Expression::literal(50i64));
     // LT relies on minValues. min=100 in row group 0 proves no row can satisfy value < 50.
-    assert!(!CheckpointStatsRowGroupFilter::apply(
+    assert!(!apply_checkpoint_meta_skipping_filter(
         metadata.metadata().row_group(0),
         &pred_lt
     ));
     // With min missing in row group 1, pruning fails (group is kept).
-    assert!(CheckpointStatsRowGroupFilter::apply(
+    assert!(apply_checkpoint_meta_skipping_filter(
         metadata.metadata().row_group(1),
         &pred_lt
     ));
