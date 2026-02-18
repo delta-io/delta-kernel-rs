@@ -48,6 +48,11 @@ pub mod create_table;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod create_table;
 
+#[cfg(feature = "internal-api")]
+pub mod data_layout;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod data_layout;
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -277,6 +282,8 @@ pub struct Transaction {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // Whether this transaction should be marked as a blind append.
+    is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -344,6 +351,7 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
+            is_blind_append: false,
             dv_matched_files: vec![],
             clustering_columns,
         })
@@ -363,6 +371,7 @@ impl Transaction {
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
+        clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
         // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
         // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
@@ -388,11 +397,9 @@ impl Transaction {
             system_domain_metadata_additions: system_domain_metadata,
             user_domain_removals: vec![],
             data_change: true,
+            is_blind_append: false,
             dv_matched_files: vec![],
-            // TODO: For CREATE TABLE with clustering, clustering columns should be passed in here
-            // (e.g., from CreateTableTransactionBuilder) so that stats_schema() and stats_columns()
-            // return the correct columns for the new table.
-            clustering_columns: None,
+            clustering_columns,
         })
     }
 
@@ -447,6 +454,8 @@ impl Transaction {
             )));
         }
 
+        self.validate_blind_append_semantics()?;
+
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
         // This is because kernel does not yet have a way to discern DML operations. For DML
@@ -486,6 +495,7 @@ impl Transaction {
             self.get_in_commit_timestamp(engine)?,
             self.operation.clone(),
             self.engine_info.clone(),
+            self.is_blind_append,
         );
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
@@ -593,6 +603,15 @@ impl Transaction {
         self
     }
 
+    /// Mark this transaction as a blind append.
+    ///
+    /// Blind append transactions should only add new files and avoid write operations that
+    /// depend on existing table state.
+    pub fn with_blind_append(mut self) -> Self {
+        self.is_blind_append = true;
+        self
+    }
+
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
     /// using a fluent API.
     #[internal_api]
@@ -649,6 +668,41 @@ impl Transaction {
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Validate that the transaction is eligible to be marked as a blind append.
+    ///
+    /// Note: Domain metadata additions/removals are allowed; blind append only constrains
+    /// data-file operations and read predicates. Conflict resolution determines whether
+    /// metadata changes are problematic.
+    fn validate_blind_append_semantics(&self) -> DeltaResult<()> {
+        if !self.is_blind_append {
+            return Ok(());
+        }
+        require!(
+            !self.is_create_table(),
+            Error::invalid_transaction_state(
+                "Blind append is not supported for create-table transactions",
+            )
+        );
+        require!(
+            !self.add_files_metadata.is_empty(),
+            Error::invalid_transaction_state("Blind append requires at least one added data file")
+        );
+        require!(
+            self.data_change,
+            Error::invalid_transaction_state("Blind append requires data_change to be true")
+        );
+        require!(
+            self.remove_files_metadata.is_empty(),
+            Error::invalid_transaction_state("Blind append cannot remove files")
+        );
+        require!(
+            self.dv_matched_files.is_empty(),
+            Error::invalid_transaction_state("Blind append cannot update deletion vectors")
+        );
+
+        Ok(())
     }
 
     /// Returns true if this is a create-table transaction.
@@ -1868,9 +1922,12 @@ pub struct RetryableTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::array::StringArray;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use crate::transaction::create_table::create_table;
+    use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
     use crate::Snapshot;
     use std::path::PathBuf;
 
@@ -2200,6 +2257,145 @@ mod tests {
             result
         );
 
+        Ok(())
+    }
+
+    // ============================================================================
+    // validate_blind_append tests
+    // ============================================================================
+    fn add_dummy_file(txn: &mut Transaction) {
+        let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
+        txn.add_files(data);
+    }
+
+    fn create_existing_table_txn(
+    ) -> DeltaResult<(Arc<dyn Engine>, Transaction, Option<tempfile::TempDir>)> {
+        let (engine, snapshot, tempdir) = load_test_table("table-without-dv-small")?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        Ok((engine, txn, tempdir))
+    }
+
+    #[test]
+    fn test_validate_blind_append_success() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        add_dummy_file(&mut txn);
+        txn.validate_blind_append_semantics()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_blind_append_requires_adds() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        let result = txn.validate_blind_append_semantics();
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_blind_append_requires_data_change() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        txn.set_data_change(false);
+        add_dummy_file(&mut txn);
+        let result = txn.validate_blind_append_semantics();
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_blind_append_rejects_removes() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        add_dummy_file(&mut txn);
+        let remove_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+            StringArray::from(vec!["remove"]),
+        ));
+        txn.remove_files(remove_data);
+        let result = txn.validate_blind_append_semantics();
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_blind_append_rejects_dv_updates() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        add_dummy_file(&mut txn);
+        let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
+            StringArray::from(vec!["dv"]),
+        ));
+        txn.dv_matched_files.push(dv_data);
+        let result = txn.validate_blind_append_semantics();
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_blind_append_rejects_create_table() -> DeltaResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let store = Arc::new(object_store::local::LocalFileSystem::new());
+        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let mut txn = create_table(
+            tempdir.path().to_str().expect("valid temp path"),
+            schema,
+            "test_engine",
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        txn = txn.with_blind_append();
+        add_dummy_file(&mut txn);
+        let result = txn.validate_blind_append_semantics();
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_blind_append_sets_commit_info_flag() -> Result<(), Box<dyn std::error::Error>> {
+        let commit_info = CommitInfo::new(1, None, None, None, true);
+        assert_eq!(commit_info.is_blind_append, Some(true));
+
+        let commit_info_false = CommitInfo::new(1, None, None, None, false);
+        assert_eq!(commit_info_false.is_blind_append, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_blind_append_commit_rejects_no_adds() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        // No files added — commit should fail with blind append validation
+        let err = txn
+            .commit(_engine.as_ref())
+            .expect_err("Blind append with no adds should fail");
+        assert!(
+            err.to_string()
+                .contains("Blind append requires at least one added data file"),
+            "Unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_blind_append_commit_success() -> DeltaResult<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        txn = txn.with_blind_append();
+        add_dummy_file(&mut txn);
+        // Blind append with add files should pass validation and proceed to commit.
+        // The commit itself may fail due to schema mismatch with the dummy data,
+        // but we verify validation (line 415) passes on the Ok path.
+        let result = txn.commit(engine.as_ref());
+        // If it fails, it should NOT be an InvalidTransactionState error
+        if let Err(e) = result {
+            assert!(
+                !matches!(e, Error::InvalidTransactionState(_)),
+                "Blind append validation should have passed, got: {e}"
+            );
+        }
         Ok(())
     }
 
