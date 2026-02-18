@@ -1,13 +1,23 @@
-//! UCCatalog implements a high-level interface for interacting with Delta Tables in Unity Catalog.
+//! Delta Kernel Unity Catalog integration.
+//!
+//! This crate provides Unity Catalog support for delta-kernel-rs, including the
+//! [`UCCommitter`] for committing transactions and the [`UCCatalog`] for loading snapshots
+//! via the UC commits API.
 
+pub mod commits_client;
 mod committer;
+pub mod models;
+
+pub use commits_client::{UCCommitsClient, UCCommitsRestClient};
 pub use committer::UCCommitter;
+pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use commits_client::{InMemoryCommitsClient, TableData};
 
 use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
-
-use uc_client::prelude::*;
 
 use itertools::Itertools;
 use tracing::debug;
@@ -15,6 +25,8 @@ use url::Url;
 
 /// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
 /// Catalog. For now this is a lightweight wrapper around a [UCCommitsClient].
+// TODO: Delete UCCatalog -- it's a passthrough API that should not be published. Callers can
+// use UCCommitsClient + Snapshot::builder_for() directly.
 pub struct UCCatalog<'a, C: UCCommitsClient> {
     client: &'a C,
 }
@@ -92,7 +104,7 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
             },
         };
 
-        // consume uc-client's Commit and hand back a delta_kernel LogPath
+        // consume UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
         // add trailing slash
         if !table_url.path().ends_with('/') {
@@ -135,13 +147,16 @@ mod tests {
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
+    use unity_catalog_client::UCClient;
 
     use tracing::info;
 
     use super::*;
 
+    use unity_catalog_client::models::credentials::Operation;
+
     // We could just re-export UCClient's get_table to not require consumers to directly import
-    // uc_client themselves.
+    // unity_catalog_client themselves.
     async fn get_table(
         client: &UCClient,
         table_name: &str,
@@ -168,7 +183,7 @@ mod tests {
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
         // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let config = unity_catalog_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let uc_client = UCClient::new(config.clone())?;
@@ -208,7 +223,7 @@ mod tests {
         // or time travel
         // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
 
-        println!("🎉 loaded snapshot: {snapshot:?}");
+        println!("loaded snapshot: {snapshot:?}");
 
         Ok(())
     }
@@ -223,7 +238,7 @@ mod tests {
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
         // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let config = unity_catalog_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let client = UCClient::new(config.clone())?;
@@ -264,7 +279,7 @@ mod tests {
 
         match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(t) => {
-                println!("🎉 committed version {}", t.commit_version());
+                println!("committed version {}", t.commit_version());
                 // TODO: should use post-commit snapshot here (plumb through log tail)
                 let _snapshot = catalog
                     .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
@@ -272,7 +287,7 @@ mod tests {
                 // then do publish
             }
             CommitResult::ConflictedTransaction(t) => {
-                println!("💥 commit conflicted at version {}", t.conflict_version());
+                println!("commit conflicted at version {}", t.conflict_version());
             }
             CommitResult::RetryableTransaction(_) => {
                 println!("we should retry...");

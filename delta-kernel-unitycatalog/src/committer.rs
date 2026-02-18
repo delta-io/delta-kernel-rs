@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::commits_client::UCCommitsClient;
+use crate::models::{Commit, CommitRequest};
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
-use uc_client::models::commits::{Commit, CommitRequest};
-use uc_client::UCCommitsClient;
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
@@ -123,13 +123,13 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{CommitsRequest, CommitsResponse};
     use delta_kernel::committer::CatalogCommit;
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::Version;
     use object_store::local::LocalFileSystem;
     use std::fs;
-    use uc_client::error::Result;
-    use uc_client::models::commits::{CommitsRequest, CommitsResponse};
+    use unity_catalog_client::error::Result;
 
     struct MockCommitsClient;
 

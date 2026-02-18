@@ -5,10 +5,10 @@ use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
+use delta_kernel_unitycatalog::commits_client::{InMemoryCommitsClient, TableData};
+use delta_kernel_unitycatalog::models::Commit;
+use delta_kernel_unitycatalog::{UCCatalog, UCCommitter};
 use object_store::local::LocalFileSystem;
-use uc_catalog::{UCCatalog, UCCommitter};
-use uc_client::commits_client::{InMemoryCommitsClient, TableData};
-use uc_client::models::commits::Commit;
 
 // ============================================================================
 // Test Setup

@@ -1,5 +1,5 @@
 [package]
-name = "uc-catalog"
+name = "delta-kernel-unitycatalog"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -13,11 +13,17 @@ version.workspace = true
 [package.metadata.release]
 release = false
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["catalog-managed"] }
-uc-client = { path = "../uc-client" }
+unity-catalog-client = { path = "../unity-catalog-client" }
+chrono = { version = "0.4", features = ["serde"] }
 itertools = "0.14"
 object_store = "0.12.3"
+reqwest = { version = "0.13", features = ["http2", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -26,7 +32,9 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+delta-kernel-unitycatalog = { path = ".", features = ["test-utils"] }
 delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
-uc-client = { path = "../uc-client", features = ["test-utils"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 object_store = "0.12"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
