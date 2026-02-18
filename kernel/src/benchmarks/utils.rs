@@ -167,7 +167,7 @@ fn load_single_spec(
         .ok_or_else(|| format!("Invalid spec file name: {}", spec_file.display()))?
         .to_string();
 
-    let spec = Spec::from_json_path(&spec_file)
+    let spec = Spec::from_json_path(spec_file)
         .map_err(|e| format!("Failed to parse spec file {}: {}", spec_file.display(), e))?;
 
     Ok(WorkloadSpecVariant {
