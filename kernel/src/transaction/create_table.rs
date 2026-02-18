@@ -57,7 +57,7 @@ use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
 };
 use crate::transaction::Transaction;
-use crate::utils::{current_time_ms, try_parse_uri};
+use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -621,7 +621,7 @@ impl CreateTableTransactionBuilder {
             None, // description
             effective_schema.clone(),
             Vec::new(), // partition_columns - added with data layout support
-            current_time_ms()?,
+            chrono::Utc::now().timestamp_millis(),
             validated.properties,
         )?;
 

@@ -35,7 +35,7 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
-use crate::utils::{current_time_ms, require};
+use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -329,7 +329,7 @@ impl Transaction {
         // Read clustering columns from snapshot (returns None if clustering not enabled)
         let clustering_columns = read_snapshot.get_clustering_columns(engine)?;
 
-        let commit_timestamp = current_time_ms()?;
+        let commit_timestamp = chrono::Utc::now().timestamp_millis();
 
         let span = tracing::info_span!(
             "txn",
@@ -392,7 +392,7 @@ impl Transaction {
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
-            commit_timestamp: current_time_ms()?,
+            commit_timestamp: chrono::Utc::now().timestamp(),
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: system_domain_metadata,
             user_domain_removals: vec![],

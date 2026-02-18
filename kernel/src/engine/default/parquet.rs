@@ -564,7 +564,6 @@ mod tests {
     use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 
-    use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -738,7 +737,7 @@ mod tests {
         let expected_size = meta.size;
 
         // check that last_modified is within 10s of now
-        let now: i64 = current_time_ms().unwrap();
+        let now: i64 = chrono::Utc::now().timestamp_millis();
 
         let filename = location.path().split('/').next_back().unwrap();
         assert_eq!(&expected_location.join(filename).unwrap(), location);

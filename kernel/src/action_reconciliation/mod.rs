@@ -59,7 +59,12 @@ pub(crate) trait RetentionCalculator {
 
         deleted_file_retention_timestamp_with_time(
             retention_duration,
-            crate::utils::current_time_duration()?,
+            Duration::from_millis(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .map_err(crate::Error::generic)?,
+            ),
         )
     }
 
@@ -118,7 +123,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties
         .set_transaction_retention_duration
         .map(|duration| -> DeltaResult<i64> {
-            let now_ms = crate::utils::current_time_ms()?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
 
             let expiration_ms = i64::try_from(duration.as_millis())
                 .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
@@ -201,7 +206,7 @@ mod tests {
         // The result should be current time minus 1 hour (approximately)
         // We can't test exact value due to timing, but we can verify it's reasonable
         let timestamp = result.unwrap();
-        let now_ms = crate::utils::current_time_ms().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let one_hour_ms = 3600 * 1000;
 
         // Should be within a reasonable range (allowing for test execution time)
@@ -251,7 +256,7 @@ mod tests {
         let result = calculator.deleted_file_retention_timestamp()?;
 
         // Should be current time minus 7 days (approximately)
-        let now_ms = crate::utils::current_time_ms().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
 
         assert!(result < now_ms);
@@ -290,7 +295,7 @@ mod tests {
         assert!(result.is_some());
 
         let timestamp = result.unwrap();
-        let now_ms = crate::utils::current_time_ms().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let two_hours_ms = 2 * 60 * 60 * 1000;
 
         assert!(timestamp < now_ms);

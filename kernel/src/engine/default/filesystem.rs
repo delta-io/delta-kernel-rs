@@ -378,7 +378,6 @@ fn supports_ordered_listing(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
-    use std::time::Duration;
 
     use itertools::Itertools;
     use object_store::memory::InMemory;
@@ -388,7 +387,6 @@ mod tests {
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngineBuilder;
-    use crate::utils::current_time_duration;
     use crate::Engine as _;
 
     use super::*;
@@ -460,7 +458,7 @@ mod tests {
     async fn test_file_meta_is_correct() {
         let store = Arc::new(InMemory::new());
 
-        let begin_time = current_time_duration().unwrap();
+        let begin_time = chrono::Utc::now();
 
         let data = Bytes::from("kernel-data");
         let name = delta_path_for_version(1, "json");
@@ -477,8 +475,8 @@ mod tests {
 
         assert!(!files.is_empty());
         for meta in files.into_iter() {
-            let meta_time = Duration::from_millis(meta.last_modified.try_into().unwrap());
-            assert!(meta_time.abs_diff(begin_time) < Duration::from_secs(10));
+            let meta_time = chrono::DateTime::from_timestamp_millis(meta.last_modified).unwrap();
+            assert!((meta_time - begin_time) < chrono::TimeDelta::seconds(10));
         }
     }
     #[tokio::test]
@@ -560,7 +558,7 @@ mod tests {
 
         let data = Bytes::from("test-content");
         let file_path = Path::from_absolute_path(tmp.path().join("test.txt")).unwrap();
-        let write_time = current_time_duration().unwrap();
+        let write_time = chrono::Utc::now();
         store.put(&file_path, data.clone().into()).await.unwrap();
 
         let file_url = Url::from_file_path(tmp.path().join("test.txt")).unwrap();
@@ -570,12 +568,12 @@ mod tests {
         assert_eq!(file_meta.size, data.len() as u64);
 
         // Verify timestamp is within the expected range
-        let meta_time = Duration::from_millis(file_meta.last_modified as u64);
+        let meta_time = chrono::DateTime::from_timestamp_millis(file_meta.last_modified).unwrap();
         assert!(
-            meta_time.abs_diff(write_time) < Duration::from_millis(100),
+            (write_time - meta_time) < chrono::TimeDelta::milliseconds(100),
             "last_modified timestamp should be around {} ms, but was {} ms",
-            write_time.as_millis(),
-            meta_time.as_millis()
+            write_time.timestamp_millis(),
+            meta_time.timestamp_millis()
         );
     }
 
