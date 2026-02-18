@@ -155,17 +155,17 @@ mod tests {
             .unwrap()
             .filter(|r| r.is_ok())
             .count();
-        assert_eq!(total_batches, 2, "expected 2 total batches (one per commit)");
+        assert_eq!(
+            total_batches, 2,
+            "expected 2 total batches (one per commit)"
+        );
 
         // Drive the loop manually — identical to the body of scan_domain_metadatas — and
         // count how many batches are consumed before filter_found() breaks the loop.
         let filter = HashSet::from(["domainA".to_string(), "domainB".to_string()]);
         let mut visitor = DomainMetadataVisitor::new(Some(filter));
         let mut batches_consumed = 0;
-        for actions in log_segment
-            .read_domain_metadata_batches(&engine)
-            .unwrap()
-        {
+        for actions in log_segment.read_domain_metadata_batches(&engine).unwrap() {
             batches_consumed += 1;
             visitor
                 .visit_rows_of(actions.unwrap().actions.as_ref())
@@ -190,7 +190,10 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result["domainA"].configuration(), "cfgA");
         assert_eq!(result["domainB"].configuration(), "cfgB");
-        assert!(!result.contains_key("domainC"), "domainC must not appear — second batch was not read");
+        assert!(
+            !result.contains_key("domainC"),
+            "domainC must not appear — second batch was not read"
+        );
     }
 
     /// Proves that when requested domains span two commits, both batches ARE consumed
@@ -205,10 +208,7 @@ mod tests {
         let filter = HashSet::from(["domainA".to_string(), "domainC".to_string()]);
         let mut visitor = DomainMetadataVisitor::new(Some(filter));
         let mut batches_consumed = 0;
-        for actions in log_segment
-            .read_domain_metadata_batches(&engine)
-            .unwrap()
-        {
+        for actions in log_segment.read_domain_metadata_batches(&engine).unwrap() {
             batches_consumed += 1;
             visitor
                 .visit_rows_of(actions.unwrap().actions.as_ref())
