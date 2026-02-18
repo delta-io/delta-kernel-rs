@@ -40,9 +40,7 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
-};
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::FileMeta;
 
@@ -3064,30 +3062,17 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     }
     Ok(())
 }
-// ===== Column Mapping Write E2E Tests =====
 
-/// Resolves a logical field path (e.g. `["address", "street"]`) to its physical names
-/// using the snapshot schema and column mapping mode.
-fn resolve_physical_path(schema: &StructType, path: &[&str]) -> Vec<String> {
-    let mut current_schema = schema;
-    let mut physical = Vec::new();
-    for (i, segment) in path.iter().enumerate() {
-        let field = current_schema
-            .field(segment)
-            .unwrap_or_else(|| panic!("field '{}' not found in schema", segment));
-        let name = match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-            Some(MetadataValue::String(s)) => s.clone(),
-            _ => segment.to_string(),
-        };
-        physical.push(name);
-        if i + 1 < path.len() {
-            current_schema = match field.data_type() {
-                DataType::Struct(s) => s,
-                _ => panic!("expected struct at '{}'", segment),
-            };
-        }
-    }
-    physical
+/// Translates a logical field path (e.g. `["address", "street"]`) to physical
+/// using the snapshot's table configuration and column mapping mode.
+fn translate_logical_path_to_physical(snapshot: &Snapshot, path: &[&str]) -> Vec<String> {
+    use delta_kernel::expressions::ColumnName;
+    let col = ColumnName::new(path.iter().map(|s| s.to_string()));
+    let tc = snapshot.table_configuration();
+    let cm = tc.column_mapping_mode();
+    tc.translate_column_name_to_physical(&col, cm)
+        .unwrap_or_else(|| panic!("failed to resolve {:?} to physical", path))
+        .into_inner()
 }
 
 /// Asserts that a field exists at the given physical path in the footer schema.
@@ -3126,7 +3111,8 @@ fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
 }
 
 /// Returns two RecordBatches with hardcoded test data matching [`nested_schema`].
-fn nested_batches(schema: &SchemaRef) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let schema = nested_schema()?;
     let arrow_schema = ArrowSchema::try_from_kernel(schema.as_ref())?;
     let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
         ArrowDataType::Struct(fields) => fields.clone(),
@@ -3194,7 +3180,7 @@ async fn write_batch_to_table(
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("test")
+        .with_engine_info("DefaultEngine")
         .with_data_change(true);
     let write_context = Arc::new(txn.get_write_context());
     let add_meta = engine
@@ -3208,7 +3194,7 @@ async fn write_batch_to_table(
     match txn.commit(engine)? {
         CommitResult::CommittedTransaction(c) => Ok(c
             .post_commit_snapshot()
-            .expect("post_commit_snapshot")
+            .expect("Failed to get post_commit_snapshot")
             .clone()),
         _ => panic!("Write commit should succeed"),
     }
@@ -3292,7 +3278,7 @@ fn create_cm_table(
 
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
-/// 3. Checkpoints and verifies add.stats column names in the checkpoint
+/// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
 /// 4. Reads a parquet footer to verify physical names/IDs
 /// 5. Reads data back to verify correctness
 #[rstest::rstest]
@@ -3322,13 +3308,13 @@ async fn test_column_mapping_write(
     let mut latest_snapshot =
         create_cm_table(&table_path, schema.clone(), cm_mode, engine.as_ref())?;
 
-    // Resolve physical names for stats verification (top-level and nested)
-    let snapshot_schema = latest_snapshot.schema();
-    let row_number_physical = resolve_physical_path(&snapshot_schema, &["row_number"]);
-    let street_physical = resolve_physical_path(&snapshot_schema, &["address", "street"]);
+    // Get physical field paths for stats verification (top-level and nested)
+    let row_number_physical = translate_logical_path_to_physical(&latest_snapshot, &["row_number"]);
+    let street_physical =
+        translate_logical_path_to_physical(&latest_snapshot, &["address", "street"]);
 
     // Step 2: Write two batches
-    for data in nested_batches(&schema)? {
+    for data in nested_batches()? {
         latest_snapshot =
             write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
     }
@@ -3365,10 +3351,9 @@ async fn test_column_mapping_write(
         let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
         let footer_schema = footer.schema;
 
-        let snapshot_schema = latest_snapshot.schema();
         // Verify top-level "row_number" and nested "address.street" use correct (physical) names
         for path in [vec!["row_number"], vec!["address", "street"]] {
-            let physical = resolve_physical_path(&snapshot_schema, &path);
+            let physical = translate_logical_path_to_physical(&latest_snapshot, &path);
             assert_footer_has_field(&footer_schema, &physical);
         }
     }
@@ -3454,7 +3439,7 @@ async fn test_column_mapping_partitioned_write(
     );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let physical_name = resolve_physical_path(&snapshot.schema(), &["category"])[0].clone();
+    let physical_name = translate_logical_path_to_physical(&snapshot, &["category"])[0].clone();
 
     // Write data with partition value
     let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
