@@ -211,7 +211,6 @@ fn transform_add_schema(
     };
 
     let modified_add = transform_fn(add_struct)?;
-    //TODO: replace with StructType::with_field_replaced
     let new_schema = base_schema.with_field_replaced(
         ADD_NAME,
         StructField {
@@ -241,7 +240,7 @@ fn add_stats_parsed_to_add_schema(
 
 fn build_add_output_schema(
     config: &StatsTransformConfig,
-    add_schema: &StructType, // add_schema is the previous checkpoint add schema?
+    add_schema: &StructType,
     stats_schema: &StructType,
 ) -> StructType {
     let new_schema = if config.write_stats_as_struct {
