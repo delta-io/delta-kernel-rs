@@ -9,7 +9,6 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -366,19 +365,6 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         self.logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
-    }
-}
-
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
-struct PrefixColumns {
-    prefix: ColumnName,
-}
-
-impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
     }
 }
 
@@ -777,36 +763,17 @@ impl Scan {
             )
     }
 
-    /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
+    /// Builds a checkpoint/sidecar metadata pruning predicate.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
-    ///
-    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
-    /// values. Without them, row groups containing files with missing stats (null stat columns)
-    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    /// We pass the original physical predicate as-is. The parquet row group skipping layer
+    /// decides how to evaluate it against footer stats for checkpoint-style layouts.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
-        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
-            return None;
-        };
-        self.state_info.physical_stats_schema.as_ref()?;
-
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
-
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
-        Some(Arc::new(prefixed.into_owned()))
+        if self.state_info.physical_stats_schema.is_some() {
+            if let PhysicalPredicate::Some(predicate, _) = &self.state_info.physical_predicate {
+                return Some(predicate.clone());
+            }
+        }
+        None
     }
 
     /// Start a parallel scan metadata processing for the table.

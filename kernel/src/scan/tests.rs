@@ -1,23 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
-use rstest::rstest;
-
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
+use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{
-    column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
-};
-use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
+use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, Snapshot};
@@ -760,54 +750,29 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 }
 
 #[test]
-fn test_prefix_columns_simple() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A simple binary predicate: x > 100
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
-
-    // The column reference should now be add.stats_parsed.x
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
-}
-
-#[test]
-fn test_build_actions_meta_predicate_with_predicate() {
+fn test_build_actions_meta_predicate_with_physical_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    // Build a scan with a predicate eligible for data skipping
     let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(predicate.clone())
         .build()
         .unwrap();
 
     let meta_pred = scan.build_actions_meta_predicate();
     assert!(
         meta_pred.is_some(),
-        "Should produce an actions meta predicate for a data-skipping-eligible predicate"
+        "should build a checkpoint meta-predicate when physical predicate + stats schema exist"
     );
-
-    // Verify all column references are prefixed with add.stats_parsed
-    let pred = meta_pred.unwrap();
-    for col_ref in pred.references() {
-        let path: Vec<_> = col_ref.iter().collect();
-        assert_eq!(
-            path[0], "add",
-            "Column reference should start with 'add': {col_ref}"
-        );
-        assert_eq!(
-            path[1], "stats_parsed",
-            "Column reference should have 'stats_parsed' as second element: {col_ref}"
-        );
-    }
+    assert_eq!(
+        meta_pred.as_ref(),
+        Some(&predicate),
+        "meta-predicate should pass through the original physical predicate"
+    );
 }
 
 #[test]
@@ -816,13 +781,11 @@ fn test_build_actions_meta_predicate_no_predicate() {
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-    // Build a scan with no predicate
     let scan = snapshot.scan_builder().build().unwrap();
 
     assert!(
         scan.build_actions_meta_predicate().is_none(),
-        "Should return None when there is no predicate"
+        "no scan predicate should produce no checkpoint meta-predicate"
     );
 }
 
@@ -833,18 +796,16 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    // A predicate that statically evaluates to false should produce StaticSkipAll,
-    // which means build_actions_meta_predicate returns None.
-    let predicate = Arc::new(Pred::literal(false));
+    // Static false maps to PhysicalPredicate::StaticSkipAll, so no meta-predicate should be built.
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(Pred::literal(false)))
         .build()
         .unwrap();
 
     assert!(
         scan.build_actions_meta_predicate().is_none(),
-        "StaticSkipAll predicate should return None"
+        "static-skip-all scans should not build a checkpoint meta-predicate"
     );
 }
 
