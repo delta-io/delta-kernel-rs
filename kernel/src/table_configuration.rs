@@ -18,11 +18,12 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{DataType, InvariantChecker, SchemaRef, SchemaTransform, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
-    KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    column_mapping_mode, get_any_level_column_physical_name, validate_schema_column_mapping,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
+    FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
+    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -261,32 +262,13 @@ impl TableConfiguration {
         logical_names
             .into_iter()
             .filter_map(|col_name| {
-                self.translate_column_name_to_physical(&col_name, column_mapping_mode)
+                get_any_level_column_physical_name(
+                    self.schema.as_ref(),
+                    &col_name,
+                    column_mapping_mode,
+                )
             })
             .collect()
-    }
-
-    /// Translates a logical [`ColumnName`] to physical.
-    ///
-    /// Returns `None` if the column name cannot be resolved in the schema.
-    fn translate_column_name_to_physical(
-        &self,
-        col_name: &ColumnName,
-        column_mapping_mode: ColumnMappingMode,
-    ) -> Option<ColumnName> {
-        let mut physical_path = Vec::new();
-        let mut current_struct: Option<&StructType> = Some(self.schema.as_ref());
-
-        for segment in col_name.path() {
-            let field = current_struct?.field(segment)?;
-            physical_path.push(field.physical_name(column_mapping_mode).to_string());
-            current_struct = match field.data_type() {
-                DataType::Struct(s) => Some(s),
-                _ => None,
-            };
-        }
-
-        Some(ColumnName::new(physical_path))
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
