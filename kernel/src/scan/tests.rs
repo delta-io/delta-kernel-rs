@@ -628,35 +628,123 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that `with_stats_columns` cannot be used with `with_predicate`.
-/// See [#1751] for tracking.
-/// [#1751]: https://github.com/delta-io/delta-kernel-rs/issues/1751
+/// Test that data skipping works correctly with pre-parsed stats from a checkpoint.
+///
+/// The parsed-stats test table has a checkpoint at version 3 (containing stats_parsed) and
+/// JSON commits at versions 4-5. This test exercises both code paths:
+/// - Checkpoint batches: stats_parsed is read directly from the transformed batch
+/// - JSON log batches: stats are parsed from JSON via the transform expression
+///
+/// Table layout (6 files, each 100 records):
+///   File 1: id [1-100],   File 2: id [101-200], File 3: id [201-300]
+///   File 4: id [301-400], File 5: id [401-500], File 6: id [501-600]
 #[test]
-fn test_scan_metadata_stats_columns_with_predicate_errors() {
-    // Use the parsed-stats table
+fn test_data_skipping_with_parsed_stats() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Predicate: id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(
+        selected_file_count, 2,
+        "Data skipping with parsed stats should keep only 2 files (id [401-500] and [501-600])"
+    );
+}
+
+/// Test that `include_stats_columns` and `with_predicate` can be used together.
+/// The scan should output stats_parsed AND perform data skipping via the predicate.
+#[test]
+fn test_scan_metadata_stats_columns_with_predicate() {
+    const STATS_PARSED_COL: &str = "stats_parsed";
+
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    // Build scan with both predicate (that references a column) and stats_columns should error
-    // Note: Pred::literal(true) has no column references, so it becomes PhysicalPredicate::None
-    let predicate = Arc::new(column_pred!("id")); // References 'id' column
-    let result = snapshot
+    // Build scan with both a predicate and stats_columns
+    let predicate = Arc::new(column_expr!("id").gt(Expr::literal(0i64)));
+    let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .include_stats_columns()
-        .build();
+        .build()
+        .expect("Should succeed when using both predicate and stats_columns");
+
+    // Verify the scan has a physical predicate (data skipping is active)
+    assert!(
+        scan.physical_predicate().is_some(),
+        "Scan should have a physical predicate for data skipping"
+    );
+
+    // Run scan_metadata and verify stats_parsed is present in the output
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert!(
-        result.is_err(),
-        "Should error when using both predicate and stats_columns"
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata results"
     );
-    let err = result.unwrap_err();
+
+    let mut file_count = 0;
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        // Verify stats_parsed column exists and is a struct type
+        let schema = filtered_batch.schema();
+        let field = schema
+            .field_with_name(STATS_PARSED_COL)
+            .expect("Schema should contain stats_parsed column");
+        assert!(
+            matches!(field.data_type(), ArrowDataType::Struct(_)),
+            "stats_parsed should be a struct type"
+        );
+
+        // Verify stats_parsed has data
+        let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
+        let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
+        for i in 0..filtered_batch.num_rows() {
+            if !stats_parsed.is_null(i) {
+                assert!(num_records.value(i) > 0, "numRecords should be positive");
+                file_count += 1;
+            }
+        }
+    }
+
     assert!(
-        err.to_string().contains("predicate") || err.to_string().contains("stats_columns"),
-        "Error message should mention predicate or stats_columns: {}",
-        err
+        file_count > 0,
+        "Should have processed at least one file with stats"
     );
 }
