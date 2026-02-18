@@ -1155,6 +1155,89 @@ mod tests {
         assert!(domain_metadata_visitor.domain_metadatas.is_empty());
     }
 
+    #[test]
+    fn test_domain_metadata_visitor_multi_domain_filter() {
+        // Reuse the same two-commit setup from test_parse_domain_metadata.
+        // commit_1 (newer): zach1(removed), zach2, zach3(removed), zach4, zach5(removed), zach6
+        // commit_0 (older): zach1(removed), zach2, zach3, zach4(removed), zach7(removed), zach8
+        let commit_1: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"cfg3","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"cfg4","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach5","configuration":"cfg5","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach6","configuration":"cfg6","removed":false}}"#,
+            ]
+            .into(),
+        );
+        let commit_0: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"old_cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"old_cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"old_cfg3","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"old_cfg4","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach7","configuration":"cfg7","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach8","configuration":"cfg8","removed":false}}"#,
+            ]
+            .into(),
+        );
+
+        // --- filter for two active domains both in commit_1 ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach4".to_string(),
+        ])));
+        assert!(!visitor.filter_found()); // nothing found yet
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // both zach2 and zach4 appear in commit_1, so early termination should trigger
+        assert!(visitor.filter_found());
+        // commit_0 would NOT be visited in a real replay (early termination), but even if it
+        // were the results should be the same since commit_1 entries take precedence
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach4"].configuration, "cfg4");
+
+        // --- filter spanning both commits (zach2 in commit_1, zach8 in commit_0) ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach8".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // only zach2 found so far — should NOT terminate early yet
+        assert!(!visitor.filter_found());
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        // now zach8 found too
+        assert!(visitor.filter_found());
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach8"].configuration, "cfg8");
+
+        // --- filter where one domain is removed (tombstone) ---
+        // zach3 is removed in commit_1; only zach6 survives into_domain_metadatas
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach3".to_string(),
+            "zach6".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        assert!(visitor.filter_found()); // both found in commit_1
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 1); // zach3 is removed, filtered out
+        assert_eq!(result["zach6"].configuration, "cfg6");
+
+        // --- filter where no requested domains exist ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "ghost1".to_string(),
+            "ghost2".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        assert!(!visitor.filter_found());
+        assert!(visitor.into_domain_metadatas().is_empty());
+    }
+
     /*************************************
      *  In-commit timestamp visitor tests *
      **************************************/

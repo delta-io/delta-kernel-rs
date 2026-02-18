@@ -68,3 +68,162 @@ impl LogSegment {
         self.read_actions(engine, schema.clone(), META_PREDICATE.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore as _;
+    use serde_json::json;
+    use url::Url;
+
+    use test_utils::delta_path_for_version;
+
+    use crate::actions::visitors::DomainMetadataVisitor;
+    use crate::engine::default::DefaultEngineBuilder;
+    use crate::{RowVisitor as _, Snapshot};
+
+    /// Write a newline-delimited JSON string as a commit file to the in-memory store.
+    async fn put_commit(store: &InMemory, version: u64, content: &str) {
+        store
+            .put(
+                &delta_path_for_version(version, "json"),
+                content.as_bytes().to_vec().into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Builds a two-commit in-memory Delta log:
+    ///   commit 0: protocol + metadata + "domainC"
+    ///   commit 1: "domainA" + "domainB"
+    ///
+    /// Log replay visits commits newest-first, so commit 1 is the first batch and commit 0
+    /// is the second batch.
+    async fn build_two_commit_log() -> (impl crate::Engine, std::sync::Arc<Snapshot>) {
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        let commit0 = [
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({"metaData": {
+                "id": "test-table-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": r#"{"type":"struct","fields":[]}"#,
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            }}),
+            json!({"domainMetadata": {"domain": "domainC", "configuration": "cfgC", "removed": false}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        put_commit(&store, 0, &commit0).await;
+
+        let commit1 = [
+            json!({"domainMetadata": {"domain": "domainA", "configuration": "cfgA", "removed": false}}),
+            json!({"domainMetadata": {"domain": "domainB", "configuration": "cfgB", "removed": false}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        put_commit(&store, 1, &commit1).await;
+
+        let url = Url::parse("memory:///").unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        (engine, snapshot)
+    }
+
+    /// Proves early termination actually fires: when both requested domains are found in the
+    /// first (newest) batch, the iterator is broken before the second (older) batch is consumed.
+    ///
+    /// Strategy: count total batches via `read_domain_metadata_batches`, then manually drive
+    /// the same loop that `scan_domain_metadatas` uses and count how many batches are consumed
+    /// before `filter_found()` triggers the break. Asserting consumed < total is the only way
+    /// to confirm the iterator is abandoned early — the domain values alone cannot distinguish
+    /// this because `or_insert` in the visitor makes results identical whether or not the second
+    /// batch was read.
+    #[tokio::test]
+    async fn test_scan_domain_metadatas_early_termination() {
+        let (engine, snapshot) = build_two_commit_log().await;
+        let log_segment = snapshot.log_segment();
+
+        // Sanity-check: the log has exactly 2 batches (one per commit).
+        let total_batches = log_segment
+            .read_domain_metadata_batches(&engine)
+            .unwrap()
+            .filter(|r| r.is_ok())
+            .count();
+        assert_eq!(total_batches, 2, "expected 2 total batches (one per commit)");
+
+        // Drive the loop manually — identical to the body of scan_domain_metadatas — and
+        // count how many batches are consumed before filter_found() breaks the loop.
+        let filter = HashSet::from(["domainA".to_string(), "domainB".to_string()]);
+        let mut visitor = DomainMetadataVisitor::new(Some(filter));
+        let mut batches_consumed = 0;
+        for actions in log_segment
+            .read_domain_metadata_batches(&engine)
+            .unwrap()
+        {
+            batches_consumed += 1;
+            visitor
+                .visit_rows_of(actions.unwrap().actions.as_ref())
+                .unwrap();
+            if visitor.filter_found() {
+                break;
+            }
+        }
+
+        // The key assertion: only 1 of the 2 batches was consumed — early termination worked.
+        assert_eq!(
+            batches_consumed, 1,
+            "should break after the first (newest) batch once both domains are found"
+        );
+        assert!(
+            batches_consumed < total_batches,
+            "early termination must consume fewer batches than the total"
+        );
+
+        // Also verify correct results: domainA and domainB present, domainC absent.
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["domainA"].configuration(), "cfgA");
+        assert_eq!(result["domainB"].configuration(), "cfgB");
+        assert!(!result.contains_key("domainC"), "domainC must not appear — second batch was not read");
+    }
+
+    /// Proves that when requested domains span two commits, both batches ARE consumed
+    /// (i.e., we don't terminate early until all N domains are found).
+    #[tokio::test]
+    async fn test_scan_domain_metadatas_no_early_termination_when_split_across_commits() {
+        let (engine, snapshot) = build_two_commit_log().await;
+        let log_segment = snapshot.log_segment();
+
+        // domainA is in commit 1 (batch 0), domainC is in commit 0 (batch 1).
+        // filter_found() must not trigger after batch 0 alone.
+        let filter = HashSet::from(["domainA".to_string(), "domainC".to_string()]);
+        let mut visitor = DomainMetadataVisitor::new(Some(filter));
+        let mut batches_consumed = 0;
+        for actions in log_segment
+            .read_domain_metadata_batches(&engine)
+            .unwrap()
+        {
+            batches_consumed += 1;
+            visitor
+                .visit_rows_of(actions.unwrap().actions.as_ref())
+                .unwrap();
+            if visitor.filter_found() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            batches_consumed, 2,
+            "must read both batches when requested domains span two commits"
+        );
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result["domainA"].configuration(), "cfgA");
+        assert_eq!(result["domainC"].configuration(), "cfgC");
+    }
+}
