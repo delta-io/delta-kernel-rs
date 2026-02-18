@@ -389,7 +389,7 @@ fn test_checkpoint_skipping_semantic(
 ) {
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), max_val)]);
+    let resolver = HashMap::from_iter([(column_name!("add.stats_parsed.maxValues.x"), max_val)]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
 }
@@ -399,8 +399,10 @@ fn test_checkpoint_skipping_semantic(
 #[test]
 fn test_checkpoint_skipping_null_guard_vs_regular() {
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let resolver =
-        HashMap::from_iter([(column_name!("maxValues.x"), Scalar::Null(DataType::INTEGER))]);
+    let resolver = HashMap::from_iter([(
+        column_name!("add.stats_parsed.maxValues.x"),
+        Scalar::Null(DataType::INTEGER),
+    )]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
 
     let guarded = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
@@ -422,8 +424,8 @@ fn test_checkpoint_skipping_null_guard_vs_regular() {
 // column's stats are sufficient. For `col_a > 100 AND col_b < 50`, the guarded predicate is:
 //
 //   AND(
-//     OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-//     OR(minValues.col_b IS NULL, minValues.col_b < 50)
+//     OR(add.stats_parsed.maxValues.col_a IS NULL, add.stats_parsed.maxValues.col_a > 100),
+//     OR(add.stats_parsed.minValues.col_b IS NULL, add.stats_parsed.minValues.col_b < 50)
 //   )
 //
 // Even if col_a's stats are null, col_b's stats alone can prune the row group.
@@ -437,8 +439,14 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
 
     // Both stats present and both allow pruning → skip
     let resolver = HashMap::from_iter([
-        (column_name!("maxValues.col_a"), Scalar::from(50)),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
+        (
+            column_name!("add.stats_parsed.maxValues.col_a"),
+            Scalar::from(50),
+        ),
+        (
+            column_name!("add.stats_parsed.minValues.col_b"),
+            Scalar::from(60),
+        ),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
@@ -450,10 +458,13 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     // col_a stats null, but col_b stats alone are enough to prune → still skip
     let resolver = HashMap::from_iter([
         (
-            column_name!("maxValues.col_a"),
+            column_name!("add.stats_parsed.maxValues.col_a"),
             Scalar::Null(DataType::INTEGER),
         ),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
+        (
+            column_name!("add.stats_parsed.minValues.col_b"),
+            Scalar::from(60),
+        ),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
@@ -465,16 +476,87 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     // col_a stats null and col_b doesn't allow pruning → keep
     let resolver = HashMap::from_iter([
         (
-            column_name!("maxValues.col_a"),
+            column_name!("add.stats_parsed.maxValues.col_a"),
             Scalar::Null(DataType::INTEGER),
         ),
-        (column_name!("minValues.col_b"), Scalar::from(30)),
+        (
+            column_name!("add.stats_parsed.minValues.col_b"),
+            Scalar::from(30),
+        ),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
         filter.eval(&skipping_pred),
         TRUE,
         "col_a null and col_b not prunable → keep"
+    );
+}
+
+// Verifies that partition columns produce `add.partitionValues_parsed` references.
+#[test]
+fn test_checkpoint_skipping_partition_column() {
+    let pred = Pred::eq(column_expr!("date"), Expr::literal("2024-01-01"));
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &["date".to_string()]).unwrap();
+
+    // Partition column references should point to add.partitionValues_parsed
+    let refs: Vec<_> = skipping_pred.references().into_iter().collect();
+    assert!(
+        refs.iter().all(|r| r
+            .path()
+            .starts_with(&["add".to_string(), "partitionValues_parsed".to_string()])),
+        "All references should start with add.partitionValues_parsed, got: {refs:?}"
+    );
+
+    // Verify it evaluates correctly with partition values
+    let resolver = HashMap::from_iter([(
+        column_name!("add.partitionValues_parsed.date"),
+        Scalar::from("2024-01-01"),
+    )]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&skipping_pred),
+        TRUE,
+        "partition value matches → keep"
+    );
+}
+
+// Verifies that a mixed OR with data + partition columns produces a combined predicate.
+#[test]
+fn test_checkpoint_skipping_mixed_or() {
+    let pred = Pred::or(
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+        Pred::eq(column_expr!("part_col"), Expr::literal("2024")),
+    );
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &["part_col".to_string()]).unwrap();
+
+    // Both branches should be present (the OR is preserved)
+    let refs: Vec<_> = skipping_pred.references().into_iter().collect();
+    let has_stats_ref = refs.iter().any(|r| {
+        r.path()
+            .starts_with(&["add".to_string(), "stats_parsed".to_string()])
+    });
+    let has_partition_ref = refs.iter().any(|r| {
+        r.path()
+            .starts_with(&["add".to_string(), "partitionValues_parsed".to_string()])
+    });
+    assert!(
+        has_stats_ref,
+        "Should have add.stats_parsed references for data column"
+    );
+    assert!(
+        has_partition_ref,
+        "Should have add.partitionValues_parsed references for partition column"
+    );
+}
+
+// Verifies that IS NULL on a partition column returns None (no null count stats for partitions).
+#[test]
+fn test_checkpoint_skipping_partition_is_null_returns_none() {
+    let pred = Pred::is_null(column_expr!("date"));
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &["date".to_string()]);
+    assert!(
+        skipping_pred.is_none(),
+        "IS NULL on partition column should return None"
     );
 }
 

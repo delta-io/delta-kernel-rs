@@ -12,9 +12,7 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{
-    column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
-};
+use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
@@ -760,22 +758,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 }
 
 #[test]
-fn test_prefix_columns_simple() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A simple binary predicate: x > 100
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
-
-    // The column reference should now be add.stats_parsed.x
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
-}
-
-#[test]
-fn test_build_actions_meta_predicate_with_predicate() {
+fn test_build_checkpoint_meta_predicate_with_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
@@ -789,10 +772,10 @@ fn test_build_actions_meta_predicate_with_predicate() {
         .build()
         .unwrap();
 
-    let meta_pred = scan.build_actions_meta_predicate();
+    let meta_pred = scan.build_checkpoint_meta_predicate();
     assert!(
         meta_pred.is_some(),
-        "Should produce an actions meta predicate for a data-skipping-eligible predicate"
+        "Should produce a checkpoint meta predicate for a data-skipping-eligible predicate"
     );
 
     // Verify all column references are prefixed with add.stats_parsed
@@ -811,7 +794,7 @@ fn test_build_actions_meta_predicate_with_predicate() {
 }
 
 #[test]
-fn test_build_actions_meta_predicate_no_predicate() {
+fn test_build_checkpoint_meta_predicate_no_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
@@ -821,20 +804,20 @@ fn test_build_actions_meta_predicate_no_predicate() {
     let scan = snapshot.scan_builder().build().unwrap();
 
     assert!(
-        scan.build_actions_meta_predicate().is_none(),
+        scan.build_checkpoint_meta_predicate().is_none(),
         "Should return None when there is no predicate"
     );
 }
 
 #[test]
-fn test_build_actions_meta_predicate_static_skip_all() {
+fn test_build_checkpoint_meta_predicate_static_skip_all() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
     // A predicate that statically evaluates to false should produce StaticSkipAll,
-    // which means build_actions_meta_predicate returns None.
+    // which means build_checkpoint_meta_predicate returns None.
     let predicate = Arc::new(Pred::literal(false));
     let scan = snapshot
         .scan_builder()
@@ -843,7 +826,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         .unwrap();
 
     assert!(
-        scan.build_actions_meta_predicate().is_none(),
+        scan.build_checkpoint_meta_predicate().is_none(),
         "StaticSkipAll predicate should return None"
     );
 }
@@ -958,18 +941,9 @@ impl CheckpointParquetBuilder {
     }
 }
 
-/// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
-fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    Some(
-        prefixer
-            .transform_pred(&skipping_pred)
-            .unwrap()
-            .into_owned(),
-    )
+/// Builds a checkpoint skipping predicate with fully qualified column paths.
+fn build_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
+    as_checkpoint_skipping_predicate(pred, &[])
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.
@@ -1039,7 +1013,7 @@ fn test_checkpoint_row_group_skipping(
     );
     let parquet_bytes = builder.finish();
 
-    let meta_predicate = build_prefixed_checkpoint_predicate(&pred);
+    let meta_predicate = build_checkpoint_predicate(&pred);
 
     match expected_rows {
         Some(expected) => {
@@ -1059,159 +1033,5 @@ fn test_checkpoint_row_group_skipping(
                 .sum();
             assert_eq!(total_rows, 6, "all rows should be read without a predicate");
         }
-    }
-}
-
-// ============================================================================
-// Partition meta-predicate rewriting tests
-// ============================================================================
-
-mod partition_meta_predicate_tests {
-    use std::borrow::Cow;
-    use std::collections::HashSet;
-
-    use crate::expressions::transforms::ExpressionTransform;
-    use crate::expressions::{
-        column_expr, column_name, ColumnName, Expression as Expr, Predicate as Pred,
-    };
-    use crate::scan::RewriteToPartitionParsed;
-
-    fn partition_set(names: &[&str]) -> HashSet<ColumnName> {
-        names.iter().map(|n| ColumnName::new([*n])).collect()
-    }
-
-    #[test]
-    fn rewrite_partition_column() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        let col = column_name!("date");
-        let result = rewriter.transform_expr_column(&col);
-        assert!(matches!(result, Some(Cow::Owned(_))));
-        let rewritten = result.unwrap().into_owned();
-        assert_eq!(
-            rewritten,
-            ColumnName::new(["add", "partitionValues_parsed", "date"])
-        );
-    }
-
-    #[test]
-    fn non_partition_column_returns_none() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        let col = column_name!("value");
-        let result = rewriter.transform_expr_column(&col);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn pure_partition_predicate_fully_rewritten() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        let pred = Pred::eq(column_expr!("date"), Expr::literal("2024-01-01"));
-        let result = rewriter.transform_pred(&pred);
-        assert!(result.is_some());
-        // The rewritten predicate should reference the partition parsed path
-        let rewritten = result.unwrap().into_owned();
-        let refs = rewritten.references();
-        assert!(refs
-            .iter()
-            .any(|r| r.path() == ["add", "partitionValues_parsed", "date"]));
-    }
-
-    #[test]
-    fn and_with_non_partition_drops_non_partition_conjuncts() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        // AND(date = '2024-01-01', value > 10)
-        let pred = Pred::and(
-            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
-            Pred::gt(column_expr!("value"), Expr::literal(10)),
-        );
-        let result = rewriter.transform_pred(&pred);
-        // The non-partition conjunct (value > 10) should be dropped, leaving just date =
-        assert!(result.is_some());
-        let rewritten = result.unwrap().into_owned();
-        let refs = rewritten.references();
-        // Should only have the partition column reference
-        assert!(refs
-            .iter()
-            .all(|r| r.path() == ["add", "partitionValues_parsed", "date"]));
-    }
-
-    #[test]
-    fn or_with_non_partition_drops_entire_or() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        // OR(date = '2024-01-01', value > 10)
-        let pred = Pred::or(
-            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
-            Pred::gt(column_expr!("value"), Expr::literal(10)),
-        );
-        let result = rewriter.transform_pred(&pred);
-        // Cannot safely drop an OR branch — must drop the entire OR
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn or_with_all_partition_columns_preserved() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date", "region"]),
-        };
-        // OR(date = '2024-01-01', region = 'us')
-        let pred = Pred::or(
-            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
-            Pred::eq(column_expr!("region"), Expr::literal("us")),
-        );
-        let result = rewriter.transform_pred(&pred);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn and_or_mixed_drops_or_keeps_and() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        // AND(date = '2024-01-01', OR(date = '2024-01-02', value > 10))
-        // The OR has a non-partition branch, so the whole OR gets dropped.
-        // The AND keeps the partition conjunct.
-        let pred = Pred::and(
-            Pred::eq(column_expr!("date"), Expr::literal("2024-01-01")),
-            Pred::or(
-                Pred::eq(column_expr!("date"), Expr::literal("2024-01-02")),
-                Pred::gt(column_expr!("value"), Expr::literal(10)),
-            ),
-        );
-        let result = rewriter.transform_pred(&pred);
-        assert!(result.is_some());
-        let rewritten = result.unwrap().into_owned();
-        let refs = rewritten.references();
-        assert!(refs
-            .iter()
-            .all(|r| r.path() == ["add", "partitionValues_parsed", "date"]));
-    }
-
-    #[test]
-    fn no_partition_columns_returns_none() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: HashSet::new(),
-        };
-        let pred = Pred::eq(column_expr!("date"), Expr::literal("2024-01-01"));
-        let result = rewriter.transform_pred(&pred);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn only_non_partition_predicate_returns_none() {
-        let mut rewriter = RewriteToPartitionParsed {
-            partition_columns: partition_set(&["date"]),
-        };
-        let pred = Pred::gt(column_expr!("value"), Expr::literal(10));
-        let result = rewriter.transform_pred(&pred);
-        assert!(result.is_none());
     }
 }
