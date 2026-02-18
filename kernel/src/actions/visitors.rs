@@ -1,7 +1,7 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -429,17 +429,18 @@ impl RowVisitor for SidecarVisitor {
 /// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
 ///
 /// This visitor maintains the first entry for each domain it encounters. A domain_filter may be
-/// included to only retain the domain metadata for a specific domain (in order to bound memory
-/// requirements).
+/// included to only retain domain metadata for a specific set of domains (in order to bound memory
+/// requirements and enable early termination once all requested domains are found).
 #[derive(Debug, Default)]
 pub(crate) struct DomainMetadataVisitor {
     domain_metadatas: DomainMetadataMap,
-    domain_filter: Option<String>,
+    domain_filter: Option<HashSet<String>>,
 }
 
 impl DomainMetadataVisitor {
-    /// Create a new visitor. When domain_filter is set then we only retain
-    pub(crate) fn new(domain_filter: Option<String>) -> Self {
+    /// Create a new visitor. When domain_filter is set then we only retain domain metadata for
+    /// domains in the provided set, enabling early termination once all requested domains are found.
+    pub(crate) fn new(domain_filter: Option<HashSet<String>>) -> Self {
         DomainMetadataVisitor {
             domain_filter,
             ..Default::default()
@@ -467,8 +468,13 @@ impl DomainMetadataVisitor {
         })
     }
 
+    /// Returns true if a domain filter is set and all requested domains have been found.
+    /// This is used to enable early termination of log replay once all N requested domains
+    /// have been discovered.
     pub(crate) fn filter_found(&self) -> bool {
-        self.domain_filter.is_some() && !self.domain_metadatas.is_empty()
+        self.domain_filter
+            .as_ref()
+            .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
     pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
@@ -490,9 +496,9 @@ impl RowVisitor for DomainMetadataVisitor {
         for i in 0..row_count {
             let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
             if let Some(domain) = domain {
-                // if caller requested a specific domain then only visit matches
+                // if caller requested specific domains then only visit matches
                 let filter = self.domain_filter.as_ref();
-                if filter.is_none_or(|requested| requested == &domain) {
+                if filter.is_none_or(|requested| requested.contains(&domain)) {
                     let domain_metadata =
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
                     self.domain_metadatas
@@ -1116,7 +1122,8 @@ mod tests {
         assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering
-        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["zach3".to_string()])));
         domain_metadata_visitor
             .visit_rows_of(commit_1.as_ref())
             .unwrap();
@@ -1137,7 +1144,8 @@ mod tests {
         assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering for a domain that is not present
-        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["notexist".to_string()])));
         domain_metadata_visitor
             .visit_rows_of(commit_1.as_ref())
             .unwrap();
