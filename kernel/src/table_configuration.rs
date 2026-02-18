@@ -238,8 +238,6 @@ impl TableConfiguration {
     /// Per the Delta protocol, clustering columns are always included in statistics,
     /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
     /// settings.
-    #[allow(unused)]
-    #[internal_api]
     pub(crate) fn stats_column_names_logical(
         &self,
         clustering_columns: Option<&[ColumnName]>,
