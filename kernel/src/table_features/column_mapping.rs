@@ -317,10 +317,34 @@ pub(crate) fn get_top_level_column_physical_name(
     Ok(field.physical_name(mode).to_string())
 }
 
+/// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
+///
+/// Returns `None` if the column name cannot be resolved in the schema.
+pub(crate) fn get_any_level_column_physical_name(
+    schema: &StructType,
+    col_name: &ColumnName,
+    column_mapping_mode: ColumnMappingMode,
+) -> Option<ColumnName> {
+    let mut physical_path = Vec::new();
+    let mut current_struct: Option<&StructType> = Some(schema);
+
+    for segment in col_name.path() {
+        let field = current_struct?.field(segment)?;
+        physical_path.push(field.physical_name(column_mapping_mode).to_string());
+        current_struct = match field.data_type() {
+            DataType::Struct(s) => Some(s),
+            _ => None,
+        };
+    }
+
+    Some(ColumnName::new(physical_path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::StructType;
+    use crate::expressions::ColumnName;
+    use crate::schema::{DataType, StructType};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -541,8 +565,6 @@ mod tests {
 
     #[test]
     fn test_assign_column_mapping_metadata_simple() {
-        use crate::schema::DataType;
-
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::STRING, true),
@@ -580,8 +602,6 @@ mod tests {
 
     #[test]
     fn test_assign_column_mapping_metadata_rejects_existing_id() {
-        use crate::schema::DataType;
-
         // Schema with pre-existing column mapping metadata should be rejected
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false).add_metadata([
@@ -611,8 +631,6 @@ mod tests {
 
     #[test]
     fn test_assign_column_mapping_metadata_nested_struct() {
-        use crate::schema::DataType;
-
         let inner = StructType::new_unchecked([
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::STRING, true),
@@ -706,7 +724,6 @@ mod tests {
     fn test_assign_column_mapping_metadata_map_with_struct_key_and_value() {
         // Test: map<struct<k: int>, struct<v: int>>
         // Both key and value are structs that need column mapping metadata
-        use crate::schema::DataType;
 
         let key_struct =
             StructType::new_unchecked([StructField::new("k", DataType::INTEGER, false)]);
@@ -759,7 +776,6 @@ mod tests {
     #[test]
     fn test_assign_column_mapping_metadata_array_with_struct_element() {
         // Test: array<struct<elem: int>>
-        use crate::schema::DataType;
 
         let elem_struct =
             StructType::new_unchecked([StructField::new("elem", DataType::INTEGER, false)]);
@@ -801,7 +817,6 @@ mod tests {
     #[test]
     fn test_assign_column_mapping_metadata_double_nested_array() {
         // Test: array<array<struct<deep: int>>>
-        use crate::schema::DataType;
 
         let deep_struct =
             StructType::new_unchecked([StructField::new("deep", DataType::INTEGER, false)]);
@@ -847,7 +862,6 @@ mod tests {
     fn test_assign_column_mapping_metadata_array_map_array_struct_nesting() {
         // Test: array<map<array<struct<k: int>>, array<struct<v: int>>>>
         // Deeply nested array-map-array-struct combination
-        use crate::schema::DataType;
 
         let key_struct =
             StructType::new_unchecked([StructField::new("k", DataType::INTEGER, false)]);
@@ -914,9 +928,74 @@ mod tests {
     }
 
     #[test]
-    fn test_get_top_level_column_physical_name_no_mapping() {
-        use crate::schema::DataType;
+    fn test_get_any_level_column_physical_name_success() {
+        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
+            .add_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-inner-y".to_string()),
+            )])]);
 
+        let schema = StructType::new_unchecked([StructField::new(
+            "a",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            MetadataValue::String("col-outer-a".to_string()),
+        )])]);
+
+        // Top-level column
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a"]),
+            ColumnMappingMode::Name,
+        );
+        assert_eq!(result, Some(ColumnName::new(["col-outer-a"])));
+
+        // Nested column
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "y"]),
+            ColumnMappingMode::Name,
+        );
+        assert_eq!(
+            result,
+            Some(ColumnName::new(["col-outer-a", "col-inner-y"]))
+        );
+
+        // No mapping mode returns logical names
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "y"]),
+            ColumnMappingMode::None,
+        );
+        assert_eq!(result, Some(ColumnName::new(["a", "y"])));
+    }
+
+    #[test]
+    fn test_get_any_level_column_physical_name_returns_none() {
+        let schema = StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
+
+        // Non-existent top-level column
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["nonexistent"]),
+            ColumnMappingMode::None,
+        );
+        assert_eq!(result, None);
+
+        // Nested path on a non-struct field
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "b"]),
+            ColumnMappingMode::None,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_top_level_column_physical_name_no_mapping() {
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::STRING, true),
@@ -931,8 +1010,6 @@ mod tests {
 
     #[test]
     fn test_get_top_level_column_physical_name_with_mapping() {
-        use crate::schema::DataType;
-
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false).add_metadata([
                 (
@@ -965,8 +1042,6 @@ mod tests {
 
     #[test]
     fn test_get_top_level_column_physical_name_not_found() {
-        use crate::schema::DataType;
-
         let schema = StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
 
         let result =
