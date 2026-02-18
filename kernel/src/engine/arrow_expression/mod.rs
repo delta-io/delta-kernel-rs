@@ -79,6 +79,7 @@ impl Scalar {
         }
 
         // Use append_value in a loop for builders without batch append (String, Binary)
+        // TODO: Remove after https://github.com/apache/arrow-rs/pull/9426 gets in
         macro_rules! append_val_as {
             ($t:ty, $val:expr) => {{
                 let builder = builder_as!($t);
@@ -115,6 +116,7 @@ impl Scalar {
                 for (builder, value) in field_builders.zip(data.values()) {
                     value.append_to(builder, num_rows)?;
                 }
+                // TODO: Loop can be removed after: https://github.com/apache/arrow-rs/pull/9430
                 for _ in 0..num_rows {
                     builder.append(true);
                 }
@@ -203,6 +205,7 @@ impl Scalar {
                 // StructBuilder and ListBuilder both provide it.
                 let builder =
                     builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
+                // TODO: Can be removed after https://github.com/apache/arrow-rs/pull/9432
                 for _ in 0..num_rows {
                     builder.append(false)?;
                 }
