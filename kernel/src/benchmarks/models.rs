@@ -31,10 +31,26 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
 }
 
 //Table info JSON files are located at the root of each table directory and act as documentation for the table
-#[derive(Clone, Deserialize, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TableInfo {
     pub name: String,
     pub description: Option<String>,
+}
+
+// Specs define the operation performed on a table - defines what operation at what version (e.g. read at version 0)
+// There will be multiple specs for a given table
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Spec {
+    Read {
+        version: Option<i64>, //If version is None, read at latest version
+    },
+}
+
+//For Read specs, we will either run a read data operation or a read metadata operation
+pub enum ReadOperation {
+    ReadData,
+    ReadMetadata,
 }
 
 #[cfg(test)]
@@ -77,6 +93,28 @@ mod tests {
     )]
     fn test_deserialize_table_info_errors(#[case] json: &str, #[case] expected_msg: &str) {
         let error = serde_json::from_str::<TableInfo>(json).unwrap_err();
+        assert!(error.to_string().contains(expected_msg));
+    }
+
+    #[rstest]
+    #[case(r#"{"type": "read", "version": 5}"#, Some(5))]
+    #[case(r#"{"type": "read"}"#, None)]
+    #[case(
+        r#"{"type": "read", "version": 7, "extra_field": "should be ignored"}"#,
+        Some(7)
+    )]
+    fn test_deserialize_spec_read(#[case] json: &str, #[case] expected_version: Option<i64>) {
+        let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize read spec");
+
+        let Spec::Read { version } = spec;
+        assert_eq!(version, expected_version);
+    }
+
+    #[rstest]
+    #[case(r#"{"version": 10}"#, "missing field")]
+    #[case(r#"{"type": "write", "version": 3}"#, "unknown variant")]
+    fn test_deserialize_spec_errors(#[case] json: &str, #[case] expected_msg: &str) {
+        let error = serde_json::from_str::<Spec>(json).unwrap_err();
         assert!(error.to_string().contains(expected_msg));
     }
 }
