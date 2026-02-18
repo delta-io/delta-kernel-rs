@@ -6,7 +6,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::benchmarks::models::{
-    default_read_configs, ReadConfig, ReadOperation, Spec, TableInfo, WorkloadSpecVariant,
+    default_read_configs, ReadConfig, ReadOperation, Spec, WorkloadSpecVariant,
 };
 use delta_kernel::benchmarks::runners::ReadMetadataRunner;
 use delta_kernel::benchmarks::utils::load_all_workloads;
