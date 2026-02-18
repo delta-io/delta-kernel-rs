@@ -18,4 +18,5 @@ delta_kernel = { path = "../../../kernel", features = [
   "internal-api",
 ] }
 object_store = { version = "0.12.3", features = ["aws", "azure", "gcp", "http"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"

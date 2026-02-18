@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, instrument};
 use url::Url;
 
 use self::log_replay::get_scan_metadata_transform_expr;
@@ -506,6 +506,7 @@ impl Scan {
     ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
     ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
     ///   from disk is already in the correct logical state.
+    #[instrument(name = "scan.metadata", skip_all, err)]
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,

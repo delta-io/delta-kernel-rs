@@ -4,10 +4,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::{
-    arrow::array::RecordBatch, engine::default::executor::tokio::TokioBackgroundExecutor,
-    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine,
-    engine::default::DefaultEngineBuilder, scan::Scan, schema::MetadataColumnSpec, DeltaResult,
-    SnapshotRef,
+    arrow::array::RecordBatch,
+    engine::default::executor::tokio::TokioBackgroundExecutor,
+    engine::default::storage::store_from_url_opts,
+    engine::default::DefaultEngine,
+    engine::default::DefaultEngineBuilder,
+    metrics::{MetricEvent, MetricsReporter},
+    scan::Scan,
+    schema::MetadataColumnSpec,
+    DeltaResult, SnapshotRef,
 };
 
 use object_store::{
@@ -15,6 +20,30 @@ use object_store::{
     DynObjectStore, ObjectStoreScheme,
 };
 use url::Url;
+
+/// A simple metrics reporter that prints events to stdout.
+#[derive(Debug)]
+pub struct PrintingMetricsReporter;
+
+impl MetricsReporter for PrintingMetricsReporter {
+    fn report(&self, event: MetricEvent) {
+        println!("[metric] {event}");
+    }
+}
+
+/// Initialize tracing with an env-filter subscriber.
+///
+/// Set the `RUST_LOG` environment variable to control verbosity, e.g.:
+/// - `RUST_LOG=debug` for all debug output
+/// - `RUST_LOG=delta_kernel=debug` for kernel-only debug output
+pub fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing_subscriber::filter::LevelFilter::WARN.into()),
+        )
+        .init();
+}
 
 #[derive(Args)]
 pub struct LocationArgs {
@@ -122,11 +151,13 @@ where
     }
 }
 
-/// Get an engine configured to read table at `url` and `LocationArgs`
+/// Get an engine configured to read table at `url` and `LocationArgs`.
+/// Includes a [`PrintingMetricsReporter`] that prints metric events to stdout.
 pub fn get_engine(
     url: &Url,
     args: &LocationArgs,
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
+    let reporter = Arc::new(PrintingMetricsReporter);
     if args.env_creds {
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
             delta_kernel::Error::Generic(format!("Object store could not parse url: {}", e))
@@ -157,13 +188,17 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
+        Ok(DefaultEngineBuilder::new(Arc::new(store))
+            .with_metrics_reporter(reporter)
+            .build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, opts)?).build())
+        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, opts)?)
+            .with_metrics_reporter(reporter)
+            .build())
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -173,7 +208,11 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, options)?).build())
+        Ok(
+            DefaultEngineBuilder::new(store_from_url_opts(url, options)?)
+                .with_metrics_reporter(reporter)
+                .build(),
+        )
     }
 }
 
