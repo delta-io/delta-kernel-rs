@@ -1,9 +1,13 @@
 use super::*;
-use crate::expressions::{column_name, column_pred};
-use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
+use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
+use crate::expressions::{column_expr, column_name, column_pred, Expression};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use crate::parquet::file::properties::WriterProperties;
 use crate::Predicate;
 use std::fs::File;
+use std::sync::Arc;
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
 ///
@@ -436,4 +440,171 @@ fn test_get_stat_values() {
                 .unwrap()
         )
     );
+}
+
+#[test]
+fn test_checkpoint_layout_detection() {
+    let value_field = Field::new("value", ArrowDataType::Int64, true);
+    let min_values = StructArray::new(
+        Fields::from(vec![value_field.clone()]),
+        vec![Arc::new(Int64Array::from(vec![Some(0)])) as ArrayRef],
+        None,
+    );
+    let max_values = StructArray::new(
+        Fields::from(vec![value_field.clone()]),
+        vec![Arc::new(Int64Array::from(vec![Some(10)])) as ArrayRef],
+        None,
+    );
+    let stats_parsed = StructArray::new(
+        Fields::from(vec![
+            Field::new(
+                "minValues",
+                ArrowDataType::Struct(Fields::from(vec![value_field.clone()])),
+                true,
+            ),
+            Field::new(
+                "maxValues",
+                ArrowDataType::Struct(Fields::from(vec![value_field])),
+                true,
+            ),
+        ]),
+        vec![Arc::new(min_values) as ArrayRef, Arc::new(max_values) as ArrayRef],
+        None,
+    );
+    let add = StructArray::new(
+        Fields::from(vec![Field::new(
+            "stats_parsed",
+            ArrowDataType::Struct(stats_parsed.fields().clone()),
+            true,
+        )]),
+        vec![Arc::new(stats_parsed) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "add",
+            ArrowDataType::Struct(add.fields().clone()),
+            true,
+        )])),
+        vec![Arc::new(add) as ArrayRef],
+    )
+    .unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    {
+        let mut writer = ArrowWriter::try_new(tmp.reopen().unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let checkpoint_md = ArrowReaderMetadata::load(&tmp.reopen().unwrap(), Default::default()).unwrap();
+    assert!(has_checkpoint_stats_layout(checkpoint_md.metadata().row_group(0)));
+
+    let regular = File::open(
+        "./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet",
+    )
+    .unwrap();
+    let regular_md = ArrowReaderMetadata::load(&regular, Default::default()).unwrap();
+    assert!(!has_checkpoint_stats_layout(regular_md.metadata().row_group(0)));
+}
+
+#[test]
+fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
+    fn checkpoint_batch(min: Option<i64>, max: Option<i64>) -> RecordBatch {
+        let value_field = Field::new("value", ArrowDataType::Int64, true);
+        let min_values_field = Field::new(
+            "minValues",
+            ArrowDataType::Struct(Fields::from(vec![value_field.clone()])),
+            true,
+        );
+        let max_values_field = Field::new(
+            "maxValues",
+            ArrowDataType::Struct(Fields::from(vec![value_field.clone()])),
+            true,
+        );
+        let stats_parsed_field = Field::new(
+            "stats_parsed",
+            ArrowDataType::Struct(Fields::from(vec![
+                min_values_field.clone(),
+                max_values_field.clone(),
+            ])),
+            true,
+        );
+        let add_field = Field::new(
+            "add",
+            ArrowDataType::Struct(Fields::from(vec![stats_parsed_field.clone()])),
+            true,
+        );
+
+        let min_values = StructArray::new(
+            Fields::from(vec![value_field.clone()]),
+            vec![Arc::new(Int64Array::from(vec![min])) as ArrayRef],
+            None,
+        );
+        let max_values = StructArray::new(
+            Fields::from(vec![value_field]),
+            vec![Arc::new(Int64Array::from(vec![max])) as ArrayRef],
+            None,
+        );
+        let stats_parsed = StructArray::new(
+            Fields::from(vec![min_values_field, max_values_field]),
+            vec![Arc::new(min_values) as ArrayRef, Arc::new(max_values) as ArrayRef],
+            None,
+        );
+        let add = StructArray::new(
+            Fields::from(vec![stats_parsed_field]),
+            vec![Arc::new(stats_parsed) as ArrayRef],
+            None,
+        );
+
+        let schema = Arc::new(ArrowSchema::new(vec![add_field]));
+        RecordBatch::try_new(schema, vec![Arc::new(add) as ArrayRef]).unwrap()
+    }
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    // Row group 0: min is complete but max is missing.
+    let batch1 = checkpoint_batch(Some(100), None);
+    // Row group 1: max is complete but min is missing.
+    let batch2 = checkpoint_batch(None, Some(10));
+    {
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(1)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            tmp.reopen().unwrap(),
+            batch1.schema(),
+            Some(props.into()),
+        )
+        .unwrap();
+        writer.write(&batch1).unwrap();
+        writer.write(&batch2).unwrap();
+        writer.close().unwrap();
+    }
+
+    let file = tmp.reopen().unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+    assert_eq!(metadata.metadata().num_row_groups(), 2);
+
+    let pred_gt = Predicate::gt(column_expr!("value"), Expression::literal(50i64));
+    // GT relies on maxValues. With max missing in row group 0, pruning fails (group is kept).
+    assert!(CheckpointStatsRowGroupFilter::apply(
+        metadata.metadata().row_group(0),
+        &pred_gt
+    ));
+    // maxValues is complete in row group 1 and max=10 proves no row can satisfy value > 50.
+    assert!(!CheckpointStatsRowGroupFilter::apply(
+        metadata.metadata().row_group(1),
+        &pred_gt
+    ));
+
+    let pred_lt = Predicate::lt(column_expr!("value"), Expression::literal(50i64));
+    // LT relies on minValues. min=100 in row group 0 proves no row can satisfy value < 50.
+    assert!(!CheckpointStatsRowGroupFilter::apply(
+        metadata.metadata().row_group(0),
+        &pred_lt
+    ));
+    // With min missing in row group 1, pruning fails (group is kept).
+    assert!(CheckpointStatsRowGroupFilter::apply(
+        metadata.metadata().row_group(1),
+        &pred_lt
+    ));
 }
