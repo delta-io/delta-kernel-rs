@@ -1,13 +1,12 @@
 use clap::{Parser, Subcommand};
+use delta_kernel_unitycatalog::{Commit, CommitsRequest, UCCommitsClient, UCCommitsRestClient};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use uc_client::{
-    models::{commits::Commit, credentials::Operation, CommitsRequest},
-    UCClient, UCCommitsClient, UCCommitsRestClient,
-};
+use unity_catalog_client::models::credentials::Operation;
+use unity_catalog_client::UCClient;
 
 #[derive(Parser)]
-#[command(name = "uc-client")]
+#[command(name = "uc-cli")]
 #[command(about = "Unity Catalog CLI client", long_about = None)]
 struct Cli {
     /// Unity Catalog URL
@@ -86,13 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Create shared config
-    let config = uc_client::ClientConfig::build(&cli.workspace_url, &cli.token)
+    let config = unity_catalog_client::ClientConfig::build(&cli.workspace_url, &cli.token)
         .with_timeout(Duration::from_secs(60))
         .with_max_retries(3)
         .build()?;
 
     // Create shared HTTP client and UC clients
-    let http_client = uc_client::http::build_http_client(&config)?;
+    let http_client = unity_catalog_client::http::build_http_client(&config)?;
     let uc_client = UCClient::with_http_client(http_client.clone(), config.clone());
     let uc_commits_client = UCCommitsRestClient::with_http_client(http_client, config);
 
@@ -103,11 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match uc_client.get_table(&name).await {
                 Ok(table) => {
-                    println!("\n✓ Table metadata retrieved successfully\n");
+                    println!("\nTable metadata retrieved successfully\n");
                     println!("{}", table);
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to get table: {}", e);
+                    eprintln!("Failed to get table: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -124,14 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let table = match uc_client.get_table(&name).await {
                 Ok(table) => {
                     println!(
-                        "✓ Table resolved: {} (ID: {})",
+                        "Table resolved: {} (ID: {})",
                         table.full_name(),
                         table.table_id
                     );
                     table
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to resolve table: {}", e);
+                    eprintln!("Failed to resolve table: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -150,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match uc_commits_client.get_commits(request).await {
                 Ok(response) => {
-                    println!("\n✓ Commits retrieved successfully\n");
+                    println!("\nCommits retrieved successfully\n");
                     println!("Table:           {}", table.full_name());
                     println!("Latest Version:  {}", response.latest_table_version);
 
@@ -162,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to get commits: {}", e);
+                    eprintln!("Failed to get commits: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -179,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match uc_client.get_credentials(&table_id, operation).await {
                 Ok(creds) => {
-                    println!("\n✓ Credentials retrieved successfully\n");
+                    println!("\nCredentials retrieved successfully\n");
                     println!("URL:              {}", creds.url);
                     let expires_str = creds
                         .expiration_as_datetime()
@@ -196,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if creds.is_expired() {
-                        println!("⚠ WARNING: Credentials are already expired!");
+                        println!("WARNING: Credentials are already expired!");
                     }
 
                     if let Some(aws_creds) = &creds.aws_temp_credentials {
@@ -213,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to get credentials: {}", e);
+                    eprintln!("Failed to get credentials: {}", e);
                     std::process::exit(1);
                 }
             }
