@@ -9,6 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -316,6 +317,19 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         self.logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
+    }
+}
+
+/// Prefixes all column references in a predicate with a fixed path.
+/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
+/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+struct PrefixColumns {
+    prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixColumns {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Owned(self.prefix.join(name)))
     }
 }
 
@@ -632,11 +646,12 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
+        let meta_predicate = self.build_actions_meta_predicate();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
-            None,
+            meta_predicate,
             self.state_info
                 .physical_stats_schema
                 .as_ref()
@@ -681,20 +696,51 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
-        // when ~every checkpoint file will contain the adds and removes we are looking for.
+        let meta_predicate = self.build_actions_meta_predicate();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
-                None,
+                meta_predicate,
                 self.state_info
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
+    }
+
+    /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
+    ///
+    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
+    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
+    /// references are prefixed with `add.stats_parsed` to match the physical column layout
+    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
+    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
+    /// contain matching files.
+    ///
+    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
+    /// values. Without them, row groups containing files with missing stats (null stat columns)
+    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+            return None;
+        };
+        self.state_info.physical_stats_schema.as_ref()?;
+
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+
+        let mut prefixer = PrefixColumns {
+            prefix: ColumnName::new(["add", "stats_parsed"]),
+        };
+        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        Some(Arc::new(prefixed.into_owned()))
     }
 
     /// Start a parallel scan metadata processing for the table.
