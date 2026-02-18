@@ -166,7 +166,4 @@ harness = false
 
 [[bench]]
 name = "expression_bench"
-
-[[bench]]
-name = "workload_bench"
 harness = false
