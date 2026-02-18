@@ -8,7 +8,8 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray};
+use delta_kernel::actions::get_log_add_schema;
+use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -17,7 +18,8 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -3042,12 +3044,55 @@ async fn test_write_parquet_rejects_unknown_partition_column(
             "Error should mention the unknown column name, got: {err_msg}"
         );
     }
+    Ok(())
+}
 // ===== Column Mapping Write E2E Tests =====
+
+/// Resolves a logical field path (e.g. `["address", "street"]`) to its physical names
+/// using the snapshot schema and column mapping mode.
+fn resolve_physical_path(schema: &StructType, path: &[&str]) -> Vec<String> {
+    let mut current_schema = schema;
+    let mut physical = Vec::new();
+    for (i, segment) in path.iter().enumerate() {
+        let field = current_schema.field(segment).unwrap_or_else(|| {
+            panic!("field '{}' not found in schema", segment)
+        });
+        let name = match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+            Some(MetadataValue::String(s)) => s.clone(),
+            _ => segment.to_string(),
+        };
+        physical.push(name);
+        if i + 1 < path.len() {
+            current_schema = match field.data_type() {
+                DataType::Struct(s) => s,
+                _ => panic!("expected struct at '{}'", segment),
+            };
+        }
+    }
+    physical
+}
+
+/// Asserts that a field exists at the given physical path in the footer schema.
+fn assert_footer_has_field(footer_schema: &StructType, physical_path: &[String]) {
+    let path_str = physical_path.join(".");
+    let mut current = footer_schema;
+    for (i, name) in physical_path.iter().enumerate() {
+        let field = current
+            .field(name)
+            .unwrap_or_else(|| panic!("footer missing field '{path_str}'"));
+        if i + 1 < physical_path.len() {
+            current = match field.data_type() {
+                DataType::Struct(s) => s,
+                _ => panic!("expected struct at '{path_str}'"),
+            };
+        }
+    }
+}
 
 /// Returns a nested schema with 6 top-level fields including a nested struct
 fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::LONG),
+        StructField::not_null("row_number", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
         StructField::nullable("score", DataType::DOUBLE),
         StructField::nullable(
@@ -3124,7 +3169,7 @@ fn nested_batches(schema: &SchemaRef) -> Result<Vec<RecordBatch>, Box<dyn std::e
 /// Writes a RecordBatch to a table and commits. Returns the post-commit snapshot.
 async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
@@ -3150,40 +3195,53 @@ async fn write_batch_to_table(
     }
 }
 
-/// Reads all add.stats from a snapshot's log segment using internal API, returning parsed JSON.
-fn read_add_stats(
+/// An add info extracted from the log segment.
+struct AddInfo {
+    path: String,
+    stats: Option<serde_json::Value>,
+}
+/// Reads all add infos from a snapshot's log segment using internal API.
+fn read_add_infos(
     snapshot: &Snapshot,
     engine: &impl Engine,
-) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    use delta_kernel::actions::get_log_add_schema;
-    use delta_kernel::arrow::array::Array;
-
+) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = get_log_add_schema().clone();
     let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
-    let mut stats = Vec::new();
+    let mut actions = Vec::new();
     for batch_result in batches {
         let actions_batch = batch_result?;
         let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
         let record_batch = engine_data.record_batch();
-        let add_idx = match record_batch.schema().index_of("add").ok() {
-            Some(idx) => idx,
+        let add_struct = match record_batch
+            .schema()
+            .index_of("add")
+            .ok()
+            .and_then(|idx| record_batch.column(idx).as_any().downcast_ref::<StructArray>())
+        {
+            Some(s) => s,
             None => continue,
         };
-        let arr = record_batch
-            .column(add_idx)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .and_then(|s| s.column_by_name("stats"))
+        let path_arr = add_struct
+            .column_by_name("path")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        if let Some(arr) = arr {
-            for i in 0..arr.len() {
-                if !arr.is_null(i) {
-                    stats.push(serde_json::from_str(arr.value(i))?);
-                }
+        let stats_arr = add_struct
+            .column_by_name("stats")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let len = add_struct.len();
+        for i in 0..len {
+            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
+                let stats = stats_arr
+                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                    .map(serde_json::from_str)
+                    .transpose()?;
+                actions.push(AddInfo {
+                    path: path.to_string(),
+                    stats,
+                });
             }
         }
     }
-    Ok(stats)
+    Ok(actions)
 }
 
 /// Helper to create a table with optional column mapping mode via `create_table_txn`.
@@ -3191,18 +3249,16 @@ fn read_add_stats(
 fn create_cm_table(
     table_path: &str,
     schema: SchemaRef,
-    cm_mode: Option<ColumnMappingMode>,
+    cm_mode: ColumnMappingMode,
     engine: &impl Engine,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut builder = create_table_txn(table_path, schema, "cm-e2e");
-    if let Some(mode) = cm_mode {
-        let mode_str = match mode {
-            ColumnMappingMode::None => "none",
-            ColumnMappingMode::Id => "id",
-            ColumnMappingMode::Name => "name",
-        };
-        builder = builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
-    }
+    let mode_str = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Id => "id",
+        ColumnMappingMode::Name => "name",
+    };
+    builder = builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
     let create_result = builder
         .build(engine, Box::new(FileSystemCommitter::new()))?
         .commit(engine)?;
@@ -3217,90 +3273,68 @@ fn create_cm_table(
 
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
-/// 3. Removes one file and verifies remove.stats column names
-/// 4. Checkpoints and verifies add.stats column names in the checkpoint
-/// 5. Reads a parquet footer to verify physical names/IDs
-/// 6. Reads data back to verify correctness
+/// 3. Checkpoints and verifies add.stats column names in the checkpoint
+/// 4. Reads a parquet footer to verify physical names/IDs
+/// 5. Reads data back to verify correctness
 #[rstest::rstest]
-#[case::cm_missed(None)]
-#[case::cm_none(Some(ColumnMappingMode::None))]
-#[case::cm_id(Some(ColumnMappingMode::Id))]
-#[case::cm_name(Some(ColumnMappingMode::Name))]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[case::cm_name(ColumnMappingMode::Name)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_column_mapping_write_e2e(
-    #[case] cm_mode: Option<ColumnMappingMode>,
+async fn test_column_mapping_write(
+    #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = nested_schema()?;
 
-    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
 
     // Step 1: Create table
     let mut latest_snapshot =
         create_cm_table(&table_path, schema.clone(), cm_mode, engine.as_ref())?;
 
-    // Determine the effective CM mode for assertions
-    let effective_cm_mode = cm_mode.unwrap_or(ColumnMappingMode::None);
-
-    // Helper: get expected stats key for a top-level field
-    let expected_stats_key = |field_name: &str| -> String {
-        if effective_cm_mode == ColumnMappingMode::None {
-            return field_name.to_string();
-        }
-        let snapshot_schema = latest_snapshot.schema();
-        let field = snapshot_schema.field(field_name).unwrap();
-        match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-            Some(MetadataValue::String(name)) => name.clone(),
-            _ => field_name.to_string(),
-        }
-    };
-    let id_stats_key = expected_stats_key("id");
-    let name_stats_key = expected_stats_key("name");
+    // Resolve physical names for stats verification (top-level and nested)
+    let snapshot_schema = latest_snapshot.schema();
+    let row_number_physical = resolve_physical_path(&snapshot_schema, &["row_number"]);
+    let street_physical = resolve_physical_path(&snapshot_schema, &["address", "street"]);
 
     // Step 2: Write two batches
     for data in nested_batches(&schema)? {
         latest_snapshot = write_batch_to_table(&latest_snapshot, engine.as_ref(), data).await?;
     }
 
-    // Step 4: Checkpoint
+    // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
     snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
-
-    // Verify add.stats in checkpoint uses correct column names
-    // Build a fresh snapshot that reads from the checkpoint
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let stats_jsons = read_add_stats(&ckpt_snapshot, engine.as_ref())?;
-    let stats = stats_jsons
+    let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
+    let stats = add_actions
         .iter()
+        .filter_map(|a| a.stats.as_ref())
         .find(|s| s.get("minValues").is_some())
         .expect("checkpoint should have at least one add.stats with minValues");
-    assert!(stats["minValues"].get(&id_stats_key).is_some());
-    assert!(stats["minValues"].get(&name_stats_key).is_some());
+    // Top-level: minValues.<row_number_physical>
+    assert!(stats["minValues"].get(&row_number_physical[0]).is_some());
+    // Nested: minValues.<address_physical>.<street_physical>
+    assert!(stats["minValues"][&street_physical[0]]
+        .get(&street_physical[1])
+        .is_some());
 
-    // === Assertion 7.3: Read parquet footer to verify physical names and field IDs ===
+    // Step 4: Read parquet footer to verify physical names
     {
-        // Get the path of one of the parquet data files from the commit log
-        let commit_url = table_url.join("_delta_log/00000000000000000001.json")?;
-        let commit_bytes = store
-            .get(&Path::from_url_path(commit_url.path())?)
-            .await?
-            .bytes()
-            .await?;
-        let actions: Vec<serde_json::Value> =
-            serde_json::Deserializer::from_slice(&commit_bytes)
-                .into_iter::<serde_json::Value>()
-                .try_collect()?;
-        let add_action = actions
-            .iter()
-            .find(|a| a.get("add").is_some())
-            .expect("should have add action");
-        let parquet_path = add_action["add"]["path"].as_str().unwrap();
+        let parquet_path = &add_actions.first().expect("should have at least one add file").path;
         let parquet_url = table_url.join(parquet_path)?;
 
-        // Get actual file size for the footer reader
         let obj_meta = store
             .head(&Path::from_url_path(parquet_url.path())?)
             .await?;
@@ -3308,45 +3342,15 @@ async fn test_column_mapping_write_e2e(
         let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
         let footer_schema = footer.schema;
 
-        match effective_cm_mode {
-            ColumnMappingMode::None => {
-                // Field names should be logical names
-                assert!(footer_schema.field("id").is_some(), "should have 'id' field");
-                assert!(footer_schema.field("name").is_some(), "should have 'name' field");
-                assert!(footer_schema.field("address").is_some(), "should have 'address' field");
-            }
-            ColumnMappingMode::Name | ColumnMappingMode::Id => {
-                // Field names should be physical names (col-UUID)
-                for field in footer_schema.fields() {
-                    assert!(
-                        field.name().starts_with("col-"),
-                        "In CM {:?} mode, parquet field name '{}' should start with 'col-'",
-                        effective_cm_mode,
-                        field.name()
-                    );
-                }
-                // Check field IDs in the footer schema
-                // In Name mode, field IDs should still be present as parquet.field.id
-                // In Id mode, field IDs are the primary resolution mechanism
-                // Note: Currently Id mode may not correctly write field IDs to parquet,
-                // but Name mode should work correctly.
-                if effective_cm_mode == ColumnMappingMode::Name {
-                    for field in footer_schema.fields() {
-                        // The parquet footer schema (converted back from Arrow) may or
-                        // may not have the field IDs depending on the Arrow writer behavior.
-                        // Just verify names are physical.
-                        assert!(
-                            field.name().starts_with("col-"),
-                            "Name mode: field '{}' should have physical name",
-                            field.name()
-                        );
-                    }
-                }
-            }
+        let snapshot_schema = latest_snapshot.schema();
+        // Verify top-level "row_number" and nested "address.street" use correct (physical) names
+        for path in [vec!["row_number"], vec!["address", "street"]] {
+            let physical = resolve_physical_path(&snapshot_schema, &path);
+            assert_footer_has_field(&footer_schema, &physical);
         }
     }
 
-    // === Assertion 7.4: Read parquet data back to verify correctness ===
+    // Step 5: Read data back to verify correctness
     {
         let post_ckpt_snapshot =
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -3360,27 +3364,39 @@ async fn test_column_mapping_write_e2e(
             })
             .collect();
 
-        // One file was removed (3 rows), one remains (3 rows)
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 3, "Should have 3 rows after removing one file");
+        let result_schema = batches[0].schema();
+        let combined =
+            delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
+        assert_eq!(combined.num_rows(), 6, "Should have 6 rows from two written batches");
 
-        // Schema should use logical column names regardless of CM mode
-        for batch in &batches {
-            let schema = batch.schema();
-            let field_names: Vec<_> = schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect();
-            assert!(
-                field_names.contains(&"id"),
-                "Read data should have logical column 'id', got: {field_names:?}"
-            );
-            assert!(
-                field_names.contains(&"address"),
-                "Read data should have logical column 'address', got: {field_names:?}"
-            );
-        }
+        // Verify logical column names and data values
+        // Top-level: row_number should contain [1..=6]
+        let row_numbers = combined
+            .column_by_name("row_number")
+            .expect("should have logical column 'row_number'")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("row_number should be Int64");
+        let mut vals: Vec<i64> = (0..row_numbers.len()).map(|i| row_numbers.value(i)).collect();
+        vals.sort();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+
+        // Nested: address.street should contain ["st1"..="st6"]
+        let address = combined
+            .column_by_name("address")
+            .expect("should have logical column 'address'")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("address should be a struct");
+        let streets = address
+            .column_by_name("street")
+            .expect("address should have 'street'")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("street should be String");
+        let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
+        street_vals.sort();
+        assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
     }
 
     Ok(())
