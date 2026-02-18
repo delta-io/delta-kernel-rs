@@ -152,6 +152,22 @@ impl WorkloadSpecVariant {
     }
 }
 
+// Specs define the operation performed on a table - defines what operation at what version (e.g. read at version 0)
+// There will be multiple specs for a given table
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Spec {
+    Read {
+        version: Option<i64>, //If version is None, read at latest version
+    },
+}
+
+//For Read specs, we will either run a read data operation or a read metadata operation
+pub enum ReadOperation {
+    ReadData,
+    ReadMetadata,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
