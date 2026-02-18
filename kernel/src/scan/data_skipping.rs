@@ -423,16 +423,16 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     /// `IS NULL` → `OR(nullCount.col IS NULL, nullCount.col != 0)`:
     /// column vs literal — RowGroupFilter can evaluate via footer stats.
     ///
-    /// `IS NOT NULL` → `OR(nullCount.col IS NULL, nullCount.col != numRecords)`:
-    /// column vs column — RowGroupFilter cannot evaluate (it resolves one column at a
-    /// time), so it conservatively keeps the row group. Safe but no pruning benefit.
+    /// `IS NOT NULL` → returns `None`. The unguarded version produces
+    /// `nullCount.col != numRecords`, which is column vs column. The RowGroupFilter can
+    /// only resolve one column at a time, so it can never prune with this predicate.
+    // TODO(#1873): support cross-column comparisons in RowGroupFilter to enable IS NOT NULL pruning
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
+        if inverted {
+            return None; // IS NOT NULL: column vs column, can't prune (#1873)
+        }
         let nullcount = self.get_nullcount_stat(col)?;
-        let safe_to_skip = match inverted {
-            true => self.get_rowcount_stat()?, // IS NOT NULL: all-null
-            false => Expr::literal(0i64),      // IS NULL: no-null
-        };
-        let comparison = Pred::ne(nullcount.clone(), safe_to_skip);
+        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
         Some(Pred::or(Pred::is_null(nullcount), comparison))
     }
 
