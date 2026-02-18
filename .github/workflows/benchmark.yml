@@ -6,6 +6,8 @@ jobs:
   runBenchmark:
     name: run benchmark
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable
