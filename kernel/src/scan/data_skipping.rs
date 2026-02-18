@@ -441,15 +441,22 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     /// Produces a nullCount-based check for IS [NOT] NULL, wrapped in an IS NULL guard on the
     /// nullCount stat itself.
     ///
-    /// Example: `col_a IS NULL` →
+    /// **IS NULL** (`col_a IS NULL`) →
     /// ```text
     /// OR(nullCount.col_a IS NULL, nullCount.col_a != 0)
     /// ```
+    /// The comparison `nullCount.col_a != 0` is **column vs literal**, which the parquet
+    /// RowGroupFilter can evaluate using footer min/max stats for `nullCount.col_a`.
     ///
-    /// Example: `col_a IS NOT NULL` →
+    /// **IS NOT NULL** (`col_a IS NOT NULL`) →
     /// ```text
     /// OR(nullCount.col_a IS NULL, nullCount.col_a != numRecords)
     /// ```
+    /// The comparison `nullCount.col_a != numRecords` is **column vs column**. The parquet
+    /// RowGroupFilter can only resolve a single column to a scalar from footer stats, so it
+    /// cannot evaluate cross-column comparisons and conservatively keeps the row group. This
+    /// is safe (no false pruning) but means IS NOT NULL predicates do not enable row group
+    /// skipping at the checkpoint level.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let nullcount = self.get_nullcount_stat(col)?;
         let safe_to_skip = match inverted {
@@ -477,13 +484,16 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
 
     /// Delegates to the opaque predicate's own data skipping implementation, passing `self`
     /// so that any recursive evaluations also use guarded comparisons.
+    /// Opaque predicates are not supported for checkpoint row group skipping. The double-layer
+    /// data skipping (our predicate generation + parquet RowGroupFilter) makes it difficult to
+    /// reason about correctness for arbitrary opaque predicates.
     fn eval_pred_opaque(
         &self,
-        op: &OpaquePredicateOpRef,
-        exprs: &[Expr],
-        inverted: bool,
+        _op: &OpaquePredicateOpRef,
+        _exprs: &[Expr],
+        _inverted: bool,
     ) -> Option<Pred> {
-        op.as_data_skipping_predicate(self, exprs, inverted)
+        None
     }
 
     /// Combines sub-predicates with AND/OR. Unsupported sub-predicates (None) are replaced
