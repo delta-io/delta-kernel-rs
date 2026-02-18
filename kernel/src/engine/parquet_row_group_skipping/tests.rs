@@ -2,8 +2,8 @@ use super::*;
 use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::expressions::{column_expr, column_name, column_pred, Expression};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::file::properties::WriterProperties;
 use crate::Predicate;
 use std::fs::File;
@@ -466,7 +466,10 @@ fn test_checkpoint_layout_detection() {
                 true,
             ),
         ]),
-        vec![Arc::new(min_values) as ArrayRef, Arc::new(max_values) as ArrayRef],
+        vec![
+            Arc::new(min_values) as ArrayRef,
+            Arc::new(max_values) as ArrayRef,
+        ],
         None,
     );
     let add = StructArray::new(
@@ -494,15 +497,20 @@ fn test_checkpoint_layout_detection() {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
-    let checkpoint_md = ArrowReaderMetadata::load(&tmp.reopen().unwrap(), Default::default()).unwrap();
-    assert!(has_checkpoint_stats_layout(checkpoint_md.metadata().row_group(0)));
+    let checkpoint_md =
+        ArrowReaderMetadata::load(&tmp.reopen().unwrap(), Default::default()).unwrap();
+    assert!(has_checkpoint_stats_layout(
+        checkpoint_md.metadata().row_group(0)
+    ));
 
     let regular = File::open(
         "./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet",
     )
     .unwrap();
     let regular_md = ArrowReaderMetadata::load(&regular, Default::default()).unwrap();
-    assert!(!has_checkpoint_stats_layout(regular_md.metadata().row_group(0)));
+    assert!(!has_checkpoint_stats_layout(
+        regular_md.metadata().row_group(0)
+    ));
 }
 
 #[test]
@@ -545,7 +553,10 @@ fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
         );
         let stats_parsed = StructArray::new(
             Fields::from(vec![min_values_field, max_values_field]),
-            vec![Arc::new(min_values) as ArrayRef, Arc::new(max_values) as ArrayRef],
+            vec![
+                Arc::new(min_values) as ArrayRef,
+                Arc::new(max_values) as ArrayRef,
+            ],
             None,
         );
         let add = StructArray::new(
@@ -567,12 +578,8 @@ fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
         let props = WriterProperties::builder()
             .set_max_row_group_size(1)
             .build();
-        let mut writer = ArrowWriter::try_new(
-            tmp.reopen().unwrap(),
-            batch1.schema(),
-            Some(props.into()),
-        )
-        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(tmp.reopen().unwrap(), batch1.schema(), Some(props)).unwrap();
         writer.write(&batch1).unwrap();
         writer.write(&batch2).unwrap();
         writer.close().unwrap();

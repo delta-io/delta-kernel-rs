@@ -636,7 +636,7 @@ impl Scan {
             engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
-            None,
+            self.build_actions_meta_predicate(),
             self.state_info
                 .physical_stats_schema
                 .as_ref()
@@ -681,20 +681,31 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
-        // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
-                None,
+                self.build_actions_meta_predicate(),
                 self.state_info
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
+    }
+
+    /// Builds a checkpoint/sidecar metadata pruning predicate.
+    ///
+    /// We pass the original physical predicate as-is. The parquet row group skipping layer
+    /// decides how to evaluate it against footer stats for checkpoint-style layouts.
+    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+        if self.state_info.physical_stats_schema.is_some() {
+            if let PhysicalPredicate::Some(predicate, _) = &self.state_info.physical_predicate {
+                return Some(predicate.clone());
+            }
+        }
+        None
     }
 
     /// Start a parallel scan metadata processing for the table.

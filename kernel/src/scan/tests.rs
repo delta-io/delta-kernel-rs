@@ -748,3 +748,63 @@ fn test_scan_metadata_stats_columns_with_predicate() {
         "Should have processed at least one file with stats"
     );
 }
+
+#[test]
+fn test_build_actions_meta_predicate_with_physical_predicate() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .build()
+        .unwrap();
+
+    let meta_pred = scan.build_actions_meta_predicate();
+    assert!(
+        meta_pred.is_some(),
+        "should build a checkpoint meta-predicate when physical predicate + stats schema exist"
+    );
+    assert_eq!(
+        meta_pred.as_ref(),
+        Some(&predicate),
+        "meta-predicate should pass through the original physical predicate"
+    );
+}
+
+#[test]
+fn test_build_actions_meta_predicate_no_predicate() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    assert!(
+        scan.build_actions_meta_predicate().is_none(),
+        "no scan predicate should produce no checkpoint meta-predicate"
+    );
+}
+
+#[test]
+fn test_build_actions_meta_predicate_static_skip_all() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    // Static false maps to PhysicalPredicate::StaticSkipAll, so no meta-predicate should be built.
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::literal(false)))
+        .build()
+        .unwrap();
+
+    assert!(
+        scan.build_actions_meta_predicate().is_none(),
+        "static-skip-all scans should not build a checkpoint meta-predicate"
+    );
+}
