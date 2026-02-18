@@ -36,7 +36,7 @@ fn workload_benchmarks(c: &mut Criterion) {
 
     for spec_variant in spec_variants {
         match &spec_variant.spec {
-            Spec::Read { version: _ } => {
+            Spec::Read { .. } => {
                 for operation in [ReadOperation::ReadMetadata] {
                     let configs = choose_config(&spec_variant.table_info);
                     for config in configs {
