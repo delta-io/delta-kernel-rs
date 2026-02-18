@@ -985,26 +985,27 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 
 /// Tests checkpoint row group skipping end-to-end with the parquet row group filter.
 ///
-/// Shared parquet layout (3 row groups):
+/// Shared parquet layout (4 row groups):
 ///   - RG 0 (2 rows): maxValues.id = [100, NULL], nullCount.id = [5, NULL]
 ///   - RG 1 (1 row):  maxValues.id = 300, nullCount.id = 0
 ///   - RG 2 (1 row):  maxValues.id = 50, nullCount.id = 10
+///   - RG 3 (2 rows): maxValues.id = [150, 40], nullCount.id = [0, NULL]
 ///
-/// | Predicate    | RG 0 (2 rows)         | RG 1 (1 row)       | RG 2 (1 row)        | Total |
-/// |--------------|-----------------------|--------------------|--------------------- |-------|
-/// | id > 200     | keep (null max stats) | keep (max=300>200) | skip (max=50<200)    | 3     |
-/// | id IS NULL   | keep (nullCount>0)    | skip (nullCount=0) | keep (nullCount=10)  | 3     |
-/// | id IS NOT NULL | no predicate (col vs col, #1873)                                | 4     |
+/// | Predicate      | RG 0 (2 rows)         | RG 1 (1 row)       | RG 2 (1 row)       | RG 3 (2 rows)        | Total |
+/// |----------------|-----------------------|--------------------|--------------------|-----------------------|-------|
+/// | id > 200       | keep (null max stats) | keep (max=300>200) | skip (max=50<200)  | skip (max=150<200)    | 3     |
+/// | id IS NULL     | keep (nullCount>0)    | skip (nullCount=0) | keep (nullCount=10)| keep (null nullCount) | 5     |
+/// | id IS NOT NULL | no predicate (col vs col, #1873)                                                       | 6     |
 #[rstest]
 #[case::comparison(
     Pred::gt(column_expr!("id"), Expr::literal(200i64)),
     Some(3),
-    "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 (max<200)"
+    "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
     Pred::is_null(column_expr!("id")),
-    Some(3),
-    "keep RG 0 (nullCount>0 + null stats) + RG 2 (nullCount>0), skip RG 1 (nullCount=0)"
+    Some(5),
+    "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(
     Pred::not(Pred::is_null(column_expr!("id"))),
@@ -1028,6 +1029,14 @@ fn test_checkpoint_row_group_skipping(
     builder.write_row_group(&[Some(300)], &[Some(201)], &[Some(0)], &[100]);
     // RG 2: maxValues.id = 50, nullCount.id = 10.
     builder.write_row_group(&[Some(50)], &[Some(1)], &[Some(10)], &[100]);
+    // RG 3: maxValues.id = [150, 40], nullCount.id = [0, NULL].
+    // Tests that null nullCount stats are conservatively kept for IS NULL.
+    builder.write_row_group(
+        &[Some(150), Some(40)],
+        &[Some(1), Some(1)],
+        &[Some(0), None],
+        &[100, 50],
+    );
     let parquet_bytes = builder.finish();
 
     let meta_predicate = build_prefixed_checkpoint_predicate(&pred);
@@ -1048,7 +1057,7 @@ fn test_checkpoint_row_group_skipping(
                 .unwrap()
                 .map(|b| b.unwrap().num_rows())
                 .sum();
-            assert_eq!(total_rows, 4, "all rows should be read without a predicate");
+            assert_eq!(total_rows, 6, "all rows should be read without a predicate");
         }
     }
 }

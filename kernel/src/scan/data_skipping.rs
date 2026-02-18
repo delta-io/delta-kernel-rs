@@ -426,7 +426,9 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     /// `IS NOT NULL` → returns `None`. The unguarded version produces
     /// `nullCount.col != numRecords`, which is column vs column. The RowGroupFilter can
     /// only resolve one column at a time, so it can never prune with this predicate.
-    // TODO(#1873): support cross-column comparisons in RowGroupFilter to enable IS NOT NULL pruning
+    // TODO(#1873): IS NOT NULL pruning requires cross-column range comparison in RowGroupFilter.
+    // Skippable when the nullCount and numRecords ranges don't overlap (e.g. nullCount in
+    // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         if inverted {
             return None; // IS NOT NULL: column vs column, can't prune (#1873)
