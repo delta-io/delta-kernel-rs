@@ -712,6 +712,7 @@ mod test {
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
+    use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
 
@@ -1867,68 +1868,44 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_stats_column_names_physical_nested_schema_name_mode() {
-        // Test nested schema with column mapping in name mode
-        let schema = nested_schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "name");
-
-        let logical_names = config.stats_column_names_logical(None);
-        assert_eq!(
-            logical_names,
-            vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["info", "name"]),
-                ColumnName::new(["info", "age"]),
-            ],
-            "Expected logical column names"
-        );
-
+    #[rstest]
+    #[case::name_mode(
+        nested_schema_with_column_mapping(),
+        "name",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    #[case::id_mode(
+        nested_schema_with_column_mapping(),
+        "id",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    #[case::none_mode(
+        nested_schema_without_column_mapping(),
+        "none",
+        vec![
+            ColumnName::new(["id"]),
+            ColumnName::new(["info", "name"]),
+            ColumnName::new(["info", "age"]),
+        ],
+    )]
+    fn test_stats_column_names_physical_nested_schema(
+        #[case] schema: SchemaRef,
+        #[case] mode: &str,
+        #[case] expected_physical: Vec<ColumnName>,
+    ) {
+        let config = create_table_config_with_column_mapping(schema, mode);
         let physical_names = config.stats_column_names_physical(None);
         assert_eq!(
-            physical_names,
-            vec![
-                ColumnName::new(["phys_id"]),
-                ColumnName::new(["phys_info", "phys_name"]),
-                ColumnName::new(["phys_info", "phys_age"]),
-            ],
-            "Expected physical column names"
-        );
-    }
-
-    #[test]
-    fn test_stats_column_names_physical_nested_schema_id_mode() {
-        // Test nested schema with column mapping in Id mode
-        let schema = nested_schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "id");
-
-        let column_names = config.stats_column_names_physical(None);
-        assert_eq!(
-            column_names,
-            vec![
-                ColumnName::new(["phys_id"]),
-                ColumnName::new(["phys_info", "phys_name"]),
-                ColumnName::new(["phys_info", "phys_age"]),
-            ],
-            "Expected physical column names"
-        );
-    }
-
-    #[test]
-    fn test_stats_column_names_physical_nested_schema_none_mode() {
-        // Test nested schema with column mapping in none mode
-        let schema = nested_schema_without_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "none");
-
-        let column_names = config.stats_column_names_physical(None);
-        assert_eq!(
-            column_names,
-            vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["info", "name"]),
-                ColumnName::new(["info", "age"]),
-            ],
-            "Expected logical column names"
+            physical_names, expected_physical,
+            "Incorrect physical column names for mode '{mode}'"
         );
     }
 
