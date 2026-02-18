@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -95,7 +96,6 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
-pub(crate) mod parallel;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -110,10 +110,13 @@ pub use log_path::LogPath;
 
 mod row_tracking;
 
+pub(crate) mod clustering;
+
 mod arrow_compat;
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
 pub use arrow_compat::*;
 
+pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
 
@@ -151,8 +154,14 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-pub use action_reconciliation::ActionReconciliationIterator;
+#[cfg(feature = "internal-api")]
+pub mod parallel;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod parallel;
+
+pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
+use delta_kernel_derive::internal_api;
 pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
@@ -174,6 +183,11 @@ pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+
+/// Sentinel version indicating a pre-commit state (table does not exist yet).
+/// Used for create-table transactions before the first commit.
+pub const PRE_COMMIT_VERSION: Version = u64::MAX;
+
 pub type FileSize = u64;
 pub type FileIndex = u64;
 
@@ -460,6 +474,7 @@ pub trait EvaluationHandler: AsAny {
 /// EvaluationHandlers.
 // For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
 #[allow(dead_code)]
+#[internal_api]
 trait EvaluationHandlerExtension: EvaluationHandler {
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
@@ -511,6 +526,7 @@ impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 /// let engine = todo!(); // create an engine
 /// let engine_data = my_struct.into_engine_data(schema, engine);
 /// ```
+#[internal_api]
 pub(crate) trait IntoEngineData {
     /// Consume this type to produce a single-row EngineData using the provided schema.
     fn into_engine_data(

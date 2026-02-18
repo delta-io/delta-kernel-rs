@@ -106,9 +106,10 @@ fn test_compaction_data() {
 
     let iterator = result.unwrap();
 
-    // Test iterator methods
-    assert_eq!(iterator.actions_count(), 0);
-    assert_eq!(iterator.add_actions_count(), 0);
+    // Test iterator stat initilize
+    let state = iterator.state();
+    assert_eq!(state.actions_count(), 0);
+    assert_eq!(state.add_actions_count(), 0);
 
     // Test debug implementation
     let debug_str = format!("{:?}", iterator);
@@ -149,23 +150,24 @@ fn test_compaction_data_with_actual_iterator() {
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
     let engine = SyncEngine::new();
 
-    let mut iterator = writer.compaction_data(&engine).unwrap();
+    let iterator = writer.compaction_data(&engine).unwrap();
 
+    let state = iterator.state();
     let mut batch_count = 0;
-    let initial_actions = iterator.actions_count();
-    let initial_add_actions = iterator.add_actions_count();
+    let initial_actions = state.actions_count();
+    let initial_add_actions = state.add_actions_count();
 
     // Both should start at 0
     assert_eq!(initial_actions, 0);
     assert_eq!(initial_add_actions, 0);
 
-    while let Some(batch_result) = iterator.next() {
+    for batch_result in iterator {
         batch_count += 1;
         assert!(batch_result.is_ok());
 
         // After processing some batches, the counts should be >= the initial counts
-        assert!(iterator.actions_count() >= initial_actions);
-        assert!(iterator.add_actions_count() >= initial_add_actions);
+        assert!(state.actions_count() >= initial_actions);
+        assert!(state.add_actions_count() >= initial_add_actions);
     }
 
     assert!(batch_count > 0, "Expected to process at least one batch");
@@ -223,21 +225,22 @@ fn test_version_filtering() {
         );
 
         let iterator = result.unwrap();
-        assert!(iterator.actions_count() >= 0);
-        assert!(iterator.add_actions_count() >= 0);
+        let state = iterator.state();
+        assert!(state.actions_count() >= 0);
+        assert!(state.add_actions_count() >= 0);
     }
 }
 
 #[tokio::test]
 async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};
@@ -248,7 +251,10 @@ async fn test_no_compaction_staged_commits() {
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            StructType::new_unchecked([StructField::nullable("value", KernelDataType::INTEGER)]),
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                KernelDataType::INTEGER,
+            )])),
             vec![],
             0,
             std::collections::HashMap::new(),

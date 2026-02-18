@@ -5,12 +5,12 @@
 //! # Example
 //!
 //! ```no_run
-//! use uc_client::{UCClient, models::CommitsRequest};
+//! use uc_client::{ClientConfig, UCCommitsRestClient, UCGetCommitsClient, models::CommitsRequest};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let client = UCClient::builder("uc.awesome.org", "your-token")
-//!         .build()?;
+//!     let config = ClientConfig::build("uc.awesome.org", "your-token").build()?;
+//!     let client = UCCommitsRestClient::new(config)?;
 //!
 //!     let request = CommitsRequest::new("table-id", "table-uri");
 //!     let commits = client.get_commits(request).await?;
@@ -20,20 +20,27 @@
 //! ```
 
 pub mod client;
+pub mod commits_client;
 pub mod config;
 pub mod error;
+pub mod http;
 pub mod models;
 
 #[cfg(test)]
 mod tests;
 
-pub use client::{UCClient, UCClientBuilder};
+pub use client::UCClient;
+pub use commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use commits_client::InMemoryCommitsClient;
 
 #[doc(hidden)]
 pub mod prelude {
     pub use crate::client::UCClient;
+    pub use crate::commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
     pub use crate::models::{
         commits::{Commit, CommitsRequest, CommitsResponse},
         credentials::{Operation, TemporaryTableCredentials},

@@ -2,6 +2,7 @@
 
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
+    convert::Infallible,
     num::ParseIntError,
     str::Utf8Error,
 };
@@ -115,6 +116,10 @@ pub enum Error {
     /// A selection vector is larger than data length
     #[error("Selection vector is larger than data length: {0}")]
     InvalidSelectionVector(String),
+
+    /// Transaction state is invalid for the requested operation
+    #[error("Invalid transaction state: {0}")]
+    InvalidTransactionState(String),
 
     /// A specified URL was invalid
     #[error("Invalid url: {0}")]
@@ -274,6 +279,10 @@ impl Error {
         Self::InvalidProtocol(msg.to_string())
     }
 
+    pub fn invalid_transaction_state(msg: impl ToString) -> Self {
+        Self::InvalidTransactionState(msg.to_string())
+    }
+
     pub fn unsupported(msg: impl ToString) -> Self {
         Self::Unsupported(msg.to_string())
     }
@@ -340,5 +349,15 @@ impl From<object_store::Error> for Error {
             object_store::Error::NotFound { path, .. } => Self::file_not_found(path),
             err => Self::ObjectStore(err),
         }
+    }
+}
+
+/// This impl is needed so the `?` operator can auto-convert `Result<T, Infallible>` to
+/// `DeltaResult<T>`. For example, `TryFrom` impls for infallible conversions use `Infallible` as
+/// their error type, and this allows those results to be propagated with `?` in functions
+/// returning `DeltaResult`. The match is unreachable since `Infallible` has no variants.
+impl From<Infallible> for Error {
+    fn from(value: Infallible) -> Self {
+        match value {}
     }
 }

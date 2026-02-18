@@ -25,9 +25,6 @@ use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
-const DEFAULT_BUFFER_SIZE: usize = 1000;
-const DEFAULT_BATCH_SIZE: usize = 1000;
-
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
@@ -48,8 +45,8 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: DEFAULT_BUFFER_SIZE,
-            batch_size: DEFAULT_BATCH_SIZE,
+            buffer_size: super::DEFAULT_BUFFER_SIZE,
+            batch_size: super::DEFAULT_BATCH_SIZE,
         }
     }
 
@@ -189,7 +186,9 @@ async fn open_json_file(
 ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
     let path = Path::from_url_path(file_meta.location.path())?;
     let result = store.get(&path).await?;
-    let builder = ReaderBuilder::new(schema).with_batch_size(batch_size);
+    let builder = ReaderBuilder::new(schema)
+        .with_batch_size(batch_size)
+        .with_coerce_primitive(true);
     match result.payload {
         GetResultPayload::File(file, _) => {
             let reader = builder.build(BufReader::new(file))?;
@@ -256,7 +255,7 @@ mod tests {
     use std::task::Waker;
 
     use crate::actions::get_commit_schema;
-    use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
+    use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::default::executor::tokio::{
@@ -488,7 +487,7 @@ mod tests {
 
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
+            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]);
@@ -498,6 +497,55 @@ mod tests {
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
         assert_eq!(batch.len(), 4);
+    }
+
+    // Test that operationParameters with boolean/numeric primitives are coerced to strings.
+    // Some delta logs contain values like `"statsOnLoad": false` instead of `"statsOnLoad": "false"`.
+    // Without `with_coerce_primitive(true)`, this would fail with:
+    // "whilst decoding field 'commitInfo': whilst decoding field 'operationParameters': expected string got false"
+    #[test]
+    fn test_parse_json_coerce_operation_parameters() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // JSON with operationParameters containing boolean and numeric primitives (not strings)
+        let json_strings = StringArray::from(vec![
+            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","statsOnLoad":false,"numRetries":5},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
+        ]);
+        let output_schema = get_commit_schema().clone();
+
+        let batch: RecordBatch = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+
+        // Verify the operationParameters were parsed correctly with primitives coerced to strings
+        let commit_info = batch.column_by_name("commitInfo").unwrap().as_struct();
+        let op_params = commit_info
+            .column_by_name("operationParameters")
+            .unwrap()
+            .as_map();
+
+        // The map should have 3 entries: mode, statsOnLoad, numRetries
+        let map_entries = op_params.value(0);
+        assert_eq!(map_entries.len(), 3);
+
+        // Extract keys and values from the map
+        let keys = map_entries.column(0).as_string::<i32>();
+        let values = map_entries.column(1).as_string::<i32>();
+
+        // Build a HashMap for easier lookup
+        let params: std::collections::HashMap<_, _> = (0..keys.len())
+            .map(|i| (keys.value(i), values.value(i)))
+            .collect();
+
+        // Verify coerced primitive values: boolean false -> "false", integer 5 -> "5"
+        assert_eq!(params.get("statsOnLoad"), Some(&"false"));
+        assert_eq!(params.get("numRetries"), Some(&"5"));
+        assert_eq!(params.get("mode"), Some(&"ErrorIfExists"));
     }
 
     #[test]
@@ -625,7 +673,7 @@ mod tests {
         );
     }
 
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::schema::StructType;
     use crate::Engine;
     use std::io::Write;
@@ -648,7 +696,7 @@ mod tests {
         let (_temp_file2, file_url2) = make_invalid_named_temp();
         let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
         let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
-        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
+        let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
 
         // Helper to check that we get expected number of errors then stream ends
         let check_errors = |file_urls: Vec<_>, expected_errors: usize| {

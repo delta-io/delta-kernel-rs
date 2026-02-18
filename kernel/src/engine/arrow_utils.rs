@@ -1066,13 +1066,18 @@ pub(crate) fn parse_json(
 }
 
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
-fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+// Also used by ParseJson expression evaluation.
+pub(crate) fn parse_json_impl(
+    json_strings: &StringArray,
+    schema: ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
     if json_strings.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
 
     let mut decoder = ReaderBuilder::new(schema.clone())
         .with_batch_size(json_strings.len())
+        .with_coerce_primitive(true)
         .build_decoder()?;
 
     for (json, row_number) in json_strings.iter().zip(1..) {

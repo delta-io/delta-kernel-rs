@@ -21,6 +21,8 @@ use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
+#[cfg(feature = "schema-diff")]
+pub(crate) mod diff;
 
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
@@ -775,6 +777,30 @@ impl StructType {
         self.fields.len()
     }
 
+    /// Recursively counts all [`StructField`] nodes in this schema tree.
+    ///
+    /// This includes nested struct fields (inside Struct, Array, and Map types) but does not
+    /// count Array/Map containers themselves. This matches the traversal pattern used by
+    /// `assign_column_mapping_metadata` when assigning column IDs, so the result equals the
+    /// expected `delta.columnMapping.maxColumnId` for a newly created table.
+    #[allow(unused)] // Only used by integration tests (create_table/column_mapping.rs)
+    #[internal_api]
+    pub(crate) fn total_struct_fields(&self) -> usize {
+        fn count_data_type(dt: &DataType) -> usize {
+            match dt {
+                DataType::Struct(inner) => inner.total_struct_fields(),
+                DataType::Array(array) => count_data_type(array.element_type()),
+                DataType::Map(map) => {
+                    count_data_type(map.key_type()) + count_data_type(map.value_type())
+                }
+                _ => 0,
+            }
+        }
+        self.fields()
+            .map(|field| 1 + count_data_type(field.data_type()))
+            .sum()
+    }
+
     /// Gets a reference to the metadata column with the given spec.
     pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
         self.metadata_columns
@@ -1241,7 +1267,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecimalType {
     precision: u8,
     scale: u8,
@@ -1310,6 +1336,32 @@ pub enum PrimitiveType {
 impl PrimitiveType {
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(DecimalType::try_new(precision, scale)?.into())
+    }
+
+    /// Returns `true` if this primitive type can be widened to the `target` type.
+    ///
+    /// Widening rules (based on Parquet reader behavior):
+    /// - Integer widening: byte → short → int → long
+    /// - Float widening: float → double
+    ///
+    /// Note: These widening rules assume the parquet reader supports reading narrower types
+    /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
+    pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
+        use PrimitiveType::*;
+        matches!(
+            (self, target),
+            // Integer widening: smaller types can be read as larger ones
+            (Byte, Short | Integer | Long)
+                | (Short, Integer | Long)
+                | (Integer, Long)
+                // Float widening: float can be read as double
+                | (Float, Double)
+                // Timestamp equivalence: both are i64 microseconds since epoch, differing only
+                // in timezone semantics. The parquet representation is identical, so reading
+                // one as the other is safe at the data layer.
+                | (Timestamp, TimestampNtz)
+                | (TimestampNtz, Timestamp)
+        )
     }
 }
 

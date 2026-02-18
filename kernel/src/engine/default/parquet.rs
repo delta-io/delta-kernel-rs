@@ -7,8 +7,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field};
+use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -23,6 +23,7 @@ use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use super::stats::collect_stats;
 use super::UrlExt;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
@@ -32,6 +33,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
@@ -46,22 +48,16 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 }
 
 /// Metadata of a data file (typically a parquet file).
-///
-/// Currently just includes the the number of records as statistics, but will expand to include
-/// more statistics and other metadata in the future.
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
-    // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
-    num_records: usize,
+    /// Collected statistics for this file (includes numRecords, tightBounds, etc.).
+    stats: StructArray,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta, num_records: usize) -> Self {
-        Self {
-            file_meta,
-            num_records,
-        }
+    pub fn new(file_meta: FileMeta, stats: StructArray) -> Self {
+        Self { file_meta, stats }
     }
 
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
@@ -80,7 +76,8 @@ impl DataFileMetadata {
                     last_modified,
                     size,
                 },
-            num_records,
+            stats,
+            ..
         } = self;
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -104,20 +101,35 @@ impl DataFileMetadata {
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let stats = Arc::new(StructArray::try_new_with_length(
-            vec![Field::new("numRecords", DataType::Int64, true)].into(),
-            vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
-            None,
-            1,
-        )?);
+
+        let stats_array = Arc::new(stats.clone());
+
+        // Build schema dynamically based on stats (stats schema varies based on collected statistics)
+        let key_value_struct = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        let schema = Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                DataType::Map(
+                    Arc::new(Field::new("key_value", key_value_struct, false)),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", DataType::Int64, false),
+            Field::new("modificationTime", DataType::Int64, false),
+            Field::new("stats", stats_array.data_type().clone(), true),
+        ]);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(
-                crate::transaction::BASE_ADD_FILES_SCHEMA
-                    .as_ref()
-                    .try_into_arrow()?,
-            ),
-            vec![path, partitions, size, modification_time, stats],
+            Arc::new(schema),
+            vec![path, partitions, size, modification_time, stats_array],
         )?)))
     }
 }
@@ -148,10 +160,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
+        stats_columns: &[ColumnName],
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
-        let num_records = record_batch.num_rows();
+
+        // Collect statistics before writing (includes numRecords)
+        let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
@@ -185,7 +200,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
 
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta, num_records))
+        Ok(DataFileMetadata::new(file_meta, stats))
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
@@ -201,8 +216,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
+        stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self.write_parquet(path, data).await?;
+        let parquet_metadata = self
+            .write_parquet(path, data, stats_columns.unwrap_or(&[]))
+            .await?;
         parquet_metadata.as_record_batch(&partition_values)
     }
 }
@@ -218,6 +236,8 @@ async fn read_parquet_files_impl(
         return Ok(Box::pin(stream::empty()));
     }
 
+    let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
+
     // get the first FileMeta to decide how to fetch the file.
     // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
     // s3://    -> aws   (ParquetOpener)
@@ -226,26 +246,44 @@ async fn read_parquet_files_impl(
     //   -> reqwest to get data
     //   -> parse to parquet
     // SAFETY: we did is_empty check above, this is ok.
-    let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
-        Box::new(PresignedUrlOpener::new(
+    if files[0].location.is_presigned() {
+        let file_opener = Box::new(PresignedUrlOpener::new(
             1024,
             physical_schema.clone(),
             predicate,
-        ))
-    } else {
-        Box::new(ParquetOpener::new(
-            1024,
-            physical_schema.clone(),
-            predicate,
-            store,
-        ))
-    };
+        ));
+        let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
+            |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
+        );
+        return Ok(Box::pin(stream));
+    }
 
-    let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
-    let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
-        |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
-    );
-    Ok(Box::pin(stream))
+    // an iterator of futures that open each file
+    let file_futures = files.into_iter().map(move |file| {
+        let store = store.clone();
+        let schema = physical_schema.clone();
+        let predicate = predicate.clone();
+        async move {
+            open_parquet_file(
+                store,
+                schema,
+                predicate,
+                None,
+                super::DEFAULT_BATCH_SIZE,
+                file,
+            )
+            .await
+        }
+    });
+    // create a stream from that iterator which buffers up to `buffer_size` futures at a time
+    let result_stream = stream::iter(file_futures)
+        .buffered(super::DEFAULT_BUFFER_SIZE)
+        .try_flatten()
+        .map_ok(|record_batch| -> Box<dyn EngineData> {
+            Box::new(ArrowEngineData::new(record_batch))
+        });
+
+    Ok(Box::pin(result_stream))
 }
 
 impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
@@ -347,111 +385,79 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 }
 
-/// Implements [`FileOpener`] for a parquet file
-struct ParquetOpener {
-    // projection: Arc<[usize]>,
-    batch_size: usize,
+/// Opens a Parquet file and returns a stream of record batches
+async fn open_parquet_file(
+    store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
     predicate: Option<PredicateRef>,
     limit: Option<usize>,
-    store: Arc<DynObjectStore>,
-}
+    batch_size: usize,
+    file_meta: FileMeta,
+) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
+    let file_location = file_meta.location.to_string();
+    let path = Path::from_url_path(file_meta.location.path())?;
 
-impl ParquetOpener {
-    pub(crate) fn new(
-        batch_size: usize,
-        table_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-        store: Arc<DynObjectStore>,
-    ) -> Self {
-        Self {
-            batch_size,
-            table_schema,
-            predicate,
-            limit: None,
-            store,
+    let mut reader = {
+        use object_store::ObjectStoreScheme;
+        // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
+        // request which isn't supported by Azure. For now we just detect if the URL is
+        // pointing to azure and if so, do a HEAD request so we can pass in file size to the
+        // reader which will cause the reader to avoid a suffix range request.
+        // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
+        //
+        // TODO(#1010): Note that we don't need this at all and can actually just _always_
+        // do the `with_file_size` but need to (1) update our unit tests which often
+        // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
+        if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
+            ObjectStoreScheme::parse(&file_meta.location)
+        {
+            // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
+            // to file changing between the two calls.
+            let meta = store.head(&path).await?;
+            ParquetObjectReader::new(store, path).with_file_size(meta.size)
+        } else {
+            ParquetObjectReader::new(store, path)
         }
+    };
+
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+    let parquet_schema = metadata.schema();
+    let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
+    let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+    if let Some(mask) = generate_mask(
+        &table_schema,
+        parquet_schema,
+        builder.parquet_schema(),
+        &indices,
+    ) {
+        builder = builder.with_projection(mask)
     }
-}
 
-impl FileOpener for ParquetOpener {
-    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
-        let store = self.store.clone();
-        let file_location = file_meta.location.to_string();
+    // Only create RowIndexBuilder if row indexes are actually needed
+    let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
+        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-        let batch_size = self.batch_size;
-        let table_schema = self.table_schema.clone();
-        let predicate = self.predicate.clone();
-        let limit = self.limit;
-
-        Ok(Box::pin(async move {
-            let path = Path::from_url_path(file_meta.location.path())?;
-
-            let mut reader = {
-                use object_store::ObjectStoreScheme;
-                // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
-                // request which isn't supported by Azure. For now we just detect if the URL is
-                // pointing to azure and if so, do a HEAD request so we can pass in file size to the
-                // reader which will cause the reader to avoid a suffix range request.
-                // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
-                //
-                // TODO(#1010): Note that we don't need this at all and can actually just _always_
-                // do the `with_file_size` but need to (1) update our unit tests which often
-                // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
-                if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
-                    ObjectStoreScheme::parse(&file_meta.location)
-                {
-                    // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
-                    // to file changing between the two calls.
-                    let meta = store.head(&path).await?;
-                    ParquetObjectReader::new(store, path).with_file_size(meta.size)
-                } else {
-                    ParquetObjectReader::new(store, path)
-                }
-            };
-
-            let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
-            let parquet_schema = metadata.schema();
-            let (indices, requested_ordering) =
-                get_requested_indices(&table_schema, parquet_schema)?;
-            let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
-            let mut builder =
-                ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
-            if let Some(mask) = generate_mask(
-                &table_schema,
-                parquet_schema,
-                builder.parquet_schema(),
-                &indices,
-            ) {
-                builder = builder.with_projection(mask)
-            }
-
-            // Only create RowIndexBuilder if row indexes are actually needed
-            let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
-
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-            }
-            if let Some(limit) = limit {
-                builder = builder.with_limit(limit)
-            }
-
-            let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-            let stream = builder.with_batch_size(batch_size).build()?;
-
-            let stream = stream.map(move |rbr| {
-                fixup_parquet_read(
-                    rbr?,
-                    &requested_ordering,
-                    row_indexes.as_mut(),
-                    Some(&file_location),
-                )
-            });
-            Ok(stream.boxed())
-        }))
+    // Filter row groups and row indexes if a predicate is provided
+    if let Some(ref predicate) = predicate {
+        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
     }
+    if let Some(limit) = limit {
+        builder = builder.with_limit(limit)
+    }
+
+    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+    let stream = builder.with_batch_size(batch_size).build()?;
+
+    let stream = stream.map(move |rbr| {
+        fixup_parquet_read(
+            rbr?,
+            &requested_ordering,
+            row_indexes.as_mut(),
+            Some(&file_location),
+        )
+    });
+    Ok(stream.boxed())
 }
 
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
@@ -618,19 +624,26 @@ mod tests {
         let last_modified = 10000000000;
         let num_records = 10;
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
-        let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
+        let stats = StructArray::try_new(
+            vec![
+                Field::new("numRecords", ArrowDataType::Int64, true),
+                Field::new("tightBounds", ArrowDataType::Boolean, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int64Array::from(vec![num_records as i64])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+            None,
+        )
+        .unwrap();
+        let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
-        let schema = Arc::new(
-            crate::transaction::BASE_ADD_FILES_SCHEMA
-                .as_ref()
-                .try_into_arrow()
-                .unwrap(),
-        );
         let mut partition_values_builder = MapBuilder::new(
             Some(MapFieldNames {
                 entry: "key_value".to_string(),
@@ -644,13 +657,33 @@ mod tests {
         partition_values_builder.values().append_value("a");
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
-        let stats_struct = StructArray::try_new_with_length(
-            vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
-            vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
-            None,
-            1,
-        )
-        .unwrap();
+
+        // Build expected schema dynamically based on stats
+        let stats_field = Field::new("stats", stats.data_type().clone(), true);
+        let schema = Arc::new(crate::arrow::datatypes::Schema::new(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                ArrowDataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        ArrowDataType::Struct(
+                            vec![
+                                Field::new("key", ArrowDataType::Utf8, false),
+                                Field::new("value", ArrowDataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+            stats_field,
+        ]));
 
         let expected = RecordBatch::try_new(
             schema,
@@ -659,7 +692,7 @@ mod tests {
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
-                Arc::new(stats_struct),
+                Arc::new(stats),
             ],
         )
         .unwrap();
@@ -682,7 +715,7 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data)
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
             .await
             .unwrap();
 
@@ -693,7 +726,7 @@ mod tests {
                     last_modified,
                     size,
                 },
-            num_records,
+            ref stats,
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 
@@ -711,6 +744,15 @@ mod tests {
         assert_eq!(&expected_location.join(filename).unwrap(), location);
         assert_eq!(expected_size, size);
         assert!(now - last_modified < 10_000);
+
+        // Check numRecords from stats
+        let num_records = stats
+            .column_by_name("numRecords")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
         assert_eq!(num_records, 3);
 
         // check we can read back
@@ -753,7 +795,7 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );

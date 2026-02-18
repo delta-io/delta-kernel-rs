@@ -49,7 +49,7 @@ pub mod tokio {
     use std::sync::mpsc::channel;
     use tokio::runtime::RuntimeFlavor;
 
-    use crate::DeltaResult;
+    use crate::{DeltaResult, Error};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
@@ -145,30 +145,77 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
         }
     }
 
-    /// A [`TaskExecutor`] that uses the tokio multi-threaded runtime. You can
-    /// create one based on a handle to an existing runtime, so it can share
-    /// the runtime with other parts of your application.
+    /// A [`TaskExecutor`] that uses the tokio multi-threaded runtime.
+    ///
+    /// You can create one based on a handle to an existing runtime (to share
+    /// the runtime with other parts of your application), or create one that
+    /// owns its own runtime.
     #[derive(Debug)]
     pub struct TokioMultiThreadExecutor {
         handle: tokio::runtime::Handle,
+        /// If Some, this executor owns the runtime and will keep it alive.
+        /// If None, the executor borrows an external runtime via `handle`.
+        _runtime: Option<tokio::runtime::Runtime>,
     }
 
     impl TokioMultiThreadExecutor {
+        /// Create a new executor that uses an existing runtime's handle.
         pub fn new(handle: tokio::runtime::Handle) -> Self {
             assert_eq!(
                 handle.runtime_flavor(),
                 RuntimeFlavor::MultiThread,
                 "TokioExecutor must be created with a multi-threaded runtime"
             );
-            Self { handle }
+            Self {
+                handle,
+                _runtime: None,
+            }
+        }
+
+        /// Create a new executor that owns its own multi-threaded Tokio runtime.
+        ///
+        /// # Parameters
+        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default.
+        ///   See [`tokio::runtime::Builder::worker_threads`].
+        /// - `max_blocking_threads`: Maximum number of threads for blocking operations.
+        ///   If `None`, uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
+        ///
+        /// # Errors
+        /// Returns an error if the runtime cannot be created.
+        pub fn new_owned_runtime(
+            worker_threads: Option<usize>,
+            max_blocking_threads: Option<usize>,
+        ) -> DeltaResult<Self> {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+
+            if let Some(threads) = worker_threads {
+                builder.worker_threads(threads);
+            }
+            if let Some(max_blocking) = max_blocking_threads {
+                builder.max_blocking_threads(max_blocking);
+            }
+
+            let runtime = builder
+                .build()
+                .map_err(|e| Error::generic(format!("Failed to create Tokio runtime: {e}")))?;
+
+            let handle = runtime.handle().clone();
+            Ok(Self {
+                handle,
+                _runtime: Some(runtime),
+            })
         }
     }
 
     impl TaskExecutor for TokioMultiThreadExecutor {
+        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
+        // See:
+        // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
         fn block_on<T>(&self, task: T) -> T::Output
         where
             T: Future + Send + 'static,
@@ -191,9 +238,23 @@ pub mod tokio {
             // We throw away the handle, but it should continue on.
             self.handle.spawn(fut);
 
-            receiver
-                .recv()
-                .expect("TokioMultiThreadExecutor has crashed")
+            let recv = || {
+                receiver
+                    .recv()
+                    .expect("TokioMultiThreadExecutor has crashed")
+            };
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Use block_in_place to tell Tokio we're about to block - this allows
+                // the runtime to move tasks off this worker's local queue so they can
+                // be stolen by other workers. Only use block_in_place if we're inside
+                // a Tokio runtime.
+                tokio::task::block_in_place(recv)
+            } else {
+                // If we're not inside a Tokio runtime, we can't use block_in_place,
+                // so we just block on the receiver.
+                recv()
+            }
         }
 
         fn spawn<F>(&self, task: F)
@@ -208,7 +269,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
         }
     }
 
@@ -245,6 +306,124 @@ pub mod tokio {
         async fn test_tokio_multi_thread_executor() {
             let executor = TokioMultiThreadExecutor::new(tokio::runtime::Handle::current());
             test_executor(executor).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_nested_block_on_does_not_deadlock() {
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            let executor = Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            ));
+            let executor_clone = executor.clone();
+
+            let (tx, rx) = channel::<i32>();
+
+            let handle = std::thread::spawn(move || {
+                // Outer block_on
+                let result = executor.block_on(async move {
+                    // Inner block_on
+                    let inner_result = executor_clone.block_on(async {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        42
+                    });
+                    inner_result + 1
+                });
+                tx.send(result).ok();
+            });
+
+            // Wait with timeout - if this times out, we have a deadlock
+            let timeout = Duration::from_secs(5);
+            let result = rx
+                .recv_timeout(timeout)
+                .expect("Timeout - likely deadlock in TokioMultiThreadExecutor::block_on");
+            assert_eq!(result, 43);
+            handle.join().expect("thread panicked");
+        }
+
+        #[test]
+        fn test_tokio_multi_thread_executor_owned_runtime() {
+            let executor = TokioMultiThreadExecutor::new_owned_runtime(None, None)
+                .expect("Failed to create executor");
+
+            // Test block_on works
+            let result = executor.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                2 + 2
+            });
+            assert_eq!(result, 4, "block_on should return the correct result");
+
+            // Test spawn works
+            let (sender, receiver) = channel::<i32>();
+            executor.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                sender.send(2 + 2).unwrap();
+            });
+            let result = receiver.recv().expect("spawn task should send result");
+            assert_eq!(result, 4, "spawned task should compute correct result");
+        }
+
+        #[test]
+        fn test_owned_runtime_small_pool_nested_block_on_deadlocks() {
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            // Create a small pool
+            let executor = Arc::new(
+                TokioMultiThreadExecutor::new_owned_runtime(Some(1), Some(1))
+                    .expect("Failed to create executor"),
+            );
+            let e1 = executor.clone();
+            let e2 = executor.clone();
+            let e3 = executor.clone();
+
+            let (tx, rx) = channel::<i32>();
+
+            // Spawn a thread to do deeply nested block_on calls
+            std::thread::spawn(move || {
+                let result = executor.block_on(async move {
+                    e1.block_on(async move {
+                        e2.block_on(async move {
+                            e3.block_on(async {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                42
+                            })
+                        })
+                    })
+                });
+                tx.send(result).ok();
+            });
+
+            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should deadlock
+            let timeout = Duration::from_millis(500);
+            let result = rx.recv_timeout(timeout);
+
+            // Test passes if we got a timeout (deadlock occurred as expected)
+            // Test fails if we got a result (no deadlock - unexpected)
+            assert!(
+                result.is_err(),
+                "Expected deadlock with 1 worker thread, 1 blocking thread and 4 nested block_on calls",
+            );
+        }
+
+        #[test]
+        fn test_block_on_works_outside_tokio_runtime() {
+            let executor = TokioMultiThreadExecutor::new_owned_runtime(None, None)
+                .expect("Failed to create executor");
+
+            // Verify we're not inside a Tokio runtime
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Test must run outside of a Tokio runtime"
+            );
+
+            // block_on should work even though we're not inside a Tokio runtime
+            let result = executor.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                42
+            });
+            assert_eq!(result, 42);
         }
     }
 }

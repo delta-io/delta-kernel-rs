@@ -47,8 +47,8 @@ pub struct TableChangesScan {
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngine};
-/// # let engine = DefaultEngine::new(store_from_url(&url).unwrap());
+/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
+/// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
 /// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
@@ -113,10 +113,12 @@ impl TableChangesScanBuilder {
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
 
         // Create StateInfo using CDF field classifier
+        // CDF doesn't support stats_columns
         let state_info = StateInfo::try_new(
             logical_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
+            None, // stats_columns
             CdfTransformFieldClassifier,
         )?;
 
