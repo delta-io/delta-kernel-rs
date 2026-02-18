@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::get_log_add_schema;
-use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray};
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray,
+};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -18,10 +20,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
@@ -36,7 +40,9 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::FileMeta;
 
@@ -3066,9 +3072,9 @@ fn resolve_physical_path(schema: &StructType, path: &[&str]) -> Vec<String> {
     let mut current_schema = schema;
     let mut physical = Vec::new();
     for (i, segment) in path.iter().enumerate() {
-        let field = current_schema.field(segment).unwrap_or_else(|| {
-            panic!("field '{}' not found in schema", segment)
-        });
+        let field = current_schema
+            .field(segment)
+            .unwrap_or_else(|| panic!("field '{}' not found in schema", segment));
         let name = match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
             Some(MetadataValue::String(s)) => s.clone(),
             _ => segment.to_string(),
@@ -3183,6 +3189,7 @@ async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
+    partition_values: HashMap<String, String>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
@@ -3194,7 +3201,7 @@ async fn write_batch_to_table(
         .write_parquet(
             &ArrowEngineData::new(data),
             write_context.as_ref(),
-            HashMap::new(),
+            partition_values,
         )
         .await?;
     txn.add_files(add_meta);
@@ -3224,12 +3231,12 @@ fn read_add_infos(
         let actions_batch = batch_result?;
         let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
         let record_batch = engine_data.record_batch();
-        let add_struct = match record_batch
-            .schema()
-            .index_of("add")
-            .ok()
-            .and_then(|idx| record_batch.column(idx).as_any().downcast_ref::<StructArray>())
-        {
+        let add_struct = match record_batch.schema().index_of("add").ok().and_then(|idx| {
+            record_batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StructArray>()
+        }) {
             Some(s) => s,
             None => continue,
         };
@@ -3322,7 +3329,8 @@ async fn test_column_mapping_write(
 
     // Step 2: Write two batches
     for data in nested_batches(&schema)? {
-        latest_snapshot = write_batch_to_table(&latest_snapshot, engine.as_ref(), data).await?;
+        latest_snapshot =
+            write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
     }
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
@@ -3344,7 +3352,10 @@ async fn test_column_mapping_write(
 
     // Step 4: Read parquet footer to verify physical names
     {
-        let parquet_path = &add_actions.first().expect("should have at least one add file").path;
+        let parquet_path = &add_actions
+            .first()
+            .expect("should have at least one add file")
+            .path;
         let parquet_url = table_url.join(parquet_path)?;
 
         let obj_meta = store
@@ -3364,8 +3375,7 @@ async fn test_column_mapping_write(
 
     // Step 5: Read data back to verify correctness
     {
-        let post_ckpt_snapshot =
-            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let post_ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let scan = post_ckpt_snapshot.scan_builder().build()?;
         let batches: Vec<RecordBatch> = scan
             .execute(engine.clone())?
@@ -3377,9 +3387,12 @@ async fn test_column_mapping_write(
             .collect();
 
         let result_schema = batches[0].schema();
-        let combined =
-            delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
-        assert_eq!(combined.num_rows(), 6, "Should have 6 rows from two written batches");
+        let combined = delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
+        assert_eq!(
+            combined.num_rows(),
+            6,
+            "Should have 6 rows from two written batches"
+        );
 
         // Verify logical column names and data values
         // Top-level: row_number should contain [1..=6]
@@ -3389,7 +3402,9 @@ async fn test_column_mapping_write(
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("row_number should be Int64");
-        let mut vals: Vec<i64> = (0..row_numbers.len()).map(|i| row_numbers.value(i)).collect();
+        let mut vals: Vec<i64> = (0..row_numbers.len())
+            .map(|i| row_numbers.value(i))
+            .collect();
         vals.sort();
         assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
 
@@ -3412,4 +3427,67 @@ async fn test_column_mapping_write(
     }
 
     Ok(())
+}
+
+/// Verifies that partitioned writes use physical column names in add.partitionValues.
+#[rstest::rstest]
+#[case::cm_none("./tests/data/partition_cm/none")]
+#[case::cm_id("./tests/data/partition_cm/id")]
+#[case::cm_name("./tests/data/partition_cm/name")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_partitioned_write(
+    #[case] table_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy test data to a temp dir so we can write to it
+    let tmp_dir = tempdir()?;
+    copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let physical_name = resolve_physical_path(&snapshot.schema(), &["category"])[0].clone();
+
+    // Write data with partition value
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let batch = RecordBatch::try_new(
+        Arc::new(data_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // Read commit log and verify add.partitionValues key uses physical name
+    let log_path = table_url.join("_delta_log/00000000000000000001.json")?;
+    let log_bytes = store
+        .get(&Path::from_url_path(log_path.path())?)
+        .await?
+        .bytes()
+        .await?;
+    for line in std::str::from_utf8(&log_bytes)?.lines() {
+        let obj: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(add) = obj.get("add") {
+            let pv = add["partitionValues"]
+                .as_object()
+                .expect("partitionValues should be an object");
+            assert!(
+                pv.contains_key(&physical_name),
+                "partitionValues key should be '{physical_name}', got: {pv:?}"
+            );
+            assert_eq!(pv[&physical_name], "A");
+            return Ok(());
+        }
+    }
+    panic!("no add action found in commit log");
 }
