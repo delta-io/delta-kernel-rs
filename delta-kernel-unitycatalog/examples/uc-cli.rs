@@ -1,13 +1,12 @@
 use clap::{Parser, Subcommand};
+use delta_kernel_unitycatalog::{Commit, CommitsRequest, UCCommitsClient, UCCommitsRestClient};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use uc_client::{
-    models::{commits::Commit, credentials::Operation, CommitsRequest},
-    UCClient, UCCommitsClient, UCCommitsRestClient,
-};
+use unity_catalog_client::models::credentials::Operation;
+use unity_catalog_client::UCClient;
 
 #[derive(Parser)]
-#[command(name = "uc-client")]
+#[command(name = "uc-cli")]
 #[command(about = "Unity Catalog CLI client", long_about = None)]
 struct Cli {
     /// Unity Catalog URL
@@ -86,13 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Create shared config
-    let config = uc_client::ClientConfig::build(&cli.workspace_url, &cli.token)
+    let config = unity_catalog_client::ClientConfig::build(&cli.workspace_url, &cli.token)
         .with_timeout(Duration::from_secs(60))
         .with_max_retries(3)
         .build()?;
 
     // Create shared HTTP client and UC clients
-    let http_client = uc_client::http::build_http_client(&config)?;
+    let http_client = unity_catalog_client::http::build_http_client(&config)?;
     let uc_client = UCClient::with_http_client(http_client.clone(), config.clone());
     let uc_commits_client = UCCommitsRestClient::with_http_client(http_client, config);
 

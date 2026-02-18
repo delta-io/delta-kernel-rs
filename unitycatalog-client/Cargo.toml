@@ -1,5 +1,5 @@
 [package]
-name = "uc-client"
+name = "unitycatalog-client"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -8,6 +8,9 @@ repository.workspace = true
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[lib]
+name = "unity_catalog_client"
 
 # for cargo-release
 [package.metadata.release]
@@ -23,10 +26,5 @@ tracing = "0.1"
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 
-[features]
-default = []
-test-utils = []
-
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive", "env"] }

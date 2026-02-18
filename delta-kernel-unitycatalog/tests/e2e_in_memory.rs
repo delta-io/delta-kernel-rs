@@ -5,10 +5,10 @@ use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
+use delta_kernel_unitycatalog::commits_client::{InMemoryCommitsClient, TableData};
+use delta_kernel_unitycatalog::models::Commit;
+use delta_kernel_unitycatalog::{UCCommitter, UCKernelClient};
 use object_store::local::LocalFileSystem;
-use uc_catalog::{UCCatalog, UCCommitter};
-use uc_client::commits_client::{InMemoryCommitsClient, TableData};
-use uc_client::models::commits::Commit;
 
 // ============================================================================
 // Test Setup
@@ -68,7 +68,7 @@ async fn setup() -> Result<TestSetup, TestError> {
         .with_task_executor(executor)
         .build();
     let table_uri = url::Url::from_directory_path(tmp_dir.path()).map_err(|_| "invalid path")?;
-    let snapshot = UCCatalog::new(commits_client.as_ref())
+    let snapshot = UCKernelClient::new(commits_client.as_ref())
         .load_snapshot_at(TABLE_ID, table_uri.as_str(), 2, &engine)
         .await?;
 

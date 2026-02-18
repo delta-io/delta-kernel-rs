@@ -8,8 +8,8 @@ members = [
     "test-utils",
     "feature-tests",
     "mem-test",
-    "uc-client", # WIP: this is an experimental UC client for catalog-managed table work
-    "uc-catalog", # WIP: this is an experimental UC catalog implementation
+    "unitycatalog-client", # WIP: this is an experimental UC client for catalog-managed table work
+    "delta-kernel-unitycatalog", # WIP: this is an experimental UC catalog implementation
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table

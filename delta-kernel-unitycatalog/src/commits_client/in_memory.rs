@@ -4,8 +4,9 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::error::{Error, Result};
-use crate::models::commits::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+use unity_catalog_client::error::{Error, Result};
+
+use crate::models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
 
 use super::UCCommitsClient;
 
