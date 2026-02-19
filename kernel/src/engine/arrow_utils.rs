@@ -179,6 +179,157 @@ where
     Ok(data.into())
 }
 
+/// Coerces a [`RecordBatch`]'s field nullability to match a target Arrow schema.
+pub(crate) fn coerce_batch_nullability(
+    batch: RecordBatch,
+    target_schema: &ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
+    if *batch.schema() == **target_schema {
+        return Ok(batch);
+    }
+
+    // Recursively coerces nullability for a column+field pair. For struct columns, recurses
+    // into children.
+    fn coerce(
+        column: Arc<dyn ArrowArray>,
+        src_field: &ArrowFieldRef,
+        target_field: &ArrowFieldRef,
+    ) -> DeltaResult<(Arc<dyn ArrowArray>, ArrowFieldRef)> {
+        match (column.data_type(), target_field.data_type()) {
+            (ArrowDataType::Struct(src_children), ArrowDataType::Struct(target_children))
+                if src_children != target_children =>
+            {
+                let struct_array =
+                    column
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            Error::generic("expected Struct array during nullability coercion")
+                        })?;
+                let (coerced_columns, coerced_fields): (
+                    Vec<Arc<dyn ArrowArray>>,
+                    Vec<ArrowFieldRef>,
+                ) = struct_array
+                    .columns()
+                    .iter()
+                    .zip(src_children.iter())
+                    .zip(target_children.iter())
+                    .map(|((child_col, src_child), target_child)| {
+                        coerce(child_col.clone(), src_child, target_child)
+                    })
+                    .collect::<DeltaResult<Vec<_>>>()?
+                    .into_iter()
+                    .unzip();
+                let coerced_array: Arc<dyn ArrowArray> = Arc::new(StructArray::try_new(
+                    coerced_fields.into(),
+                    coerced_columns,
+                    struct_array.nulls().cloned(),
+                )?);
+                let field = Arc::new(ArrowField::new(
+                    src_field.name(),
+                    coerced_array.data_type().clone(),
+                    target_field.is_nullable(),
+                ));
+                Ok((coerced_array, field))
+            }
+            // Map type: recurse into entries struct to fix nested nullability
+            (
+                ArrowDataType::Map(src_entries_field, _),
+                ArrowDataType::Map(target_entries_field, _),
+            ) if src_entries_field != target_entries_field => {
+                let map_array = column.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                    Error::generic("expected Map array during nullability coercion")
+                })?;
+                let (_, offsets, entries, nulls, ordered) = map_array.clone().into_parts();
+                let (coerced_entries_col, coerced_entries_field) =
+                    coerce(Arc::new(entries), src_entries_field, target_entries_field)?;
+                let coerced_entries = coerced_entries_col
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| {
+                        Error::generic(
+                            "expected Struct array for Map entries during nullability coercion",
+                        )
+                    })?
+                    .clone();
+                let coerced_map = MapArray::try_new(
+                    coerced_entries_field,
+                    offsets,
+                    coerced_entries,
+                    nulls,
+                    ordered,
+                )?;
+                let coerced_array: Arc<dyn ArrowArray> = Arc::new(coerced_map);
+                let field = Arc::new(ArrowField::new(
+                    src_field.name(),
+                    coerced_array.data_type().clone(),
+                    target_field.is_nullable(),
+                ));
+                Ok((coerced_array, field))
+            }
+            // List type: recurse into element to fix nested nullability
+            (ArrowDataType::List(src_element), ArrowDataType::List(target_element))
+                if src_element != target_element =>
+            {
+                let list_array = column
+                    .as_any()
+                    .downcast_ref::<GenericListArray<i32>>()
+                    .ok_or_else(|| {
+                        Error::generic("expected List array during nullability coercion")
+                    })?;
+                let (_, offsets, values, nulls) = list_array.clone().into_parts();
+                let (coerced_values, coerced_element_field) =
+                    coerce(values, src_element, target_element)?;
+                let coerced_list = GenericListArray::<i32>::try_new(
+                    coerced_element_field,
+                    offsets,
+                    coerced_values,
+                    nulls,
+                )?;
+                let coerced_array: Arc<dyn ArrowArray> = Arc::new(coerced_list);
+                let field = Arc::new(ArrowField::new(
+                    src_field.name(),
+                    coerced_array.data_type().clone(),
+                    target_field.is_nullable(),
+                ));
+                Ok((coerced_array, field))
+            }
+            _ => {
+                let field = if src_field.is_nullable() == target_field.is_nullable() {
+                    src_field.clone()
+                } else {
+                    Arc::new(
+                        src_field
+                            .as_ref()
+                            .clone()
+                            .with_nullable(target_field.is_nullable()),
+                    )
+                };
+                Ok((column, field))
+            }
+        }
+    }
+
+    let batch_schema = batch.schema();
+    let struct_array = StructArray::from(batch);
+    let (src_fields, columns, _) = struct_array.into_parts();
+
+    let (columns, fields): (Vec<Arc<dyn ArrowArray>>, Vec<ArrowFieldRef>) = columns
+        .into_iter()
+        .zip(src_fields.iter())
+        .zip(target_schema.fields().iter())
+        .map(|((column, src_field), target_field)| coerce(column, src_field, target_field))
+        .collect::<DeltaResult<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        batch_schema.metadata().clone(),
+    ));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 /*
 * The code below implements proper pruning of columns when reading parquet, reordering of columns to
 * match the specified schema, and insertion of null columns if the requested schema includes a

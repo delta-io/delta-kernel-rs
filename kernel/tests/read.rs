@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::AsArray as _;
+use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{Field as ArrowField, Int64Type, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -33,6 +33,20 @@ mod common;
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
+
+/// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
+/// conventions where the table metadata declares columns as nullable.
+fn make_nullable_fields(batch: &RecordBatch) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| ArrowField::new(f.name(), f.data_type().clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap()
+}
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +78,8 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
-    let expected_data = vec![batch.clone(), batch];
+    let expected = make_nullable_fields(&batch);
+    let expected_data = vec![expected.clone(), expected];
 
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
@@ -115,7 +130,8 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
-    let expected_data = vec![batch.clone(), batch];
+    let expected = make_nullable_fields(&batch);
+    let expected_data = vec![expected.clone(), expected];
 
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
@@ -167,7 +183,8 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
-    let expected_data = vec![batch];
+    let expected = make_nullable_fields(&batch);
+    let expected_data = vec![expected];
 
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
@@ -196,11 +213,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .fold(String::new(), |a, b| a + &b + "\n")
     }
 
-    let batch1 = generate_simple_batch()?;
-    let batch2 = generate_batch(vec![
+    let batch1 = make_nullable_fields(&generate_simple_batch()?);
+    let batch2 = make_nullable_fields(&generate_batch(vec![
         ("id", vec![5, 7].into_array()),
         ("val", vec!["e", "g"].into_array()),
-    ])?;
+    ])?);
     let storage = Arc::new(InMemory::new());
     // valid commit with min/max (0, 2)
     add_commit(
