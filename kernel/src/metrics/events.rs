@@ -78,6 +78,20 @@ pub enum MetricEvent {
 
     /// Storage copy operation completed.
     StorageCopyCompleted { duration: Duration },
+
+    /// Checkpoint write completed successfully.
+    CheckpointWriteCompleted {
+        operation_id: MetricId,
+        /// Duration of the finalize step (writing `_last_checkpoint`).
+        duration: Duration,
+        version: u64,
+        write_stats_as_json: bool,
+        write_stats_as_struct: bool,
+        /// Duration of the setup phase in `checkpoint_data()` (schema building, evaluator creation).
+        setup_duration: Duration,
+        /// Cumulative time spent evaluating stats transforms across all batches.
+        stats_transform_duration: Duration,
+    },
 }
 
 impl fmt::Display for MetricEvent {
@@ -140,6 +154,19 @@ impl fmt::Display for MetricEvent {
                 f,
                 "StorageCopyCompleted(duration={:?})",
                 duration
+            ),
+            MetricEvent::CheckpointWriteCompleted {
+                operation_id,
+                duration,
+                version,
+                write_stats_as_json,
+                write_stats_as_struct,
+                setup_duration,
+                stats_transform_duration,
+            } => write!(
+                f,
+                "CheckpointWriteCompleted(id={}, duration={:?}, version={}, stats_json={}, stats_struct={}, setup={:?}, transform={:?})",
+                operation_id, duration, version, write_stats_as_json, write_stats_as_struct, setup_duration, stats_transform_duration
             ),
         }
     }

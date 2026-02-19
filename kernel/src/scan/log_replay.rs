@@ -26,6 +26,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -613,6 +614,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
     // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
     // cannot easily be unified.
+    #[instrument(name = "scan.process_batch", skip_all, err)]
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -681,6 +683,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     // probably also need to be applied to the other copy. The copy exists because
     // [`LogReplayProcessor`] requires a `&mut self`, while [`ParallelLogReplayProcessor`] requires
     // `&self`. Presently, the different in mutabilities cannot easily be unified.
+    #[instrument(name = "scan.process_batch", skip_all, err)]
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,

@@ -1,8 +1,9 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use clap::Parser;
-use common::{LocationArgs, ParseWithExamples};
+use common::{LocationArgs, ParseWithExamples, PrintingMetricsReporter};
 use futures::future::{BoxFuture, FutureExt};
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::AsyncArrowWriter;
@@ -32,7 +33,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::init();
+    common::init_tracing();
     match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -64,7 +65,9 @@ async fn try_main() -> DeltaResult<()> {
 
     use delta_kernel::engine::default::storage::store_from_url;
     let store = store_from_url(&url)?;
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_metrics_reporter(Arc::new(PrintingMetricsReporter))
+        .build();
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     // first we create a checkpoint writer

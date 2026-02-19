@@ -26,7 +26,7 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
+    common::init_tracing();
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

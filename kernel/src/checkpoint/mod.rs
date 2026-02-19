@@ -87,7 +87,9 @@
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -104,6 +106,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::{Expression, Scalar, StructData, Transform};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
+use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
@@ -111,6 +114,7 @@ use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
+use tracing::instrument;
 use url::Url;
 
 mod stats_transform;
@@ -183,7 +187,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
     pub(crate) snapshot: SnapshotRef,
@@ -192,6 +196,14 @@ pub struct CheckpointWriter {
     /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
     /// field here to avoid multiple type conversions.
     version: i64,
+
+    /// Cumulative nanoseconds spent evaluating stats transforms across all batches.
+    /// Shared with the lazy iterator returned by `checkpoint_data()`.
+    stats_transform_nanos: Arc<AtomicU64>,
+
+    /// Duration of the setup phase in `checkpoint_data()` (schema building, evaluator creation).
+    /// Set once when `checkpoint_data()` completes.
+    setup_duration: Arc<AtomicU64>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -215,7 +227,12 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
-        Ok(Self { snapshot, version })
+        Ok(Self {
+            snapshot,
+            version,
+            stats_transform_nanos: Arc::new(AtomicU64::new(0)),
+            setup_duration: Arc::new(AtomicU64::new(0)),
+        })
     }
     /// Returns the URL where the checkpoint file should be written.
     ///
@@ -262,10 +279,18 @@ impl CheckpointWriter {
     // 3. Reads actions from the log segment and deduplicates via reconciliation
     // 4. Applies stats transforms (COALESCE/drop) to each reconciled batch
     // 5. Chains the checkpoint metadata action for V2 checkpoints
+    #[instrument(
+        name = "checkpoint.data",
+        skip_all,
+        fields(version = self.version),
+        err
+    )]
     pub fn checkpoint_data(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
+        let setup_start = Instant::now();
+
         let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
@@ -301,6 +326,7 @@ impl CheckpointWriter {
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
         let read_schema = build_checkpoint_read_schema_with_stats(base_schema, &stats_schema)?;
+        let output_schema = build_checkpoint_output_schema(&config, base_schema, &stats_schema)?;
 
         // Read actions from log segment
         let actions =
@@ -315,8 +341,6 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = build_checkpoint_output_schema(&config, base_schema, &stats_schema)?;
-
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
         let transform_expr = build_stats_transform(&config, &stats_schema);
@@ -326,11 +350,20 @@ impl CheckpointWriter {
             output_schema.clone().into(),
         )?;
 
-        // Apply stats transform to each reconciled batch
+        let setup_nanos = setup_start.elapsed().as_nanos() as u64;
+        self.setup_duration.store(setup_nanos, Ordering::Release);
+
+        // Apply stats transform to each reconciled batch, accumulating transform time
+        let transform_nanos = Arc::clone(&self.stats_transform_nanos);
         let transformed = checkpoint_data.map(move |batch_result| {
             let batch = batch_result?;
             let (data, sv) = batch.filtered_data.into_parts();
+            let transform_start = Instant::now();
             let transformed = evaluator.evaluate(data.as_ref())?;
+            transform_nanos.fetch_add(
+                transform_start.elapsed().as_nanos() as u64,
+                Ordering::Release,
+            );
             Ok(ActionReconciliationBatch {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
                 actions_count: batch.actions_count,
@@ -366,12 +399,22 @@ impl CheckpointWriter {
     // 1. Validates that the checkpoint data iterator is fully exhausted
     // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
     // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
+    /// Reports metrics: `CheckpointWriteCompleted`.
+    #[instrument(
+        name = "checkpoint.finalize",
+        skip_all,
+        fields(version = self.version),
+        err
+    )]
     pub fn finalize(
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
         checkpoint_iter_state: &ActionReconciliationIteratorState,
     ) -> DeltaResult<()> {
+        let start = Instant::now();
+        let reporter = engine.get_metrics_reporter();
+
         // Ensure the checkpoint data iterator is fully exhausted
         if !checkpoint_iter_state.is_exhausted() {
             return Err(Error::checkpoint_write(
@@ -403,6 +446,21 @@ impl CheckpointWriter {
             Box::new(std::iter::once(Ok(filtered_data))),
             true,
         )?;
+
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+        let setup_nanos = self.setup_duration.load(Ordering::Acquire);
+        let transform_nanos = self.stats_transform_nanos.load(Ordering::Acquire);
+        reporter.as_ref().inspect(|r| {
+            r.report(MetricEvent::CheckpointWriteCompleted {
+                operation_id: MetricId::new(),
+                duration: start.elapsed(),
+                version: self.snapshot.version(),
+                write_stats_as_json: config.write_stats_as_json,
+                write_stats_as_struct: config.write_stats_as_struct,
+                setup_duration: Duration::from_nanos(setup_nanos),
+                stats_transform_duration: Duration::from_nanos(transform_nanos),
+            });
+        });
 
         Ok(())
     }
