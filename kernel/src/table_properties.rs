@@ -26,6 +26,44 @@ pub use deserialize::ParseIntervalError;
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
 
+// Table property key constants
+pub(crate) const APPEND_ONLY: &str = "delta.appendOnly";
+pub(crate) const AUTO_COMPACT: &str = "delta.autoOptimize.autoCompact";
+pub(crate) const OPTIMIZE_WRITE: &str = "delta.autoOptimize.optimizeWrite";
+pub(crate) const CHECKPOINT_INTERVAL: &str = "delta.checkpointInterval";
+pub(crate) const CHECKPOINT_WRITE_STATS_AS_JSON: &str = "delta.checkpoint.writeStatsAsJson";
+pub(crate) const CHECKPOINT_WRITE_STATS_AS_STRUCT: &str = "delta.checkpoint.writeStatsAsStruct";
+pub(crate) const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
+pub(crate) const COLUMN_MAPPING_MAX_COLUMN_ID: &str = "delta.columnMapping.maxColumnId";
+pub(crate) const DATA_SKIPPING_NUM_INDEXED_COLS: &str = "delta.dataSkippingNumIndexedCols";
+pub(crate) const DATA_SKIPPING_STATS_COLUMNS: &str = "delta.dataSkippingStatsColumns";
+pub(crate) const DELETED_FILE_RETENTION_DURATION: &str = "delta.deletedFileRetentionDuration";
+pub(crate) const ENABLE_CHANGE_DATA_FEED: &str = "delta.enableChangeDataFeed";
+pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
+pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
+pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
+pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
+pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
+pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
+pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
+pub(crate) const RANDOMIZE_FILE_PREFIXES: &str = "delta.randomizeFilePrefixes";
+pub(crate) const RANDOM_PREFIX_LENGTH: &str = "delta.randomPrefixLength";
+pub(crate) const SET_TRANSACTION_RETENTION_DURATION: &str = "delta.setTransactionRetentionDuration";
+pub(crate) const TARGET_FILE_SIZE: &str = "delta.targetFileSize";
+pub(crate) const TUNE_FILE_SIZES_FOR_REWRITES: &str = "delta.tuneFileSizesForRewrites";
+pub(crate) const CHECKPOINT_POLICY: &str = "delta.checkpointPolicy";
+pub(crate) const ENABLE_ROW_TRACKING: &str = "delta.enableRowTracking";
+pub(crate) const MATERIALIZED_ROW_ID_COLUMN_NAME: &str =
+    "delta.rowTracking.materializedRowIdColumnName";
+pub(crate) const MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str =
+    "delta.rowTracking.materializedRowCommitVersionColumnName";
+pub(crate) const ROW_TRACKING_SUSPENDED: &str = "delta.rowTrackingSuspended";
+pub(crate) const ENABLE_IN_COMMIT_TIMESTAMPS: &str = "delta.enableInCommitTimestamps";
+pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
+    "delta.inCommitTimestampEnablementVersion";
+pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
+    "delta.inCommitTimestampEnablementTimestamp";
+
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
 ///
@@ -182,10 +220,34 @@ pub struct TableProperties {
     pub unknown_properties: HashMap<String, String>,
 }
 
+impl TableProperties {
+    /// Returns whether to write file statistics as JSON in checkpoints.
+    /// Default: `true` per the Delta protocol.
+    pub fn should_write_stats_as_json(&self) -> bool {
+        self.checkpoint_write_stats_as_json.unwrap_or(true)
+    }
+
+    /// Returns whether to write file statistics as parsed structs in checkpoints.
+    /// Default: `false` per the Delta protocol.
+    pub fn should_write_stats_as_struct(&self) -> bool {
+        self.checkpoint_write_stats_as_struct.unwrap_or(false)
+    }
+}
+
+/// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
+/// is not specified.
+pub const DEFAULT_NUM_INDEXED_COLS: u64 = 32;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DataSkippingNumIndexedCols {
     AllColumns,
     NumColumns(u64),
+}
+
+impl Default for DataSkippingNumIndexedCols {
+    fn default() -> Self {
+        DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEXED_COLS)
+    }
 }
 
 impl TryFrom<&str> for DataSkippingNumIndexedCols {
@@ -250,58 +312,120 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn test_property_key_constants() {
+        // Verify all property key constants have the correct string values.
+        // This also ensures coverage tools recognize these lines as exercised.
+        assert_eq!(APPEND_ONLY, "delta.appendOnly");
+        assert_eq!(AUTO_COMPACT, "delta.autoOptimize.autoCompact");
+        assert_eq!(OPTIMIZE_WRITE, "delta.autoOptimize.optimizeWrite");
+        assert_eq!(CHECKPOINT_INTERVAL, "delta.checkpointInterval");
+        assert_eq!(
+            CHECKPOINT_WRITE_STATS_AS_JSON,
+            "delta.checkpoint.writeStatsAsJson"
+        );
+        assert_eq!(
+            CHECKPOINT_WRITE_STATS_AS_STRUCT,
+            "delta.checkpoint.writeStatsAsStruct"
+        );
+        assert_eq!(COLUMN_MAPPING_MODE, "delta.columnMapping.mode");
+        assert_eq!(
+            DATA_SKIPPING_NUM_INDEXED_COLS,
+            "delta.dataSkippingNumIndexedCols"
+        );
+        assert_eq!(
+            DATA_SKIPPING_STATS_COLUMNS,
+            "delta.dataSkippingStatsColumns"
+        );
+        assert_eq!(
+            DELETED_FILE_RETENTION_DURATION,
+            "delta.deletedFileRetentionDuration"
+        );
+        assert_eq!(ENABLE_CHANGE_DATA_FEED, "delta.enableChangeDataFeed");
+        assert_eq!(ENABLE_DELETION_VECTORS, "delta.enableDeletionVectors");
+        assert_eq!(ENABLE_TYPE_WIDENING, "delta.enableTypeWidening");
+        assert_eq!(ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1");
+        assert_eq!(ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2");
+        assert_eq!(ISOLATION_LEVEL, "delta.isolationLevel");
+        assert_eq!(LOG_RETENTION_DURATION, "delta.logRetentionDuration");
+        assert_eq!(ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup");
+        assert_eq!(RANDOMIZE_FILE_PREFIXES, "delta.randomizeFilePrefixes");
+        assert_eq!(RANDOM_PREFIX_LENGTH, "delta.randomPrefixLength");
+        assert_eq!(
+            SET_TRANSACTION_RETENTION_DURATION,
+            "delta.setTransactionRetentionDuration"
+        );
+        assert_eq!(TARGET_FILE_SIZE, "delta.targetFileSize");
+        assert_eq!(
+            TUNE_FILE_SIZES_FOR_REWRITES,
+            "delta.tuneFileSizesForRewrites"
+        );
+        assert_eq!(CHECKPOINT_POLICY, "delta.checkpointPolicy");
+        assert_eq!(ENABLE_ROW_TRACKING, "delta.enableRowTracking");
+        assert_eq!(
+            MATERIALIZED_ROW_ID_COLUMN_NAME,
+            "delta.rowTracking.materializedRowIdColumnName"
+        );
+        assert_eq!(
+            MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+            "delta.rowTracking.materializedRowCommitVersionColumnName"
+        );
+        assert_eq!(ROW_TRACKING_SUSPENDED, "delta.rowTrackingSuspended");
+        assert_eq!(
+            ENABLE_IN_COMMIT_TIMESTAMPS,
+            "delta.enableInCommitTimestamps"
+        );
+        assert_eq!(
+            IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
+            "delta.inCommitTimestampEnablementVersion"
+        );
+        assert_eq!(
+            IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+            "delta.inCommitTimestampEnablementTimestamp"
+        );
+    }
+
+    #[test]
     fn test_parse_type_widening() {
-        let properties =
-            HashMap::from([("delta.enableTypeWidening".to_string(), "true".to_string())]);
+        let properties = HashMap::from([(ENABLE_TYPE_WIDENING.to_string(), "true".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
         assert_eq!(table_properties.enable_type_widening, Some(true));
 
-        let properties =
-            HashMap::from([("delta.enableTypeWidening".to_string(), "false".to_string())]);
+        let properties = HashMap::from([(ENABLE_TYPE_WIDENING.to_string(), "false".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
         assert_eq!(table_properties.enable_type_widening, Some(false));
     }
 
     #[test]
     fn test_parse_iceberg_compat_v1() {
-        let properties = HashMap::from([(
-            "delta.enableIcebergCompatV1".to_string(),
-            "true".to_string(),
-        )]);
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
         assert_eq!(table_properties.enable_iceberg_compat_v1, Some(true));
 
-        let properties = HashMap::from([(
-            "delta.enableIcebergCompatV1".to_string(),
-            "false".to_string(),
-        )]);
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V1.to_string(), "false".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
         assert_eq!(table_properties.enable_iceberg_compat_v1, Some(false));
     }
 
     #[test]
     fn test_parse_iceberg_compat_v2() {
-        let properties = HashMap::from([(
-            "delta.enableIcebergCompatV2".to_string(),
-            "true".to_string(),
-        )]);
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
         assert_eq!(table_properties.enable_iceberg_compat_v2, Some(true));
 
-        let properties = HashMap::from([(
-            "delta.enableIcebergCompatV2".to_string(),
-            "false".to_string(),
-        )]);
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "false".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
         assert_eq!(table_properties.enable_iceberg_compat_v2, Some(false));
     }
 
     #[test]
     fn known_key_unknown_val() {
-        let properties = HashMap::from([("delta.appendOnly".to_string(), "wack".to_string())]);
+        let properties = HashMap::from([(APPEND_ONLY.to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
-        let unknown_properties =
-            HashMap::from([("delta.appendOnly".to_string(), "wack".to_string())]);
+        let unknown_properties = HashMap::from([(APPEND_ONLY.to_string(), "wack".to_string())]);
         let expected = TableProperties {
             unknown_properties,
             ..Default::default()
@@ -331,46 +455,40 @@ mod tests {
     #[test]
     fn test_parse_table_properties() {
         let properties = [
-            ("delta.appendOnly", "true"),
-            ("delta.autoOptimize.optimizeWrite", "true"),
-            ("delta.autoOptimize.autoCompact", "true"),
-            ("delta.checkpointInterval", "101"),
-            ("delta.checkpoint.writeStatsAsJson", "true"),
-            ("delta.checkpoint.writeStatsAsStruct", "true"),
-            ("delta.columnMapping.mode", "id"),
-            ("delta.dataSkippingNumIndexedCols", "-1"),
-            ("delta.dataSkippingStatsColumns", "col1,col2"),
-            ("delta.deletedFileRetentionDuration", "interval 1 second"),
-            ("delta.enableChangeDataFeed", "true"),
-            ("delta.enableDeletionVectors", "true"),
-            ("delta.enableTypeWidening", "true"),
-            ("delta.enableIcebergCompatV1", "true"),
-            ("delta.enableIcebergCompatV2", "true"),
-            ("delta.isolationLevel", "snapshotIsolation"),
-            ("delta.logRetentionDuration", "interval 2 seconds"),
-            ("delta.enableExpiredLogCleanup", "true"),
-            ("delta.randomizeFilePrefixes", "true"),
-            ("delta.randomPrefixLength", "1001"),
+            (APPEND_ONLY, "true"),
+            (OPTIMIZE_WRITE, "true"),
+            (AUTO_COMPACT, "true"),
+            (CHECKPOINT_INTERVAL, "101"),
+            (CHECKPOINT_WRITE_STATS_AS_JSON, "true"),
+            (CHECKPOINT_WRITE_STATS_AS_STRUCT, "true"),
+            (COLUMN_MAPPING_MODE, "id"),
+            (DATA_SKIPPING_NUM_INDEXED_COLS, "-1"),
+            (DATA_SKIPPING_STATS_COLUMNS, "col1,col2"),
+            (DELETED_FILE_RETENTION_DURATION, "interval 1 second"),
+            (ENABLE_CHANGE_DATA_FEED, "true"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_TYPE_WIDENING, "true"),
+            (ENABLE_ICEBERG_COMPAT_V1, "true"),
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ISOLATION_LEVEL, "snapshotIsolation"),
+            (LOG_RETENTION_DURATION, "interval 2 seconds"),
+            (ENABLE_EXPIRED_LOG_CLEANUP, "true"),
+            (RANDOMIZE_FILE_PREFIXES, "true"),
+            (RANDOM_PREFIX_LENGTH, "1001"),
+            (SET_TRANSACTION_RETENTION_DURATION, "interval 60 seconds"),
+            (TARGET_FILE_SIZE, "1000000000"),
+            (TUNE_FILE_SIZES_FOR_REWRITES, "true"),
+            (CHECKPOINT_POLICY, "v2"),
+            (ENABLE_ROW_TRACKING, "true"),
+            (MATERIALIZED_ROW_ID_COLUMN_NAME, "_row-id-col-some_uuid"),
             (
-                "delta.setTransactionRetentionDuration",
-                "interval 60 seconds",
-            ),
-            ("delta.targetFileSize", "1000000000"),
-            ("delta.tuneFileSizesForRewrites", "true"),
-            ("delta.checkpointPolicy", "v2"),
-            ("delta.enableRowTracking", "true"),
-            (
-                "delta.rowTracking.materializedRowIdColumnName",
-                "_row-id-col-some_uuid",
-            ),
-            (
-                "delta.rowTracking.materializedRowCommitVersionColumnName",
+                MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
                 "_row-commit-version-col-some_uuid",
             ),
-            ("delta.rowTrackingSuspended", "false"),
-            ("delta.enableInCommitTimestamps", "true"),
-            ("delta.inCommitTimestampEnablementVersion", "15"),
-            ("delta.inCommitTimestampEnablementTimestamp", "1612345678"),
+            (ROW_TRACKING_SUSPENDED, "false"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+            (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15"),
+            (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
