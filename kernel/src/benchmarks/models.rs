@@ -64,7 +64,7 @@ impl TableInfo {
     }
 }
 
-// Specs define the operation performed on a table - defines what operation at what version (e.g. read at version 0)
+// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 // There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -104,37 +104,38 @@ impl ReadOperation {
     }
 }
 
-// Complete workload specification - for a given table, spec, operation, and config
-//
-// Created from JSON with table_info, case_name, and spec populated
-// with_read_operation and with_config are used to set the operation and config
-// validate is then used to ensure that the workload spec variant is ready to run
+// Partial workload specification loaded from JSON - table, case name, and kind only
+// This is then used to construct a WorkloadVariant with the operation and config before running a benchmark
 #[derive(Clone, Debug)]
-pub struct WorkloadSpecVariant {
+pub struct Workload {
     pub table_info: TableInfo,
     pub case_name: String, //Name of the spec JSON file
     pub spec: Spec,
-    pub operation: Option<ReadOperation>, //operation is optional because WorkloadSpecVariant is used for all specs, not just reads
-    pub config: Option<ReadConfig>, //config is optional because WorkloadSpecVariant structs will have no config upon creation, but config will be set before running a benchmark
 }
 
-impl WorkloadSpecVariant {
-    // Validates that this variant is ready to run - ensures that config and operation (operation required for read specs only) are set
+// Fully specified workload - ready to run. Constructed in the benchmark harness by
+// combining a Workload with a concrete ReadConfig and (for read specs) a ReadOperation
+#[derive(Clone, Debug)]
+pub struct WorkloadVariant {
+    pub table_info: TableInfo,
+    pub case_name: String,
+    pub spec: Spec,
+    pub operation: Option<ReadOperation>, // required for Read specs; None for other spec types
+    pub config: ReadConfig,
+}
+
+impl WorkloadVariant {
+    /// Validates that this variant is ready to run.
+    /// For Read specs, ensures that operation is set.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.config.is_none() {
-            return Err(format!(
-                "Invalid workload variant specification: '{}' must have config specified",
-                self.case_name
-            )
-            .into());
-        }
         match &self.spec {
             Spec::Read { .. } => {
                 if self.operation.is_none() {
                     return Err(format!(
-                       "Invalid workload variant specification: '{}' must have read operation specified",
-                       self.case_name
-                   ).into());
+                        "Invalid workload variant specification: '{}' must have read operation specified",
+                        self.case_name
+                    )
+                    .into());
                 }
             }
         }
@@ -153,29 +154,13 @@ impl WorkloadSpecVariant {
                 })?
                 .as_str(),
         };
-
-        let config_str = self
-            .config
-            .as_ref()
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                format!("Workload '{}' must have config set", self.case_name).into()
-            })?
-            .name();
-
         Ok(format!(
             "{}/{}/{}/{}",
-            self.table_info.name, self.case_name, workload_str, config_str
+            self.table_info.name,
+            self.case_name,
+            workload_str,
+            self.config.name()
         ))
-    }
-
-    pub fn with_read_operation(mut self, operation: ReadOperation) -> Self {
-        self.operation = Some(operation);
-        self
-    }
-
-    pub fn with_config(mut self, config: ReadConfig) -> Self {
-        self.config = Some(config);
-        self
     }
 }
 
@@ -244,41 +229,33 @@ mod tests {
         assert!(error.to_string().contains(expected_msg));
     }
 
+    fn make_variant(operation: Option<ReadOperation>, config_name: &str) -> WorkloadVariant {
+        WorkloadVariant {
+            table_info: TableInfo {
+                name: "test_table".into(),
+                description: None,
+                table_path: None,
+                table_info_dir: PathBuf::from("/tmp"),
+            },
+            case_name: "append_10k".into(),
+            spec: Spec::Read { version: Some(1) },
+            operation,
+            config: ReadConfig {
+                name: config_name.into(),
+                parallel_scan: ParallelScan::Disabled,
+            },
+        }
+    }
+
     #[rstest]
-    #[case(
-        None,
-        Some(ReadOperation::ReadMetadata),
-        false,
-        "must have config specified"
-    )]
-    #[case(Some("serial"), None, false, "must have read operation specified")]
-    #[case(Some("serial"), Some(ReadOperation::ReadMetadata), true, "")]
+    #[case(Some(ReadOperation::ReadMetadata), true, "")]
+    #[case(None, false, "must have read operation specified")]
     fn test_workload_spec_variant_validate(
-        #[case] config_name: Option<&str>,
         #[case] operation: Option<ReadOperation>,
         #[case] should_succeed: bool,
         #[case] expected_error_msg: &str,
     ) {
-        let table_info = TableInfo {
-            name: "test_table".into(),
-            description: None,
-            table_path: None,
-            table_info_dir: PathBuf::from("/tmp"),
-        };
-        let spec = Spec::Read { version: Some(1) };
-        let config = config_name.map(|name| ReadConfig {
-            name: name.into(),
-            parallel_scan: ParallelScan::Disabled,
-        });
-        let variant = WorkloadSpecVariant {
-            table_info,
-            case_name: "test_case".into(),
-            spec,
-            operation,
-            config,
-        };
-
-        let result = variant.validate();
+        let result = make_variant(operation, "serial").validate();
         if should_succeed {
             assert!(result.is_ok());
         } else {
@@ -289,83 +266,18 @@ mod tests {
 
     #[rstest]
     #[case(
-        Some("serial"),
         Some(ReadOperation::ReadMetadata),
         Ok("test_table/append_10k/read_metadata/serial")
     )]
-    #[case(
-        None,
-        Some(ReadOperation::ReadData),
-        Err("Workload 'append_10k' must have config set")
-    )]
-    #[case(
-        Some("serial"),
-        None,
-        Err("Workload 'append_10k' must have read operation set")
-    )]
+    #[case(None, Err("Workload 'append_10k' must have read operation set"))]
     fn test_workload_spec_variant_name(
-        #[case] config_name: Option<&str>,
         #[case] operation: Option<ReadOperation>,
         #[case] expected: Result<&str, &str>,
     ) {
-        let table_info = TableInfo {
-            name: "test_table".into(),
-            description: None,
-            table_path: None,
-            table_info_dir: PathBuf::from("/tmp"),
-        };
-        let spec = Spec::Read { version: Some(1) };
-        let config = config_name.map(|name| ReadConfig {
-            name: name.into(),
-            parallel_scan: ParallelScan::Disabled,
-        });
-        let variant = WorkloadSpecVariant {
-            table_info,
-            case_name: "append_10k".into(),
-            spec,
-            operation,
-            config,
-        };
-
+        let result = make_variant(operation, "serial").name();
         match expected {
-            Ok(expected_name) => {
-                assert_eq!(variant.name().unwrap(), expected_name);
-            }
-            Err(expected_error) => {
-                let error = variant.name().unwrap_err();
-                assert_eq!(error.to_string(), expected_error);
-            }
+            Ok(expected_name) => assert_eq!(result.unwrap(), expected_name),
+            Err(expected_err) => assert_eq!(result.unwrap_err().to_string(), expected_err),
         }
-    }
-
-    #[test]
-    fn test_workload_spec_variant_builder_pattern() {
-        let table_info = TableInfo {
-            name: "test_table".into(),
-            description: None,
-            table_path: None,
-            table_info_dir: PathBuf::from("/tmp"),
-        };
-        let spec = Spec::Read { version: Some(1) };
-        let config = ReadConfig {
-            name: "parallel_4".into(),
-            parallel_scan: ParallelScan::Enabled { num_threads: 4 },
-        };
-
-        let variant = WorkloadSpecVariant {
-            table_info,
-            case_name: "test_case".into(),
-            spec,
-            operation: None,
-            config: None,
-        }
-        .with_read_operation(ReadOperation::ReadMetadata)
-        .with_config(config);
-
-        assert!(variant.validate().is_ok());
-        assert_eq!(
-            variant.name().unwrap(),
-            "test_table/test_case/read_metadata/parallel_4"
-        );
     }
 }

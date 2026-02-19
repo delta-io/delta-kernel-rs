@@ -1,6 +1,6 @@
 //! Utility functions for loading workload specifications
 
-use crate::benchmarks::models::{Spec, TableInfo, WorkloadSpecVariant};
+use crate::benchmarks::models::{Spec, TableInfo, Workload};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ const SPECS_DIR: &str = "specs";
 /// Loads all workload specifications from OUTPUT_FOLDER
 /// On first run, extracts from WORKLOAD_TAR if it exists.
 /// Uses a .done file to avoid re-extracting on subsequent runs
-pub fn load_all_workloads() -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::error::Error>> {
+pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     if !workload_specs_exist() {
         extract_workload_specs()?;
     }
@@ -98,7 +98,7 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 
 fn load_specs_from_table(
     table_dir: &Path,
-) -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR);
 
     if !specs_dir.exists() || !specs_dir.is_dir() {
@@ -156,7 +156,7 @@ fn find_spec_files(specs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error:
 fn load_single_spec(
     spec_file: &Path,
     table_info: TableInfo,
-) -> Result<WorkloadSpecVariant, Box<dyn std::error::Error>> {
+) -> Result<Workload, Box<dyn std::error::Error>> {
     if !spec_file.exists() || !spec_file.is_file() {
         return Err(format!("Spec file not found: {}", spec_file.display()).into());
     }
@@ -170,11 +170,9 @@ fn load_single_spec(
     let spec = Spec::from_json_path(spec_file)
         .map_err(|e| format!("Failed to parse spec file {}: {}", spec_file.display(), e))?;
 
-    Ok(WorkloadSpecVariant {
+    Ok(Workload {
         table_info,
         case_name,
         spec,
-        operation: None,
-        config: None,
     })
 }

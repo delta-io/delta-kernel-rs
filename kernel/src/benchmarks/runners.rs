@@ -4,7 +4,7 @@
 //! Results are discarded for benchmarking purposes
 //! Currently only supports reading metadata
 
-use crate::benchmarks::models::{ParallelScan, Spec, WorkloadSpecVariant};
+use crate::benchmarks::models::{ParallelScan, Spec, WorkloadVariant};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::AfterSequential;
 use crate::snapshot::Snapshot;
@@ -17,23 +17,22 @@ use std::thread;
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
-    spec_variant: WorkloadSpecVariant, //Complete workload specification
+    workload_variant: WorkloadVariant, //Complete workload specification
 }
 
 impl ReadMetadataRunner {
     /// Sets up a benchmark runner for reading metadata.
     pub fn setup(
-        spec_variant: WorkloadSpecVariant,
+        workload_variant: WorkloadVariant,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Validate the spec variant has all necessary fields
-        spec_variant.validate()?;
+        workload_variant.validate()?;
 
-        let table_root = spec_variant.table_info.resolved_table_root();
+        let table_root = workload_variant.table_info.resolved_table_root();
 
         let url = crate::try_parse_uri(table_root)?;
 
-        let version = match &spec_variant.spec {
+        let version = match &workload_variant.spec {
             Spec::Read { version } => version,
         };
 
@@ -47,20 +46,12 @@ impl ReadMetadataRunner {
         Ok(Self {
             snapshot,
             engine,
-            spec_variant,
+            workload_variant,
         })
     }
 
     pub fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match &self
-            .spec_variant
-            .config
-            .as_ref()
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                "Config should be set, call validate() before executing".into()
-            })?
-            .parallel_scan
-        {
+        match &self.workload_variant.config.parallel_scan {
             ParallelScan::Disabled => {
                 self.execute_serial()?;
             }
@@ -135,6 +126,6 @@ impl ReadMetadataRunner {
     }
 
     pub fn name(&self) -> Result<String, Box<dyn std::error::Error>> {
-        self.spec_variant.name()
+        self.workload_variant.name()
     }
 }
