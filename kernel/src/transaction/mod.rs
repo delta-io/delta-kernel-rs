@@ -59,6 +59,9 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod stats_verifier;
+use stats_verifier::StatsVerifier;
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -457,6 +460,11 @@ impl<S> Transaction<S> {
                      Consider using separate transactions: one to add files, another to remove files."
                 )
             );
+        }
+
+        // Validate clustering column stats if ClusteredTable feature is enabled
+        if !self.add_files_metadata.is_empty() {
+            self.validate_add_files_stats(&self.add_files_metadata)?;
         }
 
         // Step 1: Generate SetTransaction actions
@@ -1205,6 +1213,38 @@ impl<S> Transaction<S> {
         self.add_files_metadata.push(add_metadata);
     }
 
+    /// Validate that add files have required statistics for clustering columns.
+    ///
+    /// This method checks that if clustering columns are configured for the table,
+    /// all provided add file batches contain statistics for those columns.
+    ///
+    /// # Arguments
+    ///
+    /// * `add_files` - Slice of engine data batches containing add file metadata
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Clustering columns are configured but stats are missing for any file
+    /// - A file has no stats at all when clustering requires stats
+    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+        if let Some(ref clustering_cols) = self.clustering_columns {
+            if !clustering_cols.is_empty() {
+                let schema = self.read_snapshot.schema();
+                let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
+                    .iter()
+                    .map(|col| {
+                        let data_type = stats_verifier::resolve_column_type(&schema, col)?;
+                        Ok((col.clone(), data_type))
+                    })
+                    .collect::<DeltaResult<_>>()?;
+                let verifier = StatsVerifier::new(columns_with_types);
+                verifier.verify(add_files)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Generate add actions, handling row tracking internally if needed
     #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
@@ -1922,6 +1962,18 @@ pub struct RetryableTransaction<S = ExistingTable> {
     pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
     pub error: Error,
+}
+
+// Test-only methods for Transaction
+#[cfg(test)]
+impl Transaction {
+    /// Set clustering columns for testing purposes.
+    /// This allows testing the stats validation logic without needing a table
+    /// with the ClusteredTable feature enabled.
+    pub(crate) fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
+        self.clustering_columns = Some(columns);
+        self
+    }
 }
 
 #[cfg(test)]
