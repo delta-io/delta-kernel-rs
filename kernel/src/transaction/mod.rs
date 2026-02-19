@@ -2599,7 +2599,7 @@ mod tests {
         let score_values = Int32Array::from(vec![10, 20, 30]);
         let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 2, 3].into());
         let scores_arr: ArrayRef = Arc::new(ListArray::try_new(
-            Arc::new(ArrowField::new("item", ArrowDataType::Int32, true)),
+            Arc::new(ArrowField::new("element", ArrowDataType::Int32, true)),
             offsets,
             Arc::new(score_values),
             None,
