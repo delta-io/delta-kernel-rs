@@ -45,6 +45,7 @@ pub trait TaskExecutor: Send + Sync + 'static {
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
 
+    /// Enter the runtime context of this executor.
     fn enter(&self) -> Self::Guard<'_>;
 }
 
