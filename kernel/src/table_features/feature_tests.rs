@@ -87,12 +87,16 @@ struct FeatureFixture {
     /// Schema with annotations that make the feature "present" (for schema-based features).
     /// The harness combines this with Enabled prop_cases when constructing TCs.
     presence_schema: Option<StructType>,
-    /// Feature names that must also be in the protocol for requirements to pass.
+    /// Feature names that must also be enabled in the protocol for requirements to pass.
     required_deps: &'static [&'static str],
-    /// Feature names that must NOT be in the protocol.
+    /// Feature names that must NOT be supported in the protocol.
     anti_deps: &'static [&'static str],
-    /// Property-based test cases. Convention: first `Enabled` variant is the "full presence" case,
-    /// used for orphan tests and capability setup.
+    /// Property-based test cases. Convention: first `Enabled` variant is the "canonical" enabled
+    /// case, used for tests that want to work with a basic enabled feature. Similarly, the first
+    /// `Disabled` variant is the "canonical" disabled case, used for tests that want the feature to
+    /// be supported but not enabled; its (non-)existence is also used to identify features whose
+    /// disabled/enabled status is controlled by table properties and/or schema presence. Any
+    /// additional cases are used to exercise corner cases (both positive and negative).
     prop_cases: &'static [PropCase],
     /// Expected outcome when presence metadata exists but the feature is NOT in the protocol.
     /// `OpExpect::Err` for features with active orphan detection.
@@ -157,22 +161,14 @@ fn try_create_table_config(
     let metadata = Metadata::try_new(None, None, std::sync::Arc::new(schema), vec![], 0, config)?;
 
     // Parse feature names and determine list placement
-    let features: Vec<TableFeature> = feature_names
-        .iter()
-        .map(|name| name.into_table_feature())
-        .collect();
-
-    let reader_features: Vec<&str> = feature_names
-        .iter()
-        .zip(features.iter())
-        .filter(|(_, f)| f.feature_type() == FeatureType::ReaderWriter)
-        .map(|(name, _)| *name)
-        .collect();
-
-    let writer_features: Vec<&str> = feature_names.to_vec();
-
-    let reader_opt = (min_reader_version >= 3).then_some(reader_features);
-    let writer_opt = (min_writer_version >= 7).then_some(writer_features);
+    let reader_opt: Option<Vec<_>> = (min_reader_version >= 3).then(|| {
+        feature_names
+            .iter()
+            .filter(|name| name.into_table_feature().feature_type() == FeatureType::ReaderWriter)
+            .copied()
+            .collect()
+    });
+    let writer_opt = (min_writer_version >= 7).then(|| feature_names.to_vec());
 
     let protocol = Protocol::try_new(
         min_reader_version,
@@ -186,6 +182,7 @@ fn try_create_table_config(
 }
 
 /// Convenience: create TC that must succeed, panicking on failure.
+#[track_caller]
 fn create_table_config(
     feature_names: &[&str],
     raw_props: &[&str],
