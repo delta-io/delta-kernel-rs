@@ -595,8 +595,8 @@ pub(crate) mod test_utils {
         ]))
     }
 
-    /// Create a table with the given schema and column mapping mode, returning
-    /// an in-memory engine and the pre-commit transaction.
+    /// Build a create-table transaction with the given schema and column mapping mode.
+    /// Returns the engine and uncommitted transaction.
     pub(crate) fn setup_column_mapping_txn(
         schema: SchemaRef,
         mode: ColumnMappingMode,
