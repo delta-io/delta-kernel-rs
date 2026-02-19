@@ -29,6 +29,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
+use tracing::warn;
 
 /// Expected schemas for file statistics.
 ///
@@ -267,6 +268,10 @@ impl TableConfiguration {
                     &col_name,
                     column_mapping_mode,
                 )
+                .inspect_err(|e| {
+                    warn!("Couldn't find physical name for {col_name}: {e}");
+                })
+                .ok()
             })
             .collect()
     }

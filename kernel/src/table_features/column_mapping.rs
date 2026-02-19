@@ -319,25 +319,33 @@ pub(crate) fn get_top_level_column_physical_name(
 
 /// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
 ///
-/// Returns `None` if the column name cannot be resolved in the schema.
+/// Returns an error if the column name cannot be resolved in the schema.
 pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
     col_name: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
-) -> Option<ColumnName> {
-    let mut physical_path = Vec::new();
+) -> DeltaResult<ColumnName> {
     let mut current_struct: Option<&StructType> = Some(schema);
-
-    for segment in col_name.path() {
-        let field = current_struct?.field(segment)?;
-        physical_path.push(field.physical_name(column_mapping_mode).to_string());
-        current_struct = match field.data_type() {
-            DataType::Struct(s) => Some(s),
-            _ => None,
-        };
-    }
-
-    Some(ColumnName::new(physical_path))
+    let physical_path: Vec<String> = col_name
+        .path()
+        .iter()
+        .map(|segment| -> DeltaResult<String> {
+            let field = current_struct
+                .and_then(|s| s.field(segment))
+                .ok_or_else(|| {
+                    Error::generic(format!(
+                        "Could not resolve column {col_name} in schema {schema}"
+                    ))
+                })?;
+            current_struct = if let DataType::Struct(s) = field.data_type() {
+                Some(s)
+            } else {
+                None
+            };
+            Ok(field.physical_name(column_mapping_mode).to_string())
+        })
+        .collect::<DeltaResult<_>>()?;
+    Ok(ColumnName::new(physical_path))
 }
 
 #[cfg(test)]
@@ -951,7 +959,7 @@ mod tests {
             &ColumnName::new(["a"]),
             ColumnMappingMode::Name,
         );
-        assert_eq!(result, Some(ColumnName::new(["col-outer-a"])));
+        assert_eq!(result.unwrap(), ColumnName::new(["col-outer-a"]));
 
         // Nested column
         let result = get_any_level_column_physical_name(
@@ -960,8 +968,8 @@ mod tests {
             ColumnMappingMode::Name,
         );
         assert_eq!(
-            result,
-            Some(ColumnName::new(["col-outer-a", "col-inner-y"]))
+            result.unwrap(),
+            ColumnName::new(["col-outer-a", "col-inner-y"])
         );
 
         // No mapping mode returns logical names
@@ -970,11 +978,11 @@ mod tests {
             &ColumnName::new(["a", "y"]),
             ColumnMappingMode::None,
         );
-        assert_eq!(result, Some(ColumnName::new(["a", "y"])));
+        assert_eq!(result.unwrap(), ColumnName::new(["a", "y"]));
     }
 
     #[test]
-    fn test_get_any_level_column_physical_name_returns_none() {
+    fn test_get_any_level_column_physical_name_errors() {
         let schema = StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
 
         // Non-existent top-level column
@@ -983,7 +991,7 @@ mod tests {
             &ColumnName::new(["nonexistent"]),
             ColumnMappingMode::None,
         );
-        assert_eq!(result, None);
+        assert!(result.is_err());
 
         // Nested path on a non-struct field
         let result = get_any_level_column_physical_name(
@@ -991,7 +999,7 @@ mod tests {
             &ColumnName::new(["a", "b"]),
             ColumnMappingMode::None,
         );
-        assert_eq!(result, None);
+        assert!(result.is_err());
     }
 
     #[test]
