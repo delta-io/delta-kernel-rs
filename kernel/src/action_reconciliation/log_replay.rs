@@ -686,6 +686,58 @@ mod tests {
 
         Ok((filtered_data, total_count, add_count))
     }
+
+    #[test]
+    fn test_getter_columns_match_selected_columns() {
+        // Construct a visitor just to access selected_column_names_and_types().
+        let mut seen_file_keys: HashSet<FileActionKey> = HashSet::new();
+        let mut seen_txns: HashSet<String> = HashSet::new();
+        let mut seen_domains: HashSet<String> = HashSet::new();
+        let visitor = ActionReconciliationVisitor::new(
+            &mut seen_file_keys,
+            true,
+            vec![],
+            0,
+            false,
+            false,
+            &mut seen_txns,
+            &mut seen_domains,
+            None,
+        );
+        let (names, _types) = visitor.selected_column_names_and_types();
+
+        // Every GetterColumn constant, in index order.
+        let all_columns = [
+            ActionReconciliationVisitor::ADD_PATH,
+            ActionReconciliationVisitor::ADD_DV_STORAGE_TYPE,
+            ActionReconciliationVisitor::ADD_DV_PATH_OR_INLINE_DV,
+            ActionReconciliationVisitor::ADD_DV_OFFSET,
+            ActionReconciliationVisitor::REMOVE_PATH,
+            ActionReconciliationVisitor::REMOVE_DELETION_TIMESTAMP,
+            ActionReconciliationVisitor::REMOVE_DV_STORAGE_TYPE,
+            ActionReconciliationVisitor::REMOVE_DV_PATH_OR_INLINE_DV,
+            ActionReconciliationVisitor::REMOVE_DV_OFFSET,
+            ActionReconciliationVisitor::METADATA_ID,
+            ActionReconciliationVisitor::PROTOCOL_MIN_READER_VERSION,
+            ActionReconciliationVisitor::TXN_APP_ID,
+            ActionReconciliationVisitor::TXN_LAST_UPDATED,
+            ActionReconciliationVisitor::DOMAIN_METADATA_DOMAIN,
+            ActionReconciliationVisitor::DOMAIN_METADATA_REMOVED,
+        ];
+
+        assert_eq!(all_columns.len(), names.len());
+        for (expected_index, col) in all_columns.iter().enumerate() {
+            assert_eq!(col.index, expected_index);
+            assert_eq!(
+                names[col.index],
+                ColumnName::from_naive_str_split(col.name),
+                "GetterColumn '{}' at index {} doesn't match selected_column_names_and_types",
+                col.name,
+                col.index,
+            );
+        }
+    }
+
     #[test]
     fn test_action_reconciliation_visitor() -> DeltaResult<()> {
         let data = action_batch();
