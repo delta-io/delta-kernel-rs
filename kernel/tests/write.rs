@@ -41,7 +41,8 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::FileMeta;
 
 use test_utils::{
@@ -3064,15 +3065,26 @@ async fn test_write_parquet_rejects_unknown_partition_column(
 }
 
 /// Translates a logical field path (e.g. `["address", "street"]`) to physical
-/// using the snapshot's table configuration and column mapping mode.
+/// using the snapshot's schema and column mapping mode.
 fn translate_logical_path_to_physical(snapshot: &Snapshot, path: &[&str]) -> Vec<String> {
-    use delta_kernel::expressions::ColumnName;
-    let col = ColumnName::new(path.iter().map(|s| s.to_string()));
     let tc = snapshot.table_configuration();
     let cm = tc.column_mapping_mode();
-    tc.translate_column_name_to_physical(&col, cm)
-        .unwrap_or_else(|| panic!("failed to resolve {:?} to physical", path))
-        .into_inner()
+    let schema = tc.schema();
+    let mut current: &StructType = schema.as_ref();
+    let mut physical = Vec::with_capacity(path.len());
+    for (i, segment) in path.iter().enumerate() {
+        let field = current
+            .field(segment)
+            .unwrap_or_else(|| panic!("field '{segment}' not found at level {i} of {path:?}"));
+        physical.push(field.physical_name(cm).to_string());
+        if i + 1 < path.len() {
+            current = match field.data_type() {
+                DataType::Struct(s) => s,
+                _ => panic!("expected struct at '{segment}' in {path:?}"),
+            };
+        }
+    }
+    physical
 }
 
 /// Asserts that a field exists at the given physical path in the footer schema.
@@ -3475,4 +3487,279 @@ async fn test_column_mapping_partitioned_write(
         }
     }
     panic!("no add action found in commit log");
+}
+
+// ===========================================================================
+// CTAS Feature Matrix Tests
+//
+// These tests exercise a CTAS-style flow: create a source table with certain
+// features, write seed data, scan it, create a target table with (possibly
+// different) features, write the scanned data, then verify the target.
+// ===========================================================================
+
+/// Scans all data from a table and returns the rows as RecordBatches.
+fn scan_table_batches(
+    table_url: &Url,
+    engine: Arc<dyn Engine>,
+) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine)?
+        .map(|r| {
+            let data = r.unwrap();
+            let arrow = ArrowEngineData::try_from_engine_data(data).unwrap();
+            arrow.record_batch().clone()
+        })
+        .collect();
+    assert!(!batches.is_empty(), "scan should return at least one batch");
+    Ok(batches)
+}
+
+/// Shared implementation for the CTAS-style flow used by multiple test functions.
+///
+/// The flow is:
+///   1. Create source table Y → write seed data
+///   2. Scan Y to collect data
+///   3. Call `create_table` to build a transaction for target table X
+///   4. Use the same transaction's `get_write_context` to write the scanned data
+///   5. `add_files` + `commit` in one atomic operation (create + data)
+///   6. Verify X matches Y (logical names, physical names, stats, protocol)
+async fn run_ctas_test(
+    src_cm: bool,
+    src_clustered: bool,
+    tgt_cm: bool,
+    tgt_clustered: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = nested_schema()?;
+
+    // --- Source table Y: create and populate ---
+    let (_src_tmp, src_table_path, _) = test_table_setup()?;
+    let src_url = Url::from_directory_path(&src_table_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let mut src_snapshot = {
+        let mut builder = create_table_txn(&src_table_path, schema.clone(), "ctas-test");
+        if src_cm {
+            builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
+        }
+        if src_clustered {
+            builder = builder.with_data_layout(DataLayout::clustered(["row_number"]));
+        }
+        let result = builder
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?;
+        match result {
+            CommitResult::CommittedTransaction(c) => c
+                .post_commit_snapshot()
+                .expect("should have post_commit_snapshot")
+                .clone(),
+            _ => panic!("Source create should succeed"),
+        }
+    };
+
+    for batch in nested_batches()? {
+        src_snapshot =
+            write_batch_to_table(&src_snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    }
+
+    // --- Scan source Y ---
+    let src_batches = scan_table_batches(&src_url, engine.clone() as Arc<dyn Engine>)?;
+    let src_schema = src_batches[0].schema();
+    let source_data =
+        delta_kernel::arrow::compute::concat_batches(&src_schema, &src_batches)?;
+    let source_row_count = source_data.num_rows();
+    assert_eq!(source_row_count, 6, "Source should have 6 rows");
+
+    // --- Target table X: create + write in a single transaction ---
+    let (_tgt_tmp, tgt_table_path, _) = test_table_setup()?;
+    let tgt_url = Url::from_directory_path(&tgt_table_path).unwrap();
+
+    let mut tgt_builder = create_table_txn(&tgt_table_path, schema.clone(), "ctas-test");
+    if tgt_cm {
+        tgt_builder = tgt_builder.with_table_properties([("delta.columnMapping.mode", "name")]);
+    }
+    if tgt_clustered {
+        tgt_builder = tgt_builder.with_data_layout(DataLayout::clustered(["row_number"]));
+    }
+    let mut tgt_txn = tgt_builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    let write_context = Arc::new(tgt_txn.get_write_context());
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(source_data),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    tgt_txn.add_files(add_meta);
+
+    let commit_result = tgt_txn.commit(engine.as_ref())?;
+    let tgt_snapshot = match commit_result {
+        CommitResult::CommittedTransaction(c) => c
+            .post_commit_snapshot()
+            .expect("should have post_commit_snapshot")
+            .clone(),
+        _ => panic!("CTAS commit should succeed"),
+    };
+
+    // --- Verify target X: version 0 with both schema and data ---
+    assert_eq!(
+        tgt_snapshot.version(),
+        0,
+        "CTAS should produce a single version-0 commit"
+    );
+
+    let tgt_config = tgt_snapshot.table_configuration();
+
+    // Protocol features
+    if tgt_cm {
+        assert!(
+            tgt_config.is_feature_supported(&TableFeature::ColumnMapping),
+            "Target should support columnMapping feature"
+        );
+        assert_eq!(
+            tgt_config.column_mapping_mode(),
+            ColumnMappingMode::Name,
+            "Target should have column mapping mode = name"
+        );
+    }
+    if tgt_clustered {
+        assert!(
+            tgt_config.is_feature_supported(&TableFeature::ClusteredTable),
+            "Target should support clusteredTable feature"
+        );
+        assert!(
+            tgt_config.is_feature_supported(&TableFeature::DomainMetadata),
+            "Target should support domainMetadata feature"
+        );
+    }
+
+    // Data roundtrip: scan target and compare
+    let tgt_batches = scan_table_batches(&tgt_url, engine.clone() as Arc<dyn Engine>)?;
+    let tgt_schema = tgt_batches[0].schema();
+    let tgt_combined =
+        delta_kernel::arrow::compute::concat_batches(&tgt_schema, &tgt_batches)?;
+    assert_eq!(
+        tgt_combined.num_rows(),
+        source_row_count,
+        "Target should have same number of rows as source"
+    );
+
+    // Logical column names are preserved
+    let row_numbers = tgt_combined
+        .column_by_name("row_number")
+        .expect("should have logical column 'row_number'")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("row_number should be Int64");
+    let mut vals: Vec<i64> = (0..row_numbers.len())
+        .map(|i| row_numbers.value(i))
+        .collect();
+    vals.sort();
+    assert_eq!(vals, (1..=source_row_count as i64).collect::<Vec<_>>());
+
+    // Nested struct survives roundtrip
+    let address = tgt_combined
+        .column_by_name("address")
+        .expect("should have logical column 'address'")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("address should be a struct");
+    let streets = address
+        .column_by_name("street")
+        .expect("address should have 'street'")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("street should be String");
+    let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
+    street_vals.sort();
+    let expected_streets: Vec<String> =
+        (1..=source_row_count).map(|i| format!("st{i}")).collect();
+    let expected_refs: Vec<&str> = expected_streets.iter().map(String::as_str).collect();
+    assert_eq!(street_vals, expected_refs);
+
+    // Physical names and stats when CM is enabled
+    if tgt_cm {
+        let row_number_physical =
+            translate_logical_path_to_physical(&tgt_snapshot, &["row_number"]);
+        let street_physical =
+            translate_logical_path_to_physical(&tgt_snapshot, &["address", "street"]);
+
+        let add_actions = read_add_infos(&tgt_snapshot, engine.as_ref())?;
+        if let Some(stats) = add_actions
+            .iter()
+            .filter_map(|a| a.stats.as_ref())
+            .find(|s| s.get("minValues").is_some())
+        {
+            assert!(
+                stats["minValues"].get(&row_number_physical[0]).is_some(),
+                "stats minValues should use physical name for row_number"
+            );
+            assert!(
+                stats["minValues"][&street_physical[0]]
+                    .get(&street_physical[1])
+                    .is_some(),
+                "stats minValues should use physical name for address.street"
+            );
+        }
+
+        if let Some(first_add) = add_actions.first() {
+            let parquet_url = tgt_url.join(&first_add.path)?;
+            let obj_meta = store
+                .head(&Path::from_url_path(parquet_url.path())?)
+                .await?;
+            let file_meta = FileMeta::new(parquet_url, 0, obj_meta.size as u64);
+            let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
+            for path in [vec!["row_number"], vec!["address", "street"]] {
+                let physical = translate_logical_path_to_physical(&tgt_snapshot, &path);
+                assert_footer_has_field(&footer.schema, &physical);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// CTAS column mapping tests: exercises all combinations of source and target
+/// column mapping modes (none vs name) without clustering.
+///
+/// These 4 tests always run regardless of feature flags.
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ctas_column_mapping(
+    #[values(false, true)] src_cm: bool,
+    #[values(false, true)] tgt_cm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_ctas_test(src_cm, /* src_clustered */ false, tgt_cm, /* tgt_clustered */ false).await
+}
+
+/// Full CTAS feature matrix including clustering: exercises all 16 combinations
+/// of {column mapping, clustering} x {column mapping, clustering}.
+///
+/// Requires the `clustered-table` cargo feature.  Cases without any clustering
+/// are already covered by `test_ctas_column_mapping` and are skipped here.
+#[cfg(feature = "clustered-table")]
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ctas_full_feature_matrix(
+    #[values(false, true)] src_cm: bool,
+    #[values(false, true)] src_clustered: bool,
+    #[values(false, true)] tgt_cm: bool,
+    #[values(false, true)] tgt_clustered: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !src_clustered && !tgt_clustered {
+        return Ok(());
+    }
+    run_ctas_test(src_cm, src_clustered, tgt_cm, tgt_clustered).await
 }
