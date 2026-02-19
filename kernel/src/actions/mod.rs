@@ -2,14 +2,12 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::table_features::{FeatureType, TableFeature};
+use crate::table_features::{FeatureType, IntoTableFeature, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
@@ -30,7 +28,6 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
-pub(crate) mod crc;
 pub(crate) mod domain_metadata;
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -257,7 +254,7 @@ impl Metadata {
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
-        schema: StructType,
+        schema: SchemaRef,
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
@@ -349,6 +346,30 @@ impl Metadata {
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_unchecked(
+        id: impl Into<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format: Format,
+        schema_string: impl Into<String>,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name,
+            description,
+            format,
+            schema_string: schema_string.into(),
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
 }
 
 // NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
@@ -400,29 +421,22 @@ pub(crate) struct Protocol {
     writer_features: Option<Vec<TableFeature>>,
 }
 
-fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
-where
-    T: FromStr,
-    T::Err: Debug,
-{
-    features
-        .map(|fs| {
-            fs.into_iter()
-                .map(|f| T::from_str(&f.to_string()))
-                .collect()
-        })
-        .transpose()
-        .ok()?
+/// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
+/// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
+fn parse_features(
+    features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+) -> Option<Vec<TableFeature>> {
+    let features = features?.into_iter().map(|f| f.into_table_feature());
+    Some(features.collect())
 }
 
 impl Protocol {
-    /// Try to create a new Protocol instance from reader/writer versions and table features. This
-    /// can fail if the protocol is invalid.
+    /// Try to create a new Protocol instance from reader/writer versions and table features.
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl ToString>>,
-        writer_features: Option<impl IntoIterator<Item = impl ToString>>,
+        reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+        writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
     ) -> DeltaResult<Self> {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
@@ -579,6 +593,21 @@ impl Protocol {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<Vec<TableFeature>>,
+        writer_features: Option<Vec<TableFeature>>,
+    ) -> Self {
+        Self {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
@@ -604,6 +633,8 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
+    /// Whether this commit is a blind append.
+    pub(crate) is_blind_append: Option<bool>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
@@ -616,6 +647,7 @@ impl CommitInfo {
         in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
+        is_blind_append: bool,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
@@ -623,6 +655,7 @@ impl CommitInfo {
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
@@ -1198,6 +1231,7 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
+                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
             ]),
@@ -1442,17 +1476,13 @@ mod tests {
 
     #[test]
     fn test_parse_table_feature_never_fails() {
-        // parse a non-str
-        let features = Some([5]);
-        let expected = Some(vec![TableFeature::unknown("5")]);
-        assert_eq!(parse_features::<TableFeature>(features), expected);
         // weird strs
         let features = Some(["", "absurD_)(+13%^⚙️"]);
-        let expected = Some(vec![
+        let expected = Some(FromIterator::from_iter([
             TableFeature::unknown(""),
             TableFeature::unknown("absurD_)(+13%^⚙️"),
-        ]);
-        assert_eq!(parse_features::<TableFeature>(features), expected);
+        ]));
+        assert_eq!(parse_features(features), expected);
     }
 
     #[test]
@@ -1492,7 +1522,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None, false);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1510,6 +1540,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
             ],
@@ -1548,7 +1579,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1573,7 +1607,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1583,7 +1620,10 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1670,7 +1710,10 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1718,7 +1761,10 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),
