@@ -189,125 +189,113 @@ pub(crate) fn coerce_batch_nullability(
     }
 
     // Recursively coerces nullability for a column+field pair. For struct columns, recurses
-    // into children.
+    // into children; for leaf columns, just adjusts the field's nullability flag.
     fn coerce(
         column: Arc<dyn ArrowArray>,
         src_field: &ArrowFieldRef,
         target_field: &ArrowFieldRef,
     ) -> DeltaResult<(Arc<dyn ArrowArray>, ArrowFieldRef)> {
-        match (column.data_type(), target_field.data_type()) {
-            (ArrowDataType::Struct(src_children), ArrowDataType::Struct(target_children))
-                if src_children != target_children =>
-            {
-                let struct_array =
-                    column
+        let coerced_array: Arc<dyn ArrowArray> =
+            match (column.data_type(), target_field.data_type()) {
+                (ArrowDataType::Struct(src_children), ArrowDataType::Struct(target_children))
+                    if src_children != target_children =>
+                {
+                    let struct_array =
+                        column
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .ok_or_else(|| {
+                                Error::generic("expected Struct array during nullability coercion")
+                            })?;
+                    let (coerced_columns, coerced_fields): (
+                        Vec<Arc<dyn ArrowArray>>,
+                        Vec<ArrowFieldRef>,
+                    ) = struct_array
+                        .columns()
+                        .iter()
+                        .zip(src_children.iter())
+                        .zip(target_children.iter())
+                        .map(|((child_col, src_child), target_child)| {
+                            coerce(child_col.clone(), src_child, target_child)
+                        })
+                        .collect::<DeltaResult<Vec<_>>>()?
+                        .into_iter()
+                        .unzip();
+                    Arc::new(StructArray::try_new(
+                        coerced_fields.into(),
+                        coerced_columns,
+                        struct_array.nulls().cloned(),
+                    )?)
+                }
+                // Map type: recurse into entries struct to fix nested nullability
+                (
+                    ArrowDataType::Map(src_entries_field, _),
+                    ArrowDataType::Map(target_entries_field, _),
+                ) if src_entries_field != target_entries_field => {
+                    let map_array =
+                        column.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                            Error::generic("expected Map array during nullability coercion")
+                        })?;
+                    let (_, offsets, entries, nulls, ordered) = map_array.clone().into_parts();
+                    let (coerced_entries_col, coerced_entries_field) =
+                        coerce(Arc::new(entries), src_entries_field, target_entries_field)?;
+                    let coerced_entries = coerced_entries_col
                         .as_any()
                         .downcast_ref::<StructArray>()
                         .ok_or_else(|| {
-                            Error::generic("expected Struct array during nullability coercion")
+                            Error::generic(
+                                "expected Struct array for Map entries during nullability coercion",
+                            )
+                        })?
+                        .clone();
+                    Arc::new(MapArray::try_new(
+                        coerced_entries_field,
+                        offsets,
+                        coerced_entries,
+                        nulls,
+                        ordered,
+                    )?)
+                }
+                // List type: recurse into element to fix nested nullability
+                (ArrowDataType::List(src_element), ArrowDataType::List(target_element))
+                    if src_element != target_element =>
+                {
+                    let list_array = column
+                        .as_any()
+                        .downcast_ref::<GenericListArray<i32>>()
+                        .ok_or_else(|| {
+                            Error::generic("expected List array during nullability coercion")
                         })?;
-                let (coerced_columns, coerced_fields): (
-                    Vec<Arc<dyn ArrowArray>>,
-                    Vec<ArrowFieldRef>,
-                ) = struct_array
-                    .columns()
-                    .iter()
-                    .zip(src_children.iter())
-                    .zip(target_children.iter())
-                    .map(|((child_col, src_child), target_child)| {
-                        coerce(child_col.clone(), src_child, target_child)
-                    })
-                    .collect::<DeltaResult<Vec<_>>>()?
-                    .into_iter()
-                    .unzip();
-                let coerced_array: Arc<dyn ArrowArray> = Arc::new(StructArray::try_new(
-                    coerced_fields.into(),
-                    coerced_columns,
-                    struct_array.nulls().cloned(),
-                )?);
-                let field = Arc::new(ArrowField::new(
-                    src_field.name(),
-                    coerced_array.data_type().clone(),
-                    target_field.is_nullable(),
-                ));
-                Ok((coerced_array, field))
-            }
-            // Map type: recurse into entries struct to fix nested nullability
-            (
-                ArrowDataType::Map(src_entries_field, _),
-                ArrowDataType::Map(target_entries_field, _),
-            ) if src_entries_field != target_entries_field => {
-                let map_array = column.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-                    Error::generic("expected Map array during nullability coercion")
-                })?;
-                let (_, offsets, entries, nulls, ordered) = map_array.clone().into_parts();
-                let (coerced_entries_col, coerced_entries_field) =
-                    coerce(Arc::new(entries), src_entries_field, target_entries_field)?;
-                let coerced_entries = coerced_entries_col
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or_else(|| {
-                        Error::generic(
-                            "expected Struct array for Map entries during nullability coercion",
+                    let (_, offsets, values, nulls) = list_array.clone().into_parts();
+                    let (coerced_values, coerced_element_field) =
+                        coerce(values, src_element, target_element)?;
+                    Arc::new(GenericListArray::<i32>::try_new(
+                        coerced_element_field,
+                        offsets,
+                        coerced_values,
+                        nulls,
+                    )?)
+                }
+                _ => {
+                    let field = if src_field.is_nullable() == target_field.is_nullable() {
+                        src_field.clone()
+                    } else {
+                        Arc::new(
+                            src_field
+                                .as_ref()
+                                .clone()
+                                .with_nullable(target_field.is_nullable()),
                         )
-                    })?
-                    .clone();
-                let coerced_map = MapArray::try_new(
-                    coerced_entries_field,
-                    offsets,
-                    coerced_entries,
-                    nulls,
-                    ordered,
-                )?;
-                let coerced_array: Arc<dyn ArrowArray> = Arc::new(coerced_map);
-                let field = Arc::new(ArrowField::new(
-                    src_field.name(),
-                    coerced_array.data_type().clone(),
-                    target_field.is_nullable(),
-                ));
-                Ok((coerced_array, field))
-            }
-            // List type: recurse into element to fix nested nullability
-            (ArrowDataType::List(src_element), ArrowDataType::List(target_element))
-                if src_element != target_element =>
-            {
-                let list_array = column
-                    .as_any()
-                    .downcast_ref::<GenericListArray<i32>>()
-                    .ok_or_else(|| {
-                        Error::generic("expected List array during nullability coercion")
-                    })?;
-                let (_, offsets, values, nulls) = list_array.clone().into_parts();
-                let (coerced_values, coerced_element_field) =
-                    coerce(values, src_element, target_element)?;
-                let coerced_list = GenericListArray::<i32>::try_new(
-                    coerced_element_field,
-                    offsets,
-                    coerced_values,
-                    nulls,
-                )?;
-                let coerced_array: Arc<dyn ArrowArray> = Arc::new(coerced_list);
-                let field = Arc::new(ArrowField::new(
-                    src_field.name(),
-                    coerced_array.data_type().clone(),
-                    target_field.is_nullable(),
-                ));
-                Ok((coerced_array, field))
-            }
-            _ => {
-                let field = if src_field.is_nullable() == target_field.is_nullable() {
-                    src_field.clone()
-                } else {
-                    Arc::new(
-                        src_field
-                            .as_ref()
-                            .clone()
-                            .with_nullable(target_field.is_nullable()),
-                    )
-                };
-                Ok((column, field))
-            }
-        }
+                    };
+                    return Ok((column, field));
+                }
+            };
+        let field = Arc::new(ArrowField::new(
+            src_field.name(),
+            coerced_array.data_type().clone(),
+            target_field.is_nullable(),
+        ));
+        Ok((coerced_array, field))
     }
 
     let batch_schema = batch.schema();
@@ -3206,5 +3194,426 @@ mod tests {
         assert_eq!(non_null_leaf_non_null_2, non_null_leaf_non_null_1);
         let non_null_leaf_nullable_2 = inner_non_null_2.column(1);
         assert_eq!(non_null_leaf_nullable_2, non_null_leaf_nullable_1);
+    }
+
+    /// (src_field, target_field, column) where src and target differ only in nullability.
+    type CoerceTestCase = (Arc<ArrowField>, Arc<ArrowField>, Arc<dyn ArrowArray>);
+
+    fn create_data_int() -> (CoerceTestCase, CoerceTestCase) {
+        let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+        let non_null = Arc::new(ArrowField::new("c", ArrowDataType::Int32, false));
+        let nullable = Arc::new(ArrowField::new("c", ArrowDataType::Int32, true));
+        (
+            (non_null.clone(), nullable.clone(), col.clone()),
+            (nullable, non_null, col),
+        )
+    }
+
+    fn create_data_string() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::array::StringArray;
+        let col: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+        let non_null = Arc::new(ArrowField::new("c", ArrowDataType::Utf8, false));
+        let nullable = Arc::new(ArrowField::new("c", ArrowDataType::Utf8, true));
+        (
+            (non_null.clone(), nullable.clone(), col.clone()),
+            (nullable, non_null, col),
+        )
+    }
+
+    fn create_data_struct() -> (CoerceTestCase, CoerceTestCase) {
+        let make = |child_nullable: bool| {
+            let inner = ArrowField::new("val", ArrowDataType::Int32, child_nullable);
+            Arc::new(ArrowField::new(
+                "c",
+                ArrowDataType::Struct(ArrowFields::from(vec![inner])),
+                false,
+            ))
+        };
+        let inner_col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+        let make_col = |child_nullable: bool| -> Arc<dyn ArrowArray> {
+            let inner = ArrowField::new("val", ArrowDataType::Int32, child_nullable);
+            Arc::new(
+                StructArray::try_new(
+                    ArrowFields::from(vec![inner]),
+                    vec![inner_col.clone()],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        (
+            (make(false), make(true), make_col(false)),
+            (make(true), make(false), make_col(true)),
+        )
+    }
+
+    fn create_data_list() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_field = |elem_nullable: bool| {
+            let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, elem_nullable));
+            Arc::new(ArrowField::new("c", ArrowDataType::List(elem), false))
+        };
+        let make_col = |elem_nullable: bool| -> Arc<dyn ArrowArray> {
+            let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, elem_nullable));
+            let values: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+            Arc::new(GenericListArray::<i32>::try_new(elem, offsets, values, None).unwrap())
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    fn create_data_map() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::array::StringArray;
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_entries = |val_nullable: bool| {
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", ArrowDataType::Utf8, false),
+                    ArrowField::new("value", ArrowDataType::Int32, val_nullable),
+                ])),
+                false,
+            ))
+        };
+        let make_field = |val_nullable: bool| {
+            Arc::new(ArrowField::new(
+                "c",
+                ArrowDataType::Map(make_entries(val_nullable), false),
+                false,
+            ))
+        };
+        let make_col = |val_nullable: bool| -> Arc<dyn ArrowArray> {
+            let entries_field = make_entries(val_nullable);
+            let entry_fields = match entries_field.data_type() {
+                ArrowDataType::Struct(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let keys: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+            let vals: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+            let entries = StructArray::try_new(entry_fields, vec![keys, vals], None).unwrap();
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            Arc::new(MapArray::try_new(entries_field, offsets, entries, None, false).unwrap())
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// List<Struct<Int32>> — toggle nullability of the Int32 leaf inside the struct element.
+    fn create_data_struct_in_list() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_field = |leaf_nullable: bool| {
+            let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+            let elem = Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Struct(ArrowFields::from(vec![leaf])),
+                false,
+            ));
+            Arc::new(ArrowField::new("c", ArrowDataType::List(elem), false))
+        };
+        let make_col = |leaf_nullable: bool| -> Arc<dyn ArrowArray> {
+            let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+            let inner_col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+            let elem_field = Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Struct(ArrowFields::from(vec![leaf.clone()])),
+                false,
+            ));
+            let structs =
+                StructArray::try_new(ArrowFields::from(vec![leaf]), vec![inner_col], None).unwrap();
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+            Arc::new(
+                GenericListArray::<i32>::try_new(elem_field, offsets, Arc::new(structs), None)
+                    .unwrap(),
+            )
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// Struct<List<Int32>> — toggle nullability of the Int32 element inside the list child.
+    fn create_data_list_in_struct() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_field = |elem_nullable: bool| {
+            let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, elem_nullable));
+            let list_field = ArrowField::new("vals", ArrowDataType::List(elem), false);
+            Arc::new(ArrowField::new(
+                "c",
+                ArrowDataType::Struct(ArrowFields::from(vec![list_field])),
+                false,
+            ))
+        };
+        let make_col = |elem_nullable: bool| -> Arc<dyn ArrowArray> {
+            let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, elem_nullable));
+            let values: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+            let list_col: Arc<dyn ArrowArray> =
+                Arc::new(GenericListArray::<i32>::try_new(elem, offsets, values, None).unwrap());
+            let list_field = ArrowField::new("vals", list_col.data_type().clone(), false);
+            Arc::new(
+                StructArray::try_new(ArrowFields::from(vec![list_field]), vec![list_col], None)
+                    .unwrap(),
+            )
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// Map<String, List<Int32>> — toggle nullability of the Int32 element inside the list value.
+    fn create_data_list_in_map() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::array::StringArray;
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_entries = |elem_nullable: bool| {
+            let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, elem_nullable));
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", ArrowDataType::Utf8, false),
+                    ArrowField::new("value", ArrowDataType::List(elem), true),
+                ])),
+                false,
+            ))
+        };
+        let make_field = |elem_nullable: bool| {
+            Arc::new(ArrowField::new(
+                "c",
+                ArrowDataType::Map(make_entries(elem_nullable), false),
+                false,
+            ))
+        };
+        let make_col = |elem_nullable: bool| -> Arc<dyn ArrowArray> {
+            let entries_field = make_entries(elem_nullable);
+            let entry_fields = match entries_field.data_type() {
+                ArrowDataType::Struct(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, elem_nullable));
+            let list_values: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+            let list_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            let list_col: Arc<dyn ArrowArray> = Arc::new(
+                GenericListArray::<i32>::try_new(elem, list_offsets, list_values, None).unwrap(),
+            );
+            let keys: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+            let entries = StructArray::try_new(entry_fields, vec![keys, list_col], None).unwrap();
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            Arc::new(MapArray::try_new(entries_field, offsets, entries, None, false).unwrap())
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// Map<String, Struct<Int32>> — toggle nullability of the Int32 leaf inside the struct value.
+    fn create_data_struct_in_map() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::array::StringArray;
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_entries = |leaf_nullable: bool| {
+            let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", ArrowDataType::Utf8, false),
+                    ArrowField::new(
+                        "value",
+                        ArrowDataType::Struct(ArrowFields::from(vec![leaf])),
+                        true,
+                    ),
+                ])),
+                false,
+            ))
+        };
+        let make_field = |leaf_nullable: bool| {
+            Arc::new(ArrowField::new(
+                "c",
+                ArrowDataType::Map(make_entries(leaf_nullable), false),
+                false,
+            ))
+        };
+        let make_col = |leaf_nullable: bool| -> Arc<dyn ArrowArray> {
+            let entries_field = make_entries(leaf_nullable);
+            let entry_fields = match entries_field.data_type() {
+                ArrowDataType::Struct(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+            let inner: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+            let struct_col: Arc<dyn ArrowArray> = Arc::new(
+                StructArray::try_new(ArrowFields::from(vec![leaf]), vec![inner], None).unwrap(),
+            );
+            let keys: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+            let entries = StructArray::try_new(entry_fields, vec![keys, struct_col], None).unwrap();
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            Arc::new(MapArray::try_new(entries_field, offsets, entries, None, false).unwrap())
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// Struct<Map<String, Int32>> — toggle nullability of the Int32 value inside the map child.
+    fn create_data_map_in_struct() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::array::StringArray;
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_entries = |val_nullable: bool| {
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", ArrowDataType::Utf8, false),
+                    ArrowField::new("value", ArrowDataType::Int32, val_nullable),
+                ])),
+                false,
+            ))
+        };
+        let make_field = |val_nullable: bool| {
+            let map_field = ArrowField::new(
+                "m",
+                ArrowDataType::Map(make_entries(val_nullable), false),
+                false,
+            );
+            Arc::new(ArrowField::new(
+                "c",
+                ArrowDataType::Struct(ArrowFields::from(vec![map_field])),
+                false,
+            ))
+        };
+        let make_col = |val_nullable: bool| -> Arc<dyn ArrowArray> {
+            let entries_field = make_entries(val_nullable);
+            let entry_fields = match entries_field.data_type() {
+                ArrowDataType::Struct(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let keys: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+            let vals: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+            let entries = StructArray::try_new(entry_fields, vec![keys, vals], None).unwrap();
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            let map_col: Arc<dyn ArrowArray> =
+                Arc::new(MapArray::try_new(entries_field, offsets, entries, None, false).unwrap());
+            let map_child_field = ArrowField::new("m", map_col.data_type().clone(), false);
+            Arc::new(
+                StructArray::try_new(
+                    ArrowFields::from(vec![map_child_field]),
+                    vec![map_col],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// List<Map<String, Int32>> — toggle nullability of the Int32 value inside the map element.
+    fn create_data_map_in_list() -> (CoerceTestCase, CoerceTestCase) {
+        use crate::arrow::array::StringArray;
+        use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        let make_entries = |val_nullable: bool| {
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", ArrowDataType::Utf8, false),
+                    ArrowField::new("value", ArrowDataType::Int32, val_nullable),
+                ])),
+                false,
+            ))
+        };
+        let make_field = |val_nullable: bool| {
+            let map_elem = Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Map(make_entries(val_nullable), false),
+                false,
+            ));
+            Arc::new(ArrowField::new("c", ArrowDataType::List(map_elem), false))
+        };
+        let make_col = |val_nullable: bool| -> Arc<dyn ArrowArray> {
+            let entries_field = make_entries(val_nullable);
+            let entry_fields = match entries_field.data_type() {
+                ArrowDataType::Struct(f) => f.clone(),
+                _ => unreachable!(),
+            };
+            let keys: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+            let vals: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+            let entries = StructArray::try_new(entry_fields, vec![keys, vals], None).unwrap();
+            let map_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            let map_array =
+                MapArray::try_new(entries_field, map_offsets, entries, None, false).unwrap();
+            let map_elem = Arc::new(ArrowField::new(
+                "item",
+                map_array.data_type().clone(),
+                false,
+            ));
+            let list_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+            Arc::new(
+                GenericListArray::<i32>::try_new(map_elem, list_offsets, Arc::new(map_array), None)
+                    .unwrap(),
+            )
+        };
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::int_to_nullable(create_data_int(), true)]
+    #[case::int_to_non_null(create_data_int(), false)]
+    #[case::string_to_nullable(create_data_string(), true)]
+    #[case::string_to_non_null(create_data_string(), false)]
+    #[case::struct_to_nullable(create_data_struct(), true)]
+    #[case::struct_to_non_null(create_data_struct(), false)]
+    #[case::list_to_nullable(create_data_list(), true)]
+    #[case::list_to_non_null(create_data_list(), false)]
+    #[case::map_to_nullable(create_data_map(), true)]
+    #[case::map_to_non_null(create_data_map(), false)]
+    #[case::struct_in_list_to_nullable(create_data_struct_in_list(), true)]
+    #[case::struct_in_list_to_non_null(create_data_struct_in_list(), false)]
+    #[case::list_in_struct_to_nullable(create_data_list_in_struct(), true)]
+    #[case::list_in_struct_to_non_null(create_data_list_in_struct(), false)]
+    #[case::list_in_map_to_nullable(create_data_list_in_map(), true)]
+    #[case::list_in_map_to_non_null(create_data_list_in_map(), false)]
+    #[case::struct_in_map_to_nullable(create_data_struct_in_map(), true)]
+    #[case::struct_in_map_to_non_null(create_data_struct_in_map(), false)]
+    #[case::map_in_struct_to_nullable(create_data_map_in_struct(), true)]
+    #[case::map_in_struct_to_non_null(create_data_map_in_struct(), false)]
+    #[case::map_in_list_to_nullable(create_data_map_in_list(), true)]
+    #[case::map_in_list_to_non_null(create_data_map_in_list(), false)]
+    fn test_coerce_batch_nullability(
+        #[case] data: (CoerceTestCase, CoerceTestCase),
+        #[case] to_nullable: bool,
+    ) {
+        let (to_nullable_case, to_non_null_case) = data;
+        let (src_field, tgt_field, col) = if to_nullable {
+            to_nullable_case
+        } else {
+            to_non_null_case
+        };
+        let src_schema = Arc::new(ArrowSchema::new(vec![(*src_field).clone()]));
+        let batch = RecordBatch::try_new(src_schema, vec![col]).unwrap();
+        let target_schema = Arc::new(ArrowSchema::new(vec![(*tgt_field).clone()]));
+        let result = coerce_batch_nullability(batch, &target_schema).unwrap();
+        assert_eq!(*result.schema(), *target_schema);
+    }
+
+    #[test]
+    fn test_coerce_batch_nullability_schema_already_matches() {
+        let field = ArrowField::new("a", ArrowDataType::Int32, false);
+        let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let result = coerce_batch_nullability(batch.clone(), &schema).unwrap();
+        assert_eq!(result, batch);
     }
 }
