@@ -70,5 +70,28 @@
 mod events;
 mod reporter;
 
+use std::sync::Arc;
+
 pub use events::{MetricEvent, MetricId};
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+use tracing::Subscriber;
+use tracing_subscriber::{
+    layer::{Layered, SubscriberExt as _},
+    registry::LookupSpan,
+};
+
+pub trait WithMetricsReporterLayer: Subscriber {
+    fn with_metrics_reporter_layer(self) -> Layered<ReportGeneratorLayer, Self>
+    where
+        Self: Sized,
+        for<'lookup> Self: LookupSpan<'lookup>,
+    {
+        self.with(ReportGeneratorLayer::new(Arc::new(
+            LoggingMetricsReporter::new(tracing::Level::INFO),
+        )))
+    }
+}
+
+impl<S> WithMetricsReporterLayer for S
+where
+    S: Subscriber {}
