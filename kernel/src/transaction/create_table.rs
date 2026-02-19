@@ -34,23 +34,28 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use itertools::Itertools;
 use url::Url;
 
 use super::data_layout::DataLayout;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
+use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
+    get_top_level_column_physical_name, ColumnMappingMode, FeatureType, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use crate::table_properties::DELTA_PROPERTY_PREFIX;
+use crate::table_properties::{
+    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
+};
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
@@ -59,28 +64,28 @@ use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
 ///
 /// Feature signals (`delta.feature.X=supported`) are validated against this list.
 /// Only features in this list can be enabled via feature signals.
-///
-/// This list will expand as more features are supported (e.g., column mapping).
 const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // DomainMetadata is required for clustering and other system domain operations
     TableFeature::DomainMetadata,
+    // ColumnMapping enables column mapping (name/id mode)
+    TableFeature::ColumnMapping,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
     // As features are supported, add them here:
-    // TableFeature::ColumnMapping,
     // TableFeature::DeletionVectors,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
 ///
-/// This list will expand as more features are supported (e.g., column mapping, clustering).
+/// This list will expand as more features are supported.
 /// The allow list will be deprecated once auto feature enablement is implemented
 /// like the Java Kernel.
 const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
-    // Empty for now - will add properties as features are implemented:
-    // - "delta.columnMapping.mode" (for column mapping)
-    // - etc.
+    // ColumnMapping mode property: triggers column mapping transform
+    COLUMN_MAPPING_MODE,
+    // As features are supported, add them here:
+    // "delta.enableDeletionVectors",
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -174,20 +179,19 @@ fn add_feature_to_lists(
     }
 }
 
-/// Configures clustering support for table creation.
+/// Configures clustering support for table creation (used by unit tests).
 ///
 /// Validates clustering columns, adds required features (DomainMetadata, ClusteredTable),
 /// and creates the domain metadata action.
 fn apply_clustering_for_table_create(
     logical_schema: &SchemaRef,
-    logical_columns: &[crate::expressions::ColumnName],
+    logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
     writer_features: &mut Vec<TableFeature>,
-) -> DeltaResult<crate::actions::DomainMetadata> {
+) -> DeltaResult<DomainMetadata> {
     validate_clustering_columns(logical_schema, logical_columns)?;
 
     // Add required features
-    // DomainMetadata is required by ClusteredTable per the Delta protocol
     add_feature_to_lists(
         TableFeature::DomainMetadata,
         reader_features,
@@ -200,6 +204,134 @@ fn apply_clustering_for_table_create(
     );
 
     Ok(create_clustering_domain_metadata(logical_columns))
+}
+
+/// Conditionally enables clustering for table creation based on the data layout.
+///
+/// If clustering is specified in the data layout, this function:
+/// 1. Validates clustering columns against the schema (using logical names)
+/// 2. Resolves logical to physical column names (if column mapping is enabled)
+/// 3. Adds DomainMetadata and ClusteredTable features to the protocol
+/// 4. Creates the clustering domain metadata with physical column names
+///
+/// # Arguments
+///
+/// * `data_layout` - The data layout (may specify clustering columns)
+/// * `effective_schema` - The schema to validate against
+/// * `column_mapping_mode` - The column mapping mode (determines name resolution)
+/// * `validated` - The validated table properties (features will be added)
+///
+/// # Returns
+///
+/// A tuple of (domain_metadata_list, clustering_columns_for_stats).
+/// The clustering columns returned are logical names (for stats_columns).
+fn maybe_enable_clustering(
+    data_layout: &DataLayout,
+    effective_schema: &SchemaRef,
+    column_mapping_mode: ColumnMappingMode,
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<(Vec<DomainMetadata>, Option<Vec<ColumnName>>)> {
+    match data_layout {
+        DataLayout::Clustered { columns } => {
+            // Validate using logical names against the schema
+            // (Schema field names are always logical, even with column mapping)
+            validate_clustering_columns(effective_schema, columns)?;
+
+            // Resolve logical to physical column names for domain metadata
+            // When column mapping is enabled, clustering stores physical names
+            // Clustering columns are always top-level (validated above), so we just
+            // need to resolve single names, not nested paths.
+            let physical_columns: Vec<ColumnName> = columns
+                .iter()
+                .map(|c| {
+                    // validate_clustering_columns guarantees each path is exactly 1 element
+                    if c.path().len() != 1 {
+                        return Err(Error::generic(format!(
+                            "Expected single-element path for clustering column '{}', got {} elements",
+                            c,
+                            c.path().len()
+                        )));
+                    }
+                    let logical_name = &c.path()[0];
+                    let physical_name = get_top_level_column_physical_name(
+                        logical_name,
+                        effective_schema,
+                        column_mapping_mode,
+                    )?;
+                    Ok(ColumnName::new([physical_name]))
+                })
+                .try_collect()?;
+
+            // Add required features
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+            add_feature_to_lists(
+                TableFeature::ClusteredTable,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+
+            // Create domain metadata with physical names
+            let dm = create_clustering_domain_metadata(&physical_columns);
+
+            // Return logical names for stats_columns
+            Ok((vec![dm], Some(columns.clone())))
+        }
+        DataLayout::None => Ok((vec![], None)),
+    }
+}
+
+/// Conditionally applies column mapping for table creation based on the mode in properties.
+///
+/// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
+/// 1. Adds the ColumnMapping feature to the protocol
+/// 2. Transforms the schema to assign IDs and physical names to all fields
+/// 3. Sets `delta.columnMapping.maxColumnId` in properties
+/// 4. Returns the transformed schema
+///
+/// If mode is `none` or not set, returns the original schema unchanged.
+///
+/// # Arguments
+///
+/// * `schema` - The table schema to potentially transform
+/// * `validated` - The validated table properties (may be modified to add maxColumnId)
+///
+/// # Returns
+///
+/// A tuple of (effective_schema, column_mapping_mode).
+fn maybe_apply_column_mapping_for_table_create(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<(SchemaRef, ColumnMappingMode)> {
+    let column_mapping_mode = get_column_mapping_mode_from_properties(&validated.properties)?;
+
+    let effective_schema = match column_mapping_mode {
+        ColumnMappingMode::Name | ColumnMappingMode::Id => {
+            // Add ColumnMapping feature to protocol (it's a ReaderWriter feature)
+            add_feature_to_lists(
+                TableFeature::ColumnMapping,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+
+            // Transform schema: assign IDs and physical names to all fields
+            let mut max_id = 0i64;
+            let transformed_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
+
+            // Add maxColumnId to properties
+            validated
+                .properties
+                .insert(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), max_id.to_string());
+
+            Arc::new(transformed_schema)
+        }
+        ColumnMappingMode::None => schema.clone(),
+    };
+
+    Ok((effective_schema, column_mapping_mode))
 }
 
 /// Validates and transforms table properties for CREATE TABLE.
@@ -462,19 +594,17 @@ impl CreateTableTransactionBuilder {
         // - Returns reader/writer features to add to protocol
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
 
-        // Handle clustering if specified
-        let (system_domain_metadata, clustering_columns) = match &self.data_layout {
-            DataLayout::Clustered { columns } => {
-                let dm = apply_clustering_for_table_create(
-                    &self.schema,
-                    columns,
-                    &mut validated.reader_features,
-                    &mut validated.writer_features,
-                )?;
-                (vec![dm], Some(columns.clone()))
-            }
-            DataLayout::None => (vec![], None),
-        };
+        // Apply column mapping if mode is name or id (must happen BEFORE clustering)
+        let (effective_schema, column_mapping_mode) =
+            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
+
+        // Handle clustering (validates, resolves to physical names, adds features)
+        let (system_domain_metadata, clustering_columns) = maybe_enable_clustering(
+            &self.data_layout,
+            &effective_schema,
+            column_mapping_mode,
+            &mut validated,
+        )?;
 
         // Create Protocol action with table features support
         let protocol = Protocol::try_new(
@@ -485,10 +615,11 @@ impl CreateTableTransactionBuilder {
         )?;
 
         // Create Metadata action with filtered properties (feature signals removed)
+        // Use effective_schema which includes column mapping annotations if enabled
         let metadata = Metadata::try_new(
             None, // name
             None, // description
-            self.schema,
+            effective_schema.clone(),
             Vec::new(), // partition_columns - added with data layout support
             current_time_ms()?,
             validated.properties,
