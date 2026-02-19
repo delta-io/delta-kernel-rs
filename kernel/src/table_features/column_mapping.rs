@@ -344,7 +344,7 @@ pub(crate) fn get_any_level_column_physical_name(
             };
             Ok(field.physical_name(column_mapping_mode).to_string())
         })
-        .collect::<DeltaResult<_>>()?;
+        .collect::<DeltaResult<Vec<String>>>()?;
     Ok(ColumnName::new(physical_path))
 }
 
