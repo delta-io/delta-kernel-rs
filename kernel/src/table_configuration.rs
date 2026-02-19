@@ -692,7 +692,12 @@ mod test {
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
     };
     use crate::table_properties::TableProperties;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
+        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        test_schema_with_array_and_column_mapping, test_schema_with_map,
+        test_schema_with_map_and_column_mapping,
+    };
     use crate::Error;
     use rstest::rstest;
 
@@ -1581,72 +1586,6 @@ mod test {
         Arc::new(StructType::new_unchecked([field_a, field_b]))
     }
 
-    fn nested_schema_with_column_mapping() -> SchemaRef {
-        Arc::new(
-            serde_json::from_str(
-                r#"{
-                    "type": "struct",
-                    "fields": [
-                        {
-                            "name": "id",
-                            "type": "long",
-                            "nullable": false,
-                            "metadata": {
-                                "delta.columnMapping.id": 1,
-                                "delta.columnMapping.physicalName": "phys_id"
-                            }
-                        },
-                        {
-                            "name": "info",
-                            "type": {
-                                "type": "struct",
-                                "fields": [
-                                    {
-                                        "name": "name",
-                                        "type": "string",
-                                        "nullable": true,
-                                        "metadata": {
-                                            "delta.columnMapping.id": 3,
-                                            "delta.columnMapping.physicalName": "phys_name"
-                                        }
-                                    },
-                                    {
-                                        "name": "age",
-                                        "type": "integer",
-                                        "nullable": true,
-                                        "metadata": {
-                                            "delta.columnMapping.id": 4,
-                                            "delta.columnMapping.physicalName": "phys_age"
-                                        }
-                                    }
-                                ]
-                            },
-                            "nullable": true,
-                            "metadata": {
-                                "delta.columnMapping.id": 2,
-                                "delta.columnMapping.physicalName": "phys_info"
-                            }
-                        }
-                    ]
-                }"#,
-            )
-            .unwrap(),
-        )
-    }
-
-    fn nested_schema_without_column_mapping() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false),
-            StructField::nullable(
-                "info",
-                StructType::new_unchecked([
-                    StructField::nullable("name", DataType::STRING),
-                    StructField::nullable("age", DataType::INTEGER),
-                ]),
-            ),
-        ]))
-    }
-
     fn create_table_config_with_column_mapping(
         schema: SchemaRef,
         column_mapping_mode: &str,
@@ -1851,26 +1790,25 @@ mod test {
     }
 
     #[rstest]
-    #[case::name_mode(
-        nested_schema_with_column_mapping(),
+    // --- flat schema ---
+    #[case::flat_none(
+        test_schema_flat(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::flat_name(
+        test_schema_flat_with_column_mapping(),
         "name",
-        vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-        ],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    #[case::id_mode(
-        nested_schema_with_column_mapping(),
+    #[case::flat_id(
+        test_schema_flat_with_column_mapping(),
         "id",
-        vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-        ],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    #[case::none_mode(
-        nested_schema_without_column_mapping(),
+    // --- nested schema ---
+    #[case::nested_none(
+        test_schema_nested(),
         "none",
         vec![
             ColumnName::new(["id"]),
@@ -1878,7 +1816,57 @@ mod test {
             ColumnName::new(["info", "age"]),
         ],
     )]
-    fn test_stats_column_names_physical_nested_schema(
+    #[case::nested_name(
+        test_schema_nested_with_column_mapping(),
+        "name",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    #[case::nested_id(
+        test_schema_nested_with_column_mapping(),
+        "id",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    // --- schema with map (map fields excluded from stats) ---
+    #[case::map_none(
+        test_schema_with_map(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::map_name(
+        test_schema_with_map_and_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::map_id(
+        test_schema_with_map_and_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    // --- schema with array (array fields excluded from stats) ---
+    #[case::array_none(
+        test_schema_with_array(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::array_name(
+        test_schema_with_array_and_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::array_id(
+        test_schema_with_array_and_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    fn test_stats_column_names_physical_all_schemas(
         #[case] schema: SchemaRef,
         #[case] mode: &str,
         #[case] expected_physical: Vec<ColumnName>,
