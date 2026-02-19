@@ -1420,4 +1420,129 @@ mod tests {
             Some(&"2".into())
         );
     }
+
+    /// Verify that `read_parquet_files` echoes back the exact `FileMeta` that was passed in,
+    /// including caller-supplied `last_modified` and `size` fields.
+    #[tokio::test]
+    async fn test_read_parquet_files_returns_file_meta() {
+        let store = Arc::new(InMemory::new());
+        // Use Arc<dyn ParquetHandler> to call the trait method (not the inherent async one)
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+        let file_url = Url::parse("memory:///test/meta_check.parquet").unwrap();
+
+        // Write a parquet file so there is something to read back
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "id",
+                Arc::new(Int64Array::from(vec![1i64, 2])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        parquet_handler
+            .write_parquet_file(file_url.clone(), Box::new(std::iter::once(Ok(engine_data))))
+            .unwrap();
+
+        // Derive schema from the written file
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        // Use distinctive last_modified / size to confirm they are echoed back unchanged
+        let input_meta = FileMeta {
+            location: file_url.clone(),
+            last_modified: 555_444,
+            size: 77,
+        };
+
+        let mut result = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&input_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap();
+
+        let (returned_meta, _data) = result.next().unwrap().unwrap();
+
+        assert_eq!(returned_meta.location, file_url);
+        assert_eq!(returned_meta.last_modified, 555_444);
+        assert_eq!(returned_meta.size, 77);
+        assert!(result.next().is_none());
+    }
+
+    /// Verify that when reading multiple files, each batch is tagged with its own source
+    /// file's `FileMeta` — not, say, all tagged with the first file.
+    #[tokio::test]
+    async fn test_read_parquet_files_multi_file_tags_correct_meta() {
+        let store = Arc::new(InMemory::new());
+        // Use Arc<dyn ParquetHandler> to call the trait method (not the inherent async one)
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let url1 = Url::parse("memory:///test/multi_file1.parquet").unwrap();
+        let url2 = Url::parse("memory:///test/multi_file2.parquet").unwrap();
+
+        // Write two distinct parquet files
+        for (url, values) in [(&url1, vec![1i64, 2]), (&url2, vec![10i64, 20, 30])] {
+            let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter(vec![(
+                    "id",
+                    Arc::new(Int64Array::from(values)) as Arc<dyn Array>,
+                )])
+                .unwrap(),
+            ));
+            parquet_handler
+                .write_parquet_file(url.clone(), Box::new(std::iter::once(Ok(engine_data))))
+                .unwrap();
+        }
+
+        // Derive schema from the first file (both files share the same schema)
+        let path1 = Path::from_url_path(url1.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path1);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+        let kernel_schema = Arc::new(physical_schema.try_into_kernel().unwrap());
+
+        let meta1 = FileMeta {
+            location: url1.clone(),
+            last_modified: 11,
+            size: 100,
+        };
+        let meta2 = FileMeta {
+            location: url2.clone(),
+            last_modified: 22,
+            size: 200,
+        };
+
+        let results: Vec<_> = parquet_handler
+            .read_parquet_files(&[meta1, meta2], kernel_schema, None)
+            .unwrap()
+            .collect::<DeltaResult<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "expected one batch per file");
+        // Each batch must be tagged with its own source file's FileMeta, not the other file's
+        assert_eq!(
+            results[0].0.location, url1,
+            "first batch should be tagged with file1's URL"
+        );
+        assert_eq!(results[0].0.last_modified, 11);
+        assert_eq!(
+            results[1].0.location, url2,
+            "second batch should be tagged with file2's URL"
+        );
+        assert_eq!(results[1].0.last_modified, 22);
+    }
 }

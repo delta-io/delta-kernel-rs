@@ -634,4 +634,120 @@ mod tests {
             Some(&"2".into())
         );
     }
+
+    /// Verify that `read_parquet_files` echoes back the exact `FileMeta` that was passed in,
+    /// including caller-supplied `last_modified` and `size` fields.
+    #[test]
+    fn test_read_parquet_files_returns_file_meta() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_meta.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        // Write a parquet file so there is something to read back
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "id",
+                Arc::new(Int64Array::from(vec![1i64, 2])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<
+            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
+        > = Box::new(std::iter::once(Ok(engine_data)));
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+
+        // Use distinctive last_modified / size to confirm the exact FileMeta is passed through
+        let file = File::open(&file_path).unwrap();
+        let schema =
+            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .schema()
+                .clone();
+
+        let input_meta = FileMeta {
+            location: url.clone(),
+            last_modified: 999_888,
+            size: 42,
+        };
+
+        let mut result = handler
+            .read_parquet_files(
+                &[input_meta],
+                Arc::new(schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap();
+
+        let (returned_meta, _data) = result.next().unwrap().unwrap();
+
+        assert_eq!(returned_meta.location, url);
+        assert_eq!(returned_meta.last_modified, 999_888);
+        assert_eq!(returned_meta.size, 42);
+        assert!(result.next().is_none());
+    }
+
+    /// Verify that when reading multiple files, each batch is tagged with its own source
+    /// file's `FileMeta` — not, say, all tagged with the first file.
+    #[test]
+    fn test_read_parquet_files_multi_file_tags_correct_meta() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let url1 = Url::from_file_path(temp_dir.path().join("file1.parquet")).unwrap();
+        let url2 = Url::from_file_path(temp_dir.path().join("file2.parquet")).unwrap();
+
+        // Write two distinct parquet files
+        for (url, values) in [(&url1, vec![1i64, 2]), (&url2, vec![10i64, 20, 30])] {
+            let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+                RecordBatch::try_from_iter(vec![(
+                    "id",
+                    Arc::new(Int64Array::from(values)) as Arc<dyn Array>,
+                )])
+                .unwrap(),
+            ));
+            let data_iter: Box<
+                dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
+            > = Box::new(std::iter::once(Ok(engine_data)));
+            handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        }
+
+        // Derive schema from one of the written files (both have the same schema)
+        let file = File::open(url1.to_file_path().unwrap()).unwrap();
+        let schema =
+            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .schema()
+                .clone();
+        let kernel_schema = Arc::new(schema.try_into_kernel().unwrap());
+
+        let meta1 = FileMeta {
+            location: url1.clone(),
+            last_modified: 11,
+            size: 100,
+        };
+        let meta2 = FileMeta {
+            location: url2.clone(),
+            last_modified: 22,
+            size: 200,
+        };
+
+        let results: Vec<_> = handler
+            .read_parquet_files(&[meta1, meta2], kernel_schema, None)
+            .unwrap()
+            .collect::<crate::DeltaResult<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "expected one batch per file");
+        // Each batch must be tagged with its own source file's FileMeta, not the other file's
+        assert_eq!(
+            results[0].0.location, url1,
+            "first batch should be tagged with file1's URL"
+        );
+        assert_eq!(results[0].0.last_modified, 11);
+        assert_eq!(
+            results[1].0.location, url2,
+            "second batch should be tagged with file2's URL"
+        );
+        assert_eq!(results[1].0.last_modified, 22);
+    }
 }

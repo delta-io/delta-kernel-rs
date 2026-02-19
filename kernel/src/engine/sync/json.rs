@@ -182,4 +182,110 @@ mod tests {
 
         Ok(())
     }
+
+    /// Verify that `read_json_files` echoes back the exact `FileMeta` that was passed in,
+    /// including caller-supplied `last_modified` and `size` fields.
+    #[test]
+    fn test_read_json_files_returns_file_meta() -> DeltaResult<()> {
+        use crate::schema::{DataType, StructField, StructType};
+
+        let test_dir = TempDir::new().unwrap();
+        let path = test_dir.path().join("test.json");
+        let handler = SyncJsonHandler;
+        let url = Url::from_file_path(&path).unwrap();
+
+        // Write a JSON file so there is something to read back
+        let data = create_test_data(vec!["remi"])?;
+        handler.write_json_file(
+            &url,
+            Box::new(std::iter::once(Ok(
+                FilteredEngineData::with_all_rows_selected(data),
+            ))),
+            false,
+        )?;
+
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "dog",
+            DataType::STRING,
+        )]));
+
+        // Use distinctive values to confirm the exact FileMeta is passed through unchanged
+        let input_meta = FileMeta {
+            location: url.clone(),
+            last_modified: 123_456,
+            size: 99,
+        };
+
+        let mut result = handler.read_json_files(&[input_meta], schema, None)?;
+        let (returned_meta, _batch) = result.next().unwrap()?;
+
+        assert_eq!(returned_meta.location, url);
+        assert_eq!(returned_meta.last_modified, 123_456);
+        assert_eq!(returned_meta.size, 99);
+        assert!(
+            result.next().is_none(),
+            "expected only one batch from one file"
+        );
+
+        Ok(())
+    }
+
+    /// Verify that when reading multiple files, each batch is tagged with its own source
+    /// file's `FileMeta` — not, say, all tagged with the first file.
+    #[test]
+    fn test_read_json_files_multi_file_tags_correct_meta() -> DeltaResult<()> {
+        use crate::schema::{DataType, StructField, StructType};
+
+        let test_dir = TempDir::new().unwrap();
+        let handler = SyncJsonHandler;
+        let url1 = Url::from_file_path(test_dir.path().join("file1.json")).unwrap();
+        let url2 = Url::from_file_path(test_dir.path().join("file2.json")).unwrap();
+
+        // Write two JSON files with different content
+        for (url, values) in [(&url1, vec!["remi"]), (&url2, vec!["wilson"])] {
+            let data = create_test_data(values)?;
+            handler.write_json_file(
+                url,
+                Box::new(std::iter::once(Ok(
+                    FilteredEngineData::with_all_rows_selected(data),
+                ))),
+                false,
+            )?;
+        }
+
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "dog",
+            DataType::STRING,
+        )]));
+
+        let meta1 = FileMeta {
+            location: url1.clone(),
+            last_modified: 11,
+            size: 111,
+        };
+        let meta2 = FileMeta {
+            location: url2.clone(),
+            last_modified: 22,
+            size: 222,
+        };
+
+        let results: Vec<(FileMeta, _)> = handler
+            .read_json_files(&[meta1, meta2], schema, None)?
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        assert_eq!(results.len(), 2, "expected one batch per file");
+        // Each batch must be tagged with its own source file's FileMeta, not the other file's
+        assert_eq!(
+            results[0].0.location, url1,
+            "first batch should be tagged with file1's URL"
+        );
+        assert_eq!(results[0].0.last_modified, 11);
+        assert_eq!(
+            results[1].0.location, url2,
+            "second batch should be tagged with file2's URL"
+        );
+        assert_eq!(results[1].0.last_modified, 22);
+
+        Ok(())
+    }
 }
