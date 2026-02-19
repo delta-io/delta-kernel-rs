@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
+use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
 
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
@@ -59,9 +59,16 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(serialize_all = "camelCase")]
+#[strum(
+    serialize_all = "camelCase",
+    parse_err_fn = xxx__not_needed__default_variant_means_parsing_is_infallible__xxx,
+    parse_err_ty = Infallible // ignored, sadly: https://github.com/Peternator7/strum/issues/430
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
+#[derive(EnumIter)]
+// ^^ We must derive EnumIter only after internal_api adjusts visibility. Otherwise, internal-api
+// builds will fail because the now-public `TableFeature::iter()` returns a pub(crate) type.
 pub(crate) enum TableFeature {
     //////////////////////////
     // Writer-only features //
@@ -708,6 +715,41 @@ impl TableFeature {
     }
 }
 
+/// Like `Into<TableFeature>`, but avoids collisions between strum's derived `EnumString` and the
+/// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
+///
+/// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
+/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
+pub(crate) trait IntoTableFeature {
+    fn into_table_feature(self) -> TableFeature;
+}
+
+impl IntoTableFeature for TableFeature {
+    fn into_table_feature(self) -> TableFeature {
+        self
+    }
+}
+
+impl IntoTableFeature for &TableFeature {
+    fn into_table_feature(self) -> TableFeature {
+        self.clone()
+    }
+}
+
+/// Parsing is infallible thanks to `TableFeature::Unknown` default variant
+impl IntoTableFeature for &str {
+    fn into_table_feature(self) -> TableFeature {
+        #[allow(clippy::unwrap_used)] // infallible, see strum parse_err_fn
+        self.parse().unwrap()
+    }
+}
+
+impl IntoTableFeature for String {
+    fn into_table_feature(self) -> TableFeature {
+        self.as_str().into_table_feature()
+    }
+}
+
 /// Formats a slice of table features using Delta's standard serialization (camelCase).
 pub(crate) fn format_features(features: &[TableFeature]) -> String {
     let feature_strings: Vec<&str> = features.iter().map(|f| f.as_ref()).collect_vec();
@@ -754,87 +796,48 @@ mod tests {
 
     #[test]
     fn test_roundtrip_table_features() {
-        let cases = [
-            (TableFeature::CatalogManaged, "catalogManaged"),
-            (TableFeature::CatalogOwnedPreview, "catalogOwned-preview"),
-            (TableFeature::ColumnMapping, "columnMapping"),
-            (TableFeature::DeletionVectors, "deletionVectors"),
-            (TableFeature::TimestampWithoutTimezone, "timestampNtz"),
-            (TableFeature::TypeWidening, "typeWidening"),
-            (TableFeature::TypeWideningPreview, "typeWidening-preview"),
-            (TableFeature::V2Checkpoint, "v2Checkpoint"),
-            (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (TableFeature::VariantType, "variantType"),
-            (TableFeature::VariantTypePreview, "variantType-preview"),
-            (
-                TableFeature::VariantShreddingPreview,
-                "variantShredding-preview",
-            ),
-            (TableFeature::unknown("something"), "something"),
-        ];
+        use strum::IntoEnumIterator as _;
 
-        for (feature, expected) in cases {
+        for feature in TableFeature::iter() {
+            let expected = match feature {
+                TableFeature::AppendOnly => "appendOnly",
+                TableFeature::Invariants => "invariants",
+                TableFeature::CheckConstraints => "checkConstraints",
+                TableFeature::ChangeDataFeed => "changeDataFeed",
+                TableFeature::GeneratedColumns => "generatedColumns",
+                TableFeature::IdentityColumns => "identityColumns",
+                TableFeature::InCommitTimestamp => "inCommitTimestamp",
+                TableFeature::RowTracking => "rowTracking",
+                TableFeature::DomainMetadata => "domainMetadata",
+                TableFeature::IcebergCompatV1 => "icebergCompatV1",
+                TableFeature::IcebergCompatV2 => "icebergCompatV2",
+                TableFeature::ClusteredTable => "clustering",
+                TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
+                TableFeature::CatalogManaged => "catalogManaged",
+                TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
+                TableFeature::ColumnMapping => "columnMapping",
+                TableFeature::DeletionVectors => "deletionVectors",
+                TableFeature::TimestampWithoutTimezone => "timestampNtz",
+                TableFeature::TypeWidening => "typeWidening",
+                TableFeature::TypeWideningPreview => "typeWidening-preview",
+                TableFeature::V2Checkpoint => "v2Checkpoint",
+                TableFeature::VacuumProtocolCheck => "vacuumProtocolCheck",
+                TableFeature::VariantType => "variantType",
+                TableFeature::VariantTypePreview => "variantType-preview",
+                TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::Unknown(_) => continue, // tested in test_unknown_features
+            };
+
+            // strum
             assert_eq!(feature.to_string(), expected);
+            assert_eq!(feature, expected.into_table_feature());
+
+            // json
             let serialized = serde_json::to_string(&feature).unwrap();
             assert_eq!(serialized, format!("\"{expected}\""));
 
             let deserialized: TableFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
-
-            let from_str: TableFeature = expected.parse().unwrap();
-            assert_eq!(from_str, feature);
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_writer_features() {
-        let cases = [
-            (TableFeature::AppendOnly, "appendOnly"),
-            (TableFeature::CatalogManaged, "catalogManaged"),
-            (TableFeature::CatalogOwnedPreview, "catalogOwned-preview"),
-            (TableFeature::Invariants, "invariants"),
-            (TableFeature::CheckConstraints, "checkConstraints"),
-            (TableFeature::ChangeDataFeed, "changeDataFeed"),
-            (TableFeature::GeneratedColumns, "generatedColumns"),
-            (TableFeature::ColumnMapping, "columnMapping"),
-            (TableFeature::IdentityColumns, "identityColumns"),
-            (TableFeature::InCommitTimestamp, "inCommitTimestamp"),
-            (TableFeature::DeletionVectors, "deletionVectors"),
-            (TableFeature::RowTracking, "rowTracking"),
-            (TableFeature::TimestampWithoutTimezone, "timestampNtz"),
-            (TableFeature::TypeWidening, "typeWidening"),
-            (TableFeature::TypeWideningPreview, "typeWidening-preview"),
-            (TableFeature::DomainMetadata, "domainMetadata"),
-            (TableFeature::V2Checkpoint, "v2Checkpoint"),
-            (TableFeature::IcebergCompatV1, "icebergCompatV1"),
-            (TableFeature::IcebergCompatV2, "icebergCompatV2"),
-            (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (TableFeature::ClusteredTable, "clustering"),
-            (
-                TableFeature::MaterializePartitionColumns,
-                "materializePartitionColumns",
-            ),
-            (TableFeature::VariantType, "variantType"),
-            (TableFeature::VariantTypePreview, "variantType-preview"),
-            (
-                TableFeature::VariantShreddingPreview,
-                "variantShredding-preview",
-            ),
-            (TableFeature::unknown("something"), "something"),
-        ];
-
-        assert_eq!(TableFeature::COUNT, cases.len());
-
-        for (feature, expected) in cases {
-            assert_eq!(feature.to_string(), expected);
-            let serialized = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serialized, format!("\"{expected}\""));
-
-            let deserialized: TableFeature = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized, feature);
-
-            let from_str: TableFeature = expected.parse().unwrap();
-            assert_eq!(from_str, feature);
         }
     }
 }
