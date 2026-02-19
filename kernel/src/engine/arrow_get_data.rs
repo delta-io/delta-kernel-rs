@@ -1,5 +1,8 @@
 use crate::arrow::array::{
-    types::{GenericBinaryType, GenericStringType, Int32Type, Int64Type},
+    types::{
+        Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
+        Int32Type, Int64Type, TimestampMicrosecondType,
+    },
     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
     PrimitiveArray,
 };
@@ -33,6 +36,56 @@ impl GetData<'_> for PrimitiveArray<Int32Type> {
 
 impl GetData<'_> for PrimitiveArray<Int64Type> {
     fn get_long(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<Float32Type> {
+    fn get_float(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<f32>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<Float64Type> {
+    fn get_double(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<f64>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<Date32Type> {
+    fn get_date(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i32>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<TimestampMicrosecondType> {
+    fn get_timestamp(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<Decimal128Type> {
+    fn get_decimal(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i128>> {
         if self.is_valid(row_index) {
             Ok(Some(self.value(row_index)))
         } else {
