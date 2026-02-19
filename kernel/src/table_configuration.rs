@@ -352,19 +352,14 @@ impl TableConfiguration {
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
-    fn validate_feature_requirements(
-        &self,
-        feature_name: &str,
-        requirements: &[FeatureRequirement],
-    ) -> DeltaResult<()> {
-        for req in requirements {
+    fn validate_feature_requirements(&self, feature: &TableFeature) -> DeltaResult<()> {
+        for req in feature.info().feature_requirements {
             match req {
                 FeatureRequirement::Supported(dep) => {
                     require!(
                         self.is_feature_supported(dep),
                         Error::invalid_protocol(format!(
-                            "{} requires {} to be supported",
-                            feature_name, dep
+                            "Feature '{feature}' requires '{dep}' to be supported"
                         ))
                     );
                 }
@@ -372,8 +367,7 @@ impl TableConfiguration {
                     require!(
                         self.is_feature_enabled(dep),
                         Error::invalid_protocol(format!(
-                            "{} requires {} to be enabled",
-                            feature_name, dep
+                            "Feature '{feature}' requires '{dep}' to be enabled"
                         ))
                     );
                 }
@@ -381,8 +375,7 @@ impl TableConfiguration {
                     require!(
                         !self.is_feature_supported(dep),
                         Error::invalid_protocol(format!(
-                            "{} requires {} to not be supported",
-                            feature_name, dep
+                            "Feature '{feature}' requires '{dep}' to not be supported"
                         ))
                     );
                 }
@@ -390,8 +383,7 @@ impl TableConfiguration {
                     require!(
                         !self.is_feature_enabled(dep),
                         Error::invalid_protocol(format!(
-                            "{} requires {} to not be enabled",
-                            feature_name, dep
+                            "Feature '{feature}' requires '{dep}' to not be enabled"
                         ))
                     );
                 }
@@ -410,16 +402,12 @@ impl TableConfiguration {
         feature: &TableFeature,
         operation: Operation,
     ) -> DeltaResult<()> {
-        let Some(info) = feature.info() else {
-            return Err(Error::unsupported(format!("Unknown feature '{}'", feature)));
-        };
-
+        let info = feature.info();
         match &info.kernel_support {
             KernelSupport::Supported => {}
             KernelSupport::NotSupported => {
                 return Err(Error::unsupported(format!(
-                    "Feature '{}' is not supported",
-                    info.name
+                    "Feature '{feature}' is not supported"
                 )))
             }
             KernelSupport::Custom(check) => {
@@ -427,7 +415,7 @@ impl TableConfiguration {
             }
         };
 
-        self.validate_feature_requirements(info.name, info.feature_requirements)
+        self.validate_feature_requirements(feature)
     }
 
     /// Returns all reader features enabled for this table based on protocol version.
@@ -446,11 +434,7 @@ impl TableConfiguration {
                 // Legacy reader: infer features from version
                 LEGACY_READER_FEATURES
                     .iter()
-                    .filter(|f| {
-                        f.info()
-                            .map(|info| v >= info.min_reader_version)
-                            .unwrap_or(false)
-                    })
+                    .filter(|f| f.is_valid_for_legacy_reader(v))
                     .cloned()
                     .collect()
             }
@@ -474,11 +458,7 @@ impl TableConfiguration {
                 // Legacy writer: infer features from version
                 LEGACY_WRITER_FEATURES
                     .iter()
-                    .filter(|f| {
-                        f.info()
-                            .map(|info| v >= info.min_writer_version)
-                            .unwrap_or(false)
-                    })
+                    .filter(|f| f.is_valid_for_legacy_writer(v))
                     .cloned()
                     .collect()
             }
@@ -627,11 +607,18 @@ impl TableConfiguration {
     /// This checks protocol versions and feature lists but does NOT check enablement properties.
     #[allow(dead_code)]
     fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
+        // NOTE: This method uses the passed-in `info` (not feature.info()) because tests
+        // construct custom FeatureInfo instances with different version thresholds.
+        let min_legacy_version = info.min_legacy_version.as_ref();
+        let min_reader_version =
+            min_legacy_version.map_or(TABLE_FEATURES_MIN_READER_VERSION, |v| v.0);
+        let min_writer_version =
+            min_legacy_version.map_or(TABLE_FEATURES_MIN_WRITER_VERSION, |v| v.1);
         match info.feature_type {
             FeatureType::WriterOnly => {
                 if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= info.min_writer_version
+                    self.protocol.min_writer_version() >= min_writer_version
                 } else {
                     // Table features writer: feature is in writer_features list
                     Self::has_feature(self.protocol.writer_features(), feature)
@@ -640,7 +627,7 @@ impl TableConfiguration {
             FeatureType::ReaderWriter => {
                 let reader_supported = if self.is_legacy_reader_version() {
                     // Legacy reader: protocol reader version meets minimum requirement
-                    self.protocol.min_reader_version() >= info.min_reader_version
+                    self.protocol.min_reader_version() >= min_reader_version
                 } else {
                     // Table features reader: feature is in reader_features list
                     Self::has_feature(self.protocol.reader_features(), feature)
@@ -648,7 +635,7 @@ impl TableConfiguration {
 
                 let writer_supported = if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= info.min_writer_version
+                    self.protocol.min_writer_version() >= min_writer_version
                 } else {
                     // Table features writer: feature is in writer_features list
                     Self::has_feature(self.protocol.writer_features(), feature)
@@ -678,9 +665,7 @@ impl TableConfiguration {
     /// This does NOT check if the feature is enabled via table properties.
     #[internal_api]
     pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
-        let Some(info) = feature.info() else {
-            return false;
-        };
+        let info = feature.info();
         self.is_feature_info_supported(feature, info)
     }
 
@@ -691,9 +676,7 @@ impl TableConfiguration {
     /// 2. The enablement check passes
     #[internal_api]
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
-        let Some(info) = feature.info() else {
-            return false;
-        };
+        let info = feature.info();
         self.is_feature_info_enabled(feature, info)
     }
 }
@@ -711,8 +694,9 @@ mod test {
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
-        EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
-        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+        EnablementCheck, FeatureInfo, FeatureType, KernelSupport, MinReaderWriterVersion,
+        Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+        TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::{
@@ -1281,10 +1265,8 @@ mod test {
 
         // Custom FeatureInfo that treats ColumnMapping as WriterOnly with min_writer_version = 2
         let custom_feature_info = FeatureInfo {
-            name: "columnMapping",
-            min_reader_version: 1,
-            min_writer_version: 2,
             feature_type: FeatureType::WriterOnly,
+            min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1303,10 +1285,8 @@ mod test {
         // Use AppendOnly instead of ColumnMapping for the 2,7 test cases
         let writer_only_feature = TableFeature::AppendOnly;
         let writer_only_info = FeatureInfo {
-            name: "appendOnly",
-            min_reader_version: 1,
-            min_writer_version: 2,
             feature_type: FeatureType::WriterOnly,
+            min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1341,10 +1321,8 @@ mod test {
 
         // Custom FeatureInfo that requires reader=2, writer=5
         let custom_feature_info = FeatureInfo {
-            name: "columnMapping",
-            min_reader_version: 2,
-            min_writer_version: 5,
             feature_type: FeatureType::ReaderWriter,
+            min_legacy_version: Some(MinReaderWriterVersion(2, 5)),
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1389,10 +1367,8 @@ mod test {
 
         // Create a custom feature with a property check function
         let custom_feature_info = FeatureInfo {
-            name: "customPropertyFeature",
-            min_reader_version: 1,
-            min_writer_version: 2,
             feature_type: FeatureType::WriterOnly,
+            min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
@@ -1415,10 +1391,8 @@ mod test {
     fn test_is_feature_info_enabled_always_if_supported() {
         // Create a custom feature that's always enabled if supported
         let custom_feature_info = FeatureInfo {
-            name: "alwaysEnabledFeature",
-            min_reader_version: 1,
-            min_writer_version: 3,
             feature_type: FeatureType::WriterOnly,
+            min_legacy_version: Some(MinReaderWriterVersion(1, 3)),
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1493,7 +1467,7 @@ mod test {
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
-            "rowTracking requires domainMetadata to be supported",
+            "Feature 'rowTracking' requires 'domainMetadata' to be supported",
         );
     }
 

@@ -186,7 +186,6 @@ pub(crate) enum FeatureType {
 }
 
 /// Defines how a feature's enablement is determined
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum EnablementCheck {
     /// Feature is enabled if it's supported (appears in protocol feature lists)
@@ -196,8 +195,7 @@ pub(crate) enum EnablementCheck {
 }
 
 /// Represents the type of operation being performed on a table
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub(crate) enum Operation {
     /// Read operations on regular table data
     Scan,
@@ -208,8 +206,6 @@ pub(crate) enum Operation {
 }
 
 /// Defines whether the Rust kernel has implementation support for a feature's operation
-#[allow(dead_code)]
-#[derive(Clone)]
 pub(crate) enum KernelSupport {
     /// Kernel has full support for any operation on this feature
     Supported,
@@ -222,8 +218,7 @@ pub(crate) enum KernelSupport {
 }
 
 /// Types of requirements for feature dependencies
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum FeatureRequirement {
     /// Feature must be supported (in protocol)
     Supported(TableFeature),
@@ -237,18 +232,18 @@ pub(crate) enum FeatureRequirement {
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
+/// Minimum protocol versions for legacy (pre-feature-list) inference.
+/// Fields are (min_reader_version, min_writer_version).
+pub(crate) struct MinReaderWriterVersion(pub i32, pub i32);
+
 /// Rich metadata about a table feature including version requirements, dependencies, and support status
-#[allow(dead_code)]
-#[derive(Clone)]
 pub(crate) struct FeatureInfo {
-    /// The feature's canonical name as it appears in the protocol
-    pub name: &'static str,
-    /// Minimum reader protocol version required for this feature
-    pub min_reader_version: i32,
-    /// Minimum writer protocol version required for this feature
-    pub min_writer_version: i32,
     /// The type of feature (WriterOnly, ReaderWriter, or Unknown)
     pub feature_type: FeatureType,
+    /// Minimum legacy protocol versions for version-based feature inference.
+    /// `Some` for features that predate feature lists and can be inferred from protocol version.
+    /// `None` for features that require explicit feature lists (reader v3+ / writer v7+).
+    pub min_legacy_version: Option<MinReaderWriterVersion>,
     /// Requirements this feature has (features + custom validations)
     pub feature_requirements: &'static [FeatureRequirement],
     /// Rust kernel's support for this feature (may vary by Operation type)
@@ -264,48 +259,36 @@ pub(crate) struct FeatureInfo {
 }
 
 // Static FeatureInfo instances for each table feature
-#[allow(dead_code)]
 static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
-    name: "appendOnly",
-    min_reader_version: 1,
-    min_writer_version: 2,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
-#[allow(dead_code)]
 // Although kernel marks invariants as "Supported", invariants must NOT actually be present in the table schema.
 // Kernel will fail to write to any table that actually uses invariants (see check in TableConfiguration::ensure_write_supported).
 // This is to allow legacy tables with the Invariants feature enabled but not in use.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
-    name: "invariants",
-    min_reader_version: 1,
-    min_writer_version: 2,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
-    name: "checkConstraints",
-    min_reader_version: 1,
-    min_writer_version: 3,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: Some(MinReaderWriterVersion(1, 3)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
-    name: "changeDataFeed",
-    min_reader_version: 1,
-    min_writer_version: 4,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -313,34 +296,25 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
-    name: "generatedColumns",
-    min_reader_version: 1,
-    min_writer_version: 4,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
-    name: "identityColumns",
-    min_reader_version: 1,
-    min_writer_version: 6,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: Some(MinReaderWriterVersion(1, 6)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
-    name: "inCommitTimestamp",
-    min_reader_version: 1,
-    min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
         Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
@@ -350,12 +324,9 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
-    name: "rowTracking",
-    min_reader_version: 1,
-    min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -363,12 +334,9 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
-    name: "domainMetadata",
-    min_reader_version: 1,
-    min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -379,12 +347,9 @@ static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
 // See Delta Spark: IcebergCompat.scala CheckNoListMapNullType (lines 422-433)
 // See Java Kernel: IcebergWriterCompatMetadataValidatorAndUpdater.java UNSUPPORTED_TYPES_CHECK
 // See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv1 for more requirements to support
-#[allow(dead_code)]
 static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
-    name: "icebergCompatV1",
-    min_reader_version: 2,
-    min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
@@ -413,12 +378,9 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
 // See Delta Spark: IcebergCompat.scala CheckTypeInV2AllowList (lines 450-459)
 // See Java Kernel: IcebergCompatMetadataValidatorAndUpdater.java V2_SUPPORTED_TYPES
 // See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2 for more requirements to support.
-#[allow(dead_code)]
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
-    name: "icebergCompatV2",
-    min_reader_version: 2,
-    min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
@@ -443,10 +405,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 };
 
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
-    name: "clustering",
-    min_reader_version: 1,
-    min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     #[cfg(feature = "clustered-table")]
     kernel_support: KernelSupport::Supported,
@@ -455,23 +415,17 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
-    name: "materializePartitionColumns",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
-    name: "catalogManaged",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
@@ -485,12 +439,9 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    name: "catalogOwned-preview",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
@@ -504,12 +455,9 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
-    name: "columnMapping",
-    min_reader_version: 2,
-    min_writer_version: 5,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: Some(MinReaderWriterVersion(2, 5)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -518,12 +466,9 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
-    name: "deletionVectors",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     // We support writing to tables with DeletionVectors enabled, but we never write DV files
     // ourselves (no DML). The kernel only performs append operations.
@@ -533,23 +478,17 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
-    name: "timestampNtz",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
-    name: "typeWidening",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Cdf => Ok(()),
@@ -560,12 +499,9 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
-#[allow(dead_code)]
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    name: "typeWidening-preview",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Cdf => Ok(()),
@@ -576,58 +512,53 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
-#[allow(dead_code)]
 static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
-    name: "v2Checkpoint",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
-    name: "vacuumProtocolCheck",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
-    name: "variantType",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    name: "variantType-preview",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-#[allow(dead_code)]
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    name: "variantShredding-preview",
-    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
-    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+/// Unknown features are not supported by the kernel but are tolerated for forward compatibility.
+/// They cannot be inferred from legacy protocol versions.
+static UNKNOWN_FEATURE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::Unknown,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -668,42 +599,59 @@ impl TableFeature {
         }
     }
 
+    /// Returns true if this feature can be inferred from a legacy reader protocol version.
+    /// Always returns false for non-legacy (feature-list-only) features.
+    pub(crate) fn is_valid_for_legacy_reader(&self, reader_version: i32) -> bool {
+        matches!(
+            self.info().min_legacy_version,
+            Some(MinReaderWriterVersion(min_reader, _)) if reader_version >= min_reader
+        )
+    }
+
+    /// Returns true if this feature can be inferred from a legacy writer protocol version.
+    /// Always returns false for non-legacy (feature-list-only) features.
+    pub(crate) fn is_valid_for_legacy_writer(&self, writer_version: i32) -> bool {
+        matches!(
+            self.info().min_legacy_version,
+            Some(MinReaderWriterVersion(_, min_writer)) if writer_version >= min_writer
+        )
+    }
+
     /// Returns rich metadata about this table feature including version requirements,
-    /// dependencies, and support status. For Unknown features, returns None.
-    #[allow(dead_code)]
-    pub(crate) fn info(&self) -> Option<&'static FeatureInfo> {
+    /// dependencies, and support status. Unknown features return UNKNOWN_FEATURE_INFO.
+    pub(crate) fn info(&self) -> &FeatureInfo {
         match self {
             // Writer-only features
-            TableFeature::AppendOnly => Some(&APPEND_ONLY_INFO),
-            TableFeature::Invariants => Some(&INVARIANTS_INFO),
-            TableFeature::CheckConstraints => Some(&CHECK_CONSTRAINTS_INFO),
-            TableFeature::ChangeDataFeed => Some(&CHANGE_DATA_FEED_INFO),
-            TableFeature::GeneratedColumns => Some(&GENERATED_COLUMNS_INFO),
-            TableFeature::IdentityColumns => Some(&IDENTITY_COLUMNS_INFO),
-            TableFeature::InCommitTimestamp => Some(&IN_COMMIT_TIMESTAMP_INFO),
-            TableFeature::RowTracking => Some(&ROW_TRACKING_INFO),
-            TableFeature::DomainMetadata => Some(&DOMAIN_METADATA_INFO),
-            TableFeature::IcebergCompatV1 => Some(&ICEBERG_COMPAT_V1_INFO),
-            TableFeature::IcebergCompatV2 => Some(&ICEBERG_COMPAT_V2_INFO),
-            TableFeature::ClusteredTable => Some(&CLUSTERED_TABLE_INFO),
-            TableFeature::MaterializePartitionColumns => Some(&MATERIALIZE_PARTITION_COLUMNS_INFO),
+            TableFeature::AppendOnly => &APPEND_ONLY_INFO,
+            TableFeature::Invariants => &INVARIANTS_INFO,
+            TableFeature::CheckConstraints => &CHECK_CONSTRAINTS_INFO,
+            TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
+            TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
+            TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
+            TableFeature::InCommitTimestamp => &IN_COMMIT_TIMESTAMP_INFO,
+            TableFeature::RowTracking => &ROW_TRACKING_INFO,
+            TableFeature::DomainMetadata => &DOMAIN_METADATA_INFO,
+            TableFeature::IcebergCompatV1 => &ICEBERG_COMPAT_V1_INFO,
+            TableFeature::IcebergCompatV2 => &ICEBERG_COMPAT_V2_INFO,
+            TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
+            TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
 
             // ReaderWriter features
-            TableFeature::CatalogManaged => Some(&CATALOG_MANAGED_INFO),
-            TableFeature::CatalogOwnedPreview => Some(&CATALOG_OWNED_PREVIEW_INFO),
-            TableFeature::ColumnMapping => Some(&COLUMN_MAPPING_INFO),
-            TableFeature::DeletionVectors => Some(&DELETION_VECTORS_INFO),
-            TableFeature::TimestampWithoutTimezone => Some(&TIMESTAMP_WITHOUT_TIMEZONE_INFO),
-            TableFeature::TypeWidening => Some(&TYPE_WIDENING_INFO),
-            TableFeature::TypeWideningPreview => Some(&TYPE_WIDENING_PREVIEW_INFO),
-            TableFeature::V2Checkpoint => Some(&V2_CHECKPOINT_INFO),
-            TableFeature::VacuumProtocolCheck => Some(&VACUUM_PROTOCOL_CHECK_INFO),
-            TableFeature::VariantType => Some(&VARIANT_TYPE_INFO),
-            TableFeature::VariantTypePreview => Some(&VARIANT_TYPE_PREVIEW_INFO),
-            TableFeature::VariantShreddingPreview => Some(&VARIANT_SHREDDING_PREVIEW_INFO),
+            TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
+            TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
+            TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
+            TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
+            TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
+            TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
+            TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
+            TableFeature::V2Checkpoint => &V2_CHECKPOINT_INFO,
+            TableFeature::VacuumProtocolCheck => &VACUUM_PROTOCOL_CHECK_INFO,
+            TableFeature::VariantType => &VARIANT_TYPE_INFO,
+            TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
+            TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
 
-            // Unknown features have no metadata
-            TableFeature::Unknown(_) => None,
+            // Unknown features: not supported by kernel, no legacy version inference.
+            TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
         }
     }
 }
