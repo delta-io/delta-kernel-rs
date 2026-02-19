@@ -1942,11 +1942,15 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{ArrayType, ColumnMetadataKey, MapType, MetadataValue};
+    use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
-    use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
+    use crate::utils::test_utils::{
+        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
+        test_schema_with_array, test_schema_with_map,
+    };
     use crate::Snapshot;
+    use rstest::rstest;
     use std::path::PathBuf;
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
@@ -2512,137 +2516,32 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: create a table with the given column mapping mode and return the
-    /// pre-commit transaction using an in-memory store.
-    fn setup_column_mapping_txn(
-        mode: ColumnMappingMode,
-    ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
-        let mode_str = match mode {
-            ColumnMappingMode::Name => "name",
-            ColumnMappingMode::Id => "id",
-            ColumnMappingMode::None => "none",
-        };
-        let store = Arc::new(object_store::memory::InMemory::new());
-        let engine: Arc<dyn Engine> =
-            Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
-
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::new("id", DataType::LONG, false),
-            StructField::nullable("value", DataType::STRING),
-            StructField::nullable("score", DataType::DOUBLE),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::new("street", DataType::STRING, false),
-                    StructField::nullable("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::INTEGER),
-                ])?,
-            ),
-            StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
-            StructField::nullable(
-                "metadata",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-        ])?);
-
-        // Build the create-table transaction.
-        let txn = create_table("memory:///test_table", schema, "DefaultEngine")
-            .with_table_properties([("delta.columnMapping.mode", mode_str)])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        Ok((engine, txn))
-    }
-
-    /// Shared validation for column mapping physical schema.
-    /// Iterates logical fields to extract expected physical name / id, then checks
-    /// the physical schema matches.
-    fn validate_physical_schema_column_mapping(mode: ColumnMappingMode) -> DeltaResult<()> {
-        let (_engine, txn) = setup_column_mapping_txn(mode)?;
+    // Input schemas have no CM metadata; create_table automatically assigns IDs and
+    // physical names when mode is Name or Id.
+    #[rstest]
+    #[case::flat_none(test_schema_flat(), ColumnMappingMode::None)]
+    #[case::flat_name(test_schema_flat(), ColumnMappingMode::Name)]
+    #[case::flat_id(test_schema_flat(), ColumnMappingMode::Id)]
+    #[case::nested_none(test_schema_nested(), ColumnMappingMode::None)]
+    #[case::nested_name(test_schema_nested(), ColumnMappingMode::Name)]
+    #[case::nested_id(test_schema_nested(), ColumnMappingMode::Id)]
+    #[case::map_none(test_schema_with_map(), ColumnMappingMode::None)]
+    #[case::map_name(test_schema_with_map(), ColumnMappingMode::Name)]
+    #[case::map_id(test_schema_with_map(), ColumnMappingMode::Id)]
+    #[case::array_none(test_schema_with_array(), ColumnMappingMode::None)]
+    #[case::array_name(test_schema_with_array(), ColumnMappingMode::Name)]
+    #[case::array_id(test_schema_with_array(), ColumnMappingMode::Id)]
+    fn test_physical_schema_column_mapping(
+        #[case] schema: SchemaRef,
+        #[case] mode: ColumnMappingMode,
+    ) -> DeltaResult<()> {
+        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.logical_schema();
-        let physical_schema = write_context.physical_schema();
-
-        assert_eq!(
-            physical_schema.fields().count(),
-            logical_schema.fields().count()
+        crate::utils::test_utils::validate_physical_schema_column_mapping(
+            write_context.logical_schema(),
+            write_context.physical_schema(),
+            mode,
         );
-
-        // Collect expected (physical_name, field_id) from logical schema
-        let expected: Vec<_> = logical_schema
-            .fields()
-            .map(|f| {
-                let physical_name =
-                    match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-                        Some(MetadataValue::String(name)) => name.clone(),
-                        _ if mode == ColumnMappingMode::None => f.name().to_string(),
-                        _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
-                    };
-                let field_id = match f.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
-                    Some(MetadataValue::Number(id)) => *id,
-                    // None mode: no column mapping id, use -1 as placeholder
-                    _ if mode == ColumnMappingMode::None => -1,
-                    _ => panic!(
-                        "Logical field '{}' missing columnMapping.id metadata",
-                        f.name()
-                    ),
-                };
-                (physical_name, field_id)
-            })
-            .collect();
-
-        // Validate each physical field against expected values
-        for (physical_field, (expected_name, expected_id)) in
-            physical_schema.fields().zip(expected.iter())
-        {
-            // Physical field name should be the physical name from logical metadata
-            assert_eq!(
-                physical_field.name(),
-                expected_name,
-                "Physical field name mismatch"
-            );
-
-            // None mode: no CM metadata
-            if mode == ColumnMappingMode::None {
-                continue;
-            }
-
-            // Name/Id mode: have CM metadata
-            assert_eq!(
-                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-                Some(&MetadataValue::String(expected_name.clone())),
-                "columnMapping.physicalName mismatch for '{}'",
-                physical_field.name()
-            );
-
-            assert_eq!(
-                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
-                Some(&MetadataValue::Number(*expected_id)),
-                "columnMapping.id mismatch for '{}'",
-                physical_field.name()
-            );
-
-            assert_eq!(
-                physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
-                Some(&MetadataValue::Number(*expected_id)),
-                "parquet.field.id mismatch for '{}'",
-                physical_field.name()
-            );
-        }
-
         Ok(())
-    }
-
-    #[test]
-    fn test_physical_schema_column_mapping_name_mode() -> DeltaResult<()> {
-        validate_physical_schema_column_mapping(ColumnMappingMode::Name)
-    }
-
-    #[test]
-    fn test_physical_schema_column_mapping_id_mode() -> DeltaResult<()> {
-        validate_physical_schema_column_mapping(ColumnMappingMode::Id)
-    }
-
-    #[test]
-    fn test_physical_schema_column_mapping_none_mode() -> DeltaResult<()> {
-        validate_physical_schema_column_mapping(ColumnMappingMode::None)
     }
 }
