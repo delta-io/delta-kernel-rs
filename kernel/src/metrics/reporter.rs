@@ -160,20 +160,19 @@ impl tracing::field::Visit for StorageEventTypeVisitor {
 
 #[derive(Default)]
 struct NewSpanVisitor {
-    uuid: Uuid
+    uuid: Uuid,
 }
 
 impl tracing::field::Visit for NewSpanVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        match field.name() {
-            "operation_id" => {
-                let s = format!("{:?}", value);
-                match Uuid::from_str(&s) {
-                    Ok(u) => self.uuid = u,
-                    Err(e) => warn!("Invalid uuid recorded to span: {value:?}. {e}. Using a default"),
+        if field.name() == "operation_id" {
+            let s = format!("{:?}", value);
+            match Uuid::from_str(&s) {
+                Ok(u) => self.uuid = u,
+                Err(e) => {
+                    warn!("Invalid uuid recorded to span: {value:?}. {e}. Using a default")
                 }
             }
-            _ => {}
         }
     }
 }

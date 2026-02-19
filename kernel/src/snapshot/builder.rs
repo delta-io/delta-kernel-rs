@@ -108,13 +108,10 @@ impl SnapshotBuilder {
                 operation_id,
             )?;
 
-            Ok(Snapshot::try_new_from_log_segment(
-                table_root,
-                log_segment,
-                engine,
-                operation_id,
-            )?
-            .into())
+            Ok(
+                Snapshot::try_new_from_log_segment(table_root, log_segment, engine, operation_id)?
+                    .into(),
+            )
         } else {
             let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
                 Error::internal_error(

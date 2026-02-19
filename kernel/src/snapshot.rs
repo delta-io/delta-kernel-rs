@@ -304,7 +304,8 @@ impl Snapshot {
         let lazy_crc = LazyCrc::new(log_segment.latest_crc_file.clone());
 
         // Read protocol and metadata (may use CRC if available)
-        let (metadata, protocol) = log_segment.read_protocol_metadata(engine, &lazy_crc, operation_id)?;
+        let (metadata, protocol) =
+            log_segment.read_protocol_metadata(engine, &lazy_crc, operation_id)?;
 
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
@@ -1165,7 +1166,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage = ObjectStoreStorageHandler::new(store, executor);
         let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
@@ -1222,7 +1223,7 @@ mod tests {
             .expect("put _last_checkpoint");
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
@@ -1252,7 +1253,7 @@ mod tests {
         }
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage = ObjectStoreStorageHandler::new(store, executor);
 
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.
@@ -1741,7 +1742,13 @@ mod tests {
             .build(&engine)?;
 
         // Test with empty log tail - should return same snapshot
-        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None, MetricId::default())?;
+        let result = Snapshot::try_new_from(
+            base_snapshot.clone(),
+            vec![],
+            &engine,
+            None,
+            MetricId::default(),
+        )?;
         assert_eq!(result, base_snapshot);
 
         Ok(())
@@ -1808,8 +1815,13 @@ mod tests {
         let log_tail = vec![parsed_path];
 
         // Create new snapshot from base to version 2 using try_new_from directly
-        let new_snapshot =
-            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2), MetricId::default())?;
+        let new_snapshot = Snapshot::try_new_from(
+            base_snapshot.clone(),
+            log_tail,
+            &engine,
+            Some(2),
+            MetricId::default(),
+        )?;
 
         // Latest commit should now be version 2
         assert_eq!(
@@ -1858,13 +1870,23 @@ mod tests {
             .build(&engine)?;
 
         // Test requesting same version - should return same snapshot
-        let same_version =
-            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1), MetricId::default())?;
+        let same_version = Snapshot::try_new_from(
+            base_snapshot.clone(),
+            vec![],
+            &engine,
+            Some(1),
+            MetricId::default(),
+        )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
         // Test requesting older version - should error
-        let older_version =
-            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0), MetricId::default());
+        let older_version = Snapshot::try_new_from(
+            base_snapshot.clone(),
+            vec![],
+            &engine,
+            Some(0),
+            MetricId::default(),
+        );
         assert!(matches!(
             older_version,
             Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")
