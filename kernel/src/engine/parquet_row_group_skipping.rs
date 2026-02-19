@@ -1,6 +1,6 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
 use crate::engine::arrow_utils::RowIndexBuilder;
-use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
+use crate::expressions::{column_name, ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::{
     CheckpointMetaSkippingFilter, ParquetStatsProvider,
 };
@@ -10,7 +10,8 @@ use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
 use chrono::{DateTime, Days};
-use std::collections::HashMap;
+use std::borrow::ToOwned;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
 #[cfg(test)]
@@ -69,7 +70,21 @@ fn apply_checkpoint_meta_skipping_filter(
     row_group: &RowGroupMetaData,
     predicate: &Predicate,
 ) -> bool {
-    let inner = RowGroupFilter::new(row_group, predicate);
+    let refs = predicate.references();
+    let min_prefix = column_name!("add.stats_parsed.minValues");
+    let max_prefix = column_name!("add.stats_parsed.maxValues");
+    let mut requested_columns: HashSet<ColumnName> = refs
+        .iter()
+        .flat_map(|col| [min_prefix.join(col), max_prefix.join(col)])
+        .collect();
+    let field_indices = row_group
+        .schema_descr()
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| requested_columns.take(f.path().parts()).map(|path| (path, i)))
+        .collect();
+    let inner = RowGroupFilter::new_with_field_indices(row_group, field_indices);
     CheckpointMetaSkippingFilter::apply(inner, predicate)
 }
 
@@ -84,9 +99,17 @@ struct RowGroupFilter<'a> {
 impl<'a> RowGroupFilter<'a> {
     /// Creates a new row group filter for the given row group and predicate.
     fn new(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> Self {
+        let field_indices = compute_field_indices(row_group.schema_descr().columns(), predicate);
+        Self::new_with_field_indices(row_group, field_indices)
+    }
+
+    fn new_with_field_indices(
+        row_group: &'a RowGroupMetaData,
+        field_indices: HashMap<ColumnName, usize>,
+    ) -> Self {
         Self {
             row_group,
-            field_indices: compute_field_indices(row_group.schema_descr().columns(), predicate),
+            field_indices,
         }
     }
 
@@ -277,7 +300,7 @@ pub(crate) fn compute_field_indices(
         .filter_map(|(i, f)| {
             requested_columns
                 .take(f.path().parts())
-                .map(|path| (path.clone(), i))
+                .map(|path| (path.to_owned(), i))
         })
         .collect()
 }
