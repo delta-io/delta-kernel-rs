@@ -23,13 +23,13 @@ pub fn load_all_workloads() -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::err
     let benchmarks_dir = spec_dir.join("benchmarks");
     let table_directories = find_table_directories(&benchmarks_dir)?;
 
-    let mut all_specs = Vec::new();
+    let mut all_workloads = Vec::new();
 
     for table_dir in table_directories {
-        all_specs.extend(load_specs_from_table(&table_dir)?);
+        all_workloads.extend(load_specs_from_table(&table_dir)?);
     }
 
-    Ok(all_specs)
+    Ok(all_workloads)
 }
 
 fn workload_specs_exist() -> bool {
@@ -40,24 +40,20 @@ fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
     let tar_path = Path::new(WORKLOAD_TAR);
 
     if !tar_path.exists() {
-        return Err(format!(
-            "Workload tarball not found at: {}. Please ensure {} exists.",
-            WORKLOAD_TAR, WORKLOAD_TAR
-        )
-        .into());
+        return Err(format!("Workload tarball not found at {}", WORKLOAD_TAR).into());
     }
 
-    let tarball_data = std::fs::read(tar_path)?;
-    extract_tarball(tarball_data)?;
+    extract_tarball(tar_path)?;
     write_done_file()?;
 
     Ok(())
 }
 
-fn extract_tarball(tarball_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::BufReader;
 
-    let tarball = flate2::read::GzDecoder::new(BufReader::new(&tarball_data[..]));
+    let file = std::fs::File::open(path)?;
+    let tarball = flate2::read::GzDecoder::new(BufReader::new(file));
     let mut archive = tar::Archive::new(tarball);
 
     std::fs::create_dir_all(OUTPUT_FOLDER)
@@ -101,7 +97,7 @@ fn load_specs_from_table(
 ) -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR);
 
-    if !specs_dir.exists() || !specs_dir.is_dir() {
+    if !specs_dir.is_dir() {
         return Err(format!("Specs directory not found: {}", specs_dir.display()).into());
     }
 
@@ -116,7 +112,7 @@ fn load_specs_from_table(
 
     if table_info.table_path.is_none() {
         let delta_dir = table_dir.join("delta");
-        if !delta_dir.exists() || !delta_dir.is_dir() {
+        if !delta_dir.is_dir() {
             return Err(format!(
                 "Table data not found for '{}'. Expected a 'delta' directory in {}",
                 table_info.name,
@@ -128,12 +124,12 @@ fn load_specs_from_table(
 
     let spec_files = find_spec_files(&specs_dir)?;
 
-    let mut all_specs = Vec::new();
+    let mut workloads = Vec::new();
     for spec_file in spec_files {
-        all_specs.push(load_single_spec(&spec_file, table_info.clone())?);
+        workloads.push(load_single_spec(&spec_file, table_info.clone())?);
     }
 
-    Ok(all_specs)
+    Ok(workloads)
 }
 
 fn find_spec_files(specs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
