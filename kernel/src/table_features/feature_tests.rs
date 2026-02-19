@@ -103,22 +103,6 @@ struct FeatureFixture {
 }
 
 impl FeatureFixture {
-    /// Find the first `Enabled` case's props, or `None` if there are no `Enabled` cases.
-    fn find_enabled(&self) -> Option<&'static [&'static str]> {
-        self.prop_cases.iter().find_map(|c| match c {
-            PropCase::Enabled(p) => Some(*p),
-            _ => None,
-        })
-    }
-
-    /// Find the first `Disabled` case's props, or `None` if there are no `Disabled` cases.
-    fn find_disabled(&self) -> Option<&'static [&'static str]> {
-        self.prop_cases.iter().find_map(|c| match c {
-            PropCase::Disabled(p) => Some(*p),
-            _ => None,
-        })
-    }
-
     /// Whether this feature has any metadata footprint (props or schema).
     fn has_metadata_footprint(&self) -> bool {
         !self.prop_cases.is_empty() || self.presence_schema.is_some()
@@ -239,7 +223,15 @@ fn run_battery(fixture: &FeatureFixture) {
         .collect();
 
     let schema_ref = fixture.presence_schema.as_ref();
-    let enabled_props = fixture.find_enabled().unwrap_or(&[]);
+    let enabled_props = fixture.prop_cases.iter().find_map(|c| match c {
+        PropCase::Enabled(p) => Some(*p),
+        _ => None,
+    });
+    let enabled_props = enabled_props.unwrap_or(&[]);
+    let disabled_props = fixture.prop_cases.iter().find_map(|c| match c {
+        PropCase::Disabled(p) => Some(*p),
+        _ => None,
+    });
 
     // ============================================================================================
     // A. Prop cases: feature IS listed in modern (3,7) protocol
@@ -284,14 +276,33 @@ fn run_battery(fixture: &FeatureFixture) {
     }
 
     // ============================================================================================
-    // B. Auto-generated: empty props + listed (modern 3,7)
+    // B. Auto-generated: listed feature (modern 3,7), supported vs. enabled
     // ============================================================================================
     if fixture.is_feature_known() {
-        let tc = create_table_config(&all_feature_names, enabled_props, schema_ref, 3, 7);
-        assert!(
-            tc.is_feature_supported(&feature),
-            "{name}: listed: expected is_feature_supported = true"
-        );
+        if let Some(disabled_props) = disabled_props {
+            // Feature has a toggle -- verify supported but NOT enabled with disabled props.
+            // Disabled props still enable deps (e.g. IcebergCompat disabled includes CM mode=name).
+            let tc = create_table_config(&all_feature_names, disabled_props, schema_ref, 3, 7);
+            assert!(
+                tc.is_feature_supported(&feature),
+                "{name}: listed + disabled: expected is_feature_supported = true"
+            );
+            assert!(
+                !tc.is_feature_enabled(&feature),
+                "{name}: listed + disabled: expected is_feature_enabled = false"
+            );
+        } else {
+            // No toggle -- supported implies enabled (AlwaysIfSupported or EnabledIfPresent).
+            let tc = create_table_config(&all_feature_names, enabled_props, schema_ref, 3, 7);
+            assert!(
+                tc.is_feature_supported(&feature),
+                "{name}: listed: expected is_feature_supported = true"
+            );
+            assert!(
+                tc.is_feature_enabled(&feature),
+                "{name}: listed: expected is_feature_enabled = true"
+            );
+        }
     }
 
     // ============================================================================================
@@ -385,7 +396,7 @@ fn run_battery(fixture: &FeatureFixture) {
         // Non-toggle features are excluded: AlwaysIfSupported features (no prop_cases) are
         // always enabled when supported, and columnMapping uses a multi-valued mode property
         // whose disabled state (mode=none) is tested in the column_mapping module.
-        if let Some(disabled_props) = fixture.find_disabled() {
+        if let Some(disabled_props) = disabled_props {
             assert!(
                 !enabled_props.is_empty(),
                 "{name}: has Disabled prop_case but no Enabled prop_case"
@@ -472,7 +483,9 @@ fn run_battery(fixture: &FeatureFixture) {
             );
         }
 
-        // G2: Present anti-dep -> should be rejected
+        // G2: Present anti-dep -> should be rejected (anti-deps forbid support, not just enablement)
+        // Uses disabled props when available to verify rejection even when the feature isn't enabled.
+        let anti_dep_props = disabled_props.unwrap_or(enabled_props);
         for anti_dep in fixture.anti_deps.iter() {
             let with_anti: Vec<&str> = all_feature_names
                 .iter()
@@ -483,7 +496,7 @@ fn run_battery(fixture: &FeatureFixture) {
             assert_dep_violation(
                 &format!("{name}: present anti-dep '{anti_dep}'"),
                 fixture.spec_type,
-                try_create_table_config(&with_anti, enabled_props, schema_ref, 3, 7),
+                try_create_table_config(&with_anti, anti_dep_props, schema_ref, 3, 7),
             );
         }
     }
