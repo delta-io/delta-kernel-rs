@@ -1,5 +1,6 @@
 //! Metrics reporter trait and implementations.
 
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,6 +8,7 @@ use tracing::span::Id;
 use tracing::{event, warn, Level, Span, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use uuid::Uuid;
 
 use crate::metrics::MetricId;
 
@@ -156,6 +158,26 @@ impl tracing::field::Visit for StorageEventTypeVisitor {
     fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
 }
 
+#[derive(Default)]
+struct NewSpanVisitor {
+    uuid: Uuid
+}
+
+impl tracing::field::Visit for NewSpanVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "operation_id" => {
+                let s = format!("{:?}", value);
+                match Uuid::from_str(&s) {
+                    Ok(u) => self.uuid = u,
+                    Err(e) => warn!("Invalid uuid recorded to span: {value:?}. {e}. Using a default"),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<S> Layer<S> for ReportGeneratorLayer
 where
     S: Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
@@ -164,21 +186,23 @@ where
         let Some(metadata) = ctx.metadata(id) else {
             return;
         };
+        let mut new_span_visitor = NewSpanVisitor::default();
+        attrs.record(&mut new_span_visitor);
         let name = metadata.name();
         let event = match name {
             "segment.for_snapshot" => Some(MetricEvent::LogSegmentLoaded {
-                operation_id: MetricId::new(),
+                operation_id: MetricId(new_span_visitor.uuid),
                 duration: std::time::Duration::default(),
                 num_commit_files: 0,
                 num_checkpoint_files: 0,
                 num_compaction_files: 0,
             }),
             "segment.read_metadata" => Some(MetricEvent::ProtocolMetadataLoaded {
-                operation_id: MetricId::new(),
+                operation_id: MetricId(new_span_visitor.uuid),
                 duration: std::time::Duration::default(),
             }),
             "snap.completed" => Some(MetricEvent::SnapshotCompleted {
-                operation_id: MetricId::new(),
+                operation_id: MetricId(new_span_visitor.uuid),
                 version: 0,
                 total_duration: std::time::Duration::default(),
             }),

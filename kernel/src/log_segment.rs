@@ -3,15 +3,13 @@
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
-use std::time::Instant;
-
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
 use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
-use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::metrics::MetricId;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
@@ -241,8 +239,8 @@ impl LogSegment {
     #[instrument(
         name = "segment.for_snapshot",
         err,
-        skip(storage, reporter, operation_id, time_travel_version),
-        fields(report, num_commit_files, num_checkpoint_files, num_compaction_files)
+        skip(storage, time_travel_version),
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
@@ -250,12 +248,8 @@ impl LogSegment {
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
-        reporter: Option<&Arc<dyn MetricsReporter>>,
-        operation_id: Option<MetricId>,
+        operation_id: MetricId,
     ) -> DeltaResult<Self> {
-        let operation_id = operation_id.unwrap_or_default();
-        let start = Instant::now();
-
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
         let result = Self::for_snapshot_impl(
@@ -265,7 +259,6 @@ impl LogSegment {
             checkpoint_hint,
             time_travel_version,
         );
-        let log_segment_loading_duration = start.elapsed();
 
         match result {
             Ok(log_segment) => {
@@ -281,15 +274,15 @@ impl LogSegment {
                     "num_compaction_files",
                     log_segment.ascending_compaction_files.len() as u64,
                 );
-                reporter.inspect(|r| {
-                    r.report(MetricEvent::LogSegmentLoaded {
-                        operation_id,
-                        duration: log_segment_loading_duration,
-                        num_commit_files: log_segment.ascending_commit_files.len() as u64,
-                        num_checkpoint_files: log_segment.checkpoint_parts.len() as u64,
-                        num_compaction_files: log_segment.ascending_compaction_files.len() as u64,
-                    });
-                });
+                // reporter.inspect(|r| {
+                //     r.report(MetricEvent::LogSegmentLoaded {
+                //         operation_id,
+                //         duration: log_segment_loading_duration,
+                //         num_commit_files: log_segment.ascending_commit_files.len() as u64,
+                //         num_checkpoint_files: log_segment.checkpoint_parts.len() as u64,
+                //         num_compaction_files: log_segment.ascending_compaction_files.len() as u64,
+                //     });
+                // });
                 Ok(log_segment)
             }
             Err(e) => Err(e),

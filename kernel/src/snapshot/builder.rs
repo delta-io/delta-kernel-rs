@@ -98,7 +98,6 @@ impl SnapshotBuilder {
 
         let log_tail = self.log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
-        let reporter = engine.get_metrics_reporter();
 
         if let Some(table_root) = self.table_root {
             let log_segment = LogSegment::for_snapshot(
@@ -106,15 +105,14 @@ impl SnapshotBuilder {
                 table_root.join("_delta_log/")?,
                 log_tail,
                 self.version,
-                reporter.as_ref(),
-                Some(operation_id),
+                operation_id,
             )?;
 
             Ok(Snapshot::try_new_from_log_segment(
                 table_root,
                 log_segment,
                 engine,
-                Some(operation_id),
+                operation_id,
             )?
             .into())
         } else {
@@ -129,7 +127,7 @@ impl SnapshotBuilder {
                 log_tail,
                 engine,
                 self.version,
-                Some(operation_id),
+                operation_id,
             )
         }
     }

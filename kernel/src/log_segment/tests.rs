@@ -2238,7 +2238,7 @@ async fn test_latest_commit_file_field_is_captured() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, MetricId::default())
             .unwrap();
 
     // The latest commit should be version 5
@@ -2266,7 +2266,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, MetricId::default())
             .unwrap();
 
     // The latest commit should be version 4
@@ -2288,7 +2288,7 @@ async fn test_latest_commit_file_with_no_commits() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, MetricId::default())
             .unwrap();
 
     // latest_commit_file should be None when there are no commits
@@ -2313,7 +2313,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, MetricId::default())
             .unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
@@ -2340,7 +2340,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, MetricId::default())
             .unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
