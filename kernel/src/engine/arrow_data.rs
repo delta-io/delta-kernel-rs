@@ -390,7 +390,7 @@ impl ArrowEngineData {
         Ok(())
     }
 
-    /// Helper function to extract a column, supporting both direct arrays and RLE-encoded (RunEndEncoded) arrays.
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
     /// This reduces boilerplate by handling the common pattern of trying direct access first,
     /// then falling back to RunArray if the column is RLE-encoded.
     fn try_extract_with_rle<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
