@@ -1149,7 +1149,7 @@ impl<S> Transaction<S> {
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
         let schema = self.read_snapshot.schema();
 
-        // Build a Struct expression that picks non-partition columns from the input,
+        // Build a Struct expression that filters out partition columns from the input(unless materializePartitionColumns is enabled),
         // and renames all fields to the physical names.
         let fields = schema
             .fields()
