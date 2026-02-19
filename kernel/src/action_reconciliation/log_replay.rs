@@ -320,9 +320,6 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
 ///
 /// `index` is the position in the `getters: &[&dyn GetData]` slice.
 /// `name` is the fully-qualified field path used when calling `get_*` (and appears in errors).
-///
-/// Invariant: these constants must match the order in
-/// `ActionReconciliationVisitor::selected_column_names_and_types()`.
 #[derive(Debug, Copy, Clone)]
 struct GetterColumn {
     index: usize,
@@ -338,6 +335,7 @@ impl GetterColumn {
 #[allow(unused)]
 impl ActionReconciliationVisitor<'_> {
     // Projected columns in the same order as `selected_column_names_and_types()`.
+    // Invariant: these indices must match the projection order exactly.
     // DV columns are defined individually for completeness, even when accessed via a start index.
     const ADD_PATH: GetterColumn = GetterColumn::new(0, "add.path");
     const ADD_DV_STORAGE_TYPE: GetterColumn =
