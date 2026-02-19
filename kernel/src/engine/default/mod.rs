@@ -88,6 +88,7 @@ const DEFAULT_BATCH_SIZE: usize = 1000;
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
+    task_executor: Arc<E>,
     storage: Arc<ObjectStoreStorageHandler<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
@@ -189,12 +190,24 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(
                 object_store.clone(),
-                task_executor,
+                task_executor.clone(),
             )),
             object_store,
+            task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
             metrics_reporter,
         }
+    }
+
+    /// Enter the runtime context of the executor associated with this engine.
+    ///
+    /// # Panics
+    ///
+    /// When calling `enter` multiple times, the returned guards **must** be dropped in the reverse
+    /// order that they were acquired.  Failure to do so will result in a panic and possible memory
+    /// leaks.
+    pub fn enter(&self) -> <E as TaskExecutor>::Guard<'_> {
+        self.task_executor.enter()
     }
 
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
