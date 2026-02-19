@@ -229,7 +229,7 @@ fn add_stats_parsed_to_add_schema(
     add_schema: &StructType,
     stats_schema: &StructType,
 ) -> DeltaResult<StructType> {
-    add_schema.with_field_inserted(
+    add_schema.with_field_inserted_after(
         Some(STATS_FIELD),
         StructField::nullable(
             STATS_PARSED_FIELD,
@@ -244,7 +244,7 @@ fn build_add_output_schema(
     stats_schema: &StructType,
 ) -> DeltaResult<StructType> {
     let new_schema = if config.write_stats_as_struct {
-        add_schema.with_field_inserted(
+        add_schema.with_field_inserted_after(
             Some(STATS_FIELD),
             StructField::nullable(
                 STATS_PARSED_FIELD,
