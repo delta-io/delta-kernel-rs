@@ -4,26 +4,34 @@ use serde::Deserialize;
 
 use std::path::{Path, PathBuf};
 
-// ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
+// Wraps operation-specific configs
 #[derive(Clone, Debug)]
-pub struct ReadConfig {
-    pub name: String,
-    pub parallel_scan: ParallelScan,
+pub enum Config {
+    Read(ReadConfig),
 }
 
-impl ReadConfig {
+impl Config {
     pub fn name(&self) -> &str {
-        &self.name
+        match self {
+            Config::Read(c) => &c.name,
+        }
     }
 }
 
+// ReadConfig represents a specific configuration for a read operation
+#[derive(Clone, Debug)]
+pub struct ReadConfig {
+    name: String,
+    pub parallel_scan: ParallelScan,
+}
+
 // Provides a default set of read configs for a given table, read spec, and operation
-pub fn default_read_configs() -> Vec<ReadConfig> {
-    vec![ReadConfig {
+pub fn default_read_configs() -> Vec<Config> {
+    vec![Config::Read(ReadConfig {
         name: "serial".into(),
         parallel_scan: ParallelScan::Disabled,
-    }]
+    })]
 }
 
 #[derive(Clone, Debug)]
@@ -121,7 +129,7 @@ pub struct WorkloadVariant {
     pub case_name: String,
     pub spec: Spec,
     pub operation: Option<ReadOperation>, // required for Read specs; None for other spec types
-    pub config: ReadConfig,
+    pub config: Config,
 }
 
 impl WorkloadVariant {
@@ -159,7 +167,7 @@ impl WorkloadVariant {
             self.table_info.name,
             self.case_name,
             workload_str,
-            self.config.name()
+            self.config.name(),
         ))
     }
 }
@@ -240,10 +248,10 @@ mod tests {
             case_name: "append_10k".into(),
             spec: Spec::Read { version: Some(1) },
             operation,
-            config: ReadConfig {
+            config: Config::Read(ReadConfig {
                 name: config_name.into(),
                 parallel_scan: ParallelScan::Disabled,
-            },
+            }),
         }
     }
 

@@ -6,7 +6,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::benchmarks::models::{
-    default_read_configs, ReadConfig, ReadOperation, Spec, WorkloadVariant,
+    default_read_configs, Config, ReadOperation, Spec, WorkloadVariant,
 };
 use delta_kernel::benchmarks::runners::ReadMetadataRunner;
 use delta_kernel::benchmarks::utils::load_all_workloads;
@@ -72,7 +72,7 @@ fn run_benchmark(
     });
 }
 
-fn choose_config() -> Vec<ReadConfig> {
+fn choose_config() -> Vec<Config> {
     //Choose which benchmark configurations to run for a given table
     //This function will take in table info to return the appropriate configs
     default_read_configs()

@@ -4,7 +4,7 @@
 //! Results are discarded for benchmarking purposes
 //! Currently only supports reading metadata
 
-use crate::benchmarks::models::{ParallelScan, Spec, WorkloadVariant};
+use crate::benchmarks::models::{Config, ParallelScan, Spec, WorkloadVariant};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::AfterSequential;
 use crate::snapshot::Snapshot;
@@ -51,13 +51,15 @@ impl ReadMetadataRunner {
     }
 
     pub fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match &self.workload_variant.config.parallel_scan {
-            ParallelScan::Disabled => {
-                self.execute_serial()?;
-            }
-            ParallelScan::Enabled { num_threads } => {
-                self.execute_parallel(num_threads)?;
-            }
+        match &self.workload_variant.config {
+            Config::Read(config) => match &config.parallel_scan {
+                ParallelScan::Disabled => {
+                    self.execute_serial()?;
+                }
+                ParallelScan::Enabled { num_threads } => {
+                    self.execute_parallel(num_threads)?;
+                }
+            },
         }
 
         Ok(())

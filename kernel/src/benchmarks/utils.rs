@@ -96,9 +96,7 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
     Ok(table_dirs)
 }
 
-fn load_specs_from_table(
-    table_dir: &Path,
-) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
+fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR);
 
     if !specs_dir.exists() || !specs_dir.is_dir() {
