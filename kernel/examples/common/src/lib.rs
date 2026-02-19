@@ -4,7 +4,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::{
-    arrow::array::RecordBatch, engine::default::{executor::tokio::TokioBackgroundExecutor, storage::store_from_url_opts, DefaultEngine, DefaultEngineBuilder}, scan::Scan, schema::MetadataColumnSpec, DeltaResult, SnapshotRef
+    arrow::array::RecordBatch,
+    engine::default::{
+        executor::tokio::TokioBackgroundExecutor, storage::store_from_url_opts, DefaultEngine,
+        DefaultEngineBuilder,
+    },
+    scan::Scan,
+    schema::MetadataColumnSpec,
+    DeltaResult, SnapshotRef,
 };
 
 use object_store::{

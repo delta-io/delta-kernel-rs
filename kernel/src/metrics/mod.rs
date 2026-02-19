@@ -92,6 +92,4 @@ pub trait WithMetricsReporterLayer: Subscriber {
     }
 }
 
-impl<S> WithMetricsReporterLayer for S
-where
-    S: Subscriber {}
+impl<S> WithMetricsReporterLayer for S where S: Subscriber {}
