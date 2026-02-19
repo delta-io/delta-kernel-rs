@@ -197,6 +197,16 @@ impl ProvidesColumnsAndFields for StructArray {
     }
 }
 
+/// Tracks the state of a column during extraction
+enum ColumnState<'a> {
+    /// Parent path used for traversal into nested structs
+    Parent,
+    /// Leaf column awaiting a getter to be extracted
+    AwaitingGetter(&'a DataType),
+    /// Leaf column with getter successfully extracted
+    HasGetter(&'a dyn GetData<'a>),
+}
+
 impl EngineData for ArrowEngineData {
     fn len(&self) -> usize {
         self.data.num_rows()
@@ -228,21 +238,15 @@ impl EngineData for ArrowEngineData {
         // short (error out below).
         let mut column_map = HashMap::new();
 
-        // Add all parent paths
-        for column in leaf_columns {
-            for i in 0..column.len() {
-                column_map
-                    .entry(column[..i + 1].to_vec())
-                    .or_insert(ColumnState::Parent);
-            }
-        }
-
-        // Set leaf columns to AwaitingGetter
         for (column, data_type) in leaf_columns.iter().zip(leaf_types.iter()) {
-            column_map.insert(
-                column.as_ref().to_vec(),
-                ColumnState::AwaitingGetter(data_type),
-            );
+            column_map.insert(column.clone(), ColumnState::AwaitingGetter(data_type));
+            let mut cur_parent = column.parent();
+            while let Some(parent) = cur_parent {
+                column_map
+                    .entry(parent.clone())
+                    .or_insert(ColumnState::Parent);
+                cur_parent = parent.parent();
+            }
         }
         debug!(
             "Column map for selected columns {leaf_columns:?} has {} entries",
@@ -310,20 +314,10 @@ impl EngineData for ArrowEngineData {
     }
 }
 
-/// Tracks the state of a column during extraction
-enum ColumnState<'a> {
-    /// Parent path used for traversal into nested structs
-    Parent,
-    /// Leaf column awaiting a getter to be extracted
-    AwaitingGetter(&'a DataType),
-    /// Leaf column with getter successfully extracted
-    HasGetter(&'a dyn GetData<'a>),
-}
-
 impl ArrowEngineData {
     fn extract_columns<'a>(
         path: &mut Vec<String>,
-        column_map: &mut HashMap<Vec<String>, ColumnState<'a>>,
+        column_map: &mut HashMap<ColumnName, ColumnState<'a>>,
         data: &'a dyn ProvidesColumnsAndFields,
     ) -> DeltaResult<()> {
         for (column, field) in data.columns().iter().zip(data.fields()) {
