@@ -48,6 +48,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // specifying clustering columns via `with_data_layout()`.
     // As features are supported, add them here:
     // TableFeature::DeletionVectors,
+    TableFeature::V2Checkpoint,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
