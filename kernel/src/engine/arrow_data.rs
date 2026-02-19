@@ -7,7 +7,8 @@ use tracing::debug;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
-    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
+    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, RunArray,
+    StructArray,
 };
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
@@ -275,88 +276,6 @@ impl EngineData for ArrowEngineData {
     }
 }
 
-/// Validates row index and returns physical index into the values array.
-///
-/// Per Arrow spec, REE parent array has no validity bitmap (null_count = 0).
-/// Nulls are encoded in the values child array, so null checking must be done
-/// on the values array in each get_* method, not here on the parent array.
-fn validate_and_get_physical_index(
-    run_array: &crate::arrow::array::RunArray<Int64Type>,
-    row_index: usize,
-    field_name: &str,
-) -> DeltaResult<usize> {
-    if row_index >= run_array.len() {
-        return Err(Error::generic(format!(
-            "Row index {} out of bounds for field '{}'",
-            row_index, field_name
-        )));
-    }
-
-    let physical_idx = run_array.run_ends().get_physical_index(row_index);
-    Ok(physical_idx)
-}
-
-/// Implement GetData for RunArray directly, so we can return it as a trait object
-/// without needing a wrapper struct or Box::leak.
-///
-/// This implementation supports multiple value types (strings, integers, booleans, etc.)
-/// by runtime downcasting of the values array.
-impl<'a> GetData<'a> for crate::arrow::array::RunArray<Int64Type> {
-    fn get_str(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
-        let values = self
-            .values()
-            .as_any()
-            .downcast_ref::<crate::arrow::array::StringArray>()
-            .ok_or_else(|| Error::generic("Expected StringArray values in RunArray"))?;
-
-        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
-    }
-
-    fn get_int(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
-        let values = self
-            .values()
-            .as_primitive_opt::<Int32Type>()
-            .ok_or_else(|| Error::generic("Expected Int32Array values in RunArray"))?;
-
-        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
-    }
-
-    fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
-        let values = self
-            .values()
-            .as_primitive_opt::<Int64Type>()
-            .ok_or_else(|| Error::generic("Expected Int64Array values in RunArray"))?;
-
-        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
-    }
-
-    fn get_bool(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<bool>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
-        let values = self
-            .values()
-            .as_boolean_opt()
-            .ok_or_else(|| Error::generic("Expected BooleanArray values in RunArray"))?;
-
-        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
-    }
-
-    fn get_binary(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
-        let physical_idx = validate_and_get_physical_index(self, row_index, field_name)?;
-        let values = self
-            .values()
-            .as_any()
-            .downcast_ref::<crate::arrow::array::GenericByteArray<
-                crate::arrow::array::types::GenericBinaryType<i32>,
-            >>()
-            .ok_or_else(|| Error::generic("Expected BinaryArray values in RunArray"))?;
-
-        Ok((!values.is_null(physical_idx)).then(|| values.value(physical_idx)))
-    }
-}
-
 impl ArrowEngineData {
     fn extract_columns<'a>(
         path: &mut Vec<String>,
@@ -390,13 +309,10 @@ impl ArrowEngineData {
         Ok(())
     }
 
-    /// Helper function to extract a column, supporting both direct arrays and RLE-encoded (RunEndEncoded) arrays.
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
     /// This reduces boilerplate by handling the common pattern of trying direct access first,
-    /// then falling back to RunArray if the column is RLE-encoded.
+    /// then falling back to RunArray if the column is REE-encoded.
     fn try_extract_with_rle<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
-        use crate::arrow::array::RunArray;
-        use crate::arrow::datatypes::DataType as ArrowDataType;
-
         match col.data_type() {
             ArrowDataType::RunEndEncoded(_, _) => col
                 .as_any()
