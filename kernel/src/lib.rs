@@ -196,9 +196,11 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
-/// An iterator of data read from specified files
+/// An iterator of data read from specified files, yielding the source [`FileMeta`] alongside each
+/// batch of [`EngineData`]. The [`FileMeta`] lets callers identify which file produced each batch
+/// without needing to split the iterator or embed a metadata column.
 pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+    Box<dyn Iterator<Item = DeltaResult<FileDataReadResult>> + Send>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -66,12 +66,12 @@ fn process_sidecars(
         .map(|sidecar| sidecar.to_filemeta(&log_root))
         .try_collect()?;
 
-    // Read the sidecar files and return an iterator of sidecar file batches
-    Ok(Some(parquet_handler.read_parquet_files(
-        &sidecar_files,
-        checkpoint_read_schema,
-        meta_predicate,
-    )?))
+    // Read the sidecar files and return an iterator of sidecar file batches (strip FileMeta)
+    Ok(Some(
+        parquet_handler
+            .read_parquet_files(&sidecar_files, checkpoint_read_schema, meta_predicate)?
+            .map_ok(|(_, batch)| batch),
+    ))
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of parts

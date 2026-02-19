@@ -201,7 +201,7 @@ fn do_work(
             .unwrap();
 
         for read_result in read_results {
-            let read_result = read_result.unwrap();
+            let (_, read_result) = read_result.unwrap();
             let len = read_result.len();
             // transform the physical data into the correct logical form
             let logical = transform_to_logical(

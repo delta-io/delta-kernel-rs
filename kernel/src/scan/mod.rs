@@ -837,8 +837,8 @@ impl Scan {
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
-                    let read_result = read_result?;
+                Ok(read_result_iter.map(move |res| -> DeltaResult<_> {
+                    let (_, read_result) = res?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),

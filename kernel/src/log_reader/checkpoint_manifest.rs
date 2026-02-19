@@ -67,7 +67,8 @@ impl CheckpointManifestReader {
             }
         };
 
-        let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
+        let actions =
+            Box::new(actions.map_ok(|(_, batch_res)| ActionsBatch::new(batch_res, false)));
         Ok(Self {
             actions,
             sidecar_visitor: SidecarVisitor::default(),

@@ -3,8 +3,8 @@
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResult, FileDataReadResultIterator,
+    FileMeta, JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -77,26 +77,38 @@ where
     let files = files.to_vec();
     let result = files
         .into_iter()
-        // Produces Iterator<DeltaResult<Iterator<DeltaResult<ArrowEngineData>>>>
+        // Produces Iterator<DeltaResult<(FileMeta, Iterator<DeltaResult<ArrowEngineData>>)>>
         .map(move |file| {
             let location_string = file.location.to_string();
-            let location = file.location;
-            debug!("Reading {location:#?} with schema {schema:#?} and predicate {predicate:#?}");
-            let path = location
+            let file_meta = file.clone();
+            debug!(
+                "Reading {:#?} with schema {schema:#?} and predicate {predicate:#?}",
+                file.location
+            );
+            let path = file
+                .location
                 .to_file_path()
                 .map_err(|_| Error::generic("can only read local files"))?;
-            try_create_from_file(
+            let batch_iter = try_create_from_file(
                 File::open(path)?,
                 schema.clone(),
                 arrow_schema.clone(),
                 predicate.clone(),
                 location_string,
-            )
+            )?;
+            // Tag each batch with the file it came from
+            let tagged = batch_iter.map(move |data| -> DeltaResult<FileDataReadResult> {
+                Ok((
+                    file_meta.clone(),
+                    Box::new(ArrowEngineData::new(data?.into())) as _,
+                ))
+            });
+            Ok(tagged)
         })
-        // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>
+        // Flatten to Iterator<DeltaResult<DeltaResult<FileDataReadResult>>>
         .flatten_ok()
-        // Double unpack and map Iterator<DeltaResult<Box<EngineData>>>
-        .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
+        // Unwrap the outer DeltaResult
+        .map(|r: DeltaResult<DeltaResult<FileDataReadResult>>| r?);
     Ok(Box::new(result))
 }
 

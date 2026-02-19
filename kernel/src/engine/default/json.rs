@@ -22,7 +22,8 @@ use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResult, FileDataReadResultIterator, FileMeta,
+    JsonHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -87,27 +88,37 @@ async fn read_json_files_impl(
     _predicate: Option<PredicateRef>,
     batch_size: usize,
     buffer_size: usize,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileDataReadResult>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
 
     let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
 
-    // an iterator of futures that open each file
+    // an iterator of futures that open each file, producing a stream tagged with the file's meta
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
         let schema = schema.clone();
-        async move { open_json_file(store, schema, batch_size, file).await }
+        async move {
+            let file_meta = file.clone();
+            let batch_stream = open_json_file(store, schema, batch_size, file).await?;
+            // Tag every batch in this file's stream with the file's FileMeta
+            let tagged: BoxStream<'static, DeltaResult<FileDataReadResult>> = batch_stream
+                .map_ok(move |record_batch| -> FileDataReadResult {
+                    (
+                        file_meta.clone(),
+                        Box::new(ArrowEngineData::new(record_batch)) as _,
+                    )
+                })
+                .boxed();
+            Ok::<_, crate::Error>(tagged)
+        }
     });
 
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
         .buffered(buffer_size)
-        .try_flatten()
-        .map_ok(|record_batch| -> Box<dyn EngineData> {
-            Box::new(ArrowEngineData::new(record_batch))
-        });
+        .try_flatten();
 
     Ok(Box::pin(result_stream))
 }
@@ -594,7 +605,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
-            .map_ok(into_record_batch)
+            .map_ok(|(_, batch)| into_record_batch(batch))
             .try_collect()
             .unwrap();
 
@@ -606,7 +617,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
-            .map_ok(into_record_batch)
+            .map_ok(|(_, batch)| into_record_batch(batch))
             .try_collect()
             .unwrap();
 
@@ -820,7 +831,7 @@ mod tests {
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()
-                .map_ok(into_record_batch)
+                .map_ok(|(_, batch)| into_record_batch(batch))
                 .try_collect()
                 .unwrap();
 

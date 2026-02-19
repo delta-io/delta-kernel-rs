@@ -28,7 +28,7 @@ impl CommitReader {
         let actions = engine
             .json_handler()
             .read_json_files(&commit_files, schema, None)?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+            .map_ok(|(_, batch)| ActionsBatch::new(batch, true));
 
         Ok(Self {
             actions: Box::new(actions),

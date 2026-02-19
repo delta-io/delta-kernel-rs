@@ -178,7 +178,7 @@ impl LogReplayScanner {
             .peekable();
 
         let mut in_commit_timestamp_opt = None;
-        if let Some(Ok(actions)) = action_iter.peek() {
+        if let Some(Ok((_, actions))) = action_iter.peek() {
             let mut visitor = InCommitTimestampVisitor::default();
             visitor.visit_rows_of(actions.as_ref())?;
             in_commit_timestamp_opt = visitor.in_commit_timestamp;
@@ -188,8 +188,8 @@ impl LogReplayScanner {
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
 
-        for actions in action_iter {
-            let actions = actions?;
+        for result in action_iter {
+            let (_, actions) = result?;
 
             let mut visitor = PreparePhaseVisitor {
                 add_paths: &mut add_paths,
@@ -330,8 +330,8 @@ impl LogReplayScanner {
             cdf_scan_row_schema().into(),
         )?;
 
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
-            let actions = actions?;
+        let result = action_iter.map(move |res| -> DeltaResult<_> {
+            let (_, actions) = res?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector

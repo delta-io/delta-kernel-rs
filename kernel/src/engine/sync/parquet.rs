@@ -200,7 +200,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine_data = result.next().unwrap().unwrap();
+        let (_, engine_data) = result.next().unwrap().unwrap();
         let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
         let record_batch = batch.record_batch();
 
@@ -321,7 +321,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine_data = result.next().unwrap().unwrap();
+        let (_, engine_data) = result.next().unwrap().unwrap();
         let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
         let record_batch = batch.record_batch();
 
@@ -409,7 +409,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine_data = result.next().unwrap().unwrap();
+        let (_, engine_data) = result.next().unwrap().unwrap();
         let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
         let record_batch = batch.record_batch();
 
@@ -484,7 +484,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine_data = result.next().unwrap().unwrap();
+        let (_, engine_data) = result.next().unwrap().unwrap();
         let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
         let record_batch = batch.record_batch();
 
@@ -563,7 +563,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine_data = result.next().unwrap().unwrap();
+        let (_, engine_data) = result.next().unwrap().unwrap();
         let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
         let record_batch = batch.record_batch();
 

@@ -302,7 +302,7 @@ impl ParsedLogPath<FileMeta> {
         // According to protocol, CommitInfo MUST be the first action when ICT is enabled,
         // so we can optimize by only reading the first batch
         match action_iter.next() {
-            Some(Ok(actions)) => {
+            Some(Ok((_, actions))) => {
                 let mut visitor = InCommitTimestampVisitor::default();
                 visitor.visit_rows_of(actions.as_ref())?;
                 visitor

@@ -79,7 +79,7 @@ fn read_result_next_impl(
         engine_data: Handle<ExclusiveEngineData>,
     ),
 ) -> DeltaResult<bool> {
-    if let Some(data) = iter.data.next().transpose()? {
+    if let Some((_, data)) = iter.data.next().transpose()? {
         (engine_visitor)(engine_context, data.into());
         Ok(true)
     } else {

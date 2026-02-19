@@ -36,8 +36,8 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResult, FileDataReadResultIterator, FileMeta,
+    ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -231,12 +231,13 @@ async fn read_parquet_files_impl(
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileDataReadResult>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
     }
 
-    let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
+    let arrow_schema: Arc<crate::arrow::datatypes::Schema> =
+        Arc::new(physical_schema.as_ref().try_into_arrow()?);
 
     // get the first FileMeta to decide how to fetch the file.
     // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
@@ -247,24 +248,39 @@ async fn read_parquet_files_impl(
     //   -> parse to parquet
     // SAFETY: we did is_empty check above, this is ok.
     if files[0].location.is_presigned() {
-        let file_opener = Box::new(PresignedUrlOpener::new(
-            1024,
-            physical_schema.clone(),
-            predicate,
-        ));
-        let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
-            |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
-        );
-        return Ok(Box::pin(stream));
+        // For presigned URLs, process each file individually so we can tag batches
+        // with their source FileMeta.
+        let per_file_streams: Vec<BoxStream<'static, DeltaResult<FileDataReadResult>>> = files
+            .into_iter()
+            .map(|file| {
+                let file_meta = file.clone();
+                let file_opener = Box::new(PresignedUrlOpener::new(
+                    1024,
+                    physical_schema.clone(),
+                    predicate.clone(),
+                ));
+                let stream = FileStream::new([file], arrow_schema.clone(), file_opener)?
+                    .map_ok(move |record_batch| -> FileDataReadResult {
+                        (
+                            file_meta.clone(),
+                            Box::new(ArrowEngineData::new(record_batch)) as _,
+                        )
+                    })
+                    .boxed();
+                Ok::<_, Error>(stream)
+            })
+            .collect::<DeltaResult<_>>()?;
+        return Ok(Box::pin(stream::iter(per_file_streams).flatten()));
     }
 
-    // an iterator of futures that open each file
+    // an iterator of futures that open each file, tagging every batch with its source FileMeta
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
         async move {
-            open_parquet_file(
+            let file_meta = file.clone();
+            let batch_stream = open_parquet_file(
                 store,
                 schema,
                 predicate,
@@ -272,16 +288,22 @@ async fn read_parquet_files_impl(
                 super::DEFAULT_BATCH_SIZE,
                 file,
             )
-            .await
+            .await?;
+            let tagged: BoxStream<'static, DeltaResult<FileDataReadResult>> = batch_stream
+                .map_ok(move |record_batch| -> FileDataReadResult {
+                    (
+                        file_meta.clone(),
+                        Box::new(ArrowEngineData::new(record_batch)) as _,
+                    )
+                })
+                .boxed();
+            Ok::<_, Error>(tagged)
         }
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
         .buffered(super::DEFAULT_BUFFER_SIZE)
-        .try_flatten()
-        .map_ok(|record_batch| -> Box<dyn EngineData> {
-            Box::new(ArrowEngineData::new(record_batch))
-        });
+        .try_flatten();
 
     Ok(Box::pin(result_stream))
 }
@@ -609,7 +631,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|r| into_record_batch(r.map(|(_, batch)| batch)))
             .try_collect()
             .unwrap();
 
@@ -771,7 +793,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|r| into_record_batch(r.map(|(_, batch)| batch)))
             .try_collect()
             .unwrap();
 
@@ -855,7 +877,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|r| into_record_batch(r.map(|(_, batch)| batch)))
             .try_collect()
             .unwrap();
 
@@ -1043,7 +1065,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|r| into_record_batch(r.map(|(_, batch)| batch)))
             .try_collect()
             .unwrap();
 
@@ -1247,7 +1269,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|r| into_record_batch(r.map(|(_, batch)| batch)))
             .try_collect()
             .unwrap();
 
@@ -1326,7 +1348,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|r| into_record_batch(r.map(|(_, batch)| batch)))
             .try_collect()
             .unwrap();
 

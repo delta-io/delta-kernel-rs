@@ -803,8 +803,8 @@ impl LogSegment {
         // The boolean flag indicates whether the batch originated from a commit file
         // (true) or a checkpoint file (false).
         let actions_iter = actions
-            .map_ok(|batch| ActionsBatch::new(batch, false))
-            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
+            .map_ok(|(_, batch)| ActionsBatch::new(batch, false))
+            .chain(sidecar_batches.map_ok(|(_, batch)| ActionsBatch::new(batch, false)));
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
@@ -840,7 +840,7 @@ impl LogSegment {
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
         for batch_result in batches {
-            let batch = batch_result?;
+            let (_, batch) = batch_result?;
             visitor.visit_rows_of(batch.as_ref())?;
         }
 

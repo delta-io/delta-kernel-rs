@@ -270,8 +270,8 @@ fn read_scan_file(
             .parquet_handler()
             .read_parquet_files(&[file], physical_schema, None)?;
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
-        let batch = batch?;
+    let result = read_result_iter.map(move |res| -> DeltaResult<_> {
+        let (_, batch) = res?;
         // Transform the physical data into the correct logical form, or pass through unchanged
         let logical = if let Some(ref eval) = phys_to_logical_eval {
             eval.evaluate(batch.as_ref())
