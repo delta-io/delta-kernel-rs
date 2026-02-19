@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::iter;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
@@ -42,6 +43,11 @@ use crate::{
     RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
+
+#[cfg(feature = "internal-api")]
+pub mod builder;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod builder;
 
 #[cfg(feature = "internal-api")]
 pub mod create_table;
@@ -237,9 +243,28 @@ fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
 
+/// Marker type for transactions on existing tables.
+///
+/// This is the default state for [`Transaction`] and provides the full set of operations
+/// including file removal, deletion vector updates, and blind append semantics.
+#[derive(Debug)]
+pub struct ExistingTable;
+
+/// Marker type for create-table transactions.
+///
+/// Transactions in this state have a restricted API surface — operations that are semantically
+/// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
+#[derive(Debug)]
+pub struct CreateTable;
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
+///
+/// The type parameter `S` controls which operations are available:
+/// - [`ExistingTable`] (default): Full API for modifying existing tables.
+/// - [`CreateTable`]: Restricted API for table creation (see
+///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
 ///
 /// # Examples
 ///
@@ -251,7 +276,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 /// // commit! (consume the transaction)
 /// txn.commit(&engine)?;
 /// ```
-pub struct Transaction {
+pub struct Transaction<S = ExistingTable> {
     span: tracing::Span,
     // The snapshot this transaction is based on. For create-table transactions,
     // this is a pre-commit snapshot with PRE_COMMIT_VERSION.
@@ -290,9 +315,12 @@ pub struct Transaction {
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection.
     clustering_columns: Option<Vec<ColumnName>>,
+    // PhantomData marker for transaction state (ExistingTable or CreateTable).
+    // Zero-sized; only affects the type system.
+    _state: PhantomData<S>,
 }
 
-impl std::fmt::Debug for Transaction {
+impl<S> std::fmt::Debug for Transaction<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let version_info = if self.is_create_table() {
             "create_table".to_string()
@@ -307,6 +335,9 @@ impl std::fmt::Debug for Transaction {
     }
 }
 
+// =============================================================================
+// Methods only for existing-table transactions (constructors + restricted API)
+// =============================================================================
 impl Transaction {
     /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
     /// to read the current state of the table (e.g. to read the current version).
@@ -354,69 +385,15 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             clustering_columns,
+            _state: PhantomData,
         })
     }
+}
 
-    /// Create a new transaction for creating a new table. This is used when the table doesn't
-    /// exist yet and we need to create it with Protocol and Metadata actions.
-    ///
-    /// The `pre_commit_snapshot` is a synthetic snapshot created from the protocol and metadata
-    /// that will be committed. It uses `PRE_COMMIT_VERSION` as a sentinel to indicate no
-    /// version exists yet on disk.
-    ///
-    /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
-    #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn try_new_create_table(
-        pre_commit_snapshot: SnapshotRef,
-        engine_info: String,
-        committer: Box<dyn Committer>,
-        system_domain_metadata: Vec<DomainMetadata>,
-        clustering_columns: Option<Vec<ColumnName>>,
-    ) -> DeltaResult<Self> {
-        // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
-        // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
-        // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
-        // the was read vs the effective snapshot we will use for the commit.
-        let span = tracing::info_span!(
-            "txn",
-            path = %pre_commit_snapshot.table_root(),
-            operation = "CREATE",
-        );
-
-        Ok(Transaction {
-            span,
-            read_snapshot: pre_commit_snapshot,
-            committer,
-            operation: Some("CREATE TABLE".to_string()),
-            engine_info: Some(engine_info),
-            add_files_metadata: vec![],
-            remove_files_metadata: vec![],
-            set_transactions: vec![],
-            commit_timestamp: current_time_ms()?,
-            user_domain_metadata_additions: vec![],
-            system_domain_metadata_additions: system_domain_metadata,
-            user_domain_removals: vec![],
-            data_change: true,
-            is_blind_append: false,
-            dv_matched_files: vec![],
-            clustering_columns,
-        })
-    }
-
-    /// Set the committer that will be used to commit this transaction. If not set, the default
-    /// filesystem-based committer will be used. Note that the default committer is only allowed
-    /// for non-catalog-managed tables. That is, you _must_ provide a committer via this API in
-    /// order to write to catalog-managed tables.
-    ///
-    /// See [`committer`] module for more details.
-    ///
-    /// [`committer`]: crate::committer
-    #[cfg(feature = "catalog-managed")]
-    pub fn with_committer(mut self, committer: Box<dyn Committer>) -> Self {
-        self.committer = committer;
-        self
-    }
-
+// =============================================================================
+// Shared methods available on ALL transaction types
+// =============================================================================
+impl<S> Transaction<S> {
     /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
@@ -431,7 +408,7 @@ impl Transaction {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -603,27 +580,12 @@ impl Transaction {
         self
     }
 
-    /// Mark this transaction as a blind append.
-    ///
-    /// Blind append transactions should only add new files and avoid write operations that
-    /// depend on existing table state.
-    pub fn set_is_blind_append(&mut self) {
-        self.is_blind_append = true;
-    }
-
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
     /// using a fluent API.
     #[internal_api]
     #[allow(dead_code)] // used in FFI
     pub(crate) fn set_data_change(&mut self, data_change: bool) {
         self.data_change = data_change;
-    }
-
-    /// Set the operation that this transaction is performing. This string will be persisted in the
-    /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
-        self
     }
 
     /// Set the engine info field of this transaction's commit info action. This field is optional.
@@ -652,20 +614,6 @@ impl Transaction {
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
-        self
-    }
-
-    /// Remove domain metadata from the Delta log.
-    /// If the domain exists in the Delta log, this creates a tombstone to logically delete
-    /// the domain. The tombstone preserves the previous configuration value.
-    /// If the domain does not exist in the Delta log, this is a no-op.
-    /// Note that each domain can only appear once per transaction. That is, multiple operations
-    /// on the same domain are disallowed in a single transaction, as well as setting and removing
-    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
-    /// fail (that is, we don't eagerly check domain validity here).
-    /// Removing metadata for multiple distinct domains is allowed.
-    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
-        self.user_domain_removals.push(domain);
         self
     }
 
@@ -821,9 +769,8 @@ impl Transaction {
         }
 
         // No removals allowed for create-table.
-        // TODO(#1768): The public API with_domain_metadata_removals
-        // should be updated to disallow removals for create-table transactions.
-        // Its ok for now as create table is not a public API
+        // Note: CreateTableTransaction does not expose with_domain_metadata_removed(),
+        // so this is a defensive check. See #1768.
         if is_create && !self.user_domain_removals.is_empty() {
             return Err(Error::unsupported(
                 "Domain metadata removals are not supported in create-table transactions",
@@ -904,7 +851,12 @@ impl Transaction {
     ) -> impl Iterator<Item = DeltaResult<FilteredEngineData>> {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
+}
 
+// =============================================================================
+// Existing-table-only: deletion vector updates
+// =============================================================================
+impl Transaction {
     /// Update deletion vectors for files in the table.
     ///
     /// This method can be called multiple times to update deletion vectors for different sets of files.
@@ -1027,7 +979,12 @@ impl Transaction {
 
         Ok(())
     }
+}
 
+// =============================================================================
+// Shared methods (continued): domain metadata, commit logic, and file operations
+// =============================================================================
+impl<S> Transaction<S> {
     /// Generate removal actions for user domain metadata by scanning the log.
     ///
     /// This performs an expensive log replay operation to fetch the previous configuration
@@ -1404,63 +1361,18 @@ impl Transaction {
         })
     }
 
-    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<S> {
         ConflictedTransaction {
             transaction: self,
             conflict_version,
         }
     }
 
-    fn into_retryable(self, error: Error) -> RetryableTransaction {
+    fn into_retryable(self, error: Error) -> RetryableTransaction<S> {
         RetryableTransaction {
             transaction: self,
             error,
         }
-    }
-
-    /// Remove files from the table in this transaction. This API generally enables the engine to
-    /// delete data (at file-level granularity) from the table. Note that this API can be called
-    /// multiple times to remove multiple batches.
-    ///
-    /// The expected schema for `remove_metadata` is given by [`scan_row_schema`]. It is expected
-    /// this will be the result of passing [`FilteredEngineData`] returned from a scan
-    /// with the selection vector modified to select rows for removal (selected rows in the selection vector are the ones to be removed).
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use std::sync::Arc;
-    /// # use delta_kernel::Engine;
-    /// # use delta_kernel::snapshot::Snapshot;
-    /// # #[cfg(feature = "catalog-managed")]
-    /// # use delta_kernel::committer::FileSystemCommitter;
-    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
-    /// # #[cfg(feature = "catalog-managed")]
-    /// # {
-    /// // Create a snapshot and transaction
-    /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    ///
-    /// // Get file metadata from a scan
-    /// let scan = snapshot.scan_builder().build()?;
-    /// let scan_metadata = scan.scan_metadata(engine.as_ref())?;
-    ///
-    /// // Remove specific files based on scan metadata
-    /// for metadata in scan_metadata {
-    ///     let metadata = metadata?;
-    ///     // In practice, you would modify the selection vector to choose which files to remove
-    ///     let files_to_remove = metadata.scan_files;
-    ///     txn.remove_files(files_to_remove);
-    /// }
-    ///
-    /// // Commit the transaction
-    /// txn.commit(engine.as_ref())?;
-    /// # }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
-        self.remove_files_metadata.push(remove_metadata);
     }
 
     /// Generates Remove actions from scan file metadata.
@@ -1644,6 +1556,100 @@ impl Transaction {
                 )
             },
         ))
+    }
+}
+
+// =============================================================================
+// Existing-table-only: public API methods restricted from create-table transactions
+// =============================================================================
+impl Transaction {
+    /// Set the committer that will be used to commit this transaction. If not set, the default
+    /// filesystem-based committer will be used. Note that the default committer is only allowed
+    /// for non-catalog-managed tables. That is, you _must_ provide a committer via this API in
+    /// order to write to catalog-managed tables.
+    ///
+    /// See [`committer`] module for more details.
+    ///
+    /// [`committer`]: crate::committer
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_committer(mut self, committer: Box<dyn Committer>) -> Self {
+        self.committer = committer;
+        self
+    }
+
+    /// Mark this transaction as a blind append.
+    ///
+    /// Blind append transactions should only add new files and avoid write operations that
+    /// depend on existing table state.
+    pub fn with_blind_append(mut self) -> Self {
+        self.is_blind_append = true;
+        self
+    }
+
+    /// Set the operation that this transaction is performing. This string will be persisted in the
+    /// commit and visible to anyone who describes the table history.
+    pub fn with_operation(mut self, operation: String) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    /// Remove domain metadata from the Delta log.
+    /// If the domain exists in the Delta log, this creates a tombstone to logically delete
+    /// the domain. The tombstone preserves the previous configuration value.
+    /// If the domain does not exist in the Delta log, this is a no-op.
+    /// Note that each domain can only appear once per transaction. That is, multiple operations
+    /// on the same domain are disallowed in a single transaction, as well as setting and removing
+    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
+    /// fail (that is, we don't eagerly check domain validity here).
+    /// Removing metadata for multiple distinct domains is allowed.
+    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+        self.user_domain_removals.push(domain);
+        self
+    }
+
+    /// Remove files from the table in this transaction. This API generally enables the engine to
+    /// delete data (at file-level granularity) from the table. Note that this API can be called
+    /// multiple times to remove multiple batches.
+    ///
+    /// The expected schema for `remove_metadata` is given by [`scan_row_schema`]. It is expected
+    /// this will be the result of passing [`FilteredEngineData`] returned from a scan
+    /// with the selection vector modified to select rows for removal (selected rows in the selection vector are the ones to be removed).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::Engine;
+    /// # use delta_kernel::snapshot::Snapshot;
+    /// # #[cfg(feature = "catalog-managed")]
+    /// # use delta_kernel::committer::FileSystemCommitter;
+    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
+    /// # #[cfg(feature = "catalog-managed")]
+    /// # {
+    /// // Create a snapshot and transaction
+    /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    ///
+    /// // Get file metadata from a scan
+    /// let scan = snapshot.scan_builder().build()?;
+    /// let scan_metadata = scan.scan_metadata(engine.as_ref())?;
+    ///
+    /// // Remove specific files based on scan metadata
+    /// for metadata in scan_metadata {
+    ///     let metadata = metadata?;
+    ///     // In practice, you would modify the selection vector to choose which files to remove
+    ///     let files_to_remove = metadata.scan_files;
+    ///     txn.remove_files(files_to_remove);
+    /// }
+    ///
+    /// // Commit the transaction
+    /// txn.commit(engine.as_ref())?;
+    /// # }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
+        self.remove_files_metadata.push(remove_metadata);
     }
 }
 
@@ -1831,7 +1837,7 @@ pub struct PostCommitStats {
 ///   can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
-pub enum CommitResult {
+pub enum CommitResult<S = ExistingTable> {
     /// The transaction was successfully committed.
     CommittedTransaction(CommittedTransaction),
     /// This transaction conflicted with an existing version (see
@@ -1840,12 +1846,12 @@ pub enum CommitResult {
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    ConflictedTransaction(ConflictedTransaction),
+    ConflictedTransaction(ConflictedTransaction<S>),
     /// An IO (retryable) error occurred during the commit.
-    RetryableTransaction(RetryableTransaction),
+    RetryableTransaction(RetryableTransaction<S>),
 }
 
-impl CommitResult {
+impl<S> CommitResult<S> {
     /// Returns true if the commit was successful.
     pub fn is_committed(&self) -> bool {
         matches!(self, CommitResult::CommittedTransaction(_))
@@ -1893,14 +1899,14 @@ impl CommittedTransaction {
 ///
 /// [conflict version]: Self::conflict_version
 #[derive(Debug)]
-pub struct ConflictedTransaction {
+pub struct ConflictedTransaction<S = ExistingTable> {
     // TODO: remove after rebase APIs
     #[allow(dead_code)]
-    transaction: Transaction,
+    transaction: Transaction<S>,
     conflict_version: Version,
 }
 
-impl ConflictedTransaction {
+impl<S> ConflictedTransaction<S> {
     /// The version attempted commit that yielded a conflict
     pub fn conflict_version(&self) -> Version {
         self.conflict_version
@@ -1911,9 +1917,9 @@ impl ConflictedTransaction {
 /// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
 /// associated error can be inspected via `RetryableTransaction::error`.
 #[derive(Debug)]
-pub struct RetryableTransaction {
+pub struct RetryableTransaction<S = ExistingTable> {
     /// The transaction that failed to commit due to a retryable error.
-    pub transaction: Transaction,
+    pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
     pub error: Error,
 }
@@ -1922,13 +1928,37 @@ pub struct RetryableTransaction {
 mod tests {
     use super::*;
     use crate::arrow::array::StringArray;
-    use crate::committer::FileSystemCommitter;
+    use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
     use crate::Snapshot;
     use std::path::PathBuf;
+
+    /// A mock committer that always returns an IOError, used to test the retryable error path.
+    struct IoErrorCommitter;
+
+    impl Committer for IoErrorCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            Err(Error::IOError(std::io::Error::other("simulated IO error")))
+        }
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
 
     /// Sets up a snapshot for a table with deletion vector support at version 1
     fn setup_dv_enabled_table() -> (SyncEngine, Arc<Snapshot>) {
@@ -2262,7 +2292,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file(txn: &mut Transaction) {
+    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
         let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
         txn.add_files(data);
     }
@@ -2277,7 +2307,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_success() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         txn.validate_blind_append_semantics()?;
         Ok(())
@@ -2286,7 +2316,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_requires_adds() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())
@@ -2295,7 +2325,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_requires_data_change() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         txn.set_data_change(false);
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
@@ -2306,7 +2336,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_rejects_removes() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         let remove_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["remove"]),
@@ -2320,7 +2350,7 @@ mod tests {
     #[test]
     fn test_validate_blind_append_rejects_dv_updates() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         let dv_data = FilteredEngineData::with_all_rows_selected(string_array_to_engine_data(
             StringArray::from(vec!["dv"]),
@@ -2346,7 +2376,9 @@ mod tests {
             "test_engine",
         )
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        txn.set_is_blind_append();
+        // CreateTableTransaction does not expose with_blind_append() (compile-time
+        // prevention per #1768). Directly set the field to test the runtime check.
+        txn.is_blind_append = true;
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
@@ -2366,7 +2398,7 @@ mod tests {
     #[test]
     fn test_blind_append_commit_rejects_no_adds() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         // No files added — commit should fail with blind append validation
         let err = txn
             .commit(_engine.as_ref())
@@ -2382,7 +2414,7 @@ mod tests {
     #[test]
     fn test_blind_append_commit_success() -> DeltaResult<()> {
         let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        txn.set_is_blind_append();
+        txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         // Blind append with add files should pass validation and proceed to commit.
         // The commit itself may fail due to schema mismatch with the dummy data,
@@ -2402,4 +2434,41 @@ mod tests {
     // have DV updates but others don't) is provided by the end-to-end integration test
     // kernel/tests/dv.rs and kernel/tests/write.rs, which exercises
     // the full deletion vector write workflow including the DvMatchVisitor logic.
+
+    #[test]
+    fn test_commit_io_error_returns_retryable_transaction() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
+        add_dummy_file(&mut txn);
+        let result = txn.commit(engine.as_ref())?;
+        assert!(
+            matches!(result, CommitResult::RetryableTransaction(_)),
+            "Expected RetryableTransaction, got: {result:?}"
+        );
+        if let CommitResult::RetryableTransaction(retryable) = result {
+            assert!(
+                retryable.error.to_string().contains("simulated IO error"),
+                "Unexpected error: {}",
+                retryable.error
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_existing_table_txn_debug() -> DeltaResult<()> {
+        let (_engine, txn, _tempdir) = create_existing_table_txn()?;
+        let debug_str = format!("{:?}", txn);
+        // Existing-table transactions should include the snapshot version number
+        assert!(
+            debug_str.contains("Transaction") && debug_str.contains("read_snapshot version"),
+            "Debug output should contain Transaction info: {debug_str}"
+        );
+        // Should NOT contain "create_table"
+        assert!(
+            !debug_str.contains("create_table"),
+            "Existing table debug should not contain create_table: {debug_str}"
+        );
+        Ok(())
+    }
 }

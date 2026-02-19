@@ -34,6 +34,7 @@ pub(crate) const CHECKPOINT_INTERVAL: &str = "delta.checkpointInterval";
 pub(crate) const CHECKPOINT_WRITE_STATS_AS_JSON: &str = "delta.checkpoint.writeStatsAsJson";
 pub(crate) const CHECKPOINT_WRITE_STATS_AS_STRUCT: &str = "delta.checkpoint.writeStatsAsStruct";
 pub(crate) const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
+pub(crate) const COLUMN_MAPPING_MAX_COLUMN_ID: &str = "delta.columnMapping.maxColumnId";
 pub(crate) const DATA_SKIPPING_NUM_INDEXED_COLS: &str = "delta.dataSkippingNumIndexedCols";
 pub(crate) const DATA_SKIPPING_STATS_COLUMNS: &str = "delta.dataSkippingStatsColumns";
 pub(crate) const DELETED_FILE_RETENTION_DURATION: &str = "delta.deletedFileRetentionDuration";
@@ -217,6 +218,20 @@ pub struct TableProperties {
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
+}
+
+impl TableProperties {
+    /// Returns whether to write file statistics as JSON in checkpoints.
+    /// Default: `true` per the Delta protocol.
+    pub fn should_write_stats_as_json(&self) -> bool {
+        self.checkpoint_write_stats_as_json.unwrap_or(true)
+    }
+
+    /// Returns whether to write file statistics as parsed structs in checkpoints.
+    /// Default: `false` per the Delta protocol.
+    pub fn should_write_stats_as_struct(&self) -> bool {
+        self.checkpoint_write_stats_as_struct.unwrap_or(false)
+    }
 }
 
 /// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
