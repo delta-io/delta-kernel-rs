@@ -891,12 +891,20 @@ impl StructType {
     }
 
     /// Returns a new StructType with `new_field` inserted after the field named `after`.
-    /// If `after` is not found, `new_field` is appended to the end.
-    pub fn with_field_inserted(&self, after: &str, new_field: StructField) -> Self {
-        let index_of_after = self
-            .fields
-            .get_index_of(after)
-            .unwrap_or(self.fields.len().saturating_sub(1));
+    /// If `after` is None, `new_field` is appended to the end.
+    /// If `after` is not found, an error is returned.
+    pub fn with_field_inserted(
+        &self,
+        after: Option<&str>,
+        new_field: StructField,
+    ) -> DeltaResult<Self> {
+        let index_of_after = match after {
+            Some(after) => self
+                .fields
+                .get_index_of(after)
+                .ok_or_else(|| Error::generic(format!("Field {} not found", after)))?,
+            None => self.fields.len().saturating_sub(1),
+        };
 
         let before = self
             .fields
@@ -911,7 +919,7 @@ impl StructType {
             .map(|(_, v)| v.clone());
         let new_fields = before.chain(std::iter::once(new_field)).chain(after);
 
-        Self::new_unchecked(new_fields)
+        Ok(Self::new_unchecked(new_fields))
     }
 
     /// Returns a new StructType with the named field removed.
@@ -3383,8 +3391,9 @@ mod tests {
             StructField::new("name", DataType::STRING, true),
         ])
         .unwrap();
-        let schema =
-            schema.with_field_inserted("id", StructField::new("age", DataType::STRING, true));
+        let schema = schema
+            .with_field_inserted(Some("id"), StructField::new("age", DataType::STRING, true))
+            .expect("with field inserted should produce a valid schema");
         assert_eq!(schema.num_fields(), 3);
         assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
@@ -3392,16 +3401,31 @@ mod tests {
     }
 
     #[test]
+    fn test_with_field_inserted_append_to_end() {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        let schema = schema
+            .with_field_inserted(None, StructField::new("age", DataType::STRING, true))
+            .expect("with field inserted should produce a valid schema");
+
+        assert_eq!(schema.num_fields(), 3);
+        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(schema.field_at_index(1).unwrap().name(), "name");
+        assert_eq!(schema.field_at_index(2).unwrap().name(), "age");
+    }
+
+    #[test]
     fn test_with_field_inserted_after_non_existent_field() {
         let schema =
             StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
         let new_schema = schema.with_field_inserted(
-            "nonexistent",
+            Some("nonexistent"),
             StructField::new("name", DataType::STRING, true),
         );
-        assert_eq!(new_schema.num_fields(), 2);
-        assert_eq!(new_schema.field_at_index(0).unwrap().name(), "id");
-        assert_eq!(new_schema.field_at_index(1).unwrap().name(), "name");
+        assert!(new_schema.is_err());
     }
 
     #[test]
