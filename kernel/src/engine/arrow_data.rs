@@ -5,7 +5,10 @@ use itertools::Itertools;
 use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
-use crate::arrow::array::types::{Int32Type, Int64Type};
+use crate::arrow::array::types::{
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    TimestampMicrosecondType,
+};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, RunArray,
     StructArray,
@@ -17,7 +20,7 @@ use crate::arrow::datatypes::{
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
 use crate::expressions::ArrayData;
-use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::{DeltaResult, Error};
 
 pub use crate::engine::arrow_utils::fix_nested_null_masks;
@@ -393,6 +396,36 @@ impl ArrowEngineData {
                     .map(|a| a as _)
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("long")
+            }
+            &DataType::FLOAT => {
+                debug!("Pushing float array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Float32Type>()
+                    .map(|a| a as _)
+                    .ok_or("float")
+            }
+            &DataType::DOUBLE => {
+                debug!("Pushing double array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Float64Type>()
+                    .map(|a| a as _)
+                    .ok_or("double")
+            }
+            &DataType::DATE => {
+                debug!("Pushing date array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Date32Type>()
+                    .map(|a| a as _)
+                    .ok_or("date")
+            }
+            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
+                debug!("Pushing timestamp array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<TimestampMicrosecondType>()
+                    .map(|a| a as _)
+                    .ok_or("timestamp")
+            }
+            DataType::Primitive(PrimitiveType::Decimal(_)) => {
+                debug!("Pushing decimal array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Decimal128Type>()
+                    .map(|a| a as _)
+                    .ok_or("decimal")
             }
             DataType::Array(_) => {
                 debug!("Pushing list for {}", ColumnName::new(path));
