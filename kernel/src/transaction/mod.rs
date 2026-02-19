@@ -1946,8 +1946,7 @@ pub struct RetryableTransaction<S = ExistingTable> {
 mod tests {
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
-        StructArray,
+        ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -2527,28 +2526,6 @@ mod tests {
         Ok(())
     }
 
-    /// A nested test table schema shared by column mapping tests
-    fn test_nested_complex_table_schema() -> DeltaResult<Arc<StructType>> {
-        Ok(Arc::new(StructType::try_new(vec![
-            StructField::new("id", DataType::LONG, false),
-            StructField::nullable("value", DataType::STRING),
-            StructField::nullable("score", DataType::DOUBLE),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::new("street", DataType::STRING, false),
-                    StructField::nullable("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::INTEGER),
-                ])?,
-            ),
-            StructField::nullable("tags", ArrayType::new(DataType::STRING, true)),
-            StructField::nullable(
-                "metadata",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-        ])?))
-    }
-
     // Input schemas have no CM metadata; create_table automatically assigns IDs and
     // physical names when mode is Name or Id.
     #[rstest]
@@ -2578,38 +2555,15 @@ mod tests {
         Ok(())
     }
 
-    /// Builds a RecordBatch with logical field names matching [`test_nested_complex_table_schema`].
+    /// Builds a RecordBatch with logical field names matching [`test_schema_nested`].
     fn build_test_record_batch() -> DeltaResult<RecordBatch> {
         let id_arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
-        let value_arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
-        let score_arr: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
 
-        // Nested struct: address
-        let street_arr: ArrayRef = Arc::new(StringArray::from(vec!["s1", "s2"]));
-        let city_arr: ArrayRef = Arc::new(StringArray::from(vec!["c1", "c2"]));
-        let zip_arr: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
-        let address_fields = vec![
-            ArrowField::new("street", ArrowDataType::Utf8, false),
-            ArrowField::new("city", ArrowDataType::Utf8, true),
-            ArrowField::new("zip", ArrowDataType::Int32, true),
-        ];
-        let address_arr: ArrayRef = Arc::new(StructArray::try_new(
-            address_fields.into(),
-            vec![street_arr, city_arr, zip_arr],
-            None,
-        )?);
+        // info struct fields
+        let name_arr: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob"]));
+        let age_arr: ArrayRef = Arc::new(Int32Array::from(vec![30, 25]));
 
-        // tags: List<String>
-        let tag_values = StringArray::from(vec!["t1", "t2", "t3"]);
-        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 2, 3].into());
-        let tags_arr: ArrayRef = Arc::new(ListArray::try_new(
-            Arc::new(ArrowField::new("element", ArrowDataType::Utf8, true)),
-            offsets,
-            Arc::new(tag_values),
-            None,
-        )?);
-
-        // metadata: Map<String, String>
+        // info.tags: Map<String, String>
         let keys = StringArray::from(vec!["k1", "k2"]);
         let vals = StringArray::from(vec!["v1", "v2"]);
         let entries_field = ArrowField::new(
@@ -2633,7 +2587,7 @@ mod tests {
             None,
         )?;
         let map_offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
-        let metadata_arr: ArrayRef = Arc::new(MapArray::new(
+        let tags_arr: ArrayRef = Arc::new(MapArray::new(
             Arc::new(entries_field),
             map_offsets,
             entries,
@@ -2641,53 +2595,53 @@ mod tests {
             false,
         ));
 
-        let arrow_schema: ArrowSchema = test_nested_complex_table_schema()?
-            .as_ref()
-            .try_into_arrow()?;
+        // info.scores: Array<Int>
+        let score_values = Int32Array::from(vec![10, 20, 30]);
+        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 2, 3].into());
+        let scores_arr: ArrayRef = Arc::new(ListArray::try_new(
+            Arc::new(ArrowField::new("item", ArrowDataType::Int32, true)),
+            offsets,
+            Arc::new(score_values),
+            None,
+        )?);
+
+        // info struct
+        let info_fields = vec![
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("age", ArrowDataType::Int32, true),
+            ArrowField::new("tags", tags_arr.data_type().clone(), true),
+            ArrowField::new("scores", scores_arr.data_type().clone(), true),
+        ];
+        let info_arr: ArrayRef = Arc::new(StructArray::try_new(
+            info_fields.into(),
+            vec![name_arr, age_arr, tags_arr, scores_arr],
+            None,
+        )?);
+
+        let arrow_schema: ArrowSchema = test_schema_nested().as_ref().try_into_arrow()?;
         Ok(RecordBatch::try_new(
             Arc::new(arrow_schema),
-            vec![
-                id_arr,
-                value_arr,
-                score_arr,
-                address_arr,
-                tags_arr,
-                metadata_arr,
-            ],
+            vec![id_arr, info_arr],
         )?)
-    }
-
-    /// Recursively asserts that Arrow field names match the kernel schema field names.
-    fn assert_schema_names_match(
-        arrow_fields: &crate::arrow::datatypes::Fields,
-        kernel_schema: &StructType,
-    ) {
-        assert_eq!(arrow_fields.len(), kernel_schema.fields().count());
-        for (arrow_field, kernel_field) in arrow_fields.iter().zip(kernel_schema.fields()) {
-            assert_eq!(
-                arrow_field.name(),
-                kernel_field.name(),
-                "Field name mismatch"
-            );
-            if let (ArrowDataType::Struct(arrow_children), DataType::Struct(kernel_children)) =
-                (arrow_field.data_type(), kernel_field.data_type())
-            {
-                assert_schema_names_match(arrow_children, kernel_children);
-            }
-        }
     }
 
     /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting levels.
     /// Builds a RecordBatch with logical names, evaluates the transform, and checks that the
     /// output uses physical names from the physical schema — including nested struct children.
     fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
-        let schema = test_nested_complex_table_schema()?;
-        let (_engine, txn) =
-            crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let schema = test_schema_nested();
+        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
+
+        if mode != ColumnMappingMode::None {
+            assert_ne!(
+                logical_schema, physical_schema,
+                "Physical schema should differ from logical schema when column mapping is enabled"
+            );
+        }
 
         let batch = build_test_record_batch()?;
 
@@ -2703,8 +2657,9 @@ mod tests {
         let result = ArrowEngineData::try_from_engine_data(result)?;
         let result_batch = result.record_batch();
 
-        // Verify: all field names (including nested) match the physical schema
-        assert_schema_names_match(result_batch.schema().fields(), physical_schema);
+        // Verify: all field names, types, and metadata match the physical schema
+        let expected_arrow_schema: ArrowSchema = physical_schema.as_ref().try_into_arrow()?;
+        assert_eq!(result_batch.schema().as_ref(), &expected_arrow_schema);
 
         // Verify: data is preserved (id values)
         let id_col = result_batch
