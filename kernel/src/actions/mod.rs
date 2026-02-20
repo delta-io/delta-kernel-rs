@@ -452,45 +452,6 @@ impl Protocol {
         Ok(protocol)
     }
 
-    /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
-    /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
-        let mut visitor = ProtocolVisitor::default();
-        visitor.visit_rows_of(data)?;
-        Ok(visitor.protocol)
-    }
-
-    /// This protocol's minimum reader version
-    #[internal_api]
-    pub(crate) fn min_reader_version(&self) -> i32 {
-        self.min_reader_version
-    }
-
-    /// This protocol's minimum writer version
-    #[internal_api]
-    pub(crate) fn min_writer_version(&self) -> i32 {
-        self.min_writer_version
-    }
-
-    /// Get the reader features for the protocol
-    #[internal_api]
-    pub(crate) fn reader_features(&self) -> Option<&[TableFeature]> {
-        self.reader_features.as_deref()
-    }
-
-    /// Get the writer features for the protocol
-    #[internal_api]
-    pub(crate) fn writer_features(&self) -> Option<&[TableFeature]> {
-        self.writer_features.as_deref()
-    }
-
-    /// True if this protocol has the requested feature
-    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
-        // Since each reader features is a subset of writer features, we only check writer feature
-        self.writer_features()
-            .is_some_and(|features| features.contains(feature))
-    }
-
     /// Validates the relationship between reader features and writer features in the protocol.
     pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
         // The protocol states that Reader features may be present if and only if the min_reader_version is 3
@@ -587,6 +548,45 @@ impl Protocol {
                 "Reader features should be present in writer features",
             )),
         }
+    }
+
+    /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
+    /// a Protocol instance. If no protocol row is found, returns Ok(None).
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+        let mut visitor = ProtocolVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.protocol)
+    }
+
+    /// This protocol's minimum reader version
+    #[internal_api]
+    pub(crate) fn min_reader_version(&self) -> i32 {
+        self.min_reader_version
+    }
+
+    /// This protocol's minimum writer version
+    #[internal_api]
+    pub(crate) fn min_writer_version(&self) -> i32 {
+        self.min_writer_version
+    }
+
+    /// Get the reader features for the protocol
+    #[internal_api]
+    pub(crate) fn reader_features(&self) -> Option<&[TableFeature]> {
+        self.reader_features.as_deref()
+    }
+
+    /// Get the writer features for the protocol
+    #[internal_api]
+    pub(crate) fn writer_features(&self) -> Option<&[TableFeature]> {
+        self.writer_features.as_deref()
+    }
+
+    /// True if this protocol has the requested feature
+    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
+        // Since each reader features is a subset of writer features, we only check writer feature
+        self.writer_features()
+            .is_some_and(|features| features.contains(feature))
     }
 
     pub(crate) fn is_catalog_managed(&self) -> bool {
