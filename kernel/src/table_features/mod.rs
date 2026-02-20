@@ -505,6 +505,11 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 5,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
+    #[cfg(feature = "column-mapping-write")]
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
+    }),
+    #[cfg(not(feature = "column-mapping-write"))]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Cdf => Ok(()),
         Operation::Write => Err(Error::unsupported(

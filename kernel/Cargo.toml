@@ -113,6 +113,10 @@ arrow-expression = ["need-arrow"]
 # enables new experimental catalog-managed tables support
 catalog-managed = []
 
+# WARNING: This feature is not fully supported by DefaultEngine yet. Don't add this flag if you are using DefaultEngine
+# enables column mapping support for write operations
+column-mapping-write = []
+
 # Schema diffing functionality (experimental)
 schema-diff = []
 
