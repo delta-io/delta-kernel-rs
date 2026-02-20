@@ -3567,42 +3567,70 @@ mod tests {
 
     use rstest::rstest;
 
+    /// Rename fields in each case tuple to `c{idx}` so multi-column batches have unique names.
+    fn allocate_name_to_field(idx: usize, (src, tgt, col): CoerceTestCase) -> CoerceTestCase {
+        let name = format!("c{idx}");
+        let src = Arc::new(ArrowField::new(
+            &name,
+            src.data_type().clone(),
+            src.is_nullable(),
+        ));
+        let tgt = Arc::new(ArrowField::new(
+            &name,
+            tgt.data_type().clone(),
+            tgt.is_nullable(),
+        ));
+        (src, tgt, col)
+    }
+
     #[rstest]
-    #[case::int_to_nullable(create_data_int(), true)]
-    #[case::int_to_non_null(create_data_int(), false)]
-    #[case::string_to_nullable(create_data_string(), true)]
-    #[case::string_to_non_null(create_data_string(), false)]
-    #[case::struct_to_nullable(create_data_struct(), true)]
-    #[case::struct_to_non_null(create_data_struct(), false)]
-    #[case::list_to_nullable(create_data_list(), true)]
-    #[case::list_to_non_null(create_data_list(), false)]
-    #[case::map_to_nullable(create_data_map(), true)]
-    #[case::map_to_non_null(create_data_map(), false)]
-    #[case::struct_in_list_to_nullable(create_data_struct_in_list(), true)]
-    #[case::struct_in_list_to_non_null(create_data_struct_in_list(), false)]
-    #[case::list_in_struct_to_nullable(create_data_list_in_struct(), true)]
-    #[case::list_in_struct_to_non_null(create_data_list_in_struct(), false)]
-    #[case::list_in_map_to_nullable(create_data_list_in_map(), true)]
-    #[case::list_in_map_to_non_null(create_data_list_in_map(), false)]
-    #[case::struct_in_map_to_nullable(create_data_struct_in_map(), true)]
-    #[case::struct_in_map_to_non_null(create_data_struct_in_map(), false)]
-    #[case::map_in_struct_to_nullable(create_data_map_in_struct(), true)]
-    #[case::map_in_struct_to_non_null(create_data_map_in_struct(), false)]
-    #[case::map_in_list_to_nullable(create_data_map_in_list(), true)]
-    #[case::map_in_list_to_non_null(create_data_map_in_list(), false)]
+    // Each basic type with a nested type: covers all leaf/container recursion paths
+    #[case::int_and_struct_in_list(vec![
+        create_data_int(), create_data_struct_in_list(),
+    ], true)]
+    #[case::string_and_list_in_struct(vec![
+        create_data_string(), create_data_list_in_struct(),
+    ], false)]
+    // All simple types together
+    #[case::all_simple_types(vec![
+        create_data_int(), create_data_string(), create_data_struct(),
+        create_data_list(), create_data_map(),
+    ], true)]
+    // All nested types together
+    #[case::all_nested_types(vec![
+        create_data_struct_in_list(), create_data_list_in_struct(),
+        create_data_list_in_map(), create_data_struct_in_map(),
+        create_data_map_in_struct(), create_data_map_in_list(),
+    ], false)]
+    // Mix of simple and nested, to_nullable
+    #[case::mixed_to_nullable(vec![
+        create_data_int(), create_data_struct(), create_data_map_in_list(),
+        create_data_struct_in_map(),
+    ], true)]
+    // Mix of simple and nested, to_non_null
+    #[case::mixed_to_non_null(vec![
+        create_data_list(), create_data_map(), create_data_list_in_map(),
+        create_data_map_in_struct(),
+    ], false)]
     fn test_coerce_batch_nullability(
-        #[case] data: (CoerceTestCase, CoerceTestCase),
+        #[case] data: Vec<(CoerceTestCase, CoerceTestCase)>,
         #[case] to_nullable: bool,
     ) {
-        let (to_nullable_case, to_non_null_case) = data;
-        let (src_field, tgt_field, col) = if to_nullable {
-            to_nullable_case
-        } else {
-            to_non_null_case
-        };
-        let src_schema = Arc::new(ArrowSchema::new(vec![(*src_field).clone()]));
-        let batch = RecordBatch::try_new(src_schema, vec![col]).unwrap();
-        let target_schema = Arc::new(ArrowSchema::new(vec![(*tgt_field).clone()]));
+        let (src_fields, tgt_fields, cols): (Vec<_>, Vec<_>, Vec<_>) = data
+            .into_iter()
+            .enumerate()
+            .map(|(i, (to_nullable_case, to_non_null_case))| {
+                let case = if to_nullable {
+                    to_nullable_case
+                } else {
+                    to_non_null_case
+                };
+                allocate_name_to_field(i, case)
+            })
+            .multiunzip();
+        let src_schema = Arc::new(ArrowSchema::new(src_fields));
+        let target_schema = Arc::new(ArrowSchema::new(tgt_fields));
+        let batch = RecordBatch::try_new(src_schema, cols).unwrap();
         let result = coerce_batch_nullability(batch, &target_schema).unwrap();
         assert_eq!(*result.schema(), *target_schema);
     }
