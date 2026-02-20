@@ -364,35 +364,35 @@ impl ArrowEngineData {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
                 col.as_boolean_opt()
                     .map(|a| a as _)
-                    .or_else(|| Self::try_extract_with_rle(col))
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("bool")
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
                 col.as_string_opt()
                     .map(|a| a as _)
-                    .or_else(|| Self::try_extract_with_rle(col))
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("string")
             }
             &DataType::BINARY => {
                 debug!("Pushing binary array for {}", ColumnName::new(path));
                 col.as_binary_opt()
                     .map(|a| a as _)
-                    .or_else(|| Self::try_extract_with_rle(col))
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("binary")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
                     .map(|a| a as _)
-                    .or_else(|| Self::try_extract_with_rle(col))
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("int")
             }
             &DataType::LONG => {
                 debug!("Pushing int64 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int64Type>()
                     .map(|a| a as _)
-                    .or_else(|| Self::try_extract_with_rle(col))
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("long")
             }
             DataType::Array(_) => {
