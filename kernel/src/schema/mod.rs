@@ -898,15 +898,14 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        let insert_index = match after {
-            Some(after) => {
+        let insert_index = after
+            .map(|after| {
                 self.fields
                     .get_index_of(after)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))?
-                    + 1
-            }
-            None => self.fields.len(),
-        };
+                    .map(|index| index + 1)
+                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))
+            })
+            .unwrap_or_else(|| Ok(self.fields.len()))?;
 
         self.fields
             .insert_before(insert_index, new_field.name.clone(), new_field);
@@ -921,13 +920,14 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        let index_of_before = match before {
-            Some(before) => self
-                .fields
-                .get_index_of(before)
-                .ok_or_else(|| Error::generic(format!("Field {} not found", before)))?,
-            None => 0,
-        };
+        let index_of_before = before
+            .map(|before| {
+                self.fields
+                    .get_index_of(before)
+                    .ok_or_else(|| Error::generic(format!("Field {} not found", before)))
+            })
+            .unwrap_or_else(|| Ok(0))?;
+
         self.fields
             .insert_before(index_of_before, new_field.name.clone(), new_field);
         Ok(self)
