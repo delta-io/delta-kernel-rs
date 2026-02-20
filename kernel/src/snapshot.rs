@@ -649,7 +649,7 @@ impl Snapshot {
         );
 
         require!(
-            self.table_configuration().protocol().is_catalog_managed(),
+            self.table_configuration().is_catalog_managed(),
             Error::generic(
                 "There are catalog commits that need publishing, but the table is not catalog-managed.",
             )
@@ -871,8 +871,7 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap();
         assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -889,8 +888,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap();
         assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;

@@ -7,7 +7,8 @@ use tracing::debug;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
-    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
+    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, RunArray,
+    StructArray,
 };
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
@@ -132,11 +133,9 @@ where
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
-        let mut result = vec![];
-        for i in 0..EngineList::len(self, row_index) {
-            result.push(self.get(row_index, i));
-        }
-        result
+        (0..EngineList::len(self, row_index))
+            .map(|i| self.get(row_index, i))
+            .collect()
     }
 }
 
@@ -238,7 +237,8 @@ impl EngineData for ArrowEngineData {
         // Collect the names of all leaf columns we want to extract, along with their parents, to
         // guide our depth-first extraction. If the list contains any non-leaf, duplicate, or
         // missing column references, the extracted column list will be too short (error out below).
-        let mut mask = HashSet::new();
+        let mask_capacity: usize = leaf_columns.iter().map(|c| c.len()).sum();
+        let mut mask = HashSet::with_capacity(mask_capacity);
         for column in leaf_columns {
             for i in 0..column.len() {
                 mask.insert(&column[..i + 1]);
@@ -246,7 +246,7 @@ impl EngineData for ArrowEngineData {
         }
         debug!("Column mask for selected columns {leaf_columns:?} is {mask:#?}");
 
-        let mut getters = vec![];
+        let mut getters = Vec::with_capacity(leaf_columns.len());
         Self::extract_columns(&mut vec![], &mut getters, leaf_types, &mask, &self.data)?;
         if getters.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
@@ -325,6 +325,19 @@ impl ArrowEngineData {
         Ok(())
     }
 
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
+    /// This reduces boilerplate by handling the common pattern of trying direct access first,
+    /// then falling back to RunArray if the column is REE-encoded.
+    fn try_extract_with_ree<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
+        match col.data_type() {
+            ArrowDataType::RunEndEncoded(_, _) => col
+                .as_any()
+                .downcast_ref::<RunArray<Int64Type>>()
+                .map(|run_array| run_array as &'a dyn GetData<'a>),
+            _ => None,
+        }
+    }
+
     fn extract_leaf_column<'a>(
         path: &[String],
         data_type: &DataType,
@@ -348,26 +361,37 @@ impl ArrowEngineData {
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
             &DataType::BOOLEAN => {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
-                col.as_boolean_opt().map(|a| a as _).ok_or("bool")
+                col.as_boolean_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("bool")
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt().map(|a| a as _).ok_or("string")
+                col.as_string_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("string")
             }
             &DataType::BINARY => {
                 debug!("Pushing binary array for {}", ColumnName::new(path));
-                col.as_binary_opt().map(|a| a as _).ok_or("binary")
+                col.as_binary_opt()
+                    .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("binary")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
                     .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("int")
             }
             &DataType::LONG => {
                 debug!("Pushing int64 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int64Type>()
                     .map(|a| a as _)
+                    .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("long")
             }
             DataType::Array(_) => {
@@ -401,16 +425,17 @@ mod tests {
     use std::sync::Arc;
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
-    use crate::arrow::array::types::Int32Type;
+    use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
-        Array, AsArray, Int32Array, MapArray, RecordBatch, StringArray, StructArray,
+        Array, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch,
+        RunArray, StringArray, StructArray,
     };
     use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::engine_data::EngineMap;
+    use crate::engine_data::{EngineMap, GetData};
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
@@ -916,6 +941,194 @@ mod tests {
             result,
             "Type mismatch on data: expected binary, got Int32",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_out_of_bounds_errors() -> DeltaResult<()> {
+        // Test that out of bounds errors include field name for all types
+        let run_ends = Int64Array::from(vec![2]);
+
+        // Test str
+        let str_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &StringArray::from(vec!["test"]))?;
+        let err_msg = str_array.get_str(2, "str_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("str_field"));
+
+        // Test int
+        let int_array = RunArray::<Int64Type>::try_new(&run_ends, &Int32Array::from(vec![42]))?;
+        let err_msg = int_array.get_int(5, "int_field").unwrap_err().to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("int_field"));
+
+        // Test long
+        let long_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &Int64Array::from(vec![100i64]))?;
+        let err_msg = long_array
+            .get_long(3, "long_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("long_field"));
+
+        // Test bool
+        let bool_array =
+            RunArray::<Int64Type>::try_new(&run_ends, &BooleanArray::from(vec![true]))?;
+        let err_msg = bool_array
+            .get_bool(2, "bool_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("bool_field"));
+
+        // Test binary
+        let binary_array = RunArray::<Int64Type>::try_new(
+            &run_ends,
+            &BinaryArray::from(vec![Some(b"data".as_ref())]),
+        )?;
+        let err_msg = binary_array
+            .get_binary(4, "binary_field")
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("out of bounds") && err_msg.contains("binary_field"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_array_extraction_via_visitor() -> DeltaResult<()> {
+        use crate::engine_data::RowVisitor;
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create RunArray columns with pattern: [val1, val1, null, null, val2]
+        // Per Arrow spec: nulls are encoded as runs in the values child array
+        let run_ends = Int64Array::from(vec![2, 4, 5]);
+        let mk_field = |name, dt| {
+            ArrowField::new(
+                name,
+                ArrowDataType::RunEndEncoded(
+                    Arc::new(ArrowField::new("run_ends", ArrowDataType::Int64, false)),
+                    Arc::new(ArrowField::new("values", dt, true)),
+                ),
+                true,
+            )
+        };
+
+        let columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &StringArray::from(vec![Some("a"), None, Some("b")]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &Int32Array::from(vec![Some(1), None, Some(2)]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &Int64Array::from(vec![Some(10i64), None, Some(20)]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &BooleanArray::from(vec![Some(true), None, Some(false)]),
+            )?),
+            Arc::new(RunArray::<Int64Type>::try_new(
+                &run_ends,
+                &BinaryArray::from(vec![Some(b"x".as_ref()), None, Some(b"y".as_ref())]),
+            )?),
+        ];
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            mk_field("s", ArrowDataType::Utf8),
+            mk_field("i", ArrowDataType::Int32),
+            mk_field("l", ArrowDataType::Int64),
+            mk_field("b", ArrowDataType::Boolean),
+            mk_field("bin", ArrowDataType::Binary),
+        ]));
+
+        let arrow_data = ArrowEngineData::new(RecordBatch::try_new(schema, columns)?);
+
+        type Row = (
+            Option<String>,
+            Option<i32>,
+            Option<i64>,
+            Option<bool>,
+            Option<Vec<u8>>,
+        );
+
+        struct TestVisitor {
+            data: Vec<Row>,
+        }
+
+        impl RowVisitor for TestVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static COLUMNS: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
+                    [
+                        ColumnName::new(["s"]),
+                        ColumnName::new(["i"]),
+                        ColumnName::new(["l"]),
+                        ColumnName::new(["b"]),
+                        ColumnName::new(["bin"]),
+                    ]
+                });
+                static TYPES: &[DataType] = &[
+                    DataType::STRING,
+                    DataType::INTEGER,
+                    DataType::LONG,
+                    DataType::BOOLEAN,
+                    DataType::BINARY,
+                ];
+                (&*COLUMNS, TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.data.push((
+                        getters[0].get_str(i, "s")?.map(|s| s.to_string()),
+                        getters[1].get_int(i, "i")?,
+                        getters[2].get_long(i, "l")?,
+                        getters[3].get_bool(i, "b")?,
+                        getters[4].get_binary(i, "bin")?.map(|b| b.to_vec()),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = TestVisitor { data: vec![] };
+        visitor.visit_rows_of(&arrow_data)?;
+
+        // Verify decompression including nulls: [val1, val1, null, null, val2]
+        let expected = vec![
+            (
+                Some("a".into()),
+                Some(1),
+                Some(10),
+                Some(true),
+                Some(b"x".to_vec()),
+            ),
+            (
+                Some("a".into()),
+                Some(1),
+                Some(10),
+                Some(true),
+                Some(b"x".to_vec()),
+            ),
+            (None, None, None, None, None),
+            (None, None, None, None, None),
+            (
+                Some("b".into()),
+                Some(2),
+                Some(20),
+                Some(false),
+                Some(b"y".to_vec()),
+            ),
+        ];
+        assert_eq!(visitor.data, expected);
 
         Ok(())
     }
