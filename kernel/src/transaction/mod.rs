@@ -2557,6 +2557,8 @@ mod tests {
 
     /// Builds a RecordBatch with logical field names matching [`test_schema_nested`].
     fn build_test_record_batch() -> DeltaResult<RecordBatch> {
+        let arrow_schema: ArrowSchema = test_schema_nested().as_ref().try_into_arrow()?;
+
         let id_arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
 
         // info struct fields
@@ -2618,7 +2620,6 @@ mod tests {
             None,
         )?);
 
-        let arrow_schema: ArrowSchema = test_schema_nested().as_ref().try_into_arrow()?;
         Ok(RecordBatch::try_new(
             Arc::new(arrow_schema),
             vec![id_arr, info_arr],
