@@ -60,22 +60,15 @@ mod tests {
         ]);
 
         // Protocol with TimestampWithoutTimezone features
-        let protocol_with_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+        let protocol_with_features = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [TableFeature::TimestampWithoutTimezone],
         )
         .unwrap();
 
         // Protocol without TimestampWithoutTimezone features
-        let protocol_without_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
         // Schema with TIMESTAMP_NTZ + Protocol with features = OK
         validate_timestamp_ntz_feature_support(&schema_with_timestamp_ntz, &protocol_with_features)

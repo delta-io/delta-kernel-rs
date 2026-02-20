@@ -11,8 +11,8 @@ use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_top_level_column_physical_name,
+    assign_column_mapping_metadata, column_mapping_mode, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, get_top_level_column_physical_name,
 };
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
@@ -625,6 +625,11 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 };
 
 impl TableFeature {
+    #[cfg(test)]
+    pub(crate) const NO_LIST: Option<Vec<TableFeature>> = None;
+    #[cfg(test)]
+    pub(crate) const EMPTY_LIST: Vec<TableFeature> = vec![];
+
     pub(crate) fn feature_type(&self) -> FeatureType {
         match self {
             TableFeature::CatalogManaged

@@ -133,11 +133,9 @@ where
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
-        let mut result = vec![];
-        for i in 0..EngineList::len(self, row_index) {
-            result.push(self.get(row_index, i));
-        }
-        result
+        (0..EngineList::len(self, row_index))
+            .map(|i| self.get(row_index, i))
+            .collect()
     }
 }
 
@@ -275,7 +273,7 @@ impl EngineData for ArrowEngineData {
         Self::extract_columns(&mut vec![], &mut column_map, &self.data)?;
 
         // Extract getters in the requested column order, verifying state transitions
-        let mut getters = vec![];
+        let mut getters = Vec::with_capacity(leaf_columns.len());
         for column in leaf_columns {
             match column_map.get(column.as_ref()) {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),

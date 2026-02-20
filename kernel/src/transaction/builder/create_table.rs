@@ -24,7 +24,6 @@ use crate::table_features::{
     assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
     get_top_level_column_physical_name, ColumnMappingMode, FeatureType, TableFeature,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
@@ -541,12 +540,8 @@ impl CreateTableTransactionBuilder {
         )?;
 
         // Create Protocol action with table features support
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(validated.reader_features),
-            Some(validated.writer_features),
-        )?;
+        let protocol =
+            Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
 
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
