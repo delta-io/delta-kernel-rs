@@ -162,9 +162,13 @@ pub(crate) mod test_utils {
     };
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::table_features::ColumnMappingMode;
+    use crate::transaction::create_table::create_table;
+    use crate::transaction::{CreateTable, Transaction};
     use crate::{DeltaResult, EngineData, Error, SnapshotRef};
     use crate::{Engine, Snapshot};
 
@@ -589,6 +593,98 @@ pub(crate) mod test_utils {
                 "phys_name",
             ),
         ]))
+    }
+
+    /// Build a create-table transaction with the given schema and column mapping mode.
+    /// Returns the engine and uncommitted transaction.
+    pub(crate) fn setup_column_mapping_txn(
+        schema: SchemaRef,
+        mode: ColumnMappingMode,
+    ) -> DeltaResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+        let mode_str = match mode {
+            ColumnMappingMode::Name => "name",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::None => "none",
+        };
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+
+        let txn = create_table("memory:///test_table", schema, "DefaultEngine")
+            .with_table_properties([("delta.columnMapping.mode", mode_str)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        Ok((engine, txn))
+    }
+
+    /// Validate that a physical schema matches the logical schema's column mapping metadata.
+    /// For Name/Id modes, checks physicalName, columnMapping.id, and parquet.field.id on
+    /// each field. For None mode, only checks field names match.
+    pub(crate) fn validate_physical_schema_column_mapping(
+        logical_schema: &StructType,
+        physical_schema: &StructType,
+        mode: ColumnMappingMode,
+    ) {
+        assert_eq!(
+            physical_schema.fields().count(),
+            logical_schema.fields().count()
+        );
+
+        // Collect expected (physical_name, field_id) from logical schema
+        let expected: Vec<_> = logical_schema
+            .fields()
+            .map(|f| {
+                let physical_name =
+                    match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                        Some(MetadataValue::String(name)) => name.clone(),
+                        _ if mode == ColumnMappingMode::None => f.name().to_string(),
+                        _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
+                    };
+                let field_id = match f.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                    Some(MetadataValue::Number(id)) => *id,
+                    _ if mode == ColumnMappingMode::None => -1,
+                    _ => panic!(
+                        "Logical field '{}' missing columnMapping.id metadata",
+                        f.name()
+                    ),
+                };
+                (physical_name, field_id)
+            })
+            .collect();
+
+        // Validate each physical field against expected values
+        for (physical_field, (expected_name, expected_id)) in
+            physical_schema.fields().zip(expected.iter())
+        {
+            assert_eq!(
+                physical_field.name(),
+                expected_name,
+                "Physical field name mismatch"
+            );
+
+            if mode == ColumnMappingMode::None {
+                continue;
+            }
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+                Some(&MetadataValue::String(expected_name.clone())),
+                "columnMapping.physicalName mismatch for '{}'",
+                physical_field.name()
+            );
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "columnMapping.id mismatch for '{}'",
+                physical_field.name()
+            );
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "parquet.field.id mismatch for '{}'",
+                physical_field.name()
+            );
+        }
     }
 
     /// Load a test table from tests/data directory.
