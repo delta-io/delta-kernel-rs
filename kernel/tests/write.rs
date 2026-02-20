@@ -47,7 +47,6 @@ use test_utils::{
     assert_result_error_with_message, copy_directory, create_add_files_metadata, create_cm_table,
     create_default_engine, create_table, engine_store_setup, read_add_infos, setup_test_tables,
     test_read, test_table_setup, translate_logical_path_to_physical, write_batch_to_table,
-    write_parquet_with_snapshot,
 };
 
 mod common;
