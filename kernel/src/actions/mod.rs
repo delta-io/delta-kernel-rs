@@ -431,6 +431,28 @@ fn parse_features(
 }
 
 impl Protocol {
+    /// Try to create a new modern Protocol instance with the given table feature lists
+    pub(crate) fn try_new_modern(
+        reader_features: impl IntoIterator<Item = impl IntoTableFeature>,
+        writer_features: impl IntoIterator<Item = impl IntoTableFeature>,
+    ) -> DeltaResult<Self> {
+        Self::try_new(3, 7, Some(reader_features), Some(writer_features))
+    }
+
+    /// Try to create a new legacy Protocol instance with the given reader/writer versions
+    #[cfg(test)]
+    pub(crate) fn try_new_legacy(
+        min_reader_version: i32,
+        min_writer_version: i32,
+    ) -> DeltaResult<Self> {
+        Self::try_new(
+            min_reader_version,
+            min_writer_version,
+            TableFeature::NO_LIST,
+            TableFeature::NO_LIST,
+        )
+    }
+
     /// Try to create a new Protocol instance from reader/writer versions and table features.
     pub(crate) fn try_new(
         min_reader_version: i32,
@@ -1297,31 +1319,39 @@ mod tests {
         let invalid_features = [
             // ReaderWriter feature not present in writer features
             (
-                Some(vec![TableFeature::DeletionVectors]),
-                Some(vec![TableFeature::AppendOnly]),
+                vec![TableFeature::DeletionVectors],
+                vec![TableFeature::AppendOnly],
                 "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
-            (Some(vec![TableFeature::DeletionVectors]), Some(vec![]), "Reader features must contain only ReaderWriter features that are also listed in writer features"),
-            // ReaderWriter feature not present in reader features
-            (Some(vec![]), Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
             (
-                Some(vec![TableFeature::VariantType]),
-                Some(vec![
+                vec![TableFeature::DeletionVectors],
+                vec![],
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+            // ReaderWriter feature not present in reader features
+            (
+                vec![],
+                vec![TableFeature::DeletionVectors],
+                "Writer features must be Writer-only or also listed in reader features",
+            ),
+            (
+                vec![TableFeature::VariantType],
+                vec![
                     TableFeature::VariantType,
                     TableFeature::DeletionVectors,
-                ]),
+                ],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
             // Writer only feature present in reader features
             (
-                Some(vec![TableFeature::AppendOnly]),
-                Some(vec![TableFeature::AppendOnly]),
+                vec![TableFeature::AppendOnly],
+                vec![TableFeature::AppendOnly],
                 "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
         ];
 
         for (reader_features, writer_features, error_msg) in invalid_features {
-            let res = Protocol::try_new(3, 7, reader_features, writer_features);
+            let res = Protocol::try_new_modern(reader_features, writer_features);
             assert!(
                 matches!(
                     &res,
@@ -1338,20 +1368,16 @@ mod tests {
         // but will be rejected when trying to use the protocol (ensure_operation_supported)
 
         // Test unknown features in reader - validation passes
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
-            Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+        let protocol = Protocol::try_new_modern(
+            vec![TableFeature::Unknown("unknown_reader".to_string())],
+            vec![TableFeature::Unknown("unknown_reader".to_string())],
         );
         assert!(protocol.is_ok());
 
         // Test unknown features in writer - validation passes
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some(Vec::<TableFeature>::new()),
-            Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::Unknown("unknown_writer".to_string())],
         );
         assert!(protocol.is_ok());
     }
@@ -1363,28 +1389,28 @@ mod tests {
             // ReaderWriter feature present in both reader/writer features,
             // Writer only feature present in writer feature
             (
-                Some(vec![TableFeature::DeletionVectors]),
-                Some(vec![TableFeature::DeletionVectors]),
+                vec![TableFeature::DeletionVectors],
+                vec![TableFeature::DeletionVectors],
             ),
-            (Some(vec![]), Some(vec![TableFeature::AppendOnly])),
+            (vec![], vec![TableFeature::AppendOnly]),
             (
-                Some(vec![TableFeature::VariantType]),
-                Some(vec![TableFeature::VariantType, TableFeature::AppendOnly]),
+                vec![TableFeature::VariantType],
+                vec![TableFeature::VariantType, TableFeature::AppendOnly],
             ),
             // Unknown feature may be ReaderWriter or Writer only (for forward compatibility)
             (
-                Some(vec![TableFeature::Unknown("rw".to_string())]),
-                Some(vec![
+                vec![TableFeature::Unknown("rw".to_string())],
+                vec![
                     TableFeature::Unknown("rw".to_string()),
                     TableFeature::Unknown("w".to_string()),
-                ]),
+                ],
             ),
             // Empty feature set is valid
-            (Some(vec![]), Some(vec![])),
+            (vec![], vec![]),
         ];
 
         for (reader_features, writer_features) in valid_features {
-            assert!(Protocol::try_new(3, 7, reader_features, writer_features).is_ok());
+            assert!(Protocol::try_new_modern(reader_features, writer_features).is_ok());
         }
     }
 
@@ -1396,7 +1422,7 @@ mod tests {
         let protocol = Protocol::try_new(
             2,
             7,
-            None::<Vec<TableFeature>>,
+            TableFeature::NO_LIST,
             Some(vec![TableFeature::ColumnMapping]),
         );
         assert!(protocol.is_ok());
@@ -1408,7 +1434,7 @@ mod tests {
         let protocol = Protocol::try_new(
             1,
             7,
-            None::<Vec<TableFeature>>,
+            TableFeature::NO_LIST,
             Some(vec![TableFeature::AppendOnly]),
         );
         assert!(protocol.is_ok());
@@ -1420,7 +1446,7 @@ mod tests {
         let protocol = Protocol::try_new(
             2,
             7,
-            None::<Vec<TableFeature>>,
+            TableFeature::NO_LIST,
             Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
         );
         assert!(protocol.is_ok());
@@ -1433,7 +1459,7 @@ mod tests {
         let protocol = Protocol::try_new(
             1,
             7,
-            None::<Vec<TableFeature>>,
+            TableFeature::NO_LIST,
             Some(vec![TableFeature::ColumnMapping]),
         );
         assert!(protocol.is_err());
@@ -1446,7 +1472,7 @@ mod tests {
         let protocol = Protocol::try_new(
             2,
             7,
-            None::<Vec<TableFeature>>,
+            TableFeature::NO_LIST,
             Some(vec![
                 TableFeature::ColumnMapping,
                 TableFeature::DeletionVectors,
@@ -1794,11 +1820,9 @@ mod tests {
     #[test]
     fn test_protocol_into_engine_data() {
         let engine = ExprEngine::new();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
 
@@ -1900,9 +1924,8 @@ mod tests {
     #[test]
     fn test_protocol_into_engine_data_empty_features() {
         let engine = ExprEngine::new();
-        let empty_features: Vec<String> = vec![];
         let protocol =
-            Protocol::try_new(3, 7, Some(empty_features.clone()), Some(empty_features)).unwrap();
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
         let engine_data = protocol
             .into_engine_data(Protocol::to_schema().into(), &engine)
@@ -1932,7 +1955,7 @@ mod tests {
     #[test]
     fn test_protocol_into_engine_data_no_features() {
         let engine = ExprEngine::new();
-        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
 
         let engine_data = protocol
             .into_engine_data(Protocol::to_schema().into(), &engine)
