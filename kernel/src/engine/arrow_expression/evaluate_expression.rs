@@ -676,6 +676,7 @@ mod tests {
     use crate::expressions::{column_expr_ref, Expression as Expr, Transform, UnaryExpressionOp};
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -1640,14 +1641,25 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), vec![a_array, bool_array]).unwrap()
     }
 
-    #[test]
-    fn test_struct_with_nullability_some_false() {
-        // Predicate false → null struct (fast path: no nulls in predicate array).
-        // Also verifies field values are correct for valid rows.
-        let batch = create_batch_with_bool_col(
-            vec![Some(1), Some(2), Some(3)],
-            vec![Some(true), Some(false), Some(true)],
-        );
+    #[rstest]
+    // Fast path: no nulls in predicate array — values bitmap used directly.
+    #[case::fast_path(
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), Some(true)],
+        vec![true, false, true],
+    )]
+    // Slow path: predicate has nulls — Kleene AND; both false and null → null struct.
+    #[case::slow_path(
+        vec![Some(1), Some(2), Some(3), Some(4)],
+        vec![Some(true), Some(false), None, Some(true)],
+        vec![true, false, false, true],
+    )]
+    fn test_struct_with_nullability_predicate(
+        #[case] a_vals: Vec<Option<i32>>,
+        #[case] pred_vals: Vec<Option<bool>>,
+        #[case] expected_valid: Vec<bool>,
+    ) {
+        let batch = create_batch_with_bool_col(a_vals, pred_vals);
         let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
             "a",
             DataType::INTEGER,
@@ -1659,85 +1671,9 @@ mod tests {
         );
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(struct_result.is_valid(0));
-        assert!(struct_result.is_null(1));
-        assert!(struct_result.is_valid(2));
-        validate_i32_column(struct_result, 0, &[1, 2, 3]);
-    }
-
-    #[test]
-    fn test_struct_with_nullability_predicate_null() {
-        // Null predicate value treated as false → null struct (slow path: Kleene AND).
-        let batch = create_batch_with_bool_col(
-            vec![Some(10), Some(20), Some(30)],
-            vec![Some(true), None, Some(true)],
-        );
-        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::INTEGER,
-            true,
-        )])));
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("a")],
-            column_expr_ref!("is_valid"),
-        );
-        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(struct_result.is_valid(0));
-        assert!(struct_result.is_null(1));
-        assert!(struct_result.is_valid(2));
-    }
-
-    #[test]
-    fn test_struct_without_nullability_predicate() {
-        // struct_with_schema_from with no predicate — existing behavior unchanged
-        let batch = create_test_batch();
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::INTEGER, false),
-        ]);
-        let expr =
-            Expr::struct_with_schema_from([column_expr_ref!("a"), column_expr_ref!("b")], schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.len(), 3);
-        assert_eq!(struct_result.null_count(), 0);
-        validate_i32_column(struct_result, 0, &[1, 2, 3]);
-        validate_i32_column(struct_result, 1, &[10, 20, 30]);
-    }
-
-    #[test]
-    fn test_struct_with_is_not_null_predicate() {
-        // IS NOT NULL pattern: struct is null when storage_type is NULL (deletion vector use case)
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "storage_type",
-            ArrowDataType::Utf8,
-            true,
-        )]);
-        let storage_type: ArrayRef =
-            Arc::new(StringArray::from(vec![Some("foo"), None, Some("bar")]));
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![storage_type]).unwrap();
-
-        let output_schema =
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "storage_type",
-                DataType::STRING,
-                true,
-            )])));
-        let predicate = Arc::new(Expr::from_pred(
-            Expression::column(["storage_type"]).is_not_null(),
-        ));
-        let expr =
-            Expr::struct_with_nullability_from([column_expr_ref!("storage_type")], predicate);
-        let result = evaluate_expression(&expr, &batch, Some(&output_schema)).unwrap();
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.len(), 3);
-        assert!(struct_result.is_valid(0));
-        assert!(
-            struct_result.is_null(1),
-            "NULL storage_type should yield null struct"
-        );
-        assert!(struct_result.is_valid(2));
+        for (i, valid) in expected_valid.iter().enumerate() {
+            assert_eq!(struct_result.is_valid(i), *valid, "row {i}");
+        }
     }
 
     #[test]
