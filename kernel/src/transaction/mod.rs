@@ -532,7 +532,6 @@ impl<S> Transaction<S> {
             && self
                 .read_snapshot
                 .table_configuration()
-                .protocol()
                 .is_catalog_managed()
         {
             return Err(Error::generic(
@@ -1139,7 +1138,6 @@ impl<S> Transaction<S> {
         let partition_cols = self
             .read_snapshot
             .table_configuration()
-            .metadata()
             .partition_columns()
             .to_vec();
         // Check if materializePartitionColumns feature is enabled
@@ -1181,7 +1179,6 @@ impl<S> Transaction<S> {
         let partition_columns: Vec<String> = self
             .read_snapshot
             .table_configuration()
-            .metadata()
             .partition_columns()
             .to_vec();
         let materialize_partition_columns = self
@@ -2149,10 +2146,7 @@ mod tests {
             .build(&engine)?;
 
         // Verify the table is partitioned by "letter" column
-        let partition_cols_without = snapshot_without
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        let partition_cols_without = snapshot_without.table_configuration().partition_columns();
         assert_eq!(partition_cols_without.len(), 1);
         assert_eq!(partition_cols_without[0], "letter");
 
@@ -2200,10 +2194,7 @@ mod tests {
             .build(&engine)?;
 
         // Verify the table is partitioned by "letter" column
-        let partition_cols_with = snapshot_with
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        let partition_cols_with = snapshot_with.table_configuration().partition_columns();
         assert_eq!(partition_cols_with.len(), 1);
         assert_eq!(partition_cols_with[0], "letter");
 

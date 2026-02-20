@@ -282,9 +282,9 @@ impl TableConfiguration {
     /// that are physically stored in the parquet files. Partition values are stored in the
     /// file path, not in the file content, so they don't have file-level statistics.
     fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.metadata().partition_columns();
+        let partition_columns = self.partition_columns();
         Arc::new(StructType::new_unchecked(
-            self.schema
+            self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
@@ -316,10 +316,24 @@ impl TableConfiguration {
         &self.table_properties
     }
 
+    /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
+    /// table feature).
+    #[internal_api]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.is_feature_supported(&TableFeature::CatalogManaged)
+            || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
+    }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
+    }
+
+    /// The partition columns of this table (empty if non-partitioned)
+    #[internal_api]
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        self.metadata().partition_columns()
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
