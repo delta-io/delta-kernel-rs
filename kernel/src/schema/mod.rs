@@ -900,6 +900,7 @@ impl StructType {
     }
 
     /// Returns a StructType with `new_field` inserted after the field named `after`.
+    /// If `new_field`  already presents in the schema, its value is replaced by the `new_field`.
     /// If `after` is None, `new_field` is appended to the end.
     /// If `after` is not found, an error is returned.
     pub fn with_field_inserted_after(
@@ -922,6 +923,7 @@ impl StructType {
     }
 
     /// Returns a StructType with `new_field` inserted before the field named `before`.
+    /// If `new_field` already presents in the schema, its value is replaced by the `new_field`.
     /// If `before` is None, `new_field` is inserted at the beginning.
     /// If `before` is not found, an error is returned.
     pub fn with_field_inserted_before(
