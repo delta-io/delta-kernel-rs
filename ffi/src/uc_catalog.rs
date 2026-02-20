@@ -170,13 +170,16 @@ impl<C: UCCommitClient + 'static> Committer for FfiUCCommitter<C> {
             .downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>()
             .map(|e| e.enter())
             .or_else(|| {
-                engine.any_ref()
+                engine
+                    .any_ref()
                     .downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>()
                     .map(|e| e.enter())
             })
-            .ok_or_else(|| delta_kernel::Error::generic(
-                "FFIUCCommitter can only be used with the default engine"
-            ))?;
+            .ok_or_else(|| {
+                delta_kernel::Error::generic(
+                    "FFIUCCommitter can only be used with the default engine",
+                )
+            })?;
         self.inner.commit(engine, actions, commit_metadata)
     }
 
