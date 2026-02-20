@@ -713,7 +713,10 @@ impl Scan {
                 .physical_stats_schema
                 .as_ref()
                 .map(|s| s.as_ref()),
-            None,
+            self.state_info
+                .physical_partition_schema
+                .as_ref()
+                .map(|s| s.as_ref()),
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result

@@ -707,7 +707,7 @@ impl LogSegment {
             (None, vec![])
         };
 
-        // Check if checkpoint has compatible stats_parsed and add it to the schema if so
+        // Check if checkpoint has compatible stats_parsed and partitionValues_parsed
         let has_stats_parsed =
             stats_schema
                 .zip(file_actions_schema.as_ref())

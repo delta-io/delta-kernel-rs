@@ -314,6 +314,13 @@ pub trait RowVisitor {
     /// engine data has different column names can manually invoke [`EngineData::visit_rows`].
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]);
 
+    /// The data types of the columns this visitor accesses. By default this returns the types
+    /// from [`RowVisitor::selected_column_names_and_types`], but visitors that dynamically expand
+    /// the column set (e.g. to include extra partition columns) can override this.
+    fn column_types(&self) -> &[DataType] {
+        self.selected_column_names_and_types().1
+    }
+
     /// Have the visitor visit the data. This will be called on a visitor passed to
     /// [`EngineData::visit_rows`]. For each leaf in the schema that was passed to `extract` a
     /// "getter" of type [`GetData`] will be present. This can be used to actually get at the data

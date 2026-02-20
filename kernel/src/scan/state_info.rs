@@ -36,9 +36,10 @@ pub(crate) struct StateInfo {
     /// the engine receives stats with physical column names (for column mapping). This
     /// logical schema maps those stats back to the table's logical column names.
     pub(crate) logical_stats_schema: Option<SchemaRef>,
-    /// Physical partition schema with native types for checkpoint partition pruning via
+    /// Physical partition schema with native types for checkpoint optimization via
     /// `partitionValues_parsed`. Fields use physical column names (for column mapping).
-    /// Only present when the table has partition columns and a predicate is provided.
+    /// Present when the table has partition columns. Used for both row-group-level
+    /// partition pruning and reading pre-typed partition values from checkpoints.
     pub(crate) physical_partition_schema: Option<SchemaRef>,
 }
 
@@ -218,13 +219,9 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build partition schema with physical names for checkpoint partition pruning.
-        // Only needed when we have a predicate and partition columns.
-        let physical_partition_schema = if !matches!(
-            physical_predicate,
-            PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
-        ) && !partition_columns.is_empty()
-        {
+        // Build partition schema with physical names for checkpoint optimization.
+        // Used for both row-group-level partition pruning and reading partitionValues_parsed.
+        let physical_partition_schema = if !partition_columns.is_empty() {
             let partition_fields: Vec<StructField> = logical_schema
                 .fields()
                 .filter(|f| partition_columns.contains(f.name()))

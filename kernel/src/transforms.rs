@@ -10,6 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+use crate::engine_data::GetData;
 use crate::expressions::{BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
@@ -193,6 +194,81 @@ pub(crate) fn get_transform_expr(
     }
 
     Ok(Arc::new(Expression::Transform(transform)))
+}
+
+/// Read a typed partition value from a `GetData` getter and return it as a `Scalar`.
+///
+/// Dispatches on the `DataType` to call the appropriate `GetData` method:
+/// - Boolean, Integer, Long, String, Binary use their respective getters directly
+/// - Date uses `get_int` (Date is stored as i32 days since epoch)
+/// - Timestamp/TimestampNtz use `get_long` (stored as i64 microseconds)
+///
+/// Returns `Scalar::Null(data_type)` if the getter returns `None` for the row.
+pub(crate) fn get_scalar_from_getter<'a>(
+    getter: &'a dyn GetData<'a>,
+    row_index: usize,
+    field_name: &str,
+    data_type: &DataType,
+) -> DeltaResult<Scalar> {
+    match *data_type {
+        DataType::BOOLEAN => match getter.get_bool(row_index, field_name)? {
+            Some(v) => Ok(Scalar::Boolean(v)),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::INTEGER => match getter.get_int(row_index, field_name)? {
+            Some(v) => Ok(Scalar::Integer(v)),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::LONG => match getter.get_long(row_index, field_name)? {
+            Some(v) => Ok(Scalar::Long(v)),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::STRING => match getter.get_str(row_index, field_name)? {
+            Some(v) => Ok(Scalar::String(v.to_string())),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::DATE => match getter.get_int(row_index, field_name)? {
+            Some(v) => Ok(Scalar::Date(v)),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::TIMESTAMP => match getter.get_long(row_index, field_name)? {
+            Some(v) => Ok(Scalar::Timestamp(v)),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::TIMESTAMP_NTZ => match getter.get_long(row_index, field_name)? {
+            Some(v) => Ok(Scalar::TimestampNtz(v)),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        DataType::BINARY => match getter.get_binary(row_index, field_name)? {
+            Some(v) => Ok(Scalar::Binary(v.to_vec())),
+            None => Ok(Scalar::Null(data_type.clone())),
+        },
+        _ => Err(Error::generic(format!(
+            "Unsupported partition column type for partitionValues_parsed: {data_type}"
+        ))),
+    }
+}
+
+/// Returns the base `DataType` used for column extraction from `partitionValues_parsed`.
+///
+/// Maps logical types to the primitive types supported by `GetData`:
+/// - Date -> Integer (both are i32)
+/// - Timestamp/TimestampNtz -> Long (both are i64)
+///
+/// Returns `None` for types not supported by partitionValues_parsed optimization,
+/// signaling the caller to fall back to string parsing.
+pub(crate) fn partition_parsed_column_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        &DataType::BOOLEAN
+        | &DataType::STRING
+        | &DataType::INTEGER
+        | &DataType::LONG
+        | &DataType::DATE
+        | &DataType::TIMESTAMP
+        | &DataType::TIMESTAMP_NTZ
+        | &DataType::BINARY => Some(data_type.clone()),
+        _ => None,
+    }
 }
 
 /// Parse a partition value from the raw string representation

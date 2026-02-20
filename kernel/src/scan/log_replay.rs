@@ -21,7 +21,10 @@ use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::transforms::{
+    get_scalar_from_getter, get_transform_expr, parse_partition_values,
+    partition_parsed_column_type, FieldTransformSpec, TransformSpec,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 use delta_kernel_derive::internal_api;
@@ -118,7 +121,6 @@ pub struct ScanLogReplayProcessor {
     /// Skip reading file statistics.
     skip_stats: bool,
     /// Whether checkpoint batches have compatible `partitionValues_parsed` columns.
-    #[allow(unused)]
     has_partition_values_parsed: bool,
 }
 
@@ -350,6 +352,63 @@ impl ScanLogReplayProcessor {
     }
 }
 
+/// Pre-computed column info for reading partition values from `partitionValues_parsed` in
+/// checkpoint batches. When available, this avoids per-row string parsing of `partitionValues`.
+struct PartitionParsedColumns {
+    /// Per partition column: (field_index in logical schema, physical_name, data_type)
+    columns: Vec<(usize, String, DataType)>,
+    /// Column names for visit_rows: `["add.partitionValues_parsed.{col}", ...]`
+    column_names: Vec<ColumnName>,
+    /// Full types array: [base checkpoint types] + [partition column types]
+    all_types: Vec<DataType>,
+}
+
+impl PartitionParsedColumns {
+    /// Build from the transform spec and logical schema. Returns `None` if:
+    /// - There are no partition columns in the transform spec
+    /// - Any partition column has a type not supported by `get_scalar_from_getter`
+    fn try_new(state_info: &StateInfo, base_types: &[DataType]) -> Option<Self> {
+        let transform_spec = state_info.transform_spec.as_ref()?;
+
+        let mut columns = Vec::new();
+        let mut column_names = Vec::new();
+        let mut all_types: Vec<DataType> = base_types.to_vec();
+
+        for field_transform in transform_spec.iter() {
+            let field_index = match field_transform {
+                FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => *field_index,
+                _ => continue,
+            };
+
+            let field = state_info.logical_schema.field_at_index(field_index)?;
+            let physical_name = field.physical_name(state_info.column_mapping_mode);
+
+            // Check if this type is supported for direct extraction
+            let column_type = partition_parsed_column_type(field.data_type())?;
+
+            let col_name = ColumnName::new(["add", "partitionValues_parsed", physical_name]);
+
+            columns.push((
+                field_index,
+                physical_name.to_string(),
+                field.data_type().clone(),
+            ));
+            column_names.push(col_name);
+            all_types.push(column_type);
+        }
+
+        if columns.is_empty() {
+            return None;
+        }
+
+        Some(PartitionParsedColumns {
+            columns,
+            column_names,
+            all_types,
+        })
+    }
+}
+
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
@@ -360,6 +419,10 @@ struct AddRemoveDedupVisitor<D: Deduplicator> {
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    /// When set, the visitor reads typed partition values from `partitionValues_parsed` columns
+    /// instead of parsing strings from `partitionValues`. Only used for checkpoint batches
+    /// where the checkpoint has compatible `partitionValues_parsed`.
+    partition_parsed_columns: Option<PartitionParsedColumns>,
 }
 
 impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
@@ -368,6 +431,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
+        partition_parsed_columns: Option<PartitionParsedColumns>,
     ) -> AddRemoveDedupVisitor<D> {
         AddRemoveDedupVisitor {
             deduplicator,
@@ -375,6 +439,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             state_info,
             partition_filter,
             row_transform_exprs: Vec::new(),
+            partition_parsed_columns,
         }
     }
 
@@ -422,14 +487,40 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
-                    &self.state_info.logical_schema,
-                    transform,
-                    &partition_values,
-                    self.state_info.column_mapping_mode,
-                )?;
+                let partition_values = if let Some(ppc) = &self.partition_parsed_columns {
+                    // Read typed values directly from partitionValues_parsed columns.
+                    // The extra getters start after the base checkpoint getters.
+                    let base_getter_count = if self.deduplicator.is_log_batch() {
+                        10
+                    } else {
+                        6
+                    };
+                    let mut partition_values = HashMap::new();
+                    for (col_idx, (field_index, physical_name, data_type)) in
+                        ppc.columns.iter().enumerate()
+                    {
+                        let getter_idx = base_getter_count + col_idx;
+                        let scalar = get_scalar_from_getter(
+                            getters[getter_idx],
+                            i,
+                            physical_name,
+                            data_type,
+                        )?;
+                        partition_values.insert(*field_index, (physical_name.clone(), scalar));
+                    }
+                    partition_values
+                } else {
+                    // Fall back to string map + parse_partition_values
+                    let partition_values = getters
+                        [ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                        .get(i, "add.partitionValues")?;
+                    parse_partition_values(
+                        &self.state_info.logical_schema,
+                        transform,
+                        &partition_values,
+                        self.state_info.column_mapping_mode,
+                    )?
+                };
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -466,30 +557,33 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
     }
 }
 
+/// Column names and types for the deduplication visitor. The first 6 entries are the base
+/// add-action columns (path, partitionValues, DV fields, baseRowId). The remaining 4 entries
+/// are for remove-action columns (path, DV fields) used only for log (commit) batches.
+static DEDUP_VISITOR_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    const STRING: DataType = DataType::STRING;
+    const INTEGER: DataType = DataType::INTEGER;
+    const LONG: DataType = DataType::LONG;
+    let ss_map: DataType = MapType::new(STRING, STRING, true).into();
+    let types_and_names = vec![
+        (STRING, column_name!("add.path")),
+        (ss_map, column_name!("add.partitionValues")),
+        (STRING, column_name!("add.deletionVector.storageType")),
+        (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+        (INTEGER, column_name!("add.deletionVector.offset")),
+        (LONG, column_name!("add.baseRowId")),
+        (STRING, column_name!("remove.path")),
+        (STRING, column_name!("remove.deletionVector.storageType")),
+        (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
+        (INTEGER, column_name!("remove.deletionVector.offset")),
+    ];
+    let (types, names) = types_and_names.into_iter().unzip();
+    (names, types).into()
+});
+
 impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            const STRING: DataType = DataType::STRING;
-            const INTEGER: DataType = DataType::INTEGER;
-            const LONG: DataType = DataType::LONG;
-            let ss_map: DataType = MapType::new(STRING, STRING, true).into();
-            let types_and_names = vec![
-                (STRING, column_name!("add.path")),
-                (ss_map, column_name!("add.partitionValues")),
-                (STRING, column_name!("add.deletionVector.storageType")),
-                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
-                (INTEGER, column_name!("add.deletionVector.offset")),
-                (LONG, column_name!("add.baseRowId")),
-                (STRING, column_name!("remove.path")),
-                (STRING, column_name!("remove.deletionVector.storageType")),
-                (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
-                (INTEGER, column_name!("remove.deletionVector.offset")),
-            ];
-            let (types, names) = types_and_names.into_iter().unzip();
-            (names, types).into()
-        });
-        let (names, types) = NAMES_AND_TYPES.as_ref();
+        let (names, types) = DEDUP_VISITOR_NAMES_AND_TYPES.as_ref();
         if self.deduplicator.is_log_batch() {
             (names, types)
         } else {
@@ -499,14 +593,45 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
         }
     }
 
+    fn column_types(&self) -> &[DataType] {
+        // When we have partition_parsed_columns, return the expanded type list that includes
+        // the extra partition column types.
+        match &self.partition_parsed_columns {
+            Some(ppc) => &ppc.all_types,
+            None => self.selected_column_names_and_types().1,
+        }
+    }
+
+    fn visit_rows_of(&mut self, data: &dyn crate::EngineData) -> DeltaResult<()>
+    where
+        Self: Sized,
+    {
+        match &self.partition_parsed_columns {
+            Some(ppc) => {
+                // Build expanded column names: base names + partition column names.
+                let (base_names, _) = self.selected_column_names_and_types();
+                let mut all_names: Vec<ColumnName> = base_names.to_vec();
+                all_names.extend(ppc.column_names.iter().cloned());
+                data.visit_rows(&all_names, self)
+            }
+            None => data.visit_rows(self.selected_column_names_and_types().0, self),
+        }
+    }
+
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 10 } else { 6 };
+        let base_getters = if is_log_batch { 10 } else { 6 };
+        let extra_getters = self
+            .partition_parsed_columns
+            .as_ref()
+            .map_or(0, |ppc| ppc.columns.len());
+        let expected_getters = base_getters + extra_getters;
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
-                "Wrong number of AddRemoveDedupVisitor getters: {}",
-                getters.len()
+                "Wrong number of AddRemoveDedupVisitor getters: {} (expected {})",
+                getters.len(),
+                expected_getters
             ))
         );
 
@@ -695,6 +820,15 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         );
 
         // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
+        // Build PartitionParsedColumns for checkpoint batches when partitionValues_parsed
+        // is available, to avoid per-row string parsing of partition values.
+        let partition_parsed_columns = if self.has_partition_values_parsed {
+            // Checkpoint batch types start with 6 base fields (no remove columns)
+            let base_types = &DEDUP_VISITOR_NAMES_AND_TYPES.as_ref().1[..6];
+            PartitionParsedColumns::try_new(&self.state_info, base_types)
+        } else {
+            None
+        };
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
@@ -705,6 +839,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            partition_parsed_columns,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -765,6 +900,14 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         );
 
         // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
+        // Build PartitionParsedColumns for checkpoint batches when partitionValues_parsed
+        // is available, to avoid per-row string parsing of partition values.
+        let partition_parsed_columns = if !is_log_batch && self.has_partition_values_parsed {
+            let base_types = &DEDUP_VISITOR_NAMES_AND_TYPES.as_ref().1[..6];
+            PartitionParsedColumns::try_new(&self.state_info, base_types)
+        } else {
+            None
+        };
         let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
             is_log_batch,
@@ -778,6 +921,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            partition_parsed_columns,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
