@@ -62,7 +62,8 @@ fn test_get_stat_values() {
         column_pred!("chrono.timestamp"),
         column_pred!("chrono.timestamp_ntz"),
     ]);
-    let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
+    let mut filter = RowGroupFilter::new(metadata.metadata().row_group(0));
+    filter.prepare_stats(columns.references());
 
     assert_eq!(filter.get_rowcount_stat(), Some(5i64.into()));
 
