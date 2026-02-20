@@ -999,12 +999,14 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 #[rstest]
 #[case::comparison(
     Pred::gt(column_expr!("id"), Expr::literal(200i64)),
-    Some(3),
+    // Should skip RG2 and RG3, but https://github.com/apache/arrow-rs/issues/9451
+    Some(6), // Some(3),
     "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
     Pred::is_null(column_expr!("id")),
-    Some(5),
+    // Should skip RG 1 (nullCount=0), but https://github.com/apache/arrow-rs/issues/9451
+    Some(6), // Some(5),
     "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(
