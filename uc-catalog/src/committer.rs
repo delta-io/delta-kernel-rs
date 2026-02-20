@@ -3,7 +3,7 @@ use std::sync::Arc;
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use uc_client::models::commits::{Commit, CommitRequest};
-use uc_client::UCCommitsClient;
+use uc_client::UCCommitClient;
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
@@ -13,12 +13,12 @@ use uc_client::UCCommitsClient;
 /// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
-pub struct UCCommitter<C: UCCommitsClient> {
+pub struct UCCommitter<C: UCCommitClient> {
     commits_client: Arc<C>,
     table_id: String,
 }
 
-impl<C: UCCommitsClient> UCCommitter<C> {
+impl<C: UCCommitClient> UCCommitter<C> {
     /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the given
     /// `table_id`.
     pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
@@ -29,7 +29,7 @@ impl<C: UCCommitsClient> UCCommitter<C> {
     }
 }
 
-impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
+impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC. UC's committer elects to write out a
     /// staged commit for the actions then call the UC commit API to 'finalize' (ratify) the staged
     /// commit. Note that this will accumulate staged commits, and separately clients are expected
@@ -129,14 +129,10 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use std::fs;
     use uc_client::error::Result;
-    use uc_client::models::commits::{CommitsRequest, CommitsResponse};
 
     struct MockCommitsClient;
 
-    impl UCCommitsClient for MockCommitsClient {
-        async fn get_commits(&self, _: CommitsRequest) -> Result<CommitsResponse> {
-            unimplemented!()
-        }
+    impl UCCommitClient for MockCommitsClient {
         async fn commit(&self, _: CommitRequest) -> Result<()> {
             unimplemented!()
         }
