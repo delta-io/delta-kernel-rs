@@ -188,6 +188,45 @@ mod tests {
         );
     }
 
+    /// scan_domain_metadatas returns the correct metadata for a single requested domain.
+    #[tokio::test]
+    async fn test_scan_domain_metadatas_one() {
+        let (engine, snapshot) = build_two_commit_log();
+        let result = snapshot
+            .log_segment()
+            .scan_domain_metadatas(Some(&HashSet::from(["domainA"])), &engine)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["domainA"].configuration(), "cfgA");
+    }
+
+    /// scan_domain_metadatas returns the correct metadata for a specific subset of domains.
+    #[tokio::test]
+    async fn test_scan_domain_metadatas_subset() {
+        let (engine, snapshot) = build_two_commit_log();
+        let result = snapshot
+            .log_segment()
+            .scan_domain_metadatas(Some(&HashSet::from(["domainA", "domainC"])), &engine)
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["domainA"].configuration(), "cfgA");
+        assert_eq!(result["domainC"].configuration(), "cfgC");
+    }
+
+    /// scan_domain_metadatas with no filter returns all domains across all commits.
+    #[tokio::test]
+    async fn test_scan_domain_metadatas_all() {
+        let (engine, snapshot) = build_two_commit_log();
+        let result = snapshot
+            .log_segment()
+            .scan_domain_metadatas(None, &engine)
+            .unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result["domainA"].configuration(), "cfgA");
+        assert_eq!(result["domainB"].configuration(), "cfgB");
+        assert_eq!(result["domainC"].configuration(), "cfgC");
+    }
+
     /// Proves that when requested domains span two commits, both batches ARE consumed
     /// (i.e., we don't terminate early until all N domains are found).
     #[tokio::test]

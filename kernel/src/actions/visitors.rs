@@ -1,6 +1,7 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -499,11 +500,15 @@ impl RowVisitor for DomainMetadataVisitor {
                 // if caller requested specific domains then only visit matches
                 let filter = self.domain_filter.as_ref();
                 if filter.is_none_or(|requested| requested.contains(&domain)) {
-                    let domain_metadata =
-                        DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
-                    self.domain_metadatas
-                        .entry(domain)
-                        .or_insert(domain_metadata);
+                    // Since batches are visited newest-first, a domain already present in
+                    // domain_metadatas was found in a newer commit and takes precedence.
+                    // Use Entry::Vacant so we only read configuration/removed when the
+                    // slot is actually empty, avoiding unnecessary field access.
+                    if let Entry::Vacant(entry) = self.domain_metadatas.entry(domain.clone()) {
+                        let domain_metadata =
+                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)?;
+                        entry.insert(domain_metadata);
+                    }
                 }
             }
         }
