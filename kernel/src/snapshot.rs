@@ -649,7 +649,7 @@ impl Snapshot {
         );
 
         require!(
-            self.table_configuration().protocol().is_catalog_managed(),
+            self.table_configuration().is_catalog_managed(),
             Error::generic(
                 "There are catalog commits that need publishing, but the table is not catalog-managed.",
             )

@@ -334,8 +334,7 @@ impl Metadata {
     }
 
     #[internal_api]
-    #[allow(dead_code)]
-    pub(crate) fn partition_columns(&self) -> &Vec<String> {
+    pub(crate) fn partition_columns(&self) -> &[String] {
         &self.partition_columns
     }
 
@@ -604,11 +603,6 @@ impl Protocol {
         // Since each reader features is a subset of writer features, we only check writer feature
         self.writer_features()
             .is_some_and(|features| features.contains(feature))
-    }
-
-    pub(crate) fn is_catalog_managed(&self) -> bool {
-        self.has_table_feature(&TableFeature::CatalogManaged)
-            || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
 
     #[cfg(test)]

@@ -162,9 +162,13 @@ pub(crate) mod test_utils {
     };
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::table_features::ColumnMappingMode;
+    use crate::transaction::create_table::create_table;
+    use crate::transaction::{CreateTable, Transaction};
     use crate::{DeltaResult, EngineData, Error, SnapshotRef};
     use crate::{Engine, Snapshot};
 
@@ -186,7 +190,8 @@ pub(crate) mod test_utils {
     }
 
     use crate::schema::{
-        DataType as KernelDataType, PrimitiveType, SchemaRef, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue,
+        PrimitiveType, SchemaRef, StructField, StructType,
     };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
@@ -368,6 +373,318 @@ pub(crate) mod test_utils {
             get_schema_field(protocol_struct, "minWriterVersion").data_type(),
             &KernelDataType::Primitive(PrimitiveType::Integer)
         );
+    }
+
+    // ==================== Test schema helpers ====================
+    //
+    // Reusable test schemas
+    // Each variant exists with and without column mapping metadata.
+
+    /// Helper to add column mapping metadata to a [`StructField`].
+    fn with_column_mapping(field: StructField, id: i64, physical_name: &str) -> StructField {
+        field.with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical_name.into()),
+            ),
+        ])
+    }
+
+    /// Flat schema: `[id: long, name: string]`
+    pub(crate) fn test_schema_flat() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, false),
+            StructField::nullable("name", KernelDataType::STRING),
+        ]))
+    }
+
+    /// Flat schema with column mapping metadata.
+    pub(crate) fn test_schema_flat_with_column_mapping() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, false),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable("name", KernelDataType::STRING),
+                2,
+                "phys_name",
+            ),
+        ]))
+    }
+
+    /// Nested struct schema with array and map inside the struct
+    pub(crate) fn test_schema_nested() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, false),
+            StructField::nullable(
+                "info",
+                StructType::new_unchecked([
+                    StructField::nullable("name", KernelDataType::STRING),
+                    StructField::nullable("age", KernelDataType::INTEGER),
+                    StructField::nullable(
+                        "tags",
+                        MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+                    ),
+                    StructField::nullable("scores", ArrayType::new(KernelDataType::INTEGER, true)),
+                ]),
+            ),
+        ]))
+    }
+
+    /// Nested struct schema with column mapping metadata.
+    pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, false),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable(
+                    "info",
+                    StructType::new_unchecked([
+                        with_column_mapping(
+                            StructField::nullable("name", KernelDataType::STRING),
+                            3,
+                            "phys_name",
+                        ),
+                        with_column_mapping(
+                            StructField::nullable("age", KernelDataType::INTEGER),
+                            4,
+                            "phys_age",
+                        ),
+                        with_column_mapping(
+                            StructField::nullable(
+                                "tags",
+                                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+                            ),
+                            5,
+                            "phys_tags",
+                        ),
+                        with_column_mapping(
+                            StructField::nullable(
+                                "scores",
+                                ArrayType::new(KernelDataType::INTEGER, true),
+                            ),
+                            6,
+                            "phys_scores",
+                        ),
+                    ]),
+                ),
+                2,
+                "phys_info",
+            ),
+        ]))
+    }
+
+    /// Schema with a map
+    pub(crate) fn test_schema_with_map() -> SchemaRef {
+        let value_struct = StructType::new_unchecked([
+            StructField::nullable("key", KernelDataType::STRING),
+            StructField::nullable("value", KernelDataType::INTEGER),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, false),
+            StructField::nullable(
+                "entries",
+                MapType::new(
+                    KernelDataType::STRING,
+                    KernelDataType::Struct(Box::new(value_struct)),
+                    true,
+                ),
+            ),
+            StructField::nullable("name", KernelDataType::STRING),
+        ]))
+    }
+
+    /// Schema with a map and column mapping metadata.
+    pub(crate) fn test_schema_with_map_and_column_mapping() -> SchemaRef {
+        let value_struct = StructType::new_unchecked([
+            with_column_mapping(
+                StructField::nullable("key", KernelDataType::STRING),
+                4,
+                "phys_key",
+            ),
+            with_column_mapping(
+                StructField::nullable("value", KernelDataType::INTEGER),
+                5,
+                "phys_value",
+            ),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, false),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable(
+                    "entries",
+                    MapType::new(
+                        KernelDataType::STRING,
+                        KernelDataType::Struct(Box::new(value_struct)),
+                        true,
+                    ),
+                ),
+                2,
+                "phys_entries",
+            ),
+            with_column_mapping(
+                StructField::nullable("name", KernelDataType::STRING),
+                3,
+                "phys_name",
+            ),
+        ]))
+    }
+
+    /// Schema with an array
+    pub(crate) fn test_schema_with_array() -> SchemaRef {
+        let item_struct = StructType::new_unchecked([
+            StructField::nullable("label", KernelDataType::STRING),
+            StructField::nullable("count", KernelDataType::INTEGER),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            StructField::new("id", KernelDataType::LONG, false),
+            StructField::nullable(
+                "items",
+                ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+            ),
+            StructField::nullable("name", KernelDataType::STRING),
+        ]))
+    }
+
+    /// Schema with an array and column mapping metadata.
+    pub(crate) fn test_schema_with_array_and_column_mapping() -> SchemaRef {
+        let item_struct = StructType::new_unchecked([
+            with_column_mapping(
+                StructField::nullable("label", KernelDataType::STRING),
+                4,
+                "phys_label",
+            ),
+            with_column_mapping(
+                StructField::nullable("count", KernelDataType::INTEGER),
+                5,
+                "phys_count",
+            ),
+        ]);
+        Arc::new(StructType::new_unchecked([
+            with_column_mapping(
+                StructField::new("id", KernelDataType::LONG, false),
+                1,
+                "phys_id",
+            ),
+            with_column_mapping(
+                StructField::nullable(
+                    "items",
+                    ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
+                ),
+                2,
+                "phys_items",
+            ),
+            with_column_mapping(
+                StructField::nullable("name", KernelDataType::STRING),
+                3,
+                "phys_name",
+            ),
+        ]))
+    }
+
+    /// Build a create-table transaction with the given schema and column mapping mode.
+    /// Returns the engine and uncommitted transaction.
+    pub(crate) fn setup_column_mapping_txn(
+        schema: SchemaRef,
+        mode: ColumnMappingMode,
+    ) -> DeltaResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+        let mode_str = match mode {
+            ColumnMappingMode::Name => "name",
+            ColumnMappingMode::Id => "id",
+            ColumnMappingMode::None => "none",
+        };
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+
+        let txn = create_table("memory:///test_table", schema, "DefaultEngine")
+            .with_table_properties([("delta.columnMapping.mode", mode_str)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        Ok((engine, txn))
+    }
+
+    /// Validate that a physical schema matches the logical schema's column mapping metadata.
+    /// For Name/Id modes, checks physicalName, columnMapping.id, and parquet.field.id on
+    /// each field. For None mode, only checks field names match.
+    pub(crate) fn validate_physical_schema_column_mapping(
+        logical_schema: &StructType,
+        physical_schema: &StructType,
+        mode: ColumnMappingMode,
+    ) {
+        assert_eq!(
+            physical_schema.fields().count(),
+            logical_schema.fields().count()
+        );
+
+        // Collect expected (physical_name, field_id) from logical schema
+        let expected: Vec<_> = logical_schema
+            .fields()
+            .map(|f| {
+                let physical_name =
+                    match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                        Some(MetadataValue::String(name)) => name.clone(),
+                        _ if mode == ColumnMappingMode::None => f.name().to_string(),
+                        _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
+                    };
+                let field_id = match f.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                    Some(MetadataValue::Number(id)) => *id,
+                    _ if mode == ColumnMappingMode::None => -1,
+                    _ => panic!(
+                        "Logical field '{}' missing columnMapping.id metadata",
+                        f.name()
+                    ),
+                };
+                (physical_name, field_id)
+            })
+            .collect();
+
+        // Validate each physical field against expected values
+        for (physical_field, (expected_name, expected_id)) in
+            physical_schema.fields().zip(expected.iter())
+        {
+            assert_eq!(
+                physical_field.name(),
+                expected_name,
+                "Physical field name mismatch"
+            );
+
+            if mode == ColumnMappingMode::None {
+                continue;
+            }
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+                Some(&MetadataValue::String(expected_name.clone())),
+                "columnMapping.physicalName mismatch for '{}'",
+                physical_field.name()
+            );
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "columnMapping.id mismatch for '{}'",
+                physical_field.name()
+            );
+
+            assert_eq!(
+                physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                Some(&MetadataValue::Number(*expected_id)),
+                "parquet.field.id mismatch for '{}'",
+                physical_field.name()
+            );
+        }
     }
 
     /// Load a test table from tests/data directory.
