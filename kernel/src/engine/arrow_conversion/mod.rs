@@ -426,7 +426,10 @@ mod tests {
 
         // And back to kernel
         let kernel_schema = StructType::try_from_arrow(&arrow_schema)?;
-        assert_eq!(kernel_schema.field("void_col").unwrap().data_type, DataType::VOID);
+        assert_eq!(
+            kernel_schema.field("void_col").unwrap().data_type,
+            DataType::VOID
+        );
 
         Ok(())
     }
