@@ -17,7 +17,7 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -435,8 +435,14 @@ pub enum Expression {
     Column(ColumnName),
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
-    /// A struct computed from a Vec of expressions
-    Struct(Vec<ExpressionRef>),
+    /// A struct computed from a Vec of expressions with optional schema.
+    /// When schema is provided, field names come from the schema; otherwise they're inferred from context.
+    /// The optional nullability predicate, if provided and evaluates to false/null, makes the entire struct null.
+    Struct(
+        Vec<ExpressionRef>,
+        Option<Box<StructType>>,
+        Option<ExpressionRef>,
+    ),
     /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
     Transform(Transform),
@@ -624,9 +630,45 @@ impl Expression {
         }
     }
 
-    /// Create a new struct expression
+    /// Create a new struct expression.
+    ///
+    /// The field names and types are supplied by the caller at evaluation time via the
+    /// `result_type` parameter of the expression evaluator. Use this when the schema is
+    /// always available from external context (e.g. the expression is the top-level output
+    /// of [`ExpressionEvaluator`]).
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
-        Self::Struct(exprs.into_iter().map(Into::into).collect())
+        Self::Struct(exprs.into_iter().map(Into::into).collect(), None, None)
+    }
+
+    /// Create a new struct expression with an explicit embedded schema.
+    ///
+    /// Prefer this over [`Self::struct_from`] when the struct may be evaluated without an
+    /// external `result_type` — for example, when it is an inner expression passed to
+    /// [`UnaryExpressionOp::ToJson`].
+    pub fn struct_with_schema_from(
+        exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>,
+        schema: StructType,
+    ) -> Self {
+        Self::Struct(
+            exprs.into_iter().map(Into::into).collect(),
+            Some(Box::new(schema)),
+            None,
+        )
+    }
+
+    /// Create a new struct expression with a nullability predicate.
+    ///
+    /// When the predicate evaluates to false or null for a row, the entire struct is null
+    /// for that row.
+    pub fn struct_with_nullability_from(
+        exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>,
+        nullability_predicate: impl Into<Arc<Self>>,
+    ) -> Self {
+        Self::Struct(
+            exprs.into_iter().map(Into::into).collect(),
+            None,
+            Some(nullability_predicate.into()),
+        )
     }
 
     /// Create a new transform expression
@@ -943,7 +985,7 @@ impl Display for Expression {
             Literal(l) => write!(f, "{l}"),
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
-            Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
+            Struct(exprs, _, _) => write!(f, "Struct({})", format_child_list(exprs)),
             Transform(transform) => {
                 write!(f, "Transform(")?;
                 let mut sep = "";
