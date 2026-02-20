@@ -635,7 +635,7 @@ impl Expression {
     /// The field names and types are supplied by the caller at evaluation time via the
     /// `result_type` parameter of the expression evaluator. Use this when the schema is
     /// always available from external context (e.g. the expression is the top-level output
-    /// of [`ExpressionEvaluator`]).
+    /// of [`crate::ExpressionEvaluator`]).
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
         Self::Struct(exprs.into_iter().map(Into::into).collect(), None, None)
     }
