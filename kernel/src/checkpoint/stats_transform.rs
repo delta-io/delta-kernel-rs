@@ -1,5 +1,4 @@
-#![allow(dead_code)] // TODO: Remove when integrated in checkpoint_data()
-//! Transforms for populating `stats_parsed` and `stats` fields on the `Add` action in checkpoint data.
+//! Transforms for populating stats_parsed and stats fields in checkpoint data.
 //!
 //! This module ensures that Add actions in checkpoints have the correct statistics format
 //! based on the table configuration. Statistics can be stored in two formats as fields on
@@ -67,7 +66,7 @@ impl StatsTransformConfig {
 /// [`expected_stats_schema`]: crate::scan::data_skipping::stats_schema::expected_stats_schema
 pub(crate) fn build_stats_transform(
     config: &StatsTransformConfig,
-    stats_schema: SchemaRef,
+    stats_schema: &SchemaRef,
 ) -> ExpressionRef {
     let mut add_transform = Transform::new_nested([ADD_NAME]);
 
@@ -157,10 +156,13 @@ pub(crate) fn build_checkpoint_output_schema(
 ///
 /// Column paths are relative to the full batch (not the nested Add struct), so we use
 /// ["add", "stats"] instead of just ["stats"].
-fn build_stats_parsed_expr(stats_schema: SchemaRef) -> ExpressionRef {
+fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
         Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
-        Expression::parse_json(Expression::column([ADD_NAME, STATS_FIELD]), stats_schema),
+        Expression::parse_json(
+            Expression::column([ADD_NAME, STATS_FIELD]),
+            stats_schema.clone(),
+        ),
     ]))
 }
 
@@ -371,7 +373,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -397,7 +399,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -418,7 +420,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -442,7 +444,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 

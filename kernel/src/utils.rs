@@ -276,6 +276,7 @@ pub(crate) mod test_utils {
     }
 
     // TODO: allow tests to pass in context (issue#1133)
+    #[track_caller]
     pub(crate) fn assert_result_error_with_message<T, E: ToString>(
         res: Result<T, E>,
         message: &str,
