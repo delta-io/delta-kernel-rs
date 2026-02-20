@@ -114,7 +114,7 @@ pub fn transform_to_logical(
 }
 
 /// A `ScanFile` represents information about one file that needs to be scanned to read a table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanFile {
     /// Path to the file
     pub path: String,
