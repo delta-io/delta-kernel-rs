@@ -1,5 +1,6 @@
 //! Conversions from kernel schema types to arrow schema types.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::arrow::datatypes::{
@@ -7,17 +8,47 @@ use crate::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use itertools::Itertools;
 
 use crate::error::Error;
 use crate::schema::{
-    ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+    StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
 pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
 pub(crate) const MAP_KEY_DEFAULT: &str = "key";
 pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
+
+/// Converts kernel [`StructField`] metadata to Arrow field metadata format.
+///
+/// Specifically, this transforms the `"parquet.field.id"` key (used by kernel/delta-spark) to
+/// `"PARQUET:field_id"` (the native Parquet/Arrow metadata key), enabling correct field ID
+/// handling by the Arrow/Parquet writer.
+pub(crate) fn kernel_metadata_to_arrow_metadata(
+    field: &StructField,
+) -> Result<HashMap<String, String>, ArrowError> {
+    field
+        .metadata()
+        .iter()
+        .map(|(key, val)| {
+            let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
+                PARQUET_FIELD_ID_META_KEY.to_string()
+            } else {
+                key.clone()
+            };
+            match val {
+                MetadataValue::String(s) => Ok((transformed_key, s.clone())),
+                _ => Ok((
+                    transformed_key,
+                    serde_json::to_string(val).map_err(|e| ArrowError::JsonError(e.to_string()))?,
+                )),
+            }
+        })
+        .collect()
+}
 
 /// Convert a kernel type into an arrow type (automatically implemented for all types that
 /// implement [`TryFromKernel`])
@@ -70,16 +101,7 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let metadata = f
-            .metadata()
-            .iter()
-            .map(|(key, val)| match &val {
-                &MetadataValue::String(val) => Ok((key.clone(), val.clone())),
-                _ => Ok((key.clone(), serde_json::to_string(val)?)),
-            })
-            .collect::<Result<_, serde_json::Error>>()
-            .map_err(|err| ArrowError::JsonError(err.to_string()))?;
-
+        let metadata = kernel_metadata_to_arrow_metadata(f)?;
         let field = ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
             .with_metadata(metadata);
 
@@ -204,7 +226,15 @@ impl TryFromArrow<&ArrowField> for StructField {
             DataType::try_from_arrow(arrow_field.data_type())?,
             arrow_field.is_nullable(),
         )
-        .with_metadata(arrow_field.metadata().iter().map(|(k, v)| (k.clone(), v))))
+        .with_metadata(arrow_field.metadata().iter().map(|(k, v)| {
+            // Transform "PARQUET:field_id" to "parquet.field.id" when reading from Parquet
+            let transformed_key = if k == PARQUET_FIELD_ID_META_KEY {
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string()
+            } else {
+                k.clone()
+            };
+            (transformed_key, v)
+        })))
     }
 }
 
@@ -308,10 +338,12 @@ mod tests {
     use super::*;
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
-    use crate::{
-        schema::{DataType, StructField},
-        DeltaResult,
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaTransform,
+        StructField, StructType,
     };
+    use crate::DeltaResult;
     use std::collections::HashMap;
 
     #[test]
@@ -345,6 +377,237 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Incorrect Variant Schema"));
+        Ok(())
+    }
+
+    /// Helper visitor to collect all field IDs from a kernel StructType
+    struct FieldIdCollector {
+        field_ids: Vec<(String, String)>, // (field_name, field_id)
+    }
+
+    impl FieldIdCollector {
+        fn new() -> Self {
+            Self {
+                field_ids: Vec::new(),
+            }
+        }
+    }
+
+    impl<'a> crate::schema::SchemaTransform<'a> for FieldIdCollector {
+        fn transform_struct_field(
+            &mut self,
+            field: &'a crate::schema::StructField,
+        ) -> Option<std::borrow::Cow<'a, crate::schema::StructField>> {
+            // Collect field ID if present
+            if let Some(field_id) = field
+                .metadata()
+                .get(crate::schema::ColumnMetadataKey::ParquetFieldId.as_ref())
+            {
+                self.field_ids
+                    .push((field.name().to_string(), field_id.to_string()));
+            }
+            // Recurse into nested types
+            self.recurse_into_struct_field(field)
+        }
+    }
+
+    /// Helper function to recursively collect field IDs from an Arrow schema
+    fn collect_arrow_field_ids(schema: &ArrowSchema, metadata_key: &str) -> Vec<(String, String)> {
+        let mut field_ids = Vec::new();
+
+        fn collect_from_fields(
+            fields: &[std::sync::Arc<ArrowField>],
+            metadata_key: &str,
+            field_ids: &mut Vec<(String, String)>,
+        ) {
+            for field in fields {
+                collect_from_field(field, metadata_key, field_ids);
+            }
+        }
+
+        fn collect_from_field(
+            field: &ArrowField,
+            metadata_key: &str,
+            field_ids: &mut Vec<(String, String)>,
+        ) {
+            // Collect field ID from this field
+            if let Some(id) = field.metadata().get(metadata_key) {
+                field_ids.push((field.name().clone(), id.clone()));
+            }
+
+            // Recurse into nested types
+            match field.data_type() {
+                ArrowDataType::Struct(fields) => {
+                    collect_from_fields(fields, metadata_key, field_ids);
+                }
+                ArrowDataType::List(element)
+                | ArrowDataType::LargeList(element)
+                | ArrowDataType::FixedSizeList(element, _) => {
+                    collect_from_field(element, metadata_key, field_ids);
+                }
+                ArrowDataType::Map(entry_field, _) => {
+                    collect_from_field(entry_field, metadata_key, field_ids);
+                }
+                _ => {}
+            }
+        }
+
+        collect_from_fields(schema.fields(), metadata_key, &mut field_ids);
+        field_ids
+    }
+
+    #[test]
+    fn test_recursive_field_id_transformation() -> DeltaResult<()> {
+        // Create a complex nested structure with field IDs at multiple levels:
+        // top_struct {
+        //   simple_field: int (field_id=1)
+        //   nested_struct: struct { (field_id=2)
+        //     inner_field: string (field_id=3)
+        //   }
+        //   array_field: array<struct { (field_id=4)
+        //     array_item: int (field_id=5)
+        //   }>
+        //   map_field: map<struct { (field_id=6)
+        //     map_key_field: string (field_id=7)
+        //   }, struct {
+        //     map_value_field: int (field_id=8)
+        //   }>
+        // }
+
+        // Build nested struct
+        let inner_struct_type = StructType::try_new(vec![StructField::new(
+            "inner_field",
+            DataType::STRING,
+            false,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(3),
+        )])])?;
+
+        // Build array element struct
+        let array_item_struct = StructType::try_new(vec![StructField::new(
+            "array_item",
+            DataType::INTEGER,
+            false,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(5),
+        )])])?;
+        let array_type = ArrayType::new(DataType::Struct(Box::new(array_item_struct)), false);
+
+        // Build map with struct key and struct value (both with field IDs)
+        let map_key_struct = StructType::try_new(vec![StructField::new(
+            "map_key_field",
+            DataType::STRING,
+            false,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(7),
+        )])])?;
+        let map_value_struct = StructType::try_new(vec![StructField::new(
+            "map_value_field",
+            DataType::INTEGER,
+            false,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(8),
+        )])])?;
+        let map_type = MapType::new(
+            DataType::Struct(Box::new(map_key_struct)),
+            DataType::Struct(Box::new(map_value_struct)),
+            false,
+        );
+
+        // Build top-level struct
+        let top_struct = StructType::try_new(vec![
+            StructField::new("simple_field", DataType::INTEGER, false).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(1),
+            )]),
+            StructField::new(
+                "nested_struct",
+                DataType::Struct(Box::new(inner_struct_type)),
+                false,
+            )
+            .with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(2),
+            )]),
+            StructField::new("array_field", DataType::Array(Box::new(array_type)), false)
+                .with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(4),
+                )]),
+            StructField::new("map_field", DataType::Map(Box::new(map_type)), false).with_metadata(
+                [(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(6),
+                )],
+            ),
+        ])?;
+
+        // Convert to Arrow schema
+        let arrow_schema = ArrowSchema::try_from_kernel(&top_struct)?;
+
+        // Verify field IDs are transformed to PARQUET:field_id at all levels using helper function
+        let arrow_field_ids: HashMap<String, String> =
+            collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY)
+                .into_iter()
+                .collect();
+
+        // Expected field IDs in Arrow format (PARQUET:field_id)
+        let expected_arrow_ids: HashMap<String, String> = [
+            ("simple_field", "1"),
+            ("nested_struct", "2"),
+            ("inner_field", "3"),
+            ("array_field", "4"),
+            ("array_item", "5"),
+            ("map_field", "6"),
+            ("map_key_field", "7"),
+            ("map_value_field", "8"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        assert_eq!(
+            arrow_field_ids, expected_arrow_ids,
+            "All field IDs should be transformed to PARQUET:field_id"
+        );
+
+        // Test reverse transformation: Arrow -> Kernel using visitor
+        let kernel_struct = StructType::try_from_arrow(&arrow_schema)?;
+
+        // Use visitor to collect all field IDs from the kernel struct
+        let mut collector = FieldIdCollector::new();
+        let _ = collector.transform_struct(&kernel_struct);
+
+        // Verify all 8 field IDs were transformed back to parquet.field.id
+        let kernel_field_ids: HashMap<String, String> = collector.field_ids.into_iter().collect();
+
+        let expected_kernel_ids: HashMap<String, String> = [
+            ("simple_field", "1"),
+            ("nested_struct", "2"),
+            ("inner_field", "3"),
+            ("array_field", "4"),
+            ("array_item", "5"),
+            ("map_field", "6"),
+            ("map_key_field", "7"),
+            ("map_value_field", "8"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        assert_eq!(
+            kernel_field_ids, expected_kernel_ids,
+            "All field IDs should be transformed back to parquet.field.id"
+        );
+
         Ok(())
     }
 }

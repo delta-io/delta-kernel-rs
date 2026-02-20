@@ -1151,7 +1151,7 @@ mod tests {
         array::AsArray,
         buffer::{OffsetBuffer, ScalarBuffer},
     };
-
+    use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
@@ -1628,20 +1628,15 @@ mod tests {
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask = vec![0, 1];
-            let expected_arrow_metadata = requested_schema
+            let expected_arrow_field = requested_schema
                 .field(parquet_name(1, mode))
                 .unwrap()
-                .metadata_with_string_values();
+                .try_into_arrow()
+                .unwrap();
             let expect_reorder = vec![
                 ReorderIndex::identity(0),
                 ReorderIndex::identity(2),
-                ReorderIndex::missing(
-                    1,
-                    Arc::new(
-                        ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
-                            .with_metadata(expected_arrow_metadata),
-                    ),
-                ),
+                ReorderIndex::missing(1, Arc::new(expected_arrow_field)),
             ];
             assert_eq!(mask_indices, expect_mask);
             assert_eq!(reorder_indices, expect_reorder);
@@ -1667,20 +1662,15 @@ mod tests {
         let (mask_indices, reorder_indices) =
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
         let expect_mask = vec![0, 1];
-        let expected_arrow_metadata = requested_schema
+        let expected_arrow_field = requested_schema
             .field("s_physical")
             .unwrap()
-            .metadata_with_string_values();
+            .try_into_arrow()
+            .unwrap();
         let expect_reorder = vec![
             ReorderIndex::identity(0),
             ReorderIndex::identity(2),
-            ReorderIndex::missing(
-                1,
-                Arc::new(
-                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
-                        .with_metadata(expected_arrow_metadata),
-                ),
-            ),
+            ReorderIndex::missing(1, Arc::new(expected_arrow_field)),
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
@@ -1705,20 +1695,15 @@ mod tests {
         let (mask_indices, reorder_indices) =
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
         let expect_mask = vec![0, 1];
-        let expected_arrow_metadata = requested_schema
+        let expected_arrow_field = requested_schema
             .field("s_physical")
             .unwrap()
-            .metadata_with_string_values();
+            .try_into_arrow()
+            .unwrap();
         let expect_reorder = vec![
             ReorderIndex::identity(0),
             ReorderIndex::identity(2),
-            ReorderIndex::missing(
-                1,
-                Arc::new(
-                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
-                        .with_metadata(expected_arrow_metadata),
-                ),
-            ),
+            ReorderIndex::missing(1, Arc::new(expected_arrow_field)),
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
@@ -2851,17 +2836,12 @@ mod tests {
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask: Vec<usize> = vec![];
 
-            // Build expected arrow fields
+            // Build expected arrow fields using proper conversion
             let mut fields = requested_schema.fields();
-            let metadata1 = fields.next().unwrap().metadata_with_string_values();
-            let metadata2 = fields.next().unwrap().metadata_with_string_values();
-            let expected_field1 = ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
-                .with_metadata(metadata1)
-                .into();
-            let expected_field2 =
-                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
-                    .with_metadata(metadata2)
-                    .into();
+            let expected_field1: Arc<ArrowField> =
+                Arc::new(fields.next().unwrap().try_into_arrow().unwrap());
+            let expected_field2: Arc<ArrowField> =
+                Arc::new(fields.next().unwrap().try_into_arrow().unwrap());
 
             let expect_reorder = vec![
                 ReorderIndex::missing(0, expected_field1),

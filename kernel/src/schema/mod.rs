@@ -114,6 +114,9 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
+            // established by delta-spark and other Delta ecosystem implementations for storing
+            // Parquet field IDs in StructField metadata.
             Self::ParquetFieldId => "parquet.field.id",
             Self::GenerationExpression => "delta.generationExpression",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
@@ -3330,5 +3333,16 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_parquet_field_id_key_value() {
+        // Verify the string value of ColumnMetadataKey::ParquetFieldId matches the convention
+        // used by delta-spark and other Delta ecosystem implementations. This is not part of
+        // the Delta protocol spec, so we pin the value here to catch accidental changes.
+        assert_eq!(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            "parquet.field.id"
+        );
     }
 }
