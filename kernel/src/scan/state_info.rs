@@ -65,7 +65,7 @@ fn validate_metadata_columns<'a>(
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
-    let partition_columns = table_configuration.metadata().partition_columns();
+    let partition_columns = table_configuration.partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
@@ -118,7 +118,7 @@ impl StateInfo {
         stats_columns: Option<Vec<ColumnName>>,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.metadata().partition_columns();
+        let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut transform_spec = Vec::new();
@@ -275,6 +275,7 @@ pub(crate) mod tests {
     use crate::actions::{Metadata, Protocol};
     use crate::expressions::{column_expr, column_name, ColumnName, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::table_features::{FeatureType, TableFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -284,13 +285,16 @@ pub(crate) mod tests {
         schema: SchemaRef,
         partition_columns: Vec<String>,
     ) -> DeltaResult<StateInfo> {
-        get_state_info(schema, partition_columns, None, HashMap::new(), vec![])
+        get_state_info(schema, partition_columns, None, &[], HashMap::new(), vec![])
     }
 
+    /// When features are non-empty, uses protocol (3,7) with explicit feature lists.
+    /// When features are empty, uses legacy protocol (2,5).
     pub(crate) fn get_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
+        features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
     ) -> DeltaResult<StateInfo> {
@@ -298,6 +302,7 @@ pub(crate) mod tests {
             schema,
             partition_columns,
             predicate,
+            features,
             metadata_configuration,
             metadata_cols,
             None,
@@ -308,6 +313,7 @@ pub(crate) mod tests {
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
+        features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
         stats_columns: Option<Vec<ColumnName>>,
@@ -320,8 +326,22 @@ pub(crate) mod tests {
             10,
             metadata_configuration,
         )?;
-        let no_features: Option<Vec<String>> = None; // needed for type annotation
-        let protocol = Protocol::try_new(2, 2, no_features.clone(), no_features)?;
+        let protocol = if features.is_empty() {
+            Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>)?
+        } else {
+            // This helper only handles known features. Unknown features would need
+            // explicit placement on reader vs writer lists.
+            assert!(
+                features
+                    .iter()
+                    .all(|f| f.feature_type() != FeatureType::Unknown),
+                "Test helper does not support unknown features"
+            );
+            let reader_features = features
+                .iter()
+                .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
+            Protocol::try_new(3, 7, Some(reader_features), Some(features))?
+        };
         let table_configuration = TableConfiguration::try_new(
             metadata,
             protocol,
@@ -503,6 +523,7 @@ pub(crate) mod tests {
             schema.clone(),
             vec![], // no partition columns
             Some(predicate),
+            &[],            // no table features
             HashMap::new(), // no extra metadata
             vec![],         // no metadata
         )
@@ -545,6 +566,9 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) const ROW_TRACKING_FEATURES: &[TableFeature] =
+        &[TableFeature::RowTracking, TableFeature::DomainMetadata];
+
     fn get_string_map(slice: &[(&str, &str)]) -> HashMap<String, String> {
         slice
             .iter()
@@ -563,11 +587,16 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
@@ -595,11 +624,16 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
@@ -627,11 +661,16 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some_row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "some_row_commit_version_col",
                 ),
             ]),
             vec![
@@ -658,17 +697,30 @@ pub(crate) mod tests {
             DataType::STRING,
         )]));
 
-        for (metadata_config, metadata_cols, expected_error) in [
-            (HashMap::new(), vec![("row_id", MetadataColumnSpec::RowId)], "Unsupported: Row ids are not enabled on this table"),
-            (
-                get_string_map(&[("delta.enableRowTracking", "true")]),
-                vec![("row_id", MetadataColumnSpec::RowId)],
-                "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
-            ),
-        ] {
-            let res = get_state_info(schema.clone(), vec![], None, metadata_config, metadata_cols);
-            assert_result_error_with_message(res, expected_error);
-        }
+        // Row IDs requested but row tracking not enabled → error
+        let res = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            &[], // no table features
+            HashMap::new(),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        );
+        assert_result_error_with_message(res, "Unsupported: Row ids are not enabled on this table");
+
+        // Row tracking enabled but missing materializedRowIdColumnName → error
+        let res = get_state_info(
+            schema,
+            vec![],
+            None,
+            ROW_TRACKING_FEATURES,
+            get_string_map(&[("delta.enableRowTracking", "true")]),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        );
+        assert_result_error_with_message(
+            res,
+            "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+        );
     }
 
     #[test]
@@ -681,6 +733,7 @@ pub(crate) mod tests {
             schema.clone(),
             vec!["part_col".to_string()],
             None,
+            &[], // no table features
             HashMap::new(),
             vec![("part_col", MetadataColumnSpec::RowId)],
         );
@@ -712,6 +765,7 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
+            &[], // no table features
             get_string_map(&[("delta.columnMapping.mode", "name")]),
             vec![("other", MetadataColumnSpec::RowIndex)],
         );
@@ -734,6 +788,7 @@ pub(crate) mod tests {
             schema,
             vec![],
             Some(predicate),
+            &[], // no table features
             HashMap::new(),
             vec![],
             Some(vec![]), // empty stats_columns = include all stats
@@ -768,6 +823,7 @@ pub(crate) mod tests {
             schema,
             vec![],
             None,
+            &[], // no table features
             HashMap::new(),
             vec![],
             Some(vec![column_name!("value")]), // non-empty stats_columns not yet supported

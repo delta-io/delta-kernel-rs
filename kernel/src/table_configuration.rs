@@ -20,14 +20,16 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
-    KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    column_mapping_mode, get_any_level_column_physical_name, validate_schema_column_mapping,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
+    FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
+    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
+use tracing::warn;
 
 /// Expected schemas for file statistics.
 ///
@@ -238,9 +240,7 @@ impl TableConfiguration {
     /// Per the Delta protocol, clustering columns are always included in statistics,
     /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
     /// settings.
-    #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn stats_column_names(
+    pub(crate) fn stats_column_names_logical(
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
@@ -251,15 +251,40 @@ impl TableConfiguration {
         )
     }
 
+    /// Returns the list of physical column names that should have statistics collected.
+    ///
+    /// Similar to [`stats_column_names_logical`], but returns physical column names.
+    pub(crate) fn stats_column_names_physical(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> Vec<ColumnName> {
+        let logical_names = self.stats_column_names_logical(clustering_columns);
+        let column_mapping_mode = self.column_mapping_mode();
+        logical_names
+            .into_iter()
+            .filter_map(|col_name| {
+                get_any_level_column_physical_name(
+                    self.schema.as_ref(),
+                    &col_name,
+                    column_mapping_mode,
+                )
+                .inspect_err(|e| {
+                    warn!("Couldn't find physical name for {col_name}: {e}");
+                })
+                .ok()
+            })
+            .collect()
+    }
+
     /// Returns the logical schema for data columns (excludes partition columns).
     ///
     /// Partition columns are excluded because statistics are only collected for data columns
     /// that are physically stored in the parquet files. Partition values are stored in the
     /// file path, not in the file content, so they don't have file-level statistics.
     fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.metadata().partition_columns();
+        let partition_columns = self.partition_columns();
         Arc::new(StructType::new_unchecked(
-            self.schema
+            self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
@@ -291,10 +316,24 @@ impl TableConfiguration {
         &self.table_properties
     }
 
+    /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
+    /// table feature).
+    #[internal_api]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.is_feature_supported(&TableFeature::CatalogManaged)
+            || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
+    }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
+    }
+
+    /// The partition columns of this table (empty if non-partitioned)
+    #[internal_api]
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        self.metadata().partition_columns()
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
@@ -672,8 +711,14 @@ mod test {
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
     };
     use crate::table_properties::TableProperties;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
+        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        test_schema_with_array_and_column_mapping, test_schema_with_map,
+        test_schema_with_map_and_column_mapping,
+    };
     use crate::Error;
+    use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
 
@@ -709,49 +754,32 @@ mod test {
         .unwrap();
 
         let (reader_features_opt, writer_features_opt) = if let Some(features) = features_opt {
+            // This helper only handles known features. Unknown features would need
+            // explicit placement on reader vs writer lists.
+            assert!(
+                features
+                    .iter()
+                    .all(|f| f.feature_type() != FeatureType::Unknown),
+                "Test helper does not support unknown features"
+            );
             let reader_features = features
                 .iter()
-                .filter(|feature| matches!(feature.feature_type(), FeatureType::ReaderWriter))
-                .cloned()
-                .collect::<Vec<_>>();
-            let writer_features = features
-                .iter()
-                .filter(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::Writer | FeatureType::ReaderWriter
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
             (
                 // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                // Protocol requires Some (even if empty) when reader = 3
-                if min_reader_version >= 3 {
-                    Some(reader_features)
-                } else {
-                    None
-                },
+                (min_reader_version >= 3).then_some(reader_features),
                 // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                // Protocol requires Some (even if empty) when writer = 7
-                if min_writer_version >= 7 {
-                    Some(writer_features)
-                } else {
-                    None
-                },
+                (min_writer_version >= 7).then_some(features),
             )
         } else {
             (None, None)
         };
 
-        let reader_features_iter = reader_features_opt.as_ref().map(|f| f.iter());
-        let writer_features_iter = writer_features_opt.as_ref().map(|f| f.iter());
-
         let protocol = Protocol::try_new(
             min_reader_version,
             min_writer_version,
-            reader_features_iter,
-            writer_features_iter,
+            reader_features_opt,
+            writer_features_opt,
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -779,7 +807,7 @@ mod test {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -812,7 +840,7 @@ mod test {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1085,7 +1113,10 @@ mod test {
             3,
             7,
             Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+            Some([
+                TableFeature::TimestampWithoutTimezone,
+                TableFeature::ChangeDataFeed,
+            ]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1115,7 +1146,7 @@ mod test {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1145,6 +1176,7 @@ mod test {
                 TableFeature::DeletionVectors,
                 TableFeature::V2Checkpoint,
                 TableFeature::AppendOnly,
+                TableFeature::ChangeDataFeed,
             ]),
         )
         .unwrap();
@@ -1743,18 +1775,127 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_returns_logical_names() {
-        // stats_column_names should return logical column names
+    fn test_stats_column_names_logical_returns_logical_names() {
+        // stats_column_names_logical should return logical column names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names(None);
+        let column_names = config.stats_column_names_logical(None /* clustering_columns */);
 
         // Should return logical names, not physical names
         assert!(column_names.contains(&ColumnName::new(["col_a"])));
         assert!(column_names.contains(&ColumnName::new(["col_b"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_returns_physical_names() {
+        // stats_column_names_physical should return physical column names
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "name");
+
+        let column_names = config.stats_column_names_physical(None /* clustering_columns */);
+
+        // Should return physical names, not logical names
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["phys_col_a"]),
+                ColumnName::new(["phys_col_b"]),
+            ],
+            "Expected physical column names, not logical names"
+        );
+    }
+
+    #[rstest]
+    // --- flat schema ---
+    #[case::flat_none(
+        test_schema_flat(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::flat_name(
+        test_schema_flat_with_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::flat_id(
+        test_schema_flat_with_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    // --- nested schema ---
+    #[case::nested_none(
+        test_schema_nested(),
+        "none",
+        vec![
+            ColumnName::new(["id"]),
+            ColumnName::new(["info", "name"]),
+            ColumnName::new(["info", "age"]),
+        ],
+    )]
+    #[case::nested_name(
+        test_schema_nested_with_column_mapping(),
+        "name",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    #[case::nested_id(
+        test_schema_nested_with_column_mapping(),
+        "id",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    // --- schema with map (map fields excluded from stats) ---
+    #[case::map_none(
+        test_schema_with_map(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::map_name(
+        test_schema_with_map_and_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::map_id(
+        test_schema_with_map_and_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    // --- schema with array (array fields excluded from stats) ---
+    #[case::array_none(
+        test_schema_with_array(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::array_name(
+        test_schema_with_array_and_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::array_id(
+        test_schema_with_array_and_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    fn test_stats_column_names_physical_all_schemas(
+        #[case] schema: SchemaRef,
+        #[case] mode: &str,
+        #[case] expected_physical: Vec<ColumnName>,
+    ) {
+        let config = create_table_config_with_column_mapping(schema, mode);
+        let physical_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            physical_names, expected_physical,
+            "Incorrect physical column names for mode '{mode}'"
+        );
     }
 
     #[cfg(feature = "clustered-table")]

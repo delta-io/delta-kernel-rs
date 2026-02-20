@@ -2,14 +2,12 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::table_features::{FeatureType, TableFeature};
+use crate::table_features::{FeatureType, IntoTableFeature, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
@@ -336,8 +334,7 @@ impl Metadata {
     }
 
     #[internal_api]
-    #[allow(dead_code)]
-    pub(crate) fn partition_columns(&self) -> &Vec<String> {
+    pub(crate) fn partition_columns(&self) -> &[String] {
         &self.partition_columns
     }
 
@@ -423,29 +420,22 @@ pub(crate) struct Protocol {
     writer_features: Option<Vec<TableFeature>>,
 }
 
-fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
-where
-    T: FromStr,
-    T::Err: Debug,
-{
-    features
-        .map(|fs| {
-            fs.into_iter()
-                .map(|f| T::from_str(&f.to_string()))
-                .collect()
-        })
-        .transpose()
-        .ok()?
+/// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
+/// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
+fn parse_features(
+    features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+) -> Option<Vec<TableFeature>> {
+    let features = features?.into_iter().map(|f| f.into_table_feature());
+    Some(features.collect())
 }
 
 impl Protocol {
-    /// Try to create a new Protocol instance from reader/writer versions and table features. This
-    /// can fail if the protocol is invalid.
+    /// Try to create a new Protocol instance from reader/writer versions and table features.
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl ToString>>,
-        writer_features: Option<impl IntoIterator<Item = impl ToString>>,
+        reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+        writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
     ) -> DeltaResult<Self> {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
@@ -596,11 +586,6 @@ impl Protocol {
                 "Reader features should be present in writer features",
             )),
         }
-    }
-
-    pub(crate) fn is_catalog_managed(&self) -> bool {
-        self.has_table_feature(&TableFeature::CatalogManaged)
-            || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
 
     #[cfg(test)]
@@ -1485,17 +1470,13 @@ mod tests {
 
     #[test]
     fn test_parse_table_feature_never_fails() {
-        // parse a non-str
-        let features = Some([5]);
-        let expected = Some(vec![TableFeature::unknown("5")]);
-        assert_eq!(parse_features::<TableFeature>(features), expected);
         // weird strs
         let features = Some(["", "absurD_)(+13%^⚙️"]);
-        let expected = Some(vec![
+        let expected = Some(FromIterator::from_iter([
             TableFeature::unknown(""),
             TableFeature::unknown("absurD_)(+13%^⚙️"),
-        ]);
-        assert_eq!(parse_features::<TableFeature>(features), expected);
+        ]));
+        assert_eq!(parse_features(features), expected);
     }
 
     #[test]

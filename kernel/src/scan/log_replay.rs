@@ -788,7 +788,7 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info,
+        assert_transform_spec, get_simple_state_info, get_state_info, ROW_TRACKING_FEATURES,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
@@ -990,11 +990,16 @@ mod tests {
             schema.clone(),
             vec![],
             None,
+            ROW_TRACKING_FEATURES,
             [
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "row_id_col",
+                ),
+                (
+                    "delta.rowTracking.materializedRowCommitVersionColumnName",
+                    "row_commit_version_col",
                 ),
             ]
             .iter()
@@ -1120,6 +1125,7 @@ mod tests {
                 schema.clone(),
                 vec![],
                 Some(predicate.clone()),
+                &[], // no table features
                 HashMap::new(),
                 vec![],
             )
@@ -1161,11 +1167,16 @@ mod tests {
                 schema,
                 vec!["date".to_string()],
                 None,
+                ROW_TRACKING_FEATURES,
                 [
                     ("delta.enableRowTracking", "true"),
                     (
                         "delta.rowTracking.materializedRowIdColumnName",
                         "row_id_col",
+                    ),
+                    (
+                        "delta.rowTracking.materializedRowCommitVersionColumnName",
+                        "row_commit_version_col",
                     ),
                 ]
                 .iter()

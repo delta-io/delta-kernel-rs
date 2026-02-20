@@ -511,9 +511,18 @@ impl StructField {
                 debug_assert!(base_metadata.contains_key(physical_name_key));
                 debug_assert!(base_metadata.contains_key(field_id_key));
 
-                // Remove all id mode related metadata keys
-                base_metadata.remove(field_id_key);
-                base_metadata.remove(parquet_field_id_key);
+                // Retain column mapping id and insert parquet field id so that
+                // Parquet files carry field IDs in Name mode as well (matching
+                // the Delta protocol requirement and Delta Spark behaviour).
+                let Some(MetadataValue::Number(fid)) = field_id else {
+                    warn!("StructField with name {} is missing field id in the Name column mapping mode", self.name());
+                    debug_assert!(false);
+                    return base_metadata;
+                };
+                base_metadata.insert(
+                    parquet_field_id_key.to_string(),
+                    MetadataValue::Number(*fid),
+                );
                 // TODO(#1070): Remove nested column ids when they are supported in kernel
             }
             ColumnMappingMode::None => {
@@ -775,6 +784,30 @@ impl StructType {
     pub fn num_fields(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
+    }
+
+    /// Recursively counts all [`StructField`] nodes in this schema tree.
+    ///
+    /// This includes nested struct fields (inside Struct, Array, and Map types) but does not
+    /// count Array/Map containers themselves. This matches the traversal pattern used by
+    /// `assign_column_mapping_metadata` when assigning column IDs, so the result equals the
+    /// expected `delta.columnMapping.maxColumnId` for a newly created table.
+    #[allow(unused)] // Only used by integration tests (create_table/column_mapping.rs)
+    #[internal_api]
+    pub(crate) fn total_struct_fields(&self) -> usize {
+        fn count_data_type(dt: &DataType) -> usize {
+            match dt {
+                DataType::Struct(inner) => inner.total_struct_fields(),
+                DataType::Array(array) => count_data_type(array.element_type()),
+                DataType::Map(map) => {
+                    count_data_type(map.key_type()) + count_data_type(map.value_type())
+                }
+                _ => 0,
+            }
+        }
+        self.fields()
+            .map(|field| 1 + count_data_type(field.data_type()))
+            .sum()
     }
 
     /// Gets a reference to the metadata column with the given spec.
@@ -2113,12 +2146,14 @@ mod tests {
                         ));
                     }
                     ColumnMappingMode::Name => {
-                        assert!(physical_field
-                            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                            .is_none());
-                        assert!(physical_field
-                            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                            .is_none(),);
+                        assert!(matches!(
+                            physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                            Some(MetadataValue::Number(4))
+                        ));
+                        assert!(matches!(
+                            physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                            Some(MetadataValue::Number(4))
+                        ));
                     }
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
@@ -2153,12 +2188,14 @@ mod tests {
                         ));
                     }
                     ColumnMappingMode::Name => {
-                        assert!(struct_field
-                            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                            .is_none());
-                        assert!(struct_field
-                            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                            .is_none());
+                        assert!(matches!(
+                            struct_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+                            Some(MetadataValue::Number(5))
+                        ));
+                        assert!(matches!(
+                            struct_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                            Some(MetadataValue::Number(5))
+                        ));
                     }
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
