@@ -142,7 +142,7 @@ fn evaluate_transform_expression(
     let mut used_field_transforms = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
-    let mut output_cols = Vec::new();
+    let mut output_cols = Vec::with_capacity(output_schema.num_fields());
 
     // Helper lambda to get the next output field type
     let mut output_schema_iter = output_schema.fields();

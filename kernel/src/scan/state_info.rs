@@ -121,7 +121,7 @@ impl StateInfo {
         let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut transform_spec = Vec::new();
+        let mut transform_spec = Vec::with_capacity(logical_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
         let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
