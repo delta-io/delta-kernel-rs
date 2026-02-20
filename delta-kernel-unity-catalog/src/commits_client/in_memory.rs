@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::error::{Error, Result};
-use crate::models::commits::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+
+use crate::models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
 
 use super::{UCCommitClient, UCGetCommitsClient};
 
