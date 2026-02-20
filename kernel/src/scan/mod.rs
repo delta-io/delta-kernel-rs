@@ -203,10 +203,13 @@ impl ScanBuilder {
     /// - Parquet checkpoint reads use column projection to skip the stats column
     /// - The `stats` field in scan results will be `None`
     /// - Data skipping is disabled (predicates still filter partitions, but not files)
+    /// - Takes precedence over [`include_stats_columns`]
     ///
     /// Use this when data skipping is handled externally (e.g., by the query engine).
     ///
     /// Default is `false` (stats are read).
+    ///
+    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
     pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
         self.skip_stats = skip_stats;
         self
@@ -867,9 +870,14 @@ impl Scan {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
+        let checkpoint_read_schema = if self.skip_stats {
+            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
-            checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+            checkpoint_read_schema,
         };
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),

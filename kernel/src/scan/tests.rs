@@ -1063,3 +1063,40 @@ fn test_checkpoint_row_group_skipping(
         }
     }
 }
+
+#[rstest]
+#[case::skip_stats(false)]
+#[case::skip_stats_with_include_stats_columns(true)]
+fn test_skip_stats_disables_data_skipping(#[case] include_stats: bool) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let mut builder = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_skip_stats(true);
+    if include_stats {
+        builder = builder.include_stats_columns();
+    }
+    let scan = builder.build().unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, 6);
+}

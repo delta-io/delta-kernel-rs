@@ -166,9 +166,6 @@ impl ScanLogReplayProcessor {
             checkpoint_read_schema,
         } = checkpoint_info;
 
-        let output_schema =
-            scan_row_schema_with_stats_parsed(state_info.physical_stats_schema.clone());
-
         // Extract the physical predicate for data skipping and partition filtering.
         // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
         let physical_predicate = match &state_info.physical_predicate {
@@ -182,6 +179,8 @@ impl ScanLogReplayProcessor {
         } else {
             state_info.physical_stats_schema.clone()
         };
+
+        let output_schema = scan_row_schema_with_stats_parsed(stats_schema_for_transform.clone());
 
         // Create data skipping filter that reads stats_parsed from the transformed batch.
         // This avoids double JSON parsing - the transform parses JSON once, then data skipping
