@@ -2962,3 +2962,69 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_create_checkpoint_on_external_table() {
+    // Use an external table: 7 rows with columns (i, j, k), with different nullability
+    //  than the schema of kernel uses to read.
+    let source_path = std::path::Path::new("./tests/data/external-table-different-nullability");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("test-checkpoint-table");
+    test_utils::copy_directory(source_path, &table_path).unwrap();
+
+    let url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let executor = Arc::new(
+        delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    let engine: Arc<delta_kernel::engine::default::DefaultEngine<_>> = Arc::new(
+        delta_kernel::engine::default::DefaultEngineBuilder::new(store)
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    // Read data before checkpoint
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan_before = Arc::clone(&snapshot).scan_builder().build().unwrap();
+    let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
+
+    // Create checkpoint via snapshot.checkpoint()
+    Arc::clone(&snapshot).checkpoint(engine.as_ref()).unwrap();
+
+    // Read data after checkpoint
+    let snapshot_after = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan_after = snapshot_after.scan_builder().build().unwrap();
+    let batches_after = test_utils::read_scan(&scan_after, engine.clone()).unwrap();
+
+    // Verify data unchanged
+    let formatted_before =
+        delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_before)
+            .unwrap()
+            .to_string();
+    let formatted_after = delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_after)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        formatted_before, formatted_after,
+        "Row data changed after checkpoint creation!"
+    );
+
+    // Verify checkpoint file exists
+    let delta_log_path = table_path.join("_delta_log");
+    let has_checkpoint = std::fs::read_dir(&delta_log_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".checkpoint.parquet"))
+        });
+    assert!(has_checkpoint, "Expected at least one checkpoint file");
+}

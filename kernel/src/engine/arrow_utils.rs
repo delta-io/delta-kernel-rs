@@ -290,6 +290,9 @@ where
 pub(crate) struct ReorderIndex {
     pub(crate) index: usize,
     transform: ReorderIndexTransform,
+    /// Target nullability from the kernel schema. When `Some`, the output field's nullability
+    /// is coerced to this value, regardless of what the parquet file declares.
+    target_nullable: Option<bool>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -310,7 +313,16 @@ pub(crate) enum ReorderIndexTransform {
 
 impl ReorderIndex {
     fn new(index: usize, transform: ReorderIndexTransform) -> Self {
-        ReorderIndex { index, transform }
+        ReorderIndex {
+            index,
+            transform,
+            target_nullable: None,
+        }
+    }
+
+    fn with_target_nullable(mut self, nullable: bool) -> Self {
+        self.target_nullable = Some(nullable);
+        self
     }
 
     fn cast(index: usize, target: ArrowDataType) -> Self {
@@ -340,6 +352,9 @@ impl ReorderIndex {
     /// Check if this reordering requires a transformation anywhere. See comment below on
     /// [`ordering_needs_transform`] to understand why this is needed.
     fn needs_transform(&self) -> bool {
+        if self.target_nullable.is_some() {
+            return true;
+        }
         match self.transform {
             // if we're casting, inserting null, or generating row index/file path, we need to transform
             ReorderIndexTransform::Cast(_)
@@ -457,7 +472,11 @@ fn get_indices(
                         // note that we found this field
                         found_fields.insert(requested_field.name());
                         // push the child reorder on
-                        reorder_indices.push(ReorderIndex::nested(index, children));
+                        let mut ri = ReorderIndex::nested(index, children);
+                        if requested_field.nullable != field.is_nullable() {
+                            ri = ri.with_target_nullable(requested_field.nullable);
+                        }
+                        reorder_indices.push(ri);
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
                     }
@@ -492,6 +511,9 @@ fn get_indices(
                         // the index is wrong, as it's the index from the inner schema. Adjust
                         // it to be our index
                         children.index = index;
+                        if requested_field.nullable != field.is_nullable() {
+                            children = children.with_target_nullable(requested_field.nullable);
+                        }
                         reorder_indices.push(children);
                     } else {
                         return Err(Error::unexpected_column_type(list_field.name()));
@@ -541,10 +563,14 @@ fn get_indices(
                                 children[1] = ReorderIndex::identity(1);
                                 num_identity_transforms += 1;
                             }
-                            let transform = match num_identity_transforms {
+                            let mut transform = match num_identity_transforms {
                                 2 => ReorderIndex::identity(index),
                                 _ => ReorderIndex::nested(index, children),
                             };
+                            if requested_field.nullable != field.is_nullable() {
+                                transform =
+                                    transform.with_target_nullable(requested_field.nullable);
+                            }
                             reorder_indices.push(transform);
                         }
                         _ => {
@@ -553,20 +579,35 @@ fn get_indices(
                     }
                 }
                 _ => {
-                    // we don't care about matching on nullability or metadata here so pass `false`
-                    // as the final argument. These can differ between the delta schema and the
-                    // parquet schema without causing issues in reading the data. We fix them up in
-                    // expression evaluation later.
+                    // We don't care about matching on nullability or metadata here so pass
+                    // `false` as the final argument. These can differ between the delta schema
+                    // and the parquet schema (e.g. external engines may write non-nullable
+                    // columns that the table schema declares as nullable). We capture any
+                    // nullability coercion in the ReorderIndex and fix it during reordering.
+                    // Nullability may differ between the kernel schema and the parquet schema
+                    // in either direction (e.g. external engines may write non-nullable columns
+                    // that the table schema declares as nullable, or vice versa for checkpoint
+                    // files). We capture any mismatch and coerce during reordering. Narrowing
+                    // (nullable → non-nullable) is safe when nulls are masked by a parent
+                    // struct's null buffer, as validated by StructArray::try_new.
                     match super::ensure_data_types::ensure_data_types(
                         &requested_field.data_type,
                         field.data_type(),
                         false,
                     )? {
                         DataTypeCompat::Identical => {
-                            reorder_indices.push(ReorderIndex::identity(index))
+                            let mut ri = ReorderIndex::identity(index);
+                            if requested_field.nullable != field.is_nullable() {
+                                ri = ri.with_target_nullable(requested_field.nullable);
+                            }
+                            reorder_indices.push(ri);
                         }
                         DataTypeCompat::NeedsCast(target) => {
-                            reorder_indices.push(ReorderIndex::cast(index, target))
+                            let mut ri = ReorderIndex::cast(index, target);
+                            if requested_field.nullable != field.is_nullable() {
+                                ri = ri.with_target_nullable(requested_field.nullable);
+                            }
+                            reorder_indices.push(ri);
                         }
                         DataTypeCompat::Nested => {
                             return Err(Error::internal_error(
@@ -804,16 +845,23 @@ pub(crate) fn reorder_struct_array(
                 ReorderIndexTransform::Cast(target) => {
                     let col = input_cols[parquet_position].as_ref();
                     let col = Arc::new(crate::arrow::compute::cast(col, target)?);
+                    let nullable = reorder_index
+                        .target_nullable
+                        .unwrap_or(input_fields[parquet_position].is_nullable());
                     let new_field = Arc::new(
                         input_fields[parquet_position]
                             .as_ref()
                             .clone()
-                            .with_data_type(col.data_type().clone()),
+                            .with_data_type(col.data_type().clone())
+                            .with_nullable(nullable),
                     );
                     final_fields_cols[reorder_index.index] = Some((new_field, col));
                 }
                 ReorderIndexTransform::Nested(children) => {
                     let input_field_name = input_fields[parquet_position].name();
+                    let nullable = reorder_index
+                        .target_nullable
+                        .unwrap_or(input_fields[parquet_position].is_nullable());
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -827,25 +875,33 @@ pub(crate) fn reorder_struct_array(
                             let new_field = Arc::new(ArrowField::new_struct(
                                 input_field_name,
                                 result_array.fields().clone(),
-                                input_fields[parquet_position].is_nullable(),
+                                nullable,
                             ));
                             final_fields_cols[reorder_index.index] =
                                 Some((new_field, result_array));
                         }
                         ArrowDataType::List(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i32>().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_list(list_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_list(
+                                list_array,
+                                input_field_name,
+                                children,
+                                Some(nullable),
+                            )?;
                         }
                         ArrowDataType::LargeList(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i64>().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_list(list_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_list(
+                                list_array,
+                                input_field_name,
+                                children,
+                                Some(nullable),
+                            )?;
                         }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
                             final_fields_cols[reorder_index.index] =
-                                reorder_map(map_array, input_field_name, children)?;
+                                reorder_map(map_array, input_field_name, children, Some(nullable))?;
                         }
                         _ => {
                             return Err(Error::internal_error(
@@ -855,10 +911,17 @@ pub(crate) fn reorder_struct_array(
                     }
                 }
                 ReorderIndexTransform::Identity => {
-                    final_fields_cols[reorder_index.index] = Some((
-                        input_fields[parquet_position].clone(), // cheap Arc clone
-                        input_cols[parquet_position].clone(),   // cheap Arc clone
-                    ));
+                    let field = match reorder_index.target_nullable {
+                        Some(nullable) => Arc::new(
+                            input_fields[parquet_position]
+                                .as_ref()
+                                .clone()
+                                .with_nullable(nullable),
+                        ),
+                        None => input_fields[parquet_position].clone(), // cheap Arc clone
+                    };
+                    final_fields_cols[reorder_index.index] =
+                        Some((field, input_cols[parquet_position].clone()));
                 }
                 ReorderIndexTransform::Missing(field) => {
                     let null_array = Arc::new(new_null_array(field.data_type(), num_rows));
@@ -906,16 +969,40 @@ pub(crate) fn reorder_struct_array(
             }
         }
         let num_cols = final_fields_cols.len();
-        let (field_vec, reordered_columns): (Vec<Arc<ArrowField>>, _) =
+        let (field_vec, reordered_columns): (Vec<Arc<ArrowField>>, Vec<Arc<dyn ArrowArray>>) =
             final_fields_cols.into_iter().flatten().unzip();
         if field_vec.len() != num_cols {
             Err(Error::internal_error("Found a None in final_fields_cols."))
         } else {
-            Ok(StructArray::try_new(
-                field_vec.into(),
-                reordered_columns,
-                null_buffer,
-            )?)
+            // Try to create the struct array with the target nullability. If this fails due to
+            // non-nullable fields containing unmasked nulls (e.g. a checkpoint field that is
+            // genuinely null), fall back by relaxing those fields to nullable.
+            let fields: ArrowFields = field_vec.into();
+            match StructArray::try_new(
+                fields.clone(),
+                reordered_columns.clone(),
+                null_buffer.clone(),
+            ) {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    let relaxed_fields: Vec<ArrowFieldRef> = fields
+                        .iter()
+                        .zip(reordered_columns.iter())
+                        .map(|(field, col)| {
+                            if !field.is_nullable() && col.null_count() > 0 {
+                                Arc::new(field.as_ref().clone().with_nullable(true))
+                            } else {
+                                field.clone()
+                            }
+                        })
+                        .collect();
+                    Ok(StructArray::try_new(
+                        relaxed_fields.into(),
+                        reordered_columns,
+                        null_buffer,
+                    )?)
+                }
+            }
         }
     }
 }
@@ -924,6 +1011,7 @@ fn reorder_list<O: OffsetSizeTrait>(
     list_array: GenericListArray<O>,
     input_field_name: &str,
     children: &[ReorderIndex],
+    target_nullable: Option<bool>,
 ) -> DeltaResult<FieldArrayOpt> {
     let (list_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
@@ -939,10 +1027,11 @@ fn reorder_list<O: OffsetSizeTrait>(
             result_array.fields().clone(),
             result_array.is_nullable(),
         ));
+        let nullable = target_nullable.unwrap_or(list_field.is_nullable());
         let new_field = Arc::new(ArrowField::new_list(
             input_field_name,
             new_list_field.clone(),
-            list_field.is_nullable(),
+            nullable,
         ));
         let list = Arc::new(GenericListArray::try_new(
             new_list_field,
@@ -962,6 +1051,7 @@ fn reorder_map(
     map_array: MapArray,
     input_field_name: &str,
     children: &[ReorderIndex],
+    target_nullable: Option<bool>,
 ) -> DeltaResult<FieldArrayOpt> {
     let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
     let result_array = reorder_struct_array(
@@ -978,13 +1068,14 @@ fn reorder_map(
     ));
     let key_field = result_fields[0].clone();
     let val_field = result_fields[1].clone();
+    let nullable = target_nullable.unwrap_or(map_field.is_nullable());
     let new_field = Arc::new(ArrowField::new_map(
         input_field_name,
         map_field.name(),
         key_field,
         val_field,
         ordered,
-        map_field.is_nullable(),
+        nullable,
     ));
     let map = Arc::new(MapArray::try_new(
         new_map_field,
@@ -3075,5 +3166,136 @@ mod tests {
         assert_eq!(non_null_leaf_non_null_2, non_null_leaf_non_null_1);
         let non_null_leaf_nullable_2 = inner_non_null_2.column(1);
         assert_eq!(non_null_leaf_nullable_2, non_null_leaf_nullable_1);
+    }
+
+    /// Test that nullability coercion works when the parquet schema has non-nullable fields
+    /// but the kernel (table) schema declares them as nullable. This simulates the scenario
+    /// where an external engine writes parquet files with stricter nullability than the Delta
+    /// table schema requires.
+    #[test]
+    fn test_reorder_coerces_nullability() {
+        use crate::arrow::array::RecordBatch;
+
+        // Parquet schema: both columns non-nullable
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, false),
+            ArrowField::new("b", ArrowDataType::Int32, false),
+        ]));
+
+        // Kernel schema: both columns nullable (as Delta table schema would declare)
+        let kernel_schema = StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, true),
+            StructField::new("b", DataType::INTEGER, true),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            parquet_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+
+        // Verify the input has non-nullable fields
+        assert!(!batch.schema().field(0).is_nullable());
+        assert!(!batch.schema().field(1).is_nullable());
+
+        let (_, requested_ordering) =
+            get_requested_indices(&Arc::new(kernel_schema), &parquet_schema).unwrap();
+        let result: RecordBatch =
+            fixup_parquet_read(batch, &requested_ordering, None, None).unwrap();
+
+        // After fixup, fields should be nullable (matching the kernel schema)
+        assert!(result.schema().field(0).is_nullable());
+        assert!(result.schema().field(1).is_nullable());
+        // Data should be unchanged
+        assert_eq!(
+            result
+                .column(0)
+                .as_primitive::<crate::arrow::datatypes::Int32Type>()
+                .values(),
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            result
+                .column(1)
+                .as_primitive::<crate::arrow::datatypes::Int32Type>()
+                .values(),
+            &[4, 5, 6]
+        );
+    }
+
+    /// Test that nullability coercion works for nested struct fields.
+    #[test]
+    fn test_reorder_coerces_nested_struct_nullability() {
+        use crate::arrow::array::RecordBatch;
+
+        // Parquet schema: struct field is non-nullable, inner field is non-nullable
+        let inner_field = ArrowField::new("x", ArrowDataType::Int32, false);
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            ArrowDataType::Struct(vec![inner_field.clone()].into()),
+            false,
+        )]));
+
+        // Kernel schema: struct field is nullable, inner field is nullable
+        let kernel_schema = StructType::new_unchecked([StructField::new(
+            "s",
+            DataType::struct_type_unchecked([StructField::new("x", DataType::INTEGER, true)]),
+            true,
+        )]);
+
+        let inner_array = Arc::new(Int32Array::from(vec![10, 20]));
+        let struct_array = StructArray::try_new(
+            vec![Arc::new(inner_field)].into(),
+            vec![inner_array as ArrowArrayRef],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            parquet_schema.clone(),
+            vec![Arc::new(struct_array) as ArrowArrayRef],
+        )
+        .unwrap();
+
+        // Verify input is non-nullable
+        assert!(!batch.schema().field(0).is_nullable());
+
+        let (_, requested_ordering) =
+            get_requested_indices(&Arc::new(kernel_schema), &parquet_schema).unwrap();
+        let result: RecordBatch =
+            fixup_parquet_read(batch, &requested_ordering, None, None).unwrap();
+
+        // The struct field should now be nullable
+        assert!(result.schema().field(0).is_nullable());
+        // Inner field should also be nullable
+        if let ArrowDataType::Struct(fields) = result.schema().field(0).data_type() {
+            assert!(fields[0].is_nullable());
+        } else {
+            panic!("Expected struct data type");
+        }
+    }
+
+    /// Test that when parquet and kernel schemas already agree on nullability, no
+    /// unnecessary transform is triggered.
+    #[test]
+    fn test_reorder_no_transform_when_nullability_matches() {
+        // Parquet schema: nullable (same as kernel)
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int32,
+            true,
+        )]));
+
+        // Kernel schema: also nullable
+        let kernel_schema =
+            StructType::new_unchecked([StructField::new("a", DataType::INTEGER, true)]);
+
+        let (_, requested_ordering) =
+            get_requested_indices(&Arc::new(kernel_schema), &parquet_schema).unwrap();
+
+        // Should NOT need a transform since nullability matches and order is the same
+        assert!(!ordering_needs_transform(&requested_ordering));
     }
 }
