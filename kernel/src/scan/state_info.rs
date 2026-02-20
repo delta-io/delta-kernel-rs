@@ -65,7 +65,7 @@ fn validate_metadata_columns<'a>(
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
-    let partition_columns = table_configuration.metadata().partition_columns();
+    let partition_columns = table_configuration.partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
@@ -118,7 +118,7 @@ impl StateInfo {
         stats_columns: Option<Vec<ColumnName>>,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.metadata().partition_columns();
+        let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut transform_spec = Vec::with_capacity(logical_schema.num_fields());
