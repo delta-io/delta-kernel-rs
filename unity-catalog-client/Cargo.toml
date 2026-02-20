@@ -1,5 +1,5 @@
 [package]
-name = "uc-client"
+name = "unity-catalog-client"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -9,15 +9,15 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[lib]
+name = "unity_catalog_client"
+
 # for cargo-release
 [package.metadata.release]
 release = false
 
 [dependencies]
 reqwest = { version = "0.13", features = ["http2", "json"] }
-# Pin native-tls due to 0.2.17 regression:
-# https://github.com/rust-native-tls/rust-native-tls/issues/370
-native-tls = "<0.2.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -26,10 +26,5 @@ tracing = "0.1"
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 
-[features]
-default = []
-test-utils = []
-
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive", "env"] }
