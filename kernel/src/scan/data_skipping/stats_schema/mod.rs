@@ -250,7 +250,7 @@ impl<'col> BaseStatsTransform<'col> {
     }
 }
 
-impl<'a, 'col> SchemaTransform<'a> for BaseStatsTransform<'col> {
+impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
 

@@ -780,6 +780,30 @@ impl StructType {
         self.fields.len()
     }
 
+    /// Recursively counts all [`StructField`] nodes in this schema tree.
+    ///
+    /// This includes nested struct fields (inside Struct, Array, and Map types) but does not
+    /// count Array/Map containers themselves. This matches the traversal pattern used by
+    /// `assign_column_mapping_metadata` when assigning column IDs, so the result equals the
+    /// expected `delta.columnMapping.maxColumnId` for a newly created table.
+    #[allow(unused)] // Only used by integration tests (create_table/column_mapping.rs)
+    #[internal_api]
+    pub(crate) fn total_struct_fields(&self) -> usize {
+        fn count_data_type(dt: &DataType) -> usize {
+            match dt {
+                DataType::Struct(inner) => inner.total_struct_fields(),
+                DataType::Array(array) => count_data_type(array.element_type()),
+                DataType::Map(map) => {
+                    count_data_type(map.key_type()) + count_data_type(map.value_type())
+                }
+                _ => 0,
+            }
+        }
+        self.fields()
+            .map(|field| 1 + count_data_type(field.data_type()))
+            .sum()
+    }
+
     /// Gets a reference to the metadata column with the given spec.
     pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
         self.metadata_columns
