@@ -133,12 +133,9 @@ where
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
-        let len = EngineList::len(self, row_index);
-        let mut result = Vec::with_capacity(len);
-        for i in 0..len {
-            result.push(self.get(row_index, i));
-        }
-        result
+        (0..EngineList::len(self, row_index))
+            .map(|i| self.get(row_index, i))
+            .collect()
     }
 }
 
@@ -268,12 +265,8 @@ impl EngineData for ArrowEngineData {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // Combine existing and new schema fields
         let schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
-        let existing_schema = self.data.schema();
-        let existing_fields = existing_schema.fields();
-        let new_fields = schema.fields();
-        let mut combined_fields = Vec::with_capacity(existing_fields.len() + new_fields.len());
-        combined_fields.extend_from_slice(existing_fields);
-        combined_fields.extend_from_slice(new_fields);
+        let mut combined_fields = self.data.schema().fields().to_vec();
+        combined_fields.extend_from_slice(schema.fields());
         let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
 
         // Combine existing and new columns
@@ -281,9 +274,7 @@ impl EngineData for ArrowEngineData {
             .into_iter()
             .map(|array_data| array_data.to_arrow())
             .try_collect()?;
-        let existing_columns = self.data.columns();
-        let mut combined_columns = Vec::with_capacity(existing_columns.len() + new_columns.len());
-        combined_columns.extend_from_slice(existing_columns);
+        let mut combined_columns = self.data.columns().to_vec();
         combined_columns.extend(new_columns);
 
         // Create a new ArrowEngineData with the combined schema and columns

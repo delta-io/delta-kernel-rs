@@ -222,9 +222,7 @@ fn list_log_files(
         .map(|f| f.version)
         .max();
 
-    let mut files = Vec::with_capacity(listed_files.len() + filtered_log_tail.len());
-    files.extend(listed_files);
-    files.extend(filtered_log_tail);
+    let files: Vec<ParsedLogPath> = listed_files.into_iter().chain(filtered_log_tail).collect();
 
     Ok(ListLogFilesResult {
         files,

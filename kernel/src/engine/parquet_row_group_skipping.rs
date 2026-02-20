@@ -33,14 +33,16 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
         predicate: &Predicate,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self {
-        let row_groups = self.metadata().row_groups();
-        // Collect ordinals of row groups that survive the filter
-        let mut ordinals = Vec::with_capacity(row_groups.len());
-        for (ordinal, row_group) in row_groups.iter().enumerate() {
-            if RowGroupFilter::apply(row_group, predicate) {
-                ordinals.push(ordinal);
-            }
-        }
+        let ordinals: Vec<_> = self
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, row_group)| {
+                // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
+                RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
+            })
+            .collect();
         debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
