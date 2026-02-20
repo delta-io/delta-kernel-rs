@@ -365,7 +365,7 @@ mod tests {
         let table_properties = TableProperties::from(table_properties.iter());
         let empty_table_properties = TableProperties::from([] as [(String, String); 0]);
 
-        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
 
         assert_eq!(
             column_mapping_mode(&protocol, &table_properties),
@@ -377,9 +377,8 @@ mod tests {
             ColumnMappingMode::None
         );
 
-        let empty_features = Some::<[String; 0]>([]);
         let protocol =
-            Protocol::try_new(3, 7, empty_features.clone(), empty_features.clone()).unwrap();
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
         assert_eq!(
             column_mapping_mode(&protocol, &table_properties),
@@ -391,13 +390,9 @@ mod tests {
             ColumnMappingMode::None
         );
 
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::ColumnMapping]),
-            Some([TableFeature::ColumnMapping]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
 
         assert_eq!(
             column_mapping_mode(&protocol, &table_properties),
@@ -409,11 +404,9 @@ mod tests {
             ColumnMappingMode::None
         );
 
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors],
         )
         .unwrap();
 
@@ -427,11 +420,9 @@ mod tests {
             ColumnMappingMode::None
         );
 
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
 

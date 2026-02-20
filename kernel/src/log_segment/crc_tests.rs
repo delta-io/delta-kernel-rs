@@ -25,25 +25,21 @@ use test_utils::delta_path_for_version;
 const SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":true,"metadata":{}},{"name":"val","type":"string","nullable":true,"metadata":{}}]}"#;
 
 fn protocol_v2() -> Protocol {
-    Protocol::try_new(3, 7, Some(["v2Checkpoint"]), Some(["v2Checkpoint"])).unwrap()
+    Protocol::try_new_modern(["v2Checkpoint"], ["v2Checkpoint"]).unwrap()
 }
 
 fn protocol_v2_dv() -> Protocol {
-    Protocol::try_new(
-        3,
-        7,
-        Some(["v2Checkpoint", "deletionVectors"]),
-        Some(["v2Checkpoint", "deletionVectors"]),
+    Protocol::try_new_modern(
+        ["v2Checkpoint", "deletionVectors"],
+        ["v2Checkpoint", "deletionVectors"],
     )
     .unwrap()
 }
 
 fn protocol_v2_dv_ntz() -> Protocol {
-    Protocol::try_new(
-        3,
-        7,
-        Some(["v2Checkpoint", "deletionVectors", "timestampNtz"]),
-        Some(["v2Checkpoint", "deletionVectors", "timestampNtz"]),
+    Protocol::try_new_modern(
+        ["v2Checkpoint", "deletionVectors", "timestampNtz"],
+        ["v2Checkpoint", "deletionVectors", "timestampNtz"],
     )
     .unwrap()
 }

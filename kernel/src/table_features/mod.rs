@@ -625,6 +625,11 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 };
 
 impl TableFeature {
+    #[cfg(test)]
+    pub(crate) const NO_LIST: Option<Vec<TableFeature>> = None;
+    #[cfg(test)]
+    pub(crate) const EMPTY_LIST: Vec<TableFeature> = vec![];
+
     pub(crate) fn feature_type(&self) -> FeatureType {
         match self {
             TableFeature::CatalogManaged

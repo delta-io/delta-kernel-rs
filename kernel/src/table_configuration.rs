@@ -803,11 +803,9 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -836,11 +834,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -947,13 +943,9 @@ mod test {
             HashMap::from_iter([(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -996,13 +988,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1041,13 +1029,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1064,13 +1048,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1085,7 +1065,7 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
+        let protocol = Protocol::try_new_modern(["unknown"], ["unknown"]).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         table_config
@@ -1109,14 +1089,12 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [
                 TableFeature::TimestampWithoutTimezone,
                 TableFeature::ChangeDataFeed,
-            ]),
+            ],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1142,11 +1120,9 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1168,16 +1144,14 @@ mod test {
             ]),
         )
         .unwrap();
-        let new_protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::V2Checkpoint]),
-            Some([
+        let new_protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::V2Checkpoint],
+            [
                 TableFeature::DeletionVectors,
                 TableFeature::V2Checkpoint,
                 TableFeature::AppendOnly,
                 TableFeature::ChangeDataFeed,
-            ]),
+            ],
         )
         .unwrap();
         let new_version = 1;
@@ -1217,19 +1191,12 @@ mod test {
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let protocol_without_timestamp_ntz_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_timestamp_ntz_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let protocol_with_timestamp_ntz_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+        let protocol_with_timestamp_ntz_features = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [TableFeature::TimestampWithoutTimezone],
         )
         .unwrap();
 
@@ -1264,21 +1231,12 @@ mod test {
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let protocol_without_variant_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_variant_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let protocol_with_variant_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::VariantType]),
-            Some([TableFeature::VariantType]),
-        )
-        .unwrap();
+        let protocol_with_variant_features =
+            Protocol::try_new_modern([TableFeature::VariantType], [TableFeature::VariantType])
+                .unwrap();
 
         let table_root = Url::try_from("file:///").unwrap();
 
@@ -1524,13 +1482,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![TableFeature::RowTracking]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, vec![TableFeature::RowTracking])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
@@ -1546,14 +1500,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ]),
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::RowTracking, TableFeature::DomainMetadata],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1620,7 +1569,7 @@ mod test {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
 
         // Use reader version 2 which supports column mapping
-        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
     }
@@ -1633,7 +1582,7 @@ mod test {
             StructField::nullable("col_b", DataType::STRING),
         ]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 

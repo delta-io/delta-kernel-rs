@@ -18,6 +18,7 @@ use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
+use crate::table_features::TableFeature;
 use crate::transaction::CommitResult;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
@@ -184,15 +185,13 @@ async fn write_commit_to_store(
 /// Create a Protocol action without v2Checkpoint feature support
 fn create_basic_protocol_action() -> Action {
     Action::Protocol(
-        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+        Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap(),
     )
 }
 
 /// Create a Protocol action with v2Checkpoint feature support
 fn create_v2_checkpoint_protocol_action() -> Action {
-    Action::Protocol(
-        Protocol::try_new(3, 7, Some(vec!["v2Checkpoint"]), Some(vec!["v2Checkpoint"])).unwrap(),
-    )
+    Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
 }
 
 /// Create a Metadata action

@@ -235,6 +235,7 @@ fn test_version_filtering() {
 async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::table_features::TableFeature;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
 
@@ -262,7 +263,7 @@ async fn test_no_compaction_staged_commits() {
         .unwrap(),
     );
     let protocol = Action::Protocol(
-        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+        Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap(),
     );
 
     let metadata_action = serde_json::to_string(&metadata).unwrap();
