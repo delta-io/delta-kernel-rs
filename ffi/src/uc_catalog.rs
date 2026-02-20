@@ -1,4 +1,4 @@
-//! FFI hooks that enable constructing a UCCommitClient. On
+//! FFI hooks that enable constructing a UCCommitClient.
 
 use crate::error::{ExternResult, IntoExternResult as _};
 use crate::{error::AllocateErrorFn, transaction::MutableCommitter};
@@ -150,11 +150,11 @@ pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUC
 
 // we need our own struct here because we want to override the calls to enter the tokio runtime
 // before calling into the standard committer
-struct FFIUCCommitter<C: UCCommitClient> {
+struct FfiUCCommitter<C: UCCommitClient> {
     inner: UCCommitter<C>,
 }
 
-impl<C: UCCommitClient + 'static> Committer for FFIUCCommitter<C> {
+impl<C: UCCommitClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
@@ -163,21 +163,20 @@ impl<C: UCCommitClient + 'static> Committer for FFIUCCommitter<C> {
         >,
         commit_metadata: delta_kernel::committer::CommitMetadata,
     ) -> DeltaResult<delta_kernel::committer::CommitResponse> {
-        let mut guard = engine
+        // We hold this guard until the end of the function so we stay in the tokio context until
+        // we're done
+        let _guard = engine
             .any_ref()
             .downcast_ref::<DefaultEngine<TokioMultiThreadExecutor>>()
-            .map(|e| e.enter());
-        if guard.is_none() {
-            guard = engine
-                .any_ref()
-                .downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>()
-                .map(|e| e.enter());
-        }
-        if guard.is_none() {
-            return Err(delta_kernel::Error::generic(
-                "FFIUCCommitter can only be used with the default engine",
-            ));
-        }
+            .map(|e| e.enter())
+            .or_else(|| {
+                engine.any_ref()
+                    .downcast_ref::<DefaultEngine<TokioBackgroundExecutor>>()
+                    .map(|e| e.enter())
+            })
+            .ok_or_else(|| delta_kernel::Error::generic(
+                "FFIUCCommitter can only be used with the default engine"
+            ))?;
         self.inner.commit(engine, actions, commit_metadata)
     }
 
@@ -216,7 +215,7 @@ fn get_uc_committer_impl(
 ) -> DeltaResult<Handle<MutableCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
     let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
-    let committer: Box<dyn Committer> = Box::new(FFIUCCommitter {
+    let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
         inner: UCCommitter::new(client, table_id_str),
     });
     Ok(committer.into())
@@ -256,6 +255,8 @@ mod tests {
         NonNull::new(Box::into_raw(context) as *mut c_void)
     }
 
+    // take back ownership of the context. be aware that you therefore cannot call this twice with
+    // the same context pointer
     fn recover_test_context(context: NullableCvoid) -> Option<Box<TestContext>> {
         context.map(|context| unsafe { Box::from_raw(context.as_ptr() as *mut TestContext) })
     }

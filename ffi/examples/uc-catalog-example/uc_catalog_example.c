@@ -26,7 +26,7 @@ void validate_and_clean_staging_file(char* table_uri, char* file_name, Commit *c
     uri = uri + 7;
   }
 
-  int path_len = strlen(table_uri) + strlen(file_name) + 28;
+  int path_len = strlen(uri) + strlen(file_name) + 28;
   char path[path_len];
   snprintf(path, path_len, "%s_delta_log/_staged_commits/%s", uri, file_name);
   printf("Checking that staging file at %s is valid\n", path);
