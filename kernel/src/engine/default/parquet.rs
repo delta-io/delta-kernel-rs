@@ -835,7 +835,8 @@ mod tests {
 
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ParquetObjectReader::new(store.clone(), path.clone());
+        let metadata = store.head(&path).await.unwrap();
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -845,7 +846,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1023,6 +1024,7 @@ mod tests {
 
         // Read it back
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1033,7 +1035,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url.clone(),
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1227,6 +1229,7 @@ mod tests {
 
         // Read back and verify it contains the second data set
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1237,7 +1240,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1306,6 +1309,7 @@ mod tests {
 
         // Verify the file was overwritten with the new data
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1316,7 +1320,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
