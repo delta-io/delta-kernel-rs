@@ -12,6 +12,7 @@ use crate::schema::{
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::{DeltaResult, Error};
 
+use itertools::Itertools;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -344,7 +345,7 @@ pub(crate) fn get_any_level_column_physical_name(
             };
             Ok(field.physical_name(column_mapping_mode).to_string())
         })
-        .collect::<DeltaResult<Vec<String>>>()?;
+        .try_collect()?;
     Ok(ColumnName::new(physical_path))
 }
 
