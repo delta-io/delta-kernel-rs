@@ -75,62 +75,54 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::memory::InMemory;
-    use object_store::ObjectStore as _;
-    use serde_json::json;
     use url::Url;
 
-    use test_utils::delta_path_for_version;
-
     use crate::actions::visitors::DomainMetadataVisitor;
+    use crate::committer::FileSystemCommitter;
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::transaction::create_table::create_table as create_table_txn;
     use crate::{RowVisitor as _, Snapshot};
 
-    /// Write a newline-delimited JSON string as a commit file to the in-memory store.
-    async fn put_commit(store: &InMemory, version: u64, content: &str) {
-        store
-            .put(
-                &delta_path_for_version(version, "json"),
-                content.as_bytes().to_vec().into(),
-            )
-            .await
-            .unwrap();
-    }
-
-    /// Builds a two-commit in-memory Delta log:
-    ///   commit 0: protocol + metadata + "domainC"
+    /// Builds a two-commit in-memory Delta table:
+    ///   commit 0: protocol + metadata (with domainMetadata feature) + "domainC"
     ///   commit 1: "domainA" + "domainB"
     ///
     /// Log replay visits commits newest-first, so commit 1 is the first batch and commit 0
     /// is the second batch.
-    async fn build_two_commit_log() -> (impl crate::Engine, std::sync::Arc<Snapshot>) {
+    fn build_two_commit_log() -> (impl crate::Engine, std::sync::Arc<Snapshot>) {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-        let commit0 = [
-            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
-            json!({"metaData": {
-                "id": "test-table-id",
-                "format": {"provider": "parquet", "options": {}},
-                "schemaString": r#"{"type":"struct","fields":[]}"#,
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 0
-            }}),
-            json!({"domainMetadata": {"domain": "domainC", "configuration": "cfgC", "removed": false}}),
-        ]
-        .map(|v| v.to_string())
-        .join("\n");
-        put_commit(&store, 0, &commit0).await;
-
-        let commit1 = [
-            json!({"domainMetadata": {"domain": "domainA", "configuration": "cfgA", "removed": false}}),
-            json!({"domainMetadata": {"domain": "domainB", "configuration": "cfgB", "removed": false}}),
-        ]
-        .map(|v| v.to_string())
-        .join("\n");
-        put_commit(&store, 1, &commit1).await;
-
+        let engine = DefaultEngineBuilder::new(store).build();
         let url = Url::parse("memory:///").unwrap();
+
+        // Commit 0: CREATE TABLE (protocol + metadata) with "domainC" in the same commit.
+        // The domainMetadata writer feature is enabled so domain metadata actions are valid.
+        let _ = create_table_txn(
+            url.as_str(),
+            Arc::new(StructType::new_unchecked(vec![StructField::new(
+                "id",
+                DataType::INTEGER,
+                true,
+            )])),
+            "test",
+        )
+        .with_table_properties([("delta.feature.domainMetadata", "supported")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
+        .commit(&engine)
+        .unwrap();
+
+        // Commit 1: add domainA and domainB via an existing-table transaction.
+        let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
+        let _ = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap()
+            .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
+            .with_domain_metadata("domainB".to_string(), "cfgB".to_string())
+            .commit(&engine)
+            .unwrap();
+
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         (engine, snapshot)
     }
@@ -146,7 +138,7 @@ mod tests {
     /// batch was read.
     #[tokio::test]
     async fn test_scan_domain_metadatas_early_termination() {
-        let (engine, snapshot) = build_two_commit_log().await;
+        let (engine, snapshot) = build_two_commit_log();
         let log_segment = snapshot.log_segment();
 
         // Sanity-check: the log has exactly 2 batches (one per commit).
@@ -200,7 +192,7 @@ mod tests {
     /// (i.e., we don't terminate early until all N domains are found).
     #[tokio::test]
     async fn test_scan_domain_metadatas_no_early_termination_when_split_across_commits() {
-        let (engine, snapshot) = build_two_commit_log().await;
+        let (engine, snapshot) = build_two_commit_log();
         let log_segment = snapshot.log_segment();
 
         // domainA is in commit 1 (batch 0), domainC is in commit 0 (batch 1).
