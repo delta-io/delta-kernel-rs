@@ -894,39 +894,30 @@ impl StructType {
     /// If `after` is None, `new_field` is appended to the end.
     /// If `after` is not found, an error is returned.
     pub fn with_field_inserted_after(
-        &self,
+        mut self,
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        let index_of_after = match after {
-            Some(after) => self
-                .fields
-                .get_index_of(after)
-                .ok_or_else(|| Error::generic(format!("Field {} not found", after)))?,
-            None => self.fields.len().saturating_sub(1),
+        let insert_index = match after {
+            Some(after) => {
+                self.fields
+                    .get_index_of(after)
+                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))?
+                    + 1
+            }
+            None => self.fields.len(),
         };
 
-        let before = self
-            .fields
-            .iter()
-            .take(index_of_after + 1)
-            .map(|(_, v)| v.clone());
-
-        let after = self
-            .fields
-            .iter()
-            .skip(index_of_after + 1)
-            .map(|(_, v)| v.clone());
-        let new_fields = before.chain(std::iter::once(new_field)).chain(after);
-
-        Ok(Self::new_unchecked(new_fields))
+        self.fields
+            .insert_before(insert_index, new_field.name.clone(), new_field);
+        Ok(self)
     }
 
     /// Returns a new StructType with `new_field` inserted before the field named `before`.
     /// If `before` is None, `new_field` is inserted at the beginning.
     /// If `before` is not found, an error is returned.
     pub fn with_field_inserted_before(
-        &self,
+        mut self,
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
@@ -937,33 +928,16 @@ impl StructType {
                 .ok_or_else(|| Error::generic(format!("Field {} not found", before)))?,
             None => 0,
         };
-
-        let prefix = self
-            .fields
-            .iter()
-            .take(index_of_before)
-            .map(|(_, v)| v.clone());
-
-        let suffix = self
-            .fields
-            .iter()
-            .skip(index_of_before)
-            .map(|(_, v)| v.clone());
-
-        let new_fields = prefix.chain(std::iter::once(new_field)).chain(suffix);
-
-        Ok(Self::new_unchecked(new_fields))
+        self.fields
+            .insert_before(index_of_before, new_field.name.clone(), new_field);
+        Ok(self)
     }
 
     /// Returns a new StructType with the named field removed.
     /// Returns self unchanged if field doesn't exist.
-    pub fn with_field_removed(&self, name: &str) -> Self {
-        let new_fields = self
-            .fields
-            .iter()
-            .filter(|(k, _)| *k != name)
-            .map(|(_, v)| v.clone());
-        Self::new_unchecked(new_fields)
+    pub fn with_field_removed(mut self, name: &str) -> Self {
+        self.fields.shift_remove(name);
+        self
     }
 
     /// Returns a new StructType with the named field replaced.
@@ -3415,6 +3389,16 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_inserted_empty_struct() {
+        let schema = StructType::try_new([]).unwrap();
+        let schema = schema
+            .with_field_inserted_after(None, StructField::new("age", DataType::STRING, true))
+            .expect("with field inserted should produce a valid schema");
+        assert_eq!(schema.num_fields(), 1);
+        assert_eq!(schema.field_at_index(0).unwrap().name(), "age");
     }
 
     #[test]
