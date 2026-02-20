@@ -329,7 +329,7 @@ impl ArrowEngineData {
     /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
     /// This reduces boilerplate by handling the common pattern of trying direct access first,
     /// then falling back to RunArray if the column is REE-encoded.
-    fn try_extract_with_rle<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
+    fn try_extract_with_ree<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
         match col.data_type() {
             ArrowDataType::RunEndEncoded(_, _) => col
                 .as_any()
