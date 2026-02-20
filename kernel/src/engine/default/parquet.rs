@@ -835,8 +835,8 @@ mod tests {
 
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path.clone());
         let metadata = store.head(&path).await.unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
