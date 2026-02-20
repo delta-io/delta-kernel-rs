@@ -39,7 +39,7 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use test_utils::{
     assert_result_error_with_message, copy_directory, create_add_files_metadata,
     create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
-    write_parquet_with_snapshot,
+    write_batch_to_table,
 };
 
 mod common;
@@ -2993,13 +2993,12 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
             Arc::new(data_schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2]))],
         )?;
-        let data = ArrowEngineData::new(batch);
 
         // Pass partition values with logical name — should succeed
-        let result = write_parquet_with_snapshot(
-            engine,
-            snapshot,
-            &data,
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
             HashMap::from([("letter".to_string(), "a".to_string())]),
         )
         .await;
@@ -3025,18 +3024,15 @@ async fn test_write_parquet_rejects_unknown_partition_column(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2]))],
         )?;
-        let data = ArrowEngineData::new(batch);
 
-        let result = write_parquet_with_snapshot(
-            engine,
-            snapshot,
-            &data,
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
             HashMap::from([("nonexistent".to_string(), "val".to_string())]),
         )
         .await;
-        let err = result
-            .err()
-            .expect("write_parquet should fail with unknown partition column");
+        let err = result.expect_err("write_parquet should fail with unknown partition column");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("Partition column 'nonexistent' not found in table schema"),
