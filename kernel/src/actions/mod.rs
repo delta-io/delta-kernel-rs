@@ -441,30 +441,17 @@ impl Protocol {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
-        let protocol = Protocol {
-            min_reader_version,
-            min_writer_version,
-            reader_features,
-            writer_features,
-        };
-        protocol.validate_table_features()?;
-
-        Ok(protocol)
-    }
-
-    /// Validates the relationship between reader features and writer features in the protocol.
-    pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
         // The protocol states that Reader features may be present if and only if the min_reader_version is 3
-        if self.min_reader_version == 3 {
+        if min_reader_version == 3 {
             require!(
-                self.reader_features.is_some(),
+                reader_features.is_some(),
                 Error::invalid_protocol(
                     "Reader features must be present when minimum reader version = 3"
                 )
             );
         } else {
             require!(
-                self.reader_features.is_none(),
+                reader_features.is_none(),
                 Error::invalid_protocol(
                     "Reader features must not be present when minimum reader version != 3"
                 )
@@ -472,23 +459,24 @@ impl Protocol {
         }
 
         // The protocol states that Writer features may be present if and only if the min_writer_version is 7
-        if self.min_writer_version == 7 {
+        if min_writer_version == 7 {
             require!(
-                self.writer_features.is_some(),
+                writer_features.is_some(),
                 Error::invalid_protocol(
                     "Writer features must be present when minimum writer version = 7"
                 )
             );
         } else {
             require!(
-                self.writer_features.is_none(),
+                writer_features.is_none(),
                 Error::invalid_protocol(
                     "Writer features must not be present when minimum writer version != 7"
                 )
             );
         }
 
-        match (&self.reader_features, &self.writer_features) {
+        // Self- and cross-validate the reader and writer feature lists.
+        match (&reader_features, &writer_features) {
             (Some(reader_features), Some(writer_features)) => {
                 // Check all reader features are ReaderWriter and present in writer features.
                 // Unknown features are treated as potentially ReaderWriter for forward compatibility.
@@ -531,7 +519,7 @@ impl Protocol {
                         FeatureType::Writer | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => {
                             // ColumnMapping is allowed when reader version is 2 (implied support)
-                            self.min_reader_version == 2 && feature == &TableFeature::ColumnMapping
+                            min_reader_version == 2 && feature == &TableFeature::ColumnMapping
                         }
                     }
                 });
@@ -547,7 +535,14 @@ impl Protocol {
             (Some(_), None) => Err(Error::invalid_protocol(
                 "Reader features should be present in writer features",
             )),
-        }
+        }?;
+
+        Ok(Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        })
     }
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
@@ -1326,17 +1321,10 @@ mod tests {
         ];
 
         for (reader_features, writer_features, error_msg) in invalid_features {
-            let protocol = Protocol {
-                min_reader_version: 3,
-                min_writer_version: 7,
-                reader_features,
-                writer_features,
-            };
-
-            let res = protocol.validate_table_features();
+            let res = Protocol::try_new(3, 7, reader_features, writer_features);
             assert!(
                 matches!(
-                    protocol.validate_table_features(),
+                    &res,
                     Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
                 ),
                 "Expected:\t{error_msg}\nBut got:{res:?}\n"
@@ -1350,22 +1338,22 @@ mod tests {
         // but will be rejected when trying to use the protocol (ensure_operation_supported)
 
         // Test unknown features in reader - validation passes
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
-            writer_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+            Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+        );
+        assert!(protocol.is_ok());
 
         // Test unknown features in writer - validation passes
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![]),
-            writer_features: Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some(Vec::<TableFeature>::new()),
+            Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
@@ -1396,14 +1384,7 @@ mod tests {
         ];
 
         for (reader_features, writer_features) in valid_features {
-            let protocol = Protocol {
-                min_reader_version: 3,
-                min_writer_version: 7,
-                reader_features,
-                writer_features,
-            };
-
-            assert!(matches!(protocol.validate_table_features(), Ok(()),));
+            assert!(Protocol::try_new(3, 7, reader_features, writer_features).is_ok());
         }
     }
 
@@ -1412,66 +1393,66 @@ mod tests {
         // Valid: ColumnMapping with reader v2
         // Reader version 2 implies columnMapping support (no explicit reader_features)
         // Writer version 7 requires explicit writer_features list
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::ColumnMapping]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
     fn test_validate_legacy_writer_only_features_valid() {
         // Valid: Writer-only features with reader v1
-        let protocol = Protocol {
-            min_reader_version: 1,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::AppendOnly]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(vec![TableFeature::AppendOnly]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
     fn test_validate_legacy_column_mapping_with_writer_features_valid() {
         // Valid: Mix of Writer-only and ColumnMapping with reader v2
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
     fn test_validate_column_mapping_reader_v1_invalid() {
         // Invalid: ColumnMapping with reader v1
         // Reader v1 doesn't imply any ReaderWriter features
-        let protocol = Protocol {
-            min_reader_version: 1,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::ColumnMapping]),
-        };
-        assert!(protocol.validate_table_features().is_err());
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_err());
     }
 
     #[test]
     fn test_validate_multiple_readerwriter_features_reader_v2_invalid() {
         // Invalid: Multiple ReaderWriter features with reader v2
         // Only ColumnMapping alone is allowed with reader v2
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(vec![
                 TableFeature::ColumnMapping,
                 TableFeature::DeletionVectors,
             ]),
-        };
-        assert!(protocol.validate_table_features().is_err());
+        );
+        assert!(protocol.is_err());
     }
 
     #[test]
