@@ -22,6 +22,9 @@ tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
+# Pin native-tls due to 0.2.17 regression:
+# https://github.com/rust-native-tls/rust-native-tls/issues/370
+native-tls = { version = "<0.2.17", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
@@ -47,7 +50,7 @@ object_store = "0.12.3"
 
 [features]
 default = ["default-engine-rustls"]
-default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
+default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base", "dep:native-tls"]
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
 catalog-managed = ["delta_kernel/catalog-managed"]
 uc-catalog = [ "dep:uc-catalog", "dep:uc-client" ]
