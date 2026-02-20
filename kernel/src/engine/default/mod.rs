@@ -11,6 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
+use itertools::Itertools as _;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -227,9 +228,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         // Translate logical partition column names to physical names
-        let physical_partition_values = partition_values
+        let physical_partition_values: HashMap<String, String> = partition_values
             .into_iter()
-            .map(|(logical_name, value)| {
+            .map(|(logical_name, value)| -> DeltaResult<_> {
                 let field = write_context
                     .logical_schema()
                     .field(&logical_name)
@@ -243,7 +244,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                     .to_string();
                 Ok((physical_name, value))
             })
-            .collect::<DeltaResult<HashMap<_, _>>>()?;
+            .try_collect()?;
 
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;

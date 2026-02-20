@@ -718,6 +718,22 @@ pub fn create_add_files_metadata(
     Ok(Box::new(ArrowEngineData::new(batch)))
 }
 
+/// Builds a [`WriteContext`] from a snapshot, then calls
+/// [`DefaultEngine::write_parquet`] with the given data and partition values.
+pub async fn write_parquet_with_snapshot(
+    engine: DefaultEngine<TokioBackgroundExecutor>,
+    snapshot: Arc<Snapshot>,
+    data: &ArrowEngineData,
+    partition_values: std::collections::HashMap<String, String>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let write_context = txn.get_write_context();
+    let engine = Arc::new(engine);
+    engine
+        .write_parquet(data, &write_context, partition_values)
+        .await
+}
+
 // Writer that captures log output into a shared buffer for test assertions
 pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
 

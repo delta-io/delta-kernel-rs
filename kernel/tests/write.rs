@@ -39,6 +39,7 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use test_utils::{
     assert_result_error_with_message, copy_directory, create_add_files_metadata,
     create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
+    write_parquet_with_snapshot,
 };
 
 mod common;
@@ -2967,7 +2968,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 }
 
 #[tokio::test]
-async fn test_write_parquet_translates_logical_partition_names(
+async fn test_write_parquet_succeed_with_logical_partition_names(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::INTEGER),
@@ -2983,11 +2984,6 @@ async fn test_write_parquet_translates_logical_partition_names(
     .await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("test");
-
-        let write_context = txn.get_write_context();
 
         // Create data with only the non-partition column
         let data_schema = Arc::new(
@@ -3000,14 +2996,13 @@ async fn test_write_parquet_translates_logical_partition_names(
         let data = ArrowEngineData::new(batch);
 
         // Pass partition values with logical name — should succeed
-        let engine = Arc::new(engine);
-        let result = engine
-            .write_parquet(
-                &data,
-                &write_context,
-                HashMap::from([("letter".to_string(), "a".to_string())]),
-            )
-            .await;
+        let result = write_parquet_with_snapshot(
+            engine,
+            snapshot,
+            &data,
+            HashMap::from([("letter".to_string(), "a".to_string())]),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "write_parquet should succeed with valid logical partition name"
@@ -3025,11 +3020,6 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("test");
-
-        let write_context = txn.get_write_context();
 
         let batch = RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
@@ -3037,14 +3027,13 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         )?;
         let data = ArrowEngineData::new(batch);
 
-        let engine = Arc::new(engine);
-        let result = engine
-            .write_parquet(
-                &data,
-                &write_context,
-                HashMap::from([("nonexistent".to_string(), "val".to_string())]),
-            )
-            .await;
+        let result = write_parquet_with_snapshot(
+            engine,
+            snapshot,
+            &data,
+            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
+        )
+        .await;
         let err = result
             .err()
             .expect("write_parquet should fail with unknown partition column");
