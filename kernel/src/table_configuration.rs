@@ -728,7 +728,12 @@ mod test {
         props_to_enable: &[(&str, &str)],
         features: &[TableFeature],
     ) -> TableConfiguration {
-        create_mock_table_config_with_version(props_to_enable, Some(features), 3, 7)
+        create_mock_table_config_with_version(
+            props_to_enable,
+            Some(features),
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+        )
     }
 
     fn create_mock_table_config_with_version(
