@@ -419,7 +419,7 @@ impl<S> Transaction<S> {
         // step 2 to fail early on duplicate transaction appIds
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
-        let mut app_ids = HashSet::new();
+        let mut app_ids = HashSet::with_capacity(self.set_transactions.len());
         if let Some(dup) = self
             .set_transactions
             .iter()
@@ -532,7 +532,6 @@ impl<S> Transaction<S> {
             && self
                 .read_snapshot
                 .table_configuration()
-                .protocol()
                 .is_catalog_managed()
         {
             return Err(Error::generic(
@@ -729,7 +728,11 @@ impl<S> Transaction<S> {
         }
 
         let is_create = self.is_create_table();
-        let mut seen_domains = HashSet::new();
+        let mut seen_domains = HashSet::with_capacity(
+            self.system_domain_metadata_additions.len()
+                + self.user_domain_metadata_additions.len()
+                + self.user_domain_removals.len(),
+        );
 
         // Validate SYSTEM domain additions (from transforms, e.g., clustering)
         // System domains are only populated during create-table
@@ -1130,7 +1133,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -1139,7 +1142,6 @@ impl<S> Transaction<S> {
         let partition_cols = self
             .read_snapshot
             .table_configuration()
-            .metadata()
             .partition_columns()
             .to_vec();
         // Check if materializePartitionColumns feature is enabled
@@ -1170,18 +1172,29 @@ impl<S> Transaction<S> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
+        let column_mapping_mode = self
+            .read_snapshot
+            .table_configuration()
+            .column_mapping_mode();
 
         // Compute physical schema: exclude partition columns since they're stored in the path
+        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
+        // logical field names to physical names.
         let partition_columns: Vec<String> = self
             .read_snapshot
             .table_configuration()
-            .metadata()
             .partition_columns()
             .to_vec();
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
         let physical_fields = snapshot_schema
             .fields()
-            .filter(|f| !partition_columns.contains(&f.name().to_string()))
-            .cloned();
+            .filter(|f| {
+                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
+            })
+            .map(|f| f.make_physical(column_mapping_mode));
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
@@ -1673,10 +1686,11 @@ impl<'a> DvMatchVisitor<'a> {
     /// Creates a new DvMatchVisitor that will match file paths against the provided DV updates map.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
+        let capacity_hint = dv_updates.len();
         Self {
             dv_updates,
-            new_dv_entries: Vec::new(),
-            matched_file_indexes: Vec::new(),
+            new_dv_entries: Vec::with_capacity(capacity_hint),
+            matched_file_indexes: Vec::with_capacity(capacity_hint),
         }
     }
 }
@@ -1931,9 +1945,14 @@ mod tests {
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
-    use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
+    use crate::utils::test_utils::{
+        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
+        test_schema_with_array, test_schema_with_map,
+    };
     use crate::Snapshot;
+    use rstest::rstest;
     use std::path::PathBuf;
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
@@ -2132,10 +2151,7 @@ mod tests {
             .build(&engine)?;
 
         // Verify the table is partitioned by "letter" column
-        let partition_cols_without = snapshot_without
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        let partition_cols_without = snapshot_without.table_configuration().partition_columns();
         assert_eq!(partition_cols_without.len(), 1);
         assert_eq!(partition_cols_without[0], "letter");
 
@@ -2183,10 +2199,7 @@ mod tests {
             .build(&engine)?;
 
         // Verify the table is partitioned by "letter" column
-        let partition_cols_with = snapshot_with
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        let partition_cols_with = snapshot_with.table_configuration().partition_columns();
         assert_eq!(partition_cols_with.len(), 1);
         assert_eq!(partition_cols_with[0], "letter");
 
@@ -2221,6 +2234,33 @@ mod tests {
             expr_str_with
         );
 
+        Ok(())
+    }
+
+    /// Physical schema should include partition columns when materializePartitionColumns is on.
+    #[test]
+    fn test_physical_schema_includes_partition_columns_when_materialized(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/partitioned_with_materialize_feature/",
+        ))
+        .unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let write_context = txn.get_write_context();
+        let physical_schema = write_context.physical_schema();
+
+        assert!(
+            physical_schema.contains("letter"),
+            "Partition column 'letter' should be in physical schema when materialized"
+        );
+        assert!(
+            physical_schema.contains("number"),
+            "Non-partition column 'number' should be in physical schema"
+        );
         Ok(())
     }
 
@@ -2468,6 +2508,35 @@ mod tests {
         assert!(
             !debug_str.contains("create_table"),
             "Existing table debug should not contain create_table: {debug_str}"
+        );
+        Ok(())
+    }
+
+    // Input schemas have no CM metadata; create_table automatically assigns IDs and
+    // physical names when mode is Name or Id.
+    #[rstest]
+    #[case::flat_none(test_schema_flat(), ColumnMappingMode::None)]
+    #[case::flat_name(test_schema_flat(), ColumnMappingMode::Name)]
+    #[case::flat_id(test_schema_flat(), ColumnMappingMode::Id)]
+    #[case::nested_none(test_schema_nested(), ColumnMappingMode::None)]
+    #[case::nested_name(test_schema_nested(), ColumnMappingMode::Name)]
+    #[case::nested_id(test_schema_nested(), ColumnMappingMode::Id)]
+    #[case::map_none(test_schema_with_map(), ColumnMappingMode::None)]
+    #[case::map_name(test_schema_with_map(), ColumnMappingMode::Name)]
+    #[case::map_id(test_schema_with_map(), ColumnMappingMode::Id)]
+    #[case::array_none(test_schema_with_array(), ColumnMappingMode::None)]
+    #[case::array_name(test_schema_with_array(), ColumnMappingMode::Name)]
+    #[case::array_id(test_schema_with_array(), ColumnMappingMode::Id)]
+    fn test_physical_schema_column_mapping(
+        #[case] schema: SchemaRef,
+        #[case] mode: ColumnMappingMode,
+    ) -> DeltaResult<()> {
+        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let write_context = txn.get_write_context();
+        crate::utils::test_utils::validate_physical_schema_column_mapping(
+            write_context.logical_schema(),
+            write_context.physical_schema(),
+            mode,
         );
         Ok(())
     }

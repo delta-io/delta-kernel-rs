@@ -882,11 +882,7 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot
-        .table_configuration()
-        .metadata()
-        .partition_columns()
-        .len()
+    snapshot.table_configuration().partition_columns().len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -898,14 +894,9 @@ pub unsafe extern "C" fn get_partition_columns(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
-    let iter: Box<StringIter> = Box::new(
-        snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns()
-            .clone()
-            .into_iter(),
-    );
+    // NOTE: Clippy doesn't like it, but we need to_vec+into_iter to decouple lifetimes
+    let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
+    let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
 }
 

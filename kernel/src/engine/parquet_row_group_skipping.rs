@@ -211,19 +211,10 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             return Some(self.get_parquet_rowcount_stat()).filter(|_| false);
         };
 
-        // WARNING: [`Statistics::null_count_opt`] returns Some(0) when the underlying stat is
-        // missing, causing an IS NULL predicate to wrongly skip the file if it contains any NULL
-        // values. Manually drill into each arm's [`ValueStatistics`] for the stat's true.
-        let nullcount = match stats? {
-            Statistics::Boolean(s) => s.null_count_opt(),
-            Statistics::Int32(s) => s.null_count_opt(),
-            Statistics::Int64(s) => s.null_count_opt(),
-            Statistics::Int96(s) => s.null_count_opt(),
-            Statistics::Float(s) => s.null_count_opt(),
-            Statistics::Double(s) => s.null_count_opt(),
-            Statistics::ByteArray(s) => s.null_count_opt(),
-            Statistics::FixedLenByteArray(s) => s.null_count_opt(),
-        };
+        // WARNING: The parquet footer decoding forces missing stats to Some(0), which would cause
+        // an IS NULL predicate to wrongly skip the file if it contains any NULL values. To be safe,
+        // we must never return Some(0). See https://github.com/apache/arrow-rs/issues/9451.
+        let nullcount = stats?.null_count_opt().filter(|n| *n > 0);
 
         // Parquet nullcount stats are always u64, so we can directly return the value instead of
         // wrapping it in a Scalar. We can safely cast it from u64 to i64 because the nullcount can
