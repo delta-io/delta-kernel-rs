@@ -17,17 +17,6 @@ typedef struct UCContext {
 } UCContext;
 
 
-// Not used in this example
-HandleExclusiveCommitsResponse get_commits_callback(
-    NullableCvoid context_ptr,
-    CommitsRequest request)
-{
-  (void)context_ptr;
-  (void)request;
-  return NULL;
-}
-
-
 // Check that a staging file matches what the commit info says, then remove it
 void validate_and_clean_staging_file(char* table_uri, char* file_name, Commit *commit_info) {
   char* uri = table_uri;
@@ -133,8 +122,7 @@ int main(int argc, char* argv[])
 
     // Create a UC commit client
     NullableCvoid context = (void*)&uc_context;
-    HandleSharedFfiUCCommitsClient uc_client =
-        get_uc_commit_client(context, get_commits_callback, commit_callback);
+    HandleSharedFfiUCCommitClient uc_client = get_uc_commit_client(context, commit_callback);
 
     // Create a UC committer for a specific table
     const char* table_id = "my_catalog.my_schema.my_table";

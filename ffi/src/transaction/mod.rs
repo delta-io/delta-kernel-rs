@@ -452,24 +452,14 @@ mod tests {
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use crate::uc_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
-            CommitsRequest, ExclusiveCommitsResponse,
         };
         use crate::{Handle, NullableCvoid, OptionalValue};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Mutex;
 
         static UC_COMMIT_CALLED: AtomicBool = AtomicBool::new(false);
-        static UC_GET_COMMITS_CALLED: AtomicBool = AtomicBool::new(false);
         static LAST_COMMIT_TABLE_ID: Mutex<Option<String>> = Mutex::new(None);
         static STAGED_COMMIT_FILE_NAME: Mutex<Option<String>> = Mutex::new(None);
-
-        #[no_mangle]
-        extern "C" fn test_uc_get_commits(
-            _context: NullableCvoid,
-            _request: CommitsRequest,
-        ) -> Handle<ExclusiveCommitsResponse> {
-            panic!("Shouldn't be called");
-        }
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
@@ -522,8 +512,7 @@ mod tests {
                 ))
             };
 
-            let uc_client =
-                unsafe { get_uc_commit_client(None, test_uc_get_commits, test_uc_commit) };
+            let uc_client = unsafe { get_uc_commit_client(None, test_uc_commit) };
             let table_id = "foo";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
@@ -587,7 +576,6 @@ mod tests {
 
             // Reset flags before commit
             UC_COMMIT_CALLED.store(false, Ordering::SeqCst);
-            UC_GET_COMMITS_CALLED.store(false, Ordering::SeqCst);
             *LAST_COMMIT_TABLE_ID.lock().unwrap() = None;
             *STAGED_COMMIT_FILE_NAME.lock().unwrap() = None;
 
