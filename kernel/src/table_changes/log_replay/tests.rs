@@ -43,7 +43,7 @@ fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
     )
     .unwrap();
     // CDF requires min_writer_version = 4
-    let protocol = Protocol::try_new(1, 4, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
     TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
 }
 
@@ -166,11 +166,9 @@ async fn metadata_protocol() {
                 .unwrap(),
             ),
             Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors],
+                    [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
                 )
                 .unwrap(),
             ),
@@ -192,20 +190,10 @@ async fn metadata_protocol() {
 async fn cdf_not_enabled() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
+    // Commit metadata without CDF property to test that CDF is rejected
     mock_table
         .commit([Action::Metadata(
-            Metadata::try_new(
-                None,
-                None,
-                get_schema(),
-                vec![],
-                0,
-                HashMap::from([(
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                )]),
-            )
-            .unwrap(),
+            Metadata::try_new(None, None, get_schema(), vec![], 0, HashMap::new()).unwrap(),
         )])
         .await;
 
@@ -229,17 +217,16 @@ async fn unsupported_reader_feature() {
     let mut mock_table = LocalMockTable::new();
     mock_table
         .commit([Action::Protocol(
-            Protocol::try_new(
-                3,
-                7,
-                Some([
+            Protocol::try_new_modern(
+                [
                     TableFeature::DeletionVectors,
                     TableFeature::unknown("unsupportedReaderFeature"),
-                ]),
-                Some([
+                ],
+                [
                     TableFeature::DeletionVectors,
+                    TableFeature::ChangeDataFeed,
                     TableFeature::unknown("unsupportedReaderFeature"),
-                ]),
+                ],
             )
             .unwrap(),
         )])
@@ -261,27 +248,62 @@ async fn unsupported_reader_feature() {
 
 #[tokio::test]
 async fn column_mapping_should_succeed() {
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
+
+    fn cm_field(name: &str, data_type: DataType, id: i64) -> StructField {
+        StructField::nullable(name, data_type).with_metadata(HashMap::from([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::String(name.to_string()),
+            ),
+        ]))
+    }
+
+    let cm_schema = Arc::new(StructType::new_unchecked([
+        cm_field("id", DataType::INTEGER, 1),
+        cm_field("value", DataType::STRING, 2),
+    ]));
+
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
-        .commit([Action::Metadata(
-            Metadata::try_new(
-                None,
-                None,
-                get_schema(),
-                vec![],
-                0,
-                HashMap::from([
-                    (
-                        "delta.enableDeletionVectors".to_string(),
-                        "true".to_string(),
-                    ),
-                    ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                    ("delta.columnMapping.mode".to_string(), "id".to_string()),
-                ]),
-            )
-            .unwrap(),
-        )])
+        .commit([
+            Action::Protocol(
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+                    [
+                        TableFeature::DeletionVectors,
+                        TableFeature::ColumnMapping,
+                        TableFeature::ChangeDataFeed,
+                    ],
+                )
+                .unwrap(),
+            ),
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    cm_schema.clone(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        ("delta.columnMapping.mode".to_string(), "id".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+        ])
         .await;
 
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -291,7 +313,7 @@ async fn column_mapping_should_succeed() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
+        table_changes_action_iter(engine, &table_config, commits, cm_schema, None)
             .unwrap()
             .try_collect();
 
@@ -342,7 +364,10 @@ async fn unsupported_protocol_feature_midstream() {
             3,
             7,
             Some(vec![TableFeature::unknown("unsupportedFeature")]),
-            Some(vec![TableFeature::unknown("unsupportedFeature")]),
+            Some(vec![
+                TableFeature::unknown("unsupportedFeature"),
+                TableFeature::ChangeDataFeed,
+            ]),
         )])
         .await;
 
@@ -838,13 +863,7 @@ async fn failing_protocol() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
-    let protocol = Protocol::try_new(
-        3,
-        7,
-        ["fake_feature".to_string()].into(),
-        ["fake_feature".to_string()].into(),
-    )
-    .unwrap();
+    let protocol = Protocol::try_new_modern(["fake_feature"], ["fake_feature"]).unwrap();
 
     mock_table
         .commit([
@@ -933,11 +952,9 @@ async fn print_table_configuration() {
                 .unwrap(),
             ),
             Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors],
+                    [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
                 )
                 .unwrap(),
             ),
@@ -999,11 +1016,9 @@ async fn print_table_info_post_phase1() {
                 .unwrap(),
             ),
             Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors],
+                    [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
                 )
                 .unwrap(),
             ),
@@ -1178,15 +1193,13 @@ async fn test_timestamp_with_ict_enabled() {
                 .unwrap(),
             ),
             Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([TableFeature::DeletionVectors]),
-                    Some([
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors],
+                    [
                         TableFeature::InCommitTimestamp,
                         TableFeature::ChangeDataFeed,
                         TableFeature::DeletionVectors,
-                    ]),
+                    ],
                 )
                 .unwrap(),
             ),
@@ -1226,15 +1239,13 @@ async fn test_timestamp_with_ict_disabled() {
                 .unwrap(),
             ),
             Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([TableFeature::DeletionVectors]),
-                    Some([
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors],
+                    [
                         TableFeature::InCommitTimestamp,
                         TableFeature::ChangeDataFeed,
                         TableFeature::DeletionVectors,
-                    ]),
+                    ],
                 )
                 .unwrap(),
             ),
@@ -1284,15 +1295,13 @@ async fn test_timestamp_with_commit_info_not_first() {
                 .unwrap(),
             ),
             Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([TableFeature::DeletionVectors]),
-                    Some([
+                Protocol::try_new_modern(
+                    [TableFeature::DeletionVectors],
+                    [
                         TableFeature::InCommitTimestamp,
                         TableFeature::ChangeDataFeed,
                         TableFeature::DeletionVectors,
-                    ]),
+                    ],
                 )
                 .unwrap(),
             ),

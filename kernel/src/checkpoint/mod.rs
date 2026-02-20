@@ -61,7 +61,7 @@
 //! let state = checkpoint_data.state();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
-//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &checkpoint_data)?;
+//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &mut checkpoint_data)?;
 //!
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
