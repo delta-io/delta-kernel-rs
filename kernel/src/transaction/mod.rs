@@ -1149,20 +1149,15 @@ impl<S> Transaction<S> {
             .read_snapshot
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        let schema = self.read_snapshot.schema();
-
-        // Build a Struct expression that filters out partition columns from the input(unless materializePartitionColumns is enabled),
-        // and renames all fields to the physical names.
-        let fields = schema
-            .fields()
-            .filter(|f| {
-                materialize_partition_columns || !partition_cols.contains(&f.name().to_string())
-            })
-            .map(|f| match f.data_type() {
-                DataType::Struct(_) => Expression::transform(Transform::new_nested([f.name()])),
-                _ => Expression::column([f.name()]),
-            });
-        Expression::struct_from(fields)
+        // Build a Transform expression that drops partition columns from the input
+        // (unless materializePartitionColumns is enabled).
+        let mut transform = Transform::new_top_level();
+        if !materialize_partition_columns {
+            for col in &partition_cols {
+                transform = transform.with_dropped_field_if_exists(col);
+            }
+        }
+        Expression::transform(transform)
     }
 
     /// Get the write context for this transaction. At the moment, this is constant for the whole
@@ -2150,102 +2145,58 @@ mod tests {
         Ok(())
     }
 
+    /// Helper: loads a partitioned test table snapshot and returns its write context.
+    fn partitioned_write_context(
+        table_path: &str,
+    ) -> Result<WriteContext, Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        Ok(txn.get_write_context())
+    }
+
+    /// Helper: evaluates the logical-to-physical transform on the given batch and returns the
+    /// output RecordBatch.
+    fn eval_logical_to_physical(
+        wc: &WriteContext,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let logical_schema = wc.logical_schema();
+        let physical_schema = wc.physical_schema();
+        let l2p = wc.logical_to_physical();
+
+        let handler = ArrowEvaluationHandler;
+        let evaluator =
+            handler.new_expression_evaluator(logical_schema.clone(), l2p, physical_schema.clone().into())?;
+        let result = ArrowEngineData::try_from_engine_data(
+            evaluator.evaluate(&ArrowEngineData::new(batch))?,
+        )?;
+        Ok(result.record_batch().clone())
+    }
+
     #[test]
     fn test_materialize_partition_columns_in_write_context(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-
-        // Test 1: Use basic_partitioned table (without materializePartitionColumns feature)
-        // Partition columns should be excluded from the logical_to_physical expression
-        let path_without =
-            std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url_without = url::Url::from_directory_path(path_without).unwrap();
-        let snapshot_without = Snapshot::builder_for(url_without)
-            .at_version(0)
-            .build(&engine)?;
-
-        // Verify the table is partitioned by "letter" column
-        let partition_cols_without = snapshot_without.table_configuration().partition_columns();
-        assert_eq!(partition_cols_without.len(), 1);
-        assert_eq!(partition_cols_without[0], "letter");
-
-        // Verify the table does not have the materializePartitionColumns feature
-        let has_feature_without = snapshot_without
-            .table_configuration()
-            .protocol()
-            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+        // Without materializePartitionColumns, partition column should be dropped
+        let wc_without = partitioned_write_context("./tests/data/basic_partitioned/")?;
+        let expr_str = format!("{}", wc_without.logical_to_physical());
         assert!(
-            !has_feature_without,
-            "basic_partitioned should not have materializePartitionColumns feature"
+            expr_str.contains("drop letter"),
+            "Partition column 'letter' should be dropped. Expression: {}",
+            expr_str
         );
 
-        // Create a transaction and get write context
-        let txn_without =
-            snapshot_without.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let write_context_without = txn_without.get_write_context();
-        let expr_without = write_context_without.logical_to_physical();
-
-        // Without materializePartitionColumns, partition column should be excluded
-        let expr_str_without = format!("{:?}", expr_without);
-        assert!(!expr_str_without.contains("letter"),
-            "Partition column 'letter' should be excluded when materializePartitionColumns is not enabled. Expression: {}",
-            expr_str_without);
-        assert!(
-            expr_str_without.contains("number"),
-            "Non-partition column 'number' should be included. Expression: {}",
-            expr_str_without
-        );
-        assert!(
-            expr_str_without.contains("a_float"),
-            "Non-partition column 'a_float' should be included. Expression: {}",
-            expr_str_without
-        );
-
-        // Test 2: Use partitioned_with_materialize_feature table (with materializePartitionColumns feature)
-        // Partition columns should be included in the logical_to_physical expression
-        let path_with = std::fs::canonicalize(PathBuf::from(
+        // With materializePartitionColumns, no columns should be dropped (identity transform)
+        let wc_with = partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
-        ))
-        .unwrap();
-        let url_with = url::Url::from_directory_path(path_with).unwrap();
-        let snapshot_with = Snapshot::builder_for(url_with)
-            .at_version(1)
-            .build(&engine)?;
-
-        // Verify the table is partitioned by "letter" column
-        let partition_cols_with = snapshot_with.table_configuration().partition_columns();
-        assert_eq!(partition_cols_with.len(), 1);
-        assert_eq!(partition_cols_with[0], "letter");
-
-        // Verify the table HAS the materializePartitionColumns feature
-        let has_feature_with = snapshot_with
-            .table_configuration()
-            .protocol()
-            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+        )?;
+        let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
-            has_feature_with,
-            "partitioned_with_materialize_feature should have materializePartitionColumns feature"
-        );
-
-        // Create a transaction and get write context
-        let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let write_context_with = txn_with.get_write_context();
-        let expr_with = write_context_with.logical_to_physical();
-
-        // With materializePartitionColumns, ALL columns including partition columns should be included
-        let expr_str_with = format!("{:?}", expr_with);
-        assert!(expr_str_with.contains("letter"),
-            "Partition column 'letter' should be included when materializePartitionColumns is enabled. Expression: {}",
-            expr_str_with);
-        assert!(
-            expr_str_with.contains("number"),
-            "Non-partition column 'number' should be included. Expression: {}",
-            expr_str_with
-        );
-        assert!(
-            expr_str_with.contains("a_float"),
-            "Non-partition column 'a_float' should be included. Expression: {}",
-            expr_str_with
+            !expr_str.contains("drop"),
+            "No columns should be dropped with materializePartitionColumns. Expression: {}",
+            expr_str
         );
 
         Ok(())
@@ -2679,5 +2630,37 @@ mod tests {
     #[case::none_mode(ColumnMappingMode::None)]
     fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> DeltaResult<()> {
         validate_logical_to_physical_transform(mode)
+    }
+
+    fn build_partitioned_batch(wc: &WriteContext) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        use crate::arrow::array::Float64Array;
+        let batch = RecordBatch::try_new(
+            Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
+            vec![
+                Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Float64Array::from(vec![1.5])),
+            ],
+        )?;
+        Ok(batch)
+    }
+
+    #[rstest]
+    #[case::dropped("./tests/data/basic_partitioned/", 2, false)]
+    #[case::kept("./tests/data/partitioned_with_materialize_feature/", 3, true)]
+    fn test_partition_column_in_eval_output(
+        #[case] table_path: &str,
+        #[case] expected_cols: usize,
+        #[case] expect_letter: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let wc = partitioned_write_context(table_path)?;
+        let batch = build_partitioned_batch(&wc)?;
+        let rb = eval_logical_to_physical(&wc, batch)?;
+        assert_eq!(rb.num_columns(), expected_cols);
+        assert_eq!(
+            rb.schema().fields().iter().any(|f| f.name() == "letter"),
+            expect_letter
+        );
+        Ok(())
     }
 }
