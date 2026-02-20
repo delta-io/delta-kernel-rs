@@ -16,6 +16,15 @@ mod tests;
 /// [`DataSkippingStatsProvider`]. From there, we can automatically derive a
 /// [`DataSkippingPredicateEvaluator`].
 pub(crate) trait ParquetStatsProvider {
+    /// Pre-registers a set of columns that may be queried shortly after. Callers are not strictly
+    /// required to invoke this method, but some providers may choose to only provide stats for
+    /// prepared columns because repeatedly traversing parquet footers can be expensive.
+    fn prepare_stats<'a, I>(&mut self, _cols: I)
+    where
+        I: IntoIterator<Item = &'a ColumnName>,
+    {
+    }
+
     /// The min-value stat for this column, if the column exists in this file, has the expected
     /// type, and the parquet footer provides stats for it.
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
@@ -126,21 +135,29 @@ pub(crate) struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
 }
 
 impl<T: ParquetStatsProvider> CheckpointMetaSkippingFilter<T> {
-    pub(crate) fn new(inner: T, predicate: &Predicate) -> Self {
-        let refs = predicate.references();
+    pub(crate) fn new(mut inner: T, predicate: &Predicate) -> Self {
         let min_prefix = column_name!("add.stats_parsed.minValues");
         let max_prefix = column_name!("add.stats_parsed.maxValues");
+        let mapped: Vec<_> = predicate
+            .references()
+            .iter()
+            .map(|&col| {
+                (
+                    (col.clone(), min_prefix.join(col)),
+                    (col.clone(), max_prefix.join(col)),
+                )
+            })
+            .collect();
+
+        let cols = mapped.iter().flat_map(|((_, min), (_, max))| [min, max]);
+        inner.prepare_stats(cols);
+
+        let (min_stats, max_stats) = mapped.into_iter().unzip();
 
         Self {
             inner,
-            min_stats: refs
-                .iter()
-                .map(|col| ((*col).clone(), min_prefix.join(col)))
-                .collect(),
-            max_stats: refs
-                .iter()
-                .map(|col| ((*col).clone(), max_prefix.join(col)))
-                .collect(),
+            min_stats,
+            max_stats,
         }
     }
 
