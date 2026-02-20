@@ -599,7 +599,7 @@ fn visit_expression_impl(
     match expression {
         Expression::Literal(scalar) => visit_expression_scalar(visitor, scalar, sibling_list_id),
         Expression::Column(name) => visit_expression_column(visitor, name, sibling_list_id),
-        Expression::Struct(exprs, _, _) => visit_expression_struct(visitor, exprs, sibling_list_id),
+        Expression::Struct(exprs, _) => visit_expression_struct(visitor, exprs, sibling_list_id),
         Expression::Transform(transform) => {
             visit_expression_transform(visitor, transform, sibling_list_id)
         }

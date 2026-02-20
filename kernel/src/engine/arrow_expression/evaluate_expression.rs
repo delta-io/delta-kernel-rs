@@ -265,17 +265,11 @@ pub fn evaluate_expression(
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
         }
         (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
-        (Struct(fields, schema, nullability), Some(DataType::Struct(output_schema))) => {
-            // Explicit embedded schema takes priority; fall back to result_type schema
-            let target_schema = schema.as_ref().map(|s| s.as_ref()).unwrap_or(output_schema);
-            evaluate_struct_expression(fields, batch, target_schema, nullability.as_ref())
+        (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
+            evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
-        (Struct(fields, Some(schema), nullability), None | Some(_)) => {
-            // Struct has explicit schema, use it regardless of result_type
-            evaluate_struct_expression(fields, batch, schema.as_ref(), nullability.as_ref())
-        }
-        (Struct(_, None, _), dt) => Err(Error::Generic(format!(
-            "Struct expression without schema expects a DataType::Struct result, but got {dt:?}"
+        (Struct(..), dt) => Err(Error::Generic(format!(
+            "Struct expression expects a DataType::Struct result, but got {dt:?}"
         ))),
         (Transform(transform), Some(DataType::Struct(output_schema))) => {
             evaluate_transform_expression(transform, batch, output_schema)
@@ -673,7 +667,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::column_expr;
-    use crate::expressions::{column_expr_ref, Expression as Expr, Transform, UnaryExpressionOp};
+    use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
     use rstest::rstest;
@@ -1677,42 +1671,11 @@ mod tests {
     }
 
     #[test]
-    fn test_struct_with_schema_used_in_to_json() {
-        // A computed field (literal, arithmetic, coalesce, etc.) has no inherent name in the
-        // batch — the embedded schema is the only source of that name, so struct_with_schema_from
-        // is required whenever the struct contains any computed field.
-        // This mirrors the pattern of building a stats struct for the Delta `stats` column.
-        let schema = ArrowSchema::new(vec![ArrowField::new("count", ArrowDataType::Int64, false)]);
-        let col: ArrayRef = Arc::new(Int64Array::from(vec![42i64, 100i64]));
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![col]).unwrap();
-
-        // "totalSize" is a computed literal — it has no corresponding column name in the batch
-        let stats_schema = StructType::new_unchecked(vec![
-            StructField::new("numRecords", DataType::LONG, false),
-            StructField::new("totalSize", DataType::LONG, false),
-        ]);
-        let struct_expr = Expr::struct_with_schema_from(
-            [column_expr_ref!("count"), Arc::new(Expr::literal(0i64))],
-            stats_schema,
-        );
-        let to_json_expr = Expr::unary(UnaryExpressionOp::ToJson, struct_expr);
-
-        let result = evaluate_expression(&to_json_expr, &batch, Some(&DataType::STRING)).unwrap();
-        let str_result = result.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(str_result.value(0), r#"{"numRecords":42,"totalSize":0}"#);
-        assert_eq!(str_result.value(1), r#"{"numRecords":100,"totalSize":0}"#);
-    }
-
-    #[test]
-    fn test_struct_without_schema_no_result_type_errors() {
-        // struct_from (no embedded schema) with result_type = None should return an error
+    fn test_struct_no_result_type_errors() {
+        // struct_from with result_type = None should return an error
         let batch = create_test_batch();
         let expr = Expr::struct_from([column_expr_ref!("a")]);
         let result = evaluate_expression(&expr, &batch, None);
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("without schema"),
-            "error should mention 'without schema'"
-        );
     }
 }
