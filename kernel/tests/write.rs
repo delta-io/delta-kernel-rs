@@ -8,7 +8,6 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray,
 };
@@ -45,9 +44,10 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::FileMeta;
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_add_files_metadata,
-    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
-    test_table_setup, write_parquet_with_snapshot,
+    assert_result_error_with_message, copy_directory, create_add_files_metadata, create_cm_table,
+    create_default_engine, create_table, engine_store_setup, read_add_infos, setup_test_tables,
+    test_read, test_table_setup, translate_logical_path_to_physical, write_batch_to_table,
+    write_parquet_with_snapshot,
 };
 
 mod common;
@@ -3051,17 +3051,6 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     Ok(())
 }
 
-/// Translates a logical field path (e.g. `["address", "street"]`) to physical
-/// using the snapshot's table configuration and column mapping mode.
-fn translate_logical_path_to_physical(snapshot: &Snapshot, path: &[&str]) -> Vec<String> {
-    use delta_kernel::expressions::ColumnName;
-    let col = ColumnName::new(path.iter().map(|s| s.to_string()));
-    let tc = snapshot.table_configuration();
-    let cm = tc.column_mapping_mode();
-    tc.translate_column_name_to_physical(&col, cm)
-        .unwrap_or_else(|| panic!("failed to resolve {:?} to physical", path))
-        .into_inner()
-}
 
 /// Asserts that a field exists at the given physical path in the footer schema.
 fn assert_footer_has_field(footer_schema: &StructType, physical_path: &[String]) {
@@ -3158,111 +3147,6 @@ fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     ])
 }
 
-/// Writes a RecordBatch to a table and commits. Returns the post-commit snapshot.
-async fn write_batch_to_table(
-    snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
-    data: RecordBatch,
-    partition_values: HashMap<String, String>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("DefaultEngine")
-        .with_data_change(true);
-    let write_context = Arc::new(txn.get_write_context());
-    let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            partition_values,
-        )
-        .await?;
-    txn.add_files(add_meta);
-    match txn.commit(engine)? {
-        CommitResult::CommittedTransaction(c) => Ok(c
-            .post_commit_snapshot()
-            .expect("Failed to get post_commit_snapshot")
-            .clone()),
-        _ => panic!("Write commit should succeed"),
-    }
-}
-
-/// An add info extracted from the log segment.
-struct AddInfo {
-    path: String,
-    stats: Option<serde_json::Value>,
-}
-/// Reads all add infos from a snapshot's log segment using internal API.
-fn read_add_infos(
-    snapshot: &Snapshot,
-    engine: &impl Engine,
-) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
-    let schema = get_log_add_schema().clone();
-    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
-    let mut actions = Vec::new();
-    for batch_result in batches {
-        let actions_batch = batch_result?;
-        let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
-        let record_batch = engine_data.record_batch();
-        let add_struct = match record_batch.schema().index_of("add").ok().and_then(|idx| {
-            record_batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StructArray>()
-        }) {
-            Some(s) => s,
-            None => continue,
-        };
-        let path_arr = add_struct
-            .column_by_name("path")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let stats_arr = add_struct
-            .column_by_name("stats")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let len = add_struct.len();
-        for i in 0..len {
-            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
-                let stats = stats_arr
-                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
-                    .map(serde_json::from_str)
-                    .transpose()?;
-                actions.push(AddInfo {
-                    path: path.to_string(),
-                    stats,
-                });
-            }
-        }
-    }
-    Ok(actions)
-}
-
-/// Helper to create a table with optional column mapping mode via `create_table_txn`.
-/// Returns the post-commit snapshot.
-fn create_cm_table(
-    table_path: &str,
-    schema: SchemaRef,
-    cm_mode: ColumnMappingMode,
-    engine: &impl Engine,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut builder = create_table_txn(table_path, schema, "cm-e2e");
-    let mode_str = match cm_mode {
-        ColumnMappingMode::None => "none",
-        ColumnMappingMode::Id => "id",
-        ColumnMappingMode::Name => "name",
-    };
-    builder = builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
-    let create_result = builder
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
-    match create_result {
-        CommitResult::CommittedTransaction(c) => Ok(c
-            .post_commit_snapshot()
-            .expect("should have post_commit_snapshot")
-            .clone()),
-        _ => panic!("Create table should succeed"),
-    }
-}
 
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
@@ -3297,9 +3181,9 @@ async fn test_column_mapping_write(
         create_cm_table(&table_path, schema.clone(), cm_mode, engine.as_ref())?;
 
     // Get physical field paths for stats verification (top-level and nested)
-    let row_number_physical = translate_logical_path_to_physical(&latest_snapshot, &["row_number"]);
+    let row_number_physical = translate_logical_path_to_physical(&latest_snapshot, &["row_number"])?;
     let street_physical =
-        translate_logical_path_to_physical(&latest_snapshot, &["address", "street"]);
+        translate_logical_path_to_physical(&latest_snapshot, &["address", "street"])?;
 
     // Step 2: Write two batches
     for data in nested_batches()? {
@@ -3341,7 +3225,7 @@ async fn test_column_mapping_write(
 
         // Verify top-level "row_number" and nested "address.street" use correct (physical) names
         for path in [vec!["row_number"], vec!["address", "street"]] {
-            let physical = translate_logical_path_to_physical(&latest_snapshot, &path);
+            let physical = translate_logical_path_to_physical(&latest_snapshot, &path)?;
             assert_footer_has_field(&footer_schema, &physical);
         }
     }
@@ -3427,7 +3311,7 @@ async fn test_column_mapping_partitioned_write(
     );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let physical_name = translate_logical_path_to_physical(&snapshot, &["category"])[0].clone();
+    let physical_name = translate_logical_path_to_physical(&snapshot, &["category"])?[0].clone();
 
     // Write data with partition value
     let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(

@@ -1,9 +1,12 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray,
+    StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -19,6 +22,9 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
+use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
@@ -617,6 +623,150 @@ pub async fn write_parquet_with_snapshot(
     engine
         .write_parquet(data, &write_context, partition_values)
         .await
+}
+
+/// Translates a logical field path (e.g. `["address", "street"]`) to physical
+/// using the snapshot's table properties and column mapping mode.
+pub fn translate_logical_path_to_physical(
+    snapshot: &Snapshot,
+    path: &[&str],
+) -> DeltaResult<Vec<String>> {
+    use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue};
+    use delta_kernel::Error;
+    let cm = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let schema = snapshot.schema();
+    let mut current_struct: Option<&delta_kernel::schema::StructType> = Some(schema.as_ref());
+    path.iter()
+        .map(|segment| {
+            let field = current_struct
+                .and_then(|s| s.field(*segment))
+                .ok_or_else(|| {
+                    Error::generic(format!(
+                        "Could not resolve '{segment}' in path {path:?} in schema {schema}"
+                    ))
+                })?;
+            current_struct = match field.data_type() {
+                DataType::Struct(s) => Some(s),
+                _ => None,
+            };
+            let phys_name = match cm {
+                ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                        Some(MetadataValue::String(s)) => s.clone(),
+                        _ => field.name.clone(),
+                    }
+                }
+                ColumnMappingMode::None => field.name.clone(),
+            };
+            Ok(phys_name)
+        })
+        .collect()
+}
+
+/// Writes a RecordBatch to a table and commits. Returns the post-commit snapshot.
+pub async fn write_batch_to_table(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    data: RecordBatch,
+    partition_values: HashMap<String, String>,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(&ArrowEngineData::new(data), &write_context, partition_values)
+        .await?;
+    txn.add_files(add_meta);
+    match txn.commit(engine)? {
+        CommitResult::CommittedTransaction(c) => Ok(c
+            .post_commit_snapshot()
+            .expect("Failed to get post_commit_snapshot")
+            .clone()),
+        _ => panic!("Write commit should succeed"),
+    }
+}
+
+/// An add info extracted from the log segment.
+pub struct AddInfo {
+    pub path: String,
+    pub stats: Option<serde_json::Value>,
+}
+
+/// Reads all add infos from a snapshot's log segment using internal API.
+pub fn read_add_infos(
+    snapshot: &Snapshot,
+    engine: &impl Engine,
+) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
+    let schema = get_log_add_schema().clone();
+    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
+    let mut actions = Vec::new();
+    for batch_result in batches {
+        let actions_batch = batch_result?;
+        let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
+        let record_batch = engine_data.record_batch();
+        let add_struct = match record_batch.schema().index_of("add").ok().and_then(|idx| {
+            record_batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StructArray>()
+        }) {
+            Some(s) => s,
+            None => continue,
+        };
+        let path_arr = add_struct
+            .column_by_name("path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let stats_arr = add_struct
+            .column_by_name("stats")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let len = add_struct.len();
+        for i in 0..len {
+            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
+                let stats = stats_arr
+                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                    .map(serde_json::from_str)
+                    .transpose()?;
+                actions.push(AddInfo {
+                    path: path.to_string(),
+                    stats,
+                });
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// Helper to create a table with optional column mapping mode via `create_table_txn`.
+/// Returns the post-commit snapshot.
+pub fn create_cm_table(
+    table_path: &str,
+    schema: SchemaRef,
+    cm_mode: ColumnMappingMode,
+    engine: &impl Engine,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut builder = create_table_txn(table_path, schema, "cm-e2e");
+    let mode_str = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Id => "id",
+        ColumnMappingMode::Name => "name",
+    };
+    builder = builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
+    let create_result = builder
+        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .commit(engine)?;
+    match create_result {
+        CommitResult::CommittedTransaction(c) => Ok(c
+            .post_commit_snapshot()
+            .expect("should have post_commit_snapshot")
+            .clone()),
+        _ => panic!("Create table should succeed"),
+    }
 }
 
 // Writer that captures log output into a shared buffer for test assertions
