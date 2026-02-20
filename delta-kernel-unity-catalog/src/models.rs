@@ -109,3 +109,20 @@ impl CommitRequest {
 
     // TODO: expose metadata/protocol (with_metadata, with_protocol)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_commits_request_builder() {
+        let request = CommitsRequest::new("test-id", "test-uri")
+            .with_start_version(1)
+            .with_end_version(10);
+
+        assert_eq!(request.table_id, "test-id");
+        assert_eq!(request.table_uri, "test-uri");
+        assert_eq!(request.start_version, Some(1));
+        assert_eq!(request.end_version, Some(10));
+    }
+}

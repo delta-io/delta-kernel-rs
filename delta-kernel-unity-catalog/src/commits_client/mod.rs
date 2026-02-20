@@ -5,7 +5,8 @@ use url::Url;
 use crate::config::ClientConfig;
 use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
+
+use crate::models::{CommitRequest, CommitsRequest, CommitsResponse};
 
 #[cfg(any(test, feature = "test-utils"))]
 mod in_memory;
@@ -16,9 +17,8 @@ pub use in_memory::{InMemoryCommitsClient, TableData};
 /// Trait for committing new versions to a UC-managed Delta table.
 ///
 /// Implementations of this trait are responsible for performing any necessary retries on transient
-/// failures. This trait is designed to be injected into a `uc_catalog::committer::UCCommitter`,
-/// which itself does not perform any retries and relies on the underlying client implementation to
-/// handle retry logic.
+/// failures. This trait is designed to be injected into a [`crate::UCCommitter`], which itself does
+/// not perform any retries and relies on the underlying client implementation to handle retry logic.
 #[allow(async_fn_in_trait)]
 pub trait UCCommitClient: Send + Sync {
     /// Commit a new version to the table.
