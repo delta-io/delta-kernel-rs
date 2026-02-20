@@ -3630,6 +3630,7 @@ mod tests {
             .multiunzip();
         let src_schema = Arc::new(ArrowSchema::new(src_fields));
         let target_schema = Arc::new(ArrowSchema::new(tgt_fields));
+        assert_ne!(src_schema, target_schema);
         let batch = RecordBatch::try_new(src_schema, cols).unwrap();
         let result = coerce_batch_nullability(batch, &target_schema).unwrap();
         assert_eq!(*result.schema(), *target_schema);
