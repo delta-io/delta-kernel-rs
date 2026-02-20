@@ -1,6 +1,7 @@
 //! File system committer for non-catalog-managed tables.
 
 use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
+use tracing::{info, instrument};
 
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
@@ -21,12 +22,19 @@ impl FileSystemCommitter {
 }
 
 impl Committer for FileSystemCommitter {
+    #[instrument(
+        name = "fs_committer.commit",
+        skip_all,
+        fields(version = commit_metadata.version()),
+        err
+    )]
     fn commit(
         &self,
         engine: &dyn Engine,
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
+        let version = commit_metadata.version();
         let published_commit_path = commit_metadata.published_commit_path()?;
 
         match engine.json_handler().write_json_file(
@@ -35,6 +43,10 @@ impl Committer for FileSystemCommitter {
             false,
         ) {
             Ok(()) => {
+                info!(
+                    committed_version = version,
+                    "Committed delta file via filesystem committer"
+                );
                 // For now, we don't need the real size of the written file, so we can use 0.
                 // If we need this in the future, we can get it from StorageHandler::head.
                 let file_meta = FileMeta::new(
@@ -44,9 +56,13 @@ impl Committer for FileSystemCommitter {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResponse::Conflict {
-                version: commit_metadata.version,
-            }),
+            Err(Error::FileAlreadyExists(_)) => {
+                info!(
+                    conflicting_version = version,
+                    "Filesystem commit conflict: target version already exists"
+                );
+                Ok(CommitResponse::Conflict { version })
+            }
             Err(e) => Err(e),
         }
     }
@@ -136,5 +152,28 @@ mod tests {
             }
             CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_committer_returns_conflict_for_existing_version() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = DefaultEngineBuilder::new(storage).build();
+
+        let committer = FileSystemCommitter::new();
+        let first_metadata =
+            CommitMetadata::new(LogRoot::new(table_root.clone()).unwrap(), 1, 12345, Some(0));
+        let second_metadata =
+            CommitMetadata::new(LogRoot::new(table_root).unwrap(), 1, 12346, Some(0));
+
+        let first = committer
+            .commit(&engine, Box::new(std::iter::empty()), first_metadata)
+            .unwrap();
+        assert!(matches!(first, CommitResponse::Committed { .. }));
+
+        let second = committer
+            .commit(&engine, Box::new(std::iter::empty()), second_metadata)
+            .unwrap();
+        assert!(matches!(second, CommitResponse::Conflict { version: 1 }));
     }
 }
