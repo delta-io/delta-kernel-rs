@@ -1,6 +1,5 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::get_log_add_schema;

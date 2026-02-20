@@ -3049,7 +3049,6 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     Ok(())
 }
 
-
 /// Asserts that a field exists at the given physical path in the footer schema.
 fn assert_footer_has_field(footer_schema: &StructType, physical_path: &[String]) {
     let path_str = physical_path.join(".");
@@ -3145,7 +3144,6 @@ fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     ])
 }
 
-
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
 /// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
@@ -3179,7 +3177,8 @@ async fn test_column_mapping_write(
         create_cm_table(&table_path, schema.clone(), cm_mode, engine.as_ref())?;
 
     // Get physical field paths for stats verification (top-level and nested)
-    let row_number_physical = translate_logical_path_to_physical(&latest_snapshot, &["row_number"])?;
+    let row_number_physical =
+        translate_logical_path_to_physical(&latest_snapshot, &["row_number"])?;
     let street_physical =
         translate_logical_path_to_physical(&latest_snapshot, &["address", "street"])?;
 
