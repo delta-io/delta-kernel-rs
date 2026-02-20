@@ -1,28 +1,39 @@
-//! UCCatalog implements a high-level interface for interacting with Delta Tables in Unity Catalog.
+//! Delta Kernel Unity Catalog integration.
+//!
+//! This crate provides Unity Catalog support for delta-kernel-rs, including the
+//! [`UCCommitter`] for committing transactions and the [`UCKernelClient`] for loading snapshots
+//! via the UC commits API.
 
+pub mod commits_client;
 mod committer;
+pub mod models;
+
+pub use commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
 pub use committer::UCCommitter;
+pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use commits_client::{InMemoryCommitsClient, TableData};
 
 use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
 
-use uc_client::prelude::*;
-
 use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-/// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
-/// Catalog. For now this is a lightweight wrapper around a [UCGetCommitsClient].
-pub struct UCCatalog<'a, C: UCGetCommitsClient> {
+/// [UCKernelClient] is the bridge between UC and Kernel. It calls UC to get commits for
+/// catalog-managed tables, translates the response into kernel [`LogPath`]s, and injects them
+/// into Kernel's [`Snapshot`] builder to construct a snapshot.
+pub struct UCKernelClient<'a, C: UCGetCommitsClient> {
     client: &'a C,
 }
 
-impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
-    /// Create a new [UCCatalog] instance with the provided client.
+impl<'a, C: UCGetCommitsClient> UCKernelClient<'a, C> {
+    /// Create a new [UCKernelClient] instance with the provided client.
     pub fn new(client: &'a C) -> Self {
-        UCCatalog { client }
+        UCKernelClient { client }
     }
 
     /// Load the latest snapshot of a Delta Table identified by `table_id` and `table_uri` in Unity
@@ -92,7 +103,7 @@ impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
             },
         };
 
-        // consume uc-client's Commit and hand back a delta_kernel LogPath
+        // consume UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
         // add trailing slash
         if !table_url.path().ends_with('/') {
@@ -135,13 +146,16 @@ mod tests {
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
+    use unity_catalog_client::UCClient;
 
     use tracing::info;
 
     use super::*;
 
+    use unity_catalog_client::models::credentials::Operation;
+
     // We could just re-export UCClient's get_table to not require consumers to directly import
-    // uc_client themselves.
+    // unity_catalog_client themselves.
     async fn get_table(
         client: &UCClient,
         table_name: &str,
@@ -168,7 +182,7 @@ mod tests {
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
         // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let config = unity_catalog_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let uc_client = UCClient::new(config.clone())?;
@@ -180,7 +194,7 @@ mod tests {
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
 
-        let catalog = UCCatalog::new(&uc_commits_client);
+        let catalog = UCKernelClient::new(&uc_commits_client);
 
         // TODO: support non-AWS
         let creds = creds
@@ -223,7 +237,7 @@ mod tests {
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
         // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let config = unity_catalog_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let client = UCClient::new(config.clone())?;
@@ -235,7 +249,7 @@ mod tests {
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
 
-        let catalog = UCCatalog::new(commits_client.as_ref());
+        let catalog = UCKernelClient::new(commits_client.as_ref());
 
         // TODO: support non-AWS
         let creds = creds
