@@ -211,7 +211,7 @@ fn transform_add_schema(
     };
 
     let modified_add = transform_fn(add_struct)?;
-    let new_schema = base_schema.with_field_replaced(
+    let new_schema = base_schema.clone().with_field_replaced(
         ADD_NAME,
         StructField {
             name: ADD_NAME.to_string(),

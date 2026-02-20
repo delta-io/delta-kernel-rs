@@ -899,7 +899,7 @@ impl StructType {
         Ok(())
     }
 
-    /// Returns a new StructType with `new_field` inserted after the field named `after`.
+    /// Returns a StructType with `new_field` inserted after the field named `after`.
     /// If `after` is None, `new_field` is appended to the end.
     /// If `after` is not found, an error is returned.
     pub fn with_field_inserted_after(
@@ -921,7 +921,7 @@ impl StructType {
         Ok(self)
     }
 
-    /// Returns a new StructType with `new_field` inserted before the field named `before`.
+    /// Returns a StructType with `new_field` inserted before the field named `before`.
     /// If `before` is None, `new_field` is inserted at the beginning.
     /// If `before` is not found, an error is returned.
     pub fn with_field_inserted_before(
@@ -942,7 +942,7 @@ impl StructType {
         Ok(self)
     }
 
-    /// Returns a new StructType with the named field removed.
+    /// Returns a StructType with the named field removed.
     /// Returns self unchanged if field doesn't exist.
     pub fn with_field_removed(mut self, name: &str) -> Self {
         self.fields.shift_remove(name);
@@ -952,23 +952,24 @@ impl StructType {
     /// Returns a new StructType with the named field replaced.
     /// Returns an error if field doesn't exist.
     pub fn with_field_replaced(
-        &self,
+        mut self,
         name: &str,
         new_field: StructField,
     ) -> DeltaResult<StructType> {
-        let pos = self
+        let replace_field = self
             .fields
-            .get_index_of(name)
+            .get_mut(name)
             .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
 
-        let new_fields = self.fields.iter().enumerate().map(|(i, (_, v))| {
-            if i == pos {
-                new_field.clone()
-            } else {
-                v.clone()
-            }
-        });
-        Ok(Self::new_unchecked(new_fields))
+        *replace_field = new_field;
+        //    let new_fields = self.fields.iter().enumerate().map(|(i, (_, v))| {
+        //        if i == pos {
+        //            new_field.clone()
+        //        } else {
+        //            v.clone()
+        //        }
+        //    });
+        Ok(self)
     }
 }
 
