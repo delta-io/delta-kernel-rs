@@ -35,7 +35,7 @@ use crate::schema::{
     ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema,
 };
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{ColumnMappingMode, Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
 use crate::FileMeta;
 use crate::{
@@ -1130,7 +1130,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -1149,16 +1149,20 @@ impl<S> Transaction<S> {
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
         let schema = self.read_snapshot.schema();
 
-        // If the materialize partition columns feature is enabled, pass through all columns in the
-        // schema. Otherwise, exclude partition columns.
+        // Build a Struct expression that filters out partition columns from the input(unless materializePartitionColumns is enabled),
+        // and renames all fields to the physical names.
         let fields = schema
             .fields()
             .filter(|f| {
                 materialize_partition_columns || !partition_cols.contains(&f.name().to_string())
             })
-            .map(|f| Expression::column([f.name()]));
+            .map(|f| match f.data_type() {
+                DataType::Struct(_) => Expression::transform(Transform::new_nested([f.name()])),
+                _ => Expression::column([f.name()]),
+            });
         Expression::struct_from(fields)
     }
+
     /// Get the write context for this transaction. At the moment, this is constant for the whole
     /// transaction.
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
@@ -1170,18 +1174,30 @@ impl<S> Transaction<S> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
+        let column_mapping_mode = self
+            .read_snapshot
+            .table_configuration()
+            .column_mapping_mode();
 
         // Compute physical schema: exclude partition columns since they're stored in the path
+        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
+        // logical field names to physical names.
         let partition_columns: Vec<String> = self
             .read_snapshot
             .table_configuration()
             .metadata()
             .partition_columns()
             .to_vec();
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
         let physical_fields = snapshot_schema
             .fields()
-            .filter(|f| !partition_columns.contains(&f.name().to_string()))
-            .cloned();
+            .filter(|f| {
+                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
+            })
+            .map(|f| f.make_physical(column_mapping_mode));
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
@@ -1192,6 +1208,7 @@ impl<S> Transaction<S> {
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            column_mapping_mode,
             stats_columns,
         )
     }
@@ -1742,6 +1759,7 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
 }
@@ -1752,6 +1770,7 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
@@ -1759,6 +1778,7 @@ impl WriteContext {
             logical_schema,
             physical_schema,
             logical_to_physical,
+            column_mapping_mode,
             stats_columns,
         }
     }
@@ -1777,6 +1797,11 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// The [`ColumnMappingMode`] for this table.
+    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
+        self.column_mapping_mode
     }
 
     /// Returns the column names that should have statistics collected during writes.
@@ -1927,13 +1952,28 @@ pub struct RetryableTransaction<S = ExistingTable> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::StringArray;
+    use crate::arrow::array::{
+        ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+    };
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
+    use crate::engine::arrow_conversion::TryIntoArrow;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
-    use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
+    use crate::utils::test_utils::{
+        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
+        test_schema_with_array, test_schema_with_map,
+    };
+    use crate::EvaluationHandler;
     use crate::Snapshot;
+    use rstest::rstest;
     use std::path::PathBuf;
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
@@ -2224,6 +2264,33 @@ mod tests {
         Ok(())
     }
 
+    /// Physical schema should include partition columns when materializePartitionColumns is on.
+    #[test]
+    fn test_physical_schema_includes_partition_columns_when_materialized(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/partitioned_with_materialize_feature/",
+        ))
+        .unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let write_context = txn.get_write_context();
+        let physical_schema = write_context.physical_schema();
+
+        assert!(
+            physical_schema.contains("letter"),
+            "Partition column 'letter' should be in physical schema when materialized"
+        );
+        assert!(
+            physical_schema.contains("number"),
+            "Non-partition column 'number' should be in physical schema"
+        );
+        Ok(())
+    }
+
     /// Tests that update_deletion_vectors validates table protocol requirements.
     /// Validates that attempting DV updates on unsupported tables returns protocol error.
     #[test]
@@ -2470,5 +2537,159 @@ mod tests {
             "Existing table debug should not contain create_table: {debug_str}"
         );
         Ok(())
+    }
+
+    // Input schemas have no CM metadata; create_table automatically assigns IDs and
+    // physical names when mode is Name or Id.
+    #[rstest]
+    #[case::flat_none(test_schema_flat(), ColumnMappingMode::None)]
+    #[case::flat_name(test_schema_flat(), ColumnMappingMode::Name)]
+    #[case::flat_id(test_schema_flat(), ColumnMappingMode::Id)]
+    #[case::nested_none(test_schema_nested(), ColumnMappingMode::None)]
+    #[case::nested_name(test_schema_nested(), ColumnMappingMode::Name)]
+    #[case::nested_id(test_schema_nested(), ColumnMappingMode::Id)]
+    #[case::map_none(test_schema_with_map(), ColumnMappingMode::None)]
+    #[case::map_name(test_schema_with_map(), ColumnMappingMode::Name)]
+    #[case::map_id(test_schema_with_map(), ColumnMappingMode::Id)]
+    #[case::array_none(test_schema_with_array(), ColumnMappingMode::None)]
+    #[case::array_name(test_schema_with_array(), ColumnMappingMode::Name)]
+    #[case::array_id(test_schema_with_array(), ColumnMappingMode::Id)]
+    fn test_physical_schema_column_mapping(
+        #[case] schema: SchemaRef,
+        #[case] mode: ColumnMappingMode,
+    ) -> DeltaResult<()> {
+        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let write_context = txn.get_write_context();
+        crate::utils::test_utils::validate_physical_schema_column_mapping(
+            write_context.logical_schema(),
+            write_context.physical_schema(),
+            mode,
+        );
+        Ok(())
+    }
+
+    /// Builds a RecordBatch with logical field names matching [`test_schema_nested`].
+    fn build_test_record_batch() -> DeltaResult<RecordBatch> {
+        let id_arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
+
+        // info struct fields
+        let name_arr: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob"]));
+        let age_arr: ArrayRef = Arc::new(Int32Array::from(vec![30, 25]));
+
+        // info.tags: Map<String, String>
+        let keys = StringArray::from(vec!["k1", "k2"]);
+        let vals = StringArray::from(vec!["v1", "v2"]);
+        let entries_field = ArrowField::new(
+            "key_value",
+            ArrowDataType::Struct(
+                vec![
+                    ArrowField::new("key", ArrowDataType::Utf8, false),
+                    ArrowField::new("value", ArrowDataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let entries = StructArray::try_new(
+            vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Utf8, true),
+            ]
+            .into(),
+            vec![Arc::new(keys), Arc::new(vals)],
+            None,
+        )?;
+        let map_offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
+        let tags_arr: ArrayRef = Arc::new(MapArray::new(
+            Arc::new(entries_field),
+            map_offsets,
+            entries,
+            None,
+            false,
+        ));
+
+        // info.scores: Array<Int>
+        let score_values = Int32Array::from(vec![10, 20, 30]);
+        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 2, 3].into());
+        let scores_arr: ArrayRef = Arc::new(ListArray::try_new(
+            Arc::new(ArrowField::new("element", ArrowDataType::Int32, true)),
+            offsets,
+            Arc::new(score_values),
+            None,
+        )?);
+
+        // info struct
+        let info_fields = vec![
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("age", ArrowDataType::Int32, true),
+            ArrowField::new("tags", tags_arr.data_type().clone(), true),
+            ArrowField::new("scores", scores_arr.data_type().clone(), true),
+        ];
+        let info_arr: ArrayRef = Arc::new(StructArray::try_new(
+            info_fields.into(),
+            vec![name_arr, age_arr, tags_arr, scores_arr],
+            None,
+        )?);
+
+        let arrow_schema: ArrowSchema = test_schema_nested().as_ref().try_into_arrow()?;
+        Ok(RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![id_arr, info_arr],
+        )?)
+    }
+
+    /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting levels.
+    /// Builds a RecordBatch with logical names, evaluates the transform, and checks that the
+    /// output uses physical names from the physical schema — including nested struct children.
+    fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
+        let schema = test_schema_nested();
+        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let write_context = txn.get_write_context();
+        let logical_schema = write_context.logical_schema();
+        let physical_schema = write_context.physical_schema();
+        let logical_to_physical_expression = write_context.logical_to_physical();
+
+        if mode != ColumnMappingMode::None {
+            assert_ne!(
+                logical_schema, physical_schema,
+                "Physical schema should differ from logical schema when column mapping is enabled"
+            );
+        }
+
+        let batch = build_test_record_batch()?;
+
+        // Evaluate the logical_to_physical expression
+        let input_schema: SchemaRef = logical_schema.clone();
+        let handler = ArrowEvaluationHandler;
+        let evaluator = handler.new_expression_evaluator(
+            input_schema,
+            logical_to_physical_expression.clone(),
+            physical_schema.clone().into(),
+        )?;
+        let result = evaluator.evaluate(&ArrowEngineData::new(batch))?;
+        let result = ArrowEngineData::try_from_engine_data(result)?;
+        let result_batch = result.record_batch();
+
+        // Verify: all field names, types, and metadata match the physical schema
+        let expected_arrow_schema: ArrowSchema = physical_schema.as_ref().try_into_arrow()?;
+        assert_eq!(result_batch.schema().as_ref(), &expected_arrow_schema);
+
+        // Verify: data is preserved (id values)
+        let id_col = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column should be Int64");
+        assert_eq!(id_col.values(), &[1i64, 2]);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::name_mode(ColumnMappingMode::Name)]
+    #[case::id_mode(ColumnMappingMode::Id)]
+    #[case::none_mode(ColumnMappingMode::None)]
+    fn test_logical_to_physical_transform(#[case] mode: ColumnMappingMode) -> DeltaResult<()> {
+        validate_logical_to_physical_transform(mode)
     }
 }

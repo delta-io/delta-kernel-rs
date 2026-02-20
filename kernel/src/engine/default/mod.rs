@@ -25,7 +25,8 @@ use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
+    StorageHandler,
 };
 
 pub mod executor;
@@ -214,12 +215,36 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         Some(self.object_store.clone())
     }
 
+    /// Write `data` as a parquet file using the provided `write_context`.
+    ///
+    /// The `partition_values` keys should use **logical** column names. They will be
+    /// automatically translated to physical names using the column mapping mode from
+    /// `write_context`.
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        // Translate logical partition column names to physical names
+        let physical_partition_values = partition_values
+            .into_iter()
+            .map(|(logical_name, value)| {
+                let field = write_context
+                    .logical_schema()
+                    .field(&logical_name)
+                    .ok_or_else(|| {
+                        Error::generic(format!(
+                            "Partition column '{logical_name}' not found in table schema"
+                        ))
+                    })?;
+                let physical_name = field
+                    .physical_name(write_context.column_mapping_mode())
+                    .to_string();
+                Ok((physical_name, value))
+            })
+            .collect::<DeltaResult<HashMap<_, _>>>()?;
+
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.physical_schema();
@@ -233,7 +258,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .write_parquet_file(
                 write_context.target_dir(),
                 physical_data,
-                partition_values,
+                physical_partition_values,
                 Some(write_context.stats_columns()),
             )
             .await
