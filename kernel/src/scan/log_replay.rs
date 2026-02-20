@@ -586,18 +586,20 @@ fn get_add_transform_expr(
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
-        Arc::new(Expression::struct_from([Arc::new(Expression::struct_from([
-            column_expr_ref!("path"),
-            column_expr_ref!("fileConstantValues.partitionValues"),
-            column_expr_ref!("size"),
-            column_expr_ref!("modificationTime"),
-            column_expr_ref!("stats"),
-            column_expr_ref!("fileConstantValues.tags"),
-            column_expr_ref!("deletionVector"),
-            column_expr_ref!("fileConstantValues.baseRowId"),
-            column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
-            column_expr_ref!("fileConstantValues.clusteringProvider"),
-        ]))]))
+        Arc::new(Expression::struct_from([Arc::new(
+            Expression::struct_from([
+                column_expr_ref!("path"),
+                column_expr_ref!("fileConstantValues.partitionValues"),
+                column_expr_ref!("size"),
+                column_expr_ref!("modificationTime"),
+                column_expr_ref!("stats"),
+                column_expr_ref!("fileConstantValues.tags"),
+                column_expr_ref!("deletionVector"),
+                column_expr_ref!("fileConstantValues.baseRowId"),
+                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                column_expr_ref!("fileConstantValues.clusteringProvider"),
+            ]),
+        )]))
     });
     EXPR.clone()
 }

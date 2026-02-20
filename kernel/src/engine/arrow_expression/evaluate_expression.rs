@@ -666,7 +666,9 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray};
+    use crate::arrow::array::{
+        ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray,
+    };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
@@ -1716,16 +1718,17 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("foo"), None, Some("bar")]));
         let batch = RecordBatch::try_new(Arc::new(schema), vec![storage_type]).unwrap();
 
-        let output_schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![
-            StructField::new("storage_type", DataType::STRING, true),
-        ])));
+        let output_schema =
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "storage_type",
+                DataType::STRING,
+                true,
+            )])));
         let predicate = Arc::new(Expr::from_pred(
             Expression::column(["storage_type"]).is_not_null(),
         ));
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("storage_type")],
-            predicate,
-        );
+        let expr =
+            Expr::struct_with_nullability_from([column_expr_ref!("storage_type")], predicate);
         let result = evaluate_expression(&expr, &batch, Some(&output_schema)).unwrap();
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(struct_result.len(), 3);
@@ -1743,8 +1746,7 @@ mod tests {
         // batch — the embedded schema is the only source of that name, so struct_with_schema_from
         // is required whenever the struct contains any computed field.
         // This mirrors the pattern of building a stats struct for the Delta `stats` column.
-        let schema =
-            ArrowSchema::new(vec![ArrowField::new("count", ArrowDataType::Int64, false)]);
+        let schema = ArrowSchema::new(vec![ArrowField::new("count", ArrowDataType::Int64, false)]);
         let col: ArrayRef = Arc::new(Int64Array::from(vec![42i64, 100i64]));
         let batch = RecordBatch::try_new(Arc::new(schema), vec![col]).unwrap();
 
@@ -1754,10 +1756,7 @@ mod tests {
             StructField::new("totalSize", DataType::LONG, false),
         ]);
         let struct_expr = Expr::struct_with_schema_from(
-            [
-                column_expr_ref!("count"),
-                Arc::new(Expr::literal(0i64)),
-            ],
+            [column_expr_ref!("count"), Arc::new(Expr::literal(0i64))],
             stats_schema,
         );
         let to_json_expr = Expr::unary(UnaryExpressionOp::ToJson, struct_expr);
