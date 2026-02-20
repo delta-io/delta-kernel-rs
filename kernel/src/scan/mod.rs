@@ -320,19 +320,6 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
-struct PrefixColumns {
-    prefix: ColumnName,
-}
-
-impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
-    }
-}
-
 struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
@@ -646,7 +633,7 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let meta_predicate = self.build_actions_meta_predicate();
+        let meta_predicate = self.build_checkpoint_meta_predicate();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
@@ -696,7 +683,7 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let meta_predicate = self.build_actions_meta_predicate();
+        let meta_predicate = self.build_checkpoint_meta_predicate();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -713,21 +700,25 @@ impl Scan {
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
+    /// The scan predicate is transformed into a data-skipping form with IS NULL guards and
+    /// fully qualified column paths. Data columns reference `add.stats_parsed.*` and partition
+    /// columns reference `add.partitionValues_parsed.*`. The parquet reader's row group filter
+    /// can then use parquet-level statistics on these nested columns to skip entire row groups
+    /// that cannot contain matching files.
     ///
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
-    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+    fn build_checkpoint_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
-        self.state_info.physical_stats_schema.as_ref()?;
+        // Need either stats schema or partition schema for any checkpoint skipping
+        if self.state_info.physical_stats_schema.is_none()
+            && self.state_info.physical_partition_schema.is_none()
+        {
+            return None;
+        }
 
         let partition_columns = self
             .snapshot
@@ -736,11 +727,7 @@ impl Scan {
             .partition_columns();
         let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
 
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
-        Some(Arc::new(prefixed.into_owned()))
+        Some(Arc::new(skipping_pred))
     }
 
     /// Start a parallel scan metadata processing for the table.
