@@ -10,6 +10,7 @@ use crate::arrow::array::{
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
+use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
 use super::super::arrow_utils::make_arrow_error;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
@@ -76,7 +77,7 @@ fn transform_struct(
                     &target_field.name,
                     transformed_col.data_type(),
                     target_field.nullable,
-                    Some(target_field.metadata_with_string_values()),
+                    Some(kernel_metadata_to_arrow_metadata(target_field)?),
                 );
                 Ok((transformed_field, transformed_col))
             });
@@ -194,7 +195,8 @@ mod apply_schema_validation_tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 
     #[test]
     fn test_apply_schema_basic_functionality() {
@@ -308,5 +310,44 @@ mod apply_schema_validation_tests {
         assert_eq!(col_a.value(2), 3);
         assert_eq!(col_b.value(0), 10);
         assert_eq!(col_b.value(2), 30);
+    }
+
+    /// Test that apply_schema transforms "parquet.field.id" metadata to "PARQUET:field_id".
+    ///
+    /// This ensures the same key translation applied during schema conversion
+    /// (`TryFromKernel<&StructField> for ArrowField`) is also applied when `apply_schema` is used
+    /// to map data onto an existing schema (e.g. in the arrow expression evaluator).
+    #[test]
+    fn test_apply_schema_transforms_parquet_field_id_metadata() {
+        let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
+        let target_schema =
+            StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)
+                .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])]);
+
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false);
+        let input_array = StructArray::try_new(
+            vec![arrow_field].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        )
+        .unwrap();
+
+        let result = apply_schema_to_struct(&input_array, &target_schema).unwrap();
+
+        let (_, output_field) = result.fields().find("a").unwrap();
+        // "parquet.field.id" must be translated to the Arrow/Parquet native key
+        assert_eq!(
+            output_field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("42"),
+            "parquet.field.id should be translated to PARQUET:field_id"
+        );
+        // The original key must not be present
+        assert!(
+            !output_field.metadata().contains_key(field_id_key),
+            "original parquet.field.id key should not be present after translation"
+        );
     }
 }

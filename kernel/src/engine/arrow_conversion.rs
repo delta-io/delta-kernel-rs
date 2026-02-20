@@ -1,5 +1,6 @@
 //! Conversions from kernel schema types to arrow schema types.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::arrow::datatypes::{
@@ -20,6 +21,34 @@ pub(crate) const LIST_ARRAY_ROOT: &str = "element";
 pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
 pub(crate) const MAP_KEY_DEFAULT: &str = "key";
 pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
+
+/// Converts kernel [`StructField`] metadata to Arrow field metadata format.
+///
+/// Specifically, this transforms the `"parquet.field.id"` key (used by kernel/delta-spark) to
+/// `"PARQUET:field_id"` (the native Parquet/Arrow metadata key), enabling correct field ID
+/// handling by the Arrow/Parquet writer.
+pub(crate) fn kernel_metadata_to_arrow_metadata(
+    field: &StructField,
+) -> Result<HashMap<String, String>, ArrowError> {
+    field
+        .metadata()
+        .iter()
+        .map(|(key, val)| {
+            let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
+                PARQUET_FIELD_ID_META_KEY.to_string()
+            } else {
+                key.clone()
+            };
+            match val {
+                MetadataValue::String(s) => Ok((transformed_key, s.clone())),
+                _ => Ok((
+                    transformed_key,
+                    serde_json::to_string(val).map_err(|e| ArrowError::JsonError(e.to_string()))?,
+                )),
+            }
+        })
+        .collect()
+}
 
 /// Convert a kernel type into an arrow type (automatically implemented for all types that
 /// implement [`TryFromKernel`])
@@ -72,25 +101,7 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let metadata = f
-            .metadata()
-            .iter()
-            .map(|(key, val)| {
-                // Transform "parquet.field.id" to "PARQUET:field_id" for Parquet writer
-                let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
-                    PARQUET_FIELD_ID_META_KEY.to_string()
-                } else {
-                    key.clone()
-                };
-
-                match &val {
-                    &MetadataValue::String(val) => Ok((transformed_key, val.clone())),
-                    _ => Ok((transformed_key, serde_json::to_string(val)?)),
-                }
-            })
-            .collect::<Result<_, serde_json::Error>>()
-            .map_err(|err| ArrowError::JsonError(err.to_string()))?;
-
+        let metadata = kernel_metadata_to_arrow_metadata(f)?;
         let field = ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
             .with_metadata(metadata);
 
