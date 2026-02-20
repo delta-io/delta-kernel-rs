@@ -15,9 +15,6 @@ release = false
 
 [dependencies]
 reqwest = { version = "0.13", features = ["http2", "json"] }
-# Pin native-tls due to 0.2.17 regression:
-# https://github.com/rust-native-tls/rust-native-tls/issues/370
-native-tls = "<0.2.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
