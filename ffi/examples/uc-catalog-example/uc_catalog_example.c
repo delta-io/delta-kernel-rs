@@ -40,7 +40,11 @@ void validate_and_clean_staging_file(char* table_uri, char* file_name, Commit *c
       printf("staged has size: %9jd, but commit_info says something else\n", (intmax_t)buf.st_size);
       exit(-1);
     }
+#if defined(__APPLE__)
+    time_t mt = buf.st_mtimespec.tv_sec;
+#else
     time_t mt = buf.st_mtim.tv_sec;
+#endif
     time_t expected_mt = commit_info->file_modification_timestamp / 1000;
     if (mt != expected_mt) {
       printf("staged has modification time: %ld, but commit_info has %ld\n", mt, expected_mt);
