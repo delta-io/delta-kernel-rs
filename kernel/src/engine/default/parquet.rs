@@ -559,6 +559,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -1406,8 +1407,6 @@ mod tests {
     /// with ColumnMetadataKey::ParquetFieldId.
     #[test]
     fn test_parquet_footer_read_with_field_id() {
-        use crate::schema::ColumnMetadataKey;
-
         // Write parquet file with field ID
         let field = Field::new("value", ArrowDataType::Int64, false).with_metadata(HashMap::from(
             [(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())],
