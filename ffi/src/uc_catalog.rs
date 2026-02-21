@@ -238,7 +238,7 @@ pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitte
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
     use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
@@ -248,31 +248,31 @@ mod tests {
     use uc_client::models::Commit as ClientCommit;
     use uc_client::UCCommitClient;
 
-    struct TestContext {
-        commit_called: bool,
-        last_commit_request: Option<(String, String)>,
-        last_staged_filename: Option<String>,
-        should_fail_commit: bool,
+    pub(crate) struct TestContext {
+        pub(crate) commit_called: bool,
+        pub(crate) last_commit_request: Option<(String, String)>,
+        pub(crate) last_staged_filename: Option<String>,
+        pub(crate) should_fail_commit: bool,
     }
 
-    fn get_test_context(should_fail_commit: bool) -> NullableCvoid {
+    pub(crate) fn get_test_context(should_fail_commit: bool) -> NullableCvoid {
         let context = Box::new(TestContext {
             commit_called: false,
             last_commit_request: None,
             last_staged_filename: None,
-            should_fail_commit
+            should_fail_commit,
         });
         NonNull::new(Box::into_raw(context) as *mut c_void)
     }
 
     // take back ownership of the context. be aware that you therefore cannot call this twice with
     // the same context pointer
-    fn recover_test_context(context: NullableCvoid) -> Option<Box<TestContext>> {
+    pub(crate) fn recover_test_context(context: NullableCvoid) -> Option<Box<TestContext>> {
         context.map(|context| unsafe { Box::from_raw(context.as_ptr() as *mut TestContext) })
     }
 
     // get the context without taking ownership
-    fn cast_test_context<'a>(context: NullableCvoid) -> Option<&'a mut TestContext> {
+    pub(crate) fn cast_test_context<'a>(context: NullableCvoid) -> Option<&'a mut TestContext> {
         context.map(|ptr| unsafe { &mut *(ptr.as_ptr() as *mut TestContext) })
     }
 

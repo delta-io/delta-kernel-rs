@@ -451,34 +451,29 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use crate::uc_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+            free_uc_commit_client, get_uc_commit_client, get_uc_committer,
+            tests::{cast_test_context, get_test_context, recover_test_context},
+            CommitRequest,
         };
         use crate::{Handle, NullableCvoid, OptionalValue};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Mutex;
-
-        static UC_COMMIT_CALLED: AtomicBool = AtomicBool::new(false);
-        static LAST_COMMIT_TABLE_ID: Mutex<Option<String>> = Mutex::new(None);
-        static STAGED_COMMIT_FILE_NAME: Mutex<Option<String>> = Mutex::new(None);
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
-            _context: NullableCvoid,
+            context: NullableCvoid,
             request: CommitRequest,
         ) -> OptionalValue<Handle<crate::ExclusiveRustString>> {
-            UC_COMMIT_CALLED.store(true, Ordering::SeqCst);
+            let context = cast_test_context(context).unwrap();
+            context.commit_called = true;
 
-            let table_id: String =
-                unsafe { crate::TryFromStringSlice::try_from_slice(&request.table_id) }.unwrap();
-            *LAST_COMMIT_TABLE_ID.lock().unwrap() = Some(table_id);
+            let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
+            let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
+
+            context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
 
             // Capture the staged commit file name if present
             if let OptionalValue::Some(commit_info) = request.commit_info {
-                if let Ok(file_name) =
-                    unsafe { crate::TryFromStringSlice::try_from_slice(&commit_info.file_name) }
-                {
-                    *STAGED_COMMIT_FILE_NAME.lock().unwrap() = Some(file_name);
-                }
+                let file_name = unsafe { String::try_from_slice(&commit_info.file_name).unwrap() };
+                context.last_staged_filename = Some(file_name);
             }
 
             OptionalValue::None
@@ -512,7 +507,9 @@ mod tests {
                 ))
             };
 
-            let uc_client = unsafe { get_uc_commit_client(None, test_uc_commit) };
+            let context = get_test_context(false);
+
+            let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
             let table_id = "foo";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
@@ -574,46 +571,35 @@ mod tests {
 
             unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
 
-            // Reset flags before commit
-            UC_COMMIT_CALLED.store(false, Ordering::SeqCst);
-            *LAST_COMMIT_TABLE_ID.lock().unwrap() = None;
-            *STAGED_COMMIT_FILE_NAME.lock().unwrap() = None;
-
-            assert!(
-                !UC_COMMIT_CALLED.load(Ordering::SeqCst),
-                "Commit callback should not be called before commit"
-            );
-
             let commit_result = unsafe { commit(txn_with_engine_info, engine.shallow_copy()) };
 
             // UC committer returns success from our mock callback
             assert!(commit_result.is_ok(), "Commit should succeed");
 
+            let context = recover_test_context(context).unwrap();
+
             assert!(
-                UC_COMMIT_CALLED.load(Ordering::SeqCst),
+                context.commit_called,
                 "Commit callback should be called after commit"
             );
 
             {
                 // scope so we don't hold mutex across the await lower down
-                let last_table_id = LAST_COMMIT_TABLE_ID.lock().unwrap();
-                assert!(last_table_id.is_some(), "Table ID should be captured");
+                let (last_table_id, _) = context.last_commit_request.unwrap();
                 assert_eq!(
-                    last_table_id.as_ref().unwrap(),
-                    "foo",
+                    last_table_id, "foo",
                     "Table ID should match the one passed to UCCommitter"
                 );
             }
 
             let staged_file_name = {
                 // scope so we don't hold mutex across await
-                let staged_file_name = STAGED_COMMIT_FILE_NAME.lock().unwrap();
                 assert!(
-                    staged_file_name.is_some(),
+                    context.last_staged_filename.is_some(),
                     "Staged commit file name should be captured"
                 );
 
-                staged_file_name.clone().unwrap()
+                context.last_staged_filename.clone().unwrap()
             };
 
             // Read the staged commit
