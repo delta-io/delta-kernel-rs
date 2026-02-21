@@ -67,36 +67,35 @@ fn transform_struct(
 ) -> DeltaResult<StructArray> {
     let (input_fields, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
-    let result_iter =
-        arrow_cols
-            .into_iter()
-            .zip(input_fields.iter())
-            .zip(target_fields)
-            .map(|((sa_col, input_field), target_field)| -> DeltaResult<_> {
-                let target_field = target_field.borrow();
-                let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
-                let arrow_metadata = kernel_metadata_to_arrow_metadata(target_field)?;
-                // If both the input field and the target field carry a field ID they must agree,
-                // otherwise we would silently overwrite one field ID with another.
-                if let (Some(input_id), Some(target_id)) = (
-                    input_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-                    arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
-                ) {
-                    if input_id != target_id {
-                        return Err(Error::generic(format!(
-                            "Field '{}': input field ID {} conflicts with target field ID {}",
-                            target_field.name, input_id, target_id
-                        )));
-                    }
+    let result_iter = arrow_cols
+        .into_iter()
+        .zip(input_fields.iter())
+        .zip(target_fields)
+        .map(|((sa_col, input_field), target_field)| -> DeltaResult<_> {
+            let target_field = target_field.borrow();
+            let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
+            let arrow_metadata = kernel_metadata_to_arrow_metadata(target_field)?;
+            // If both the input field and the target field carry a field ID they must agree,
+            // otherwise we would silently overwrite one field ID with another.
+            if let (Some(input_id), Some(target_id)) = (
+                input_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+                arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
+            ) {
+                if input_id != target_id {
+                    return Err(Error::generic(format!(
+                        "Field '{}': input field ID {} conflicts with target field ID {}",
+                        target_field.name, input_id, target_id
+                    )));
                 }
-                let transformed_field = new_field_with_metadata(
-                    &target_field.name,
-                    transformed_col.data_type(),
-                    target_field.nullable,
-                    Some(arrow_metadata),
-                );
-                Ok((transformed_field, transformed_col))
-            });
+            }
+            let transformed_field = new_field_with_metadata(
+                &target_field.name,
+                transformed_col.data_type(),
+                target_field.nullable,
+                Some(arrow_metadata),
+            );
+            Ok((transformed_field, transformed_col))
+        });
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
@@ -413,5 +412,4 @@ mod apply_schema_validation_tests {
             "conflicts with",
         );
     }
-
 }

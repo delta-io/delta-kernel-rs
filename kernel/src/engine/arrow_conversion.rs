@@ -223,9 +223,9 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     }
                 }
             }
-            DataType::Struct(s) => {
-                Ok(ArrowDataType::Struct(try_kernel_struct_to_arrow_fields(s)?.into()))
-            }
+            DataType::Struct(s) => Ok(ArrowDataType::Struct(
+                try_kernel_struct_to_arrow_fields(s)?.into(),
+            )),
             DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into_arrow()?))),
             DataType::Map(m) => Ok(ArrowDataType::Map(
                 Arc::new(m.as_ref().try_into_arrow()?),
@@ -233,7 +233,9 @@ impl TryFromKernel<&DataType> for ArrowDataType {
             )),
             DataType::Variant(s) => {
                 if *t == DataType::unshredded_variant() {
-                    Ok(ArrowDataType::Struct(try_kernel_struct_to_arrow_fields(s)?.into()))
+                    Ok(ArrowDataType::Struct(
+                        try_kernel_struct_to_arrow_fields(s)?.into(),
+                    ))
                 } else {
                     Err(ArrowError::SchemaError(format!(
                         "Incorrect Variant Schema: {t}. Only the unshredded variant schema is supported right now."
@@ -703,10 +705,8 @@ mod tests {
     }
 
     fn schema_nested_duplicates() -> StructType {
-        let nested = StructType::new_unchecked([
-            make_field_with_id("x", 5),
-            make_field_with_id("y", 5),
-        ]);
+        let nested =
+            StructType::new_unchecked([make_field_with_id("x", 5), make_field_with_id("y", 5)]);
         StructType::new_unchecked([StructField::new(
             "outer",
             DataType::Struct(Box::new(nested)),
