@@ -5,10 +5,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
-use delta_kernel::benchmarks::models::{
-    default_read_configs, ReadConfig, ReadOperation, Spec, WorkloadSpecVariant,
-};
-use delta_kernel::benchmarks::runners::ReadMetadataRunner;
+use delta_kernel::benchmarks::models::{default_read_configs, ReadConfig, ReadOperation, Spec};
+use delta_kernel::benchmarks::runners::{create_read_runner, WorkloadRunner};
 use delta_kernel::benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
@@ -21,48 +19,39 @@ fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
 }
 
 fn workload_benchmarks(c: &mut Criterion) {
-    let spec_variants = match load_all_workloads() {
-        Ok(variants) if !variants.is_empty() => variants,
-        Ok(_) => {
-            panic!("No workload specs found");
-        }
-        Err(e) => {
-            panic!("Failed to load workload specs: {}", e);
-        }
+    let workloads = match load_all_workloads() {
+        Ok(workloads) if !workloads.is_empty() => workloads,
+        Ok(_) => panic!("No workloads found"),
+        Err(e) => panic!("Failed to load workloads: {}", e),
     };
 
     let engine = setup_engine();
-    let mut read_metadata_group = c.benchmark_group("read_metadata_benchmarks");
+    let mut group = c.benchmark_group("workload_benchmarks");
 
-    for spec_variant in spec_variants {
-        match &spec_variant.spec {
+    for workload in workloads {
+        match &workload.spec {
             Spec::Read { .. } => {
                 for operation in [ReadOperation::ReadMetadata] {
                     let configs = choose_config();
                     for config in configs {
-                        let variant = spec_variant
-                            .clone()
-                            .with_read_operation(operation)
-                            .with_config(config);
-                        run_benchmark(&mut read_metadata_group, variant, &engine);
+                        let runner =
+                            create_read_runner(workload.clone(), operation, config, engine.clone())
+                                .expect("Failed to create read runner");
+                        run_benchmark(&mut group, runner.as_ref());
                     }
                 }
             }
         }
     }
 
-    read_metadata_group.finish();
+    group.finish();
 }
 
 fn run_benchmark(
     group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
-    spec_variant: WorkloadSpecVariant,
-    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    runner: &dyn WorkloadRunner,
 ) {
-    let runner = ReadMetadataRunner::setup(spec_variant, engine.clone())
-        .expect("Failed to setup benchmark runner");
-
-    let name = runner.name().expect("Failed to get benchmark name");
+    let name = runner.name();
 
     group.bench_function(&name, |b| {
         b.iter(|| runner.execute().expect("Benchmark execution failed"))

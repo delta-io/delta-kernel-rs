@@ -1,20 +1,20 @@
 //! Utility functions for loading workload specifications
 
-use crate::benchmarks::models::{Spec, TableInfo, WorkloadSpecVariant};
+use crate::benchmarks::models::{Spec, TableInfo, Workload};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 // Workload extraction configuration
-const WORKLOAD_TAR: &str = "tests/data/workloads.tar.gz";
-const OUTPUT_FOLDER: &str = "tests/data/workloads";
-const DONE_FILE: &str = "tests/data/workloads/.done";
+const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads.tar.gz");
+const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads");
+const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads/.done");
 const TABLE_INFO_FILE: &str = "table_info.json";
 const SPECS_DIR: &str = "specs";
 
 /// Loads all workload specifications from OUTPUT_FOLDER
 /// On first run, extracts from WORKLOAD_TAR if it exists.
 /// Uses a .done file to avoid re-extracting on subsequent runs
-pub fn load_all_workloads() -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::error::Error>> {
+pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     if !workload_specs_exist() {
         extract_workload_specs()?;
     }
@@ -92,9 +92,7 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
     Ok(table_dirs)
 }
 
-fn load_specs_from_table(
-    table_dir: &Path,
-) -> Result<Vec<WorkloadSpecVariant>, Box<dyn std::error::Error>> {
+fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR);
 
     if !specs_dir.is_dir() {
@@ -152,11 +150,7 @@ fn find_spec_files(specs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error:
 fn load_single_spec(
     spec_file: &Path,
     table_info: TableInfo,
-) -> Result<WorkloadSpecVariant, Box<dyn std::error::Error>> {
-    if !spec_file.exists() || !spec_file.is_file() {
-        return Err(format!("Spec file not found: {}", spec_file.display()).into());
-    }
-
+) -> Result<Workload, Box<dyn std::error::Error>> {
     let case_name = spec_file
         .file_stem()
         .and_then(|n| n.to_str())
@@ -166,11 +160,9 @@ fn load_single_spec(
     let spec = Spec::from_json_path(spec_file)
         .map_err(|e| format!("Failed to parse spec file {}: {}", spec_file.display(), e))?;
 
-    Ok(WorkloadSpecVariant {
+    Ok(Workload {
         table_info,
         case_name,
         spec,
-        operation: None,
-        config: None,
     })
 }
