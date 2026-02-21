@@ -761,6 +761,27 @@ impl StructType {
         self.fields.get_index(index).map(|(_, field)| field)
     }
 
+    /// Looks up the data type of a column by path.
+    ///
+    /// The path is resolved through nested struct fields only. If any segment is missing, or a
+    /// non-struct field is traversed before the final segment, this returns `None`.
+    pub(crate) fn lookup_column_type(&self, column: &ColumnName) -> Option<&DataType> {
+        let mut parts = column.iter();
+        let first = parts.next()?;
+        let mut current_field = self.field(first)?;
+
+        for part in parts {
+            match current_field.data_type() {
+                DataType::Struct(struct_type) => {
+                    current_field = struct_type.field(part)?;
+                }
+                _ => return None,
+            }
+        }
+
+        Some(current_field.data_type())
+    }
+
     /// Gets a reference to all the fields in this struct type.
     pub fn fields(
         &self,
@@ -3330,5 +3351,47 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_lookup_column_type() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable(
+                "user",
+                StructType::new_unchecked([
+                    StructField::nullable(
+                        "address",
+                        StructType::new_unchecked([
+                            StructField::nullable("city", DataType::STRING),
+                            StructField::nullable("zip", DataType::INTEGER),
+                        ]),
+                    ),
+                    StructField::nullable("name", DataType::STRING),
+                ]),
+            ),
+        ]);
+
+        assert_eq!(
+            schema.lookup_column_type(&ColumnName::new(["id"])),
+            Some(&DataType::LONG)
+        );
+        assert_eq!(
+            schema.lookup_column_type(&ColumnName::new(["user", "name"])),
+            Some(&DataType::STRING)
+        );
+        assert_eq!(
+            schema.lookup_column_type(&ColumnName::new(["user", "address", "zip"])),
+            Some(&DataType::INTEGER)
+        );
+
+        assert_eq!(
+            schema.lookup_column_type(&ColumnName::new(["user", "missing"])),
+            None
+        );
+        assert_eq!(
+            schema.lookup_column_type(&ColumnName::new(["id", "extra"])),
+            None
+        );
     }
 }
