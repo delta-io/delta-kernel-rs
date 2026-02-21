@@ -690,9 +690,12 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
+            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
-                if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+                if matches!(
+                    &*source,
+                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+                ) =>
                 true,
             _ => false,
         }));

@@ -336,6 +336,9 @@ pub struct FieldTransform {
     pub exprs: Vec<ExpressionRef>,
     /// If true, the output expressions replace the input field instead of following after it.
     pub is_replace: bool,
+    /// If true, this transform is silently ignored when the target field does not exist in the
+    /// input. Otherwise, a missing target field produces an error.
+    pub optional: bool,
 }
 
 /// A transformation that efficiently represents sparse modifications to struct schemas.
@@ -379,6 +382,14 @@ impl Transform {
     pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
         let field_transform = self.field_transform(name);
         field_transform.is_replace = true;
+        self
+    }
+
+    /// Like [`Self::with_dropped_field`], but silently ignored if the field does not exist.
+    pub fn with_dropped_field_if_exists(mut self, name: impl Into<String>) -> Self {
+        let field_transform = self.field_transform(name);
+        field_transform.is_replace = true;
+        field_transform.optional = true;
         self
     }
 
