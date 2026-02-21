@@ -2145,16 +2145,18 @@ mod tests {
         Ok(())
     }
 
-    /// Helper: loads a partitioned test table snapshot and returns its write context.
-    fn partitioned_write_context(
+    /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
+    fn snapshot_and_write_context(
         table_path: &str,
-    ) -> Result<WriteContext, Box<dyn std::error::Error>> {
+    ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        Ok(txn.get_write_context())
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        Ok((snapshot, txn.get_write_context()))
     }
 
     /// Helper: evaluates the logical-to-physical transform on the given batch and returns the
@@ -2168,8 +2170,11 @@ mod tests {
         let l2p = wc.logical_to_physical();
 
         let handler = ArrowEvaluationHandler;
-        let evaluator =
-            handler.new_expression_evaluator(logical_schema.clone(), l2p, physical_schema.clone().into())?;
+        let evaluator = handler.new_expression_evaluator(
+            logical_schema.clone(),
+            l2p,
+            physical_schema.clone().into(),
+        )?;
         let result = ArrowEngineData::try_from_engine_data(
             evaluator.evaluate(&ArrowEngineData::new(batch))?,
         )?;
@@ -2180,7 +2185,18 @@ mod tests {
     fn test_materialize_partition_columns_in_write_context(
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Without materializePartitionColumns, partition column should be dropped
-        let wc_without = partitioned_write_context("./tests/data/basic_partitioned/")?;
+        let (snap_without, wc_without) =
+            snapshot_and_write_context("./tests/data/basic_partitioned/")?;
+        let partition_cols = snap_without.table_configuration().partition_columns();
+        assert_eq!(partition_cols.len(), 1);
+        assert_eq!(partition_cols[0], "letter");
+        assert!(
+            !snap_without
+                .table_configuration()
+                .protocol()
+                .has_table_feature(&TableFeature::MaterializePartitionColumns),
+            "basic_partitioned should not have materializePartitionColumns feature"
+        );
         let expr_str = format!("{}", wc_without.logical_to_physical());
         assert!(
             expr_str.contains("drop letter"),
@@ -2189,9 +2205,18 @@ mod tests {
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
-        let wc_with = partitioned_write_context(
-            "./tests/data/partitioned_with_materialize_feature/",
-        )?;
+        let (snap_with, wc_with) =
+            snapshot_and_write_context("./tests/data/partitioned_with_materialize_feature/")?;
+        let partition_cols = snap_with.table_configuration().partition_columns();
+        assert_eq!(partition_cols.len(), 1);
+        assert_eq!(partition_cols[0], "letter");
+        assert!(
+            snap_with
+                .table_configuration()
+                .protocol()
+                .has_table_feature(&TableFeature::MaterializePartitionColumns),
+            "partitioned_with_materialize_feature should have materializePartitionColumns feature"
+        );
         let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
             !expr_str.contains("drop"),
@@ -2632,8 +2657,16 @@ mod tests {
         validate_logical_to_physical_transform(mode)
     }
 
-    fn build_partitioned_batch(wc: &WriteContext) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    #[rstest]
+    #[case::dropped("./tests/data/basic_partitioned/", 2, &[])]
+    #[case::kept("./tests/data/partitioned_with_materialize_feature/", 3, &["letter"])]
+    fn test_partition_column_in_eval_output(
+        #[case] table_path: &str,
+        #[case] expected_cols: usize,
+        #[case] expected_partition_cols: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::arrow::array::Float64Array;
+        let (_snap, wc) = snapshot_and_write_context(table_path)?;
         let batch = RecordBatch::try_new(
             Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
             vec![
@@ -2642,25 +2675,11 @@ mod tests {
                 Arc::new(Float64Array::from(vec![1.5])),
             ],
         )?;
-        Ok(batch)
-    }
-
-    #[rstest]
-    #[case::dropped("./tests/data/basic_partitioned/", 2, false)]
-    #[case::kept("./tests/data/partitioned_with_materialize_feature/", 3, true)]
-    fn test_partition_column_in_eval_output(
-        #[case] table_path: &str,
-        #[case] expected_cols: usize,
-        #[case] expect_letter: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let wc = partitioned_write_context(table_path)?;
-        let batch = build_partitioned_batch(&wc)?;
         let rb = eval_logical_to_physical(&wc, batch)?;
         assert_eq!(rb.num_columns(), expected_cols);
-        assert_eq!(
-            rb.schema().fields().iter().any(|f| f.name() == "letter"),
-            expect_letter
-        );
+        for col in expected_partition_cols {
+            assert!(rb.schema().fields().iter().any(|f| f.name() == *col));
+        }
         Ok(())
     }
 }
