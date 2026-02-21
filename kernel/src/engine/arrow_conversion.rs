@@ -92,10 +92,61 @@ where
     }
 }
 
+/// Recursively validates that all field IDs across an entire kernel struct schema (including
+/// nested structs, arrays, and maps) are unique. Field IDs must be unique across the whole schema,
+/// not just within a single struct level, since parquet readers use them for global column
+/// matching.
+fn check_no_duplicate_field_ids<'a>(
+    fields: impl Iterator<Item = &'a StructField>,
+    seen: &mut HashMap<String, String>,
+) -> Result<(), ArrowError> {
+    for field in fields {
+        if let Some(id) = field
+            .metadata()
+            .get(ColumnMetadataKey::ParquetFieldId.as_ref())
+        {
+            let id_str = id.to_string();
+            if let Some(prev) = seen.insert(id_str.clone(), field.name().to_string()) {
+                return Err(ArrowError::SchemaError(format!(
+                    "Duplicate field ID {} assigned to both '{}' and '{}'",
+                    id_str,
+                    prev,
+                    field.name()
+                )));
+            }
+        }
+        check_no_duplicate_field_ids_in_type(field.data_type(), seen)?;
+    }
+    Ok(())
+}
+
+fn check_no_duplicate_field_ids_in_type(
+    dt: &DataType,
+    seen: &mut HashMap<String, String>,
+) -> Result<(), ArrowError> {
+    match dt {
+        DataType::Struct(s) => check_no_duplicate_field_ids(s.fields(), seen)?,
+        DataType::Array(a) => check_no_duplicate_field_ids_in_type(a.element_type(), seen)?,
+        DataType::Map(m) => {
+            check_no_duplicate_field_ids_in_type(m.key_type(), seen)?;
+            check_no_duplicate_field_ids_in_type(m.value_type(), seen)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validates then converts a kernel [`StructType`] to a `Vec<ArrowField>`. The duplicate field ID
+/// check is always run before conversion so that every call site (full schema, nested struct,
+/// variant) is protected automatically — callers do not need to invoke the check separately.
+fn try_kernel_struct_to_arrow_fields(s: &StructType) -> Result<Vec<ArrowField>, ArrowError> {
+    check_no_duplicate_field_ids(s.fields(), &mut HashMap::new())?;
+    s.fields().map(|f| f.try_into_arrow()).try_collect()
+}
+
 impl TryFromKernel<&StructType> for ArrowSchema {
     fn try_from_kernel(s: &StructType) -> Result<Self, ArrowError> {
-        let fields: Vec<ArrowField> = s.fields().map(|f| f.try_into_arrow()).try_collect()?;
-        Ok(ArrowSchema::new(fields))
+        Ok(ArrowSchema::new(try_kernel_struct_to_arrow_fields(s)?))
     }
 }
 
@@ -172,12 +223,9 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     }
                 }
             }
-            DataType::Struct(s) => Ok(ArrowDataType::Struct(
-                s.fields()
-                    .map(TryIntoArrow::try_into_arrow)
-                    .collect::<Result<Vec<ArrowField>, ArrowError>>()?
-                    .into(),
-            )),
+            DataType::Struct(s) => {
+                Ok(ArrowDataType::Struct(try_kernel_struct_to_arrow_fields(s)?.into()))
+            }
             DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into_arrow()?))),
             DataType::Map(m) => Ok(ArrowDataType::Map(
                 Arc::new(m.as_ref().try_into_arrow()?),
@@ -185,12 +233,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
             )),
             DataType::Variant(s) => {
                 if *t == DataType::unshredded_variant() {
-                    Ok(ArrowDataType::Struct(
-                        s.fields()
-                            .map(TryIntoArrow::try_into_arrow)
-                            .collect::<Result<Vec<ArrowField>, ArrowError>>()?
-                            .into(),
-                    ))
+                    Ok(ArrowDataType::Struct(try_kernel_struct_to_arrow_fields(s)?.into()))
                 } else {
                     Err(ArrowError::SchemaError(format!(
                         "Incorrect Variant Schema: {t}. Only the unshredded variant schema is supported right now."
@@ -221,12 +264,31 @@ impl TryFromArrow<ArrowSchemaRef> for StructType {
 
 impl TryFromArrow<&ArrowField> for StructField {
     fn try_from_arrow(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
+        let metadata = arrow_field.metadata();
+        // If both the native Arrow key (PARQUET:field_id) and the kernel key (parquet.field.id)
+        // are present with different values, the translation below would silently overwrite one
+        // with the other. Detect and reject this up front.
+        if let (Some(arrow_id), Some(kernel_id)) = (
+            metadata.get(PARQUET_FIELD_ID_META_KEY),
+            metadata.get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+        ) {
+            if arrow_id != kernel_id {
+                return Err(ArrowError::SchemaError(format!(
+                    "Field '{}': conflicting parquet field IDs: '{}' ({}) vs '{}' ({})",
+                    arrow_field.name(),
+                    arrow_id,
+                    PARQUET_FIELD_ID_META_KEY,
+                    kernel_id,
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                )));
+            }
+        }
         Ok(StructField::new(
             arrow_field.name().clone(),
             DataType::try_from_arrow(arrow_field.data_type())?,
             arrow_field.is_nullable(),
         )
-        .with_metadata(arrow_field.metadata().iter().map(|(k, v)| {
+        .with_metadata(metadata.iter().map(|(k, v)| {
             // Transform "PARQUET:field_id" to "parquet.field.id" when reading from Parquet
             let transformed_key = if k == PARQUET_FIELD_ID_META_KEY {
                 ColumnMetadataKey::ParquetFieldId.as_ref().to_string()
@@ -588,5 +650,86 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// When an Arrow field carries both `PARQUET:field_id` and `parquet.field.id` with the same
+    /// value, the round-trip to kernel should succeed (one key is kept after translation).
+    #[test]
+    fn test_arrow_to_kernel_matching_field_ids_succeed() {
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            [
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string()),
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                    "42".to_string(),
+                ),
+            ]
+            .into(),
+        );
+        let result = StructField::try_from_arrow(&arrow_field);
+        assert!(result.is_ok(), "Matching field IDs should succeed");
+    }
+
+    /// When an Arrow field carries both `PARQUET:field_id` and `parquet.field.id` with *different*
+    /// values, converting to kernel must fail rather than silently overwriting one ID with the
+    /// other.
+    #[test]
+    fn test_arrow_to_kernel_conflicting_field_ids_fail() {
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false).with_metadata(
+            [
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                    "2".to_string(),
+                ),
+            ]
+            .into(),
+        );
+        crate::utils::test_utils::assert_result_error_with_message(
+            StructField::try_from_arrow(&arrow_field),
+            "conflicting parquet field IDs",
+        );
+    }
+
+    fn make_field_with_id(name: &str, id: i64) -> StructField {
+        StructField::new(name, DataType::INTEGER, false).with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(id),
+        )])
+    }
+
+    fn schema_same_level_duplicates() -> StructType {
+        StructType::new_unchecked([make_field_with_id("a", 1), make_field_with_id("b", 1)])
+    }
+
+    fn schema_nested_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([
+            make_field_with_id("x", 5),
+            make_field_with_id("y", 5),
+        ]);
+        StructType::new_unchecked([StructField::new(
+            "outer",
+            DataType::Struct(Box::new(nested)),
+            false,
+        )])
+    }
+
+    fn schema_cross_level_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([make_field_with_id("inner", 1)]);
+        StructType::new_unchecked([
+            make_field_with_id("a", 1),
+            StructField::new("b", DataType::Struct(Box::new(nested)), false),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::same_level(schema_same_level_duplicates())]
+    #[case::nested_struct(schema_nested_duplicates())]
+    #[case::across_nesting_levels(schema_cross_level_duplicates())]
+    fn test_duplicate_field_ids_rejected(#[case] schema: StructType) {
+        crate::utils::test_utils::assert_result_error_with_message(
+            ArrowSchema::try_from_kernel(&schema),
+            "Duplicate field ID",
+        );
     }
 }
