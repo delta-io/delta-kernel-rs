@@ -10,7 +10,7 @@ use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
-    engine_data::{GetData, RowVisitor, TypedGetData as _},
+    engine_data::{FilteredEngineDataVisitor, GetData, RowIndexIterator, TypedGetData},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
@@ -163,28 +163,30 @@ impl ScanMetadata {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
         let mut visitor = ScanFileVisitor {
             callback,
-            selection_vector: self.scan_files.selection_vector(),
             transforms: &self.scan_file_transforms,
             context,
         };
-        visitor.visit_rows_of(self.scan_files.data())?;
+        visitor.visit_rows_of(&self.scan_files)?;
         Ok(visitor.context)
     }
 }
 // add some visitor magic for engines
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
-    selection_vector: &'a [bool],
     transforms: &'a [Option<ExpressionRef>],
     context: T,
 }
-impl<T> RowVisitor for ScanFileVisitor<'_, T> {
+impl<T> FilteredEngineDataVisitor for ScanFileVisitor<'_, T> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
         NAMES_AND_TYPES.as_ref()
     }
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
         require!(
             getters.len() == 14,
             Error::InternalError(format!(
@@ -192,11 +194,8 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 getters.len()
             ))
         );
-        for row_index in 0..row_count {
-            if !self.selection_vector[row_index] {
-                // skip skipped rows
-                continue;
-            }
+        for range in rows.selected_runs() {
+            for row_index in range {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
@@ -214,7 +213,8 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")
                     .ok_or_else(|| Error::missing_column("deletionVector"))?;
-                let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
+                let deletion_vector =
+                    visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
                     getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
@@ -228,6 +228,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     partition_values,
                 };
                 (self.callback)(&mut self.context, scan_file)
+            }
             }
         }
         Ok(())

@@ -162,7 +162,10 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
-pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
+pub use engine_data::{
+    EngineData, FilteredEngineData, FilteredEngineDataVisitor, GetData, RowEvent,
+    RowIndexIterator, RowVisitor, SelectedRunIter,
+};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
