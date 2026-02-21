@@ -242,7 +242,6 @@ mod tests {
     use super::*;
     use crate::ffi_test_utils::{allocate_err, ok_or_panic};
     use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
-    use std::cell::RefCell;
     use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::Arc;
@@ -250,11 +249,19 @@ mod tests {
     use uc_client::UCCommitClient;
 
     struct TestContext {
-        x: u32, // have a value so we can ensure it's passed correctly
+        commit_called: bool,
+        last_commit_request: Option<(String, String)>,
+        last_staged_filename: Option<String>,
+        should_fail_commit: bool,
     }
 
-    fn get_test_context(x: u32) -> NullableCvoid {
-        let context = Box::new(TestContext { x });
+    fn get_test_context(should_fail_commit: bool) -> NullableCvoid {
+        let context = Box::new(TestContext {
+            commit_called: false,
+            last_commit_request: None,
+            last_staged_filename: None,
+            should_fail_commit
+        });
         NonNull::new(Box::into_raw(context) as *mut c_void)
     }
 
@@ -264,12 +271,9 @@ mod tests {
         context.map(|context| unsafe { Box::from_raw(context.as_ptr() as *mut TestContext) })
     }
 
-    thread_local! {
-        static COMMIT_CALLED: RefCell<bool> = const { RefCell::new(false) };
-        static LAST_COMMIT_REQUEST: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
-        static LAST_STAGED_FILENAME: RefCell<Option<String>> = const { RefCell::new(None) };
-        static SHOULD_FAIL_COMMIT: RefCell<bool> = const { RefCell::new(false) };
-        static CONTEXT_LAST_VALUE: RefCell<u32> = const { RefCell::new(0) };
+    // get the context without taking ownership
+    fn cast_test_context<'a>(context: NullableCvoid) -> Option<&'a mut TestContext> {
+        context.map(|ptr| unsafe { &mut *(ptr.as_ptr() as *mut TestContext) })
     }
 
     #[no_mangle]
@@ -277,10 +281,9 @@ mod tests {
         context: NullableCvoid,
         request: CommitRequest,
     ) -> OptionalValue<Handle<ExclusiveRustString>> {
-        COMMIT_CALLED.with(|called| *called.borrow_mut() = true);
-        if let Some(context) = recover_test_context(context) {
-            CONTEXT_LAST_VALUE.with(|v| *v.borrow_mut() = context.x);
-        }
+        let context = cast_test_context(context).unwrap();
+
+        context.commit_called = true;
 
         let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
         let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
@@ -289,29 +292,21 @@ mod tests {
             let file_name = unsafe {
                 crate::TryFromStringSlice::try_from_slice(&commit_info.file_name).unwrap()
             };
-            LAST_STAGED_FILENAME.with(|sf| {
-                *sf.borrow_mut() = Some(file_name);
-            });
+            context.last_staged_filename = Some(file_name);
         }
-
-        LAST_COMMIT_REQUEST.with(|req| {
-            *req.borrow_mut() = Some((table_id.clone(), table_uri.clone()));
-        });
-
-        SHOULD_FAIL_COMMIT.with(|should_fail| {
-            if *should_fail.borrow() {
-                let error_msg = "Test commit failure";
-                let error_str = unsafe {
-                    ok_or_panic(allocate_kernel_string(
-                        kernel_string_slice!(error_msg),
-                        allocate_err,
-                    ))
-                };
-                OptionalValue::Some(error_str)
-            } else {
-                OptionalValue::None
-            }
-        })
+        context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+        if context.should_fail_commit {
+            let error_msg = "Test commit failure";
+            let error_str = unsafe {
+                ok_or_panic(allocate_kernel_string(
+                    kernel_string_slice!(error_msg),
+                    allocate_err,
+                ))
+            };
+            OptionalValue::Some(error_str)
+        } else {
+            OptionalValue::None
+        }
     }
 
     #[test]
@@ -324,10 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ffi_uc_commit_client_commit_success() {
-        COMMIT_CALLED.with(|c| *c.borrow_mut() = false);
-        SHOULD_FAIL_COMMIT.with(|f| *f.borrow_mut() = false);
-
-        let context = get_test_context(5);
+        let context = get_test_context(false);
 
         let client = unsafe { get_uc_commit_client(context, test_commit_callback) };
 
@@ -351,34 +343,24 @@ mod tests {
         let result: uc_client::Result<()> = client_arc.commit(request).await;
 
         assert!(result.is_ok());
-        assert!(COMMIT_CALLED.with(|c| *c.borrow()));
-        CONTEXT_LAST_VALUE.with(|v| assert_eq!(*v.borrow(), 5));
 
-        LAST_COMMIT_REQUEST.with(|req| {
-            let req = req.borrow();
-            let (table_id, table_uri) = req.as_ref().unwrap();
-            assert_eq!(table_id, "test_table_id");
-            assert_eq!(table_uri, "s3://bucket/path");
-        });
+        let context = recover_test_context(context).unwrap();
 
-        LAST_STAGED_FILENAME.with(|sf| {
-            let sf = sf.borrow();
-            let staged_path = sf.as_ref().unwrap();
-            assert_eq!(
-                staged_path,
-                "_staged_commits/00000000000000000010.uuid.json"
-            );
-        });
+        assert!(context.commit_called);
+        let (table_id, table_uri) = context.last_commit_request.unwrap();
+        assert_eq!(table_id, "test_table_id");
+        assert_eq!(table_uri, "s3://bucket/path");
+        assert_eq!(
+            context.last_staged_filename.unwrap(),
+            "_staged_commits/00000000000000000010.uuid.json"
+        );
 
         unsafe { free_uc_commit_client(client) };
     }
 
     #[tokio::test]
     async fn test_ffi_uc_commit_client_commit_failure() {
-        COMMIT_CALLED.with(|c| *c.borrow_mut() = false);
-        SHOULD_FAIL_COMMIT.with(|f| *f.borrow_mut() = true);
-
-        let context = get_test_context(6);
+        let context = get_test_context(true);
 
         let client = unsafe { get_uc_commit_client(context, test_commit_callback) };
 
@@ -402,8 +384,10 @@ mod tests {
         let result: uc_client::Result<()> = client_arc.commit(request).await;
 
         assert!(result.is_err());
-        assert!(COMMIT_CALLED.with(|c| *c.borrow()));
-        CONTEXT_LAST_VALUE.with(|v| assert_eq!(*v.borrow(), 6));
+
+        let context = recover_test_context(context).unwrap();
+
+        assert!(context.commit_called);
 
         let error = result.unwrap_err();
         assert!(matches!(error, uc_client::Error::Generic(_)));
