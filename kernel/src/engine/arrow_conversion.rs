@@ -396,12 +396,12 @@ mod tests {
     impl<'a> crate::schema::SchemaTransform<'a> for FieldIdCollector {
         fn transform_struct_field(
             &mut self,
-            field: &'a crate::schema::StructField,
-        ) -> Option<std::borrow::Cow<'a, crate::schema::StructField>> {
+            field: &'a StructField,
+        ) -> Option<std::borrow::Cow<'a, StructField>> {
             // Collect field ID if present
             if let Some(field_id) = field
                 .metadata()
-                .get(crate::schema::ColumnMetadataKey::ParquetFieldId.as_ref())
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref())
             {
                 self.field_ids
                     .push((field.name().to_string(), field_id.to_string()));
@@ -553,59 +553,38 @@ mod tests {
         // Convert to Arrow schema
         let arrow_schema = ArrowSchema::try_from_kernel(&top_struct)?;
 
-        // Verify field IDs are transformed to PARQUET:field_id at all levels using helper function
+        let expected_ids: HashMap<String, String> = [
+            ("simple_field", "1"),
+            ("nested_struct", "2"),
+            ("inner_field", "3"),
+            ("array_field", "4"),
+            ("array_item", "5"),
+            ("map_field", "6"),
+            ("map_key_field", "7"),
+            ("map_value_field", "8"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        // Verify field IDs are transformed to PARQUET:field_id at all levels
         let arrow_field_ids: HashMap<String, String> =
             collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY)
                 .into_iter()
                 .collect();
-
-        // Expected field IDs in Arrow format (PARQUET:field_id)
-        let expected_arrow_ids: HashMap<String, String> = [
-            ("simple_field", "1"),
-            ("nested_struct", "2"),
-            ("inner_field", "3"),
-            ("array_field", "4"),
-            ("array_item", "5"),
-            ("map_field", "6"),
-            ("map_key_field", "7"),
-            ("map_value_field", "8"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-
         assert_eq!(
-            arrow_field_ids, expected_arrow_ids,
+            arrow_field_ids, expected_ids,
             "All field IDs should be transformed to PARQUET:field_id"
         );
 
-        // Test reverse transformation: Arrow -> Kernel using visitor
+        // Test round-trip: Arrow -> Kernel, field IDs should be preserved unchanged
         let kernel_struct = StructType::try_from_arrow(&arrow_schema)?;
-
-        // Use visitor to collect all field IDs from the kernel struct
         let mut collector = FieldIdCollector::new();
         let _ = collector.transform_struct(&kernel_struct);
-
-        // Verify all 8 field IDs were transformed back to parquet.field.id
         let kernel_field_ids: HashMap<String, String> = collector.field_ids.into_iter().collect();
-
-        let expected_kernel_ids: HashMap<String, String> = [
-            ("simple_field", "1"),
-            ("nested_struct", "2"),
-            ("inner_field", "3"),
-            ("array_field", "4"),
-            ("array_item", "5"),
-            ("map_field", "6"),
-            ("map_key_field", "7"),
-            ("map_value_field", "8"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-
         assert_eq!(
-            kernel_field_ids, expected_kernel_ids,
-            "All field IDs should be transformed back to parquet.field.id"
+            kernel_field_ids, arrow_field_ids,
+            "Kernel field IDs should match Arrow field IDs after round-trip"
         );
 
         Ok(())
