@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
@@ -98,7 +98,7 @@ pub struct Workload {
 
 impl Workload {
     pub fn name(&self) -> String {
-        format!("{}/{}", self.table_info.name, self.case_name,)
+        format!("{}/{}", self.table_info.name, self.case_name)
     }
 }
 
