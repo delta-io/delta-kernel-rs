@@ -568,6 +568,8 @@ fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaR
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
 ///   names), or None if stats should not be included in output.
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+/// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
+///   raw stats JSON string from checkpoint parquet files.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
 /// Stats are output using physical column names. Engines can use `Scan::logical_stats_schema()`
@@ -787,6 +789,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// [`FilteredEngineData`] and transforms that must be applied to correctly read the data). Each row
 /// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
 /// Non-selected rows _must_ be ignored.
+///
+/// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
+/// data skipping is disabled.
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.

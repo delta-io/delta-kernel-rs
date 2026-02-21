@@ -14,7 +14,7 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -64,9 +64,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
 
 /// Checkpoint schema WITHOUT stats for column projection pushdown.
 /// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
-#[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::actions::Add;
     let add_schema = Add::to_schema();
     let fields_no_stats: Vec<_> = add_schema
         .fields()
@@ -203,13 +201,16 @@ impl ScanBuilder {
     /// - Parquet checkpoint reads use column projection to skip the stats column
     /// - The `stats` field in scan results will be `None`
     /// - Data skipping is disabled (predicates still filter partitions, but not files)
-    /// - Takes precedence over [`include_stats_columns`]
+    ///
+    /// This option is mutually exclusive with [`include_stats_columns`] — setting both
+    /// will cause [`build`] to return an error.
     ///
     /// Use this when data skipping is handled externally (e.g., by the query engine).
     ///
     /// Default is `false` (stats are read).
     ///
     /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
+    /// [`build`]: ScanBuilder::build
     pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
         self.skip_stats = skip_stats;
         self
@@ -222,6 +223,12 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
+        if self.skip_stats && self.stats_columns.is_some() {
+            return Err(Error::generic(
+                "Cannot set both skip_stats and include_stats_columns",
+            ));
+        }
+
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
@@ -688,15 +695,13 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let checkpoint_schema = if self.skip_stats {
-            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+        let (checkpoint_schema, meta_predicate) = if self.skip_stats {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
         } else {
-            CHECKPOINT_READ_SCHEMA.clone()
-        };
-        let meta_predicate = if self.skip_stats {
-            None
-        } else {
-            self.build_actions_meta_predicate()
+            (
+                CHECKPOINT_READ_SCHEMA.clone(),
+                self.build_actions_meta_predicate(),
+            )
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
@@ -748,15 +753,13 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let checkpoint_schema = if self.skip_stats {
-            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+        let (checkpoint_schema, meta_predicate) = if self.skip_stats {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
         } else {
-            CHECKPOINT_READ_SCHEMA.clone()
-        };
-        let meta_predicate = if self.skip_stats {
-            None
-        } else {
-            self.build_actions_meta_predicate()
+            (
+                CHECKPOINT_READ_SCHEMA.clone(),
+                self.build_actions_meta_predicate(),
+            )
         };
         self.snapshot
             .log_segment()
