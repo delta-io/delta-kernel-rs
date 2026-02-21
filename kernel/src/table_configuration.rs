@@ -23,7 +23,8 @@ use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_schema_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
     FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
-    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
+    MAX_VALID_WRITER_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -432,7 +433,7 @@ impl TableConfiguration {
     /// For legacy protocol (v1-2), infers features from the version number.
     fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
         match self.protocol.min_reader_version() {
-            3 => {
+            TABLE_FEATURES_MIN_READER_VERSION => {
                 // Table features reader: use explicit reader_features list
                 self.protocol
                     .reader_features()
@@ -460,7 +461,7 @@ impl TableConfiguration {
     /// For legacy protocol (v1-6), infers features from the version number.
     fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
         match self.protocol.min_writer_version() {
-            7 => {
+            TABLE_FEATURES_MIN_WRITER_VERSION => {
                 // Table features writer: use explicit writer_features list
                 self.protocol
                     .writer_features()
@@ -498,8 +499,8 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        // Version check: kernel supports reader versions 1-3
-        if self.protocol.min_reader_version() > 3 {
+        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
+        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum reader version {}",
                 self.protocol.min_reader_version()
@@ -516,8 +517,8 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: kernel supports writer versions 1-7
-        if self.protocol.min_writer_version() > 7 {
+        // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
+        if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
@@ -604,13 +605,13 @@ impl TableConfiguration {
     /// Returns true if the protocol uses legacy reader version (< 3)
     #[allow(dead_code)]
     fn is_legacy_reader_version(&self) -> bool {
-        self.protocol.min_reader_version() < 3
+        self.protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
     }
 
     /// Returns true if the protocol uses legacy writer version (< 7)
     #[allow(dead_code)]
     fn is_legacy_writer_version(&self) -> bool {
-        self.protocol.min_writer_version() < 7
+        self.protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION
     }
 
     /// Helper to check if a feature is present in a feature list.
@@ -709,6 +710,7 @@ mod test {
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::{
@@ -726,7 +728,12 @@ mod test {
         props_to_enable: &[(&str, &str)],
         features: &[TableFeature],
     ) -> TableConfiguration {
-        create_mock_table_config_with_version(props_to_enable, Some(features), 3, 7)
+        create_mock_table_config_with_version(
+            props_to_enable,
+            Some(features),
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+        )
     }
 
     fn create_mock_table_config_with_version(
@@ -767,9 +774,10 @@ mod test {
                 .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
             (
                 // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                (min_reader_version >= 3).then_some(reader_features),
+                (min_reader_version >= TABLE_FEATURES_MIN_READER_VERSION)
+                    .then_some(reader_features),
                 // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                (min_writer_version >= 7).then_some(features),
+                (min_writer_version >= TABLE_FEATURES_MIN_WRITER_VERSION).then_some(features),
             )
         } else {
             (None, None)
@@ -803,11 +811,9 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -836,11 +842,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -947,13 +951,9 @@ mod test {
             HashMap::from_iter([(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -996,13 +996,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1041,13 +1037,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1064,13 +1056,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1085,7 +1073,7 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
+        let protocol = Protocol::try_new_modern(["unknown"], ["unknown"]).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         table_config
@@ -1109,14 +1097,12 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [
                 TableFeature::TimestampWithoutTimezone,
                 TableFeature::ChangeDataFeed,
-            ]),
+            ],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1142,11 +1128,9 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1168,16 +1152,14 @@ mod test {
             ]),
         )
         .unwrap();
-        let new_protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::V2Checkpoint]),
-            Some([
+        let new_protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::V2Checkpoint],
+            [
                 TableFeature::DeletionVectors,
                 TableFeature::V2Checkpoint,
                 TableFeature::AppendOnly,
                 TableFeature::ChangeDataFeed,
-            ]),
+            ],
         )
         .unwrap();
         let new_version = 1;
@@ -1217,19 +1199,12 @@ mod test {
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let protocol_without_timestamp_ntz_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_timestamp_ntz_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let protocol_with_timestamp_ntz_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+        let protocol_with_timestamp_ntz_features = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [TableFeature::TimestampWithoutTimezone],
         )
         .unwrap();
 
@@ -1264,21 +1239,12 @@ mod test {
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let protocol_without_variant_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_variant_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let protocol_with_variant_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::VariantType]),
-            Some([TableFeature::VariantType]),
-        )
-        .unwrap();
+        let protocol_with_variant_features =
+            Protocol::try_new_modern([TableFeature::VariantType], [TableFeature::VariantType])
+                .unwrap();
 
         let table_root = Url::try_from("file:///").unwrap();
 
@@ -1524,13 +1490,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![TableFeature::RowTracking]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, vec![TableFeature::RowTracking])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
@@ -1546,14 +1508,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ]),
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::RowTracking, TableFeature::DomainMetadata],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1620,7 +1577,7 @@ mod test {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
 
         // Use reader version 2 which supports column mapping
-        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
     }
@@ -1633,7 +1590,7 @@ mod test {
             StructField::nullable("col_b", DataType::STRING),
         ]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 

@@ -106,27 +106,21 @@ mod tests {
             .for_each(|(variant_reader, variant_writer)| {
                 // Protocol with variantType features
                 let protocol_with_features =
-                    Protocol::try_new(3, 7, Some([variant_reader]), Some([variant_writer]))
-                        .unwrap();
+                    Protocol::try_new_modern([variant_reader], [variant_writer]).unwrap();
 
                 // Protocol without variantType features
-                let protocol_without_features = Protocol::try_new(
-                    3,
-                    7,
-                    Some::<Vec<String>>(vec![]),
-                    Some::<Vec<String>>(vec![]),
-                )
-                .unwrap();
+                let protocol_without_features =
+                    Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
                 // Since variant features are ReaderWriter feature, protocol that
                 // lists a variant feature in only one of reader/writer feature = ERR
                 let protocol_without_writer_feature =
-                    Protocol::try_new(3, 7, Some([variant_reader]), Some::<Vec<String>>(vec![]));
+                    Protocol::try_new_modern([variant_reader], TableFeature::EMPTY_LIST);
                 assert_result_error_with_message(protocol_without_writer_feature,
                     "Reader features must contain only ReaderWriter features that are also listed in writer features");
 
                 let protocol_without_reader_feature =
-                    Protocol::try_new(3, 7, Some::<Vec<String>>(vec![]), Some([variant_writer]));
+                    Protocol::try_new_modern(TableFeature::EMPTY_LIST, [variant_writer]);
                 assert_result_error_with_message(protocol_without_reader_feature,
                     "Writer features must be Writer-only or also listed in reader features");
 
