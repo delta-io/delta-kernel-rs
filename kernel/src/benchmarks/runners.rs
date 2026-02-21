@@ -4,7 +4,7 @@
 //! Results are discarded for benchmarking purposes
 //! Currently only supports reading metadata
 
-use crate::benchmarks::models::{ParallelScan, Spec, WorkloadSpecVariant};
+use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, Spec, Workload};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::AfterSequential;
 use crate::snapshot::Snapshot;
@@ -14,26 +14,30 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 
+pub trait WorkloadRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
+    fn name(&self) -> String;
+}
+
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
-    spec_variant: WorkloadSpecVariant, //Complete workload specification
+    workload: Workload, //Complete workload specification
+    config: ReadConfig,
 }
 
 impl ReadMetadataRunner {
     /// Sets up a benchmark runner for reading metadata.
     pub fn setup(
-        spec_variant: WorkloadSpecVariant,
+        workload: Workload,
+        config: ReadConfig,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Validate the spec variant has all necessary fields
-        spec_variant.validate()?;
-
-        let table_root = spec_variant.table_info.resolved_table_root();
+        let table_root = workload.table_info.resolved_table_root();
 
         let url = crate::try_parse_uri(table_root)?;
 
-        let version = match &spec_variant.spec {
+        let version = match &workload.spec {
             Spec::Read { version } => version,
         };
 
@@ -47,29 +51,9 @@ impl ReadMetadataRunner {
         Ok(Self {
             snapshot,
             engine,
-            spec_variant,
+            workload,
+            config,
         })
-    }
-
-    pub fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match &self
-            .spec_variant
-            .config
-            .as_ref()
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                "Config should be set, call validate() before executing".into()
-            })?
-            .parallel_scan
-        {
-            ParallelScan::Disabled => {
-                self.execute_serial()?;
-            }
-            ParallelScan::Enabled { num_threads } => {
-                self.execute_parallel(num_threads)?;
-            }
-        }
-
-        Ok(())
     }
 
     fn execute_serial(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -81,7 +65,7 @@ impl ReadMetadataRunner {
         Ok(())
     }
 
-    fn execute_parallel(&self, num_threads: &usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
         let scan = self.snapshot.clone().scan_builder().build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
@@ -92,8 +76,7 @@ impl ReadMetadataRunner {
         match phase1.finish()? {
             AfterSequential::Done(_) => {}
             AfterSequential::Parallel { processor, files } => {
-                let num_workers = *num_threads;
-                let files_per_worker = files.len().div_ceil(num_workers);
+                let files_per_worker = files.len().div_ceil(num_threads);
 
                 let partitions: Vec<_> = files
                     .chunks(files_per_worker)
@@ -133,8 +116,44 @@ impl ReadMetadataRunner {
         }
         Ok(())
     }
+}
 
-    pub fn name(&self) -> Result<String, Box<dyn std::error::Error>> {
-        self.spec_variant.name()
+impl WorkloadRunner for ReadMetadataRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.config.parallel_scan {
+            ParallelScan::Disabled => {
+                self.execute_serial()?;
+            }
+            ParallelScan::Enabled { num_threads } => {
+                self.execute_parallel(*num_threads)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.workload.name(),
+            ReadOperation::ReadMetadata.as_str(),
+            self.config.name(),
+        )
+    }
+}
+
+pub fn create_read_runner(
+    workload: Workload,
+    operation: ReadOperation,
+    config: ReadConfig,
+    engine: Arc<dyn Engine>,
+) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
+    match operation {
+        ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
+            workload, config, engine,
+        )?)),
+        ReadOperation::ReadData => {
+            todo!("ReadDataRunner not yet implemented")
+        }
     }
 }
