@@ -900,7 +900,7 @@ impl StructType {
     }
 
     /// Returns a StructType with `new_field` inserted after the field named `after`.
-    /// If `new_field`  already presents in the schema, its value is replaced by the `new_field`.
+    /// If `new_field`  already presents in the schema, an error is returned.
     /// If `after` is None, `new_field` is appended to the end.
     /// If `after` is not found, an error is returned.
     pub fn with_field_inserted_after(
@@ -908,6 +908,13 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        if self.fields.contains_key(&new_field.name) {
+            return Err(Error::generic(format!(
+                "Field {} already exists",
+                new_field.name
+            )));
+        }
+
         let insert_index = after
             .map(|after| {
                 self.fields
@@ -923,7 +930,7 @@ impl StructType {
     }
 
     /// Returns a StructType with `new_field` inserted before the field named `before`.
-    /// If `new_field` already presents in the schema, its value is replaced by the `new_field`.
+    /// If `new_field` already presents in the schema, an error is returned.
     /// If `before` is None, `new_field` is inserted at the beginning.
     /// If `before` is not found, an error is returned.
     pub fn with_field_inserted_before(
@@ -931,6 +938,13 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        if self.fields.contains_key(&new_field.name) {
+            return Err(Error::generic(format!(
+                "Field {} already exists",
+                new_field.name
+            )));
+        }
+
         let index_of_before = before
             .map(|before| {
                 self.fields
@@ -951,7 +965,7 @@ impl StructType {
         self
     }
 
-    /// Returns a new StructType with the named field replaced.
+    /// Returns a StructType with the named field replaced.
     /// Returns an error if field doesn't exist.
     pub fn with_field_replaced(
         mut self,
@@ -964,13 +978,6 @@ impl StructType {
             .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
 
         *replace_field = new_field;
-        //    let new_fields = self.fields.iter().enumerate().map(|(i, (_, v))| {
-        //        if i == pos {
-        //            new_field.clone()
-        //        } else {
-        //            v.clone()
-        //        }
-        //    });
         Ok(self)
     }
 }
@@ -3462,6 +3469,21 @@ mod tests {
     }
 
     #[test]
+    fn test_with_field_inserted_after_duplicate_field() {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        let new_schema = schema.with_field_inserted_after(
+            Some("name"),
+            StructField::new("id", DataType::STRING, true),
+        );
+        assert!(new_schema.is_err());
+        assert_result_error_with_message(new_schema, "Field id already exists");
+    }
+
+    #[test]
     fn test_with_field_inserted_before() {
         let schema = StructType::try_new([
             StructField::new("id", DataType::INTEGER, false),
@@ -3478,6 +3500,21 @@ mod tests {
         assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(schema.field_at_index(1).unwrap().name(), "age");
         assert_eq!(schema.field_at_index(2).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_with_field_inserted_before_duplicate_field() {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        let new_schema = schema.with_field_inserted_before(
+            Some("name"),
+            StructField::new("id", DataType::STRING, true),
+        );
+        assert!(new_schema.is_err());
+        assert_result_error_with_message(new_schema, "Field id already exists");
     }
 
     #[test]
