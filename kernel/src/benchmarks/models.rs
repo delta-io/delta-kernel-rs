@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
