@@ -2249,6 +2249,56 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
     Ok(())
 }
 
+// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/739
+// Void columns should be dropped from the scan's logical schema and should not
+// appear in the read results.
+#[tokio::test]
+async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>> {
+    // Parquet batch has only the non-void column (parquet cannot represent void)
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"void_col\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // The table schema has both "id" and "void_col"
+    assert!(snapshot.schema().field("void_col").is_some());
+    assert!(snapshot.schema().field("id").is_some());
+
+    let scan = snapshot.scan_builder().build()?;
+
+    // The scan's logical schema should NOT contain the void column
+    let logical_schema = scan.logical_schema();
+    assert!(logical_schema.field("void_col").is_none());
+    assert!(logical_schema.field("id").is_some());
+    assert_eq!(logical_schema.fields().count(), 1);
+
+    // Execute the scan and verify we get correct data without the void column
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 1);
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+    assert_eq!(batches[0].num_rows(), 3);
+
+    Ok(())
+}
+
 // End-to-end tests using a Spark-written Delta table with real truncated JSON stats.
 // Table has three files:
 //   file 1: id=[1,2], ts_col=[1s, 2s]           -- max at ms boundary
@@ -2277,6 +2327,20 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
             "| 5  | 1970-01-01T00:00:07Z        |",
             "| 6  | 1970-01-01T00:00:08Z        |",
             "+----+-----------------------------+",
+        ],
+    )
+}
+
+// Integration test using a real Delta table created by Spark with a void column.
+// Verifies that the kernel drops the void column on reads, matching Spark behavior.
+#[test]
+fn read_spark_table_with_void_column() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/void-column",
+        None, // SELECT * -- void column should be dropped automatically
+        None,
+        vec![
+            "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+",
         ],
     )
 }
@@ -2370,4 +2434,52 @@ fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>
             "+----+-----------------------------+",
         ],
     )
+}
+
+// Verify that a table with void nested inside an Array is rejected at snapshot load time.
+#[tokio::test]
+async fn reject_void_in_array_type() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void-array","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"arr\",\"type\":{\"type\":\"array\",\"elementType\":\"void\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let result = Snapshot::builder_for(location).build(engine.as_ref());
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("array element type"),
+        "Expected error about void in array, got: {err}"
+    );
+    Ok(())
+}
+
+// Verify that a table with void nested inside a Map value is rejected at snapshot load time.
+#[tokio::test]
+async fn reject_void_in_map_type() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void-map","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"m\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"void\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\n")).await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let result = Snapshot::builder_for(location).build(engine.as_ref());
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("map value type"),
+        "Expected error about void in map, got: {err}"
+    );
+    Ok(())
 }
