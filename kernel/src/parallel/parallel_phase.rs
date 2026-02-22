@@ -203,6 +203,7 @@ mod tests {
             state_info,
             checkpoint_info,
             seen_file_keys,
+            false,
         )
     }
 
