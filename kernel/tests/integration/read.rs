@@ -2330,6 +2330,102 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
         ],
     )
 }
+// Verify that an explicit projection including a void column still drops it at scan time.
+// This documents the intended behavior: void columns are silently removed even if requested.
+#[tokio::test]
+async fn explicit_projection_with_void_column_is_dropped() -> Result<(), Box<dyn std::error::Error>>
+{
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"void_col\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // Explicitly request both columns, including the void one
+    let schema = snapshot.schema();
+    let scan = snapshot.scan_builder().with_schema(schema).build()?;
+
+    // The void column should still be dropped from the logical schema
+    let logical_schema = scan.logical_schema();
+    assert!(logical_schema.field("void_col").is_none());
+    assert!(logical_schema.field("id").is_some());
+    assert_eq!(logical_schema.fields().count(), 1);
+
+    // Execute and verify
+    let batches = read_scan(&scan, engine)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 1);
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+
+    Ok(())
+}
+
+// Verify that void fields inside nested structs are recursively dropped at scan time.
+// Delta schema: {id: int, info: struct<name: string, v: void>}
+// Scan logical schema should be: {id: int, info: struct<name: string>}
+#[tokio::test]
+async fn read_table_with_void_in_nested_struct() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"test-void-nested","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"info\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"v\",\"type\":\"void\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+    ];
+
+    add_commit("memory:///", storage.as_ref(), 0, actions.iter().join("\\n")).await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+
+    // Table schema has the void field inside nested struct
+    let table_schema = snapshot.schema();
+    let info_field = table_schema.field("info").expect("info should exist");
+    if let DataType::Struct(inner) = info_field.data_type() {
+        assert!(
+            inner.field("v").is_some(),
+            "table schema should have void field 'v'"
+        );
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+
+    // Scan logical schema should have void field dropped from the nested struct
+    let logical_schema = scan.logical_schema();
+    let info_field = logical_schema
+        .field("info")
+        .expect("info should exist in scan");
+    if let DataType::Struct(inner) = info_field.data_type() {
+        assert!(
+            inner.field("v").is_none(),
+            "void field 'v' should be dropped"
+        );
+        assert!(
+            inner.field("name").is_some(),
+            "non-void field 'name' should remain"
+        );
+    } else {
+        panic!("info should be a struct type");
+    }
+
+    Ok(())
+}
 
 // Integration test using a real Delta table created by Spark with a void column.
 // Verifies that the kernel drops the void column on reads, matching Spark behavior.
