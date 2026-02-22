@@ -257,6 +257,16 @@ mod tests {
     }
 
     #[test]
+    fn test_drop_void_all_fields_void() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::VOID),
+            StructField::nullable("b", DataType::VOID),
+        ]);
+        let result = drop_void_fields(&schema);
+        assert_eq!(result.fields().count(), 0);
+    }
+
+    #[test]
     fn test_drop_void_no_void_unchanged() {
         let schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
