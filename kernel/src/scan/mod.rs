@@ -264,6 +264,14 @@ impl ScanBuilder {
         let logical_read_schema = self
             .logical_read_schema
             .unwrap_or_else(|| table_schema.clone());
+        // Drop void columns on reads — they always contain null and cannot be
+        // represented in parquet. See delta protocol primitive types note.
+        let logical_read_schema: SchemaRef = Arc::new(StructType::new_unchecked(
+            logical_read_schema
+                .fields()
+                .filter(|f| !matches!(f.data_type(), DataType::Primitive(PrimitiveType::Void)))
+                .cloned(),
+        ));
 
         self.snapshot
             .table_configuration()
