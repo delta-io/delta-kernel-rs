@@ -31,6 +31,7 @@ pub mod derive_macro_utils;
 pub(crate) mod derive_macro_utils;
 pub(crate) mod validation;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
