@@ -154,15 +154,13 @@ fn base_checkpoint_action_fields() -> Vec<StructField> {
 static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(StructType::new_unchecked(base_checkpoint_action_fields())));
 
-/// Schema for the checkpointMetadata field in V2 checkpoints.
-fn checkpoint_metadata_field() -> StructField {
-    StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
-}
-
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
 static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
     let mut fields = base_checkpoint_action_fields();
-    fields.push(checkpoint_metadata_field());
+    fields.push(StructField::nullable(
+        CHECKPOINT_METADATA_NAME,
+        CheckpointMetadata::to_schema(),
+    ));
     Arc::new(StructType::new_unchecked(fields))
 });
 
