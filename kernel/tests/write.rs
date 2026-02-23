@@ -690,9 +690,12 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
+            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
-                if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+                if matches!(
+                    &*source,
+                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+                ) =>
                 true,
             _ => false,
         }));
@@ -735,18 +738,9 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id1", &engine)?,
-            Some(1)
-        );
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id2", &engine)?,
-            Some(2)
-        );
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id3", &engine)?,
-            None
-        );
+        assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
+        assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
+        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
 
         let commit1 = store
             .get(&Path::from(format!(

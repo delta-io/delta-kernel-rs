@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
+use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
 
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
@@ -10,11 +10,20 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
-pub(crate) use column_mapping::column_mapping_mode;
+pub(crate) use column_mapping::{
+    assign_column_mapping_metadata, column_mapping_mode, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, get_top_level_column_physical_name,
+};
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
+
+/// Maximum reader protocol version that the kernel can handle.
+pub const MAX_VALID_READER_VERSION: i32 = 3;
+
+/// Maximum writer protocol version that the kernel can handle.
+pub const MAX_VALID_WRITER_VERSION: i32 = 7;
 
 /// Minimum reader version for tables that use table features.
 /// When set to 3, the protocol requires an explicit `readerFeatures` array.
@@ -56,9 +65,16 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(serialize_all = "camelCase")]
+#[strum(
+    serialize_all = "camelCase",
+    parse_err_fn = xxx__not_needed__default_variant_means_parsing_is_infallible__xxx,
+    parse_err_ty = Infallible // ignored, sadly: https://github.com/Peternator7/strum/issues/430
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
+#[derive(EnumIter)]
+// ^^ We must derive EnumIter only after internal_api adjusts visibility. Otherwise, internal-api
+// builds will fail because the now-public `TableFeature::iter()` returns a pub(crate) type.
 pub(crate) enum TableFeature {
     //////////////////////////
     // Writer-only features //
@@ -420,13 +436,15 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    #[cfg(feature = "clustered-table")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "clustered-table"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -434,8 +452,8 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "materializePartitionColumns",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -445,8 +463,8 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     name: "catalogManaged",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
@@ -464,8 +482,8 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "catalogOwned-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
@@ -502,8 +520,8 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     name: "deletionVectors",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     // We support writing to tables with DeletionVectors enabled, but we never write DV files
@@ -517,8 +535,8 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     name: "timestampNtz",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -528,8 +546,8 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     name: "typeWidening",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
@@ -544,8 +562,8 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "typeWidening-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
@@ -560,8 +578,8 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     name: "v2Checkpoint",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -571,8 +589,8 @@ static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     name: "vacuumProtocolCheck",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -582,8 +600,8 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     name: "variantType",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -593,8 +611,8 @@ static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "variantType-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -604,8 +622,8 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "variantShredding-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -613,6 +631,11 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 };
 
 impl TableFeature {
+    #[cfg(test)]
+    pub(crate) const NO_LIST: Option<Vec<TableFeature>> = None;
+    #[cfg(test)]
+    pub(crate) const EMPTY_LIST: Vec<TableFeature> = vec![];
+
     pub(crate) fn feature_type(&self) -> FeatureType {
         match self {
             TableFeature::CatalogManaged
@@ -703,6 +726,41 @@ impl TableFeature {
     }
 }
 
+/// Like `Into<TableFeature>`, but avoids collisions between strum's derived `EnumString` and the
+/// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
+///
+/// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
+/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
+pub(crate) trait IntoTableFeature {
+    fn into_table_feature(self) -> TableFeature;
+}
+
+impl IntoTableFeature for TableFeature {
+    fn into_table_feature(self) -> TableFeature {
+        self
+    }
+}
+
+impl IntoTableFeature for &TableFeature {
+    fn into_table_feature(self) -> TableFeature {
+        self.clone()
+    }
+}
+
+/// Parsing is infallible thanks to `TableFeature::Unknown` default variant
+impl IntoTableFeature for &str {
+    fn into_table_feature(self) -> TableFeature {
+        #[allow(clippy::unwrap_used)] // infallible, see strum parse_err_fn
+        self.parse().unwrap()
+    }
+}
+
+impl IntoTableFeature for String {
+    fn into_table_feature(self) -> TableFeature {
+        self.as_str().into_table_feature()
+    }
+}
+
 /// Formats a slice of table features using Delta's standard serialization (camelCase).
 pub(crate) fn format_features(features: &[TableFeature]) -> String {
     let feature_strings: Vec<&str> = features.iter().map(|f| f.as_ref()).collect_vec();
@@ -749,87 +807,48 @@ mod tests {
 
     #[test]
     fn test_roundtrip_table_features() {
-        let cases = [
-            (TableFeature::CatalogManaged, "catalogManaged"),
-            (TableFeature::CatalogOwnedPreview, "catalogOwned-preview"),
-            (TableFeature::ColumnMapping, "columnMapping"),
-            (TableFeature::DeletionVectors, "deletionVectors"),
-            (TableFeature::TimestampWithoutTimezone, "timestampNtz"),
-            (TableFeature::TypeWidening, "typeWidening"),
-            (TableFeature::TypeWideningPreview, "typeWidening-preview"),
-            (TableFeature::V2Checkpoint, "v2Checkpoint"),
-            (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (TableFeature::VariantType, "variantType"),
-            (TableFeature::VariantTypePreview, "variantType-preview"),
-            (
-                TableFeature::VariantShreddingPreview,
-                "variantShredding-preview",
-            ),
-            (TableFeature::unknown("something"), "something"),
-        ];
+        use strum::IntoEnumIterator as _;
 
-        for (feature, expected) in cases {
+        for feature in TableFeature::iter() {
+            let expected = match feature {
+                TableFeature::AppendOnly => "appendOnly",
+                TableFeature::Invariants => "invariants",
+                TableFeature::CheckConstraints => "checkConstraints",
+                TableFeature::ChangeDataFeed => "changeDataFeed",
+                TableFeature::GeneratedColumns => "generatedColumns",
+                TableFeature::IdentityColumns => "identityColumns",
+                TableFeature::InCommitTimestamp => "inCommitTimestamp",
+                TableFeature::RowTracking => "rowTracking",
+                TableFeature::DomainMetadata => "domainMetadata",
+                TableFeature::IcebergCompatV1 => "icebergCompatV1",
+                TableFeature::IcebergCompatV2 => "icebergCompatV2",
+                TableFeature::ClusteredTable => "clustering",
+                TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
+                TableFeature::CatalogManaged => "catalogManaged",
+                TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
+                TableFeature::ColumnMapping => "columnMapping",
+                TableFeature::DeletionVectors => "deletionVectors",
+                TableFeature::TimestampWithoutTimezone => "timestampNtz",
+                TableFeature::TypeWidening => "typeWidening",
+                TableFeature::TypeWideningPreview => "typeWidening-preview",
+                TableFeature::V2Checkpoint => "v2Checkpoint",
+                TableFeature::VacuumProtocolCheck => "vacuumProtocolCheck",
+                TableFeature::VariantType => "variantType",
+                TableFeature::VariantTypePreview => "variantType-preview",
+                TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::Unknown(_) => continue, // tested in test_unknown_features
+            };
+
+            // strum
             assert_eq!(feature.to_string(), expected);
+            assert_eq!(feature, expected.into_table_feature());
+
+            // json
             let serialized = serde_json::to_string(&feature).unwrap();
             assert_eq!(serialized, format!("\"{expected}\""));
 
             let deserialized: TableFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
-
-            let from_str: TableFeature = expected.parse().unwrap();
-            assert_eq!(from_str, feature);
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_writer_features() {
-        let cases = [
-            (TableFeature::AppendOnly, "appendOnly"),
-            (TableFeature::CatalogManaged, "catalogManaged"),
-            (TableFeature::CatalogOwnedPreview, "catalogOwned-preview"),
-            (TableFeature::Invariants, "invariants"),
-            (TableFeature::CheckConstraints, "checkConstraints"),
-            (TableFeature::ChangeDataFeed, "changeDataFeed"),
-            (TableFeature::GeneratedColumns, "generatedColumns"),
-            (TableFeature::ColumnMapping, "columnMapping"),
-            (TableFeature::IdentityColumns, "identityColumns"),
-            (TableFeature::InCommitTimestamp, "inCommitTimestamp"),
-            (TableFeature::DeletionVectors, "deletionVectors"),
-            (TableFeature::RowTracking, "rowTracking"),
-            (TableFeature::TimestampWithoutTimezone, "timestampNtz"),
-            (TableFeature::TypeWidening, "typeWidening"),
-            (TableFeature::TypeWideningPreview, "typeWidening-preview"),
-            (TableFeature::DomainMetadata, "domainMetadata"),
-            (TableFeature::V2Checkpoint, "v2Checkpoint"),
-            (TableFeature::IcebergCompatV1, "icebergCompatV1"),
-            (TableFeature::IcebergCompatV2, "icebergCompatV2"),
-            (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (TableFeature::ClusteredTable, "clustering"),
-            (
-                TableFeature::MaterializePartitionColumns,
-                "materializePartitionColumns",
-            ),
-            (TableFeature::VariantType, "variantType"),
-            (TableFeature::VariantTypePreview, "variantType-preview"),
-            (
-                TableFeature::VariantShreddingPreview,
-                "variantShredding-preview",
-            ),
-            (TableFeature::unknown("something"), "something"),
-        ];
-
-        assert_eq!(TableFeature::COUNT, cases.len());
-
-        for (feature, expected) in cases {
-            assert_eq!(feature.to_string(), expected);
-            let serialized = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serialized, format!("\"{expected}\""));
-
-            let deserialized: TableFeature = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized, feature);
-
-            let from_str: TableFeature = expected.parse().unwrap();
-            assert_eq!(from_str, feature);
         }
     }
 }

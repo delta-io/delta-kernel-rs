@@ -16,9 +16,10 @@ pub(crate) struct RowTrackingDomainMetadata {
     row_id_high_water_mark: i64,
 }
 
-impl RowTrackingDomainMetadata {
-    const ROW_TRACKING_DOMAIN_NAME: &str = "delta.rowTracking";
+/// The domain name for row tracking metadata.
+pub(crate) const ROW_TRACKING_DOMAIN_NAME: &str = "delta.rowTracking";
 
+impl RowTrackingDomainMetadata {
     pub(crate) fn new(row_id_high_water_mark: i64) -> Self {
         RowTrackingDomainMetadata {
             row_id_high_water_mark,
@@ -45,14 +46,16 @@ impl RowTrackingDomainMetadata {
         snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        Ok(domain_metadata_configuration(
-            snapshot.log_segment(),
-            Self::ROW_TRACKING_DOMAIN_NAME,
-            engine,
-        )?
-        .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
-        .transpose()?
-        .map(|metadata| metadata.row_id_high_water_mark))
+        Ok(
+            domain_metadata_configuration(
+                snapshot.log_segment(),
+                ROW_TRACKING_DOMAIN_NAME,
+                engine,
+            )?
+            .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
+            .transpose()?
+            .map(|metadata| metadata.row_id_high_water_mark),
+        )
     }
 }
 
@@ -61,7 +64,7 @@ impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
 
     fn try_from(metadata: RowTrackingDomainMetadata) -> DeltaResult<Self> {
         Ok(DomainMetadata::new(
-            RowTrackingDomainMetadata::ROW_TRACKING_DOMAIN_NAME.to_string(),
+            ROW_TRACKING_DOMAIN_NAME.to_string(),
             serde_json::to_string(&metadata)?,
         ))
     }
