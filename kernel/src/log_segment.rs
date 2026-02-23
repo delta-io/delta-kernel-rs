@@ -274,15 +274,6 @@ impl LogSegment {
                     "num_compaction_files",
                     log_segment.ascending_compaction_files.len() as u64,
                 );
-                // reporter.inspect(|r| {
-                //     r.report(MetricEvent::LogSegmentLoaded {
-                //         operation_id,
-                //         duration: log_segment_loading_duration,
-                //         num_commit_files: log_segment.ascending_commit_files.len() as u64,
-                //         num_checkpoint_files: log_segment.checkpoint_parts.len() as u64,
-                //         num_compaction_files: log_segment.ascending_compaction_files.len() as u64,
-                //     });
-                // });
                 Ok(log_segment)
             }
             Err(e) => Err(e),

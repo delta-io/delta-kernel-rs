@@ -4,7 +4,8 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::span::Id;
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
 use tracing::{event, warn, Level, Span, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
@@ -86,8 +87,8 @@ impl EventVisitor {
     }
 }
 
-impl tracing::field::Visit for EventVisitor {
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+impl Visit for EventVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
         if let Some(MetricEvent::LogSegmentLoaded {
             ref mut num_commit_files,
             ref mut num_checkpoint_files,
@@ -104,7 +105,7 @@ impl tracing::field::Visit for EventVisitor {
         }
     }
 
-    fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
         match field.name() {
             "return" => {} // we default to the success case
             "error" => {
@@ -134,8 +135,8 @@ struct StorageEventTypeVisitor {
     duration: u64,
 }
 
-impl tracing::field::Visit for StorageEventTypeVisitor {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+impl Visit for StorageEventTypeVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "name" {
             match value {
                 "copy_completed" => self.typ = StorageEventType::Copy,
@@ -146,7 +147,7 @@ impl tracing::field::Visit for StorageEventTypeVisitor {
         }
     }
 
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+    fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "num_files" => self.num_files = value,
             "bytes_read" => self.bytes_read = value,
@@ -155,7 +156,7 @@ impl tracing::field::Visit for StorageEventTypeVisitor {
         }
     }
 
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
 }
 
 #[derive(Default)]
@@ -163,8 +164,8 @@ struct NewSpanVisitor {
     uuid: Uuid,
 }
 
-impl tracing::field::Visit for NewSpanVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+impl Visit for NewSpanVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "operation_id" {
             let s = format!("{:?}", value);
             match Uuid::from_str(&s) {
@@ -181,7 +182,7 @@ impl<S> Layer<S> for ReportGeneratorLayer
 where
     S: Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
 {
-    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(metadata) = ctx.metadata(id) else {
             return;
         };
@@ -249,7 +250,7 @@ where
         }
     }
 
-    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
             let mut extensions = span.extensions_mut();
             if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
