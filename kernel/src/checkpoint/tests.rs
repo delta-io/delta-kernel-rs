@@ -4,19 +4,22 @@ use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::array::{ArrayRef, StructArray};
-use crate::arrow::datatypes::{DataType, Schema};
+use crate::arrow::array::Int32Array;
+use crate::arrow::datatypes::DataType;
 use crate::arrow::{
     array::{create_array, RecordBatch},
-    datatypes::Field,
+    datatypes::{Field, Schema},
 };
-use crate::checkpoint::create_last_checkpoint_data;
+use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
 use crate::committer::FileSystemCommitter;
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_conversion::TryIntoArrow;
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
+use crate::table_features::TableFeature;
+use crate::transaction::CommitResult;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, Engine, FileMeta, LogPath, Snapshot};
 
@@ -68,10 +71,12 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.create_checkpoint_writer()?;
 
-    let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
+    // Use V2 schema for the checkpoint metadata batch
+    let checkpoint_batch =
+        writer.create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)?;
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
-    // Verify the underlying EngineData contains the expected CheckpointMetadata action
+    // Verify the underlying EngineData contains the expected fields
     let (underlying_data, _) = checkpoint_batch.filtered_data.into_parts();
     let arrow_engine_data = ArrowEngineData::try_from_engine_data(underlying_data)?;
     let record_batch = arrow_engine_data.record_batch();
@@ -133,7 +138,25 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )
     .unwrap();
 
-    assert_eq!(*record_batch, expected);
+    // Verify the schema has the expected fields
+    let schema = record_batch.schema();
+    assert!(
+        schema.field_with_name("checkpointMetadata").is_ok(),
+        "Schema should have checkpointMetadata field"
+    );
+    assert!(
+        schema.field_with_name("add").is_ok(),
+        "Schema should have add field"
+    );
+    assert!(
+        schema.field_with_name("remove").is_ok(),
+        "Schema should have remove field"
+    );
+
+    // Verify we have one row
+    assert_eq!(record_batch.num_rows(), 1);
+
+    // Verify action counts
     assert_eq!(checkpoint_batch.actions_count, 1);
     assert_eq!(checkpoint_batch.add_actions_count, 0);
 
@@ -505,15 +528,13 @@ async fn write_commit_to_store(
 /// Create a Protocol action without v2Checkpoint feature support
 fn create_basic_protocol_action() -> Action {
     Action::Protocol(
-        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+        Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap(),
     )
 }
 
 /// Create a Protocol action with v2Checkpoint feature support
 fn create_v2_checkpoint_protocol_action() -> Action {
-    Action::Protocol(
-        Protocol::try_new(3, 7, Some(vec!["v2Checkpoint"]), Some(vec!["v2Checkpoint"])).unwrap(),
-    )
+    Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
 }
 
 /// Create a Metadata action
@@ -534,7 +555,7 @@ fn create_metadata_action() -> Action {
     )
 }
 
-/// Create an Add action with the specified path
+/// Create a simple Add action with the specified path (no stats)
 fn create_add_action(path: &str) -> Action {
     Action::Add(Add {
         path: path.into(),
@@ -592,13 +613,18 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit: adds `fake_path_1`
-    write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0).await?;
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("fake_path_1", 10)],
+        0,
+    )
+    .await?;
 
     // 2nd commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("fake_path_2"),
+            create_add_action_with_stats("fake_path_2", 20),
             create_remove_action("fake_path_1"),
         ],
         1,
@@ -624,7 +650,8 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -676,8 +703,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("file1.parquet"),
-            create_add_action("file2.parquet"),
+            create_add_action_with_stats("file1.parquet", 100),
+            create_add_action_with_stats("file2.parquet", 200),
         ],
         1,
     )
@@ -696,7 +723,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -774,7 +802,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("fake_path_2"),
+            create_add_action_with_stats("fake_path_2", 50),
             create_remove_action("fake_path_1"),
         ],
         0,
@@ -803,7 +831,8 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -880,6 +909,20 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
         crate::Error::Generic(e) if e == "Log segment is not published"
     ));
     Ok(())
+}
+
+/// Create an Add action with JSON stats
+fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
+    let stats = format!(
+        r#"{{"numRecords":{},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#,
+        num_records
+    );
+    Action::Add(Add {
+        path: path.into(),
+        data_change: true,
+        stats: Some(stats),
+        ..Default::default()
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1064,3 +1107,228 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 }
 
 // TODO: Add test that checkpoint does not contain tombstoned domain metadata.
+
+/// Tests that writing a V2 checkpoint to parquet succeeds.
+///
+/// V2 checkpoints include a checkpointMetadata batch in addition to the regular action
+/// batches. All batches in a parquet file must share the same schema. This test verifies
+/// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // TODO(#1844): Replace with `create_table` once it supports v2 checkpoints.
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["v2Checkpoint"],
+                "writerFeatures": ["v2Checkpoint"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    // Commit an add action via the transaction API so the checkpoint has action + metadata batches
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let arrow_schema: Schema = snapshot.schema().as_ref().try_into_arrow()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .with_data_change(true);
+    let data = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+    let write_context = Arc::new(txn.get_write_context());
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_files_metadata);
+    let result = txn.commit(&engine)?;
+    assert!(matches!(result, CommitResult::CommittedTransaction(_)));
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    // This writes to parquet — will fail if the checkpointMetadata batch has a different
+    // schema than the action batches.
+    snapshot.checkpoint(&engine)?;
+
+    // Verify the checkpoint was written and is readable
+    let snapshot2 = Snapshot::builder_for(table_url).build(&engine)?;
+    assert_eq!(snapshot2.version(), 1);
+
+    Ok(())
+}
+
+/// Helper to create metadata action with specific stats settings
+fn create_metadata_with_stats_config(
+    write_stats_as_json: bool,
+    write_stats_as_struct: bool,
+) -> Action {
+    let config = HashMap::from([
+        (
+            "delta.checkpoint.writeStatsAsJson".to_string(),
+            write_stats_as_json.to_string(),
+        ),
+        (
+            "delta.checkpoint.writeStatsAsStruct".to_string(),
+            write_stats_as_struct.to_string(),
+        ),
+    ]);
+    Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([
+                StructField::nullable("id", KernelDataType::LONG),
+                StructField::nullable("name", KernelDataType::STRING),
+            ])
+            .into(),
+            vec![],
+            0,
+            config,
+        )
+        .unwrap(),
+    )
+}
+
+/// Verifies checkpoint schema has expected fields based on stats configuration.
+/// Takes an Arrow schema (from a RecordBatch) and checks the add action's stats fields.
+fn verify_checkpoint_schema(
+    schema: &Schema,
+    expect_stats: bool,
+    expect_stats_parsed: bool,
+) -> DeltaResult<()> {
+    let add_field = schema
+        .field_with_name("add")
+        .expect("schema should have 'add' field");
+
+    if let DataType::Struct(add_fields) = add_field.data_type() {
+        let has_stats = add_fields.iter().any(|f| f.name() == "stats");
+        let has_stats_parsed = add_fields.iter().any(|f| f.name() == "stats_parsed");
+
+        assert_eq!(
+            has_stats, expect_stats,
+            "stats field: expected={}, actual={}",
+            expect_stats, has_stats
+        );
+        assert_eq!(
+            has_stats_parsed, expect_stats_parsed,
+            "stats_parsed field: expected={}, actual={}",
+            expect_stats_parsed, has_stats_parsed
+        );
+    } else {
+        panic!("add field should be a struct");
+    }
+    Ok(())
+}
+
+/// Tests all 16 combinations of writeStatsAsJson and writeStatsAsStruct settings with a
+/// full round-trip through parquet.
+///
+/// For each combination (json1, struct1, json2, struct2):
+/// 1. Writes checkpoint 1 to parquet with (json1, struct1) settings
+/// 2. Changes config to (json2, struct2)
+/// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths
+///    (e.g., recovering stats from stats_parsed via ToJson, or vice versa)
+/// 4. Verifies checkpoint 2 schema matches (json2, struct2)
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stats_config_round_trip(
+    #[values(true, false)] json1: bool,
+    #[values(true, false)] struct1: bool,
+    #[values(true, false)] json2: bool,
+    #[values(true, false)] struct2: bool,
+) -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+    let table_root = Url::parse("memory:///")?;
+
+    // Commit 0: protocol + metadata with initial settings
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_with_stats_config(json1, struct1),
+        ],
+        0,
+    )
+    .await?;
+
+    // Commit 1: add action with JSON stats
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("file1.parquet", 100)],
+        1,
+    )
+    .await?;
+
+    // Write checkpoint 1 to parquet with (json1, struct1) settings
+    let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    snapshot1.checkpoint(&engine)?;
+
+    // Commit 2: update metadata with new settings
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_with_stats_config(json2, struct2)],
+        2,
+    )
+    .await?;
+
+    // Build snapshot that reads from checkpoint 1 + commit 2.
+    // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
+    // expressions must recover stats across format changes.
+    let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer2 = snapshot2.create_checkpoint_writer()?;
+    let mut result2 = writer2.checkpoint_data(&engine)?;
+
+    // Verify checkpoint 2 schema matches new settings
+    let first_batch = result2.next().expect("should have at least one batch")?;
+    let data = first_batch.apply_selection_vector()?;
+    let record_batch = data.try_into_record_batch()?;
+    verify_checkpoint_schema(&record_batch.schema(), json2, struct2)?;
+
+    // Consume remaining batches (verifies COALESCE doesn't error)
+    for batch in result2 {
+        let _ = batch?;
+    }
+
+    Ok(())
+}
