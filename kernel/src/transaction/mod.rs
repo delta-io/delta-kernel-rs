@@ -9,10 +9,9 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_commit_schema,
-    get_log_commit_info_schema, get_log_domain_metadata_schema, get_log_remove_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
-    METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_commit_info_schema,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
@@ -703,9 +702,18 @@ impl<S> Transaction<S> {
             return Ok(vec![]);
         }
 
-        // Scan log to fetch existing configurations for tombstones
-        let existing_domains =
-            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
+        // Scan log to fetch existing configurations for tombstones.
+        // Pass the specific set of domains to remove so that log replay can terminate early
+        // once all target domains have been found, instead of replaying the entire log.
+        let domains: HashSet<&str> = self
+            .user_domain_removals
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let existing_domains = self
+            .read_snapshot
+            .log_segment()
+            .scan_domain_metadatas(Some(&domains), engine)?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
