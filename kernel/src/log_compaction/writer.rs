@@ -15,7 +15,7 @@ pub fn should_compact(commit_version: Version, compaction_interval: Version) -> 
     // Commits start at 0, so we add one to the commit version to check if we've hit the interval
     compaction_interval > 0
         && commit_version > 0
-        && ((commit_version + 1) % compaction_interval) == 0
+        && (commit_version + 1).is_multiple_of(compaction_interval)
 }
 
 /// Writer for log compaction files

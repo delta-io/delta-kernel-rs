@@ -424,7 +424,7 @@ impl LogSegmentFiles {
 mod list_log_files_with_log_tail_tests {
     use std::sync::Arc;
 
-    use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+    use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
     use url::Url;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;

@@ -93,7 +93,7 @@ mod tests {
     use crate::path::LogRoot;
 
     use object_store::memory::InMemory;
-    use object_store::ObjectStore as _;
+    use object_store::ObjectStoreExt;
     use url::Url;
 
     #[cfg(feature = "catalog-managed")]

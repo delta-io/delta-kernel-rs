@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;

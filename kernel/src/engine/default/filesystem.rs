@@ -8,7 +8,7 @@ use delta_kernel_derive::internal_api;
 use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore, PutMode};
+use object_store::{self, DynObjectStore, ObjectStoreExt, PutMode};
 use url::Url;
 
 use super::UrlExt;
@@ -407,8 +407,8 @@ mod tests {
     use std::time::Duration;
 
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
-    use object_store::{local::LocalFileSystem, ObjectStore};
 
     use test_utils::delta_path_for_version;
 

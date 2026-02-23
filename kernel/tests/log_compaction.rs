@@ -7,7 +7,7 @@ use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
 
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use url::Url;
 
 /// Convert a URL to an object_store::Path

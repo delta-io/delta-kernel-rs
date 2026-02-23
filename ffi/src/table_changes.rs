@@ -348,7 +348,7 @@ mod tests {
     use delta_kernel::Engine;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
     use test_utils::{
         actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
