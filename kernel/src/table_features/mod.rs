@@ -505,12 +505,7 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 5,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'columnMapping' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.column_mapping_mode.is_some()
             && props.column_mapping_mode != Some(ColumnMappingMode::None)

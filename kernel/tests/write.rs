@@ -8,18 +8,23 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray,
+};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
@@ -35,11 +40,14 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::FileMeta;
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_add_files_metadata,
-    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
-    write_batch_to_table,
+    assert_result_error_with_message, copy_directory, create_add_files_metadata, create_cm_table,
+    create_default_engine, create_table, engine_store_setup, read_add_infos, setup_test_tables,
+    test_read, test_table_setup, translate_logical_path_to_physical, write_batch_to_table,
+    write_parquet_with_snapshot,
 };
 
 mod common;
@@ -3040,4 +3048,302 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         );
     }
     Ok(())
+}
+
+
+/// Asserts that a field exists at the given physical path in the footer schema.
+fn assert_footer_has_field(footer_schema: &StructType, physical_path: &[String]) {
+    let path_str = physical_path.join(".");
+    let mut current = footer_schema;
+    for (i, name) in physical_path.iter().enumerate() {
+        let field = current
+            .field(name)
+            .unwrap_or_else(|| panic!("footer missing field '{path_str}'"));
+        if i + 1 < physical_path.len() {
+            current = match field.data_type() {
+                DataType::Struct(s) => s,
+                _ => panic!("expected struct at '{path_str}'"),
+            };
+        }
+    }
+}
+
+/// Returns a nested schema with 6 top-level fields including a nested struct
+fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::not_null("row_number", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("score", DataType::DOUBLE),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![
+                StructField::not_null("street", DataType::STRING),
+                StructField::nullable("city", DataType::STRING),
+            ])?,
+        ),
+        StructField::nullable("tag", DataType::STRING),
+        StructField::nullable("value", DataType::INTEGER),
+    ])?))
+}
+
+/// Returns two RecordBatches with hardcoded test data matching [`nested_schema`].
+fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let schema = nested_schema()?;
+    let arrow_schema = ArrowSchema::try_from_kernel(schema.as_ref())?;
+    let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        _ => panic!("expected struct"),
+    };
+
+    let build = |ids: Vec<i64>,
+                 names: Vec<&str>,
+                 scores: Vec<f64>,
+                 streets: Vec<&str>,
+                 cities: Vec<Option<&str>>,
+                 tags: Vec<Option<&str>>,
+                 values: Vec<Option<i32>>|
+     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let address_array = StructArray::new(
+            address_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(streets)) as ArrayRef,
+                Arc::new(StringArray::from(cities)) as ArrayRef,
+            ],
+            None,
+        );
+        Ok(RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(Float64Array::from(scores)) as ArrayRef,
+                Arc::new(address_array) as ArrayRef,
+                Arc::new(StringArray::from(tags)) as ArrayRef,
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            ],
+        )?)
+    };
+
+    Ok(vec![
+        build(
+            vec![1, 2, 3],
+            vec!["alice", "bob", "charlie"],
+            vec![1.0, 2.0, 3.0],
+            vec!["st1", "st2", "st3"],
+            vec![Some("c1"), None, Some("c3")],
+            vec![Some("t1"), Some("t2"), None],
+            vec![Some(10), Some(20), None],
+        )?,
+        build(
+            vec![4, 5, 6],
+            vec!["dave", "eve", "frank"],
+            vec![4.0, 5.0, 6.0],
+            vec!["st4", "st5", "st6"],
+            vec![Some("c4"), Some("c5"), Some("c6")],
+            vec![None, Some("t5"), Some("t6")],
+            vec![Some(40), None, Some(60)],
+        )?,
+    ])
+}
+
+
+/// 1. Creates a table with the given column mapping mode
+/// 2. Writes two batches of data
+/// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
+/// 4. Reads a parquet footer to verify physical names/IDs
+/// 5. Reads data back to verify correctness
+#[rstest::rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_write(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = nested_schema()?;
+
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    // Step 1: Create table
+    let mut latest_snapshot =
+        create_cm_table(&table_path, schema.clone(), cm_mode, engine.as_ref())?;
+
+    // Get physical field paths for stats verification (top-level and nested)
+    let row_number_physical = translate_logical_path_to_physical(&latest_snapshot, &["row_number"])?;
+    let street_physical =
+        translate_logical_path_to_physical(&latest_snapshot, &["address", "street"])?;
+
+    // Step 2: Write two batches
+    for data in nested_batches()? {
+        latest_snapshot =
+            write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
+    }
+
+    // Step 3: Checkpoint and verify add.stats uses correct column names
+    let snapshot_for_checkpoint = latest_snapshot.clone();
+    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
+    let stats = add_actions
+        .iter()
+        .filter_map(|a| a.stats.as_ref())
+        .find(|s| s.get("minValues").is_some())
+        .expect("checkpoint should have at least one add.stats with minValues");
+    // Top-level: minValues.<row_number_physical>
+    assert!(stats["minValues"].get(&row_number_physical[0]).is_some());
+    // Nested: minValues.<address_physical>.<street_physical>
+    assert!(stats["minValues"][&street_physical[0]]
+        .get(&street_physical[1])
+        .is_some());
+
+    // Step 4: Read parquet footer to verify physical names
+    {
+        let parquet_path = &add_actions
+            .first()
+            .expect("should have at least one add file")
+            .path;
+        let parquet_url = table_url.join(parquet_path)?;
+
+        let obj_meta = store
+            .head(&Path::from_url_path(parquet_url.path())?)
+            .await?;
+        let file_meta = FileMeta::new(parquet_url, 0, obj_meta.size as u64);
+        let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
+        let footer_schema = footer.schema;
+
+        // Verify top-level "row_number" and nested "address.street" use correct (physical) names
+        for path in [vec!["row_number"], vec!["address", "street"]] {
+            let physical = translate_logical_path_to_physical(&latest_snapshot, &path)?;
+            assert_footer_has_field(&footer_schema, &physical);
+        }
+    }
+
+    // Step 5: Read data back to verify correctness
+    {
+        let post_ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = post_ckpt_snapshot.scan_builder().build()?;
+        let batches: Vec<RecordBatch> = scan
+            .execute(engine.clone())?
+            .map(|r| {
+                let data = r.unwrap();
+                let arrow = ArrowEngineData::try_from_engine_data(data).unwrap();
+                arrow.record_batch().clone()
+            })
+            .collect();
+
+        let result_schema = batches[0].schema();
+        let combined = delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
+        assert_eq!(
+            combined.num_rows(),
+            6,
+            "Should have 6 rows from two written batches"
+        );
+
+        // Verify logical column names and data values
+        // Top-level: row_number should contain [1..=6]
+        let row_numbers = combined
+            .column_by_name("row_number")
+            .expect("should have logical column 'row_number'")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("row_number should be Int64");
+        let mut vals: Vec<i64> = (0..row_numbers.len())
+            .map(|i| row_numbers.value(i))
+            .collect();
+        vals.sort();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+
+        // Nested: address.street should contain ["st1"..="st6"]
+        let address = combined
+            .column_by_name("address")
+            .expect("should have logical column 'address'")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("address should be a struct");
+        let streets = address
+            .column_by_name("street")
+            .expect("address should have 'street'")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("street should be String");
+        let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
+        street_vals.sort();
+        assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
+    }
+
+    Ok(())
+}
+
+/// Verifies that partitioned writes use physical column names in add.partitionValues.
+#[rstest::rstest]
+#[case::cm_none("./tests/data/partition_cm/none")]
+#[case::cm_id("./tests/data/partition_cm/id")]
+#[case::cm_name("./tests/data/partition_cm/name")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_partitioned_write(
+    #[case] table_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy test data to a temp dir so we can write to it
+    let tmp_dir = tempdir()?;
+    copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let physical_name = translate_logical_path_to_physical(&snapshot, &["category"])?[0].clone();
+
+    // Write data with partition value
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let batch = RecordBatch::try_new(
+        Arc::new(data_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // Read commit log and verify add.partitionValues key uses physical name
+    let log_path = table_url.join("_delta_log/00000000000000000001.json")?;
+    let log_bytes = store
+        .get(&Path::from_url_path(log_path.path())?)
+        .await?
+        .bytes()
+        .await?;
+    for line in std::str::from_utf8(&log_bytes)?.lines() {
+        let obj: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(add) = obj.get("add") {
+            let pv = add["partitionValues"]
+                .as_object()
+                .expect("partitionValues should be an object");
+            assert!(
+                pv.contains_key(&physical_name),
+                "partitionValues key should be '{physical_name}', got: {pv:?}"
+            );
+            assert_eq!(pv[&physical_name], "A");
+            return Ok(());
+        }
+    }
+    panic!("no add action found in commit log");
 }
