@@ -193,6 +193,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         let ActionsBatch {
             actions,
             is_log_batch,
+            ..
         } = actions_batch;
         let selection_vector = vec![true; actions.len()];
 

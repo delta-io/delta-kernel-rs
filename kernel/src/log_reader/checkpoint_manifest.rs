@@ -148,6 +148,7 @@ mod tests {
             let ActionsBatch {
                 actions,
                 is_log_batch,
+                ..
             } = batch;
             assert!(!is_log_batch, "Manifest should not be a log batch");
 

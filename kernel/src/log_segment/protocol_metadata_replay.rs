@@ -7,10 +7,16 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::{CrcLoadResult, LazyCrc};
+use crate::engine_data::{GetData, RowVisitor};
 use crate::log_replay::ActionsBatch;
-use crate::{DeltaResult, Engine, Error, Expression, Predicate, PredicateRef};
+use crate::path::ParsedLogPath;
+use crate::schema::{
+    ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, StructField, StructType,
+};
+use crate::{DeltaResult, Engine, Expression, FileMeta, Predicate, PredicateRef, Version};
 
 use tracing::{info, instrument, warn};
+use url::Url;
 
 use super::LogSegment;
 
@@ -27,9 +33,9 @@ impl LogSegment {
     ) -> DeltaResult<(Metadata, Protocol)> {
         match self.read_protocol_metadata_opt(engine, lazy_crc)? {
             (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
+            (None, Some(_)) => Err(crate::Error::MissingMetadata),
+            (Some(_), None) => Err(crate::Error::MissingProtocol),
+            (None, None) => Err(crate::Error::MissingMetadataAndProtocol),
         }
     }
 
@@ -62,64 +68,123 @@ impl LogSegment {
             );
         }
 
-        // We didn't return above, so we need to do log replay to find P&M.
+        // Case 2: CRC exists at an earlier version. Use a single streaming pass over the full
+        // log segment, leveraging per-batch FilePath column to detect the CRC version boundary
+        // mid-stream:
         //
-        // Case 2: CRC exists at an earlier version => Prune the log segment to only replay
-        //         commits *after* the CRC version.
-        //   (a) If we find new P&M in the pruned replay, return it.
-        //   (b) If we don't find new P&M, fall back to the CRC.
-        //   (c) If the CRC also fails, fall back to replaying the remaining segment
-        //       (checkpoint + commits up through the CRC version).
+        //   (a) If P&M is complete once all commits after the CRC version are read, return it.
+        //   (b) If P&M is incomplete, fall back to the CRC.
+        //   (c) If the CRC also fails, continue streaming the remaining commits and checkpoint.
         //
-        // Case 3: CRC at target version failed to load => Full P&M log replay.
-        //
-        // Case 4: No CRC exists at all => Full P&M log replay.
-
+        // This replaces the previous approach of pre-splitting the segment into two separate
+        // LogSegment objects (one for "after CRC" and one for "through CRC").
         if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
-            // Case 2(a): Replay only commits after CRC version
-            info!("Pruning log segment to commits after CRC version {}", crc_v);
-            let pruned = self.segment_after_crc(crc_v);
-            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine, None, None)?;
-
-            if metadata_opt.is_some() && protocol_opt.is_some() {
-                info!("Found P&M from pruned log replay");
-                return Ok((metadata_opt, protocol_opt));
-            }
-
-            // Case 2(b): P&M incomplete from pruned replay, try CRC.
-            // Use `or_else` so any newer P or M found in the pruned replay takes priority
-            // over the (older) CRC values.
-            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
-                info!("P&M fallback to CRC (no P&M changes after CRC version)");
-                return Ok((
-                    metadata_opt.or_else(|| Some(crc.metadata.clone())),
-                    protocol_opt.or_else(|| Some(crc.protocol.clone())),
-                ));
-            }
-
-            // Case 2(c): CRC failed to load. Replay the remaining segment (checkpoint +
-            // commits up through CRC version), carrying forward any partial results from the
-            // pruned replay above.
-            warn!(
-                "CRC at version {} failed to load, replaying remaining segment",
-                crc_v
-            );
-            let remaining = self.segment_through_crc(crc_v);
-            return remaining.replay_for_pm(engine, metadata_opt, protocol_opt);
+            return self.replay_for_pm_with_crc_shortcircuit(engine, lazy_crc, crc_v);
         }
 
-        // Case 3 / Case 4: Full P&M log replay.
-        self.replay_for_pm(engine, None, None)
+        // Case 3 / Case 4: Full P&M log replay (no CRC or CRC at target version failed).
+        self.replay_for_pm(engine)
     }
 
-    /// Replays the log segment for Protocol and Metadata, merging with any already-found values.
-    /// Stops early once both are found.
+    /// Single-pass P&M replay that short-circuits to the CRC at `crc_v` once all commits after
+    /// that version have been read.
+    ///
+    /// Batches are streamed via `read_actions_with_projected_checkpoint_actions`. The CRC boundary
+    /// is detected per-batch using the `FilePath` metadata column injected by `fixup_json_read`
+    /// into commit batches. Checkpoint batches carry `is_log_batch = false`, which also signals
+    /// that all commits have been exhausted.
+    fn replay_for_pm_with_crc_shortcircuit(
+        &self,
+        engine: &dyn Engine,
+        lazy_crc: &LazyCrc,
+        crc_v: Version,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        // Commit schema includes FilePath so we can detect the CRC version boundary per-batch.
+        // Checkpoint schema omits it — parquet checkpoints don't inject FilePath, and we use
+        // is_log_batch=false as the boundary signal when we transition to checkpoint batches.
+        let commit_schema = pm_schema_with_file_path()?;
+        let checkpoint_schema = pm_schema()?;
+
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
+        let mut crossed_crc_boundary = false;
+
+        let actions = self
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                commit_schema,
+                checkpoint_schema,
+                META_PREDICATE.clone(),
+                None,
+            )?
+            .actions;
+
+        for actions_batch in actions {
+            let ActionsBatch {
+                actions,
+                is_log_batch,
+            } = actions_batch?;
+
+            // Detect the CRC boundary: first commit batch at/before crc_v, or first checkpoint batch.
+            if !crossed_crc_boundary {
+                let past_boundary = if is_log_batch {
+                    file_version_from_data(actions.as_ref())?.is_some_and(|v| v <= crc_v)
+                } else {
+                    true // all commits exhausted; now reading checkpoint
+                };
+
+                if past_boundary {
+                    crossed_crc_boundary = true;
+                    info!(
+                        "Crossed CRC boundary at version {} while replaying P&M",
+                        crc_v
+                    );
+
+                    // Case 2(a): P&M already complete from commits after CRC.
+                    if metadata_opt.is_some() && protocol_opt.is_some() {
+                        info!("Found P&M from commits after CRC version");
+                        return Ok((metadata_opt, protocol_opt));
+                    }
+
+                    // Case 2(b): P&M incomplete — try the CRC.
+                    if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                        info!("P&M fallback to CRC (no P&M changes after CRC version)");
+                        return Ok((
+                            metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                            protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                        ));
+                    }
+
+                    // Case 2(c): CRC failed — fall through and continue reading.
+                    warn!(
+                        "CRC at version {} failed to load, replaying remaining segment",
+                        crc_v
+                    );
+                }
+            }
+
+            // Accumulate P&M from this batch.
+            if metadata_opt.is_none() {
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            }
+            if protocol_opt.is_none() {
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+            }
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                break;
+            }
+        }
+
+        Ok((metadata_opt, protocol_opt))
+    }
+
+    /// Replays the log segment for Protocol and Metadata. Stops early once both are found.
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
-        mut metadata_opt: Option<Metadata>,
-        mut protocol_opt: Option<Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
         for actions_batch in self.read_pm_batches(engine)? {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
@@ -140,18 +205,81 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-            )))
-        });
+        let schema = pm_schema()?;
         // read the same protocol and metadata schema for both commits and checkpoints
         self.read_actions(engine, schema, META_PREDICATE.clone())
     }
 }
+
+/// Projected schema for Protocol and Metadata replay.
+fn pm_schema() -> DeltaResult<crate::schema::SchemaRef> {
+    get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])
+}
+
+/// Projected schema for Protocol and Metadata replay, with a FilePath metadata column appended.
+///
+/// The FilePath column is injected by `fixup_json_read` for each commit batch and carries the
+/// URL of the commit file, allowing us to extract the Delta version per batch.
+fn pm_schema_with_file_path() -> DeltaResult<crate::schema::SchemaRef> {
+    let base = pm_schema()?;
+    let fields: Vec<StructField> = base
+        .fields()
+        .cloned()
+        .chain(std::iter::once(StructField::create_metadata_column(
+            MetadataColumnSpec::FilePath.text_value(),
+            MetadataColumnSpec::FilePath,
+        )))
+        .collect();
+    Ok(Arc::new(StructType::try_new(fields)?))
+}
+
+/// Extracts the Delta log version from the `FilePath` metadata column in `data`.
+///
+/// Returns `None` if the column is absent, empty, or its path cannot be parsed as a Delta log path.
+fn file_version_from_data(data: &dyn crate::EngineData) -> DeltaResult<Option<Version>> {
+    struct FilePathVisitor {
+        path: Option<String>,
+    }
+    static FILE_PATH_COL: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+        ColumnNamesAndTypes::from((
+            vec![ColumnName::new([MetadataColumnSpec::FilePath.text_value()])],
+            vec![DataType::STRING],
+        ))
+    });
+    impl RowVisitor for FilePathVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            FILE_PATH_COL.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            if row_count > 0 && self.path.is_none() {
+                self.path = getters[0]
+                    .get_str(0, MetadataColumnSpec::FilePath.text_value())?
+                    .map(str::to_string);
+            }
+            Ok(())
+        }
+    }
+    let mut visitor = FilePathVisitor { path: None };
+    visitor.visit_rows_of(data)?;
+    Ok(visitor.path.and_then(|p| {
+        let url = Url::parse(&p).ok()?;
+        ParsedLogPath::try_from(FileMeta::new(url, 0, 0))
+            .ok()
+            .flatten()
+            .map(|parsed| parsed.version)
+    }))
+}
+
+static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
+    Some(Arc::new(Predicate::or(
+        Expression::column([METADATA_NAME, "id"]).is_not_null(),
+        Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
+    )))
+});
 
 #[cfg(test)]
 mod tests {
@@ -161,6 +289,7 @@ mod tests {
     use test_log::test;
 
     use crate::engine::sync::SyncEngine;
+    use crate::schema::MetadataColumnSpec;
     use crate::Snapshot;
 
     // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -203,5 +332,71 @@ mod tests {
         // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
         // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
         assert_eq!(data.len(), 4);
+    }
+
+    /// Verifies that `pm_schema_with_file_path` returns a schema with the standard P&M fields
+    /// plus a `FilePath` metadata column.
+    #[test]
+    fn test_pm_schema_with_file_path() {
+        use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
+        let schema = super::pm_schema_with_file_path().unwrap();
+        assert!(
+            schema.field(PROTOCOL_NAME).is_some(),
+            "missing protocol field"
+        );
+        assert!(
+            schema.field(METADATA_NAME).is_some(),
+            "missing metadata field"
+        );
+        let fp_field = schema
+            .field(MetadataColumnSpec::FilePath.text_value())
+            .expect("missing FilePath field");
+        assert_eq!(
+            fp_field.get_metadata_column_spec(),
+            Some(MetadataColumnSpec::FilePath)
+        );
+    }
+
+    /// Verifies that `file_version_from_data` correctly extracts the Delta version from the
+    /// `FilePath` metadata column injected into commit batches by `fixup_json_read`.
+    ///
+    /// Uses the `app-txn-no-checkpoint` test table (commits v0 and v1). Reads with
+    /// `pm_schema_with_file_path()` so the `_file` column is populated, then checks that each
+    /// commit batch yields the expected version.
+    #[test]
+    fn test_file_version_from_data() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-no-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let commit_schema = super::pm_schema_with_file_path().unwrap();
+        let checkpoint_schema = super::pm_schema().unwrap();
+
+        // Collect only commit batches (is_log_batch=true); commits are read newest-first.
+        let commit_versions: Vec<_> = snapshot
+            .log_segment()
+            .read_actions_with_projected_checkpoint_actions(
+                &engine,
+                commit_schema,
+                checkpoint_schema,
+                None,
+                None,
+            )
+            .unwrap()
+            .actions
+            .filter_map(|b| {
+                let b = b.unwrap();
+                b.is_log_batch.then(|| {
+                    super::file_version_from_data(b.actions.as_ref())
+                        .unwrap()
+                        .expect("commit batch must have a FilePath version")
+                })
+            })
+            .collect();
+
+        // app-txn-no-checkpoint has commits v0 and v1; newest first.
+        assert_eq!(commit_versions, vec![1, 0]);
     }
 }

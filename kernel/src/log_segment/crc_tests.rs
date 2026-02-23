@@ -96,15 +96,19 @@ fn commit_info_json() -> serde_json::Value {
     json!({"commitInfo": serde_json::to_value(commit_info()).unwrap()})
 }
 
-fn crc_json(protocol: &Protocol, metadata: &Metadata) -> serde_json::Value {
-    json!({
+fn crc_json(protocol: &Protocol, metadata: &Metadata, ict: Option<i64>) -> serde_json::Value {
+    let mut val = json!({
         "tableSizeBytes": 0,
         "numFiles": 0,
         "numMetadata": 1,
         "numProtocol": 1,
         "metadata": serde_json::to_value(metadata).unwrap(),
         "protocol": serde_json::to_value(protocol).unwrap(),
-    })
+    });
+    if let Some(ts) = ict {
+        val["inCommitTimestamp"] = json!(ts);
+    }
+    val
 }
 
 // ============================================================================
@@ -128,6 +132,7 @@ enum Op {
         version: u64,
         protocol: Protocol,
         metadata: Metadata,
+        ict: Option<i64>,
     },
     CorruptCrc(u64),
 }
@@ -173,12 +178,19 @@ impl CrcReadTest {
         self
     }
 
-    /// Write a CRC file with the given protocol and metadata.
-    fn crc(mut self, version: u64, protocol: Protocol, metadata: Metadata) -> Self {
+    /// Write a CRC file with the given protocol, metadata, and optional in-commit timestamp.
+    fn crc(
+        mut self,
+        version: u64,
+        protocol: Protocol,
+        metadata: Metadata,
+        ict: impl Into<Option<i64>>,
+    ) -> Self {
         self.ops.push(Op::Crc {
             version,
             protocol,
             metadata,
+            ict: ict.into(),
         });
         self
     }
@@ -231,8 +243,15 @@ impl CrcReadTest {
                     version: v,
                     ref protocol,
                     ref metadata,
+                    ict,
                 } => {
-                    put(&store, v, "crc", &crc_json(protocol, metadata).to_string()).await;
+                    put(
+                        &store,
+                        v,
+                        "crc",
+                        &crc_json(protocol, metadata, ict).to_string(),
+                    )
+                    .await;
                 }
                 Op::CorruptCrc(v) => {
                     put(&store, v, "crc", "CORRUPT_CRC_DATA").await;
@@ -352,7 +371,7 @@ async fn test_get_p_m_from_crc_at_target() {
         .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
         .delta(2)
-        .crc(2, protocol_v2_dv(), metadata_b()) // <-- P & M from here
+        .crc(2, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
@@ -366,7 +385,7 @@ async fn test_crc_preferred_over_delta_at_target() {
         .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
         .delta_with_p_m(2, protocol_v2_dv(), metadata_a())
-        .crc(2, protocol_v2_dv_ntz(), metadata_b()) // <-- P & M from here
+        .crc(2, protocol_v2_dv_ntz(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_b());
@@ -393,7 +412,7 @@ async fn test_crc_wins_over_checkpoint() {
         .delta(1)
         .delta(2)
         .v2_checkpoint(2, protocol_v2(), metadata_a())
-        .crc(2, protocol_v2_dv(), metadata_b()) // <-- P & M from here
+        .crc(2, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
@@ -421,11 +440,26 @@ async fn test_crc_at_earlier_version() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_v2_dv(), metadata_b()) // <-- P & M from here
+        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- P & M from here
         .delta(2)
         .build()
         .await
         .assert_p_m(None, &protocol_v2_dv(), &metadata_b());
+}
+
+/// Case 2(a): both P&M are found in commits newer than the CRC version.
+/// The shortcircuit should return the P&M from the newer commits without ever loading the CRC.
+/// Distinguishable from the CRC because the CRC carries different P&M values.
+#[tokio::test]
+async fn test_pm_both_found_in_commits_after_crc_shortcircuits() {
+    CrcReadTest::new()
+        .v2_checkpoint(0, protocol_v2(), metadata_a())
+        .delta(1)
+        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- would be used if shortcircuit broken
+        .delta_with_p_m(2, protocol_v2_dv_ntz(), metadata_a()) // <-- P & M from here
+        .build()
+        .await
+        .assert_p_m(None, &protocol_v2_dv_ntz(), &metadata_a());
 }
 
 #[tokio::test]
@@ -433,7 +467,7 @@ async fn test_get_p_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_v2_dv(), metadata_b()) // <-- M from here
+        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- M from here
         .delta_with_p_m(2, protocol_v2_dv_ntz(), None) // <-- P from here
         .build()
         .await
@@ -445,7 +479,7 @@ async fn test_get_m_from_newer_delta_over_older_crc() {
     CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_v2_dv(), metadata_b()) // <-- P from here
+        .crc(1, protocol_v2_dv(), metadata_b(), None) // <-- P from here
         .delta_with_p_m(2, None, metadata_a()) // <-- M from here
         .build()
         .await
@@ -469,7 +503,7 @@ async fn test_crc_before_checkpoint_is_ignored() {
     CrcReadTest::new()
         .delta_with_p_m(0, protocol_v2(), metadata_a())
         .delta(1)
-        .crc(1, protocol_v2_dv_ntz(), metadata_b())
+        .crc(1, protocol_v2_dv_ntz(), metadata_b(), None)
         .v2_checkpoint(2, protocol_v2_dv(), metadata_a()) // <-- P & M from here
         .delta(3)
         .build()

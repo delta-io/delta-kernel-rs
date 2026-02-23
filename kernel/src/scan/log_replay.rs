@@ -651,6 +651,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let ActionsBatch {
             actions,
             is_log_batch,
+            ..
         } = actions_batch;
         require!(
             !is_log_batch,
@@ -719,6 +720,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let ActionsBatch {
             actions,
             is_log_batch,
+            ..
         } = actions_batch;
 
         // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
