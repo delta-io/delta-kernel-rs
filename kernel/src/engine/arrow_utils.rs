@@ -813,7 +813,6 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] = Some((new_field, col));
                 }
                 ReorderIndexTransform::Nested(children) => {
-                    let input_field_name = input_fields[parquet_position].name();
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -823,29 +822,42 @@ pub(crate) fn reorder_struct_array(
                                 None, // Nested structures don't need row indexes since metadata columns can't be nested
                                 None, // No file_location passed since metadata columns can't be nested
                             )?);
-                            // create the new field specifying the correct order for the struct
-                            let new_field = Arc::new(ArrowField::new_struct(
-                                input_field_name,
-                                result_array.fields().clone(),
-                                input_fields[parquet_position].is_nullable(),
-                            ));
+                            // Clone the original field and update data type to preserve metadata
+                            // (e.g. PARQUET:field_id)
+                            let new_field = Arc::new(
+                                input_fields[parquet_position]
+                                    .as_ref()
+                                    .clone()
+                                    .with_data_type(ArrowDataType::Struct(
+                                        result_array.fields().clone(),
+                                    )),
+                            );
                             final_fields_cols[reorder_index.index] =
                                 Some((new_field, result_array));
                         }
                         ArrowDataType::List(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i32>().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_list(list_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_list(
+                                list_array,
+                                input_fields[parquet_position].as_ref(),
+                                children,
+                            )?;
                         }
                         ArrowDataType::LargeList(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i64>().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_list(list_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_list(
+                                list_array,
+                                input_fields[parquet_position].as_ref(),
+                                children,
+                            )?;
                         }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
-                            final_fields_cols[reorder_index.index] =
-                                reorder_map(map_array, input_field_name, children)?;
+                            final_fields_cols[reorder_index.index] = reorder_map(
+                                map_array,
+                                input_fields[parquet_position].as_ref(),
+                                children,
+                            )?;
                         }
                         _ => {
                             return Err(Error::internal_error(
@@ -922,7 +934,7 @@ pub(crate) fn reorder_struct_array(
 
 fn reorder_list<O: OffsetSizeTrait>(
     list_array: GenericListArray<O>,
-    input_field_name: &str,
+    input_field: &ArrowField,
     children: &[ReorderIndex],
 ) -> DeltaResult<FieldArrayOpt> {
     let (list_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
@@ -934,16 +946,20 @@ fn reorder_list<O: OffsetSizeTrait>(
             None, // Nested structures don't need row indexes since metadata columns can't be nested
             None, // No file_location passed since metadata columns can't be nested
         )?);
-        let new_list_field = Arc::new(ArrowField::new_struct(
-            list_field.name(),
-            result_array.fields().clone(),
-            result_array.is_nullable(),
-        ));
-        let new_field = Arc::new(ArrowField::new_list(
-            input_field_name,
-            new_list_field.clone(),
-            list_field.is_nullable(),
-        ));
+        // Clone inner field to preserve metadata (e.g. PARQUET:field_id)
+        let new_list_field = Arc::new(
+            list_field
+                .as_ref()
+                .clone()
+                .with_data_type(ArrowDataType::Struct(result_array.fields().clone())),
+        );
+        // Clone outer field to preserve metadata, updating data type to match
+        let new_data_type = match input_field.data_type() {
+            ArrowDataType::List(_) => ArrowDataType::List(new_list_field.clone()),
+            ArrowDataType::LargeList(_) => ArrowDataType::LargeList(new_list_field.clone()),
+            _ => unreachable!("reorder_list called with non-list field"),
+        };
+        let new_field = Arc::new(input_field.clone().with_data_type(new_data_type));
         let list = Arc::new(GenericListArray::try_new(
             new_list_field,
             offset_buffer,
@@ -960,7 +976,7 @@ fn reorder_list<O: OffsetSizeTrait>(
 
 fn reorder_map(
     map_array: MapArray,
-    input_field_name: &str,
+    input_field: &ArrowField,
     children: &[ReorderIndex],
 ) -> DeltaResult<FieldArrayOpt> {
     let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
@@ -971,21 +987,19 @@ fn reorder_map(
         None, // No file_location passed since metadata columns can't be nested
     )?;
     let result_fields = result_array.fields();
-    let new_map_field = Arc::new(ArrowField::new_struct(
-        map_field.name(),
-        result_fields.clone(),
-        result_array.is_nullable(),
-    ));
-    let key_field = result_fields[0].clone();
-    let val_field = result_fields[1].clone();
-    let new_field = Arc::new(ArrowField::new_map(
-        input_field_name,
-        map_field.name(),
-        key_field,
-        val_field,
-        ordered,
-        map_field.is_nullable(),
-    ));
+    // Clone inner field to preserve metadata (e.g. PARQUET:field_id)
+    let new_map_field = Arc::new(
+        map_field
+            .as_ref()
+            .clone()
+            .with_data_type(ArrowDataType::Struct(result_fields.clone())),
+    );
+    // Clone outer field to preserve metadata, updating data type to match
+    let new_field = Arc::new(
+        input_field
+            .clone()
+            .with_data_type(ArrowDataType::Map(new_map_field.clone(), ordered)),
+    );
     let map = Arc::new(MapArray::try_new(
         new_map_field,
         offset_buffer,
@@ -1964,6 +1978,52 @@ mod tests {
         assert_result_error_with_message(
             result,
             "File path column requested but file location not provided",
+        );
+    }
+
+    #[test]
+    fn test_reorder_struct_preserves_field_metadata() {
+        use std::collections::HashMap;
+
+        // Create an inner struct field with PARQUET:field_id metadata
+        let mut metadata = HashMap::new();
+        metadata.insert("PARQUET:field_id".to_string(), "42".to_string());
+
+        let inner_field = ArrowField::new("value", ArrowDataType::Int32, false);
+        let fields: ArrowFields = vec![Arc::new(inner_field.clone())].into();
+        let struct_field =
+            ArrowField::new_struct("nested", fields, true).with_metadata(metadata.clone());
+
+        // Build a struct array with the nested struct
+        let inner_array: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let inner_struct = StructArray::try_new(
+            vec![Arc::new(inner_field.clone())].into(),
+            vec![inner_array.clone()],
+            None,
+        )
+        .unwrap();
+
+        let outer = StructArray::try_new(
+            vec![Arc::new(struct_field)].into(),
+            vec![Arc::new(inner_struct) as ArrowArrayRef],
+            None,
+        )
+        .unwrap();
+
+        // Reorder with a Nested transform (identity on inner field)
+        let reorder = vec![ReorderIndex {
+            index: 0,
+            transform: ReorderIndexTransform::Nested(vec![ReorderIndex::identity(0)]),
+        }];
+
+        let result = reorder_struct_array(outer, &reorder, None, None).unwrap();
+
+        // The resulting struct's first field should still have the PARQUET:field_id metadata
+        let result_field = &result.fields()[0];
+        assert_eq!(
+            result_field.metadata().get("PARQUET:field_id"),
+            Some(&"42".to_string()),
+            "PARQUET:field_id metadata was lost during struct reorder"
         );
     }
 
