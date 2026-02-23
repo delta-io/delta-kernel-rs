@@ -73,6 +73,10 @@ where
     if files.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
+    // NOTE: `arrow_schema` is passed to `try_create_from_file` for callers like
+    // `try_create_from_parquet` that use it directly. JSON callers (e.g. `try_create_from_json`)
+    // ignore this parameter and rebuild their own filtered schema via `json_arrow_schema` in order
+    // to strip out metadata columns that Arrow's JSON reader cannot populate.
     let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let files = files.to_vec();
     let result = files

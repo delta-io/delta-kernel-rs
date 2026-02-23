@@ -1389,6 +1389,109 @@ pub(crate) fn to_json_bytes(
     Ok(writer.into_inner())
 }
 
+/// Inserts synthesized metadata columns into `batch` at the positions specified by `schema`.
+///
+/// When reading JSON files, metadata columns (annotated with [`MetadataColumnSpec`]) are not
+/// stored in the file itself. The JSON reader produces a batch containing only the "real" JSON
+/// columns. This function walks `schema` in order, taking non-metadata columns from `batch`
+/// sequentially and synthesizing metadata columns from context:
+///
+/// - [`MetadataColumnSpec::FilePath`]: populated with `file_location` using run-end encoding
+///   (efficient because the path is constant for all rows in a batch from the same file).
+///
+/// For any other [`MetadataColumnSpec`] variant (e.g. [`MetadataColumnSpec::RowIndex`],
+/// [`MetadataColumnSpec::RowId`], [`MetadataColumnSpec::RowCommitVersion`]), the column is
+/// filled with nulls. These variants are not meaningful for JSON log files, but inserting nulls
+/// preserves backwards-compatible behavior.
+///
+/// # Companion functions
+/// - Use [`json_arrow_schema`] to build the Arrow schema without metadata columns before reading.
+/// - This function reinserts the metadata columns after reading.
+pub(crate) fn fixup_json_read(
+    batch: RecordBatch,
+    schema: &StructType,
+    file_location: &str,
+) -> DeltaResult<RecordBatch> {
+    // Fast path: no metadata columns in this schema.
+    if !schema.fields().any(|f| f.is_metadata_column()) {
+        return Ok(batch);
+    }
+
+    let n = batch.num_rows();
+    let mut new_fields: Vec<ArrowFieldRef> = Vec::with_capacity(schema.num_fields());
+    let mut new_cols: Vec<Arc<dyn ArrowArray>> = Vec::with_capacity(schema.num_fields());
+    // Tracks position in `batch`, which contains only the non-metadata columns in order.
+    let mut batch_col_idx = 0usize;
+
+    for field in schema.fields() {
+        match field.get_metadata_column_spec() {
+            Some(MetadataColumnSpec::FilePath) => {
+                // Constant per file — use run-end encoding for efficiency.
+                let run_ends = PrimitiveArray::<Int64Type>::from_iter_values([n as i64]);
+                let values = StringArray::from_iter_values([file_location]);
+                let file_path_array = RunArray::try_new(&run_ends, &values)?;
+                let ree_field = Arc::new(ArrowField::new(
+                    field.name(),
+                    file_path_array.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                new_fields.push(ree_field);
+                new_cols.push(Arc::new(file_path_array));
+            }
+            Some(_) => {
+                // Unsupported metadata column spec: the JSON reader cannot populate this column,
+                // so insert all-null values to preserve backwards-compatible behavior (before this
+                // function existed, Arrow's JSON reader would produce nulls for any column absent
+                // from the file). Mark the field nullable since we are synthesizing nulls.
+                let arrow_field = Arc::new(ArrowField::try_from_kernel(field)?.with_nullable(true));
+                let null_col = new_null_array(arrow_field.data_type(), n);
+                new_fields.push(arrow_field);
+                new_cols.push(null_col);
+            }
+            None => {
+                // Regular field: take the next column from the batch in order.
+                if batch_col_idx >= batch.num_columns() {
+                    return Err(Error::internal_error(
+                        "JSON batch has fewer columns than non-metadata schema fields",
+                    ));
+                }
+                new_fields.push(Arc::clone(&batch.schema().fields()[batch_col_idx]));
+                new_cols.push(Arc::clone(batch.column(batch_col_idx)));
+                batch_col_idx += 1;
+            }
+        }
+    }
+
+    // Ensure we consumed exactly all columns from the batch (i.e. no stray columns that
+    // weren't accounted for by a non-metadata schema field). A mismatch indicates a
+    // programming error where the caller passed a batch that doesn't match `schema`.
+    if batch_col_idx != batch.num_columns() {
+        return Err(Error::internal_error(format!(
+            "JSON batch has {} columns but schema has only {} non-metadata fields",
+            batch.num_columns(),
+            batch_col_idx,
+        )));
+    }
+
+    let new_schema = Arc::new(ArrowSchema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_cols).map_err(Error::Arrow)
+}
+
+/// Builds an Arrow [`ArrowSchema`] from `schema` containing only the "real" JSON columns,
+/// omitting any fields annotated with [`MetadataColumnSpec`].
+///
+/// Pass the returned schema to Arrow's JSON reader; then call [`fixup_json_read`] on each
+/// resulting batch to insert the synthesized metadata columns at their correct positions.
+pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
+    let json_fields = StructType::try_new(
+        schema
+            .fields()
+            .filter(|f| f.get_metadata_column_spec().is_none())
+            .cloned(),
+    )?;
+    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -3885,5 +3988,144 @@ mod tests {
         };
         assert_eq!(map_val.metadata(), &meta("value"));
         assert!(map_val.is_nullable());
+    }
+
+    // --- Tests for fixup_json_read and json_arrow_schema ---
+
+    #[test]
+    fn test_json_arrow_schema_strips_metadata_columns() {
+        use crate::schema::MetadataColumnSpec;
+
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::nullable("b", DataType::STRING),
+        ]);
+        let arrow_schema = json_arrow_schema(&schema).unwrap();
+        assert_eq!(arrow_schema.fields().len(), 2);
+        assert_eq!(arrow_schema.field(0).name(), "a");
+        assert_eq!(arrow_schema.field(1).name(), "b");
+    }
+
+    #[test]
+    fn test_json_arrow_schema_no_metadata_columns() {
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ]);
+        let arrow_schema = json_arrow_schema(&schema).unwrap();
+        assert_eq!(arrow_schema.fields().len(), 2);
+        assert_eq!(arrow_schema.field(0).name(), "a");
+        assert_eq!(arrow_schema.field(1).name(), "b");
+    }
+
+    #[test]
+    fn test_fixup_json_read_fast_path_no_metadata_columns() {
+        // When schema has no metadata columns, batch is returned unchanged.
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, false),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+        let result = fixup_json_read(batch, &schema, "s3://bucket/file.json").unwrap();
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.schema().field(0).name(), "a");
+        assert_eq!(result.schema().field(1).name(), "b");
+    }
+
+    #[test]
+    fn test_fixup_json_read_inserts_file_path_at_correct_position() {
+        use crate::schema::MetadataColumnSpec;
+
+        // FilePath column sits between two regular columns.
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::nullable("b", DataType::INTEGER),
+        ]);
+        // Input batch has only the non-metadata columns.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, false),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let file_path = "s3://bucket/path/to/file.json";
+        let result = fixup_json_read(batch, &schema, file_path).unwrap();
+
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(0).name(), "a");
+        assert_eq!(result.schema().field(1).name(), "_file");
+        assert_eq!(result.schema().field(2).name(), "b");
+
+        // Verify file path column is run-end encoded with the correct value.
+        let run_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<RunArray<Int64Type>>()
+            .expect("Expected RunArray<Int64Type>");
+        assert_eq!(run_array.len(), 3);
+        let run_ends = run_array.run_ends().values();
+        assert_eq!(run_ends.len(), 1, "Should have exactly 1 run");
+        assert_eq!(run_ends[0], 3, "Run should end at the last row");
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.value(0), file_path);
+    }
+
+    #[test]
+    fn test_fixup_json_read_unsupported_metadata_column_inserts_nulls() {
+        use crate::arrow::array::Int64Array;
+        use crate::schema::MetadataColumnSpec;
+
+        // RowIndex is not supported for JSON reads; it should produce a null column.
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let result = fixup_json_read(batch, &schema, "s3://bucket/file.json").unwrap();
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.schema().field(1).name(), "row_index");
+
+        // The row_index column should be all nulls.
+        let row_index_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(row_index_col.len(), 3);
+        assert!(row_index_col.is_null(0));
+        assert!(row_index_col.is_null(1));
+        assert!(row_index_col.is_null(2));
     }
 }
