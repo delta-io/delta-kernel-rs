@@ -19,6 +19,12 @@ pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
 
+/// Maximum reader protocol version that the kernel can handle.
+pub const MAX_VALID_READER_VERSION: i32 = 3;
+
+/// Maximum writer protocol version that the kernel can handle.
+pub const MAX_VALID_WRITER_VERSION: i32 = 7;
+
 /// Minimum reader version for tables that use table features.
 /// When set to 3, the protocol requires an explicit `readerFeatures` array.
 pub const TABLE_FEATURES_MIN_READER_VERSION: i32 = 3;
@@ -444,8 +450,8 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "materializePartitionColumns",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -455,8 +461,8 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     name: "catalogManaged",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
@@ -474,8 +480,8 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "catalogOwned-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
@@ -512,8 +518,8 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     name: "deletionVectors",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     // We support writing to tables with DeletionVectors enabled, but we never write DV files
@@ -527,8 +533,8 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     name: "timestampNtz",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -538,8 +544,8 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     name: "typeWidening",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
@@ -554,8 +560,8 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "typeWidening-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
@@ -570,8 +576,8 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     name: "v2Checkpoint",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -581,8 +587,8 @@ static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     name: "vacuumProtocolCheck",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -592,8 +598,8 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     name: "variantType",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -603,8 +609,8 @@ static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "variantType-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
@@ -614,8 +620,8 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 #[allow(dead_code)]
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "variantShredding-preview",
-    min_reader_version: 3,
-    min_writer_version: 7,
+    min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
+    min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,

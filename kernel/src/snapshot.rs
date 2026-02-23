@@ -772,6 +772,9 @@ mod tests {
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
+    use crate::table_features::{
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    };
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use delta_kernel::actions::DomainMetadata;
 
@@ -798,13 +801,13 @@ mod tests {
             let mut protocol = json!({
                 "protocol": {
                     "minReaderVersion": reader_version,
-                    "minWriterVersion": 7,
+                    "minWriterVersion": TABLE_FEATURES_MIN_WRITER_VERSION,
                     "writerFeatures": ["inCommitTimestamp"]
                 }
             });
 
-            // Only include readerFeatures if minReaderVersion >= 3
-            if reader_version >= 3 {
+            // Only include readerFeatures if minReaderVersion >= table-features minimum.
+            if reader_version >= TABLE_FEATURES_MIN_READER_VERSION as u32 {
                 protocol["protocol"]["readerFeatures"] = json!([]);
             }
 
@@ -1603,8 +1606,8 @@ mod tests {
         let commit_data = [
             json!({
                 "protocol": {
-                    "minReaderVersion": 3,
-                    "minWriterVersion": 7,
+                    "minReaderVersion": TABLE_FEATURES_MIN_READER_VERSION,
+                    "minWriterVersion": TABLE_FEATURES_MIN_WRITER_VERSION,
                     "readerFeatures": [],
                     "writerFeatures": ["inCommitTimestamp"]
                 }
@@ -1650,7 +1653,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -1683,7 +1686,7 @@ mod tests {
 
         // Create initial commit with ICT enabled
         let commit_data = [
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -1738,7 +1741,7 @@ mod tests {
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
             create_commit_info(1587968586154, None),
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
                 Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
@@ -1752,7 +1755,7 @@ mod tests {
         // Create 00000000000000000001.checkpoint.parquet
         let checkpoint_data = [
             create_commit_info(1587968586154, None),
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
                 Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),

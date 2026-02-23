@@ -7,7 +7,10 @@ use std::sync::{Arc, LazyLock};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::table_features::{FeatureType, TableFeature};
+use crate::table_features::{
+    FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
+};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
@@ -432,10 +435,15 @@ fn parse_features(
 impl Protocol {
     /// Try to create a new modern Protocol instance with the given table feature lists
     pub(crate) fn try_new_modern(
-        reader_features: impl IntoIterator<Item = impl IntoTableFeature>,
-        writer_features: impl IntoIterator<Item = impl IntoTableFeature>,
+        reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
+        writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
     ) -> DeltaResult<Self> {
-        Self::try_new(3, 7, Some(reader_features), Some(writer_features))
+        Self::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features),
+            Some(writer_features),
+        )
     }
 
     /// Try to create a new legacy Protocol instance with the given reader/writer versions
@@ -463,7 +471,7 @@ impl Protocol {
         let writer_features = parse_features(writer_features);
 
         // The protocol states that Reader features may be present if and only if the min_reader_version is 3
-        if min_reader_version == 3 {
+        if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 reader_features.is_some(),
                 Error::invalid_protocol(
@@ -480,7 +488,7 @@ impl Protocol {
         }
 
         // The protocol states that Writer features may be present if and only if the min_writer_version is 7
-        if min_writer_version == 7 {
+        if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 writer_features.is_some(),
                 Error::invalid_protocol(
