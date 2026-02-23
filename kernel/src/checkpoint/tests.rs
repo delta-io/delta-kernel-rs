@@ -167,9 +167,6 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     assert_eq!(checkpoint_batch.actions_count, 1);
     assert_eq!(checkpoint_batch.add_actions_count, 0);
 
-    use crate::parquet::arrow::ArrowWriter;
-    use crate::parquet::file::reader::{FileReader, SerializedFileReader};
-
     // Create a new checkpoint metadata batch for writing (since the previous one was consumed)
     let checkpoint_batch_for_write =
         writer.create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)?;
@@ -177,107 +174,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let arrow_data_for_write = ArrowEngineData::try_from_engine_data(underlying_data_for_write)?;
     let record_batch_for_write = arrow_data_for_write.record_batch();
 
-    // Write the checkpoint metadata batch to a parquet file
-    let mut buffer = vec![];
-    let mut parquet_writer =
-        ArrowWriter::try_new(&mut buffer, record_batch_for_write.schema(), None)?;
-    parquet_writer.write(record_batch_for_write)?;
-    parquet_writer.close()?;
-
-    let checkpoint_path = Path::from("_delta_log/checkpoint_metadata_test.parquet");
-    store.put(&checkpoint_path, buffer.into()).await?;
-
-    // Read the parquet file and verify the schema includes the tags field
-    let checkpoint_path = Path::from("_delta_log/checkpoint_metadata_test.parquet");
-    let checkpoint_data = store.get(&checkpoint_path).await?;
-    let checkpoint_bytes = checkpoint_data.bytes().await?;
-    let file_reader = SerializedFileReader::new(checkpoint_bytes)?;
-
-    // Get the parquet schema to verify checkpointMetadata column exists with tags
-    let parquet_schema = file_reader.metadata().file_metadata().schema();
-
-    // Find the checkpointMetadata column in the schema
-    let checkpoint_metadata_field = parquet_schema
-        .get_fields()
-        .iter()
-        .find(|f| f.name() == "checkpointMetadata");
-
-    assert!(
-        checkpoint_metadata_field.is_some(),
-        "checkpointMetadata column should exist in the checkpoint file"
-    );
-
-    // Verify the checkpointMetadata struct has version and tags fields
-    if let Some(field) = checkpoint_metadata_field {
-        if let crate::parquet::schema::types::Type::GroupType { fields, .. } = field.as_ref() {
-            let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
-            assert!(
-                field_names.contains(&"version"),
-                "checkpointMetadata should have version field, got: {:?}",
-                field_names
-            );
-            assert!(
-                field_names.contains(&"tags"),
-                "checkpointMetadata should have tags field, got: {:?}",
-                field_names
-            );
-        } else {
-            panic!("checkpointMetadata should be a group type");
-        }
-    }
-
-    // Read back the parquet file and verify the data values
-    use crate::arrow::array::Array;
-    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let checkpoint_data_for_read = store.get(&checkpoint_path).await?;
-    let checkpoint_bytes_for_read = checkpoint_data_for_read.bytes().await?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes_for_read)?.build()?;
-
-    let mut found_checkpoint_metadata = false;
-    for batch_result in reader {
-        let batch = batch_result?;
-
-        // Check if this batch has a checkpointMetadata column
-        if let Ok(col_idx) = batch.schema().index_of("checkpointMetadata") {
-            let checkpoint_metadata_col = batch.column(col_idx);
-
-            // The checkpointMetadata column should be a struct with version and tags
-            if let Some(struct_array) = checkpoint_metadata_col
-                .as_any()
-                .downcast_ref::<StructArray>()
-            {
-                // Check if any row has a non-null checkpointMetadata
-                for row_idx in 0..struct_array.len() {
-                    if struct_array.is_valid(row_idx) {
-                        found_checkpoint_metadata = true;
-
-                        // Verify the version field
-                        let version_col = struct_array.column_by_name("version").unwrap();
-                        let version_array = version_col
-                            .as_any()
-                            .downcast_ref::<crate::arrow::array::Int64Array>()
-                            .unwrap();
-                        assert_eq!(version_array.value(row_idx), 0);
-
-                        // Verify the tags field is null (as we're not setting any tags)
-                        let tags_col = struct_array.column_by_name("tags").unwrap();
-                        assert!(
-                            tags_col.is_null(row_idx),
-                            "tags should be null when no tags are set"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    assert!(
-        found_checkpoint_metadata,
-        "checkpointMetadata action should be present in the checkpoint file"
-    );
-
-    Ok(())
+    verify_checkpoint_metadata_parquet(&store, record_batch_for_write, 0, None).await
 }
 
 /// Tests that checkpoint metadata with non-null tags is correctly written to parquet.
@@ -286,11 +183,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch_with_tags() -> DeltaResult<()> {
     use crate::actions::{CheckpointMetadata, CHECKPOINT_METADATA_NAME};
-    use crate::arrow::array::Array;
     use crate::expressions::Scalar;
-    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use crate::parquet::arrow::ArrowWriter;
-    use crate::parquet::file::reader::{FileReader, SerializedFileReader};
     use crate::schema::ToSchema;
     use crate::EvaluationHandlerExtension;
 
@@ -310,7 +203,7 @@ async fn test_create_checkpoint_metadata_batch_with_tags() -> DeltaResult<()> {
     tags.insert("delta.checkpoint.format".to_string(), "parquet".to_string());
 
     // Convert tags to Scalar::Map
-    let tags_scalar: Scalar = tags.try_into()?;
+    let tags_scalar: Scalar = tags.clone().try_into()?;
 
     // Create the checkpoint metadata batch with tags
     let version: i64 = 42;
@@ -319,142 +212,11 @@ async fn test_create_checkpoint_metadata_batch_with_tags() -> DeltaResult<()> {
         &[Scalar::from(version), tags_scalar],
     )?;
 
-    // Convert to Arrow and write to parquet
+    // Convert to Arrow and write to parquet, then verify
     let arrow_data = ArrowEngineData::try_from_engine_data(checkpoint_metadata_batch)?;
     let record_batch = arrow_data.record_batch();
 
-    let mut buffer = vec![];
-    let mut parquet_writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-    parquet_writer.write(record_batch)?;
-    parquet_writer.close()?;
-
-    let checkpoint_path = Path::from("_delta_log/checkpoint_metadata_with_tags_test.parquet");
-    store.put(&checkpoint_path, buffer.into()).await?;
-
-    // Read the parquet file and verify the schema includes the tags field
-    let checkpoint_data = store.get(&checkpoint_path).await?;
-    let checkpoint_bytes = checkpoint_data.bytes().await?;
-    let file_reader = SerializedFileReader::new(checkpoint_bytes.clone())?;
-
-    // Get the parquet schema to verify checkpointMetadata column exists with tags
-    let parquet_schema = file_reader.metadata().file_metadata().schema();
-
-    // Find the checkpointMetadata column in the schema
-    let checkpoint_metadata_field = parquet_schema
-        .get_fields()
-        .iter()
-        .find(|f| f.name() == "checkpointMetadata");
-
-    assert!(
-        checkpoint_metadata_field.is_some(),
-        "checkpointMetadata column should exist in the checkpoint file"
-    );
-
-    // Verify the checkpointMetadata struct has version and tags fields
-    if let Some(field) = checkpoint_metadata_field {
-        if let crate::parquet::schema::types::Type::GroupType { fields, .. } = field.as_ref() {
-            let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
-            assert!(
-                field_names.contains(&"version"),
-                "checkpointMetadata should have version field, got: {:?}",
-                field_names
-            );
-            assert!(
-                field_names.contains(&"tags"),
-                "checkpointMetadata should have tags field, got: {:?}",
-                field_names
-            );
-        } else {
-            panic!("checkpointMetadata should be a group type");
-        }
-    }
-
-    // Read back the parquet file and verify the data values including tags
-    let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes)?.build()?;
-
-    let mut found_checkpoint_metadata = false;
-    for batch_result in reader {
-        let batch = batch_result?;
-
-        // Check if this batch has a checkpointMetadata column
-        if let Ok(col_idx) = batch.schema().index_of("checkpointMetadata") {
-            let checkpoint_metadata_col = batch.column(col_idx);
-
-            // The checkpointMetadata column should be a struct with version and tags
-            if let Some(struct_array) = checkpoint_metadata_col
-                .as_any()
-                .downcast_ref::<StructArray>()
-            {
-                // Check if any row has a non-null checkpointMetadata
-                for row_idx in 0..struct_array.len() {
-                    if struct_array.is_valid(row_idx) {
-                        found_checkpoint_metadata = true;
-
-                        // Verify the version field
-                        let version_col = struct_array.column_by_name("version").unwrap();
-                        let version_array = version_col
-                            .as_any()
-                            .downcast_ref::<crate::arrow::array::Int64Array>()
-                            .unwrap();
-                        assert_eq!(version_array.value(row_idx), 42);
-
-                        // Verify the tags field is NOT null and contains the expected values
-                        let tags_col = struct_array.column_by_name("tags").unwrap();
-                        assert!(
-                            !tags_col.is_null(row_idx),
-                            "tags should NOT be null when tags are set"
-                        );
-
-                        // Verify the tags map contains the expected key-value pairs
-                        use crate::arrow::array::MapArray;
-                        let tags_map = tags_col.as_any().downcast_ref::<MapArray>().unwrap();
-
-                        // Get the keys and values arrays
-                        let keys = tags_map.keys();
-                        let values = tags_map.values();
-
-                        let keys_array = keys
-                            .as_any()
-                            .downcast_ref::<crate::arrow::array::StringArray>()
-                            .unwrap();
-                        let values_array = values
-                            .as_any()
-                            .downcast_ref::<crate::arrow::array::StringArray>()
-                            .unwrap();
-
-                        // Collect the key-value pairs
-                        let mut read_tags: HashMap<String, String> = HashMap::new();
-                        for i in 0..keys_array.len() {
-                            read_tags.insert(
-                                keys_array.value(i).to_string(),
-                                values_array.value(i).to_string(),
-                            );
-                        }
-
-                        // Verify the tags contain the expected values
-                        assert_eq!(
-                            read_tags.get("delta.checkpoint.version"),
-                            Some(&"2".to_string()),
-                            "tags should contain delta.checkpoint.version=2"
-                        );
-                        assert_eq!(
-                            read_tags.get("delta.checkpoint.format"),
-                            Some(&"parquet".to_string()),
-                            "tags should contain delta.checkpoint.format=parquet"
-                        );
-                        assert_eq!(read_tags.len(), 2, "tags should contain exactly 2 entries");
-                    }
-                }
-            }
-        }
-    }
-
-    assert!(
-        found_checkpoint_metadata,
-        "checkpointMetadata action should be present in the checkpoint file"
-    );
-
-    Ok(())
+    verify_checkpoint_metadata_parquet(&store, record_batch, 42, Some(&tags)).await
 }
 
 #[test]
@@ -500,6 +262,148 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     .unwrap();
 
     assert_eq!(*record_batch, expected);
+    Ok(())
+}
+
+/// Write a checkpoint metadata record batch to parquet, read it back, and verify:
+/// 1. The parquet schema has a checkpointMetadata struct with version and tags fields
+/// 2. The data contains the expected version and tags values
+async fn verify_checkpoint_metadata_parquet(
+    store: &Arc<InMemory>,
+    record_batch: &RecordBatch,
+    expected_version: i64,
+    expected_tags: Option<&HashMap<String, String>>,
+) -> DeltaResult<()> {
+    use crate::arrow::array::{Array, MapArray};
+    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use crate::parquet::arrow::ArrowWriter;
+    use crate::parquet::file::reader::{FileReader, SerializedFileReader};
+
+    // Write the record batch to a parquet file
+    let mut buffer = vec![];
+    let mut parquet_writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
+    parquet_writer.write(record_batch)?;
+    parquet_writer.close()?;
+
+    let checkpoint_path = Path::from("_delta_log/checkpoint_metadata_test.parquet");
+    store.put(&checkpoint_path, buffer.into()).await?;
+
+    // Read the parquet file and verify the schema includes the tags field
+    let checkpoint_data = store.get(&checkpoint_path).await?;
+    let checkpoint_bytes = checkpoint_data.bytes().await?;
+    let file_reader = SerializedFileReader::new(checkpoint_bytes)?;
+
+    // Verify checkpointMetadata column exists with version and tags fields
+    let parquet_schema = file_reader.metadata().file_metadata().schema();
+    let checkpoint_metadata_field = parquet_schema
+        .get_fields()
+        .iter()
+        .find(|f| f.name() == "checkpointMetadata");
+
+    assert!(
+        checkpoint_metadata_field.is_some(),
+        "checkpointMetadata column should exist in the checkpoint file"
+    );
+
+    if let Some(field) = checkpoint_metadata_field {
+        if let crate::parquet::schema::types::Type::GroupType { fields, .. } = field.as_ref() {
+            let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+            assert!(
+                field_names.contains(&"version"),
+                "checkpointMetadata should have version field, got: {:?}",
+                field_names
+            );
+            assert!(
+                field_names.contains(&"tags"),
+                "checkpointMetadata should have tags field, got: {:?}",
+                field_names
+            );
+        } else {
+            panic!("checkpointMetadata should be a group type");
+        }
+    }
+
+    // Read back the parquet file and verify the data values
+    let checkpoint_data_for_read = store.get(&checkpoint_path).await?;
+    let checkpoint_bytes_for_read = checkpoint_data_for_read.bytes().await?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(checkpoint_bytes_for_read)?.build()?;
+
+    let mut found_checkpoint_metadata = false;
+    for batch_result in reader {
+        let batch = batch_result?;
+
+        if let Ok(col_idx) = batch.schema().index_of("checkpointMetadata") {
+            let checkpoint_metadata_col = batch.column(col_idx);
+
+            if let Some(struct_array) = checkpoint_metadata_col
+                .as_any()
+                .downcast_ref::<StructArray>()
+            {
+                for row_idx in 0..struct_array.len() {
+                    if struct_array.is_valid(row_idx) {
+                        found_checkpoint_metadata = true;
+
+                        // Verify the version field
+                        let version_col = struct_array.column_by_name("version").unwrap();
+                        let version_array = version_col
+                            .as_any()
+                            .downcast_ref::<crate::arrow::array::Int64Array>()
+                            .unwrap();
+                        assert_eq!(version_array.value(row_idx), expected_version);
+
+                        // Verify the tags field
+                        let tags_col = struct_array.column_by_name("tags").unwrap();
+                        match expected_tags {
+                            None => {
+                                assert!(
+                                    tags_col.is_null(row_idx),
+                                    "tags should be null when no tags are set"
+                                );
+                            }
+                            Some(expected) => {
+                                assert!(
+                                    !tags_col.is_null(row_idx),
+                                    "tags should NOT be null when tags are set"
+                                );
+
+                                let tags_map =
+                                    tags_col.as_any().downcast_ref::<MapArray>().unwrap();
+                                let keys_array = tags_map
+                                    .keys()
+                                    .as_any()
+                                    .downcast_ref::<crate::arrow::array::StringArray>()
+                                    .unwrap();
+                                let values_array = tags_map
+                                    .values()
+                                    .as_any()
+                                    .downcast_ref::<crate::arrow::array::StringArray>()
+                                    .unwrap();
+
+                                let mut read_tags: HashMap<String, String> = HashMap::new();
+                                for i in 0..keys_array.len() {
+                                    read_tags.insert(
+                                        keys_array.value(i).to_string(),
+                                        values_array.value(i).to_string(),
+                                    );
+                                }
+
+                                assert_eq!(
+                                    &read_tags, expected,
+                                    "tags should match expected values"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_checkpoint_metadata,
+        "checkpointMetadata action should be present in the checkpoint file"
+    );
+
     Ok(())
 }
 
