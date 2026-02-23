@@ -81,6 +81,9 @@ impl ReadMetadataRunner {
         match phase1.finish()? {
             AfterSequential::Done(_) => {}
             AfterSequential::Parallel { processor, files } => {
+                if num_threads == 0 {
+                    return Err("num_threads in ReadConfig must be greater than 0".into());
+                }
                 let files_per_worker = files.len().div_ceil(num_threads);
 
                 let partitions: Vec<_> = files
