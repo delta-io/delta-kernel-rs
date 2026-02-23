@@ -697,10 +697,7 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 /// // Given schema: { address: { street: string, city: string } }
 /// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
 /// ```
-pub fn assert_schema_has_field(
-    schema: &delta_kernel::schema::StructType,
-    path: &[String],
-) {
+pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
     let path_str = path.join(".");
     let mut current = schema;
     for (i, name) in path.iter().enumerate() {

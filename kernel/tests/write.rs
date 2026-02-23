@@ -8,9 +8,7 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{
-    Array, ArrayRef, BinaryArray, Int64Array, StructArray,
-};
+use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -3050,7 +3048,6 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     Ok(())
 }
 
-
 /// Removes all scan files from the given snapshot by feeding all scan metadata into `txn.remove_files`.
 fn remove_all_files(
     txn: &mut delta_kernel::transaction::Transaction,
@@ -3065,8 +3062,6 @@ fn remove_all_files(
     }
     Ok(())
 }
-
-
 
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
