@@ -361,7 +361,8 @@ mod tests {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        // CDF (enableChangeDataFeed) requires min_writer_version = 4
+        let protocol = Protocol::try_new_legacy(1, 4).unwrap();
         let table_config =
             TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
 
