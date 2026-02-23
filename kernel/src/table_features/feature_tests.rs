@@ -69,6 +69,10 @@ impl PropCase {
 }
 
 /// Spec-derived fixture for a single table feature. Drives the shared test battery.
+///
+/// Schema fields represent valid metadata for each feature state. The harness does not test
+/// invalid schema combinations — features that need schema validation coverage (e.g. CM
+/// annotations with mode=none) should test their validators directly in module tests.
 #[derive(Debug, Clone)]
 struct FeatureFixture {
     /// Feature name as it appears in the protocol (e.g. "appendOnly", "allowColumnDefaults").
@@ -84,9 +88,18 @@ struct FeatureFixture {
     /// Only meaningful when `spec_legacy_versions` is `Some`. Delete once all legacy features
     /// have presence checkers (at which point all would be `true`).
     legacy_enablement_by_presence: bool,
-    /// Schema with annotations that make the feature "present" (for schema-based features).
-    /// The harness combines this with Enabled prop_cases when constructing TCs.
-    presence_schema: Option<StructType>,
+    /// Valid schema for the Enabled state. Includes schema-level annotations that make
+    /// the feature "present" (e.g. CM annotations, variant columns, widened columns).
+    /// Some features require this for enablement (CM); others allow but don't require it
+    /// (ntz, variant). The harness always passes this when testing enabled states.
+    /// Also used for Error prop_cases (which test prop-level failures with valid schema).
+    enabled_schema: Option<StructType>,
+    /// Valid schema for the Disabled state. Differs from `enabled_schema` when disabling a
+    /// feature means its schema artifacts must be absent (e.g. CM: `None` because annotations
+    /// are invalid when mode=none). Matches `enabled_schema` when schema artifacts may persist
+    /// (e.g. typeWidening: widened columns survive disabling) or when dependencies need the
+    /// schema regardless (e.g. icebergCompat: CM annotations needed either way).
+    disabled_schema: Option<StructType>,
     /// Feature names that must also be enabled in the protocol for requirements to pass.
     required_deps: &'static [&'static str],
     /// Feature names that must NOT be supported in the protocol.
@@ -109,7 +122,7 @@ struct FeatureFixture {
 impl FeatureFixture {
     /// Whether this feature has any metadata footprint (props or schema).
     fn has_metadata_footprint(&self) -> bool {
-        !self.prop_cases.is_empty() || self.presence_schema.is_some()
+        !self.prop_cases.is_empty() || self.enabled_schema.is_some()
     }
 
     /// Parse the feature name to a TableFeature. Unknown features become TableFeature::Unknown.
@@ -219,7 +232,8 @@ fn run_battery(fixture: &FeatureFixture) {
         .chain(fixture.required_deps.iter().copied())
         .collect();
 
-    let schema_ref = fixture.presence_schema.as_ref();
+    let enabled_schema = fixture.enabled_schema.as_ref();
+    let disabled_schema = fixture.disabled_schema.as_ref();
     let enabled_props = fixture.prop_cases.iter().find_map(|c| match c {
         PropCase::Enabled(p) => Some(*p),
         _ => None,
@@ -234,7 +248,11 @@ fn run_battery(fixture: &FeatureFixture) {
     // A. Prop cases: feature IS listed in modern (3,7) protocol
     // ============================================================================================
     for (i, case) in fixture.prop_cases.iter().enumerate() {
-        let result = try_create_table_config(&all_feature_names, case.props(), schema_ref, 3, 7);
+        let schema = match case {
+            PropCase::Enabled(_) | PropCase::Error(_) => enabled_schema,
+            PropCase::Disabled(_) => disabled_schema,
+        };
+        let result = try_create_table_config(&all_feature_names, case.props(), schema, 3, 7);
 
         match case {
             PropCase::Enabled(_) => {
@@ -278,8 +296,7 @@ fn run_battery(fixture: &FeatureFixture) {
     if fixture.is_feature_known() {
         if let Some(disabled_props) = disabled_props {
             // Feature has a toggle -- verify supported but NOT enabled with disabled props.
-            // Disabled props still enable deps (e.g. IcebergCompat disabled includes CM mode=name).
-            let tc = create_table_config(&all_feature_names, disabled_props, schema_ref, 3, 7);
+            let tc = create_table_config(&all_feature_names, disabled_props, disabled_schema, 3, 7);
             assert!(
                 tc.is_feature_supported(&feature),
                 "{name}: listed + disabled: expected is_feature_supported = true"
@@ -290,7 +307,7 @@ fn run_battery(fixture: &FeatureFixture) {
             );
         } else {
             // No toggle -- supported implies enabled (AlwaysIfSupported or EnabledIfPresent).
-            let tc = create_table_config(&all_feature_names, enabled_props, schema_ref, 3, 7);
+            let tc = create_table_config(&all_feature_names, enabled_props, enabled_schema, 3, 7);
             assert!(
                 tc.is_feature_supported(&feature),
                 "{name}: listed: expected is_feature_supported = true"
@@ -323,23 +340,35 @@ fn run_battery(fixture: &FeatureFixture) {
     // D. Orphan test: presence metadata + feature NOT in protocol
     // ============================================================================================
     if fixture.has_metadata_footprint() {
-        // Use Enabled props if available (for property-based presence), otherwise empty
-        // (for schema-only presence like timestampNtz, variantType).
+        // Test each Enabled prop case as an orphan (feature NOT in protocol, metadata IS present).
+        // For schema-only features (no prop_cases), test with empty props + enabled_schema.
+        let mut orphan_cases: Vec<&[&str]> = fixture
+            .prop_cases
+            .iter()
+            .filter_map(|c| match c {
+                PropCase::Enabled(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        if orphan_cases.is_empty() {
+            orphan_cases.push(&[]);
+        }
 
-        // Feature NOT in protocol, but its metadata IS present
-        let result = try_create_table_config(&[], enabled_props, schema_ref, 3, 7);
+        for (i, props) in orphan_cases.iter().enumerate() {
+            let result = try_create_table_config(&[], props, enabled_schema, 3, 7);
 
-        match fixture.expected_orphan {
-            OpExpect::Err => {
-                assert!(
-                    result.is_err(),
-                    "{name}: orphan: expected TC construction to fail (orphan detection), but it succeeded"
-                );
-            }
-            OpExpect::Ok => {
-                result.unwrap_or_else(|e| {
-                    panic!("{name}: orphan: expected TC construction to succeed (no orphan detection yet), got: {e}")
-                });
+            match fixture.expected_orphan {
+                OpExpect::Err => {
+                    assert!(
+                        result.is_err(),
+                        "{name}: orphan[{i}]: expected TC construction to fail (orphan detection), but it succeeded"
+                    );
+                }
+                OpExpect::Ok => {
+                    result.unwrap_or_else(|e| {
+                        panic!("{name}: orphan[{i}]: expected TC construction to succeed (no orphan detection yet), got: {e}")
+                    });
+                }
             }
         }
     }
@@ -366,12 +395,46 @@ fn run_battery(fixture: &FeatureFixture) {
         // E2: Legacy version insufficient -> feature not supported
         // Use one version below the minimum writer version
         if legacy_writer > 1 {
-            let tc = create_table_config(&[], &[], None, 1, legacy_writer - 1);
+            let insufficient_writer = legacy_writer - 1;
+            let tc = create_table_config(&[], &[], None, 1, insufficient_writer);
             assert!(
                 !tc.is_feature_supported(&feature),
-                "{name}: legacy insufficient version (1,{}): expected is_feature_supported = false",
-                legacy_writer - 1
+                "{name}: legacy insufficient version (1,{insufficient_writer}): \
+                 expected is_feature_supported = false",
             );
+
+            // Orphan check: same insufficient version, but with each Enabled prop case.
+            // Legacy protocol analogue to Section D.
+            for (i, case) in fixture.prop_cases.iter().enumerate() {
+                let PropCase::Enabled(props) = case else {
+                    continue;
+                };
+                let result = try_create_table_config(
+                    &[], props, enabled_schema, 1, insufficient_writer,
+                );
+                match fixture.expected_orphan {
+                    OpExpect::Err => {
+                        assert!(
+                            result.is_err(),
+                            "{name}: legacy orphan[{i}] (1,{insufficient_writer}): \
+                             expected TC construction to fail (orphan detection)"
+                        );
+                    }
+                    OpExpect::Ok => {
+                        let tc = result.unwrap_or_else(|e| {
+                            panic!(
+                                "{name}: legacy orphan[{i}] (1,{insufficient_writer}): \
+                                 expected TC construction to succeed, got: {e}"
+                            )
+                        });
+                        assert!(
+                            !tc.is_feature_supported(&feature),
+                            "{name}: legacy orphan[{i}] (1,{insufficient_writer}): \
+                             expected is_feature_supported = false"
+                        );
+                    }
+                }
+            }
         }
 
         // E3: ReaderWriter feature with writer sufficient but reader insufficient
@@ -386,32 +449,36 @@ fn run_battery(fixture: &FeatureFixture) {
 
         // E4/E5: Legacy enablement for toggle features.
         //
-        // Toggle features have both Enabled and Disabled prop_cases (a boolean property
-        // like delta.appendOnly that can be true or false). We verify that legacy version
-        // inference correctly distinguishes supported-but-not-enabled from supported-and-enabled.
-        //
-        // Non-toggle features are excluded: AlwaysIfSupported features (no prop_cases) are
-        // always enabled when supported, and columnMapping uses a multi-valued mode property
-        // whose disabled state (mode=none) is tested in the column_mapping module.
+        // Toggle features have both Enabled and Disabled prop_cases. We verify that legacy
+        // version inference correctly distinguishes supported-but-not-enabled from
+        // supported-and-enabled.
         if let Some(disabled_props) = disabled_props {
             assert!(
                 !enabled_props.is_empty(),
                 "{name}: has Disabled prop_case but no Enabled prop_case"
             );
 
-            // E4: Legacy version + enabled props -> supported AND enabled
-            let tc = create_table_config(&[], enabled_props, None, legacy_reader, legacy_writer);
-            assert!(
-                tc.is_feature_supported(&feature),
-                "{name}: legacy + enabled props: expected is_feature_supported = true"
-            );
-            assert!(
-                tc.is_feature_enabled(&feature),
-                "{name}: legacy + enabled props: expected is_feature_enabled = true"
-            );
+            // E4: Legacy version + each Enabled case + schema -> supported AND enabled.
+            // Iterates all Enabled cases (e.g. CM mode=name and mode=id) rather than
+            // just the first, so each mode gets legacy coverage.
+            for (i, case) in fixture.prop_cases.iter().enumerate() {
+                if let PropCase::Enabled(props) = case {
+                    let tc = create_table_config(
+                        &[], props, enabled_schema, legacy_reader, legacy_writer,
+                    );
+                    assert!(
+                        tc.is_feature_supported(&feature),
+                        "{name}: legacy + enabled props[{i}]: expected is_feature_supported = true"
+                    );
+                    assert!(
+                        tc.is_feature_enabled(&feature),
+                        "{name}: legacy + enabled props[{i}]: expected is_feature_enabled = true"
+                    );
+                }
+            }
 
             // E5: Legacy version + disabled props -> supported but NOT enabled
-            let tc = create_table_config(&[], disabled_props, None, legacy_reader, legacy_writer);
+            let tc = create_table_config(&[], disabled_props, disabled_schema, legacy_reader, legacy_writer);
             assert!(
                 tc.is_feature_supported(&feature),
                 "{name}: legacy + disabled props: expected is_feature_supported = true"
@@ -428,7 +495,7 @@ fn run_battery(fixture: &FeatureFixture) {
     // ============================================================================================
     {
         // Build a TC where the feature is supported+enabled.
-        let tc = create_table_config(&all_feature_names, enabled_props, schema_ref, 3, 7);
+        let tc = create_table_config(&all_feature_names, enabled_props, enabled_schema, 3, 7);
 
         // Operation::iter() automatically enumerates every variant even as new ones are added, and
         // the exhaustive match on CapabilityExpect fields ensures every variant has an
@@ -476,13 +543,14 @@ fn run_battery(fixture: &FeatureFixture) {
             assert_dep_violation(
                 &format!("{name}: missing dep '{missing_dep}'"),
                 fixture.spec_type,
-                try_create_table_config(&without_dep, enabled_props, schema_ref, 3, 7),
+                try_create_table_config(&without_dep, enabled_props, enabled_schema, 3, 7),
             );
         }
 
         // G2: Present anti-dep -> should be rejected (anti-deps forbid support, not just enablement)
         // Uses disabled props when available to verify rejection even when the feature isn't enabled.
         let anti_dep_props = disabled_props.unwrap_or(enabled_props);
+        let anti_dep_schema = disabled_props.map_or(enabled_schema, |_| disabled_schema);
         for anti_dep in fixture.anti_deps.iter() {
             let with_anti: Vec<&str> = all_feature_names
                 .iter()
@@ -493,7 +561,7 @@ fn run_battery(fixture: &FeatureFixture) {
             assert_dep_violation(
                 &format!("{name}: present anti-dep '{anti_dep}'"),
                 fixture.spec_type,
-                try_create_table_config(&with_anti, anti_dep_props, schema_ref, 3, 7),
+                try_create_table_config(&with_anti, anti_dep_props, anti_dep_schema, 3, 7),
             );
         }
     }
@@ -601,7 +669,8 @@ fn test_append_only() {
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
@@ -628,7 +697,8 @@ fn test_invariants() {
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 2)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: Some(invariants_schema),
+        enabled_schema: Some(invariants_schema),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. TODO: Enabled when delta.invariants column metadata is present in schema.
@@ -647,7 +717,8 @@ fn test_check_constraints() {
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 3)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Enabled when delta.constraints.* table properties are present.
@@ -668,7 +739,8 @@ fn test_change_data_feed() {
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
@@ -696,7 +768,8 @@ fn test_generated_columns() {
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 4)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: Some(gen_schema),
+        enabled_schema: Some(gen_schema),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Enabled when delta.generationExpression column metadata is present.
@@ -707,6 +780,10 @@ fn test_generated_columns() {
     });
 }
 
+/// Column mapping has both a multi-valued toggle (mode=id|name|none) and schema-level
+/// presence (annotations). The enabled/disabled schema split lets the battery cover
+/// mode=none (disabled_schema=None → plain schema). The full {support × mode × annotations}
+/// matrix is covered by dedicated tests in the `column_mapping` module.
 #[test]
 fn test_column_mapping() {
     run_battery(&FeatureFixture {
@@ -715,17 +792,18 @@ fn test_column_mapping() {
         spec_legacy_versions: Some(MinReaderWriterVersion(2, 5)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: Some(column_mapping_schema()),
+        enabled_schema: Some(column_mapping_schema()),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
             PropCase::Enabled(&["delta.columnMapping.mode=name"]),
             PropCase::Enabled(&["delta.columnMapping.mode=id"]),
-            // mode=none is a feature-specific edge case -- see column_mapping module tests.
+            PropCase::Disabled(&["delta.columnMapping.mode=none"]),
+            PropCase::Disabled(&[]),
+            PropCase::Error(&[]), // NOTE: orphaned schema (error cases use enabled_schema)
         ],
-        // CM schema annotations without CM in protocol are rejected.
         expected_orphan: OpExpect::Err,
-        // Column mapping: reads supported (scan+cdf), writes not supported
         capability: READS_ONLY,
     });
 }
@@ -743,7 +821,8 @@ fn test_identity_columns() {
         spec_legacy_versions: Some(MinReaderWriterVersion(1, 6)),
         // TODO: infer enablement by metadata presence, not just protocol version
         legacy_enablement_by_presence: false,
-        presence_schema: Some(identity_schema),
+        enabled_schema: Some(identity_schema),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Enabled when delta.identity.* column metadata is present in schema.
@@ -765,7 +844,8 @@ fn test_deletion_vectors() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
@@ -785,7 +865,8 @@ fn test_row_tracking() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &["domainMetadata"],
         anti_deps: &[],
         prop_cases: &[
@@ -833,7 +914,8 @@ fn test_timestamp_ntz() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(ntz_schema),
+        enabled_schema: Some(ntz_schema),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Presence is a TimestampNtz column in the schema.
@@ -851,7 +933,8 @@ fn test_domain_metadata() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
@@ -868,7 +951,8 @@ fn test_v2_checkpoint() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // delta.checkpointPolicy is an optional config (not a toggle)
@@ -889,7 +973,9 @@ fn test_iceberg_compat_v1() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(column_mapping_schema()),
+        // CM annotations needed even when disabled
+        enabled_schema: Some(column_mapping_schema()),
+        disabled_schema: Some(column_mapping_schema()),
         // IcebergCompatV1 requires column mapping enabled in name or id mode.
         // Also requires DeletionVectors NOT supported.
         required_deps: &["columnMapping"],
@@ -917,7 +1003,9 @@ fn test_iceberg_compat_v2() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(column_mapping_schema()),
+        // CM annotations needed even when disabled
+        enabled_schema: Some(column_mapping_schema()),
+        disabled_schema: Some(column_mapping_schema()),
         // IcebergCompatV2 requires column mapping enabled in name or id mode.
         // Requires DeletionVectors NOT supported, IcebergCompatV1 NOT enabled.
         required_deps: &["columnMapping"],
@@ -945,7 +1033,8 @@ fn test_clustered_table() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &["domainMetadata"],
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
@@ -965,7 +1054,8 @@ fn test_vacuum_protocol_check() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
@@ -982,7 +1072,8 @@ fn test_in_commit_timestamp() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
@@ -1014,7 +1105,8 @@ fn test_variant_type() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(variant_schema()),
+        enabled_schema: Some(variant_schema()),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Presence is a Variant column in the schema.
@@ -1032,7 +1124,8 @@ fn test_variant_type_preview() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(variant_schema()),
+        enabled_schema: Some(variant_schema()),
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // No toggle property. Presence is a Variant column in the schema.
@@ -1052,7 +1145,8 @@ fn test_variant_shredding_preview_with_variant_type() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(variant_schema()),
+        enabled_schema: Some(variant_schema()),
+        disabled_schema: None,
         required_deps: &["variantType"],
         anti_deps: &[],
         // No toggle property. Presence is a Variant column in the schema.
@@ -1069,7 +1163,8 @@ fn test_variant_shredding_preview_with_variant_type_preview() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(variant_schema()),
+        enabled_schema: Some(variant_schema()),
+        disabled_schema: None,
         required_deps: &["variantType-preview"],
         anti_deps: &[],
         // No toggle property. Presence is a Variant column in the schema.
@@ -1086,7 +1181,9 @@ fn test_type_widening() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(type_widened_schema()),
+        // Previously-widened columns can persist after disabling the feature
+        enabled_schema: Some(type_widened_schema()),
+        disabled_schema: Some(type_widened_schema()),
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
@@ -1106,7 +1203,8 @@ fn test_type_widening_preview() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: Some(type_widened_schema()),
+        enabled_schema: Some(type_widened_schema()),
+        disabled_schema: Some(type_widened_schema()),
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
@@ -1126,7 +1224,8 @@ fn test_materialize_partition_columns() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
@@ -1143,7 +1242,8 @@ fn test_catalog_managed() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
@@ -1165,7 +1265,8 @@ fn test_catalog_owned_preview() {
         spec_type: FeatureType::ReaderWriter,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // Protocol-only, no metadata footprint.
@@ -1190,7 +1291,8 @@ fn test_allow_column_defaults() {
         spec_type: FeatureType::Writer,
         spec_legacy_versions: None,
         legacy_enablement_by_presence: false,
-        presence_schema: None,
+        enabled_schema: None,
+        disabled_schema: None,
         required_deps: &[],
         anti_deps: &[],
         // Unknown to kernel -- no toggle property can be modeled.
