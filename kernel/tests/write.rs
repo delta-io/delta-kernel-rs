@@ -39,6 +39,7 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use test_utils::{
     assert_result_error_with_message, copy_directory, create_add_files_metadata,
     create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
+    write_batch_to_table,
 };
 
 mod common;
@@ -690,9 +691,12 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
+            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
-                if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+                if matches!(
+                    &*source,
+                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+                ) =>
                 true,
             _ => false,
         }));
@@ -2960,5 +2964,80 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_parquet_succeed_with_logical_partition_names(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("letter", DataType::STRING),
+    ])?);
+
+    for (table_url, engine, _store, _table_name) in setup_test_tables(
+        schema.clone(),
+        &["letter"],
+        None,
+        "test_partition_translate",
+    )
+    .await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        // Create data with only the non-partition column
+        let data_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(data_schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        // Pass partition values with logical name — should succeed
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("letter".to_string(), "a".to_string())]),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "write_parquet should succeed with valid logical partition name"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_parquet_rejects_unknown_partition_column(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
+        )
+        .await;
+        let err = result.expect_err("write_parquet should fail with unknown partition column");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Partition column 'nonexistent' not found in table schema"),
+            "Error should mention the unknown column name, got: {err_msg}"
+        );
+    }
     Ok(())
 }

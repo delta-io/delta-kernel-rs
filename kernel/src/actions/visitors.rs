@@ -1,7 +1,8 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -429,17 +430,18 @@ impl RowVisitor for SidecarVisitor {
 /// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
 ///
 /// This visitor maintains the first entry for each domain it encounters. A domain_filter may be
-/// included to only retain the domain metadata for a specific domain (in order to bound memory
-/// requirements).
+/// included to only retain domain metadata for a specific set of domains (in order to bound memory
+/// requirements and enable early termination once all requested domains are found).
 #[derive(Debug, Default)]
 pub(crate) struct DomainMetadataVisitor {
     domain_metadatas: DomainMetadataMap,
-    domain_filter: Option<String>,
+    domain_filter: Option<HashSet<String>>,
 }
 
 impl DomainMetadataVisitor {
-    /// Create a new visitor. When domain_filter is set then we only retain
-    pub(crate) fn new(domain_filter: Option<String>) -> Self {
+    /// Create a new visitor. When domain_filter is set then we only retain domain metadata for
+    /// domains in the provided set, enabling early termination once all requested domains are found.
+    pub(crate) fn new(domain_filter: Option<HashSet<String>>) -> Self {
         DomainMetadataVisitor {
             domain_filter,
             ..Default::default()
@@ -467,8 +469,13 @@ impl DomainMetadataVisitor {
         })
     }
 
+    /// Returns true if a domain filter is set and all requested domains have been found.
+    /// This is used to enable early termination of log replay once all N requested domains
+    /// have been discovered.
     pub(crate) fn filter_found(&self) -> bool {
-        self.domain_filter.is_some() && !self.domain_metadatas.is_empty()
+        self.domain_filter
+            .as_ref()
+            .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
     pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
@@ -490,14 +497,18 @@ impl RowVisitor for DomainMetadataVisitor {
         for i in 0..row_count {
             let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
             if let Some(domain) = domain {
-                // if caller requested a specific domain then only visit matches
+                // if caller requested specific domains then only visit matches
                 let filter = self.domain_filter.as_ref();
-                if filter.is_none_or(|requested| requested == &domain) {
-                    let domain_metadata =
-                        DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
-                    self.domain_metadatas
-                        .entry(domain)
-                        .or_insert(domain_metadata);
+                if filter.is_none_or(|requested| requested.contains(&domain)) {
+                    // Since batches are visited newest-first, a domain already present in
+                    // domain_metadatas was found in a newer commit and takes precedence.
+                    // Use Entry::Vacant so we only read configuration/removed when the
+                    // slot is actually empty, avoiding unnecessary field access.
+                    if let Entry::Vacant(entry) = self.domain_metadatas.entry(domain.clone()) {
+                        let domain_metadata =
+                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)?;
+                        entry.insert(domain_metadata);
+                    }
                 }
             }
         }
@@ -1116,7 +1127,8 @@ mod tests {
         assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering
-        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["zach3".to_string()])));
         domain_metadata_visitor
             .visit_rows_of(commit_1.as_ref())
             .unwrap();
@@ -1137,7 +1149,8 @@ mod tests {
         assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering for a domain that is not present
-        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["notexist".to_string()])));
         domain_metadata_visitor
             .visit_rows_of(commit_1.as_ref())
             .unwrap();
@@ -1145,6 +1158,89 @@ mod tests {
             .visit_rows_of(commit_0.as_ref())
             .unwrap();
         assert!(domain_metadata_visitor.domain_metadatas.is_empty());
+    }
+
+    #[test]
+    fn test_domain_metadata_visitor_multi_domain_filter() {
+        // Reuse the same two-commit setup from test_parse_domain_metadata.
+        // commit_1 (newer): zach1(removed), zach2, zach3(removed), zach4, zach5(removed), zach6
+        // commit_0 (older): zach1(removed), zach2, zach3, zach4(removed), zach7(removed), zach8
+        let commit_1: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"cfg3","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"cfg4","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach5","configuration":"cfg5","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach6","configuration":"cfg6","removed":false}}"#,
+            ]
+            .into(),
+        );
+        let commit_0: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"old_cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"old_cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"old_cfg3","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"old_cfg4","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach7","configuration":"cfg7","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach8","configuration":"cfg8","removed":false}}"#,
+            ]
+            .into(),
+        );
+
+        // --- filter for two active domains both in commit_1 ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach4".to_string(),
+        ])));
+        assert!(!visitor.filter_found()); // nothing found yet
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // both zach2 and zach4 appear in commit_1, so early termination should trigger
+        assert!(visitor.filter_found());
+        // commit_0 would NOT be visited in a real replay (early termination), but even if it
+        // were the results should be the same since commit_1 entries take precedence
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach4"].configuration, "cfg4");
+
+        // --- filter spanning both commits (zach2 in commit_1, zach8 in commit_0) ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach8".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // only zach2 found so far — should NOT terminate early yet
+        assert!(!visitor.filter_found());
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        // now zach8 found too
+        assert!(visitor.filter_found());
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach8"].configuration, "cfg8");
+
+        // --- filter where one domain is removed (tombstone) ---
+        // zach3 is removed in commit_1; only zach6 survives into_domain_metadatas
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach3".to_string(),
+            "zach6".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        assert!(visitor.filter_found()); // both found in commit_1
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 1); // zach3 is removed, filtered out
+        assert_eq!(result["zach6"].configuration, "cfg6");
+
+        // --- filter where no requested domains exist ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "ghost1".to_string(),
+            "ghost2".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        assert!(!visitor.filter_found());
+        assert!(visitor.into_domain_metadatas().is_empty());
     }
 
     /*************************************

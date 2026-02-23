@@ -1,5 +1,6 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
@@ -9,15 +10,20 @@ use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
@@ -246,7 +252,25 @@ pub fn create_default_engine(
     Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
 }
 
-/// Test setup helper that creates a temporary directory and engine.
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine_mt_executor(
+    table_root: &url::Url,
+) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
+    let store = store_from_url(table_root)?;
+    let task_executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    Ok(Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_task_executor(task_executor)
+            .build(),
+    ))
+}
+
+/// Test setup helper that creates a temporary directory and a `DefaultEngine` backed by
+/// [`TokioBackgroundExecutor`].
 ///
 /// Returns `(temp_dir, table_path, engine)` for use in integration tests.
 /// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
@@ -270,6 +294,28 @@ pub fn test_table_setup() -> DeltaResult<(
     let table_url = url::Url::from_directory_path(&table_path)
         .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
     let engine = create_default_engine(&table_url)?;
+    Ok((temp_dir, table_path, engine))
+}
+
+/// Test setup helper that creates a temporary directory and a `DefaultEngine` backed by
+/// [`TokioMultiThreadExecutor`].
+///
+/// Returns `(temp_dir, table_path, engine)` for use in integration tests.
+/// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
+pub fn test_table_setup_mt() -> DeltaResult<(
+    tempfile::TempDir,
+    String,
+    Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+)> {
+    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let table_path = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let table_url = url::Url::from_directory_path(&table_path)
+        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+    let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
 
@@ -507,6 +553,39 @@ pub fn test_read(
     Ok(())
 }
 
+/// Insert column arrays into an existing table in a single commit.
+///
+/// Takes a snapshot and column arrays, constructs a [`RecordBatch`] from the snapshot schema,
+/// opens a transaction, writes the batch as a parquet file, and commits.
+/// Useful for quickly seeding test tables without writing the transaction boilerplate each time.
+///
+/// # Example
+///
+/// ```ignore
+/// let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+/// insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![1]))]).await?;
+/// ```
+pub async fn insert_data<E: TaskExecutor>(
+    snapshot: Arc<Snapshot>,
+    engine: &Arc<DefaultEngine<E>>,
+    columns: Vec<ArrayRef>,
+) -> DeltaResult<CommitResult> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+
+    let write_context = txn.get_write_context();
+    let add_files_metadata = engine
+        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+        .await?;
+    txn.add_files(add_files_metadata);
+
+    txn.commit(engine.as_ref())
+}
+
 // Helper function to set json values in a serde_json Values
 pub fn set_json_value(
     value: &mut serde_json::Value,
@@ -583,10 +662,47 @@ pub fn create_add_files_metadata(
         false,
     ));
 
-    let stats_struct = StructArray::from(vec![(
-        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-        Arc::new(num_records_array) as ArrayRef,
-    )]);
+    // Build stats struct with all fields: numRecords, nullCount, minValues, maxValues, tightBounds
+    // nullCount, minValues, maxValues are empty structs (structure depends on data schema)
+    let empty_struct_fields: delta_kernel::arrow::datatypes::Fields =
+        Vec::<Arc<Field>>::new().into();
+    let empty_struct = StructArray::new_empty_fields(num_files, None);
+    let tight_bounds_array = BooleanArray::from(vec![true; num_files]);
+
+    let stats_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(num_records_array) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "nullCount",
+                ArrowDataType::Struct(empty_struct_fields.clone()),
+                true,
+            )),
+            Arc::new(empty_struct.clone()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "minValues",
+                ArrowDataType::Struct(empty_struct_fields.clone()),
+                true,
+            )),
+            Arc::new(empty_struct.clone()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "maxValues",
+                ArrowDataType::Struct(empty_struct_fields),
+                true,
+            )),
+            Arc::new(empty_struct) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(tight_bounds_array) as ArrayRef,
+        ),
+    ]);
 
     let batch = RecordBatch::try_new(
         Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
@@ -600,6 +716,37 @@ pub fn create_add_files_metadata(
     )?;
 
     Ok(Box::new(ArrowEngineData::new(batch)))
+}
+
+/// Writes a [`RecordBatch`] to a table, commits the transaction, and returns the post-commit
+/// snapshot.
+pub async fn write_batch_to_table(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    data: RecordBatch,
+    partition_values: std::collections::HashMap<String, String>,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            &write_context,
+            partition_values,
+        )
+        .await?;
+    txn.add_files(add_meta);
+    match txn.commit(engine)? {
+        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+            .post_commit_snapshot()
+            .expect("Failed to get post_commit_snapshot")
+            .clone()),
+        _ => panic!("Write commit should succeed"),
+    }
 }
 
 // Writer that captures log output into a shared buffer for test assertions
