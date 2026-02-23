@@ -137,7 +137,7 @@ impl WorkloadRunner for ReadMetadataRunner {
             "{}/{}/{}",
             self.workload.name(),
             ReadOperation::ReadMetadata.as_str(),
-            self.config.name(),
+            self.config.name,
         )
     }
 }

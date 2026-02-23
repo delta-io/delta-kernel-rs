@@ -8,14 +8,8 @@ use std::path::PathBuf;
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
 #[derive(Clone, Debug)]
 pub struct ReadConfig {
-    name: String,
+    pub name: String,
     pub parallel_scan: ParallelScan,
-}
-
-impl ReadConfig {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
 }
 
 // Provides a default set of read configs for a given table, read spec, and operation
