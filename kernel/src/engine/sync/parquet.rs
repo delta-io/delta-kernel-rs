@@ -26,7 +26,7 @@ pub(crate) struct SyncParquetHandler;
 fn try_create_from_parquet(
     file: File,
     schema: SchemaRef,
-    _arrow_schema: ArrowSchemaRef,
+    arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
@@ -55,6 +55,7 @@ fn try_create_from_parquet(
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
+            Some(&arrow_schema),
         )
     }))
 }

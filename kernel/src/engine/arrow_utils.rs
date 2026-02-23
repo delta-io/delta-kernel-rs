@@ -165,17 +165,25 @@ impl RowIndexBuilder {
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
+/// If `target_schema` is provided, coerces the batch's field nullability to match it.
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
+    target_schema: Option<&ArrowSchemaRef>,
 ) -> DeltaResult<T>
 where
     StructArray: Into<T>,
 {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
+    let data = if let Some(schema) = target_schema {
+        let batch = RecordBatch::from(data);
+        coerce_batch_nullability(batch, schema)?.into()
+    } else {
+        data
+    };
     Ok(data.into())
 }
 
