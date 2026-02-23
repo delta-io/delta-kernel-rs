@@ -180,7 +180,8 @@ where
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
         let batch = RecordBatch::from(data);
-        coerce_batch_nullability(batch, schema)?.into()
+        let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
+        coerce_batch_nullability(batch, schema, Some(&allow_all))?.into()
     } else {
         data
     };
@@ -188,9 +189,14 @@ where
 }
 
 /// Coerces a [`RecordBatch`]'s field nullability to match a target Arrow schema.
+///
+/// If `type_mismatch_validator` is provided, it is called when a source field's data type differs
+/// from the target field's data type. It should return `Ok(())` to allow the mismatch or an error
+/// to reject it. When `None`, any type mismatch is rejected with an internal error.
 pub(crate) fn coerce_batch_nullability(
     batch: RecordBatch,
     target_schema: &ArrowSchemaRef,
+    type_mismatch_validator: Option<&dyn Fn(&ArrowFieldRef, &ArrowFieldRef) -> DeltaResult<()>>,
 ) -> DeltaResult<RecordBatch> {
     if *batch.schema() == **target_schema {
         return Ok(batch);
@@ -202,6 +208,7 @@ pub(crate) fn coerce_batch_nullability(
         column: Arc<dyn ArrowArray>,
         src_field: &ArrowFieldRef,
         target_field: &ArrowFieldRef,
+        type_mismatch_validator: Option<&dyn Fn(&ArrowFieldRef, &ArrowFieldRef) -> DeltaResult<()>>,
     ) -> DeltaResult<(Arc<dyn ArrowArray>, ArrowFieldRef)> {
         let coerced_array: Arc<dyn ArrowArray> =
             match (column.data_type(), target_field.data_type()) {
@@ -224,7 +231,12 @@ pub(crate) fn coerce_batch_nullability(
                         .zip(src_children.iter())
                         .zip(target_children.iter())
                         .map(|((child_col, src_child), target_child)| {
-                            coerce(child_col.clone(), src_child, target_child)
+                            coerce(
+                                child_col.clone(),
+                                src_child,
+                                target_child,
+                                type_mismatch_validator,
+                            )
                         })
                         .collect::<DeltaResult<Vec<_>>>()?
                         .into_iter()
@@ -245,8 +257,12 @@ pub(crate) fn coerce_batch_nullability(
                             Error::generic("expected Map array during nullability coercion")
                         })?;
                     let (_, offsets, entries, nulls, ordered) = map_array.clone().into_parts();
-                    let (coerced_entries_col, coerced_entries_field) =
-                        coerce(Arc::new(entries), src_entries_field, target_entries_field)?;
+                    let (coerced_entries_col, coerced_entries_field) = coerce(
+                        Arc::new(entries),
+                        src_entries_field,
+                        target_entries_field,
+                        type_mismatch_validator,
+                    )?;
                     let coerced_entries = coerced_entries_col
                         .as_any()
                         .downcast_ref::<StructArray>()
@@ -276,13 +292,35 @@ pub(crate) fn coerce_batch_nullability(
                         })?;
                     let (_, offsets, values, nulls) = list_array.clone().into_parts();
                     let (coerced_values, coerced_element_field) =
-                        coerce(values, src_element, target_element)?;
+                        coerce(values, src_element, target_element, type_mismatch_validator)?;
                     Arc::new(GenericListArray::<i32>::try_new(
                         coerced_element_field,
                         offsets,
                         coerced_values,
                         nulls,
                     )?)
+                }
+                (src_type, target_type) if src_type != target_type => {
+                    if let Some(validator) = type_mismatch_validator {
+                        validator(src_field, target_field)?;
+                    } else {
+                        return Err(Error::internal_error(format!(
+                            "data type mismatch for field '{}': \
+                             source has {src_type:?} but target has {target_type:?}",
+                            src_field.name(),
+                        )));
+                    }
+                    let field = if src_field.is_nullable() == target_field.is_nullable() {
+                        src_field.clone()
+                    } else {
+                        Arc::new(
+                            src_field
+                                .as_ref()
+                                .clone()
+                                .with_nullable(target_field.is_nullable()),
+                        )
+                    };
+                    return Ok((column, field));
                 }
                 _ => {
                     let field = if src_field.is_nullable() == target_field.is_nullable() {
@@ -314,7 +352,9 @@ pub(crate) fn coerce_batch_nullability(
         .into_iter()
         .zip(src_fields.iter())
         .zip(target_schema.fields().iter())
-        .map(|((column, src_field), target_field)| coerce(column, src_field, target_field))
+        .map(|((column, src_field), target_field)| {
+            coerce(column, src_field, target_field, type_mismatch_validator)
+        })
         .collect::<DeltaResult<Vec<_>>>()?
         .into_iter()
         .unzip();
@@ -3640,7 +3680,7 @@ mod tests {
         let target_schema = Arc::new(ArrowSchema::new(tgt_fields));
         assert_ne!(src_schema, target_schema);
         let batch = RecordBatch::try_new(src_schema, cols).unwrap();
-        let result = coerce_batch_nullability(batch, &target_schema).unwrap();
+        let result = coerce_batch_nullability(batch, &target_schema, None).unwrap();
         assert_eq!(*result.schema(), *target_schema);
     }
 
@@ -3650,7 +3690,33 @@ mod tests {
         let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
         let schema = Arc::new(ArrowSchema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
-        let result = coerce_batch_nullability(batch.clone(), &schema).unwrap();
+        let result = coerce_batch_nullability(batch.clone(), &schema, None).unwrap();
         assert_eq!(result, batch);
+    }
+
+    #[test]
+    fn test_coerce_batch_nullability_type_mismatch_rejected_without_validator() {
+        let ((int_src_field, _, int_col), _) = create_data_int();
+        let (_, (_, string_tgt_field, _)) = create_data_string();
+        let src_schema = Arc::new(ArrowSchema::new(vec![int_src_field.as_ref().clone()]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![string_tgt_field.as_ref().clone()]));
+        let batch = RecordBatch::try_new(src_schema, vec![int_col]).unwrap();
+        let result = coerce_batch_nullability(batch, &target_schema, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("data type mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_coerce_batch_nullability_type_mismatch_allowed_with_validator() {
+        let ((int_src_field, _, int_col), _) = create_data_int();
+        let ((_, string_tgt_field, _), _) = create_data_string();
+        let src_schema = Arc::new(ArrowSchema::new(vec![int_src_field.as_ref().clone()]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![string_tgt_field.as_ref().clone()]));
+        let batch = RecordBatch::try_new(src_schema, vec![int_col]).unwrap();
+        let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
+        let result = coerce_batch_nullability(batch, &target_schema, Some(&allow_all)).unwrap();
+        assert_eq!(result.schema().field(0).data_type(), &ArrowDataType::Int32);
+        assert!(result.schema().field(0).is_nullable());
     }
 }
