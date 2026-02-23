@@ -29,6 +29,7 @@ pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 pub(crate) mod variant_utils;
+pub(crate) mod visitor;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;

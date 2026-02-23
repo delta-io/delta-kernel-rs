@@ -12,6 +12,7 @@ use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use itertools::Itertools;
 
 use crate::error::Error;
+use crate::schema::visitor::{visit_struct, visit_type, SchemaVisitor};
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
@@ -92,55 +93,69 @@ where
     }
 }
 
-/// Recursively validates that all field IDs across an entire kernel struct schema (including
-/// nested structs, arrays, and maps) are unique. Field IDs must be unique across the whole schema,
-/// not just within a single struct level, since parquet readers use them for global column
-/// matching.
-fn check_no_duplicate_field_ids<'a>(
-    fields: impl Iterator<Item = &'a StructField>,
-    seen: &mut HashMap<String, String>,
-) -> Result<(), ArrowError> {
-    for field in fields {
+/// Validates that all field IDs across an entire kernel struct schema (including nested structs,
+/// arrays, and maps) are unique. Field IDs must be unique across the whole schema, not just within
+/// a single struct level, since parquet readers use them for global column matching.
+#[derive(Default)]
+struct DuplicateFieldIdChecker {
+    seen: HashMap<String, String>,
+}
+
+impl SchemaVisitor for DuplicateFieldIdChecker {
+    type T = ();
+
+    fn field(&mut self, field: &StructField, _: ()) -> crate::DeltaResult<()> {
         if let Some(id) = field
             .metadata()
             .get(ColumnMetadataKey::ParquetFieldId.as_ref())
         {
             let id_str = id.to_string();
-            if let Some(prev) = seen.insert(id_str.clone(), field.name().to_string()) {
-                return Err(ArrowError::SchemaError(format!(
+            if let Some(prev) = self.seen.insert(id_str.clone(), field.name().to_string()) {
+                return Err(Error::schema(format!(
                     "Duplicate field ID {} assigned to both '{}' and '{}'",
-                    id_str,
-                    prev,
-                    field.name()
+                    id_str, prev, field.name()
                 )));
             }
         }
-        check_no_duplicate_field_ids_in_type(field.data_type(), seen)?;
+        Ok(())
     }
-    Ok(())
+
+    // All duplicate checking is done in `field` (post-order), so by the time `struct` is
+    // called all fields have already been validated and there is nothing left to do.
+    fn r#struct(&mut self, _: &StructType, _: Vec<()>) -> crate::DeltaResult<()> {
+        Ok(())
+    }
+
+    fn array(&mut self, array: &ArrayType) -> crate::DeltaResult<()> {
+        visit_type(array.element_type(), self)
+    }
+
+    fn map(&mut self, map: &MapType) -> crate::DeltaResult<()> {
+        visit_type(map.key_type(), self)?;
+        visit_type(map.value_type(), self)
+    }
+
+    fn primitive(&mut self, _: &PrimitiveType) -> crate::DeltaResult<()> {
+        Ok(())
+    }
+
+    fn variant(&mut self, _: &StructType) -> crate::DeltaResult<()> {
+        Ok(())
+    }
 }
 
-fn check_no_duplicate_field_ids_in_type(
-    dt: &DataType,
-    seen: &mut HashMap<String, String>,
-) -> Result<(), ArrowError> {
-    match dt {
-        DataType::Struct(s) => check_no_duplicate_field_ids(s.fields(), seen)?,
-        DataType::Array(a) => check_no_duplicate_field_ids_in_type(a.element_type(), seen)?,
-        DataType::Map(m) => {
-            check_no_duplicate_field_ids_in_type(m.key_type(), seen)?;
-            check_no_duplicate_field_ids_in_type(m.value_type(), seen)?;
-        }
-        _ => {}
+impl DuplicateFieldIdChecker {
+    fn check(s: &StructType) -> Result<(), ArrowError> {
+        visit_struct(s, &mut DuplicateFieldIdChecker::default())
+            .map_err(|e| ArrowError::SchemaError(e.to_string()))
     }
-    Ok(())
 }
 
 /// Validates then converts a kernel [`StructType`] to a `Vec<ArrowField>`. The duplicate field ID
 /// check is always run before conversion so that every call site (full schema, nested struct,
 /// variant) is protected automatically — callers do not need to invoke the check separately.
 fn try_kernel_struct_to_arrow_fields(s: &StructType) -> Result<Vec<ArrowField>, ArrowError> {
-    check_no_duplicate_field_ids(s.fields(), &mut HashMap::new())?;
+    DuplicateFieldIdChecker::check(s)?;
     s.fields().map(|f| f.try_into_arrow()).try_collect()
 }
 
