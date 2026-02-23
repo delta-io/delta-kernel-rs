@@ -230,7 +230,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         // Translate logical partition column names to physical names
         let physical_partition_values: HashMap<String, String> = partition_values
             .into_iter()
-            .map(|(logical_name, value)| -> DeltaResult<_> {
+            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
                 let field = write_context
                     .logical_schema()
                     .field(&logical_name)
