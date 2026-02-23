@@ -328,7 +328,7 @@ mod apply_schema_validation_tests {
         assert_eq!(col_b.value(2), 30);
     }
 
-    /// Test that apply_schema translates "parquet.field.id" kernel metadata to the Arrow-native
+    /// Test that apply_schema translates "parquet.field.id" kernel metadata to the Arrow-specific
     /// "PARQUET:field_id" key. This ensures the same key translation applied during schema
     /// conversion (`TryFromKernel<&StructField> for ArrowField`) is also applied when
     /// `apply_schema` is used to map data onto an existing schema (e.g. in the arrow expression
