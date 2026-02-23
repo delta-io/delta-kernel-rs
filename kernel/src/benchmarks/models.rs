@@ -53,15 +53,18 @@ impl TableInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
-    Read {
-        version: Option<u64>, //If version is None, read at latest version
-    },
+    Read(ReadSpec),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReadSpec {
+    pub version: Option<u64>, // If version is None, read at latest version
 }
 
 impl Spec {
     pub fn as_str(&self) -> &str {
         match self {
-            Spec::Read { .. } => "read",
+            Spec::Read(_) => "read",
         }
     }
 }
@@ -149,8 +152,8 @@ mod tests {
     fn test_deserialize_spec_read(#[case] json: &str, #[case] expected_version: Option<u64>) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize read spec");
 
-        let Spec::Read { version } = spec;
-        assert_eq!(version, expected_version);
+        let Spec::Read(read_spec) = spec;
+        assert_eq!(read_spec.version, expected_version);
     }
 
     #[rstest]

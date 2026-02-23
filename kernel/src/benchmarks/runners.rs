@@ -38,7 +38,7 @@ impl ReadMetadataRunner {
         let url = crate::try_parse_uri(table_root)?;
 
         let version = match &workload.spec {
-            Spec::Read { version } => version,
+            Spec::Read(read_spec) => &read_spec.version,
         };
 
         let mut builder = Snapshot::builder_for(url);
