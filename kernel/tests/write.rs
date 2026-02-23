@@ -9,11 +9,11 @@ use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray,
+    Array, ArrayRef, BinaryArray, Int64Array, StructArray,
 };
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
@@ -44,8 +44,9 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::FileMeta;
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_add_files_metadata, create_cm_table,
-    create_default_engine, create_table, engine_store_setup, read_add_infos, setup_test_tables,
+    assert_result_error_with_message, assert_schema_has_field, copy_directory,
+    create_add_files_metadata, create_cm_table, create_default_engine, create_table,
+    engine_store_setup, nested_batches, nested_schema, read_add_infos, setup_test_tables,
     test_read, test_table_setup, translate_logical_path_to_physical, write_batch_to_table,
 };
 
@@ -3049,22 +3050,6 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     Ok(())
 }
 
-/// Asserts that a field exists at the given physical path in the footer schema.
-fn assert_footer_has_field(footer_schema: &StructType, physical_path: &[String]) {
-    let path_str = physical_path.join(".");
-    let mut current = footer_schema;
-    for (i, name) in physical_path.iter().enumerate() {
-        let field = current
-            .field(name)
-            .unwrap_or_else(|| panic!("footer missing field '{path_str}'"));
-        if i + 1 < physical_path.len() {
-            current = match field.data_type() {
-                DataType::Struct(s) => s,
-                _ => panic!("expected struct at '{path_str}'"),
-            };
-        }
-    }
-}
 
 /// Removes all scan files from the given snapshot by feeding all scan metadata into `txn.remove_files`.
 fn remove_all_files(
@@ -3081,83 +3066,7 @@ fn remove_all_files(
     Ok(())
 }
 
-/// Returns a nested schema with 6 top-level fields including a nested struct
-fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::not_null("row_number", DataType::LONG),
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("score", DataType::DOUBLE),
-        StructField::nullable(
-            "address",
-            StructType::try_new(vec![
-                StructField::not_null("street", DataType::STRING),
-                StructField::nullable("city", DataType::STRING),
-            ])?,
-        ),
-        StructField::nullable("tag", DataType::STRING),
-        StructField::nullable("value", DataType::INTEGER),
-    ])?))
-}
 
-/// Returns two RecordBatches with hardcoded test data matching [`nested_schema`].
-fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
-    let schema = nested_schema()?;
-    let arrow_schema = ArrowSchema::try_from_kernel(schema.as_ref())?;
-    let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
-        ArrowDataType::Struct(fields) => fields.clone(),
-        _ => panic!("expected struct"),
-    };
-
-    let build = |ids: Vec<i64>,
-                 names: Vec<&str>,
-                 scores: Vec<f64>,
-                 streets: Vec<&str>,
-                 cities: Vec<Option<&str>>,
-                 tags: Vec<Option<&str>>,
-                 values: Vec<Option<i32>>|
-     -> Result<RecordBatch, Box<dyn std::error::Error>> {
-        let address_array = StructArray::new(
-            address_fields.clone(),
-            vec![
-                Arc::new(StringArray::from(streets)) as ArrayRef,
-                Arc::new(StringArray::from(cities)) as ArrayRef,
-            ],
-            None,
-        );
-        Ok(RecordBatch::try_new(
-            Arc::new(arrow_schema.clone()),
-            vec![
-                Arc::new(Int64Array::from(ids)) as ArrayRef,
-                Arc::new(StringArray::from(names)) as ArrayRef,
-                Arc::new(Float64Array::from(scores)) as ArrayRef,
-                Arc::new(address_array) as ArrayRef,
-                Arc::new(StringArray::from(tags)) as ArrayRef,
-                Arc::new(Int32Array::from(values)) as ArrayRef,
-            ],
-        )?)
-    };
-
-    Ok(vec![
-        build(
-            vec![1, 2, 3],
-            vec!["alice", "bob", "charlie"],
-            vec![1.0, 2.0, 3.0],
-            vec!["st1", "st2", "st3"],
-            vec![Some("c1"), None, Some("c3")],
-            vec![Some("t1"), Some("t2"), None],
-            vec![Some(10), Some(20), None],
-        )?,
-        build(
-            vec![4, 5, 6],
-            vec!["dave", "eve", "frank"],
-            vec![4.0, 5.0, 6.0],
-            vec!["st4", "st5", "st6"],
-            vec![Some("c4"), Some("c5"), Some("c6")],
-            vec![None, Some("t5"), Some("t6")],
-            vec![Some(40), None, Some(60)],
-        )?,
-    ])
-}
 
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
@@ -3209,19 +3118,41 @@ async fn test_column_mapping_write(
     snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
-    let stats = add_actions
+    let mut all_stats: Vec<_> = add_actions
         .iter()
         .filter_map(|a| a.stats.as_ref())
-        .find(|s| s.get("minValues").is_some())
-        .expect("checkpoint should have at least one add.stats with minValues");
-    // Top-level: minValues.<row_number_physical>
-    assert!(stats["minValues"].get(&row_number_physical[0]).is_some());
-    // Nested: minValues.<address_physical>.<street_physical>
-    assert!(stats["minValues"][&street_physical[0]]
-        .get(&street_physical[1])
-        .is_some());
+        .filter(|s| s.get("minValues").is_some())
+        .collect();
+    assert_eq!(all_stats.len(), 2, "should have stats for 2 files");
+    all_stats.sort_by_key(|s| s["minValues"][&row_number_physical[0]].as_i64().unwrap());
 
-    // Step 4: Read parquet footer to verify physical names
+    // Batch 1: row_number 1..3, address.street "st1".."st3"
+    assert_eq!(all_stats[0]["minValues"][&row_number_physical[0]], 1);
+    assert_eq!(all_stats[0]["maxValues"][&row_number_physical[0]], 3);
+    assert_eq!(
+        all_stats[0]["minValues"][&street_physical[0]][&street_physical[1]],
+        "st1"
+    );
+    assert_eq!(
+        all_stats[0]["maxValues"][&street_physical[0]][&street_physical[1]],
+        "st3"
+    );
+
+    // Batch 2: row_number 4..6, address.street "st4".."st6"
+    assert_eq!(all_stats[1]["minValues"][&row_number_physical[0]], 4);
+    assert_eq!(all_stats[1]["maxValues"][&row_number_physical[0]], 6);
+    assert_eq!(
+        all_stats[1]["minValues"][&street_physical[0]][&street_physical[1]],
+        "st4"
+    );
+    assert_eq!(
+        all_stats[1]["maxValues"][&street_physical[0]][&street_physical[1]],
+        "st6"
+    );
+
+    // Step 4: Read the parquet file footer (SchemaElement entries in the file metadata)
+    // to verify that columns are stored under their physical names, not logical names.
+    // Ref: https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
     {
         let parquet_path = &add_actions
             .first()
@@ -3239,7 +3170,7 @@ async fn test_column_mapping_write(
         // Verify top-level "row_number" and nested "address.street" use correct (physical) names
         for path in [vec!["row_number"], vec!["address", "street"]] {
             let physical = translate_logical_path_to_physical(&latest_snapshot, &path)?;
-            assert_footer_has_field(&footer_schema, &physical);
+            assert_schema_has_field(&footer_schema, &physical);
         }
     }
 

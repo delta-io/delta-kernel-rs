@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray,
-    StructArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
+    StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
@@ -24,7 +24,7 @@ use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
@@ -603,6 +603,117 @@ pub fn set_json_value(
         .ok_or_else(|| format!("key '{path}' not found"))?;
     *v = new_value;
     Ok(())
+}
+
+/// Returns a nested schema with 6 top-level fields including a nested struct:
+/// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag: string, value: int]`
+pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::not_null("row_number", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("score", DataType::DOUBLE),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![
+                StructField::not_null("street", DataType::STRING),
+                StructField::nullable("city", DataType::STRING),
+            ])?,
+        ),
+        StructField::nullable("tag", DataType::STRING),
+        StructField::nullable("value", DataType::INTEGER),
+    ])?))
+}
+
+/// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
+///
+/// Batch 1: rows 1..3, names alice/bob/charlie, streets st1..st3
+/// Batch 2: rows 4..6, names dave/eve/frank, streets st4..st6
+pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let schema = nested_schema()?;
+    let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(schema.as_ref())?;
+    let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        _ => panic!("expected struct"),
+    };
+
+    let build = |ids: Vec<i64>,
+                 names: Vec<&str>,
+                 scores: Vec<f64>,
+                 streets: Vec<&str>,
+                 cities: Vec<Option<&str>>,
+                 tags: Vec<Option<&str>>,
+                 values: Vec<Option<i32>>|
+     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let address_array = StructArray::new(
+            address_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(streets)) as ArrayRef,
+                Arc::new(StringArray::from(cities)) as ArrayRef,
+            ],
+            None,
+        );
+        Ok(RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(Float64Array::from(scores)) as ArrayRef,
+                Arc::new(address_array) as ArrayRef,
+                Arc::new(StringArray::from(tags)) as ArrayRef,
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            ],
+        )?)
+    };
+
+    Ok(vec![
+        build(
+            vec![1, 2, 3],
+            vec!["alice", "bob", "charlie"],
+            vec![1.0, 2.0, 3.0],
+            vec!["st1", "st2", "st3"],
+            vec![Some("c1"), None, Some("c3")],
+            vec![Some("t1"), Some("t2"), None],
+            vec![Some(10), Some(20), None],
+        )?,
+        build(
+            vec![4, 5, 6],
+            vec!["dave", "eve", "frank"],
+            vec![4.0, 5.0, 6.0],
+            vec!["st4", "st5", "st6"],
+            vec![Some("c4"), Some("c5"), Some("c6")],
+            vec![None, Some("t5"), Some("t6")],
+            vec![Some(40), None, Some(60)],
+        )?,
+    ])
+}
+
+/// Asserts that a field exists at the given dot-separated path in a [`StructType`] schema,
+/// traversing into nested structs as needed. Panics if any segment of the path is missing
+/// or if a non-terminal segment is not a struct type.
+///
+/// # Example
+///
+/// ```ignore
+/// // Given schema: { address: { street: string, city: string } }
+/// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
+/// ```
+pub fn assert_schema_has_field(
+    schema: &delta_kernel::schema::StructType,
+    path: &[String],
+) {
+    let path_str = path.join(".");
+    let mut current = schema;
+    for (i, name) in path.iter().enumerate() {
+        let field = current
+            .field(name)
+            .unwrap_or_else(|| panic!("schema missing field '{path_str}'"));
+        if i + 1 < path.len() {
+            current = match field.data_type() {
+                delta_kernel::schema::DataType::Struct(s) => s,
+                _ => panic!("expected struct at '{path_str}'"),
+            };
+        }
+    }
 }
 
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
