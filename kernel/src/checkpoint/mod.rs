@@ -155,13 +155,8 @@ static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(StructType::new_unchecked(base_checkpoint_action_fields())));
 
 /// Schema for the checkpointMetadata field in V2 checkpoints.
-/// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
-/// we're not supporting yet due to the lack of map support TODO(#880).
 fn checkpoint_metadata_field() -> StructField {
-    StructField::nullable(
-        CHECKPOINT_METADATA_NAME,
-        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
-    )
+    StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
 }
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
@@ -436,9 +431,17 @@ impl CheckpointWriter {
         let null_row = engine.evaluation_handler().null_row(schema.clone())?;
 
         // Build the checkpointMetadata struct value
+        let tags_type = DataType::Map(Box::new(crate::schema::MapType::new(
+            DataType::STRING,
+            DataType::STRING,
+            false,
+        )));
         let checkpoint_metadata_value = Scalar::Struct(StructData::try_new(
-            vec![StructField::not_null("version", DataType::LONG)],
-            vec![Scalar::from(self.version)],
+            vec![
+                StructField::not_null("version", DataType::LONG),
+                StructField::nullable("tags", tags_type.clone()),
+            ],
+            vec![Scalar::from(self.version), Scalar::Null(tags_type)],
         )?);
 
         // Use a Transform to set just the checkpointMetadata field, keeping others null

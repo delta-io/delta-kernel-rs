@@ -7,7 +7,7 @@ use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::Int32Array;
 use crate::arrow::datatypes::DataType;
 use crate::arrow::{
-    array::{create_array, RecordBatch},
+    array::{create_array, ArrayRef, RecordBatch, StructArray},
     datatypes::{Field, Schema},
 };
 use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
@@ -138,6 +138,16 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )
     .unwrap();
 
+    // Project only the checkpointMetadata column for comparison (the full batch has all V2 fields)
+    let checkpoint_metadata_idx = record_batch
+        .schema()
+        .index_of("checkpointMetadata")
+        .unwrap();
+    let projected = record_batch.project(&[checkpoint_metadata_idx]).unwrap();
+    assert_eq!(projected, expected);
+    assert_eq!(checkpoint_batch.actions_count, 1);
+    assert_eq!(checkpoint_batch.add_actions_count, 0);
+
     // Verify the schema has the expected fields
     let schema = record_batch.schema();
     assert!(
@@ -164,7 +174,8 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     use crate::parquet::file::reader::{FileReader, SerializedFileReader};
 
     // Create a new checkpoint metadata batch for writing (since the previous one was consumed)
-    let checkpoint_batch_for_write = writer.create_checkpoint_metadata_batch(&engine)?;
+    let checkpoint_batch_for_write =
+        writer.create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)?;
     let (underlying_data_for_write, _) = checkpoint_batch_for_write.filtered_data.into_parts();
     let arrow_data_for_write = ArrowEngineData::try_from_engine_data(underlying_data_for_write)?;
     let record_batch_for_write = arrow_data_for_write.record_batch();
