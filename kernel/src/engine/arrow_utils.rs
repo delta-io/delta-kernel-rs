@@ -15,8 +15,8 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, ArrayRef, GenericListArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::{
@@ -1297,6 +1297,17 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     unsafe { StructArray::new_unchecked(fields, columns, nulls) }
 }
 
+/// Cast an array to `StringArray`, handling `LargeStringArray` and `StringViewArray` transparently.
+/// Returns the original array (via `Arc::clone`) if it's already a `StringArray`, avoiding any
+/// conversion overhead on the common path.
+pub(crate) fn ensure_string_array(col: &ArrayRef) -> DeltaResult<ArrayRef> {
+    if col.data_type() == &ArrowDataType::Utf8 {
+        Ok(Arc::clone(col))
+    } else {
+        Ok(crate::arrow::compute::cast(col, &ArrowDataType::Utf8)?)
+    }
+}
+
 /// Arrow lacks the functionality to json-parse a string column into a struct column, so we
 /// implement it here. This method is for json-parsing each string in a column of strings (add.stats
 /// to be specific) to produce a nested column of strongly typed values. We require that N rows in
@@ -1307,13 +1318,11 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let json_strings = json_strings
-        .column(0)
+    let col = ensure_string_array(json_strings.column(0))?;
+    let json_strings = col
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            Error::generic("Expected json_strings to be a StringArray, found something else")
-        })?;
+        .ok_or_else(|| Error::generic("Expected json_strings to be castable to StringArray"))?;
     let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let result = parse_json_impl(json_strings, schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
@@ -1574,6 +1583,35 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
+    }
+
+    #[test]
+    fn test_parse_json_large_string_array() {
+        // See issue#1923: parse_json should handle LargeStringArray (64-bit offsets)
+        use crate::arrow::array::LargeStringArray;
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let large_strings = LargeStringArray::from(vec![
+            Some(r#"{"a": 1, "b": "hello"}"#),
+            None,
+            Some(r#"{"a": 3, "b": "world"}"#),
+        ]);
+        let field = Arc::new(ArrowField::new("s", ArrowDataType::LargeUtf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(large_strings) as ArrowArrayRef]).unwrap();
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ]));
+        let result = parse_json(engine_data, output_schema).unwrap();
+        let result = ArrowEngineData::try_from_engine_data(result).unwrap();
+        let batch: RecordBatch = result.into();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 1);
+        assert_eq!(batch.column(1).null_count(), 1);
     }
 
     #[test]
