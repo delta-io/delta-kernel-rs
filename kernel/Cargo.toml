@@ -63,20 +63,16 @@ reqwest = { version = "0.13", optional = true }
 # optionally used with default engine (though not required)
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
-object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-comfy-table = { version = "7.1", optional = true }
-
-# arrow 56
-[dependencies.arrow_56]
-package = "arrow"
-version = "56"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
+[dependencies.object_store_12]
+package = "object_store"
+version = "0.12.3"
 optional = true
-[dependencies.parquet_56]
-package = "parquet"
-version = "56"
-features = ["async", "object_store"]
+features = ["aws", "azure", "gcp", "http"]
+[dependencies.object_store_13]
+package = "object_store"
+version = "0.13.1"
 optional = true
+features = ["aws", "azure", "gcp", "http"]
 
 # arrow 57
 [dependencies.arrow_57]
@@ -87,6 +83,18 @@ optional = true
 [dependencies.parquet_57]
 package = "parquet"
 version = "57"
+features = ["async", "object_store"]
+optional = true
+
+# arrow 58
+[dependencies.arrow_58]
+package = "arrow"
+version = "58"
+features = ["chrono-tz", "ffi", "json", "prettyprint"]
+optional = true
+[dependencies.parquet_58]
+package = "parquet"
+version = "58"
 features = ["async", "object_store"]
 optional = true
 
@@ -101,11 +109,11 @@ test-utils = []
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-57"] # latest arrow version
+arrow = ["arrow-58"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store", "comfy-table"]
-arrow-57 = ["dep:arrow_57", "dep:parquet_57", "object_store", "comfy-table"]
+arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
+arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
@@ -145,7 +153,7 @@ delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "default-en
 test_utils = { path = "../test-utils" }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
-hdfs-native-object-store = { version = "0.15.0" }
+hdfs-native-object-store = { version = "0.16.0" }
 hdfs-native = "0.12.2"
 walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
