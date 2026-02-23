@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::measurement::WallTime;
+use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -28,15 +29,21 @@ fn workload_benchmarks(c: &mut Criterion) {
     let engine = setup_engine();
     let mut group = c.benchmark_group("workload_benchmarks");
 
-    for workload in workloads {
+    for workload in &workloads {
         match &workload.spec {
-            Spec::Read { .. } => {
+            Spec::Read(read_spec) => {
                 for operation in [ReadOperation::ReadMetadata] {
                     let configs = choose_config();
                     for config in configs {
-                        let runner =
-                            create_read_runner(workload.clone(), operation, config, engine.clone())
-                                .expect("Failed to create read runner");
+                        let runner = create_read_runner(
+                            &workload.table_info,
+                            &workload.case_name,
+                            read_spec,
+                            operation,
+                            config,
+                            engine.clone(),
+                        )
+                        .expect("Failed to create read runner");
                         run_benchmark(&mut group, runner.as_ref());
                     }
                 }
@@ -47,20 +54,15 @@ fn workload_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-fn run_benchmark(
-    group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
-    runner: &dyn WorkloadRunner,
-) {
-    let name = runner.name();
-
-    group.bench_function(&name, |b| {
+fn run_benchmark(group: &mut BenchmarkGroup<WallTime>, runner: &dyn WorkloadRunner) {
+    group.bench_function(runner.name(), |b| {
         b.iter(|| runner.execute().expect("Benchmark execution failed"))
     });
 }
 
 fn choose_config() -> Vec<ReadConfig> {
     //Choose which benchmark configurations to run for a given table
-    //This function will take in table info to return the appropriate configs
+    // TODO: This function will take in table info to choose the appropriate configs for a given table
     default_read_configs()
 }
 
