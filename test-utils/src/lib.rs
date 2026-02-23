@@ -718,6 +718,37 @@ pub fn create_add_files_metadata(
     Ok(Box::new(ArrowEngineData::new(batch)))
 }
 
+/// Writes a [`RecordBatch`] to a table, commits the transaction, and returns the post-commit
+/// snapshot.
+pub async fn write_batch_to_table(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    data: RecordBatch,
+    partition_values: std::collections::HashMap<String, String>,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            &write_context,
+            partition_values,
+        )
+        .await?;
+    txn.add_files(add_meta);
+    match txn.commit(engine)? {
+        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+            .post_commit_snapshot()
+            .expect("Failed to get post_commit_snapshot")
+            .clone()),
+        _ => panic!("Write commit should succeed"),
+    }
+}
+
 // Writer that captures log output into a shared buffer for test assertions
 pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
 
