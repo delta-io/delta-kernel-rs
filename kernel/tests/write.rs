@@ -3155,6 +3155,7 @@ fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
 /// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
 /// 4. Reads a parquet footer to verify physical names/IDs
 /// 5. Reads data back to verify correctness
+/// 6. Removes files and verifies remove.stats matches the original add.stats
 #[rstest::rstest]
 #[case::cm_none(ColumnMappingMode::None)]
 #[case::cm_id(ColumnMappingMode::Id)]
@@ -3345,6 +3346,95 @@ async fn test_column_mapping_write(
         assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
     }
 
+    // Step 6: Remove files and verify remove.stats matches original add.stats
+    {
+        let original_add_stats: Vec<serde_json::Value> = add_actions
+            .iter()
+            .filter_map(|a| a.stats.clone())
+            .collect();
+        assert!(
+            !original_add_stats.is_empty(),
+            "should have at least one add with stats"
+        );
+
+        let mut txn = latest_snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_engine_info("test engine")
+            .with_data_change(true);
+
+        let scan = latest_snapshot.scan_builder().build()?;
+        for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+            let scan_metadata = scan_metadata?;
+            let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+            let remove_metadata = FilteredEngineData::try_new(data, selection_vector)?;
+            txn.remove_files(remove_metadata);
+        }
+
+        let result = txn.commit(engine.as_ref())?;
+        match result {
+            CommitResult::CommittedTransaction(committed) => {
+                let commit_version = committed.commit_version();
+                let commit_path = std::path::Path::new(&table_path)
+                    .join(format!("_delta_log/{:020}.json", commit_version));
+                let commit_content = std::fs::read_to_string(commit_path)?;
+
+                let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
+                    .into_iter::<serde_json::Value>()
+                    .try_collect()?;
+
+                let remove_actions: Vec<_> = parsed_commits
+                    .iter()
+                    .filter_map(|action| action.get("remove"))
+                    .collect();
+
+                assert!(
+                    !remove_actions.is_empty(),
+                    "Expected at least one remove action"
+                );
+
+                for remove in &remove_actions {
+                    let stats_str = remove["stats"]
+                        .as_str()
+                        .expect("remove action should have stats");
+                    let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+
+                    assert!(
+                        stats.get("numRecords").is_some(),
+                        "remove.stats should have numRecords"
+                    );
+                    assert!(
+                        stats["minValues"].get(&row_number_physical[0]).is_some(),
+                        "remove.stats minValues should use physical name '{}' for row_number",
+                        row_number_physical[0]
+                    );
+                    assert!(
+                        stats["minValues"][&street_physical[0]]
+                            .get(&street_physical[1])
+                            .is_some(),
+                        "remove.stats minValues should use physical name '{}.{}' for address.street",
+                        street_physical[0],
+                        street_physical[1]
+                    );
+                }
+
+                let remove_stats: Vec<serde_json::Value> = remove_actions
+                    .iter()
+                    .filter_map(|r| {
+                        r["stats"]
+                            .as_str()
+                            .map(|s| serde_json::from_str(s).unwrap())
+                    })
+                    .collect();
+                assert_eq!(
+                    remove_stats, original_add_stats,
+                    "remove.stats should match original add.stats"
+                );
+            }
+            _ => panic!("Transaction should be committed"),
+        }
+    }
+
     Ok(())
 }
 
@@ -3394,6 +3484,8 @@ async fn test_column_mapping_partitioned_write(
         .await?
         .bytes()
         .await?;
+    let mut found_add = false;
+    let mut original_add_stats: Option<String> = None;
     for line in std::str::from_utf8(&log_bytes)?.lines() {
         let obj: serde_json::Value = serde_json::from_str(line)?;
         if let Some(add) = obj.get("add") {
@@ -3405,8 +3497,78 @@ async fn test_column_mapping_partitioned_write(
                 "partitionValues key should be '{physical_name}', got: {pv:?}"
             );
             assert_eq!(pv[&physical_name], "A");
-            return Ok(());
+            original_add_stats = add.get("stats").and_then(|s| s.as_str()).map(String::from);
+            found_add = true;
         }
     }
-    panic!("no add action found in commit log");
+    assert!(found_add, "no add action found in commit log");
+
+    // Remove the written file and verify remove action preserves physical names
+    let post_write_snapshot =
+        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    let mut txn = post_write_snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_data_change(true);
+
+    let scan = post_write_snapshot.scan_builder().build()?;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        let scan_metadata = scan_metadata?;
+        let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let remove_metadata = FilteredEngineData::try_new(data, selection_vector)?;
+        txn.remove_files(remove_metadata);
+    }
+
+    let result = txn.commit(engine.as_ref())?;
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            let commit_version = committed.commit_version();
+            let remove_log_path = table_url
+                .join(&format!("_delta_log/{:020}.json", commit_version))?;
+            let remove_log_bytes = store
+                .get(&Path::from_url_path(remove_log_path.path())?)
+                .await?
+                .bytes()
+                .await?;
+
+            let mut found_remove = false;
+            for line in std::str::from_utf8(&remove_log_bytes)?.lines() {
+                let obj: serde_json::Value = serde_json::from_str(line)?;
+                if let Some(remove) = obj.get("remove") {
+                    found_remove = true;
+
+                    // Verify remove.partitionValues uses physical name
+                    let pv = remove["partitionValues"]
+                        .as_object()
+                        .expect("remove should have partitionValues");
+                    assert!(
+                        pv.contains_key(&physical_name),
+                        "remove partitionValues key should be '{physical_name}', got: {pv:?}"
+                    );
+                    assert_eq!(pv[&physical_name], "A");
+
+                    // Verify remove.stats matches original add.stats
+                    if let Some(ref expected_stats) = original_add_stats {
+                        let remove_stats = remove["stats"]
+                            .as_str()
+                            .expect("remove should have stats");
+                        let expected: serde_json::Value =
+                            serde_json::from_str(expected_stats)?;
+                        let actual: serde_json::Value =
+                            serde_json::from_str(remove_stats)?;
+                        assert_eq!(
+                            actual, expected,
+                            "remove.stats should match original add.stats"
+                        );
+                    }
+                }
+            }
+            assert!(found_remove, "no remove action found in commit log");
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
 }
