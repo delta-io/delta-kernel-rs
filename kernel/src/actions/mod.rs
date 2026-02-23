@@ -8,8 +8,7 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;

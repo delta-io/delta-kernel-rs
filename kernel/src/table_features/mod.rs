@@ -65,9 +65,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(
-    serialize_all = "camelCase"
-)]
+#[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 #[derive(EnumIter)]
