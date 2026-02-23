@@ -74,6 +74,7 @@
 extern crate self as delta_kernel;
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fs::DirEntry;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -663,6 +664,30 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
+/// Specifies how the parquet reader should apply row group filtering.
+#[derive(Clone, Debug, Default)]
+pub enum FilePredicate {
+    /// No row group filtering.
+    #[default]
+    None,
+    /// Standard row group skipping — predicate columns map directly to parquet columns.
+    Data(PredicateRef),
+    /// Checkpoint row group skipping — predicate references data columns (e.g., `id`)
+    /// and the reader remaps them to `add.stats_parsed.{minValues,maxValues,nullCount}.id`
+    /// in the parquet footer for row group filtering.
+    ///
+    /// Partition column predicates are also supported: they are remapped to
+    /// `add.partitionValues_parsed.<col>` where both min and max stats come from the
+    /// same column (the actual partition value stored in the checkpoint).
+    Checkpoint {
+        predicate: PredicateRef,
+        /// Maps physical partition column names (as used in the predicate) to logical
+        /// column names (as stored in `partitionValues_parsed`). Empty if no partition
+        /// columns are referenced.
+        partition_columns: HashMap<expressions::ColumnName, expressions::ColumnName>,
+    },
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -770,7 +795,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Specifies how row group filtering should be applied.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
@@ -798,7 +823,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
+        predicate: FilePredicate,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
     /// Write data to a Parquet file at the specified URL.

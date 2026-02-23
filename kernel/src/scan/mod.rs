@@ -31,7 +31,9 @@ use crate::schema::{
     StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, FileMeta, FilePredicate, SnapshotRef, Version,
+};
 
 use self::log_replay::scan_action_iter;
 
@@ -696,12 +698,13 @@ impl Scan {
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate) = if self.skip_stats {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), FilePredicate::None)
         } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
+            let pred = match self.build_actions_meta_predicate() {
+                Some(pred) => FilePredicate::Data(pred),
+                None => FilePredicate::None,
+            };
+            (CHECKPOINT_READ_SCHEMA.clone(), pred)
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
@@ -754,12 +757,13 @@ impl Scan {
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
         let (checkpoint_schema, meta_predicate) = if self.skip_stats {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), FilePredicate::None)
         } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
+            let pred = match self.build_actions_meta_predicate() {
+                Some(pred) => FilePredicate::Data(pred),
+                None => FilePredicate::None,
+            };
+            (CHECKPOINT_READ_SCHEMA.clone(), pred)
         };
         self.snapshot
             .log_segment()
@@ -948,7 +952,7 @@ impl Scan {
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     physical_schema.clone(),
-                    None,
+                    FilePredicate::None,
                 )?;
 
                 let engine = engine.clone(); // Arc clone

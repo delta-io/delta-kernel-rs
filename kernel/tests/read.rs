@@ -17,7 +17,7 @@ use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{Engine, FileMeta, Snapshot};
+use delta_kernel::{Engine, FileMeta, FilePredicate, Snapshot};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -370,7 +370,10 @@ fn read_with_scan_metadata(
             .read_parquet_files(
                 &[meta],
                 scan.physical_schema().clone(),
-                scan.physical_predicate().clone(),
+                match scan.physical_predicate() {
+                    Some(pred) => FilePredicate::Data(pred),
+                    None => FilePredicate::None,
+                },
             )
             .unwrap();
 

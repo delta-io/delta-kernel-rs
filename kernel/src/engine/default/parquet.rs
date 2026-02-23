@@ -36,8 +36,8 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilePredicate,
+    ParquetFooter, ParquetHandler,
 };
 
 #[derive(Debug)]
@@ -230,7 +230,7 @@ async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
+    predicate: FilePredicate,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -291,7 +291,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
+        predicate: FilePredicate,
     ) -> DeltaResult<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
@@ -389,7 +389,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 async fn open_parquet_file(
     store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
+    predicate: FilePredicate,
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
@@ -438,9 +438,15 @@ async fn open_parquet_file(
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-    // Filter row groups and row indexes if a predicate is provided
-    if let Some(ref predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+    // Filter row groups based on predicate variant
+    match predicate {
+        FilePredicate::None => {}
+        FilePredicate::Data(ref pred) => {
+            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+        }
+        FilePredicate::Checkpoint { .. } => {
+            // Checkpoint-aware row group skipping is handled separately (PR 2).
+        }
     }
     if let Some(limit) = limit {
         builder = builder.with_limit(limit)
@@ -466,18 +472,14 @@ async fn open_parquet_file(
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
-    predicate: Option<PredicateRef>,
+    predicate: FilePredicate,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
 }
 
 impl PresignedUrlOpener {
-    pub(crate) fn new(
-        batch_size: usize,
-        schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> Self {
+    pub(crate) fn new(batch_size: usize, schema: SchemaRef, predicate: FilePredicate) -> Self {
         Self {
             batch_size,
             table_schema: schema,
@@ -521,9 +523,15 @@ impl FileOpener for PresignedUrlOpener {
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
                 .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+            // Filter row groups based on predicate variant
+            match predicate {
+                FilePredicate::None => {}
+                FilePredicate::Data(ref pred) => {
+                    builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+                }
+                FilePredicate::Checkpoint { .. } => {
+                    // Checkpoint-aware row group skipping is handled separately (PR 2).
+                }
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
@@ -614,7 +622,7 @@ mod tests {
             .read_parquet_files(
                 files,
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap()
             .map(into_record_batch)
@@ -776,7 +784,7 @@ mod tests {
             .read_parquet_files(
                 slice::from_ref(parquet_file),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap()
             .map(into_record_batch)
@@ -861,7 +869,7 @@ mod tests {
             .read_parquet_files(
                 slice::from_ref(&file_meta),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap()
             .map(into_record_batch)
@@ -1050,7 +1058,7 @@ mod tests {
             .read_parquet_files(
                 slice::from_ref(&file_meta),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap()
             .map(into_record_batch)
@@ -1255,7 +1263,7 @@ mod tests {
             .read_parquet_files(
                 slice::from_ref(&file_meta),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap()
             .map(into_record_batch)
@@ -1335,7 +1343,7 @@ mod tests {
             .read_parquet_files(
                 slice::from_ref(&file_meta),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap()
             .map(into_record_batch)
@@ -1541,7 +1549,7 @@ mod tests {
 
         // Should successfully match by field ID despite different names
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(slice::from_ref(&file_meta), kernel_schema, None)
+            .read_parquet_files(slice::from_ref(&file_meta), kernel_schema, FilePredicate::None)
             .unwrap()
             .map(into_record_batch)
             .try_collect()

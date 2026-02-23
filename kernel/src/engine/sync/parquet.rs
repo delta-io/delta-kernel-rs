@@ -14,8 +14,8 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
-    PredicateRef,
+    DeltaResult, Error, FileDataReadResultIterator, FileMeta, FilePredicate, ParquetFooter,
+    ParquetHandler,
 };
 
 use url::Url;
@@ -25,7 +25,7 @@ pub(crate) struct SyncParquetHandler;
 fn try_create_from_parquet(
     file: File,
     schema: SchemaRef,
-    predicate: Option<PredicateRef>,
+    predicate: FilePredicate,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
@@ -41,9 +41,15 @@ fn try_create_from_parquet(
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-    // Filter row groups and row indexes if a predicate is provided
-    if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
+    // Filter row groups based on predicate variant
+    match predicate {
+        FilePredicate::None => {}
+        FilePredicate::Data(ref pred) => {
+            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+        }
+        FilePredicate::Checkpoint { .. } => {
+            // Checkpoint-aware row group skipping is handled separately (PR 2).
+        }
     }
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
@@ -64,7 +70,7 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         files: &[FileMeta],
         schema: SchemaRef,
-        predicate: Option<PredicateRef>,
+        predicate: FilePredicate,
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
@@ -197,7 +203,7 @@ mod tests {
             .read_parquet_files(
                 &[file_meta],
                 Arc::new(schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap();
 
@@ -318,7 +324,7 @@ mod tests {
             .read_parquet_files(
                 &[file_meta],
                 Arc::new(schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap();
 
@@ -406,7 +412,7 @@ mod tests {
             .read_parquet_files(
                 &[file_meta],
                 Arc::new(schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap();
 
@@ -481,7 +487,7 @@ mod tests {
             .read_parquet_files(
                 &[file_meta],
                 Arc::new(schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap();
 
@@ -560,7 +566,7 @@ mod tests {
             .read_parquet_files(
                 &[file_meta],
                 Arc::new(schema.try_into_kernel().unwrap()),
-                None,
+                FilePredicate::None,
             )
             .unwrap();
 
