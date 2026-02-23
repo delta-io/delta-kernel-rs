@@ -662,10 +662,47 @@ pub fn create_add_files_metadata(
         false,
     ));
 
-    let stats_struct = StructArray::from(vec![(
-        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-        Arc::new(num_records_array) as ArrayRef,
-    )]);
+    // Build stats struct with all fields: numRecords, nullCount, minValues, maxValues, tightBounds
+    // nullCount, minValues, maxValues are empty structs (structure depends on data schema)
+    let empty_struct_fields: delta_kernel::arrow::datatypes::Fields =
+        Vec::<Arc<Field>>::new().into();
+    let empty_struct = StructArray::new_empty_fields(num_files, None);
+    let tight_bounds_array = BooleanArray::from(vec![true; num_files]);
+
+    let stats_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(num_records_array) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "nullCount",
+                ArrowDataType::Struct(empty_struct_fields.clone()),
+                true,
+            )),
+            Arc::new(empty_struct.clone()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "minValues",
+                ArrowDataType::Struct(empty_struct_fields.clone()),
+                true,
+            )),
+            Arc::new(empty_struct.clone()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "maxValues",
+                ArrowDataType::Struct(empty_struct_fields),
+                true,
+            )),
+            Arc::new(empty_struct) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(tight_bounds_array) as ArrayRef,
+        ),
+    ]);
 
     let batch = RecordBatch::try_new(
         Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
