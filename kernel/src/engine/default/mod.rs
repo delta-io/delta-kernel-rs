@@ -227,7 +227,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Translate logical partition column names to physical names
+        // Validate partition columns exist in the schema and translate logical names to physical names.
         let physical_partition_values: HashMap<String, String> = partition_values
             .into_iter()
             .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
