@@ -4,7 +4,7 @@
 //! Results are discarded for benchmarking purposes
 //! Currently only supports reading metadata
 
-use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, Spec, Workload};
+use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, ReadSpec, TableInfo};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::AfterSequential;
 use crate::snapshot::Snapshot;
@@ -16,42 +16,47 @@ use std::thread;
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
-    fn name(&self) -> String;
+    fn name(&self) -> &str;
 }
 
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
-    workload: Workload, //Complete workload specification
+    name: String,
     config: ReadConfig,
 }
 
 impl ReadMetadataRunner {
     /// Sets up a benchmark runner for reading metadata.
     pub fn setup(
-        workload: Workload,
+        table_info: &TableInfo,
+        case_name: &str,
+        read_spec: &ReadSpec,
         config: ReadConfig,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = workload.table_info.resolved_table_root();
-
+        let table_root = table_info.resolved_table_root();
         let url = crate::try_parse_uri(table_root)?;
 
-        let version = match &workload.spec {
-            Spec::Read(read_spec) => &read_spec.version,
-        };
-
         let mut builder = Snapshot::builder_for(url);
-        if let Some(version) = version {
-            builder = builder.at_version(*version);
+        if let Some(version) = read_spec.version {
+            builder = builder.at_version(version);
         }
 
         let snapshot = builder.build(engine.as_ref())?;
 
+        let name = format!(
+            "{}/{}/{}/{}",
+            table_info.name,
+            case_name,
+            ReadOperation::ReadMetadata.as_str(),
+            config.name,
+        );
+
         Ok(Self {
             snapshot,
             engine,
-            workload,
+            name,
             config,
         })
     }
@@ -132,25 +137,22 @@ impl WorkloadRunner for ReadMetadataRunner {
         Ok(())
     }
 
-    fn name(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.workload.name(),
-            ReadOperation::ReadMetadata.as_str(),
-            self.config.name,
-        )
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
 pub fn create_read_runner(
-    workload: Workload,
+    table_info: &TableInfo,
+    case_name: &str,
+    read_spec: &ReadSpec,
     operation: ReadOperation,
     config: ReadConfig,
     engine: Arc<dyn Engine>,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match operation {
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
-            workload, config, engine,
+            table_info, case_name, read_spec, config, engine,
         )?)),
         ReadOperation::ReadData => {
             todo!("ReadDataRunner not yet implemented")

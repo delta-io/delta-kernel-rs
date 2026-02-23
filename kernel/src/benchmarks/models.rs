@@ -93,12 +93,6 @@ pub struct Workload {
     pub spec: Spec,
 }
 
-impl Workload {
-    pub fn name(&self) -> String {
-        format!("{}/{}", self.table_info.name, self.case_name)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
