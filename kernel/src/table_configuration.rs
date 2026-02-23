@@ -889,28 +889,35 @@ mod test {
                 ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
-            // NOTE: The following cases should be updated if column mapping for writes is
-            // supported before cdc is.
+            // NOTE: When `column-mapping-write` is enabled, column mapping is supported for
+            // writes, so these cases should succeed instead of failing.
             (
-                // Should fail since change data feed and column mapping features cannot both be
-                // present.
+                // CDF + column mapping features both present
                 create_mock_table_config(
                     &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                if cfg!(feature = "column-mapping-write") {
+                    Ok(())
+                } else {
+                    Err(Error::unsupported(
+                        "Feature 'columnMapping' is not supported for writes",
+                    ))
+                },
             ),
             (
-                // The table does not require writing CDC files, so it is safe to write to it.
+                // CDF supported but not enabled, column mapping present
                 create_mock_table_config(
                     &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                if cfg!(feature = "column-mapping-write") {
+                    Ok(())
+                } else {
+                    Err(Error::unsupported(
+                        "Feature 'columnMapping' is not supported for writes",
+                    ))
+                },
             ),
             (
                 // Should succeed since change data feed is not enabled
