@@ -113,7 +113,9 @@ impl SchemaVisitor for DuplicateFieldIdChecker {
             if let Some(prev) = self.seen.insert(id_str.clone(), field.name().to_string()) {
                 return Err(Error::schema(format!(
                     "Duplicate field ID {} assigned to both '{}' and '{}'",
-                    id_str, prev, field.name()
+                    id_str,
+                    prev,
+                    field.name()
                 )));
             }
         }
@@ -737,10 +739,36 @@ mod tests {
         ])
     }
 
+    fn schema_array_duplicates() -> StructType {
+        let element = StructType::new_unchecked([make_field_with_id("x", 1)]);
+        StructType::new_unchecked([
+            make_field_with_id("a", 1),
+            StructField::new(
+                "b",
+                ArrayType::new(DataType::Struct(Box::new(element)), false),
+                false,
+            ),
+        ])
+    }
+
+    fn schema_map_duplicates() -> StructType {
+        let value = StructType::new_unchecked([make_field_with_id("x", 1)]);
+        StructType::new_unchecked([
+            make_field_with_id("a", 1),
+            StructField::new(
+                "b",
+                MapType::new(DataType::STRING, DataType::Struct(Box::new(value)), false),
+                false,
+            ),
+        ])
+    }
+
     #[rstest::rstest]
     #[case::same_level(schema_same_level_duplicates())]
     #[case::nested_struct(schema_nested_duplicates())]
     #[case::across_nesting_levels(schema_cross_level_duplicates())]
+    #[case::across_array(schema_array_duplicates())]
+    #[case::across_map(schema_map_duplicates())]
     fn test_duplicate_field_ids_rejected(#[case] schema: StructType) {
         crate::utils::test_utils::assert_result_error_with_message(
             ArrowSchema::try_from_kernel(&schema),
