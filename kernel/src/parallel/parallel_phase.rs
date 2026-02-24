@@ -559,6 +559,7 @@ mod tests {
         let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
         let _data_skipping_time = extract_metric(logs, "data_skipping_time_ms");
         let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
+        let _phase1_duration = extract_metric(logs, "phase1_duration_ms");
 
         // Verify Parallel metrics if expected
         if let Some(expected) = parallel_expected {
