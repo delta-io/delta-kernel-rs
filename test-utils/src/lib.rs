@@ -695,20 +695,32 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 /// // Given schema: { address: { street: string, city: string } }
 /// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
 /// ```
-pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
-    let path_str = path.join(".");
+/// Resolves a nested field in a schema by path. Returns an error if any segment is missing
+/// or a non-terminal segment is not a struct type.
+pub fn resolve_field<'a>(
+    schema: &'a delta_kernel::schema::StructType,
+    path: &[impl AsRef<str>],
+) -> Result<&'a delta_kernel::schema::StructField, String> {
+    let path_str: Vec<&str> = path.iter().map(|s| s.as_ref()).collect();
+    let display = path_str.join(".");
+    let (last, rest) = path.split_last().ok_or_else(|| "empty path".to_string())?;
     let mut current = schema;
-    for (i, name) in path.iter().enumerate() {
+    for name in rest {
         let field = current
-            .field(name)
-            .unwrap_or_else(|| panic!("schema missing field '{path_str}'"));
-        if i + 1 < path.len() {
-            current = match field.data_type() {
-                delta_kernel::schema::DataType::Struct(s) => s,
-                _ => panic!("expected struct at '{path_str}'"),
-            };
-        }
+            .field(name.as_ref())
+            .ok_or_else(|| format!("schema missing field '{display}'"))?;
+        current = match field.data_type() {
+            delta_kernel::schema::DataType::Struct(s) => s,
+            _ => return Err(format!("expected struct at '{display}'")),
+        };
     }
+    current
+        .field(last.as_ref())
+        .ok_or_else(|| format!("schema missing field '{display}'"))
+}
+
+pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
+    resolve_field(schema, path).unwrap();
 }
 
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
