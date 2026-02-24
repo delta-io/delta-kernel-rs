@@ -48,8 +48,8 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 ///
 /// Each variant corresponds to one such feature. A feature is either:
 /// - **ReaderWriter** (must be supported by both readers and writers), or
-/// - **Writer only** (applies only to writers).
-/// There are no Reader only features. See `TableFeature::feature_type` for the category of each.
+/// - **WriterOnly** (applies only to writers).
+/// There are no ReaderOnly features. See `TableFeature::feature_type` for the category of each.
 ///
 /// The kernel currently supports all reader features except `V2Checkpoint`.
 #[derive(
@@ -172,7 +172,7 @@ pub(crate) static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeatureType {
     /// Feature only affects write operations
-    Writer,
+    WriterOnly,
     /// Feature affects both read and write operations (must appear in both feature lists)
     ReaderWriter,
     /// Unknown feature type (for forward compatibility)
@@ -241,17 +241,17 @@ pub(crate) struct FeatureInfo {
     pub min_reader_version: i32,
     /// Minimum writer protocol version required for this feature
     pub min_writer_version: i32,
-    /// The type of feature (Writer, ReaderWriter, or Unknown)
+    /// The type of feature (WriterOnly, ReaderWriter, or Unknown)
     pub feature_type: FeatureType,
     /// Requirements this feature has (features + custom validations)
     pub feature_requirements: &'static [FeatureRequirement],
     /// Rust kernel's support for this feature (may vary by Operation type)
     ///
     /// Note: `kernel_support` validation depends on `feature_type`:
-    /// Writer features: Only checked during `Operation::Write`
+    /// WriterOnly features: Only checked during `Operation::Write`
     /// ReaderWriter features: Checked during all operations (Scan/Write/CDF)
     /// Read operations (Scan/CDF) only validate reader features, so `kernel_support` for
-    /// Writer-only features is never invoked for Scan/CDF regardless of the custom check logic.
+    /// WriterOnly features are never invoked for Scan/CDF regardless of the custom check logic.
     pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
@@ -263,7 +263,7 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     name: "appendOnly",
     min_reader_version: 1,
     min_writer_version: 2,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
@@ -277,7 +277,7 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     name: "invariants",
     min_reader_version: 1,
     min_writer_version: 2,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -288,7 +288,7 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     name: "checkConstraints",
     min_reader_version: 1,
     min_writer_version: 3,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -299,7 +299,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     name: "changeDataFeed",
     min_reader_version: 1,
     min_writer_version: 4,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -312,7 +312,7 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "generatedColumns",
     min_reader_version: 1,
     min_writer_version: 4,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -323,7 +323,7 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "identityColumns",
     min_reader_version: 1,
     min_writer_version: 6,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -334,7 +334,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     name: "inCommitTimestamp",
     min_reader_version: 1,
     min_writer_version: 7,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
         Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
@@ -349,7 +349,7 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     name: "rowTracking",
     min_reader_version: 1,
     min_writer_version: 7,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -362,7 +362,7 @@ static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
     name: "domainMetadata",
     min_reader_version: 1,
     min_writer_version: 7,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -378,7 +378,7 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     name: "icebergCompatV1",
     min_reader_version: 2,
     min_writer_version: 7,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
@@ -412,7 +412,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     name: "icebergCompatV2",
     min_reader_version: 2,
     min_writer_version: 7,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
@@ -440,7 +440,7 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
     min_writer_version: 7,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
     #[cfg(feature = "clustered-table")]
     kernel_support: KernelSupport::Supported,
@@ -454,7 +454,7 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "materializePartitionColumns",
     min_reader_version: TABLE_FEATURES_MIN_READER_VERSION,
     min_writer_version: TABLE_FEATURES_MIN_WRITER_VERSION,
-    feature_type: FeatureType::Writer,
+    feature_type: FeatureType::WriterOnly,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -662,7 +662,7 @@ impl TableFeature {
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
             | TableFeature::ClusteredTable
-            | TableFeature::MaterializePartitionColumns => FeatureType::Writer,
+            | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
