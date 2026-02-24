@@ -31,7 +31,7 @@ pub enum ParallelScan {
 pub struct TableInfo {
     pub name: String,                // Table name used for identifying the table
     pub description: Option<String>, // Human-readable description of the table
-    pub table_path: Option<String>,  // Path or URL to the table
+    pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
