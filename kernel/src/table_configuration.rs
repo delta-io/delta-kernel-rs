@@ -1273,19 +1273,59 @@ mod test {
         assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
     }
 
+    #[derive(Debug)]
+    struct WriterFeatureSupportCase {
+        description: &'static str,
+        min_reader_version: i32,
+        min_writer_version: i32,
+        features_opt: Option<Vec<TableFeature>>,
+        expected: bool,
+    }
+
     #[rstest]
-    #[case(1, 2, None, true)]
-    #[case(1, 1, None, false)]
-    #[case(2, 7, Some(vec![TableFeature::AppendOnly]), true)]
-    #[case(2, 7, Some(vec![TableFeature::ChangeDataFeed]), false)]
-    #[case(3, 7, Some(vec![TableFeature::AppendOnly]), true)]
-    #[case(3, 7, Some(vec![TableFeature::DeletionVectors]), false)]
-    fn test_is_feature_info_supported_writer(
-        #[case] min_reader_version: i32,
-        #[case] min_writer_version: i32,
-        #[case] features_opt: Option<Vec<TableFeature>>,
-        #[case] expected: bool,
-    ) {
+    #[case(WriterFeatureSupportCase {
+        description: "legacy protocol supports writer-only feature when version requirement is met",
+        min_reader_version: 1,
+        min_writer_version: 2,
+        features_opt: None,
+        expected: true,
+    })]
+    #[case(WriterFeatureSupportCase {
+        description: "legacy protocol does not support writer-only feature below min writer version",
+        min_reader_version: 1,
+        min_writer_version: 1,
+        features_opt: None,
+        expected: false,
+    })]
+    #[case(WriterFeatureSupportCase {
+        description: "reader=2/writer=7 supports appendOnly when present in writer feature list",
+        min_reader_version: 2,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::AppendOnly]),
+        expected: true,
+    })]
+    #[case(WriterFeatureSupportCase {
+        description: "reader=2/writer=7 does not support appendOnly when only changeDataFeed is set",
+        min_reader_version: 2,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::ChangeDataFeed]),
+        expected: false,
+    })]
+    #[case(WriterFeatureSupportCase {
+        description: "non-legacy protocol supports appendOnly when present in feature list",
+        min_reader_version: 3,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::AppendOnly]),
+        expected: true,
+    })]
+    #[case(WriterFeatureSupportCase {
+        description: "non-legacy protocol does not support appendOnly when absent from feature list",
+        min_reader_version: 3,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::DeletionVectors]),
+        expected: false,
+    })]
+    fn test_is_feature_info_supported_writer(#[case] case: WriterFeatureSupportCase) {
         let feature = TableFeature::AppendOnly;
         let writer_only_info = FeatureInfo {
             name: "appendOnly",
@@ -1299,30 +1339,72 @@ mod test {
 
         let config = create_mock_table_config_with_version(
             &[],
-            features_opt.as_deref(),
-            min_reader_version,
-            min_writer_version,
+            case.features_opt.as_deref(),
+            case.min_reader_version,
+            case.min_writer_version,
         );
 
         assert_eq!(
             config.is_feature_info_supported(&feature, &writer_only_info),
-            expected
+            case.expected,
+            "case={}",
+            case.description,
         );
     }
 
+    #[derive(Debug)]
+    struct ReaderWriterFeatureSupportCase {
+        description: &'static str,
+        min_reader_version: i32,
+        min_writer_version: i32,
+        features_opt: Option<Vec<TableFeature>>,
+        expected: bool,
+    }
+
     #[rstest]
-    #[case(2, 5, None, true)]
-    #[case(1, 5, None, false)]
-    #[case(2, 4, None, false)]
-    #[case(2, 7, Some(vec![TableFeature::AppendOnly]), false)]
-    #[case(3, 7, Some(vec![TableFeature::ColumnMapping]), true)]
-    #[case(3, 7, Some(vec![TableFeature::DeletionVectors]), false)]
-    fn test_is_feature_info_supported_reader_writer(
-        #[case] min_reader_version: i32,
-        #[case] min_writer_version: i32,
-        #[case] features_opt: Option<Vec<TableFeature>>,
-        #[case] expected: bool,
-    ) {
+    #[case(ReaderWriterFeatureSupportCase {
+        description: "legacy columnMapping is supported when reader/writer minimums are met",
+        min_reader_version: 2,
+        min_writer_version: 5,
+        features_opt: None,
+        expected: true,
+    })]
+    #[case(ReaderWriterFeatureSupportCase {
+        description: "legacy columnMapping is not supported below required reader version",
+        min_reader_version: 1,
+        min_writer_version: 5,
+        features_opt: None,
+        expected: false,
+    })]
+    #[case(ReaderWriterFeatureSupportCase {
+        description: "legacy columnMapping is not supported below required writer version",
+        min_reader_version: 2,
+        min_writer_version: 4,
+        features_opt: None,
+        expected: false,
+    })]
+    #[case(ReaderWriterFeatureSupportCase {
+        description: "reader=2/writer=7 with writer-only list does not support reader-writer features",
+        min_reader_version: 2,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::AppendOnly]),
+        expected: false,
+    })]
+    #[case(ReaderWriterFeatureSupportCase {
+        description: "non-legacy protocol supports columnMapping when present in feature list",
+        min_reader_version: 3,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::ColumnMapping]),
+        expected: true,
+    })]
+    #[case(ReaderWriterFeatureSupportCase {
+        description: "non-legacy protocol does not support columnMapping when absent from feature list",
+        min_reader_version: 3,
+        min_writer_version: 7,
+        features_opt: Some(vec![TableFeature::DeletionVectors]),
+        expected: false,
+    })]
+    fn test_is_feature_info_supported_reader_writer(#[case] case: ReaderWriterFeatureSupportCase) {
         let feature = TableFeature::ColumnMapping;
         let custom_feature_info = FeatureInfo {
             name: "columnMapping",
@@ -1336,14 +1418,16 @@ mod test {
 
         let config = create_mock_table_config_with_version(
             &[],
-            features_opt.as_deref(),
-            min_reader_version,
-            min_writer_version,
+            case.features_opt.as_deref(),
+            case.min_reader_version,
+            case.min_writer_version,
         );
 
         assert_eq!(
             config.is_feature_info_supported(&feature, &custom_feature_info),
-            expected
+            case.expected,
+            "case={}",
+            case.description,
         );
     }
 
