@@ -1,5 +1,6 @@
 //! Conversions from kernel schema types to arrow schema types.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -12,10 +13,9 @@ use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use itertools::Itertools;
 
 use crate::error::Error;
-use crate::schema::visitor::{visit_struct, visit_type, SchemaVisitor};
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, SchemaTransform,
+    StructField, StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -96,60 +96,47 @@ where
 /// Validates that all field IDs across an entire kernel struct schema (including nested structs,
 /// arrays, and maps) are unique. Field IDs must be unique across the whole schema, not just within
 /// a single struct level, since parquet readers use them for global column matching.
+///
+/// TODO: switch to SchemaVisitor once https://github.com/delta-io/delta-kernel-rs/pull/1268 merges.
 #[derive(Default)]
 struct DuplicateFieldIdChecker {
     seen: HashMap<String, String>,
+    error: Option<ArrowError>,
 }
 
-impl SchemaVisitor for DuplicateFieldIdChecker {
-    type T = ();
-
-    fn field(&mut self, field: &StructField, _: ()) -> crate::DeltaResult<()> {
-        if let Some(id) = field
-            .metadata()
-            .get(ColumnMetadataKey::ParquetFieldId.as_ref())
-        {
-            let id_str = id.to_string();
-            if let Some(prev) = self.seen.insert(id_str.clone(), field.name().to_string()) {
-                return Err(Error::schema(format!(
-                    "Duplicate field ID {} assigned to both '{}' and '{}'",
-                    id_str,
-                    prev,
-                    field.name()
-                )));
+impl<'a> SchemaTransform<'a> for DuplicateFieldIdChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if self.error.is_none() {
+            if let Some(id) = field
+                .metadata()
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref())
+            {
+                let id_str = id.to_string();
+                if let Some(prev) = self.seen.insert(id_str.clone(), field.name().to_string()) {
+                    self.error = Some(ArrowError::SchemaError(format!(
+                        "Duplicate field ID {} assigned to both '{}' and '{}'",
+                        id_str,
+                        prev,
+                        field.name()
+                    )));
+                }
+            }
+            if self.error.is_none() {
+                let _ = self.recurse_into_struct_field(field);
             }
         }
-        Ok(())
-    }
-
-    // All duplicate checking is done in `field` (post-order), so by the time `struct` is
-    // called all fields have already been validated and there is nothing left to do.
-    fn r#struct(&mut self, _: &StructType, _: Vec<()>) -> crate::DeltaResult<()> {
-        Ok(())
-    }
-
-    fn array(&mut self, array: &ArrayType) -> crate::DeltaResult<()> {
-        visit_type(array.element_type(), self)
-    }
-
-    fn map(&mut self, map: &MapType) -> crate::DeltaResult<()> {
-        visit_type(map.key_type(), self)?;
-        visit_type(map.value_type(), self)
-    }
-
-    fn primitive(&mut self, _: &PrimitiveType) -> crate::DeltaResult<()> {
-        Ok(())
-    }
-
-    fn variant(&mut self, _: &StructType) -> crate::DeltaResult<()> {
-        Ok(())
+        Some(Cow::Borrowed(field))
     }
 }
 
 impl DuplicateFieldIdChecker {
     fn check(s: &StructType) -> Result<(), ArrowError> {
-        visit_struct(s, &mut DuplicateFieldIdChecker::default())
-            .map_err(|e| ArrowError::SchemaError(e.to_string()))
+        let mut checker = DuplicateFieldIdChecker::default();
+        let _ = checker.transform_struct(s);
+        match checker.error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
