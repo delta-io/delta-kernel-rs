@@ -29,7 +29,10 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+mod domain_metadata_replay;
 mod protocol_metadata_replay;
+
+pub(crate) use domain_metadata_replay::DomainMetadataMap;
 
 #[cfg(test)]
 mod crc_tests;
