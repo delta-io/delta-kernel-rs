@@ -513,6 +513,13 @@ impl Snapshot {
         &self.log_segment
     }
 
+    /// Lazy CRC loader for this snapshot. Used for CRC-accelerated domain metadata
+    /// scanning and other CRC-based optimizations.
+    #[internal_api]
+    pub(crate) fn lazy_crc(&self) -> &LazyCrc {
+        &self.lazy_crc
+    }
+
     pub fn table_root(&self) -> &Url {
         self.table_configuration.table_root()
     }
@@ -593,7 +600,7 @@ impl Snapshot {
             ));
         }
 
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        domain_metadata_configuration(self.log_segment(), &self.lazy_crc, domain, engine)
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
@@ -613,7 +620,7 @@ impl Snapshot {
             .protocol()
             .has_table_feature(&TableFeature::ClusteredTable)
         {
-            get_clustering_columns(&self.log_segment, engine)
+            get_clustering_columns(&self.log_segment, &self.lazy_crc, engine)
         } else {
             Ok(None)
         }
@@ -698,7 +705,7 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        domain_metadata_configuration(self.log_segment(), &self.lazy_crc, domain, engine)
     }
 
     #[allow(unused)]
@@ -707,7 +714,8 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
+        let all_metadata =
+            all_domain_metadata_configuration(self.log_segment(), &self.lazy_crc, engine)?;
         Ok(all_metadata
             .into_iter()
             .filter(|domain| !domain.is_internal())

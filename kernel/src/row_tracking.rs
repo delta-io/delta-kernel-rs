@@ -46,16 +46,15 @@ impl RowTrackingDomainMetadata {
         snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        Ok(
-            domain_metadata_configuration(
-                snapshot.log_segment(),
-                ROW_TRACKING_DOMAIN_NAME,
-                engine,
-            )?
-            .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
-            .transpose()?
-            .map(|metadata| metadata.row_id_high_water_mark),
-        )
+        Ok(domain_metadata_configuration(
+            snapshot.log_segment(),
+            snapshot.lazy_crc(),
+            ROW_TRACKING_DOMAIN_NAME,
+            engine,
+        )?
+        .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
+        .transpose()?
+        .map(|metadata| metadata.row_id_high_water_mark))
     }
 }
 
