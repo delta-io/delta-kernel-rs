@@ -55,7 +55,10 @@ impl Phase1ScanMetadata {
         let elapsed = self.start_time.elapsed();
 
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => {
+            AfterSequential::Done(processor) => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Completed Phase 1 scan metadata");
                 tracing::info!(
                     phase1_duration_ms = elapsed.as_millis(),
                     "Phase 1 (sequential) completed"
@@ -63,11 +66,20 @@ impl Phase1ScanMetadata {
                 Ok(AfterPhase1ScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Completed Phase 1 scan metadata");
                 tracing::info!(
                     phase1_duration_ms = elapsed.as_millis(),
                     num_phase2_files = files.len(),
                     "Phase 1 (sequential) completed, Phase 2 needed"
                 );
+                processor.get_metrics().reset_counters();
+
+                // Enable logging on drop for Phase 2
+                processor
+                    .get_metrics()
+                    .set_log_on_drop("Completed Phase 2 scan metadata");
 
                 Ok(AfterPhase1ScanMetadata::Phase2 {
                     state: Phase2State {
