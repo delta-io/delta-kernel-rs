@@ -865,7 +865,18 @@ pub struct AddInfo {
     pub stats: Option<serde_json::Value>,
 }
 
-/// Reads all add infos from a snapshot's log segment using internal API.
+/// Reads all [`AddInfo`]s from a snapshot's log segment.
+///
+/// # Example (conceptual)
+///
+/// Given a delta log entry like:
+/// ```json
+/// {"add": {"path": "part-00000.parquet", "stats": "{\"numRecords\":10}"}}
+/// ```
+/// This function would return:
+/// ```text
+/// vec![AddInfo { path: "part-00000.parquet", stats: Some({"numRecords": 10}) }]
+/// ```
 pub fn read_add_infos(
     snapshot: &Snapshot,
     engine: &impl Engine,

@@ -3127,6 +3127,30 @@ async fn test_column_mapping_write(
             write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
     }
 
+    // Enable writeStatsAsStruct so the checkpoint contains native stats_parsed.
+    // CREATE TABLE doesn't allow this property yet, so we write a metadata-update commit directly.
+    latest_snapshot = {
+        let v0_path = std::path::Path::new(&table_path)
+            .join("_delta_log/00000000000000000000.json");
+        let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+            .lines()
+            .find_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .filter(|v| v.get("metaData").is_some())
+            })
+            .expect("version 0 should contain a metaData action");
+
+        meta["metaData"]["configuration"]["delta.checkpoint.writeStatsAsStruct"] = json!("true");
+
+        let new_commit = std::path::Path::new(&table_path).join(format!(
+            "_delta_log/{:020}.json",
+            latest_snapshot.version() + 1
+        ));
+        std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+    };
+
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
     snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
@@ -3164,6 +3188,97 @@ async fn test_column_mapping_write(
         "st6"
     );
 
+    // Step 3b: Verify stats_parsed in scan metadata uses correct physical column names
+    {
+        let scan = ckpt_snapshot
+            .scan_builder()
+            .include_stats_columns()
+            .build()?;
+        let scan_metadata_results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
+        for sm in scan_metadata_results {
+            let (data, sel) = sm.scan_files.into_parts();
+            let batch: RecordBatch =
+                ArrowEngineData::try_from_engine_data(data)?.into();
+
+            let stats_parsed = batch
+                .column_by_name("stats_parsed")
+                .expect("should have stats_parsed column")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("stats_parsed should be a struct");
+            let min_values = stats_parsed
+                .column_by_name("minValues")
+                .expect("should have minValues")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let max_values = stats_parsed
+                .column_by_name("maxValues")
+                .expect("should have maxValues")
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+
+            let min_row_num = min_values
+                .column_by_name(&row_number_physical[0])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let max_row_num = max_values
+                .column_by_name(&row_number_physical[0])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            let min_addr = min_values
+                .column_by_name(&street_physical[0])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let min_st = min_addr
+                .column_by_name(&street_physical[1])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let max_addr = max_values
+                .column_by_name(&street_physical[0])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let max_st = max_addr
+                .column_by_name(&street_physical[1])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                if sel[i] && !stats_parsed.is_null(i) {
+                    stats_rows.push((
+                        min_row_num.value(i),
+                        max_row_num.value(i),
+                        min_st.value(i).to_string(),
+                        max_st.value(i).to_string(),
+                    ));
+                }
+            }
+        }
+
+        stats_rows.sort_by_key(|r| r.0);
+        assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
+        assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
+        assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
+    }
+
     // Step 4: Read the parquet file footer (SchemaElement entries in the file metadata)
     // to verify that columns are stored under their physical names, not logical names.
     // Ref: https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
@@ -3177,7 +3292,7 @@ async fn test_column_mapping_write(
         let obj_meta = store
             .head(&Path::from_url_path(parquet_url.path())?)
             .await?;
-        let file_meta = FileMeta::new(parquet_url, 0, obj_meta.size as u64);
+        let file_meta = FileMeta::new(parquet_url, 0 /* last_modified */, obj_meta.size as u64);
         let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
         let footer_schema = footer.schema;
 
