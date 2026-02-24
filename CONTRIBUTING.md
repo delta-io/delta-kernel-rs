@@ -7,6 +7,24 @@
 
 [existing issues]: (https://github.com/delta-io/delta-kernel-rs/issues)
 
+## Getting your PR reviewed
+Note that we have limited review bandwidth in this repository. We therefore encourage contributors
+who would like their PRs reviewed in a timely manner to review _other_ open PRs. This helps increase
+our overall review rate, as well as allowing contributors to build credibility within the project.
+
+PRs from contributors who do not review others' work will be lower priority, though we do try to
+review all PRs as promptly as possible.
+
+We also encourage contributors to optimize their PRs for review:
+- A crisp and complete PR description that explains clearly what the change is for cross-checking
+  against the code.
+- Tightly-scoped. That is, don't mix multiple changes in a single PR.
+- Code structure and doc comments optimized for understandability (e.g. avoid bloat, redundancy, and
+convoluted control flow).
+
+PRs that do not follow these principles are much more time consuming to review, and less likely to
+get prompt reviews.
+
 ## How to Contribute
 
 For trivial fixes, etc. please feel free to open a PR directly. For larger changes, we follow a
