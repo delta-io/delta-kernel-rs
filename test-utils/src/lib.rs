@@ -3,11 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
+    StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
@@ -22,7 +24,7 @@ use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
@@ -30,7 +32,7 @@ use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
-use serde_json::{json, to_vec};
+use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -601,6 +603,114 @@ pub fn set_json_value(
     Ok(())
 }
 
+/// Returns a nested schema with 6 top-level fields including a nested struct:
+/// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag: string, value: int]`
+pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::not_null("row_number", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("score", DataType::DOUBLE),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![
+                StructField::not_null("street", DataType::STRING),
+                StructField::nullable("city", DataType::STRING),
+            ])?,
+        ),
+        StructField::nullable("tag", DataType::STRING),
+        StructField::nullable("value", DataType::INTEGER),
+    ])?))
+}
+
+/// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
+///
+/// Batch 1: rows 1..3, names alice/bob/charlie, streets st1..st3
+/// Batch 2: rows 4..6, names dave/eve/frank, streets st4..st6
+pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let schema = nested_schema()?;
+    let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(schema.as_ref())?;
+    let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        _ => panic!("expected struct"),
+    };
+
+    let build = |ids: Vec<i64>,
+                 names: Vec<&str>,
+                 scores: Vec<f64>,
+                 streets: Vec<&str>,
+                 cities: Vec<Option<&str>>,
+                 tags: Vec<Option<&str>>,
+                 values: Vec<Option<i32>>|
+     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let address_array = StructArray::new(
+            address_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(streets)) as ArrayRef,
+                Arc::new(StringArray::from(cities)) as ArrayRef,
+            ],
+            None,
+        );
+        Ok(RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(Float64Array::from(scores)) as ArrayRef,
+                Arc::new(address_array) as ArrayRef,
+                Arc::new(StringArray::from(tags)) as ArrayRef,
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            ],
+        )?)
+    };
+
+    Ok(vec![
+        build(
+            vec![1, 2, 3],
+            vec!["alice", "bob", "charlie"],
+            vec![1.0, 2.0, 3.0],
+            vec!["st1", "st2", "st3"],
+            vec![Some("c1"), None, Some("c3")],
+            vec![Some("t1"), Some("t2"), None],
+            vec![Some(10), Some(20), None],
+        )?,
+        build(
+            vec![4, 5, 6],
+            vec!["dave", "eve", "frank"],
+            vec![4.0, 5.0, 6.0],
+            vec!["st4", "st5", "st6"],
+            vec![Some("c4"), Some("c5"), Some("c6")],
+            vec![None, Some("t5"), Some("t6")],
+            vec![Some(40), None, Some(60)],
+        )?,
+    ])
+}
+
+/// Asserts that a field exists at the given dot-separated path in a [`StructType`] schema,
+/// traversing into nested structs as needed. Panics if any segment of the path is missing
+/// or if a non-terminal segment is not a struct type.
+///
+/// # Example
+///
+/// ```ignore
+/// // Given schema: { address: { street: string, city: string } }
+/// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
+/// ```
+pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
+    let path_str = path.join(".");
+    let mut current = schema;
+    for (i, name) in path.iter().enumerate() {
+        let field = current
+            .field(name)
+            .unwrap_or_else(|| panic!("schema missing field '{path_str}'"));
+        if i + 1 < path.len() {
+            current = match field.data_type() {
+                delta_kernel::schema::DataType::Struct(s) => s,
+                _ => panic!("expected struct at '{path_str}'"),
+            };
+        }
+    }
+}
+
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
     match res {
         Ok(_) => panic!("Expected error, but got Ok result"),
@@ -749,6 +859,86 @@ pub async fn write_batch_to_table(
     }
 }
 
+/// An add info extracted from the log segment.
+pub struct AddInfo {
+    pub path: String,
+    pub stats: Option<serde_json::Value>,
+}
+
+/// Reads all [`AddInfo`]s from a snapshot's log segment.
+///
+/// # Example (conceptual)
+///
+/// Given a delta log entry like:
+/// ```json
+/// {"add": {"path": "part-00000.parquet", "stats": "{\"numRecords\":10}"}}
+/// ```
+/// This function would return:
+/// ```text
+/// vec![AddInfo { path: "part-00000.parquet", stats: Some({"numRecords": 10}) }]
+/// ```
+pub fn read_add_infos(
+    snapshot: &Snapshot,
+    engine: &impl Engine,
+) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
+    let schema = get_log_add_schema().clone();
+    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
+    let mut actions = Vec::new();
+    for batch_result in batches {
+        let actions_batch = batch_result?;
+        let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
+        let record_batch = engine_data.record_batch();
+        let add_struct = match record_batch.schema().index_of("add").ok().and_then(|idx| {
+            record_batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StructArray>()
+        }) {
+            Some(s) => s,
+            None => continue,
+        };
+        let path_arr = add_struct
+            .column_by_name("path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let stats_arr = add_struct
+            .column_by_name("stats")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let len = add_struct.len();
+        for i in 0..len {
+            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
+                let stats = stats_arr
+                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                    .map(serde_json::from_str)
+                    .transpose()?;
+                actions.push(AddInfo {
+                    path: path.to_string(),
+                    stats,
+                });
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// Helper to create a table with the given properties, then load and return its snapshot.
+pub fn create_table_and_load_snapshot(
+    table_path: &str,
+    schema: SchemaRef,
+    engine: &dyn Engine,
+    properties: &[(&str, &str)],
+) -> DeltaResult<Arc<Snapshot>> {
+    use delta_kernel::committer::FileSystemCommitter;
+    use delta_kernel::transaction::create_table::create_table;
+
+    let _ = create_table(table_path, schema, "Test/1.0")
+        .with_table_properties(properties.to_vec())
+        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .commit(engine)?;
+
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    Snapshot::builder_for(table_url).build(engine)
+}
+
 // Writer that captures log output into a shared buffer for test assertions
 pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
 
@@ -791,4 +981,59 @@ impl LoggingTest {
     pub fn logs(&self) -> String {
         String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
     }
+}
+
+/// Reads a commit log file and returns all actions of the given type (e.g. "add" or "remove").
+pub fn read_actions_from_commit(
+    table_url: &Url,
+    version: u64,
+    action_type: &str,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let table_path = table_url.to_file_path().expect("should be a file URL");
+    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let content = std::fs::read_to_string(commit_path)?;
+    let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+    Ok(parsed
+        .into_iter()
+        .filter_map(|v| v.get(action_type).cloned())
+        .collect())
+}
+
+/// Removes all scan files from the snapshot, commits the transaction, and returns
+/// the parsed remove actions from the resulting commit log.
+pub fn remove_all_and_get_remove_actions(
+    snapshot: &Arc<Snapshot>,
+    table_url: &Url,
+    engine: &impl Engine,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let scan = snapshot.clone().scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    for sm in all_scan_metadata {
+        txn.remove_files(sm.scan_files);
+    }
+    let committed = match txn.commit(engine)? {
+        CommitResult::CommittedTransaction(c) => c,
+        _ => panic!("Transaction should be committed"),
+    };
+    read_actions_from_commit(table_url, committed.commit_version(), "remove")
+}
+
+/// Asserts that `action["partitionValues"]` contains the given key with the expected value.
+pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_value: &str) {
+    let pv = action["partitionValues"]
+        .as_object()
+        .expect("action should have partitionValues");
+    assert!(
+        pv.contains_key(key),
+        "partitionValues should contain key '{key}', got: {pv:?}"
+    );
+    assert_eq!(pv[key], expected_value);
 }

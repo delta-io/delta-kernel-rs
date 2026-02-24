@@ -8,7 +8,7 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
+use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -17,9 +17,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
@@ -34,12 +37,17 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::FileMeta;
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_add_files_metadata,
-    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
-    write_batch_to_table,
+    assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
+    copy_directory, create_add_files_metadata, create_default_engine, create_table,
+    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
+    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, setup_test_tables,
+    test_read, test_table_setup, write_batch_to_table,
 };
 
 mod common;
@@ -131,6 +139,82 @@ fn get_scan_files(
 
 fn get_simple_int_schema() -> Arc<StructType> {
     Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
+}
+
+/// Write a metadata-update commit that sets a table property on the existing table.
+/// Returns a fresh snapshot reflecting the new commit.
+/// Used in tests as a hack to set table properties when create table doesn't support the property.
+fn set_table_property(
+    table_path: &str,
+    table_url: &Url,
+    engine: &dyn Engine,
+    current_version: Version,
+    key: &str,
+    value: &str,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|v| v.get("metaData").is_some())
+        })
+        .expect("version 0 should contain a metaData action");
+
+    meta["metaData"]["configuration"][key] = json!(value);
+
+    let new_commit = std::path::Path::new(table_path)
+        .join(format!("_delta_log/{:020}.json", current_version + 1));
+    std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+}
+
+/// Resolve a nested column inside a [`StructArray`] by walking the given field-name path,
+/// and downcast the leaf to the requested array type.
+fn resolve_struct_field<'a, T: 'static>(root: &'a StructArray, path: &[String]) -> &'a T {
+    assert!(!path.is_empty(), "path must be non-empty");
+    let mut current: &StructArray = root;
+    for (i, name) in path.iter().enumerate() {
+        let col = current
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing field: {name}"));
+        if i == path.len() - 1 {
+            return col
+                .as_any()
+                .downcast_ref::<T>()
+                .expect("leaf array type mismatch");
+        }
+        current = col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap_or_else(|| panic!("expected StructArray at field: {name}"));
+    }
+    unreachable!()
+}
+
+/// Navigate into a nested JSON value by following a sequence of object keys.
+/// E.g. `resolve_json_path(stats, &["address", "street"])` returns `stats["address"]["street"]`.
+fn resolve_json_path<'a>(root: &'a serde_json::Value, path: &[String]) -> &'a serde_json::Value {
+    path.iter().fold(root, |v, key| &v[key])
+}
+
+/// Assert that `stats["minValues"]` and `stats["maxValues"]` at the given physical path equal the
+/// expected values.
+fn assert_min_max_stats(
+    stats: &serde_json::Value,
+    physical_path: &[String],
+    expected_min: impl Into<serde_json::Value>,
+    expected_max: impl Into<serde_json::Value>,
+) {
+    assert_eq!(
+        *resolve_json_path(&stats["minValues"], physical_path),
+        expected_min.into()
+    );
+    assert_eq!(
+        *resolve_json_path(&stats["maxValues"], physical_path),
+        expected_max.into()
+    );
 }
 
 #[tokio::test]
@@ -3039,5 +3123,343 @@ async fn test_write_parquet_rejects_unknown_partition_column(
             "Error should mention the unknown column name, got: {err_msg}"
         );
     }
+    Ok(())
+}
+
+/// 1. Creates a table with the given column mapping mode
+/// 2. Writes two batches of data
+/// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
+/// 4. Reads a parquet footer to verify physical names/IDs
+/// 5. Reads data back to verify correctness
+/// 6. Removes files and verifies remove.stats matches the original add.stats
+#[rstest::rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_write(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = nested_schema()?;
+
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    // Step 1: Create table
+    let mode_str = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Id => "id",
+        ColumnMappingMode::Name => "name",
+    };
+    let mut latest_snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", mode_str)],
+    )?;
+
+    // Get physical field paths for stats verification (top-level and nested)
+    let cm = latest_snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let row_number_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["row_number"]),
+        cm,
+    )?
+    .into_inner();
+    let street_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["address", "street"]),
+        cm,
+    )?
+    .into_inner();
+
+    // Step 2: Write two batches
+    for data in nested_batches()? {
+        latest_snapshot =
+            write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
+    }
+
+    // Enable writeStatsAsStruct so the checkpoint contains native stats_parsed.
+    // CREATE TABLE doesn't allow this property yet, so we write a metadata-update commit directly.
+    latest_snapshot = set_table_property(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        latest_snapshot.version(),
+        "delta.checkpoint.writeStatsAsStruct",
+        "true",
+    )?;
+
+    // Step 3: Checkpoint and verify add.stats uses correct column names
+    let snapshot_for_checkpoint = latest_snapshot.clone();
+    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
+    let mut all_stats: Vec<_> = add_actions
+        .iter()
+        .filter_map(|a| a.stats.as_ref())
+        .filter(|s| s.get("minValues").is_some())
+        .collect();
+    assert_eq!(all_stats.len(), 2, "should have stats for 2 files");
+    all_stats.sort_by_key(|s| s["minValues"][&row_number_physical[0]].as_i64().unwrap());
+
+    // Batch 1: row_number 1..3, address.street "st1".."st3"
+    assert_min_max_stats(all_stats[0], &row_number_physical, 1, 3);
+    assert_min_max_stats(all_stats[0], &street_physical, "st1", "st3");
+
+    // Batch 2: row_number 4..6, address.street "st4".."st6"
+    assert_min_max_stats(all_stats[1], &row_number_physical, 4, 6);
+    assert_min_max_stats(all_stats[1], &street_physical, "st4", "st6");
+
+    // Step 3b: Verify stats_parsed in scan metadata uses correct physical column names
+    {
+        let scan = ckpt_snapshot
+            .scan_builder()
+            .include_stats_columns()
+            .build()?;
+        let scan_metadata_results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
+        for sm in scan_metadata_results {
+            let (data, sel) = sm.scan_files.into_parts();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
+
+            let batch_struct = StructArray::from(batch.clone());
+            let stats_parsed: &StructArray =
+                resolve_struct_field(&batch_struct, &["stats_parsed".into()]);
+
+            let min_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "minValues".into()], field].concat()
+            };
+            let max_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "maxValues".into()], field].concat()
+            };
+            let min_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &min_path(&row_number_physical));
+            let max_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &max_path(&row_number_physical));
+            let min_st: &StringArray =
+                resolve_struct_field(&batch_struct, &min_path(&street_physical));
+            let max_st: &StringArray =
+                resolve_struct_field(&batch_struct, &max_path(&street_physical));
+
+            for (i, &selected) in sel.iter().enumerate().take(batch.num_rows()) {
+                if selected && !stats_parsed.is_null(i) {
+                    stats_rows.push((
+                        min_row_num.value(i),
+                        max_row_num.value(i),
+                        min_st.value(i).to_string(),
+                        max_st.value(i).to_string(),
+                    ));
+                }
+            }
+        }
+
+        stats_rows.sort_by_key(|r| r.0);
+        assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
+        assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
+        assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
+    }
+
+    // Step 4: Read the parquet file footer (SchemaElement entries in the file metadata)
+    // to verify that columns are stored under their physical names, not logical names.
+    // Ref: https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
+    {
+        let parquet_path = &add_actions
+            .first()
+            .expect("should have at least one add file")
+            .path;
+        let parquet_url = table_url.join(parquet_path)?;
+
+        let obj_meta = store
+            .head(&Path::from_url_path(parquet_url.path())?)
+            .await?;
+        let file_meta = FileMeta::new(
+            parquet_url,
+            0, /* last_modified */
+            obj_meta.size as u64,
+        );
+        let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
+        let footer_schema = footer.schema;
+
+        // Verify top-level "row_number" and nested "address.street" use correct (physical) names
+        for path in [
+            ColumnName::new(["row_number"]),
+            ColumnName::new(["address", "street"]),
+        ] {
+            let physical =
+                get_any_level_column_physical_name(latest_snapshot.schema().as_ref(), &path, cm)?
+                    .into_inner();
+            assert_schema_has_field(&footer_schema, &physical);
+        }
+    }
+
+    // Step 5: Read data back to verify correctness
+    {
+        let post_ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = post_ckpt_snapshot.scan_builder().build()?;
+        let batches: Vec<RecordBatch> = scan
+            .execute(engine.clone())?
+            .map(|r| {
+                let data = r.unwrap();
+                let arrow = ArrowEngineData::try_from_engine_data(data).unwrap();
+                arrow.record_batch().clone()
+            })
+            .collect();
+
+        let result_schema = batches[0].schema();
+        let combined = delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
+        assert_eq!(
+            combined.num_rows(),
+            6,
+            "Should have 6 rows from two written batches"
+        );
+
+        // Verify logical column names and data values
+        let combined_struct = StructArray::from(combined);
+
+        // Top-level: row_number should contain [1..=6]
+        let row_numbers: &Int64Array =
+            resolve_struct_field(&combined_struct, &["row_number".into()]);
+        let mut vals: Vec<i64> = (0..row_numbers.len())
+            .map(|i| row_numbers.value(i))
+            .collect();
+        vals.sort();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+
+        // Nested: address.street should contain ["st1"..="st6"]
+        let streets: &StringArray =
+            resolve_struct_field(&combined_struct, &["address".into(), "street".into()]);
+        let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
+        street_vals.sort();
+        assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
+    }
+
+    // Step 6: Remove files and verify remove.stats matches original add.stats
+    {
+        let original_add_stats: Vec<serde_json::Value> =
+            add_actions.iter().filter_map(|a| a.stats.clone()).collect();
+        assert!(
+            !original_add_stats.is_empty(),
+            "should have at least one add with stats"
+        );
+
+        let remove_actions =
+            remove_all_and_get_remove_actions(&latest_snapshot, &table_url, engine.as_ref())?;
+        assert!(
+            !remove_actions.is_empty(),
+            "Expected at least one remove action"
+        );
+
+        let remove_stats: Vec<serde_json::Value> = remove_actions
+            .iter()
+            .filter_map(|r| {
+                r["stats"]
+                    .as_str()
+                    .map(|s| serde_json::from_str(s).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            remove_stats, original_add_stats,
+            "remove.stats should match original add.stats"
+        );
+    }
+
+    Ok(())
+}
+
+/// Verifies that partitioned writes use physical column names in add.partitionValues.
+#[rstest::rstest]
+#[case::cm_none("./tests/data/partition_cm/none")]
+#[case::cm_id("./tests/data/partition_cm/id")]
+#[case::cm_name("./tests/data/partition_cm/name")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_partitioned_write(
+    #[case] table_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy test data to a temp dir so we can write to it
+    let tmp_dir = tempdir()?;
+    copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let cm = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let physical_name = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["category"]),
+        cm,
+    )?
+    .into_inner()
+    .remove(0);
+
+    // Verify physical name for column mapping mode
+    if table_dir.ends_with("none") {
+        assert_eq!(physical_name, "category");
+    } else {
+        assert_ne!(
+            physical_name, "category",
+            "physical name should differ from logical name under column mapping"
+        );
+    }
+
+    // Write data with partition value
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let batch = RecordBatch::try_new(
+        Arc::new(data_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // Read commit log and verify add.partitionValues key uses physical name
+    let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+    assert!(!add_actions.is_empty(), "no add action found in commit log");
+    for add in &add_actions {
+        assert_partition_values(add, &physical_name, "A");
+    }
+
+    // Remove the written file and verify remove action preserves physical names
+    let post_write_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let remove_actions =
+        remove_all_and_get_remove_actions(&post_write_snapshot, &table_url, engine.as_ref())?;
+    assert!(
+        !remove_actions.is_empty(),
+        "no remove action found in commit log"
+    );
+    for remove in &remove_actions {
+        assert_partition_values(remove, &physical_name, "A");
+    }
+
     Ok(())
 }

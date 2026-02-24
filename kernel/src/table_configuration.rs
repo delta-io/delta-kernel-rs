@@ -889,28 +889,22 @@ mod test {
                 ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
-            // NOTE: The following cases should be updated if column mapping for writes is
-            // supported before cdc is.
+            // Column mapping is now supported for writes.
             (
-                // Should fail since change data feed and column mapping features cannot both be
-                // present.
+                // CDF + column mapping: both supported, should succeed
                 create_mock_table_config(
                     &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
-                // The table does not require writing CDC files, so it is safe to write to it.
+                // Column mapping + AppendOnly, no CDF enabled: should succeed
                 create_mock_table_config(
                     &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled
