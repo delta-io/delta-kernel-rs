@@ -398,6 +398,7 @@ mod tests {
         predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
+        dispatcher: Option<tracing::Dispatch>,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
@@ -440,8 +441,12 @@ mod tests {
                     .map(|partition_files| {
                         let engine = engine.clone();
                         let state = final_state.clone();
+                        let dispatcher = dispatcher.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
+                            // Set the dispatcher in this thread to capture logs
+                            let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
+
                             assert!(!partition_files.is_empty());
 
                             let mut phase2 = Phase2ScanMetadata::try_new(
@@ -479,8 +484,134 @@ mod tests {
         Ok(())
     }
 
+    /// Extract a metric value from logs by searching for "metric_name=value"
+    fn extract_metric(logs: &str, metric_name: &str) -> u64 {
+        if let Some(pos) = logs.find(&format!("{}=", metric_name)) {
+            let after = &logs[pos + metric_name.len() + 1..];
+            if let Some(space_pos) = after.find(char::is_whitespace) {
+                let value_str = &after[..space_pos];
+                value_str.parse().unwrap_or_else(|_| {
+                    panic!("Failed to parse {} value: {}", metric_name, value_str)
+                })
+            } else {
+                panic!("Failed to find end of {} value", metric_name);
+            }
+        } else {
+            panic!("Failed to find {} in logs", metric_name);
+        }
+    }
+
+    fn verify_metrics_in_logs(logs: &str, table_name: &str, verify_phase2: bool) {
+        // Verify Phase 1 metrics were logged
+        assert!(
+            logs.contains("Completed Phase 1 scan metadata"),
+            "Expected Phase 1 completion log for table '{}'",
+            table_name
+        );
+
+        // Extract and verify counter values from Phase 1
+        let phase1_adds = extract_metric(logs, "num_adds");
+        let phase1_removes = extract_metric(logs, "num_removes");
+        let phase1_non_file_actions = extract_metric(logs, "num_non_file_actions");
+        let _data_skipping_filtered = extract_metric(logs, "data_skipping_filtered");
+        let _partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
+
+        // For v2-checkpoints-json-with-sidecars:
+        // Phase 1 processes commits and single-part checkpoints (0 adds, 5 non-file actions)
+        // Phase 2 processes multi-part checkpoint sidecars (101 adds)
+        if table_name == "v2-checkpoints-json-with-sidecars" {
+            assert_eq!(
+                phase1_adds, 0,
+                "Expected 0 adds in Phase 1 for {}",
+                table_name
+            );
+            assert_eq!(
+                phase1_removes, 0,
+                "Expected 0 removes in Phase 1 for {}",
+                table_name
+            );
+            assert_eq!(
+                phase1_non_file_actions, 5,
+                "Expected 5 non-file actions in Phase 1 for {}",
+                table_name
+            );
+        }
+
+        // Verify timing metrics are present and parseable
+        let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
+        let _data_skipping_time = extract_metric(logs, "data_skipping_time_ms");
+        let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
+        let _phase1_duration = extract_metric(logs, "phase1_duration_ms");
+
+        // Verify Phase 2 metrics if requested
+        if verify_phase2 && logs.contains("Phase 2 needed") {
+            assert!(
+                logs.contains("Completed Phase 2 scan metadata"),
+                "Expected Phase 2 completion log for table '{}'",
+                table_name
+            );
+            assert!(
+                logs.contains("phase2_duration_ms"),
+                "Expected phase2_duration_ms in logs for table '{}'",
+                table_name
+            );
+            assert!(
+                logs.contains("thread_id"),
+                "Expected thread_id in Phase 2 logs for table '{}'",
+                table_name
+            );
+            assert!(
+                logs.contains("Phase 2 (parallel) completed"),
+                "Expected Phase 2 timing log for table '{}'",
+                table_name
+            );
+
+            // Extract Phase 2 counter values
+            // Note: There may be multiple "Completed Phase 2" logs (from multiple test configurations)
+            // Find all occurrences and check that at least one has the expected adds
+            let mut max_phase2_adds = 0u64;
+            let mut search_start = 0;
+            while let Some(pos) = logs[search_start..].find("Completed Phase 2 scan metadata") {
+                let absolute_pos = search_start + pos;
+                let remaining = &logs[absolute_pos..];
+
+                if let Some(num_adds_pos) = remaining.find("num_adds=") {
+                    let after = &remaining[num_adds_pos + 9..];
+                    if let Some(space_pos) = after.find(char::is_whitespace) {
+                        if let Ok(adds) = after[..space_pos].parse::<u64>() {
+                            max_phase2_adds = max_phase2_adds.max(adds);
+                        }
+                    }
+                }
+                search_start = absolute_pos + 1;
+            }
+
+            if table_name == "v2-checkpoints-json-with-sidecars" {
+                // At least one test configuration should have processed 101 adds in Phase 2
+                assert_eq!(
+                    max_phase2_adds, 101,
+                    "Expected at least one Phase 2 run with 101 adds for {} (max found: {})",
+                    table_name, max_phase2_adds
+                );
+            }
+        }
+    }
+
+    /// Tests parallel workflow with JSON sidecars and verifies metrics logging.
+    ///
+    /// Note: This test captures logs from spawned threads by sharing the tracing dispatcher.
+    /// If running with other tests in parallel causes flakiness, use `--test-threads=1`.
     #[test]
     fn test_parallel_with_json_sidecars() -> DeltaResult<()> {
+        use test_utils::LoggingTest;
+
+        // Set up log capture
+        let logging_test = LoggingTest::new();
+
+        // Capture the dispatcher to share with spawned threads
+        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
+        // Run all test configurations
         for with_serde in [false, true] {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
@@ -488,14 +619,21 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    Some(dispatcher.clone()),
                 )?;
             }
         }
+
+        // Verify metrics were logged (Phase 2 logs should be captured from spawned threads)
+        let logs = logging_test.logs();
+        verify_metrics_in_logs(&logs, "v2-checkpoints-json-with-sidecars", true);
+
         Ok(())
     }
 
     #[test]
     fn test_parallel_with_parquet_sidecars() -> DeltaResult<()> {
+        // No log verification needed - test_parallel_with_json_sidecars already verifies
         for with_serde in [false, true] {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
@@ -503,6 +641,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    None,
                 )?;
             }
         }
@@ -518,6 +657,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    None,
                 )?;
             }
         }
@@ -536,6 +676,7 @@ mod tests {
                     Some(predicate.clone()),
                     with_serde,
                     one_file_per_worker,
+                    None,
                 )?;
             }
         }

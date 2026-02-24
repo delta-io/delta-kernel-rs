@@ -1,6 +1,11 @@
 use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
@@ -24,8 +29,6 @@ use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
-use delta_kernel_derive::internal_api;
-use serde::{Deserialize, Serialize};
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -116,7 +119,9 @@ pub struct ScanLogReplayProcessor {
     /// Skip reading file statistics.
     skip_stats: bool,
     /// Information about checkpoint reading for stats optimization
+    #[allow(dead_code)]
     checkpoint_info: CheckpointReadInfo,
+    metrics: Arc<ScanMetrics>,
 }
 
 impl ScanLogReplayProcessor {
@@ -225,12 +230,22 @@ impl ScanLogReplayProcessor {
             state_info,
             skip_stats,
             checkpoint_info,
+            metrics: Default::default(),
         })
     }
 
     /// Get a reference to the checkpoint info.
     pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
         &self.checkpoint_info
+    }
+
+    pub(crate) fn get_metrics(&self) -> &ScanMetrics {
+        self.metrics.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_metrics_arc(&self) -> Arc<ScanMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Serialize the processor state for distributed processing.
@@ -283,7 +298,7 @@ impl ScanLogReplayProcessor {
             predicate,
             internal_state_blob,
             seen_file_keys: self.seen_file_keys,
-            checkpoint_info: self.checkpoint_info,
+            checkpoint_info: CheckpointReadInfo::without_stats_parsed(),
         })
     }
 
@@ -343,6 +358,140 @@ impl ScanLogReplayProcessor {
     }
 }
 
+/// Metrics collected from [`ScanLogReplayProcessor`]
+#[internal_api]
+pub(crate) struct ScanMetrics {
+    num_adds: AtomicU64,
+    num_removes: AtomicU64,
+    num_non_file_actions: AtomicU64,
+    hash_set_size: AtomicUsize,
+    data_skipping_filtered: AtomicU64,
+    partition_pruning_filtered: AtomicU64,
+    // Timing metrics (in nanoseconds)
+    dedup_visitor_time_ns: AtomicU64,
+    data_skipping_time_ns: AtomicU64,
+    partition_pruning_time_ns: AtomicU64,
+    // If set, log metrics on drop with this message
+    log_on_drop_message: Mutex<Option<String>>,
+}
+
+impl Default for ScanMetrics {
+    fn default() -> Self {
+        Self {
+            num_adds: AtomicU64::new(0),
+            num_removes: AtomicU64::new(0),
+            num_non_file_actions: AtomicU64::new(0),
+            hash_set_size: AtomicUsize::new(0),
+            data_skipping_filtered: AtomicU64::new(0),
+            partition_pruning_filtered: AtomicU64::new(0),
+            dedup_visitor_time_ns: AtomicU64::new(0),
+            data_skipping_time_ns: AtomicU64::new(0),
+            partition_pruning_time_ns: AtomicU64::new(0),
+            log_on_drop_message: Mutex::new(None),
+        }
+    }
+}
+
+impl ScanMetrics {
+    pub(crate) fn reset_counters(&self) {
+        // NOTE: We do not reset hash set size because that never decreases. All subsequent uses of
+        // the processor will reuse the same hashset.
+        self.num_adds.store(0, Ordering::SeqCst);
+        self.num_removes.store(0, Ordering::SeqCst);
+        self.num_non_file_actions.store(0, Ordering::SeqCst);
+        self.data_skipping_filtered.store(0, Ordering::SeqCst);
+        self.partition_pruning_filtered.store(0, Ordering::SeqCst);
+        self.dedup_visitor_time_ns.store(0, Ordering::SeqCst);
+        self.data_skipping_time_ns.store(0, Ordering::SeqCst);
+        self.partition_pruning_time_ns.store(0, Ordering::SeqCst);
+    }
+    pub(crate) fn incr_adds(&self) {
+        self.num_adds.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_removes(&self) {
+        self.num_removes.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_partition_pruning_filtered(&self) {
+        self.partition_pruning_filtered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_non_file_actions(&self) {
+        self.num_non_file_actions.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn add_data_skipping_filtered(&self, value: u64) {
+        self.data_skipping_filtered
+            .fetch_add(value, Ordering::Relaxed);
+    }
+    pub(crate) fn set_hash_set(&self, value: usize) {
+        self.hash_set_size.fetch_max(value, Ordering::SeqCst);
+    }
+
+    pub(crate) fn add_dedup_visitor_time_ns(&self, duration_ns: u64) {
+        self.dedup_visitor_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_data_skipping_time_ns(&self, duration_ns: u64) {
+        self.data_skipping_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_partition_pruning_time_ns(&self, duration_ns: u64) {
+        self.partition_pruning_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn log_with_message(&self, message: impl AsRef<str>) {
+        let num_adds = self.num_adds.load(Ordering::Relaxed);
+        let num_removes = self.num_removes.load(Ordering::Relaxed);
+        let num_non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
+        let hash_set_size = self.hash_set_size.load(Ordering::Relaxed);
+        let data_skipping_filtered = self.data_skipping_filtered.load(Ordering::Relaxed);
+        let partition_pruning_filtered = self.partition_pruning_filtered.load(Ordering::Relaxed);
+        let dedup_visitor_time_ms = self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        let data_skipping_time_ms = self.data_skipping_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        let partition_pruning_time_ms =
+            self.partition_pruning_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        info!(
+            num_adds,
+            num_removes,
+            num_non_file_actions,
+            hash_set_size,
+            data_skipping_filtered,
+            partition_pruning_filtered,
+            dedup_visitor_time_ms,
+            data_skipping_time_ms,
+            partition_pruning_time_ms,
+            "{}",
+            message.as_ref()
+        );
+    }
+
+    /// Set the message to log when these metrics are dropped.
+    pub(crate) fn set_log_on_drop(&self, message: impl Into<String>) {
+        if let Ok(mut guard) = self.log_on_drop_message.lock() {
+            *guard = Some(message.into());
+        }
+    }
+
+    /// Clear the log-on-drop message (disables logging on drop).
+    pub(crate) fn clear_log_on_drop(&self) {
+        if let Ok(mut guard) = self.log_on_drop_message.lock() {
+            *guard = None;
+        }
+    }
+}
+
+impl Drop for ScanMetrics {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.log_on_drop_message.lock() {
+            if let Some(message) = guard.as_ref() {
+                self.log_with_message(message);
+            }
+        }
+    }
+}
+
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
@@ -353,6 +502,7 @@ struct AddRemoveDedupVisitor<D: Deduplicator> {
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    metrics: Arc<ScanMetrics>,
 }
 
 impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
@@ -361,6 +511,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
+        metrics: Arc<ScanMetrics>,
     ) -> AddRemoveDedupVisitor<D> {
         AddRemoveDedupVisitor {
             deduplicator,
@@ -368,6 +519,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             state_info,
             partition_filter,
             row_transform_exprs: Vec::new(),
+            metrics,
         }
     }
 
@@ -404,7 +556,14 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
         else {
+            self.metrics.incr_non_file_actions();
             return Ok(false);
+        };
+
+        if is_add {
+            self.metrics.incr_adds()
+        } else {
+            self.metrics.incr_removes()
         };
 
         // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
@@ -415,6 +574,8 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
+                let start = std::time::Instant::now();
+
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values(
@@ -423,9 +584,17 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
                     &partition_values,
                     self.state_info.column_mapping_mode,
                 )?;
-                if self.is_file_partition_pruned(&partition_values) {
+
+                let is_pruned = self.is_file_partition_pruned(&partition_values);
+
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                self.metrics.add_partition_pruning_time_ns(elapsed_ns);
+
+                if is_pruned {
+                    self.metrics.incr_partition_pruning_filtered();
                     return Ok(false);
                 }
+
                 partition_values
             }
             _ => Default::default(),
@@ -493,6 +662,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let start = std::time::Instant::now();
+
         let is_log_batch = self.deduplicator.is_log_batch();
         let expected_getters = if is_log_batch { 10 } else { 6 };
         require!(
@@ -508,6 +679,10 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
                 self.selection_vector[i] = self.is_valid_add(i, getters)?;
             }
         }
+
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        self.metrics.add_dedup_visitor_time_ns(elapsed_ns);
+
         Ok(())
     }
 }
@@ -676,7 +851,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
         // This avoids double JSON parsing - the transform already parsed the stats.
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        let selection_vector =
+            self.build_selection_vector(transformed.as_ref(), self.metrics.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
             selection_vector.len() == actions.len(),
@@ -698,15 +874,18 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            self.metrics.clone(),
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics.set_hash_set(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 }
 
@@ -746,7 +925,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
         // This avoids double JSON parsing - the transform already parsed the stats.
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        let selection_vector =
+            self.build_selection_vector(transformed.as_ref(), self.metrics.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
             selection_vector.len() == actions.len(),
@@ -771,15 +951,18 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            self.metrics.clone(),
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics.set_hash_set(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
@@ -848,6 +1031,7 @@ mod tests {
     use super::{
         scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
     };
+    use crate::log_replay::LogReplayProcessor;
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
@@ -1460,5 +1644,167 @@ mod tests {
             found_add = true;
         }
         assert!(found_add);
+    }
+
+    #[test]
+    fn test_scan_metrics_counters() {
+        use super::ScanMetrics;
+        use std::sync::atomic::Ordering;
+
+        let metrics = ScanMetrics::default();
+
+        // Test initial state - all counters should be zero
+        assert_eq!(metrics.num_adds.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.num_removes.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.num_non_file_actions.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.data_skipping_filtered.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.partition_pruning_filtered.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.dedup_visitor_time_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.data_skipping_time_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.partition_pruning_time_ns.load(Ordering::Relaxed), 0);
+
+        // Test counter increments
+        metrics.incr_adds();
+        metrics.incr_adds();
+        metrics.incr_adds();
+        assert_eq!(metrics.num_adds.load(Ordering::Relaxed), 3);
+
+        metrics.incr_removes();
+        metrics.incr_removes();
+        assert_eq!(metrics.num_removes.load(Ordering::Relaxed), 2);
+
+        metrics.incr_non_file_actions();
+        assert_eq!(metrics.num_non_file_actions.load(Ordering::Relaxed), 1);
+
+        metrics.incr_partition_pruning_filtered();
+        metrics.incr_partition_pruning_filtered();
+        assert_eq!(
+            metrics.partition_pruning_filtered.load(Ordering::Relaxed),
+            2
+        );
+
+        // Test data skipping filtered (can add multiple at once)
+        metrics.add_data_skipping_filtered(10);
+        metrics.add_data_skipping_filtered(5);
+        assert_eq!(metrics.data_skipping_filtered.load(Ordering::Relaxed), 15);
+
+        // Test hash set size (uses fetch_max, so only largest value is kept)
+        metrics.set_hash_set(100);
+        metrics.set_hash_set(50); // Should not change it
+        metrics.set_hash_set(200); // Should update to 200
+        assert_eq!(metrics.hash_set_size.load(Ordering::Relaxed), 200);
+
+        // Test timing metrics accumulation
+        metrics.add_dedup_visitor_time_ns(1_000_000); // 1ms
+        metrics.add_dedup_visitor_time_ns(2_000_000); // 2ms
+        assert_eq!(
+            metrics.dedup_visitor_time_ns.load(Ordering::Relaxed),
+            3_000_000
+        );
+
+        metrics.add_data_skipping_time_ns(5_000_000); // 5ms
+        metrics.add_data_skipping_time_ns(3_000_000); // 3ms
+        assert_eq!(
+            metrics.data_skipping_time_ns.load(Ordering::Relaxed),
+            8_000_000
+        );
+
+        metrics.add_partition_pruning_time_ns(10_000_000); // 10ms
+        metrics.add_partition_pruning_time_ns(15_000_000); // 15ms
+        assert_eq!(
+            metrics.partition_pruning_time_ns.load(Ordering::Relaxed),
+            25_000_000
+        );
+
+        // Test reset_counters
+        metrics.reset_counters();
+        assert_eq!(metrics.num_adds.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.num_removes.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.num_non_file_actions.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.data_skipping_filtered.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.partition_pruning_filtered.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.dedup_visitor_time_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.data_skipping_time_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.partition_pruning_time_ns.load(Ordering::Relaxed), 0);
+        // Hash set size should NOT be reset
+        assert_eq!(metrics.hash_set_size.load(Ordering::Relaxed), 200);
+    }
+
+    #[test]
+    fn test_scan_metrics_with_real_scan() {
+        use std::sync::atomic::Ordering;
+
+        // Test with add_batch_with_remove which contains:
+        // - 1 remove action
+        // - 1 add action
+        // - 2 non-file actions (metaData, protocol)
+        let batch = vec![add_batch_with_remove(get_commit_schema().clone())];
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "value",
+            DataType::INTEGER,
+            true,
+        )]));
+        let state_info = get_simple_state_info(schema, vec![]).unwrap();
+
+        let engine = SyncEngine::new();
+        let state_info_arc = Arc::new(state_info);
+        let processor =
+            ScanLogReplayProcessor::new(&engine, state_info_arc, test_checkpoint_info(), false)
+                .unwrap();
+
+        // Get metrics Arc before moving processor
+        let metrics = processor.get_metrics_arc();
+
+        // Process batches (process_actions_iter consumes processor)
+        let _results: Vec<_> = processor
+            .process_actions_iter(
+                batch
+                    .into_iter()
+                    .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            )
+            .collect::<DeltaResult<_>>()
+            .unwrap();
+
+        // Verify exact counter values based on test data
+        // add_batch_with_remove contains: 2 adds, 1 remove, 1 metaData (non-file action)
+        assert_eq!(
+            metrics.num_adds.load(Ordering::Relaxed),
+            2,
+            "Expected exactly 2 add actions"
+        );
+        assert_eq!(
+            metrics.num_removes.load(Ordering::Relaxed),
+            1,
+            "Expected exactly 1 remove action"
+        );
+        assert_eq!(
+            metrics.num_non_file_actions.load(Ordering::Relaxed),
+            1,
+            "Expected exactly 1 non-file action (metaData)"
+        );
+
+        // Timing should have accumulated (dedup visitor was called)
+        assert!(
+            metrics.dedup_visitor_time_ns.load(Ordering::Relaxed) > 0,
+            "Expected dedup timing to be non-zero"
+        );
+
+        // No data skipping or partition pruning in this test
+        assert_eq!(
+            metrics.data_skipping_filtered.load(Ordering::Relaxed),
+            0,
+            "Expected no data skipping filtered"
+        );
+        assert_eq!(
+            metrics.partition_pruning_filtered.load(Ordering::Relaxed),
+            0,
+            "Expected no partition pruning filtered"
+        );
     }
 }

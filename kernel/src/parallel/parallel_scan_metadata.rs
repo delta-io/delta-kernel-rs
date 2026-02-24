@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 
@@ -31,6 +32,7 @@ pub enum AfterPhase1ScanMetadata {
 pub struct Phase1ScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
     pub(crate) span: tracing::Span,
+    start_time: Instant,
 }
 
 impl Phase1ScanMetadata {
@@ -39,17 +41,49 @@ impl Phase1ScanMetadata {
         parent_span: tracing::Span,
     ) -> Self {
         let span = tracing::info_span!(parent: parent_span, "scan_metadata_phase1");
-        Self { sequential, span }
+        Self {
+            sequential,
+            span,
+            start_time: Instant::now(),
+        }
     }
 
     pub fn finish(self) -> DeltaResult<AfterPhase1ScanMetadata> {
         let _guard = self.span.enter();
+        let elapsed = self.start_time.elapsed();
+
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterPhase1ScanMetadata::Done),
-            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
-                state: Phase2State { inner: processor },
-                files,
-            }),
+            AfterSequential::Done(processor) => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Completed Phase 1 scan metadata");
+                tracing::info!(
+                    phase1_duration_ms = elapsed.as_millis(),
+                    "Phase 1 (sequential) completed"
+                );
+                Ok(AfterPhase1ScanMetadata::Done)
+            }
+            AfterSequential::Parallel { processor, files } => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Completed Phase 1 scan metadata");
+                tracing::info!(
+                    phase1_duration_ms = elapsed.as_millis(),
+                    num_phase2_files = files.len(),
+                    "Phase 1 (sequential) completed, Phase 2 needed"
+                );
+                processor.get_metrics().reset_counters();
+
+                // Enable logging on drop for Phase 2
+                processor
+                    .get_metrics()
+                    .set_log_on_drop("Completed Phase 2 scan metadata");
+
+                Ok(AfterPhase1ScanMetadata::Phase2 {
+                    state: Phase2State { inner: processor },
+                    files,
+                })
+            }
         }
     }
 }
@@ -97,6 +131,8 @@ impl Phase2State {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+        // Disable logging on drop since we're serializing, not completing
+        self.inner.get_metrics().clear_log_on_drop();
         self.inner.into_serializable_state()
     }
 
@@ -112,6 +148,10 @@ impl Phase2State {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
+        // Enable logging on drop for the reconstructed state
+        inner
+            .get_metrics()
+            .set_log_on_drop("Completed Phase 2 scan metadata");
         Ok(Self { inner })
     }
 
@@ -148,6 +188,7 @@ impl Phase2State {
 
 pub struct Phase2ScanMetadata {
     pub(crate) processor: ParallelPhase<Arc<Phase2State>>,
+    start_time: Instant,
 }
 
 impl Phase2ScanMetadata {
@@ -159,6 +200,7 @@ impl Phase2ScanMetadata {
         let read_schema = state.file_read_schema();
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            start_time: Instant::now(),
         })
     }
 
@@ -168,6 +210,7 @@ impl Phase2ScanMetadata {
     ) -> Self {
         Self {
             processor: ParallelPhase::new_from_iter(state, iter),
+            start_time: Instant::now(),
         }
     }
 }
@@ -177,5 +220,18 @@ impl Iterator for Phase2ScanMetadata {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.processor.next()
+    }
+}
+
+impl Drop for Phase2ScanMetadata {
+    fn drop(&mut self) {
+        let elapsed = self.start_time.elapsed();
+        let thread_id = std::thread::current().id();
+
+        tracing::info!(
+            phase2_duration_ms = elapsed.as_millis(),
+            thread_id = ?thread_id,
+            "Phase 2 (parallel) completed"
+        );
     }
 }
