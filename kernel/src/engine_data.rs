@@ -321,26 +321,16 @@ impl<'sv> RowIndexIterator<'sv> {
         }
     }
 
-    /// Convert into a [`SelectedRunIter`] that yields one `Range<usize>` per contiguous
-    /// run of selected rows, silently discarding deselected rows.
+    /// Convert into an iterator that yields one `Range<usize>` per contiguous run of selected
+    /// rows, silently discarding deselected rows.
     ///
     /// Prefer this over iterating `self` directly in visitors that only need to process
     /// selected rows and do not need to track deselected row positions.
     ///
     /// Use `self` (full [`RowEvent`]-based iteration) when you need to account for skipped
     /// rows — for example to emit `null` values for them.
-    pub fn selected_runs(self) -> SelectedRunIter<'sv> {
+    pub fn selected_runs(self) -> impl Iterator<Item = Range<usize>> + 'sv {
         SelectedRunIter { inner: self }
-    }
-
-    /// Convert into an iterator that yields each selected row index as a `usize`,
-    /// silently skipping deselected rows.
-    ///
-    /// This is equivalent to `self.selected_runs().flatten()` but more convenient when
-    /// you don't need the range structure — for example in a simple
-    /// `for row_index in rows.selected_rows() { ... }` loop.
-    pub fn selected_rows(self) -> impl Iterator<Item = usize> + 'sv {
-        self.selected_runs().flatten()
     }
 }
 
@@ -390,10 +380,7 @@ impl<'sv> Iterator for RowIndexIterator<'sv> {
 /// Produced by [`RowIndexIterator::selected_runs`]. Unlike iterating a [`RowIndexIterator`]
 /// directly (which yields both [`RowEvent::Row`] and [`RowEvent::Skipped`] events), this
 /// iterator yields only a `Range<usize>` per contiguous selected run.
-///
-/// Flatten this iterator (or use [`RowIndexIterator::selected_rows`]) to get individual
-/// row indices.
-pub struct SelectedRunIter<'sv> {
+struct SelectedRunIter<'sv> {
     inner: RowIndexIterator<'sv>,
 }
 
