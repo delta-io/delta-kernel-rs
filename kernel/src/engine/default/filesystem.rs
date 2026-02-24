@@ -13,6 +13,7 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
+use crate::metrics::reporter::{COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
@@ -177,13 +178,13 @@ async fn list_from_impl(
             tracing::Level::INFO,
             "storage",
             report = tracing::field::Empty,
-            name = "list_completed",
+            name = LIST_COMPLETED_NAME,
             num_files = items.len() as u64,
             duration = duration.as_nanos() as u64,
         );
         Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
     } else {
-        let stream = MetricsIterator::new(stream, "list_completed", start);
+        let stream = MetricsIterator::new(stream, LIST_COMPLETED_NAME, start);
         Ok(Box::pin(stream))
     }
 }
@@ -227,7 +228,7 @@ async fn read_files_impl(
     // buffer the results. This allows us to achieve async concurrency.
     Ok(Box::pin(MetricsIterator::new(
         files.buffered(readahead),
-        "read_completed",
+        READ_COMPLETED_NAME,
         start,
     )))
 }
@@ -252,7 +253,7 @@ async fn copy_atomic_impl(
         tracing::Level::INFO,
         "storage",
         report = tracing::field::Empty,
-        name = "copy_completed",
+        name = COPY_COMPLETED_NAME,
         duration = duration.as_nanos() as u64,
     );
 

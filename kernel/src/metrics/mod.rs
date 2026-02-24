@@ -68,7 +68,7 @@
 //! correlating to specific Snapshot/Transaction operations.
 
 mod events;
-mod reporter;
+pub(crate) mod reporter;
 
 use std::sync::Arc;
 
@@ -91,7 +91,10 @@ pub trait WithMetricsReporterLayer: Subscriber {
     ///        Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
     ///    )
     /// ```
-    fn with_metrics_reporter_layer(self, reporter: Arc<dyn MetricsReporter>) -> Layered<ReportGeneratorLayer, Self>
+    fn with_metrics_reporter_layer(
+        self,
+        reporter: Arc<dyn MetricsReporter>,
+    ) -> Layered<ReportGeneratorLayer, Self>
     where
         Self: Sized,
         for<'lookup> Self: LookupSpan<'lookup>,

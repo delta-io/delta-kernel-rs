@@ -105,8 +105,7 @@ impl Visit for EventVisitor {
         }
 
         if let Some(MetricEvent::SnapshotCompleted {
-            ref mut version,
-            ..
+            ref mut version, ..
         }) = self.event
         {
             match field.name() {
@@ -146,13 +145,17 @@ struct StorageEventTypeVisitor {
     duration: u64,
 }
 
+pub(crate) const COPY_COMPLETED_NAME: &'static str = "copy_completed";
+pub(crate) const LIST_COMPLETED_NAME: &'static str = "list_completed";
+pub(crate) const READ_COMPLETED_NAME: &'static str = "read_completed";
+
 impl Visit for StorageEventTypeVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "name" {
             match value {
-                "copy_completed" => self.typ = StorageEventType::Copy,
-                "list_completed" => self.typ = StorageEventType::List,
-                "read_completed" => self.typ = StorageEventType::Read,
+                COPY_COMPLETED_NAME => self.typ = StorageEventType::Copy,
+                LIST_COMPLETED_NAME => self.typ = StorageEventType::List,
+                READ_COMPLETED_NAME => self.typ = StorageEventType::Read,
                 _ => warn!("Storage with unknown type: {value}"),
             }
         }

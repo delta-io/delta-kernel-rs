@@ -139,10 +139,7 @@ impl Snapshot {
         let old_version = existing_snapshot.version();
         let new_version = version.into();
         if let Some(new_version) = new_version {
-            tracing::Span::current().record(
-                "version",
-                new_version,
-            );
+            tracing::Span::current().record("version", new_version);
             if new_version == old_version {
                 // Re-requesting the same version
                 return Ok(existing_snapshot.clone());
@@ -154,10 +151,7 @@ impl Snapshot {
                 )));
             }
         } else {
-            tracing::Span::current().record(
-                "version",
-                old_version,
-            );
+            tracing::Span::current().record("version", old_version);
         }
 
         let log_root = old_log_segment.log_root.clone();
@@ -319,10 +313,7 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        tracing::Span::current().record(
-            "version",
-            table_configuration.version(),
-        );
+        tracing::Span::current().record("version", table_configuration.version());
 
         Ok(Self::new(log_segment, table_configuration))
     }
