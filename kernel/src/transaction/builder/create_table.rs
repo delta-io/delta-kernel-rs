@@ -145,7 +145,7 @@ fn add_feature_to_lists(
                 writer_features.push(feature);
             }
         }
-        FeatureType::Writer | FeatureType::Unknown => {
+        FeatureType::WriterOnly | FeatureType::Unknown => {
             if !writer_features.contains(&feature) {
                 writer_features.push(feature);
             }
