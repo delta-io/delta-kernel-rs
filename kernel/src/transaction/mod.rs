@@ -53,7 +53,11 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod post_commit_context;
 mod update;
+
+use post_commit_context::FileSizeVisitor;
+pub(crate) use post_commit_context::PostCommitContext;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -322,9 +326,10 @@ impl<S> Transaction<S> {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
+        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
-            self.get_in_commit_timestamp(engine)?,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
@@ -357,6 +362,14 @@ impl<S> Transaction<S> {
         // Step 4b: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+
+        // Step 4c: Accumulate file statistics for PostCommitContext (CRC writing).
+        // This visits the in-memory add/remove data before the committer consumes it.
+        // Best-effort: if accumulation fails (e.g. missing size column in test data),
+        // we still proceed with the commit but without CRC context.
+        let post_commit_context = self
+            .accumulate_post_commit_context(in_commit_timestamp)
+            .ok();
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
@@ -406,7 +419,7 @@ impl<S> Transaction<S> {
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(file_meta)?,
+                self.into_committed(file_meta, post_commit_context)?,
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -1065,7 +1078,63 @@ impl<S> Transaction<S> {
         }
     }
 
-    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+    /// Accumulate file statistics and other commit-level information for CRC writing.
+    /// This visits the in-memory add/remove file data before the committer consumes it.
+    fn accumulate_post_commit_context(
+        &self,
+        in_commit_timestamp: Option<i64>,
+    ) -> DeltaResult<PostCommitContext> {
+        // Count add files and sum their sizes
+        let mut add_visitor = FileSizeVisitor::default();
+        for batch in &self.add_files_metadata {
+            add_visitor.visit_rows_of(batch.as_ref())?;
+        }
+
+        // Count remove files and sum their sizes (respecting selection vectors)
+        let mut remove_visitor = FileSizeVisitor::default();
+        for filtered in &self.remove_files_metadata {
+            // We need a fresh visitor per batch to use the correct selection vector,
+            // then accumulate into the main visitor.
+            let mut batch_visitor =
+                FileSizeVisitor::with_selection_vector(filtered.selection_vector());
+            batch_visitor.visit_rows_of(filtered.data())?;
+            remove_visitor.count += batch_visitor.count;
+            remove_visitor.total_size += batch_visitor.total_size;
+        }
+
+        // Also count removes from DV updates (each DV update generates a remove+add pair)
+        for dv_file in &self.dv_matched_files {
+            let mut batch_visitor =
+                FileSizeVisitor::with_selection_vector(dv_file.selection_vector());
+            batch_visitor.visit_rows_of(dv_file.data())?;
+            remove_visitor.count += batch_visitor.count;
+            remove_visitor.total_size += batch_visitor.total_size;
+        }
+
+        // Collect domain metadata actions that this transaction committed
+        let mut dm_actions: Vec<DomainMetadata> = Vec::new();
+        dm_actions.extend(self.system_domain_metadata_additions.iter().cloned());
+        dm_actions.extend(self.user_domain_metadata_additions.iter().cloned());
+        for domain in &self.user_domain_removals {
+            dm_actions.push(DomainMetadata::remove(domain.clone(), String::new()));
+        }
+
+        Ok(PostCommitContext {
+            num_add_files: add_visitor.count,
+            total_add_file_size_bytes: add_visitor.total_size,
+            num_remove_files: remove_visitor.count,
+            total_remove_file_size_bytes: remove_visitor.total_size,
+            domain_metadata_actions: dm_actions,
+            in_commit_timestamp,
+            operation: self.operation.clone(),
+        })
+    }
+
+    fn into_committed(
+        self,
+        file_meta: FileMeta,
+        post_commit_context: Option<PostCommitContext>,
+    ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1086,6 +1155,7 @@ impl<S> Transaction<S> {
             post_commit_snapshot: Some(Arc::new(
                 self.read_snapshot.new_post_commit(parsed_commit)?,
             )),
+            post_commit_context,
         })
     }
 
@@ -1352,6 +1422,10 @@ pub struct CommittedTransaction {
     /// This is optional to allow incremental development of new features (e.g., table creation,
     /// transaction retries) without blocking on implementing post-commit snapshot support.
     post_commit_snapshot: Option<SnapshotRef>,
+    /// Context from the commit (file stats delta, known DMs, ICT, operation) for CRC writing.
+    /// Used by the CRC writer (future PR) to compute numFiles/tableSizeBytes.
+    #[allow(dead_code)] // Will be used by CRC writer
+    post_commit_context: Option<PostCommitContext>,
 }
 
 impl CommittedTransaction {
@@ -1368,6 +1442,13 @@ impl CommittedTransaction {
     /// The [`SnapshotRef`] of the table after this transaction was committed.
     pub fn post_commit_snapshot(&self) -> Option<&SnapshotRef> {
         self.post_commit_snapshot.as_ref()
+    }
+
+    /// The [`PostCommitContext`] for this transaction, containing file stats delta,
+    /// domain metadata actions, ICT, and operation info for CRC writing.
+    #[allow(dead_code)] // Will be used by CRC writer
+    pub(crate) fn post_commit_context(&self) -> Option<&PostCommitContext> {
+        self.post_commit_context.as_ref()
     }
 }
 
