@@ -36,7 +36,7 @@ const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c00
 
 /// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
 /// conventions where the table metadata declares columns as nullable.
-fn make_nullable_fields(batch: &RecordBatch) -> RecordBatch {
+fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(
         batch
             .schema()
@@ -78,7 +78,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
-    let expected = make_nullable_fields(&batch);
+    let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
 
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
@@ -130,7 +130,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
-    let expected = make_nullable_fields(&batch);
+    let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
 
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
@@ -183,7 +183,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
-    let expected = make_nullable_fields(&batch);
+    let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected];
 
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
@@ -213,8 +213,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .fold(String::new(), |a, b| a + &b + "\n")
     }
 
-    let batch1 = make_nullable_fields(&generate_simple_batch()?);
-    let batch2 = make_nullable_fields(&generate_batch(vec![
+    let batch1 = make_top_level_fields_nullable(&generate_simple_batch()?);
+    let batch2 = make_top_level_fields_nullable(&generate_batch(vec![
         ("id", vec![5, 7].into_array()),
         ("val", vec!["e", "g"].into_array()),
     ])?);

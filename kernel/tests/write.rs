@@ -3465,9 +3465,11 @@ async fn test_column_mapping_partitioned_write(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_create_checkpoint_on_external_table() {
-    // Use an external table: 7 rows with columns (i, j, k), with different nullability
-    //  than the schema of kernel uses to read.
+async fn test_checkpoint_non_kernel_written_table() {
+    // Table written by a non-kernel-integrated connector: 7 rows with columns (i, j, k), where
+    // parquet field nullabilities differ from the Delta schema. DefaultEngine reads it, coerces
+    // nullabilities to match the Delta schema, creates a checkpoint, and verifies the data is
+    // unchanged.
     let source_path = std::path::Path::new("./tests/data/external-table-different-nullability");
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("test-checkpoint-table");
