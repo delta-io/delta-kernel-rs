@@ -326,6 +326,12 @@ impl Metadata {
         &self.configuration
     }
 
+    /// The format specification for files stored in the table.
+    #[internal_api]
+    pub(crate) fn format(&self) -> &Format {
+        &self.format
+    }
+
     #[internal_api]
     pub(crate) fn schema_string(&self) -> &String {
         &self.schema_string
@@ -985,6 +991,12 @@ impl DomainMetadata {
     #[internal_api]
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
+    }
+
+    /// Returns true if this is a tombstone (removal) action.
+    #[internal_api]
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.removed
     }
 }
 
