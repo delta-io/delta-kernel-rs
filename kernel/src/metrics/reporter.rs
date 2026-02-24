@@ -103,6 +103,17 @@ impl Visit for EventVisitor {
                 _ => warn!("Invalid field recorded on segment.read_metadata span"),
             }
         }
+
+        if let Some(MetricEvent::SnapshotCompleted {
+            ref mut version,
+            ..
+        }) = self.event
+        {
+            match field.name() {
+                "version" => *version = value,
+                _ => warn!("Invalid field recorded on snap.completed span"),
+            }
+        }
     }
 
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {

@@ -127,7 +127,7 @@ impl Snapshot {
     /// snapshot to a later version.
     ///
     /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
-    #[instrument(name = "snap.completed", err, fields(report, operation_id = %operation_id), skip(engine, version))]
+    #[instrument(name = "snap.completed", err, fields(report, version, operation_id = %operation_id), skip(engine))]
     fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -139,6 +139,10 @@ impl Snapshot {
         let old_version = existing_snapshot.version();
         let new_version = version.into();
         if let Some(new_version) = new_version {
+            tracing::Span::current().record(
+                "version",
+                new_version,
+            );
             if new_version == old_version {
                 // Re-requesting the same version
                 return Ok(existing_snapshot.clone());
@@ -149,6 +153,11 @@ impl Snapshot {
                     "Requested snapshot version {new_version} is older than snapshot hint version {old_version}"
                 )));
             }
+        } else {
+            tracing::Span::current().record(
+                "version",
+                old_version,
+            );
         }
 
         let log_root = old_log_segment.log_root.clone();
@@ -293,7 +302,7 @@ impl Snapshot {
     /// Create a new [`Snapshot`] instance.
     ///
     /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
-    #[instrument(err, name = "snap.completed", fields(report, operation_id = %operation_id), skip(engine))]
+    #[instrument(err, name = "snap.completed", fields(report, version, operation_id = %operation_id), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
@@ -309,6 +318,11 @@ impl Snapshot {
 
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+
+        tracing::Span::current().record(
+            "version",
+            table_configuration.version(),
+        );
 
         Ok(Self::new(log_segment, table_configuration))
     }
