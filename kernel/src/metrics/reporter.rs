@@ -145,9 +145,9 @@ struct StorageEventTypeVisitor {
     duration: u64,
 }
 
-pub(crate) const COPY_COMPLETED_NAME: &'static str = "copy_completed";
-pub(crate) const LIST_COMPLETED_NAME: &'static str = "list_completed";
-pub(crate) const READ_COMPLETED_NAME: &'static str = "read_completed";
+pub(crate) const COPY_COMPLETED_NAME: &str = "copy_completed";
+pub(crate) const LIST_COMPLETED_NAME: &str = "list_completed";
+pub(crate) const READ_COMPLETED_NAME: &str = "read_completed";
 
 impl Visit for StorageEventTypeVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
