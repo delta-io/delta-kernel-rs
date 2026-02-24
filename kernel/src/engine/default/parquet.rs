@@ -438,16 +438,7 @@ async fn open_parquet_file(
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-    // Filter row groups based on predicate variant
-    match predicate {
-        FilePredicate::None => {}
-        FilePredicate::Data(ref pred) => {
-            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
-        }
-        FilePredicate::Checkpoint { .. } => {
-            // Checkpoint-aware row group skipping is handled separately (PR 2).
-        }
-    }
+    builder = builder.with_file_predicate_filter(&predicate, row_indexes.as_mut());
     if let Some(limit) = limit {
         builder = builder.with_limit(limit)
     }
@@ -523,16 +514,7 @@ impl FileOpener for PresignedUrlOpener {
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
                 .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-            // Filter row groups based on predicate variant
-            match predicate {
-                FilePredicate::None => {}
-                FilePredicate::Data(ref pred) => {
-                    builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
-                }
-                FilePredicate::Checkpoint { .. } => {
-                    // Checkpoint-aware row group skipping is handled separately (PR 2).
-                }
-            }
+            builder = builder.with_file_predicate_filter(&predicate, row_indexes.as_mut());
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }
@@ -1549,7 +1531,11 @@ mod tests {
 
         // Should successfully match by field ID despite different names
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(slice::from_ref(&file_meta), kernel_schema, FilePredicate::None)
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                kernel_schema,
+                FilePredicate::None,
+            )
             .unwrap()
             .map(into_record_batch)
             .try_collect()

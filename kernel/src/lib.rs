@@ -74,7 +74,6 @@
 extern crate self as delta_kernel;
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fs::DirEntry;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -672,20 +671,17 @@ pub enum FilePredicate {
     None,
     /// Standard row group skipping — predicate columns map directly to parquet columns.
     Data(PredicateRef),
-    /// Checkpoint row group skipping — predicate references data columns (e.g., `id`)
-    /// and the reader remaps them to `add.stats_parsed.{minValues,maxValues,nullCount}.id`
-    /// in the parquet footer for row group filtering.
-    ///
-    /// Partition column predicates are also supported: they are remapped to
-    /// `add.partitionValues_parsed.<col>` where both min and max stats come from the
-    /// same column (the actual partition value stored in the checkpoint).
-    Checkpoint {
-        predicate: PredicateRef,
-        /// Maps physical partition column names (as used in the predicate) to logical
-        /// column names (as stored in `partitionValues_parsed`). Empty if no partition
-        /// columns are referenced.
-        partition_columns: HashMap<expressions::ColumnName, expressions::ColumnName>,
-    },
+}
+
+impl FilePredicate {
+    /// Creates a `FilePredicate` from an optional predicate. Returns `Data(pred)` if `Some`,
+    /// or `None` if the predicate is absent.
+    pub fn data(predicate: Option<PredicateRef>) -> Self {
+        match predicate {
+            Some(pred) => Self::Data(pred),
+            None => Self::None,
+        }
+    }
 }
 
 /// Provides Parquet file related functionalities to Delta Kernel.

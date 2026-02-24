@@ -41,16 +41,7 @@ fn try_create_from_parquet(
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-    // Filter row groups based on predicate variant
-    match predicate {
-        FilePredicate::None => {}
-        FilePredicate::Data(ref pred) => {
-            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
-        }
-        FilePredicate::Checkpoint { .. } => {
-            // Checkpoint-aware row group skipping is handled separately (PR 2).
-        }
-    }
+    builder = builder.with_file_predicate_filter(&predicate, row_indexes.as_mut());
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;

@@ -7,6 +7,7 @@ use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
+use crate::FilePredicate;
 use chrono::{DateTime, Days};
 use std::collections::HashMap;
 use tracing::debug;
@@ -24,6 +25,15 @@ pub(crate) trait ParquetRowGroupSkipping {
     fn with_row_group_filter(
         self,
         predicate: &Predicate,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self;
+
+    /// Applies row group filtering based on a [`FilePredicate`]. For `Data` predicates, this
+    /// delegates to [`with_row_group_filter`](Self::with_row_group_filter). For `None`, this is
+    /// a no-op.
+    fn with_file_predicate_filter(
+        self,
+        predicate: &FilePredicate,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
 }
@@ -48,6 +58,17 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             row_indexes.select_row_groups(&ordinals);
         }
         self.with_row_groups(ordinals)
+    }
+
+    fn with_file_predicate_filter(
+        self,
+        predicate: &FilePredicate,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self {
+        match predicate {
+            FilePredicate::None => self,
+            FilePredicate::Data(pred) => self.with_row_group_filter(pred, row_indexes),
+        }
     }
 }
 

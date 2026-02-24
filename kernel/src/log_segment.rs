@@ -519,15 +519,11 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let file_predicate = match meta_predicate {
-            Some(pred) => FilePredicate::Data(pred),
-            None => FilePredicate::None,
-        };
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
             action_schema,
-            file_predicate,
+            FilePredicate::data(meta_predicate),
             None,
         )?;
         Ok(result.actions)
@@ -771,21 +767,13 @@ impl LogSegment {
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
-        // Extract a plain predicate for JSON handler (which doesn't understand FilePredicate).
-        let json_predicate = match &meta_predicate {
-            FilePredicate::Data(pred)
-            | FilePredicate::Checkpoint {
-                predicate: pred, ..
-            } => Some(pred.clone()),
-            FilePredicate::None => None,
-        };
-
         let actions = match self.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
+                // The default JSON handler doesn't support predicate pushdown, so pass None.
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    json_predicate,
+                    None,
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler

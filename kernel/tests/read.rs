@@ -370,10 +370,7 @@ fn read_with_scan_metadata(
             .read_parquet_files(
                 &[meta],
                 scan.physical_schema().clone(),
-                match scan.physical_predicate() {
-                    Some(pred) => FilePredicate::Data(pred),
-                    None => FilePredicate::None,
-                },
+                FilePredicate::data(scan.physical_predicate()),
             )
             .unwrap();
 

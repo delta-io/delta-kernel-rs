@@ -46,11 +46,12 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let file_predicate = match predicate {
-            Some(pred) => FilePredicate::Data(pred),
-            None => FilePredicate::None,
-        };
-        read_files(files, schema, file_predicate, try_create_from_json)
+        read_files(
+            files,
+            schema,
+            FilePredicate::data(predicate),
+            try_create_from_json,
+        )
     }
 
     fn parse_json(

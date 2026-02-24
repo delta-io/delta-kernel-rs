@@ -700,11 +700,10 @@ impl Scan {
         let (checkpoint_schema, meta_predicate) = if self.skip_stats {
             (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), FilePredicate::None)
         } else {
-            let pred = match self.build_actions_meta_predicate() {
-                Some(pred) => FilePredicate::Data(pred),
-                None => FilePredicate::None,
-            };
-            (CHECKPOINT_READ_SCHEMA.clone(), pred)
+            (
+                CHECKPOINT_READ_SCHEMA.clone(),
+                FilePredicate::data(self.build_actions_meta_predicate()),
+            )
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
@@ -759,11 +758,10 @@ impl Scan {
         let (checkpoint_schema, meta_predicate) = if self.skip_stats {
             (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), FilePredicate::None)
         } else {
-            let pred = match self.build_actions_meta_predicate() {
-                Some(pred) => FilePredicate::Data(pred),
-                None => FilePredicate::None,
-            };
-            (CHECKPOINT_READ_SCHEMA.clone(), pred)
+            (
+                CHECKPOINT_READ_SCHEMA.clone(),
+                FilePredicate::data(self.build_actions_meta_predicate()),
+            )
         };
         self.snapshot
             .log_segment()
