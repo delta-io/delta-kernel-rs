@@ -138,8 +138,8 @@ impl DataSkippingFilter {
     }
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
-    /// which can be applied to the batch to find rows that passed data skipping.
-    pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+    /// and the number of filtered rows for metrics tracking.
+    pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<(Vec<bool>, u64)> {
         let batch_len = batch.len();
 
         let file_stats = self.stats_evaluator.evaluate(batch)?;
@@ -189,7 +189,7 @@ impl DataSkippingFilter {
             info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
         }
 
-        Ok(visitor.selection_vector)
+        Ok((visitor.selection_vector, visitor.num_filtered))
     }
 }
 

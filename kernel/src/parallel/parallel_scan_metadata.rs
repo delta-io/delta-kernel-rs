@@ -39,8 +39,23 @@ impl SequentialScanMetadata {
 
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterSequentialScanMetadata::Done),
+            AfterSequential::Done(processor) => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Completed sequential scan metadata");
+                Ok(AfterSequentialScanMetadata::Done)
+            }
             AfterSequential::Parallel { processor, files } => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Completed sequential scan metadata");
+                processor.get_metrics().reset_counters();
+
+                // Enable logging on drop for parallel
+                processor
+                    .get_metrics()
+                    .set_log_on_drop("Completed parallel scan metadata");
+
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState { inner: processor }),
                     files,
@@ -93,6 +108,8 @@ impl ParallelState {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+        // Disable logging on drop since we're serializing, not completing
+        self.inner.get_metrics().clear_log_on_drop();
         self.inner.into_serializable_state()
     }
 
@@ -109,6 +126,11 @@ impl ParallelState {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
+        // Enable logging on drop for the reconstructed state. This will include all the metrics
+        // across parallel workers.
+        inner
+            .get_metrics()
+            .set_log_on_drop("Completed parallel scan metadata");
         Ok(Self { inner })
     }
 

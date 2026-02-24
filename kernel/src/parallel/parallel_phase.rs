@@ -398,6 +398,7 @@ mod tests {
         predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
+        dispatcher: Option<tracing::Dispatch>,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
@@ -442,8 +443,12 @@ mod tests {
                     .map(|partition_files| {
                         let engine = engine.clone();
                         let state = final_state.clone();
+                        let dispatcher = dispatcher.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
+                            // Set the dispatcher in this thread to capture logs
+                            let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
+
                             assert!(!partition_files.is_empty());
 
                             let mut parallel = ParallelScanMetadata::try_new(
@@ -481,66 +486,274 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parallel_with_json_sidecars() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                )?;
-            }
-        }
-        Ok(())
+    /// Extract a metric value from logs by searching for "metric_name=value"
+    fn extract_metric(logs: &str, metric_name: &str) -> u64 {
+        let Some(pos) = logs.find(&format!("{}=", metric_name)) else {
+            panic!("Failed to find {} in logs", metric_name);
+        };
+        let after = &logs[pos + metric_name.len() + 1..];
+        let Some(space_pos) = after.find(char::is_whitespace) else {
+            panic!("Failed to find end of {} value", metric_name);
+        };
+        let value_str = &after[..space_pos];
+        value_str
+            .parse()
+            .unwrap_or_else(|_| panic!("Failed to parse {} value: {}", metric_name, value_str))
     }
 
-    #[test]
-    fn test_parallel_with_parquet_sidecars() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-parquet-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                )?;
-            }
-        }
-        Ok(())
+    /// Expected metric values for a test case
+    #[derive(Debug, Clone)]
+    struct ExpectedMetrics {
+        // Sequential phase counter metrics
+        sequential_adds: u64,
+        sequential_removes: u64,
+        sequential_non_file_actions: u64,
+        sequential_data_skipping_filtered: u64,
+        sequential_partition_pruning_filtered: u64,
+
+        // Parallel phase counter metrics (None if parallel phase not expected)
+        parallel_adds_per_run: Option<u64>,
+        parallel_removes_per_run: Option<u64>,
+        parallel_non_file_actions_per_run: Option<u64>,
+        parallel_data_skipping_filtered_per_run: Option<u64>,
+        parallel_partition_pruning_filtered_per_run: Option<u64>,
     }
 
-    #[test]
-    fn test_no_parallel_phase_needed() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "table-without-dv-small",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                )?;
+    fn verify_metrics_in_logs(
+        logs: &str,
+        table_name: &str,
+        expected: &ExpectedMetrics,
+        num_test_runs: usize,
+    ) {
+        // Verify Sequentialmetrics were logged
+        assert!(
+            logs.contains("Completed sequential scan metadata"),
+            "Expected Sequentialcompletion log for table '{}'",
+            table_name
+        );
+
+        // Extract and verify counter values from Phase 1
+        let sequential_adds = extract_metric(logs, "num_adds");
+        let sequential_removes = extract_metric(logs, "num_removes");
+        let sequential_non_file_actions = extract_metric(logs, "num_non_file_actions");
+        let data_skipping_filtered = extract_metric(logs, "data_skipping_filtered");
+        let partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
+
+        assert_eq!(
+            sequential_adds, expected.sequential_adds,
+            "Sequentialnum_adds mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            sequential_removes, expected.sequential_removes,
+            "Sequentialnum_removes mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            sequential_non_file_actions, expected.sequential_non_file_actions,
+            "Sequentialnum_non_file_actions mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            data_skipping_filtered, expected.sequential_data_skipping_filtered,
+            "Sequentialdata_skipping_filtered mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            partition_pruning_filtered, expected.sequential_partition_pruning_filtered,
+            "Sequentialpartition_pruning_filtered mismatch for {}",
+            table_name
+        );
+
+        // Verify timing metrics are present and parseable
+        let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
+        let _data_skipping_time = extract_metric(logs, "data_skipping_time_ms");
+        let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
+
+        // Verify Parallelmetrics if expected
+        if let Some(expected_adds_per_run) = expected.parallel_adds_per_run {
+            // Extract Parallelcounter values
+            // Note: There may be multiple "Completed Phase 2" logs (from multiple test configurations)
+            // Validate that EVERY Parallellog has the expected counter values
+            let mut total_parallel_adds = 0u64;
+            let mut search_start = 0;
+            let mut parallel_count = 0;
+
+            while let Some(pos) = logs[search_start..].find("Completed parallel scan metadata") {
+                let absolute_pos = search_start + pos;
+                let remaining = &logs[absolute_pos..];
+                parallel_count += 1;
+
+                // Extract and validate num_adds
+                let adds = extract_metric(remaining, "num_adds");
+                total_parallel_adds += adds;
+                assert_eq!(
+                    adds, expected_adds_per_run,
+                    "Parallellog #{} num_adds mismatch for {}",
+                    parallel_count, table_name
+                );
+
+                // Extract and validate num_removes
+                let removes = extract_metric(remaining, "num_removes");
+                assert_eq!(
+                    removes,
+                    expected.parallel_removes_per_run.unwrap(),
+                    "Parallellog #{} num_removes mismatch for {}",
+                    parallel_count,
+                    table_name
+                );
+
+                // Extract and validate num_non_file_actions
+                let non_file_actions = extract_metric(remaining, "num_non_file_actions");
+                assert_eq!(
+                    non_file_actions,
+                    expected.parallel_non_file_actions_per_run.unwrap(),
+                    "Parallellog #{} num_non_file_actions mismatch for {}",
+                    parallel_count,
+                    table_name
+                );
+
+                // Extract and validate data_skipping_filtered
+                let data_skipping_filtered = extract_metric(remaining, "data_skipping_filtered");
+                assert_eq!(
+                    data_skipping_filtered,
+                    expected.parallel_data_skipping_filtered_per_run.unwrap(),
+                    "Parallellog #{} data_skipping_filtered mismatch for {}",
+                    parallel_count,
+                    table_name
+                );
+
+                // Extract and validate partition_pruning_filtered
+                let partition_pruning_filtered =
+                    extract_metric(remaining, "partition_pruning_filtered");
+                assert_eq!(
+                    partition_pruning_filtered,
+                    expected
+                        .parallel_partition_pruning_filtered_per_run
+                        .unwrap(),
+                    "Parallellog #{} partition_pruning_filtered mismatch for {}",
+                    parallel_count,
+                    table_name
+                );
+
+                search_start = absolute_pos + 1;
             }
+
+            // Verify total adds across all Parallelruns
+            let expected_total = expected_adds_per_run * num_test_runs as u64;
+            assert_eq!(
+                total_parallel_adds, expected_total,
+                "Expected total of {} adds across all Parallelruns for {} ({} runs × {} adds each), found: {}",
+                expected_total, table_name, num_test_runs, expected_adds_per_run, total_parallel_adds
+            );
         }
-        Ok(())
     }
 
-    #[test]
-    fn test_parallel_with_dataskipping_predicate() -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression as Expr};
-
-        let predicate = Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)));
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    Some(predicate.clone()),
-                    with_serde,
-                    one_file_per_worker,
-                )?;
-            }
+    /// Tests parallel workflow with sidecars and verifies metrics logging.
+    ///
+    /// This parameterized test covers both JSON and Parquet checkpoint sidecars,
+    /// with all combinations of serialization and worker configurations.
+    ///
+    /// Note: This test captures logs from spawned threads by sharing the tracing dispatcher.
+    /// If running with other tests in parallel causes flakiness, use `--test-threads=1`.
+    #[rstest::rstest]
+    #[case::json_sidecars(
+        "v2-checkpoints-json-with-sidecars",
+        None,
+        ExpectedMetrics {
+            sequential_adds: 0,
+            sequential_removes: 0,
+            sequential_non_file_actions: 5,
+            sequential_data_skipping_filtered: 0,
+            sequential_partition_pruning_filtered: 0,
+            parallel_adds_per_run: Some(101),
+            parallel_removes_per_run: Some(0),
+            parallel_non_file_actions_per_run: Some(0),
+            parallel_data_skipping_filtered_per_run: Some(0),
+            parallel_partition_pruning_filtered_per_run: Some(0),
         }
+    )]
+    #[case::parquet_sidecars(
+        "v2-checkpoints-parquet-with-sidecars",
+        None,
+        ExpectedMetrics {
+            sequential_adds: 0,
+            sequential_removes: 0,
+            sequential_non_file_actions: 5,
+            sequential_data_skipping_filtered: 0,
+            sequential_partition_pruning_filtered: 0,
+            parallel_adds_per_run: Some(101),
+            parallel_removes_per_run: Some(0),
+            parallel_non_file_actions_per_run: Some(0),
+            parallel_data_skipping_filtered_per_run: Some(0),
+            parallel_partition_pruning_filtered_per_run: Some(0),
+        }
+    )]
+    #[case::json_sidecars_with_predicate(
+        "v2-checkpoints-json-with-sidecars",
+        Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+        }),
+        ExpectedMetrics {
+            sequential_adds: 0,
+            sequential_removes: 0,
+            sequential_non_file_actions: 5,
+            sequential_data_skipping_filtered: 0,
+            sequential_partition_pruning_filtered: 0,
+            // Data skipping predicate filters 4 files (101 → 97)
+            parallel_adds_per_run: Some(97),
+            parallel_removes_per_run: Some(0),
+            parallel_non_file_actions_per_run: Some(0),
+            parallel_data_skipping_filtered_per_run: Some(4),
+            parallel_partition_pruning_filtered_per_run: Some(0),
+        }
+    )]
+    #[case::no_parallel_needed(
+        "table-without-dv-small",
+        None,
+        ExpectedMetrics {
+            // This table has single-part checkpoint, completes in Phase 1
+            sequential_adds: 1,
+            sequential_removes: 0,
+            sequential_non_file_actions: 3,
+            sequential_data_skipping_filtered: 0,
+            sequential_partition_pruning_filtered: 0,
+            // No Parallelneeded
+            parallel_adds_per_run: None,
+            parallel_removes_per_run: None,
+            parallel_non_file_actions_per_run: None,
+            parallel_data_skipping_filtered_per_run: None,
+            parallel_partition_pruning_filtered_per_run: None,
+        }
+    )]
+    fn test_parallel_workflow_with_metrics(
+        #[case] table_name: &str,
+        #[case] predicate: Option<PredicateRef>,
+        #[case] expected: ExpectedMetrics,
+        #[values(false, true)] with_serde: bool,
+        #[values(false, true)] one_file_per_worker: bool,
+    ) -> DeltaResult<()> {
+        use test_utils::LoggingTest;
+
+        // Set up log capture
+        let logging_test = LoggingTest::new();
+
+        // Capture the dispatcher to share with spawned threads
+        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
+        verify_parallel_workflow(
+            table_name,
+            predicate,
+            with_serde,
+            one_file_per_worker,
+            Some(dispatcher),
+        )?;
+
+        // Verify metrics were logged
+        let logs = logging_test.logs();
+        verify_metrics_in_logs(&logs, table_name, &expected, 1);
+
         Ok(())
     }
 
