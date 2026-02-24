@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::UCCommitsClient;
 
@@ -133,7 +133,7 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         for catalog_commit in publish_metadata.commits_to_publish() {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();
-            debug!(
+            info!(
                 version = catalog_commit.version(),
                 source = %src,
                 destination = %dest,
