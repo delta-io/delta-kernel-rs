@@ -1,8 +1,10 @@
 //! Utility functions for loading workload specifications
 
-use crate::benchmarks::models::{Spec, TableInfo, Workload};
-use std::io::Write;
+use delta_kernel::benchmarks::models::{Spec, TableInfo, Workload};
+use flate2::read::GzDecoder;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use tar::Archive;
 
 // Workload extraction configuration
 const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads.tar.gz");
@@ -50,11 +52,9 @@ fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::BufReader;
-
     let file = std::fs::File::open(path)?;
-    let tarball = flate2::read::GzDecoder::new(BufReader::new(file));
-    let mut archive = tar::Archive::new(tarball);
+    let tarball = GzDecoder::new(BufReader::new(file));
+    let mut archive = Archive::new(tarball);
 
     std::fs::create_dir_all(OUTPUT_FOLDER)
         .map_err(|e| format!("Failed to create output directory: {}", e))?;

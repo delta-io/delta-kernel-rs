@@ -55,8 +55,6 @@ tracing = { version = "0.1", features = ["log"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
-tar = "0.4"
-flate2 = "1"
 
 # optional deps
 futures = { version = "0.3", optional = true }
@@ -159,6 +157,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 rstest = "0.23"
+tar = "0.4"
+flate2 = "1"
 
 [[bench]]
 name = "metadata_bench"
