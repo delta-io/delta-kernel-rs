@@ -21,6 +21,11 @@ use crate::DeltaResult;
 /// on another thread. This could be a multi-threaded runtime, like Tokio's or
 /// could be a single-threaded runtime on a background thread.
 pub trait TaskExecutor: Send + Sync + 'static {
+    /// The type of guard returned for `enter`
+    type Guard<'a>
+    where
+        Self: 'a;
+
     /// Block on the given future, returning its output.
     ///
     /// This should NOT panic if called within an async context. Thus it can't
@@ -39,6 +44,9 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
+
+    /// Enter the runtime context of this executor.
+    fn enter(&self) -> Self::Guard<'_>;
 }
 
 #[cfg(any(feature = "tokio", test))]
@@ -47,7 +55,7 @@ pub mod tokio {
     use futures::TryFutureExt;
     use futures::{future::BoxFuture, Future};
     use std::sync::mpsc::channel;
-    use tokio::runtime::RuntimeFlavor;
+    use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
     use crate::{DeltaResult, Error};
 
@@ -56,6 +64,7 @@ pub mod tokio {
     #[derive(Debug)]
     pub struct TokioBackgroundExecutor {
         sender: tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>,
+        handle: Handle,
         _thread: std::thread::JoinHandle<()>,
     }
 
@@ -67,20 +76,25 @@ pub mod tokio {
 
     impl TokioBackgroundExecutor {
         pub fn new() -> Self {
+            let (handle_sender, handle_receiver) = std::sync::mpsc::channel::<Handle>();
             let (sender, mut receiver) = tokio::sync::mpsc::channel::<BoxFuture<'_, ()>>(50);
             let thread = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
+                let handle = rt.handle().clone();
+                handle_sender.send(handle).unwrap();
                 rt.block_on(async move {
                     while let Some(task) = receiver.recv().await {
                         tokio::task::spawn(task);
                     }
                 });
             });
+            let handle = handle_receiver.recv().unwrap();
             Self {
                 sender,
+                handle,
                 _thread: thread,
             }
         }
@@ -107,6 +121,8 @@ pub mod tokio {
     }
 
     impl TaskExecutor for TokioBackgroundExecutor {
+        type Guard<'a> = EnterGuard<'a>;
+
         fn block_on<T>(&self, task: T) -> T::Output
         where
             T: Future + Send + 'static,
@@ -146,6 +162,10 @@ pub mod tokio {
             R: Send + 'static,
         {
             Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+        }
+
+        fn enter(&self) -> EnterGuard<'_> {
+            self.handle.enter()
         }
     }
 
@@ -213,6 +233,8 @@ pub mod tokio {
     }
 
     impl TaskExecutor for TokioMultiThreadExecutor {
+        type Guard<'a> = EnterGuard<'a>;
+
         // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
         // See:
         // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
@@ -270,6 +292,10 @@ pub mod tokio {
             R: Send + 'static,
         {
             Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+        }
+
+        fn enter(&self) -> EnterGuard<'_> {
+            self.handle.enter()
         }
     }
 
@@ -424,6 +450,33 @@ pub mod tokio {
                 42
             });
             assert_eq!(result, 42);
+        }
+
+        #[rstest::rstest]
+        #[case::multithreaded(
+            TokioMultiThreadExecutor::new_owned_runtime(None, None).expect("Couldn't create multithreaded executor")
+        )]
+        #[case::background(TokioBackgroundExecutor::new())]
+        fn can_enter_a_runtime<T: TaskExecutor>(#[case] executor: T) {
+            // Verify we're not inside a Tokio runtime
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Test must run outside of a Tokio runtime"
+            );
+
+            let guard = executor.enter();
+
+            assert!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                "Should have entered runtime"
+            );
+
+            drop(guard);
+
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "Should have exited runtime"
+            );
         }
     }
 }

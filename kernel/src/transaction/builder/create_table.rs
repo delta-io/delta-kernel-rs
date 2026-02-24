@@ -15,6 +15,7 @@ use url::Url;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
+use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
@@ -24,7 +25,6 @@ use crate::table_features::{
     assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
     get_top_level_column_physical_name, ColumnMappingMode, FeatureType, TableFeature,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
@@ -49,6 +49,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // specifying clustering columns via `with_data_layout()`.
     // As features are supported, add them here:
     // TableFeature::DeletionVectors,
+    TableFeature::V2Checkpoint,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -541,12 +542,8 @@ impl CreateTableTransactionBuilder {
         )?;
 
         // Create Protocol action with table features support
-        let protocol = Protocol::try_new(
-            TABLE_FEATURES_MIN_READER_VERSION,
-            TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(validated.reader_features),
-            Some(validated.writer_features),
-        )?;
+        let protocol =
+            Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
 
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
@@ -567,7 +564,11 @@ impl CreateTableTransactionBuilder {
 
         // Create Transaction<CreateTable> with pre-commit snapshot
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(log_segment, table_configuration)),
+            Arc::new(Snapshot::new(
+                log_segment,
+                table_configuration,
+                Arc::new(LazyCrc::new(None)),
+            )),
             self.engine_info,
             committer,
             system_domain_metadata,

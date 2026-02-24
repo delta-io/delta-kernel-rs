@@ -999,12 +999,14 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 #[rstest]
 #[case::comparison(
     Pred::gt(column_expr!("id"), Expr::literal(200i64)),
-    Some(3),
+    // Should skip RG2 and RG3, but https://github.com/apache/arrow-rs/issues/9451
+    Some(6), // Some(3),
     "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
     Pred::is_null(column_expr!("id")),
-    Some(5),
+    // Should skip RG 1 (nullCount=0), but https://github.com/apache/arrow-rs/issues/9451
+    Some(6), // Some(5),
     "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(
@@ -1060,4 +1062,58 @@ fn test_checkpoint_row_group_skipping(
             assert_eq!(total_rows, 6, "all rows should be read without a predicate");
         }
     }
+}
+
+#[test]
+fn test_skip_stats_disables_data_skipping() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_skip_stats(true)
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, 6);
+}
+
+#[test]
+fn test_skip_stats_and_include_stats_columns_errors() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let result = snapshot
+        .scan_builder()
+        .with_skip_stats(true)
+        .include_stats_columns()
+        .build();
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Cannot set both skip_stats and include_stats_columns"),
+        "unexpected error: {err}"
+    );
 }

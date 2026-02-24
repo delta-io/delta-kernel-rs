@@ -65,7 +65,7 @@ fn validate_metadata_columns<'a>(
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
-    let partition_columns = table_configuration.metadata().partition_columns();
+    let partition_columns = table_configuration.partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
@@ -118,10 +118,10 @@ impl StateInfo {
         stats_columns: Option<Vec<ColumnName>>,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.metadata().partition_columns();
+        let partition_columns = table_configuration.partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut transform_spec = Vec::new();
+        let mut transform_spec = Vec::with_capacity(logical_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
 
         let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
@@ -327,7 +327,7 @@ pub(crate) mod tests {
             metadata_configuration,
         )?;
         let protocol = if features.is_empty() {
-            Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>)?
+            Protocol::try_new_legacy(2, 5)?
         } else {
             // This helper only handles known features. Unknown features would need
             // explicit placement on reader vs writer lists.
@@ -340,7 +340,7 @@ pub(crate) mod tests {
             let reader_features = features
                 .iter()
                 .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
-            Protocol::try_new(3, 7, Some(reader_features), Some(features))?
+            Protocol::try_new_modern(reader_features, features)?
         };
         let table_configuration = TableConfiguration::try_new(
             metadata,

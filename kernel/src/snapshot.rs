@@ -50,6 +50,7 @@ pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
+    lazy_crc: Arc<LazyCrc>,
 }
 
 impl PartialEq for Snapshot {
@@ -110,7 +111,11 @@ impl Snapshot {
     }
 
     #[internal_api]
-    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+    pub(crate) fn new(
+        log_segment: LogSegment,
+        table_configuration: TableConfiguration,
+        lazy_crc: Arc<LazyCrc>,
+    ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -122,6 +127,7 @@ impl Snapshot {
             span,
             log_segment,
             table_configuration,
+            lazy_crc,
         }
     }
 
@@ -234,7 +240,7 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let lazy_crc = LazyCrc::new(new_log_segment.latest_crc_file.clone());
+        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.latest_crc_file.clone()));
         let (new_metadata, new_protocol) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
@@ -282,9 +288,12 @@ impl Snapshot {
             // Preserve checkpoint schema from old segment
             old_log_segment.checkpoint_schema.clone(),
         )?;
+
+        let lazy_crc = Arc::new(LazyCrc::new(combined_log_segment.latest_crc_file.clone()));
         Ok(Arc::new(Snapshot::new(
             combined_log_segment,
             table_configuration,
+            lazy_crc,
         )))
     }
 
@@ -343,7 +352,7 @@ impl Snapshot {
         let reporter = engine.get_metrics_reporter();
 
         // Create lazy CRC loader for P&M optimization
-        let lazy_crc = LazyCrc::new(log_segment.latest_crc_file.clone());
+        let lazy_crc = Arc::new(LazyCrc::new(log_segment.latest_crc_file.clone()));
 
         // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
@@ -360,7 +369,7 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new(log_segment, table_configuration))
+        Ok(Self::new(log_segment, table_configuration, lazy_crc))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -438,7 +447,11 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot::new(new_log_segment, new_table_configuration))
+        Ok(Snapshot::new(
+            new_log_segment,
+            new_table_configuration,
+            self.lazy_crc.clone(),
+        ))
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -649,7 +662,7 @@ impl Snapshot {
         );
 
         require!(
-            self.table_configuration().protocol().is_catalog_managed(),
+            self.table_configuration().is_catalog_managed(),
             Error::generic(
                 "There are catalog commits that need publishing, but the table is not catalog-managed.",
             )
@@ -670,6 +683,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
+            self.lazy_crc.clone(),
         )))
     }
 
@@ -734,7 +748,23 @@ impl Snapshot {
             }
         }
 
-        // Read the ICT from latest_commit_file
+        // Fast path: try reading ICT from CRC file (if it is at this snapshot version)
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            match crc.in_commit_timestamp_opt {
+                Some(ict) => return Ok(Some(ict)),
+                None => {
+                    return Err(Error::generic(format!(
+                        "In-Commit Timestamp not found in CRC file at version {}",
+                        self.version()
+                    )));
+                }
+            }
+        }
+
+        // Fallback: read the ICT from latest_commit_file
         match &self.log_segment.latest_commit_file {
             Some(commit_file_meta) => {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
@@ -772,6 +802,9 @@ mod tests {
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
+    use crate::table_features::{
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    };
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use delta_kernel::actions::DomainMetadata;
 
@@ -798,13 +831,13 @@ mod tests {
             let mut protocol = json!({
                 "protocol": {
                     "minReaderVersion": reader_version,
-                    "minWriterVersion": 7,
+                    "minWriterVersion": TABLE_FEATURES_MIN_WRITER_VERSION,
                     "writerFeatures": ["inCommitTimestamp"]
                 }
             });
 
-            // Only include readerFeatures if minReaderVersion >= 3
-            if reader_version >= 3 {
+            // Only include readerFeatures if minReaderVersion >= table-features minimum.
+            if reader_version >= TABLE_FEATURES_MIN_READER_VERSION as u32 {
                 protocol["protocol"]["readerFeatures"] = json!([]);
             }
 
@@ -871,8 +904,7 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap();
         assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -889,8 +921,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap();
         assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -1605,8 +1636,8 @@ mod tests {
         let commit_data = [
             json!({
                 "protocol": {
-                    "minReaderVersion": 3,
-                    "minWriterVersion": 7,
+                    "minReaderVersion": TABLE_FEATURES_MIN_READER_VERSION,
+                    "minWriterVersion": TABLE_FEATURES_MIN_WRITER_VERSION,
                     "readerFeatures": [],
                     "writerFeatures": ["inCommitTimestamp"]
                 }
@@ -1652,7 +1683,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -1685,7 +1716,7 @@ mod tests {
 
         // Create initial commit with ICT enabled
         let commit_data = [
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -1721,7 +1752,8 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit = Snapshot::new(log_segment, table_config);
+        let snapshot_no_commit =
+            Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
@@ -1740,7 +1772,7 @@ mod tests {
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
             create_commit_info(1587968586154, None),
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
                 Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
@@ -1754,7 +1786,7 @@ mod tests {
         // Create 00000000000000000001.checkpoint.parquet
         let checkpoint_data = [
             create_commit_info(1587968586154, None),
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
                 Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
