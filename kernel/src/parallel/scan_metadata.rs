@@ -43,16 +43,14 @@ impl Phase1ScanMetadata {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(_) => Ok(AfterPhase1::Done),
-            AfterSequential::Parallel { processor, files } => {
-                Ok(AfterPhase1::Phase2 {
-                    state: Phase2State {
-                        inner: processor.into(),
-                        log_on_drop: Cell::new(false),
-                        checkpoint_info: CheckpointReadInfo::default(),
-                    },
-                    files,
-                })
-            }
+            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1::Phase2 {
+                state: Phase2State {
+                    inner: processor.into(),
+                    log_on_drop: Cell::new(false),
+                    checkpoint_info: CheckpointReadInfo::default(),
+                },
+                files,
+            }),
         }
     }
 }

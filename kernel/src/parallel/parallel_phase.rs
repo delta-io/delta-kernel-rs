@@ -415,7 +415,8 @@ mod tests {
                 let processor = if with_serde {
                     // Serialize and then deserialize to test the serde path
                     let serialized_bytes = state.into_bytes()?;
-                    let deserialized_state = Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?;
+                    let deserialized_state =
+                        Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?;
                     deserialized_state.processor().clone()
                 } else {
                     // Non-serde: just extract the processor directly

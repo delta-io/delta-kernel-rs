@@ -6,7 +6,7 @@
 
 use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, ReadSpec, TableInfo};
 use crate::parallel::parallel_phase::ParallelPhase;
-use crate::parallel::sequential_phase::AfterSequential;
+use crate::scan::AfterPhase1ScanMetadata;
 use crate::snapshot::Snapshot;
 use crate::Engine;
 
@@ -79,8 +79,8 @@ impl ReadMetadataRunner {
         }
 
         match phase1.finish()? {
-            AfterSequential::Done(_) => {}
-            AfterSequential::Parallel { processor, files } => {
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 if num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
@@ -91,7 +91,7 @@ impl ReadMetadataRunner {
                     .map(|chunk| chunk.to_vec())
                     .collect();
 
-                let processor = Arc::new(processor);
+                let processor = state.processor().clone();
 
                 let handles: Vec<_> = partitions
                     .into_iter()

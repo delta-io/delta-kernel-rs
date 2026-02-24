@@ -1305,13 +1305,9 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
         });
-        let processor = ScanLogReplayProcessor::new(
-            &engine,
-            state_info,
-            checkpoint_info.clone(),
-            false,
-        )
-        .unwrap();
+        let processor =
+            ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
+                .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
         assert!(serialized.predicate.is_none());
         let deserialized =
