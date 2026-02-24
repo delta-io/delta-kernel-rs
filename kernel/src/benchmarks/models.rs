@@ -26,19 +26,19 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
-//Table info JSON files are located at the root of each table directory
+// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 pub struct TableInfo {
-    pub name: String,                //Table name used for identifying the table
-    pub description: Option<String>, //Human-readable description of the table
-    pub table_path: Option<String>,  //Path or URL to the table
+    pub name: String,                // Table name used for identifying the table
+    pub description: Option<String>, // Human-readable description of the table
+    pub table_path: Option<String>,  // Path or URL to the table
     #[serde(skip, default)]
-    pub table_info_dir: PathBuf, //Path to the directory containing the table info JSON file
+    pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
 
 impl TableInfo {
     pub fn resolved_table_root(&self) -> String {
-        //If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
+        // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
         self.table_path.clone().unwrap_or_else(|| {
             self.table_info_dir
                 .join("delta")
@@ -69,7 +69,7 @@ impl Spec {
     }
 }
 
-//For Read specs, we will either run a read data operation or a read metadata operation
+// For Read specs, we will either run a read data operation or a read metadata operation
 #[derive(Clone, Copy, Debug)]
 pub enum ReadOperation {
     ReadData,
@@ -89,7 +89,7 @@ impl ReadOperation {
 #[derive(Clone, Debug)]
 pub struct Workload {
     pub table_info: TableInfo,
-    pub case_name: String, //Name of the spec JSON file
+    pub case_name: String, // Name of the spec JSON file
     pub spec: Spec,
 }
 

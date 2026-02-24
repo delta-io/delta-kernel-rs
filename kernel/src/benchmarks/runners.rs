@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_read_runner() {
+    fn test_create_read_runner_read_metadata() {
         let runner = create_read_runner(
             &test_table_info(),
             "test_case",
@@ -250,5 +250,18 @@ mod tests {
         )
         .expect("create_read_runner should succeed");
         assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_create_read_runner_read_data_unimplemented() {
+        let result = create_read_runner(
+            &test_table_info(),
+            "test_case",
+            &test_read_spec(),
+            ReadOperation::ReadData,
+            serial_config(),
+            test_engine(),
+        );
+        assert!(result.is_err());
     }
 }
