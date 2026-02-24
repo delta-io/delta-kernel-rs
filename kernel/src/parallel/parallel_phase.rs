@@ -420,7 +420,13 @@ mod tests {
         match phase1.finish()? {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
-                let final_state = if with_serde {
+                use crate::parallel::scan_metadata::{Phase2ScanMetadata, Phase2State};
+
+                // Extract the processor Arc to share across threads
+                // Note: We can't share Phase2State directly because it contains Cell<bool>
+                // which is not Sync. But the processor (Arc<ScanLogReplayProcessor>) is already
+                // Arc-wrapped and thread-safe.
+                let processor = if with_serde {
                     // Serialize and then deserialize to test the serde path
                     let serialized_bytes = state.into_bytes()?;
                     Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?

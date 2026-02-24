@@ -357,7 +357,6 @@ impl ScanLogReplayProcessor {
         )
     }
 }
-
 /// Metrics collected from [`ScanLogReplayProcessor`]
 #[internal_api]
 pub(crate) struct ScanMetrics {
