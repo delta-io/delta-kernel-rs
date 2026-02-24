@@ -6,6 +6,18 @@ use tracing::{debug, info, instrument};
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::UCCommitsClient;
 
+fn max_published_version_for_uc(max_published_version: Option<u64>) -> DeltaResult<Option<i64>> {
+    max_published_version
+        .map(|v| {
+            v.try_into().map_err(|_| {
+                DeltaError::Generic(format!(
+                    "Max published version {v} does not fit into i64 for UC commit"
+                ))
+            })
+        })
+        .transpose()
+}
+
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
@@ -57,23 +69,11 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         let committed = engine.storage_handler().head(&staged_commit_path)?;
         info!(
             staged_commit_path = %staged_commit_path,
-            staged_file_size = committed.size,
+            staged_file = ?committed,
             "Wrote staged commit file"
         );
-        let max_published_version = commit_metadata
-            .max_published_version()
-            .map(|v| {
-                v.try_into().map_err(|_| {
-                    DeltaError::Generic(format!(
-                        "Max published version {v} does not fit into i64 for UC commit"
-                    ))
-                })
-            })
-            .transpose()?;
-        debug!(
-            ?max_published_version,
-            "Ratifying staged commit with max_published_version"
-        );
+        let max_published_version =
+            max_published_version_for_uc(commit_metadata.max_published_version())?;
 
         let commit_req = CommitRequest::new(
             self.table_id.clone(),
@@ -191,6 +191,26 @@ mod tests {
         table_root
             .join(&format!("_delta_log/{:020}.json", version))
             .unwrap()
+    }
+
+    #[test]
+    fn test_max_published_version_for_uc_none() {
+        assert_eq!(max_published_version_for_uc(None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_max_published_version_for_uc_with_value() {
+        assert_eq!(max_published_version_for_uc(Some(42)).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn test_max_published_version_for_uc_overflow() {
+        let err = max_published_version_for_uc(Some(u64::MAX)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not fit into i64 for UC commit"),
+            "Unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
