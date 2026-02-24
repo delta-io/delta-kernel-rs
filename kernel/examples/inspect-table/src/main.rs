@@ -59,9 +59,7 @@ fn main() -> ExitCode {
             tracing_subscriber::fmt::layer()
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NONE),
         )
-        .with_metrics_reporter_layer(
-            Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
-        )
+        .with_metrics_reporter_layer(Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO)))
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     match try_main() {
