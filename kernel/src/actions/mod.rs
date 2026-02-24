@@ -527,7 +527,7 @@ impl Protocol {
                 let check_w = writer_features
                     .iter()
                     .all(|feature| match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => reader_features.contains(feature),
                     });
                 require!(
@@ -545,7 +545,7 @@ impl Protocol {
                 // Unknown features are treated as potentially Writer-only for forward compatibility.
                 let is_valid = writer_features.iter().all(|feature| {
                     match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => {
                             // ColumnMapping is allowed when reader version is 2 (implied support)
                             min_reader_version == 2 && feature == &TableFeature::ColumnMapping
@@ -1344,7 +1344,7 @@ mod tests {
                 ],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
-            // Writer only feature present in reader features
+            // WriterOnly feature present in reader features
             (
                 vec![TableFeature::AppendOnly],
                 vec![TableFeature::AppendOnly],
@@ -1389,7 +1389,7 @@ mod tests {
         // (reader_feature, writer_feature)
         let valid_features = [
             // ReaderWriter feature present in both reader/writer features,
-            // Writer only feature present in writer feature
+            // WriterOnly feature present in writer feature
             (
                 vec![TableFeature::DeletionVectors],
                 vec![TableFeature::DeletionVectors],
@@ -1399,7 +1399,7 @@ mod tests {
                 vec![TableFeature::VariantType],
                 vec![TableFeature::VariantType, TableFeature::AppendOnly],
             ),
-            // Unknown feature may be ReaderWriter or Writer only (for forward compatibility)
+            // Unknown feature may be ReaderWriter or WriterOnly (for forward compatibility)
             (
                 vec![TableFeature::Unknown("rw".to_string())],
                 vec![
