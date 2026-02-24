@@ -205,19 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_metadata_runner_setup() {
-        let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "test_case",
-            &test_read_spec(),
-            serial_config(),
-            test_engine(),
-        );
-        assert!(runner.is_ok());
-    }
-
-    #[test]
-    fn test_read_metadata_runner_name() {
+    fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
             &test_table_info(),
             "test_case",
@@ -230,23 +218,11 @@ mod tests {
             runner.name(),
             "basic_partitioned/test_case/read_metadata/serial"
         );
-    }
-
-    #[test]
-    fn test_read_metadata_runner_execute_serial() {
-        let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "test_case",
-            &test_read_spec(),
-            serial_config(),
-            test_engine(),
-        )
-        .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
 
     #[test]
-    fn test_read_metadata_runner_execute_parallel() {
+    fn test_read_metadata_runner_parallel() {
         let runner = ReadMetadataRunner::setup(
             &test_table_info(),
             "test_case",
@@ -255,6 +231,10 @@ mod tests {
             test_engine(),
         )
         .expect("setup should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/test_case/read_metadata/parallel"
+        );
         assert!(runner.execute().is_ok());
     }
 
