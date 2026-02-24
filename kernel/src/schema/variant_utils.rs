@@ -39,7 +39,6 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::actions::Protocol;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::TableFeature;

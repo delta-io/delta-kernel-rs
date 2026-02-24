@@ -304,6 +304,7 @@ pub(crate) mod test_utils {
     /// - no schema + no protocol → Ok
     /// - no schema + protocol → Ok
     /// - schema + no protocol → Err (orphaned schema presence)
+    ///
     /// Additional error schemas (e.g. nested) are also tested against `protocol_without`.
     #[track_caller]
     pub(crate) fn assert_schema_feature_validation(
