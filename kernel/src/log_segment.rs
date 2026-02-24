@@ -35,6 +35,7 @@ mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
+pub(crate) use protocol_metadata_replay::CachedLogStats;
 
 #[cfg(test)]
 mod crc_tests;

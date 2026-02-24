@@ -18,6 +18,7 @@ use crate::committer::{Committer, PublishMetadata};
 use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
+use crate::log_segment::CachedLogStats;
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -51,6 +52,10 @@ pub struct Snapshot {
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
     lazy_crc: Arc<LazyCrc>,
+    /// Stats accumulated from commit files during P&M log replay. Used by the CRC writer
+    /// to avoid re-reading commit files when computing file statistics.
+    #[allow(dead_code)] // Used by CRC writer (future PR)
+    cached_log_stats: Option<CachedLogStats>,
 }
 
 impl PartialEq for Snapshot {
@@ -115,6 +120,7 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         lazy_crc: Arc<LazyCrc>,
+        cached_log_stats: Option<CachedLogStats>,
     ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -128,6 +134,7 @@ impl Snapshot {
             log_segment,
             table_configuration,
             lazy_crc,
+            cached_log_stats,
         }
     }
 
@@ -241,7 +248,7 @@ impl Snapshot {
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
         let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.latest_crc_file.clone()));
-        let (new_metadata, new_protocol) =
+        let (new_metadata, new_protocol, cached_log_stats) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
@@ -294,6 +301,7 @@ impl Snapshot {
             combined_log_segment,
             table_configuration,
             lazy_crc,
+            Some(cached_log_stats),
         )))
     }
 
@@ -354,9 +362,11 @@ impl Snapshot {
         // Create lazy CRC loader for P&M optimization
         let lazy_crc = Arc::new(LazyCrc::new(log_segment.latest_crc_file.clone()));
 
-        // Read protocol and metadata (may use CRC if available)
+        // Read protocol and metadata (may use CRC if available).
+        // Also accumulates file stats from commit files for future CRC writing.
         let start = Instant::now();
-        let (metadata, protocol) = log_segment.read_protocol_metadata(engine, &lazy_crc)?;
+        let (metadata, protocol, cached_log_stats) =
+            log_segment.read_protocol_metadata(engine, &lazy_crc)?;
         let read_metadata_duration = start.elapsed();
 
         reporter.as_ref().inspect(|r| {
@@ -369,7 +379,12 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new(log_segment, table_configuration, lazy_crc))
+        Ok(Self::new(
+            log_segment,
+            table_configuration,
+            lazy_crc,
+            Some(cached_log_stats),
+        ))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -451,6 +466,7 @@ impl Snapshot {
             new_log_segment,
             new_table_configuration,
             self.lazy_crc.clone(),
+            self.cached_log_stats.clone(),
         ))
     }
 
@@ -518,6 +534,14 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn lazy_crc(&self) -> &LazyCrc {
         &self.lazy_crc
+    }
+
+    /// Stats accumulated from commit files during P&M log replay.
+    /// Returns `None` for pre-commit snapshots or if stats were not collected.
+    #[allow(dead_code)] // Used by CRC writer (future PR)
+    #[internal_api]
+    pub(crate) fn cached_log_stats(&self) -> Option<&CachedLogStats> {
+        self.cached_log_stats.as_ref()
     }
 
     pub fn table_root(&self) -> &Url {
@@ -691,6 +715,7 @@ impl Snapshot {
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
             self.lazy_crc.clone(),
+            self.cached_log_stats.clone(),
         )))
     }
 
@@ -1760,8 +1785,12 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit =
-            Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
+        let snapshot_no_commit = Snapshot::new(
+            log_segment,
+            table_config,
+            Arc::new(LazyCrc::new(None)),
+            None,
+        );
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);

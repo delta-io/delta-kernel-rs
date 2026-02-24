@@ -568,6 +568,7 @@ impl CreateTableTransactionBuilder {
                 log_segment,
                 table_configuration,
                 Arc::new(LazyCrc::new(None)),
+                None,
             )),
             self.engine_info,
             committer,
