@@ -80,15 +80,23 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
+/// An extension trait to add a convenience method for adding a layer that will send reports to a
+/// `MetricsReporter`
 pub trait WithMetricsReporterLayer: Subscriber {
-    fn with_metrics_reporter_layer(self) -> Layered<ReportGeneratorLayer, Self>
+    /// Add a layer that will generate [`MetricEvent`]s. This is how you can register to get metric
+    /// reports if you prefer to consume things that way. For example, to write reports out as logs:
+    /// ```
+    /// tracing_subscriber::registry()
+    ///    .with_metrics_reporter_layer(
+    ///        Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
+    ///    )
+    /// ```
+    fn with_metrics_reporter_layer(self, reporter: Arc<dyn MetricsReporter>) -> Layered<ReportGeneratorLayer, Self>
     where
         Self: Sized,
         for<'lookup> Self: LookupSpan<'lookup>,
     {
-        self.with(ReportGeneratorLayer::new(Arc::new(
-            LoggingMetricsReporter::new(tracing::Level::INFO),
-        )))
+        self.with(ReportGeneratorLayer::new(reporter))
     }
 }
 
