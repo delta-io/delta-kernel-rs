@@ -9,10 +9,9 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_commit_schema,
-    get_log_commit_info_schema, get_log_domain_metadata_schema, get_log_remove_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
-    METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_commit_info_schema,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
@@ -30,7 +29,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::TableFeature;
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -82,11 +81,32 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
     &MANDATORY_ADD_FILE_SCHEMA
 }
 
-/// The static instance referenced by [`add_files_schema`].
+/// The base schema for add file metadata, referenced by [`Transaction::add_files_schema`].
+///
+/// The `stats` field represents the minimum structure. The actual stats written by
+/// [`DefaultEngine::write_parquet`] include additional fields computed from the data:
+/// - `nullCount`: nested struct mirroring the data schema (all fields LONG)
+/// - `minValues`: nested struct with min/max eligible column types
+/// - `maxValues`: nested struct with min/max eligible column types
+///
+/// The nested structures within nullCount/minValues/maxValues depend on the table's data schema
+/// and which columns have statistics enabled. Use [`Transaction::stats_schema`] to get the
+/// expected stats schema for a specific table.
+///
+/// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
-        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
+        DataType::struct_type_unchecked(vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            // nullCount, minValues, maxValues are dynamic based on data schema.
+            // Empty struct placeholders indicate these fields exist but their inner
+            // structure depends on the table schema and stats column configuration.
+            StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
+            StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
+            StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]),
     );
 
     StructTypeBuilder::from_schema(mandatory_add_file_schema())
@@ -682,9 +702,18 @@ impl<S> Transaction<S> {
             return Ok(vec![]);
         }
 
-        // Scan log to fetch existing configurations for tombstones
-        let existing_domains =
-            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
+        // Scan log to fetch existing configurations for tombstones.
+        // Pass the specific set of domains to remove so that log replay can terminate early
+        // once all target domains have been found, instead of replaying the entire log.
+        let domains: HashSet<&str> = self
+            .user_domain_removals
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let existing_domains = self
+            .read_snapshot
+            .log_segment()
+            .scan_domain_metadatas(Some(&domains), engine)?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
@@ -756,14 +785,19 @@ impl<S> Transaction<S> {
     /// file to be added to the table. Kernel takes this information and extends it to the full add_file
     /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
-    /// For now, Kernel only supports the number of records as a file statistic.
-    /// This will change in a future release.
+    /// The `stats` field contains file-level statistics. The schema returned here shows the base
+    /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
+    /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
+    /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
+    /// stats schema.
     ///
     /// Note: While currently static, in the future the schema might change depending on
     /// options set on the transaction or features enabled on the table.
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
+    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+    /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
@@ -885,6 +919,7 @@ impl<S> Transaction<S> {
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            column_mapping_mode,
             stats_columns,
         )
     }
@@ -1176,6 +1211,7 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
 }
@@ -1186,6 +1222,7 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
@@ -1193,6 +1230,7 @@ impl WriteContext {
             logical_schema,
             physical_schema,
             logical_to_physical,
+            column_mapping_mode,
             stats_columns,
         }
     }
@@ -1211,6 +1249,11 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// The [`ColumnMappingMode`] for this table.
+    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
+        self.column_mapping_mode
     }
 
     /// Returns the column names that should have statistics collected during writes.
@@ -1484,10 +1527,13 @@ mod tests {
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::nullable(
                 "stats",
-                DataType::struct_type_unchecked(vec![StructField::nullable(
-                    "numRecords",
-                    DataType::LONG,
-                )]),
+                DataType::struct_type_unchecked(vec![
+                    StructField::nullable("numRecords", DataType::LONG),
+                    StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])),
+                    StructField::nullable("tightBounds", DataType::BOOLEAN),
+                ]),
             ),
         ]);
         assert_eq!(*schema, expected.into());
