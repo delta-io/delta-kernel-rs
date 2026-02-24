@@ -25,8 +25,6 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
@@ -861,47 +859,6 @@ pub async fn write_batch_to_table(
     }
 }
 
-/// Translates a logical field path (e.g. `["address", "street"]`) to physical
-/// using the snapshot's table properties and column mapping mode.
-pub fn translate_logical_path_to_physical(
-    snapshot: &Snapshot,
-    path: &[&str],
-) -> DeltaResult<Vec<String>> {
-    use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue};
-    use delta_kernel::Error;
-    let cm = snapshot
-        .table_properties()
-        .column_mapping_mode
-        .unwrap_or(ColumnMappingMode::None);
-    let schema = snapshot.schema();
-    let mut current_struct: Option<&delta_kernel::schema::StructType> = Some(schema.as_ref());
-    path.iter()
-        .map(|segment| {
-            let field = current_struct
-                .and_then(|s| s.field(*segment))
-                .ok_or_else(|| {
-                    Error::generic(format!(
-                        "Could not resolve '{segment}' in path {path:?} in schema {schema}"
-                    ))
-                })?;
-            current_struct = match field.data_type() {
-                DataType::Struct(s) => Some(s),
-                _ => None,
-            };
-            let phys_name = match cm {
-                ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-                        Some(MetadataValue::String(s)) => s.clone(),
-                        _ => field.name.clone(),
-                    }
-                }
-                ColumnMappingMode::None => field.name.clone(),
-            };
-            Ok(phys_name)
-        })
-        .collect()
-}
-
 /// An add info extracted from the log segment.
 pub struct AddInfo {
     pub path: String,
@@ -952,31 +909,23 @@ pub fn read_add_infos(
     Ok(actions)
 }
 
-/// Helper to create a table with optional column mapping mode via `create_table_txn`.
-/// Returns the post-commit snapshot.
-pub fn create_cm_table(
+/// Helper to create a table with the given properties, then load and return its snapshot.
+pub fn create_table_and_load_snapshot(
     table_path: &str,
     schema: SchemaRef,
-    cm_mode: ColumnMappingMode,
-    engine: &impl Engine,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut builder = create_table_txn(table_path, schema, "cm-e2e");
-    let mode_str = match cm_mode {
-        ColumnMappingMode::None => "none",
-        ColumnMappingMode::Id => "id",
-        ColumnMappingMode::Name => "name",
-    };
-    builder = builder.with_table_properties([("delta.columnMapping.mode", mode_str)]);
-    let create_result = builder
+    engine: &dyn Engine,
+    properties: &[(&str, &str)],
+) -> DeltaResult<Arc<Snapshot>> {
+    use delta_kernel::committer::FileSystemCommitter;
+    use delta_kernel::transaction::create_table::create_table;
+
+    let _ = create_table(table_path, schema, "Test/1.0")
+        .with_table_properties(properties.to_vec())
         .build(engine, Box::new(FileSystemCommitter::new()))?
         .commit(engine)?;
-    match create_result {
-        CommitResult::CommittedTransaction(c) => Ok(c
-            .post_commit_snapshot()
-            .expect("should have post_commit_snapshot")
-            .clone()),
-        _ => panic!("Create table should succeed"),
-    }
+
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    Snapshot::builder_for(table_url).build(engine)
 }
 
 // Writer that captures log output into a shared buffer for test assertions

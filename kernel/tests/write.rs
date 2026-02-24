@@ -37,15 +37,16 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
 
 use test_utils::{
     assert_result_error_with_message, assert_schema_has_field, copy_directory,
-    create_add_files_metadata, create_cm_table, create_default_engine, create_table,
+    create_add_files_metadata, create_default_engine, create_table, create_table_and_load_snapshot,
     engine_store_setup, nested_batches, nested_schema, read_add_infos, setup_test_tables,
-    test_read, test_table_setup, translate_logical_path_to_physical, write_batch_to_table,
+    test_read, test_table_setup, write_batch_to_table,
 };
 
 mod common;
@@ -3054,11 +3055,8 @@ fn remove_all_files(
     snapshot: &Arc<Snapshot>,
     engine: &impl Engine,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let scan = snapshot.clone().scan_builder().build()?;
-    for scan_metadata in scan.scan_metadata(engine)? {
-        let scan_metadata = scan_metadata?;
-        let (data, selection_vector) = scan_metadata.scan_files.into_parts();
-        txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+    for scan_file in get_scan_files(snapshot.clone(), engine)? {
+        txn.remove_files(scan_file);
     }
     Ok(())
 }
@@ -3093,14 +3091,35 @@ async fn test_column_mapping_write(
     );
 
     // Step 1: Create table
-    let mut latest_snapshot =
-        create_cm_table(&table_path, schema.clone(), cm_mode, engine.as_ref())?;
+    let mode_str = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Id => "id",
+        ColumnMappingMode::Name => "name",
+    };
+    let mut latest_snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", mode_str)],
+    )?;
 
     // Get physical field paths for stats verification (top-level and nested)
-    let row_number_physical =
-        translate_logical_path_to_physical(&latest_snapshot, &["row_number"])?;
-    let street_physical =
-        translate_logical_path_to_physical(&latest_snapshot, &["address", "street"])?;
+    let cm = latest_snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let row_number_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["row_number"]),
+        cm,
+    )?
+    .into_inner();
+    let street_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["address", "street"]),
+        cm,
+    )?
+    .into_inner();
 
     // Step 2: Write two batches
     for data in nested_batches()? {
@@ -3163,8 +3182,13 @@ async fn test_column_mapping_write(
         let footer_schema = footer.schema;
 
         // Verify top-level "row_number" and nested "address.street" use correct (physical) names
-        for path in [vec!["row_number"], vec!["address", "street"]] {
-            let physical = translate_logical_path_to_physical(&latest_snapshot, &path)?;
+        for path in [
+            ColumnName::new(["row_number"]),
+            ColumnName::new(["address", "street"]),
+        ] {
+            let physical =
+                get_any_level_column_physical_name(latest_snapshot.schema().as_ref(), &path, cm)?
+                    .into_inner();
             assert_schema_has_field(&footer_schema, &physical);
         }
     }
@@ -3331,7 +3355,17 @@ async fn test_column_mapping_partitioned_write(
     );
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let physical_name = translate_logical_path_to_physical(&snapshot, &["category"])?[0].clone();
+    let cm = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let physical_name = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["category"]),
+        cm,
+    )?
+    .into_inner()
+    .remove(0);
 
     // Verify physical name for column mapping mode
     if table_dir.ends_with("none") {
