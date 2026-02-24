@@ -141,6 +141,82 @@ fn get_simple_int_schema() -> Arc<StructType> {
     Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
 }
 
+/// Write a metadata-update commit that sets a table property on the existing table.
+/// Returns a fresh snapshot reflecting the new commit.
+/// Used in tests as a hack to set table properties when create table doesn't support the property.
+fn set_table_property(
+    table_path: &str,
+    table_url: &Url,
+    engine: &dyn Engine,
+    current_version: Version,
+    key: &str,
+    value: &str,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|v| v.get("metaData").is_some())
+        })
+        .expect("version 0 should contain a metaData action");
+
+    meta["metaData"]["configuration"][key] = json!(value);
+
+    let new_commit = std::path::Path::new(table_path)
+        .join(format!("_delta_log/{:020}.json", current_version + 1));
+    std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+}
+
+/// Resolve a nested column inside a [`StructArray`] by walking the given field-name path,
+/// and downcast the leaf to the requested array type.
+fn resolve_struct_field<'a, T: 'static>(root: &'a StructArray, path: &[String]) -> &'a T {
+    assert!(!path.is_empty(), "path must be non-empty");
+    let mut current: &StructArray = root;
+    for (i, name) in path.iter().enumerate() {
+        let col = current
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing field: {name}"));
+        if i == path.len() - 1 {
+            return col
+                .as_any()
+                .downcast_ref::<T>()
+                .expect("leaf array type mismatch");
+        }
+        current = col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap_or_else(|| panic!("expected StructArray at field: {name}"));
+    }
+    unreachable!()
+}
+
+/// Navigate into a nested JSON value by following a sequence of object keys.
+/// E.g. `resolve_json_path(stats, &["address", "street"])` returns `stats["address"]["street"]`.
+fn resolve_json_path<'a>(root: &'a serde_json::Value, path: &[String]) -> &'a serde_json::Value {
+    path.iter().fold(root, |v, key| &v[key])
+}
+
+/// Assert that `stats["minValues"]` and `stats["maxValues"]` at the given physical path equal the
+/// expected values.
+fn assert_min_max_stats(
+    stats: &serde_json::Value,
+    physical_path: &[String],
+    expected_min: impl Into<serde_json::Value>,
+    expected_max: impl Into<serde_json::Value>,
+) {
+    assert_eq!(
+        *resolve_json_path(&stats["minValues"], physical_path),
+        expected_min.into()
+    );
+    assert_eq!(
+        *resolve_json_path(&stats["maxValues"], physical_path),
+        expected_max.into()
+    );
+}
+
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -3118,27 +3194,14 @@ async fn test_column_mapping_write(
 
     // Enable writeStatsAsStruct so the checkpoint contains native stats_parsed.
     // CREATE TABLE doesn't allow this property yet, so we write a metadata-update commit directly.
-    latest_snapshot = {
-        let v0_path =
-            std::path::Path::new(&table_path).join("_delta_log/00000000000000000000.json");
-        let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
-            .lines()
-            .find_map(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .filter(|v| v.get("metaData").is_some())
-            })
-            .expect("version 0 should contain a metaData action");
-
-        meta["metaData"]["configuration"]["delta.checkpoint.writeStatsAsStruct"] = json!("true");
-
-        let new_commit = std::path::Path::new(&table_path).join(format!(
-            "_delta_log/{:020}.json",
-            latest_snapshot.version() + 1
-        ));
-        std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
-        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
-    };
+    latest_snapshot = set_table_property(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        latest_snapshot.version(),
+        "delta.checkpoint.writeStatsAsStruct",
+        "true",
+    )?;
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
@@ -3154,28 +3217,12 @@ async fn test_column_mapping_write(
     all_stats.sort_by_key(|s| s["minValues"][&row_number_physical[0]].as_i64().unwrap());
 
     // Batch 1: row_number 1..3, address.street "st1".."st3"
-    assert_eq!(all_stats[0]["minValues"][&row_number_physical[0]], 1);
-    assert_eq!(all_stats[0]["maxValues"][&row_number_physical[0]], 3);
-    assert_eq!(
-        all_stats[0]["minValues"][&street_physical[0]][&street_physical[1]],
-        "st1"
-    );
-    assert_eq!(
-        all_stats[0]["maxValues"][&street_physical[0]][&street_physical[1]],
-        "st3"
-    );
+    assert_min_max_stats(all_stats[0], &row_number_physical, 1, 3);
+    assert_min_max_stats(all_stats[0], &street_physical, "st1", "st3");
 
     // Batch 2: row_number 4..6, address.street "st4".."st6"
-    assert_eq!(all_stats[1]["minValues"][&row_number_physical[0]], 4);
-    assert_eq!(all_stats[1]["maxValues"][&row_number_physical[0]], 6);
-    assert_eq!(
-        all_stats[1]["minValues"][&street_physical[0]][&street_physical[1]],
-        "st4"
-    );
-    assert_eq!(
-        all_stats[1]["maxValues"][&street_physical[0]][&street_physical[1]],
-        "st6"
-    );
+    assert_min_max_stats(all_stats[1], &row_number_physical, 4, 6);
+    assert_min_max_stats(all_stats[1], &street_physical, "st4", "st6");
 
     // Step 3b: Verify stats_parsed in scan metadata uses correct physical column names
     {
@@ -3192,62 +3239,24 @@ async fn test_column_mapping_write(
             let (data, sel) = sm.scan_files.into_parts();
             let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
 
-            let stats_parsed = batch
-                .column_by_name("stats_parsed")
-                .expect("should have stats_parsed column")
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .expect("stats_parsed should be a struct");
-            let min_values = stats_parsed
-                .column_by_name("minValues")
-                .expect("should have minValues")
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
-            let max_values = stats_parsed
-                .column_by_name("maxValues")
-                .expect("should have maxValues")
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
+            let batch_struct = StructArray::from(batch.clone());
+            let stats_parsed: &StructArray =
+                resolve_struct_field(&batch_struct, &["stats_parsed".into()]);
 
-            let min_row_num = min_values
-                .column_by_name(&row_number_physical[0])
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let max_row_num = max_values
-                .column_by_name(&row_number_physical[0])
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-
-            let min_addr = min_values
-                .column_by_name(&street_physical[0])
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
-            let min_st = min_addr
-                .column_by_name(&street_physical[1])
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let max_addr = max_values
-                .column_by_name(&street_physical[0])
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
-            let max_st = max_addr
-                .column_by_name(&street_physical[1])
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+            let min_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "minValues".into()], field].concat()
+            };
+            let max_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "maxValues".into()], field].concat()
+            };
+            let min_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &min_path(&row_number_physical));
+            let max_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &max_path(&row_number_physical));
+            let min_st: &StringArray =
+                resolve_struct_field(&batch_struct, &min_path(&street_physical));
+            let max_st: &StringArray =
+                resolve_struct_field(&batch_struct, &max_path(&street_physical));
 
             for (i, &selected) in sel.iter().enumerate().take(batch.num_rows()) {
                 if selected && !stats_parsed.is_null(i) {
@@ -3322,13 +3331,11 @@ async fn test_column_mapping_write(
         );
 
         // Verify logical column names and data values
+        let combined_struct = StructArray::from(combined);
+
         // Top-level: row_number should contain [1..=6]
-        let row_numbers = combined
-            .column_by_name("row_number")
-            .expect("should have logical column 'row_number'")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("row_number should be Int64");
+        let row_numbers: &Int64Array =
+            resolve_struct_field(&combined_struct, &["row_number".into()]);
         let mut vals: Vec<i64> = (0..row_numbers.len())
             .map(|i| row_numbers.value(i))
             .collect();
@@ -3336,18 +3343,8 @@ async fn test_column_mapping_write(
         assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
 
         // Nested: address.street should contain ["st1"..="st6"]
-        let address = combined
-            .column_by_name("address")
-            .expect("should have logical column 'address'")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("address should be a struct");
-        let streets = address
-            .column_by_name("street")
-            .expect("address should have 'street'")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("street should be String");
+        let streets: &StringArray =
+            resolve_struct_field(&combined_struct, &["address".into(), "street".into()]);
         let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
         street_vals.sort();
         assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
@@ -3368,31 +3365,6 @@ async fn test_column_mapping_write(
             !remove_actions.is_empty(),
             "Expected at least one remove action"
         );
-
-        for remove in &remove_actions {
-            let stats: serde_json::Value = serde_json::from_str(
-                remove["stats"]
-                    .as_str()
-                    .expect("remove action should have stats"),
-            )?;
-            assert!(
-                stats.get("numRecords").is_some(),
-                "remove.stats should have numRecords"
-            );
-            assert!(
-                stats["minValues"].get(&row_number_physical[0]).is_some(),
-                "remove.stats minValues should use physical name '{}' for row_number",
-                row_number_physical[0]
-            );
-            assert!(
-                stats["minValues"][&street_physical[0]]
-                    .get(&street_physical[1])
-                    .is_some(),
-                "remove.stats minValues should use physical name '{}.{}' for address.street",
-                street_physical[0],
-                street_physical[1]
-            );
-        }
 
         let remove_stats: Vec<serde_json::Value> = remove_actions
             .iter()
