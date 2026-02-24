@@ -1145,10 +1145,15 @@ pub(crate) fn to_json_bytes(
 /// - [`MetadataColumnSpec::FilePath`]: populated with `file_location` using run-end encoding
 ///   (efficient because the path is constant for all rows in a batch from the same file).
 ///
-/// For any other [`MetadataColumnSpec`] variant (e.g. [`MetadataColumnSpec::RowIndex`],
-/// [`MetadataColumnSpec::RowId`], [`MetadataColumnSpec::RowCommitVersion`]), the column is
-/// filled with nulls. These variants are not meaningful for JSON log files, but inserting nulls
-/// preserves backwards-compatible behavior.
+/// Any other [`MetadataColumnSpec`] variant (e.g. [`MetadataColumnSpec::RowIndex`],
+/// [`MetadataColumnSpec::RowId`], [`MetadataColumnSpec::RowCommitVersion`]) is not supported.
+/// A null array is inserted for the column and the field's declared nullability is preserved,
+/// so if the field is non-nullable (as all current specs are) the [`RecordBatch`] constructor
+/// will return an error.
+///
+/// Only top-level metadata columns are handled here. This is a kernel-wide invariant:
+/// [`StructType::try_new`] rejects schemas where a metadata column appears inside a nested
+/// struct, array, or map, so nested metadata columns cannot be constructed.
 ///
 /// # Companion functions
 /// - Use [`json_arrow_schema`] to build the Arrow schema without metadata columns before reading.
@@ -1186,10 +1191,10 @@ pub(crate) fn fixup_json_read(
             }
             Some(_) => {
                 // Unsupported metadata column spec: the JSON reader cannot populate this column,
-                // so insert all-null values to preserve backwards-compatible behavior (before this
-                // function existed, Arrow's JSON reader would produce nulls for any column absent
-                // from the file). Mark the field nullable since we are synthesizing nulls.
-                let arrow_field = Arc::new(ArrowField::try_from_kernel(field)?.with_nullable(true));
+                // so insert all-null values. We preserve the field's declared nullability so that
+                // if the caller asked for a non-nullable field, RecordBatch::try_new will error
+                // naturally rather than silently accepting nulls.
+                let arrow_field = Arc::new(ArrowField::try_from_kernel(field)?);
                 let null_col = new_null_array(arrow_field.data_type(), n);
                 new_fields.push(arrow_field);
                 new_cols.push(null_col);
@@ -1229,12 +1234,7 @@ pub(crate) fn fixup_json_read(
 /// Pass the returned schema to Arrow's JSON reader; then call [`fixup_json_read`] on each
 /// resulting batch to insert the synthesized metadata columns at their correct positions.
 pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
-    let json_fields = StructType::try_new(
-        schema
-            .fields()
-            .filter(|f| f.get_metadata_column_spec().is_none())
-            .cloned(),
-    )?;
+    let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)
 }
 
@@ -3283,11 +3283,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fixup_json_read_unsupported_metadata_column_inserts_nulls() {
-        use crate::arrow::array::Int64Array;
+    fn test_fixup_json_read_unsupported_metadata_column_errors() {
         use crate::schema::MetadataColumnSpec;
 
-        // RowIndex is not supported for JSON reads; it should produce a null column.
+        // RowIndex is not supported for JSON reads. All metadata column specs are non-nullable,
+        // so attempting to insert a null column for an unsupported spec should error: the
+        // RecordBatch constructor will reject a null array for a non-nullable field.
         let schema = StructType::new_unchecked([
             StructField::not_null("a", DataType::INTEGER),
             StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
@@ -3303,19 +3304,6 @@ mod tests {
         )
         .unwrap();
 
-        let result = fixup_json_read(batch, &schema, "s3://bucket/file.json").unwrap();
-        assert_eq!(result.num_columns(), 2);
-        assert_eq!(result.schema().field(1).name(), "row_index");
-
-        // The row_index column should be all nulls.
-        let row_index_col = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(row_index_col.len(), 3);
-        assert!(row_index_col.is_null(0));
-        assert!(row_index_col.is_null(1));
-        assert!(row_index_col.is_null(2));
+        assert!(fixup_json_read(batch, &schema, "s3://bucket/file.json").is_err());
     }
 }

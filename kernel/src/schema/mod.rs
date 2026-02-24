@@ -965,6 +965,14 @@ impl StructType {
         self
     }
 
+    /// Returns a new [`StructType`] containing only the fields for which `predicate` returns `true`.
+    pub fn with_fields_filtered(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Self> {
+        Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
+    }
+
     /// Returns a StructType with the named field replaced.
     /// Returns an error if field doesn't exist.
     pub fn with_field_replaced(
