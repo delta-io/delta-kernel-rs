@@ -340,15 +340,8 @@ pub(crate) mod test_utils {
         props: impl IntoIterator<Item = (String, String)>,
     ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
         let schema = std::sync::Arc::new(schema);
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0,
-            props.into_iter().collect(),
-        )
-        .unwrap();
+        let metadata =
+            Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
     }

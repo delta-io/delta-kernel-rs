@@ -368,16 +368,25 @@ mod tests {
     fn test_column_mapping_mode() {
         let annotated = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
         let plain = create_schema(None, None, None, None);
-        let cmm_id =
-            HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
+        let cmm_id = HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
         let no_props = HashMap::new();
 
         // v2 legacy + mode=id → Id (annotated schema required)
-        let tc = make_test_tc(annotated.clone(), Protocol::try_new_legacy(2, 5).unwrap(), cmm_id.clone()).unwrap();
+        let tc = make_test_tc(
+            annotated.clone(),
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            cmm_id.clone(),
+        )
+        .unwrap();
         assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
         // v2 legacy + no mode → None
-        let tc = make_test_tc(plain.clone(), Protocol::try_new_legacy(2, 5).unwrap(), no_props.clone()).unwrap();
+        let tc = make_test_tc(
+            plain.clone(),
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            no_props.clone(),
+        )
+        .unwrap();
         assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
         // v3 + empty features + mode=id → None (mode ignored without CM feature)

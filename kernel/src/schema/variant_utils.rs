@@ -97,7 +97,10 @@ mod tests {
 
         for (reader, writer) in [
             (TableFeature::VariantType, TableFeature::VariantType),
-            (TableFeature::VariantTypePreview, TableFeature::VariantTypePreview),
+            (
+                TableFeature::VariantTypePreview,
+                TableFeature::VariantTypePreview,
+            ),
         ] {
             let protocol_with = Protocol::try_new_modern([&reader], [&writer]).unwrap();
 
