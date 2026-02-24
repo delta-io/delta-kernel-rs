@@ -22,7 +22,6 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
-use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
@@ -95,7 +94,6 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
-    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 /// Builder for creating [`DefaultEngine`] instances.
@@ -120,7 +118,6 @@ pub struct DefaultEngine<E: TaskExecutor> {
 pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
@@ -129,18 +126,11 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
         Self {
             object_store,
             task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
-            metrics_reporter: None,
         }
     }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<E> {
-    /// Set the metrics reporter for the engine.
-    pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
-        self.metrics_reporter = Some(reporter);
-        self
-    }
-
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
@@ -151,13 +141,12 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
-            metrics_reporter: self.metrics_reporter,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor)
     }
 }
 
@@ -175,11 +164,7 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(
-        object_store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        metrics_reporter: Option<Arc<dyn MetricsReporter>>,
-    ) -> Self {
+    fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
@@ -196,7 +181,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
-            metrics_reporter,
         }
     }
 
@@ -281,10 +265,6 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
     }
-
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        self.metrics_reporter.clone()
-    }
 }
 
 trait UrlExt {
@@ -320,15 +300,7 @@ impl UrlExt for Url {
 mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use crate::metrics::MetricEvent;
     use object_store::local::LocalFileSystem;
-
-    #[derive(Debug)]
-    struct TestMetricsReporter;
-
-    impl MetricsReporter for TestMetricsReporter {
-        fn report(&self, _event: MetricEvent) {}
-    }
 
     #[test]
     fn test_default_engine() {
@@ -345,19 +317,6 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_with_metrics_reporter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
-            .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
@@ -393,13 +352,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
             .with_task_executor(executor)
             .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
