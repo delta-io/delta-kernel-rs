@@ -96,7 +96,7 @@ async fn read_json_files_impl(
     // (e.g. FilePath) that the JSON reader cannot populate from the file content.
     let json_arrow_schema = Arc::new(json_arrow_schema(&physical_schema)?);
 
-    // An iterator of futures that open each file, producing a stream tagged with metadata columns.
+    // An iterator of futures that open each file and post-process each resulting batch.
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
         let json_arrow_schema = json_arrow_schema.clone();
@@ -105,11 +105,11 @@ async fn read_json_files_impl(
             let file_path = file.location.to_string();
             let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
-            let tagged: BoxStream<'static, DeltaResult<Box<dyn EngineData>>> = batch_stream
+            let tagged = batch_stream
                 .map(move |result| -> DeltaResult<Box<dyn EngineData>> {
                     let batch = result?;
                     let batch = fixup_json_read(batch, &physical_schema, &file_path)?;
-                    Ok(Box::new(ArrowEngineData::new(batch)) as _)
+                    Ok(Box::new(ArrowEngineData::new(batch)))
                 })
                 .boxed();
             Ok::<_, Error>(tagged)
