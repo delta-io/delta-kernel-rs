@@ -1009,9 +1009,7 @@ pub fn remove_all_and_get_remove_actions(
     engine: &impl Engine,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let scan = snapshot.clone().scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan
-        .scan_metadata(engine)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
 
     let mut txn = snapshot
         .clone()
@@ -1029,11 +1027,7 @@ pub fn remove_all_and_get_remove_actions(
 }
 
 /// Asserts that `action["partitionValues"]` contains the given key with the expected value.
-pub fn assert_partition_values(
-    action: &serde_json::Value,
-    key: &str,
-    expected_value: &str,
-) {
+pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_value: &str) {
     let pv = action["partitionValues"]
         .as_object()
         .expect("action should have partitionValues");

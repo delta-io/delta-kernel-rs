@@ -3119,8 +3119,8 @@ async fn test_column_mapping_write(
     // Enable writeStatsAsStruct so the checkpoint contains native stats_parsed.
     // CREATE TABLE doesn't allow this property yet, so we write a metadata-update commit directly.
     latest_snapshot = {
-        let v0_path = std::path::Path::new(&table_path)
-            .join("_delta_log/00000000000000000000.json");
+        let v0_path =
+            std::path::Path::new(&table_path).join("_delta_log/00000000000000000000.json");
         let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
             .lines()
             .find_map(|line| {
@@ -3190,8 +3190,7 @@ async fn test_column_mapping_write(
         let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
         for sm in scan_metadata_results {
             let (data, sel) = sm.scan_files.into_parts();
-            let batch: RecordBatch =
-                ArrowEngineData::try_from_engine_data(data)?.into();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
 
             let stats_parsed = batch
                 .column_by_name("stats_parsed")
@@ -3250,8 +3249,8 @@ async fn test_column_mapping_write(
                 .downcast_ref::<StringArray>()
                 .unwrap();
 
-            for i in 0..batch.num_rows() {
-                if sel[i] && !stats_parsed.is_null(i) {
+            for (i, &selected) in sel.iter().enumerate().take(batch.num_rows()) {
+                if selected && !stats_parsed.is_null(i) {
                     stats_rows.push((
                         min_row_num.value(i),
                         max_row_num.value(i),
@@ -3281,7 +3280,11 @@ async fn test_column_mapping_write(
         let obj_meta = store
             .head(&Path::from_url_path(parquet_url.path())?)
             .await?;
-        let file_meta = FileMeta::new(parquet_url, 0 /* last_modified */, obj_meta.size as u64);
+        let file_meta = FileMeta::new(
+            parquet_url,
+            0, /* last_modified */
+            obj_meta.size as u64,
+        );
         let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
         let footer_schema = footer.schema;
 
