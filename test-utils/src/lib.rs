@@ -32,7 +32,7 @@ use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
-use serde_json::{json, to_vec};
+use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -981,4 +981,65 @@ impl LoggingTest {
     pub fn logs(&self) -> String {
         String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
     }
+}
+
+/// Reads a commit log file and returns all actions of the given type (e.g. "add" or "remove").
+pub fn read_actions_from_commit(
+    table_url: &Url,
+    version: u64,
+    action_type: &str,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let table_path = table_url.to_file_path().expect("should be a file URL");
+    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let content = std::fs::read_to_string(commit_path)?;
+    let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+    Ok(parsed
+        .into_iter()
+        .filter_map(|v| v.get(action_type).cloned())
+        .collect())
+}
+
+/// Removes all scan files from the snapshot, commits the transaction, and returns
+/// the parsed remove actions from the resulting commit log.
+pub fn remove_all_and_get_remove_actions(
+    snapshot: &Arc<Snapshot>,
+    table_url: &Url,
+    engine: &impl Engine,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let scan = snapshot.clone().scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    for sm in all_scan_metadata {
+        txn.remove_files(sm.scan_files);
+    }
+    let committed = match txn.commit(engine)? {
+        CommitResult::CommittedTransaction(c) => c,
+        _ => panic!("Transaction should be committed"),
+    };
+    read_actions_from_commit(table_url, committed.commit_version(), "remove")
+}
+
+/// Asserts that `action["partitionValues"]` contains the given key with the expected value.
+pub fn assert_partition_values(
+    action: &serde_json::Value,
+    key: &str,
+    expected_value: &str,
+) {
+    let pv = action["partitionValues"]
+        .as_object()
+        .expect("action should have partitionValues");
+    assert!(
+        pv.contains_key(key),
+        "partitionValues should contain key '{key}', got: {pv:?}"
+    );
+    assert_eq!(pv[key], expected_value);
 }

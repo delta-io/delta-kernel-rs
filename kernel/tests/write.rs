@@ -43,9 +43,10 @@ use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMap
 use delta_kernel::FileMeta;
 
 use test_utils::{
-    assert_result_error_with_message, assert_schema_has_field, copy_directory,
-    create_add_files_metadata, create_default_engine, create_table, create_table_and_load_snapshot,
-    engine_store_setup, nested_batches, nested_schema, read_add_infos, setup_test_tables,
+    assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
+    copy_directory, create_add_files_metadata, create_default_engine, create_table,
+    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
+    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, setup_test_tables,
     test_read, test_table_setup, write_batch_to_table,
 };
 
@@ -3049,18 +3050,6 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     Ok(())
 }
 
-/// Removes all scan files from the given snapshot by feeding all scan metadata into `txn.remove_files`.
-fn remove_all_files(
-    txn: &mut delta_kernel::transaction::Transaction,
-    snapshot: &Arc<Snapshot>,
-    engine: &impl Engine,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for scan_file in get_scan_files(snapshot.clone(), engine)? {
-        txn.remove_files(scan_file);
-    }
-    Ok(())
-}
-
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
 /// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
@@ -3370,76 +3359,50 @@ async fn test_column_mapping_write(
             "should have at least one add with stats"
         );
 
-        let mut txn = latest_snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_engine_info("DefaultEngine")
-            .with_data_change(true);
+        let remove_actions =
+            remove_all_and_get_remove_actions(&latest_snapshot, &table_url, engine.as_ref())?;
+        assert!(
+            !remove_actions.is_empty(),
+            "Expected at least one remove action"
+        );
 
-        remove_all_files(&mut txn, &latest_snapshot, engine.as_ref())?;
-
-        let result = txn.commit(engine.as_ref())?;
-        match result {
-            CommitResult::CommittedTransaction(committed) => {
-                let commit_version = committed.commit_version();
-                let commit_path = std::path::Path::new(&table_path)
-                    .join(format!("_delta_log/{:020}.json", commit_version));
-                let commit_content = std::fs::read_to_string(commit_path)?;
-
-                let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
-                    .into_iter::<serde_json::Value>()
-                    .try_collect()?;
-
-                let remove_actions: Vec<_> = parsed_commits
-                    .iter()
-                    .filter_map(|action| action.get("remove"))
-                    .collect();
-
-                assert!(
-                    !remove_actions.is_empty(),
-                    "Expected at least one remove action"
-                );
-
-                for remove in &remove_actions {
-                    let stats_str = remove["stats"]
-                        .as_str()
-                        .expect("remove action should have stats");
-                    let stats: serde_json::Value = serde_json::from_str(stats_str)?;
-
-                    assert!(
-                        stats.get("numRecords").is_some(),
-                        "remove.stats should have numRecords"
-                    );
-                    assert!(
-                        stats["minValues"].get(&row_number_physical[0]).is_some(),
-                        "remove.stats minValues should use physical name '{}' for row_number",
-                        row_number_physical[0]
-                    );
-                    assert!(
-                        stats["minValues"][&street_physical[0]]
-                            .get(&street_physical[1])
-                            .is_some(),
-                        "remove.stats minValues should use physical name '{}.{}' for address.street",
-                        street_physical[0],
-                        street_physical[1]
-                    );
-                }
-
-                let remove_stats: Vec<serde_json::Value> = remove_actions
-                    .iter()
-                    .filter_map(|r| {
-                        r["stats"]
-                            .as_str()
-                            .map(|s| serde_json::from_str(s).unwrap())
-                    })
-                    .collect();
-                assert_eq!(
-                    remove_stats, original_add_stats,
-                    "remove.stats should match original add.stats"
-                );
-            }
-            _ => panic!("Transaction should be committed"),
+        for remove in &remove_actions {
+            let stats: serde_json::Value = serde_json::from_str(
+                remove["stats"]
+                    .as_str()
+                    .expect("remove action should have stats"),
+            )?;
+            assert!(
+                stats.get("numRecords").is_some(),
+                "remove.stats should have numRecords"
+            );
+            assert!(
+                stats["minValues"].get(&row_number_physical[0]).is_some(),
+                "remove.stats minValues should use physical name '{}' for row_number",
+                row_number_physical[0]
+            );
+            assert!(
+                stats["minValues"][&street_physical[0]]
+                    .get(&street_physical[1])
+                    .is_some(),
+                "remove.stats minValues should use physical name '{}.{}' for address.street",
+                street_physical[0],
+                street_physical[1]
+            );
         }
+
+        let remove_stats: Vec<serde_json::Value> = remove_actions
+            .iter()
+            .filter_map(|r| {
+                r["stats"]
+                    .as_str()
+                    .map(|s| serde_json::from_str(s).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            remove_stats, original_add_stats,
+            "remove.stats should match original add.stats"
+        );
     }
 
     Ok(())
@@ -3505,71 +3468,22 @@ async fn test_column_mapping_partitioned_write(
     write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
 
     // Read commit log and verify add.partitionValues key uses physical name
-    let log_path = table_url.join("_delta_log/00000000000000000001.json")?;
-    let log_bytes = store
-        .get(&Path::from_url_path(log_path.path())?)
-        .await?
-        .bytes()
-        .await?;
-    let mut found_add = false;
-    for line in std::str::from_utf8(&log_bytes)?.lines() {
-        let obj: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(add) = obj.get("add") {
-            let pv = add["partitionValues"]
-                .as_object()
-                .expect("partitionValues should be an object");
-            assert!(
-                pv.contains_key(&physical_name),
-                "partitionValues key should be '{physical_name}', got: {pv:?}"
-            );
-            assert_eq!(pv[&physical_name], "A");
-            found_add = true;
-        }
+    let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+    assert!(!add_actions.is_empty(), "no add action found in commit log");
+    for add in &add_actions {
+        assert_partition_values(add, &physical_name, "A");
     }
-    assert!(found_add, "no add action found in commit log");
 
     // Remove the written file and verify remove action preserves physical names
     let post_write_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-
-    let mut txn = post_write_snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("DefaultEngine")
-        .with_data_change(true);
-
-    remove_all_files(&mut txn, &post_write_snapshot, engine.as_ref())?;
-
-    let result = txn.commit(engine.as_ref())?;
-    match result {
-        CommitResult::CommittedTransaction(committed) => {
-            let commit_version = committed.commit_version();
-            let remove_log_path =
-                table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
-            let remove_log_bytes = store
-                .get(&Path::from_url_path(remove_log_path.path())?)
-                .await?
-                .bytes()
-                .await?;
-
-            let mut found_remove = false;
-            for line in std::str::from_utf8(&remove_log_bytes)?.lines() {
-                let obj: serde_json::Value = serde_json::from_str(line)?;
-                if let Some(remove) = obj.get("remove") {
-                    found_remove = true;
-
-                    let pv = remove["partitionValues"]
-                        .as_object()
-                        .expect("remove should have partitionValues");
-                    assert!(
-                        pv.contains_key(&physical_name),
-                        "remove partitionValues key should be '{physical_name}', got: {pv:?}"
-                    );
-                    assert_eq!(pv[&physical_name], "A");
-                }
-            }
-            assert!(found_remove, "no remove action found in commit log");
-        }
-        _ => panic!("Transaction should be committed"),
+    let remove_actions =
+        remove_all_and_get_remove_actions(&post_write_snapshot, &table_url, engine.as_ref())?;
+    assert!(
+        !remove_actions.is_empty(),
+        "no remove action found in commit log"
+    );
+    for remove in &remove_actions {
+        assert_partition_values(remove, &physical_name, "A");
     }
 
     Ok(())
