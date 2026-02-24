@@ -468,9 +468,9 @@ pub async fn create_table(
     Ok(table_path)
 }
 
-/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.
-/// the tables will be named {table_base_name}_11 and table_base_name}_37. The local_directory param
-/// can be set to write out the tables to the local filesystem, passing in None will create in-memory tables
+/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
+/// be named {table_base_name}_11 and {table_base_name}_37. The local_directory param can be set to
+/// write out the tables to the local filesystem, passing in None will create in-memory tables
 pub async fn setup_test_tables(
     schema: SchemaRef,
     partition_columns: &[&str],
