@@ -180,6 +180,8 @@ where
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
         let batch = RecordBatch::from(data);
+        // Type mismatches are already handled by `reorder_struct_array` above,
+        // we don't do anything more strict here.
         let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
         coerce_batch_nullability(batch, schema, Some(&allow_all))?.into()
     } else {
@@ -216,8 +218,7 @@ where
 ///
 /// **Complexity:** O(F) time and space where F is the total number of fields (including nested)
 /// in the schema. The actual row data (Arrow buffers) is shared via `Arc` and never copied.
-/// When the source schema already matches the target, only an O(F) schema comparison is
-/// performed and the original batch is returned without any allocation.
+/// When the source schema already matches the target, the original batch is returned immediately.
 ///
 /// If `type_mismatch_validator` is provided, it is called when a source field's data type differs
 /// from the target field's data type. It should return `Ok(())` to allow the mismatch or an error
