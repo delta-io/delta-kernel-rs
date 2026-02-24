@@ -30,19 +30,39 @@ pub enum AfterSequentialScanMetadata {
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    engine: Arc<dyn Engine>,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
-        Self { sequential }
+    pub(crate) fn new(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        engine: Arc<dyn Engine>,
+    ) -> Self {
+        Self { sequential, engine }
     }
 
+    #[tracing::instrument(skip_all, name = "sequential_scan_metadata")]
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterSequentialScanMetadata::Done),
+            AfterSequential::Done(processor) => {
+                processor
+                    .get_metrics()
+                    .log("Sequential scan metadata completed");
+                Ok(AfterSequentialScanMetadata::Done)
+            }
             AfterSequential::Parallel { processor, files } => {
+                // Log sequential metrics before reconstruction
+                processor
+                    .get_metrics()
+                    .log("Sequential scan metadata completed");
+
+                // Reconstruct with fresh metrics for parallel phase
+                let fresh_processor = processor.reconstruct_for_parallel(self.engine.as_ref())?;
+
                 Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState { inner: processor }),
+                    state: Box::new(ParallelState {
+                        inner: fresh_processor,
+                    }),
                     files,
                 })
             }
@@ -75,6 +95,30 @@ impl ParallelLogReplayProcessor for Arc<ParallelState> {
 }
 
 impl ParallelState {
+    /// Log the accumulated metrics from parallel processing.
+    ///
+    /// Call this after all parallel workers complete. The metrics will be logged
+    /// in the current tracing span context.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use tracing::instrument;
+    /// #[instrument(skip_all, name = "parallel_scan")]
+    /// async fn process(state: Arc<ParallelState>) {
+    ///     // ... spawn workers that share Arc<ParallelState> ...
+    ///     // ... wait for workers to complete ...
+    ///
+    ///     // Log accumulated metrics
+    ///     state.log_metrics();
+    /// }
+    /// ```
+    pub fn log_metrics(&self) {
+        self.inner
+            .get_metrics()
+            .log("Parallel scan metadata completed");
+    }
+
     /// Get the schema to use for reading checkpoint files.
     ///
     /// Returns the checkpoint read schema which may have stats excluded

@@ -38,6 +38,7 @@ use self::log_replay::scan_action_iter;
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
+pub(crate) mod metrics;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -911,9 +912,10 @@ impl Scan {
             checkpoint_info,
             self.skip_stats(),
         )?;
-        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+        let sequential =
+            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        Ok(SequentialScanMetadata::new(sequential, engine))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

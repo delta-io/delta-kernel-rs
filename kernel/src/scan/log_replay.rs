@@ -2,7 +2,11 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
+
 use super::data_skipping::DataSkippingFilter;
+use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -24,8 +28,6 @@ use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructFie
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
-use delta_kernel_derive::internal_api;
-use serde::{Deserialize, Serialize};
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -120,6 +122,8 @@ pub struct ScanLogReplayProcessor {
     has_partition_values_parsed: bool,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
+    /// Metrics related to the scan
+    metrics: Arc<ScanMetrics>,
 }
 
 impl ScanLogReplayProcessor {
@@ -172,6 +176,9 @@ impl ScanLogReplayProcessor {
             checkpoint_read_schema,
         } = checkpoint_info.clone();
 
+        // Create metrics first so we can pass them to DataSkippingFilter
+        let metrics = Arc::new(ScanMetrics::default());
+
         // Extract the physical predicate for data skipping and partition filtering.
         // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
         let physical_predicate = match &state_info.physical_predicate {
@@ -208,6 +215,7 @@ impl ScanLogReplayProcessor {
                         None, // no partition schema yet
                         column_expr_ref!("partitionValues_parsed"),
                         output_schema.clone(),
+                        Some(metrics.clone()),
                     )
                 })
         };
@@ -232,12 +240,42 @@ impl ScanLogReplayProcessor {
             state_info,
             skip_stats,
             checkpoint_info,
+            metrics,
         })
     }
 
     /// Get a reference to the checkpoint info.
     pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
         &self.checkpoint_info
+    }
+
+    pub(crate) fn get_metrics(&self) -> &ScanMetrics {
+        self.metrics.as_ref()
+    }
+
+    /// Reconstruct processor with fresh metrics for parallel phase.
+    ///
+    /// Returns a new processor with fresh metrics, preserving the hash set size
+    /// from the sequential phase. The caller is responsible for logging sequential
+    /// metrics before calling this method.
+    pub(crate) fn reconstruct_for_parallel(self, engine: &dyn Engine) -> DeltaResult<Self> {
+        let hash_set_size = self.seen_file_keys.len();
+
+        // Create fresh processor with new metrics
+        let fresh_processor = Self::new_with_seen_files(
+            engine,
+            self.state_info,
+            self.checkpoint_info,
+            self.seen_file_keys,
+            self.skip_stats,
+        )?;
+
+        // Preserve hash_set_size from sequential phase
+        fresh_processor
+            .metrics
+            .update_peak_hash_set_size(hash_set_size);
+
+        Ok(fresh_processor)
     }
 
     /// Serialize the processor state for distributed processing.
@@ -354,27 +392,30 @@ impl ScanLogReplayProcessor {
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<D: Deduplicator> {
+struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    metrics: &'a ScanMetrics,
 }
 
-impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
+impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
     fn new(
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
-    ) -> AddRemoveDedupVisitor<D> {
+        metrics: &'a ScanMetrics,
+    ) -> AddRemoveDedupVisitor<'a, D> {
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
             state_info,
             partition_filter,
             row_transform_exprs: Vec::new(),
+            metrics,
         }
     }
 
@@ -398,7 +439,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on action type:
         // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
         // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8
@@ -411,7 +452,14 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
         else {
+            self.metrics.incr_non_file_actions();
             return Ok(false);
+        };
+
+        if is_add {
+            self.metrics.incr_add_files_seen()
+        } else {
+            self.metrics.incr_remove_files_seen()
         };
 
         // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
@@ -422,6 +470,8 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
+                let start = std::time::Instant::now();
+
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values(
@@ -430,9 +480,17 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
                     &partition_values,
                     self.state_info.column_mapping_mode,
                 )?;
-                if self.is_file_partition_pruned(&partition_values) {
+
+                let is_pruned = self.is_file_partition_pruned(&partition_values);
+
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                self.metrics.add_predicate_eval_time_ns(elapsed_ns);
+
+                if is_pruned {
+                    self.metrics.incr_predicate_filtered();
                     return Ok(false);
                 }
+
                 partition_values
             }
             _ => Default::default(),
@@ -462,11 +520,12 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             self.row_transform_exprs.resize_with(i, Default::default);
             self.row_transform_exprs.push(transform);
         }
+        self.metrics.incr_active_add_files();
         Ok(true)
     }
 }
 
-impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
+impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
@@ -500,6 +559,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let start = std::time::Instant::now();
+
         let is_log_batch = self.deduplicator.is_log_batch();
         let expected_getters = if is_log_batch { 10 } else { 6 };
         require!(
@@ -515,6 +576,10 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
                 self.selection_vector[i] = self.is_valid_add(i, getters)?;
             }
         }
+
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        self.metrics.add_dedup_visitor_time_ns(elapsed_ns);
+
         Ok(())
     }
 }
@@ -704,15 +769,19 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics
+            .update_peak_hash_set_size(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 }
 
@@ -777,15 +846,19 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics
+            .update_peak_hash_set_size(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
