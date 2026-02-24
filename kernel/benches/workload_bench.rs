@@ -9,7 +9,9 @@ use delta_kernel::engine::default::DefaultEngine;
 mod utils;
 
 use delta_kernel::benchmarks::models::{default_read_configs, ReadConfig, ReadOperation, Spec};
-use delta_kernel::benchmarks::runners::{create_read_runner, WorkloadRunner};
+use delta_kernel::benchmarks::runners::{
+    create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
+};
 use utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
@@ -48,6 +50,16 @@ fn workload_benchmarks(c: &mut Criterion) {
                         run_benchmark(&mut group, runner.as_ref());
                     }
                 }
+            }
+            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                let runner = SnapshotConstructionRunner::setup(
+                    &workload.table_info,
+                    &workload.case_name,
+                    snapshot_construction_spec,
+                    engine.clone(),
+                )
+                .expect("Failed to create snapshot runner");
+                run_benchmark(&mut group, &runner);
             }
         }
     }
