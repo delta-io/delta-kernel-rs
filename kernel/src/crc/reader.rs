@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use super::{Crc, CrcVisitor};
+use crate::actions::DomainMetadata;
 use crate::path::ParsedLogPath;
 use crate::schema::ToSchema as _;
-use crate::{DeltaResult, Engine, Error, RowVisitor as _};
+use crate::{DeltaResult, Engine, EngineData, Error, RowVisitor as _};
 
 /// Attempt to read and parse a CRC file.
 ///
@@ -30,10 +31,99 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
         )));
     }
 
-    // Use visitor to extract CRC fields
+    // Use visitor to extract scalar CRC fields (P&M, ICT, tableSizeBytes, numFiles)
     let mut visitor = CrcVisitor::default();
     visitor.visit_rows_of(batch.as_ref())?;
-    visitor.into_crc()
+    let mut crc = visitor.into_crc()?;
+
+    // Extract domain metadata from the already-loaded batch via Arrow downcast.
+    // The visitor pattern's EngineList trait only supports string arrays, not
+    // array-of-struct, so we use Arrow APIs directly. The data is already in memory.
+    crc.domain_metadata = extract_domain_metadata_from_batch(batch)?;
+
+    Ok(crc)
+}
+
+/// Extract domain metadata from a CRC batch using Arrow downcast.
+///
+/// The `domainMetadata` field is `Array<Struct<domain: String, configuration: String,
+/// removed: Boolean>>`. The standard visitor pattern does not support array-of-struct
+/// extraction, so we downcast to Arrow and read the arrays directly.
+///
+/// Returns `None` if the column is missing or null (CRC has no domain metadata).
+/// Tombstones (`removed=true`) are excluded from the result.
+#[cfg(feature = "default-engine-base")]
+fn extract_domain_metadata_from_batch(
+    batch: Box<dyn EngineData>,
+) -> DeltaResult<Option<Vec<DomainMetadata>>> {
+    use crate::arrow::array::cast::AsArray as _;
+    use crate::arrow::array::Array as _;
+    use crate::engine::arrow_data::ArrowEngineData;
+
+    let arrow_data = ArrowEngineData::try_from_engine_data(batch)?;
+    let rb = arrow_data.record_batch();
+
+    // Find the domainMetadata column
+    let col_idx = match rb.schema().index_of("domainMetadata") {
+        Ok(idx) => idx,
+        Err(_) => return Ok(None),
+    };
+
+    let col = rb.column(col_idx);
+    if col.is_null(0) {
+        return Ok(None);
+    }
+
+    // domainMetadata is List<Struct<domain, configuration, removed>>
+    let list_array = col
+        .as_list_opt::<i32>()
+        .ok_or_else(|| Error::generic("domainMetadata is not a list array"))?;
+
+    let struct_array = list_array
+        .value(0)
+        .as_struct_opt()
+        .ok_or_else(|| Error::generic("domainMetadata list element is not a struct"))?
+        .clone();
+
+    let domain_col = struct_array
+        .column_by_name("domain")
+        .ok_or_else(|| Error::generic("domainMetadata missing 'domain' field"))?
+        .as_string_opt::<i32>()
+        .ok_or_else(|| Error::generic("domainMetadata.domain is not a string array"))?;
+
+    let config_col = struct_array
+        .column_by_name("configuration")
+        .ok_or_else(|| Error::generic("domainMetadata missing 'configuration' field"))?
+        .as_string_opt::<i32>()
+        .ok_or_else(|| Error::generic("domainMetadata.configuration is not a string array"))?;
+
+    let removed_col = struct_array
+        .column_by_name("removed")
+        .ok_or_else(|| Error::generic("domainMetadata missing 'removed' field"))?
+        .as_boolean_opt()
+        .ok_or_else(|| Error::generic("domainMetadata.removed is not a boolean array"))?;
+
+    let mut result = Vec::with_capacity(domain_col.len());
+    for i in 0..domain_col.len() {
+        let domain = domain_col.value(i).to_string();
+        let configuration = config_col.value(i).to_string();
+        let removed = removed_col.value(i);
+
+        // Exclude tombstones from the CRC domain metadata
+        if !removed {
+            result.push(DomainMetadata::new(domain, configuration));
+        }
+    }
+
+    Ok(Some(result))
+}
+
+/// Fallback for non-Arrow engines: domain metadata extraction is not supported.
+#[cfg(not(feature = "default-engine-base"))]
+fn extract_domain_metadata_from_batch(
+    _batch: Box<dyn EngineData>,
+) -> DeltaResult<Option<Vec<DomainMetadata>>> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -116,6 +206,17 @@ mod tests {
             ]),
         );
         assert_eq!(crc.metadata, expected_metadata);
+
+        // Verify domain metadata was extracted (the crc-full test file has one DM entry)
+        let domain_metadata = crc
+            .domain_metadata
+            .as_ref()
+            .expect("domain_metadata should be Some");
+        assert_eq!(domain_metadata.len(), 1);
+        assert_eq!(domain_metadata[0].domain(), "delta.rowTracking");
+        assert!(domain_metadata[0]
+            .configuration()
+            .contains("rowIdHighWaterMark"));
     }
 
     #[test]
