@@ -298,6 +298,61 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Asserts the 2×2 matrix of (schema_has_feature, protocol_supports_feature) outcomes
+    /// for schema-level feature validators. The expected pattern is:
+    /// - schema + protocol → Ok
+    /// - no schema + no protocol → Ok
+    /// - no schema + protocol → Ok
+    /// - schema + no protocol → Err (orphaned schema presence)
+    /// Additional error schemas (e.g. nested) are also tested against `protocol_without`.
+    #[track_caller]
+    pub(crate) fn assert_schema_feature_validation(
+        schema_with: &StructType,
+        schema_without: &StructType,
+        protocol_with: &Protocol,
+        protocol_without: &Protocol,
+        extra_err_schemas: &[&StructType],
+        err_msg: &str,
+    ) {
+        make_test_tc(schema_with.clone(), protocol_with.clone(), [])
+            .expect("feature present + supported");
+        make_test_tc(schema_without.clone(), protocol_without.clone(), [])
+            .expect("feature absent + unsupported");
+        make_test_tc(schema_without.clone(), protocol_with.clone(), [])
+            .expect("feature absent + supported");
+        assert_result_error_with_message(
+            make_test_tc(schema_with.clone(), protocol_without.clone(), []),
+            err_msg,
+        );
+        for schema in extra_err_schemas {
+            assert_result_error_with_message(
+                make_test_tc((*schema).clone(), protocol_without.clone(), []),
+                err_msg,
+            );
+        }
+    }
+
+    /// Creates a [`TableConfiguration`] from a schema, protocol, and table properties.
+    /// Useful for testing validators that need a TC.
+    pub(crate) fn make_test_tc(
+        schema: StructType,
+        protocol: Protocol,
+        props: impl IntoIterator<Item = (String, String)>,
+    ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
+        let schema = std::sync::Arc::new(schema);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            props.into_iter().collect(),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    }
+
     /// Helper to get a field from a StructType by name, panicking if not found.
     pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
         struct_type

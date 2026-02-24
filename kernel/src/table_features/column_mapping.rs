@@ -9,6 +9,7 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, Schema,
     SchemaTransform, StructField, StructType,
 };
+use crate::table_configuration::TableConfiguration;
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::{DeltaResult, Error};
 
@@ -49,6 +50,11 @@ pub(crate) fn column_mapping_mode(
         (Some(mode), 3) if protocol.has_table_feature(&TableFeature::ColumnMapping) => mode,
         _ => ColumnMappingMode::None,
     }
+}
+
+/// Validates that the schema annotations are consistent with the column mapping mode.
+pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
+    validate_schema_column_mapping(&tc.schema(), tc.column_mapping_mode())
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
@@ -355,87 +361,71 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructType};
+    use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_column_mapping_mode() {
-        let table_properties: HashMap<_, _> =
-            [("delta.columnMapping.mode".to_string(), "id".to_string())]
-                .into_iter()
-                .collect();
-        let table_properties = TableProperties::from(table_properties.iter());
-        let empty_table_properties = TableProperties::from([] as [(String, String); 0]);
+        let annotated = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+        let plain = create_schema(None, None, None, None);
+        let cmm_id =
+            HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
+        let no_props = HashMap::new();
 
-        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        // v2 legacy + mode=id → Id (annotated schema required)
+        let tc = make_test_tc(annotated.clone(), Protocol::try_new_legacy(2, 5).unwrap(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
+        // v2 legacy + no mode → None
+        let tc = make_test_tc(plain.clone(), Protocol::try_new_legacy(2, 5).unwrap(), no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
+        // v3 + empty features + mode=id → None (mode ignored without CM feature)
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::None
-        );
+        // v3 + empty features + no mode → None
+        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
+        // v3 + CM feature + mode=id → Id
         let protocol =
             Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
                 .unwrap();
+        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
+        // v3 + CM feature + no mode → None
+        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
+        // v3 + DV feature (no CM) + mode=id → None (mode ignored)
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors],
             [TableFeature::DeletionVectors],
         )
         .unwrap();
+        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::None
-        );
+        // v3 + DV feature + no mode → None
+        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
+        // v3 + DV + CM features + mode=id → Id
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
+        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
+        // v3 + DV + CM features + no mode → None
+        let tc = make_test_tc(plain.clone(), protocol, no_props).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
     }
 
     // Creates optional schema field annotations for column mapping id and physical name, as a string.
