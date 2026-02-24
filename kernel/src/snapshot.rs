@@ -731,9 +731,7 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::json;
-    use test_utils::{
-        add_commit, add_commit_at, delta_path_for_version, delta_path_for_version_at,
-    };
+    use test_utils::{add_commit, delta_path_for_version};
 
     use crate::actions::Protocol;
     use crate::arrow::array::StringArray;
@@ -875,6 +873,19 @@ mod tests {
     }
 
     // TODO: unify this and lots of stuff in LogSegment tests and test_utils
+    fn delta_path_for_table_version(table_root: &Url, version: u64, suffix: &str) -> Path {
+        let table_prefix = table_root
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        let file_path = delta_path_for_version(version, suffix);
+        if table_prefix.is_empty() {
+            file_path
+        } else {
+            Path::from(format!("{table_prefix}/{}", file_path.as_ref()).as_str())
+        }
+    }
+
     async fn commit(
         store: &InMemory,
         table_root: Option<&Url>,
@@ -887,9 +898,8 @@ mod tests {
             .collect::<Vec<String>>()
             .join("\n");
         if let Some(table_root) = table_root {
-            add_commit_at(store, table_root, version, commit_data)
-                .await
-                .unwrap();
+            let path = delta_path_for_table_version(table_root, version, "json");
+            store.put(&path, commit_data.into()).await.unwrap();
         } else {
             add_commit(store, version, commit_data).await.unwrap();
         }
@@ -1776,7 +1786,7 @@ mod tests {
         writer.write(&checkpoint)?;
         writer.close()?;
 
-        let checkpoint_path = delta_path_for_version_at(&url, 1, "checkpoint.parquet");
+        let checkpoint_path = delta_path_for_table_version(&url, 1, "checkpoint.parquet");
         store.put(&checkpoint_path, buffer.into()).await?;
 
         // Create 00000000000000000001.json with ICT
