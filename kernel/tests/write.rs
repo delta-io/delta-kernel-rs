@@ -38,6 +38,7 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
@@ -59,8 +60,6 @@ mod common;
 ///
 /// Panics if the file cannot be read or the physical path doesn't exist in the parquet schema.
 fn get_parquet_field_id(parquet_file: &std::path::Path, physical_path: &[String]) -> Option<i32> {
-    use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
-
     let file = std::fs::File::open(parquet_file).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
     let root = reader
