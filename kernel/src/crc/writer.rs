@@ -232,8 +232,19 @@ impl IntoEngineData for Crc {
         values.push(null_array_scalar::<SetTransaction>());
         values.push(domain_metadata_scalar);
 
-        // FileSizeHistogram (always None for now)
-        values.push(Scalar::Null(super::FileSizeHistogram::to_data_type()));
+        // FileSizeHistogram: a nullable struct with 3 array leaves.
+        // When null, provide null for each leaf field.
+        // sortedBinBoundaries: Array<Long>
+        let long_array_type = ArrayType::new(DataType::LONG, false);
+        values.push(Scalar::Null(DataType::Array(Box::new(
+            long_array_type.clone(),
+        ))));
+        // fileCounts: Array<Long>
+        values.push(Scalar::Null(DataType::Array(Box::new(
+            long_array_type.clone(),
+        ))));
+        // totalBytes: Array<Long>
+        values.push(Scalar::Null(DataType::Array(Box::new(long_array_type))));
 
         // allFiles (always None for now)
         values.push(null_array_scalar::<Add>());
@@ -250,10 +261,12 @@ impl IntoEngineData for Crc {
                 .unwrap_or(Scalar::Null(DataType::LONG)),
         );
 
-        // DeletedRecordCountsHistogram (always None for now)
-        values.push(Scalar::Null(
-            super::DeletedRecordCountsHistogram::to_data_type(),
-        ));
+        // DeletedRecordCountsHistogram: a nullable struct with 1 array leaf.
+        // deletedRecordCounts: Array<Long>
+        values.push(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+            DataType::LONG,
+            false,
+        )))));
 
         engine.evaluation_handler().create_one(schema, &values)
     }
