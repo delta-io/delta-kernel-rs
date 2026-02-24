@@ -162,3 +162,113 @@ pub fn create_read_runner(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
+    use crate::engine::sync::SyncEngine;
+    use std::path::PathBuf;
+
+    fn test_table_info() -> TableInfo {
+        TableInfo {
+            name: "basic_partitioned".to_string(),
+            description: None,
+            table_path: Some(format!(
+                "{}/tests/data/basic_partitioned",
+                env!("CARGO_MANIFEST_DIR")
+            )),
+            table_info_dir: PathBuf::new(),
+        }
+    }
+
+    fn test_read_spec() -> ReadSpec {
+        ReadSpec { version: None }
+    }
+
+    fn serial_config() -> ReadConfig {
+        ReadConfig {
+            name: "serial".to_string(),
+            parallel_scan: ParallelScan::Disabled,
+        }
+    }
+
+    fn parallel_config() -> ReadConfig {
+        ReadConfig {
+            name: "parallel".to_string(),
+            parallel_scan: ParallelScan::Enabled { num_threads: 2 },
+        }
+    }
+
+    fn test_engine() -> Arc<dyn Engine> {
+        Arc::new(SyncEngine::new())
+    }
+
+    #[test]
+    fn test_read_metadata_runner_setup() {
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_read_spec(),
+            serial_config(),
+            test_engine(),
+        );
+        assert!(runner.is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_name() {
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_read_spec(),
+            serial_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/test_case/read_metadata/serial"
+        );
+    }
+
+    #[test]
+    fn test_read_metadata_runner_execute_serial() {
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_read_spec(),
+            serial_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_execute_parallel() {
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_read_spec(),
+            parallel_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_create_read_runner() {
+        let runner = create_read_runner(
+            &test_table_info(),
+            "test_case",
+            &test_read_spec(),
+            ReadOperation::ReadMetadata,
+            serial_config(),
+            test_engine(),
+        )
+        .expect("create_read_runner should succeed");
+        assert!(runner.execute().is_ok());
+    }
+}
