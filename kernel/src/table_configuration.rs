@@ -721,7 +721,6 @@ mod test {
         test_schema_with_map_and_column_mapping,
     };
     use crate::Error;
-    use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
 

@@ -1490,7 +1490,12 @@ mod tests {
             case.reader_features,
             case.writer_features,
         );
-        assert_eq!(result.is_ok(), case.should_be_valid, "case={}", case.description);
+        assert_eq!(
+            result.is_ok(),
+            case.should_be_valid,
+            "case={}",
+            case.description
+        );
     }
 
     #[test]
