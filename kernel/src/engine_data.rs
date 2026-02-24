@@ -305,7 +305,7 @@ pub enum RowEvent {
 /// run of selected rows.
 ///
 /// Constructed by [`FilteredVisitorBridge`] and passed (alongside the column getters) to
-/// [`FilteredEngineDataVisitor::visit_filtered`].
+/// [`FilteredRowVisitor::visit_filtered`].
 pub struct RowIndexIterator<'sv> {
     sv_pos: usize,
     selection_vector: &'sv [bool],
@@ -374,7 +374,6 @@ impl<'sv> Iterator for RowIndexIterator<'sv> {
     }
 }
 
-
 /// An iterator over contiguous ranges of selected rows, silently skipping deselected rows.
 ///
 /// Produced by [`RowIndexIterator::selected_runs`]. Unlike iterating a [`RowIndexIterator`]
@@ -404,9 +403,9 @@ impl<'sv> Iterator for SelectedRunIter<'sv> {
 /// The default [`visit_rows_of`] method handles all the plumbing: extracting the selection
 /// vector, building the bridge, and calling [`EngineData::visit_rows`].
 ///
-/// [`visit_filtered`]: FilteredEngineDataVisitor::visit_filtered
-/// [`visit_rows_of`]: FilteredEngineDataVisitor::visit_rows_of
-pub trait FilteredEngineDataVisitor {
+/// [`visit_filtered`]: FilteredRowVisitor::visit_filtered
+/// [`visit_rows_of`]: FilteredRowVisitor::visit_rows_of
+pub trait FilteredRowVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]);
 
     /// Process this batch. `getters` contains one [`GetData`] item per requested column.
@@ -438,13 +437,13 @@ pub trait FilteredEngineDataVisitor {
     }
 }
 
-/// Private bridge that implements [`RowVisitor`] and forwards to a [`FilteredEngineDataVisitor`].
-struct FilteredVisitorBridge<'bridge, V: FilteredEngineDataVisitor> {
+/// Private bridge that implements [`RowVisitor`] and forwards to a [`FilteredRowVisitor`].
+struct FilteredVisitorBridge<'bridge, V: FilteredRowVisitor> {
     visitor: &'bridge mut V,
     selection_vector: &'bridge [bool],
 }
 
-impl<V: FilteredEngineDataVisitor> RowVisitor for FilteredVisitorBridge<'_, V> {
+impl<V: FilteredRowVisitor> RowVisitor for FilteredVisitorBridge<'_, V> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         self.visitor.selected_column_names_and_types()
     }

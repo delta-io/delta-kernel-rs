@@ -163,8 +163,8 @@ pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliati
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
 pub use engine_data::{
-    EngineData, FilteredEngineData, FilteredEngineDataVisitor, GetData, RowEvent,
-    RowIndexIterator, RowVisitor,
+    EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowEvent, RowIndexIterator,
+    RowVisitor,
 };
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};

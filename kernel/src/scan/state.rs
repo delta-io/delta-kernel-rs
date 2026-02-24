@@ -10,7 +10,7 @@ use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
-    engine_data::{FilteredEngineDataVisitor, GetData, RowIndexIterator, TypedGetData},
+    engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
@@ -176,7 +176,7 @@ struct ScanFileVisitor<'a, T> {
     transforms: &'a [Option<ExpressionRef>],
     context: T,
 }
-impl<T> FilteredEngineDataVisitor for ScanFileVisitor<'_, T> {
+impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
@@ -196,39 +196,40 @@ impl<T> FilteredEngineDataVisitor for ScanFileVisitor<'_, T> {
         );
         for range in rows.selected_runs() {
             for row_index in range {
-            // Since path column is required, use it to detect presence of an Add action
-            if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
-                let size = getters[1].get(row_index, "scanFile.size")?;
-                let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
-                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
-                let stats: Option<Stats> =
-                    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
-                        Ok(stats) => Some(stats),
-                        Err(e) => {
-                            warn!("Invalid stats string in Add file {json}: {}", e);
-                            None
-                        }
-                    });
+                // Since path column is required, use it to detect presence of an Add action
+                if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
+                    let size = getters[1].get(row_index, "scanFile.size")?;
+                    let modification_time: i64 =
+                        getters[2].get(row_index, "add.modificationTime")?;
+                    let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
+                    let stats: Option<Stats> =
+                        stats.and_then(|json| match serde_json::from_str(json.as_str()) {
+                            Ok(stats) => Some(stats),
+                            Err(e) => {
+                                warn!("Invalid stats string in Add file {json}: {}", e);
+                                None
+                            }
+                        });
 
-                let dv_index = SCAN_ROW_SCHEMA
-                    .index_of("deletionVector")
-                    .ok_or_else(|| Error::missing_column("deletionVector"))?;
-                let deletion_vector =
-                    visit_deletion_vector_at(row_index, &getters[dv_index..])?;
-                let dv_info = DvInfo { deletion_vector };
-                let partition_values =
-                    getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
-                let scan_file = ScanFile {
-                    path,
-                    size,
-                    modification_time,
-                    stats,
-                    dv_info,
-                    transform: get_transform_for_row(row_index, self.transforms),
-                    partition_values,
-                };
-                (self.callback)(&mut self.context, scan_file)
-            }
+                    let dv_index = SCAN_ROW_SCHEMA
+                        .index_of("deletionVector")
+                        .ok_or_else(|| Error::missing_column("deletionVector"))?;
+                    let deletion_vector =
+                        visit_deletion_vector_at(row_index, &getters[dv_index..])?;
+                    let dv_info = DvInfo { deletion_vector };
+                    let partition_values =
+                        getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
+                    let scan_file = ScanFile {
+                        path,
+                        size,
+                        modification_time,
+                        stats,
+                        dv_info,
+                        transform: get_transform_for_row(row_index, self.transforms),
+                        partition_values,
+                    };
+                    (self.callback)(&mut self.context, scan_file)
+                }
             }
         }
         Ok(())

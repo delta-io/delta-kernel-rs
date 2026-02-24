@@ -15,7 +15,9 @@ use crate::actions::{
     INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
-use crate::engine_data::{FilteredEngineData, FilteredEngineDataVisitor, GetData, RowEvent, RowIndexIterator, TypedGetData};
+use crate::engine_data::{
+    FilteredEngineData, FilteredRowVisitor, GetData, RowEvent, RowIndexIterator, TypedGetData,
+};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
@@ -1675,8 +1677,8 @@ impl<'a> DvMatchVisitor<'a> {
     }
 }
 
-/// A `FilteredEngineDataVisitor` that matches file paths against the provided DV updates map.
-impl FilteredEngineDataVisitor for DvMatchVisitor<'_> {
+/// A `FilteredRowVisitor` that matches file paths against the provided DV updates map.
+impl FilteredRowVisitor for DvMatchVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
             let names = vec![column_name!("path")];
@@ -1714,7 +1716,9 @@ impl FilteredEngineDataVisitor for DvMatchVisitor<'_> {
                         };
                         if let Some(dv_result) = self.dv_updates.get(&path) {
                             self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
-                                DeletionVectorDescriptor::to_schema().into_fields().collect(),
+                                DeletionVectorDescriptor::to_schema()
+                                    .into_fields()
+                                    .collect(),
                                 vec![
                                     Scalar::from(dv_result.storage_type.to_string()),
                                     Scalar::from(dv_result.path_or_inline_dv.clone()),
