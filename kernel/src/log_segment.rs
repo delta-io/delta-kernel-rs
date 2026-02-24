@@ -50,6 +50,12 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
+    /// Whether the checkpoint has compatible pre-parsed partition values.
+    /// When `true`, checkpoint batches can read typed partition values directly from
+    /// `partitionValues_parsed` instead of parsing strings from `partitionValues`.
+    #[serde(default)]
+    #[allow(unused)]
+    pub has_partition_values_parsed: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -492,6 +498,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -503,6 +510,7 @@ impl LogSegment {
             checkpoint_read_schema,
             meta_predicate,
             stats_schema,
+            partition_schema,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -524,6 +532,7 @@ impl LogSegment {
             action_schema.clone(),
             action_schema,
             meta_predicate,
+            None,
             None,
         )?;
         Ok(result.actions)
@@ -682,6 +691,7 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -705,55 +715,69 @@ impl LogSegment {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
 
-        // Build final schema with any additional fields needed (stats_parsed, sidecar)
+        let has_partition_values_parsed = partition_schema
+            .zip(file_actions_schema.as_ref())
+            .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
+
+        // Build final schema with any additional fields needed
+        // (stats_parsed, partitionValues_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let augmented_checkpoint_read_schema = if let (true, Some(add_field), Some(stats_schema)) =
-            (has_stats_parsed, action_schema.field("add"), stats_schema)
-        {
-            // Add stats_parsed to the "add" field
-            let DataType::Struct(add_struct) = add_field.data_type() else {
-                return Err(Error::internal_error(
-                    "add field in action schema must be a struct",
-                ));
-            };
-            let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-            add_fields.push(StructField::nullable(
-                "stats_parsed",
-                DataType::Struct(Box::new(stats_schema.clone())),
-            ));
+        let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
+        let augmented_checkpoint_read_schema =
+            if let (true, Some(add_field)) = (needs_add_augmentation, action_schema.field("add")) {
+                let DataType::Struct(add_struct) = add_field.data_type() else {
+                    return Err(Error::internal_error(
+                        "add field in action schema must be a struct",
+                    ));
+                };
+                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
-            // Rebuild schema with modified add field
-            let mut new_fields: Vec<StructField> = action_schema
-                .fields()
-                .map(|f| {
-                    if f.name() == "add" {
-                        StructField::new(
-                            add_field.name(),
-                            StructType::new_unchecked(add_fields.clone()),
-                            add_field.is_nullable(),
-                        )
-                        .with_metadata(add_field.metadata.clone())
-                    } else {
-                        f.clone()
-                    }
-                })
-                .collect();
+                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
+                    add_fields.push(StructField::nullable(
+                        "stats_parsed",
+                        DataType::Struct(Box::new(ss.clone())),
+                    ));
+                }
 
-            // Add sidecar column at top-level for V2 checkpoints
-            if needs_sidecar {
+                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
+                    add_fields.push(StructField::nullable(
+                        "partitionValues_parsed",
+                        DataType::Struct(Box::new(ps.clone())),
+                    ));
+                }
+
+                // Rebuild schema with modified add field
+                let mut new_fields: Vec<StructField> = action_schema
+                    .fields()
+                    .map(|f| {
+                        if f.name() == "add" {
+                            StructField::new(
+                                add_field.name(),
+                                StructType::new_unchecked(add_fields.clone()),
+                                add_field.is_nullable(),
+                            )
+                            .with_metadata(add_field.metadata.clone())
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect();
+
+                // Add sidecar column at top-level for V2 checkpoints
+                if needs_sidecar {
+                    new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+                }
+
+                Arc::new(StructType::new_unchecked(new_fields))
+            } else if needs_sidecar {
+                // Only need to add sidecar, no stats_parsed or partitionValues_parsed
+                let mut new_fields: Vec<StructField> = action_schema.fields().cloned().collect();
                 new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-            }
-
-            Arc::new(StructType::new_unchecked(new_fields))
-        } else if needs_sidecar {
-            // Only need to add sidecar, no stats_parsed
-            let mut new_fields: Vec<StructField> = action_schema.fields().cloned().collect();
-            new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-            Arc::new(StructType::new_unchecked(new_fields))
-        } else {
-            // No modifications needed, use schema as-is
-            action_schema.clone()
-        };
+                Arc::new(StructType::new_unchecked(new_fields))
+            } else {
+                // No modifications needed, use schema as-is
+                action_schema.clone()
+            };
 
         let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
@@ -815,6 +839,7 @@ impl LogSegment {
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
+            has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
@@ -1119,6 +1144,52 @@ impl LogSegment {
                 }
             }
         }
+        true
+    }
+
+    /// Checks if a checkpoint schema contains a usable `add.partitionValues_parsed` field.
+    ///
+    /// Validates that:
+    /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
+    /// 2. The types for partition columns present in both schemas are compatible
+    ///
+    /// Missing partition columns in the checkpoint are OK (they simply won't contribute
+    /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
+    /// or has incompatible types for any shared column.
+    pub(crate) fn schema_has_compatible_partition_values_parsed(
+        checkpoint_schema: &StructType,
+        partition_schema: &StructType,
+    ) -> bool {
+        let Some(partition_parsed) =
+            checkpoint_schema
+                .field("add")
+                .and_then(|f| match f.data_type() {
+                    DataType::Struct(s) => s.field("partitionValues_parsed"),
+                    _ => None,
+                })
+        else {
+            debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
+            return false;
+        };
+
+        let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
+            debug!(
+                "partitionValues_parsed not compatible: add.partitionValues_parsed is not a Struct, got {:?}",
+                partition_parsed.data_type()
+            );
+            return false;
+        };
+
+        // Flat struct: reuse the recursive type checker (trivial case with no nesting)
+        if !Self::structs_have_compatible_types(
+            partition_struct,
+            partition_schema,
+            "partitionValues_parsed",
+        ) {
+            return false;
+        }
+
+        debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
 }
