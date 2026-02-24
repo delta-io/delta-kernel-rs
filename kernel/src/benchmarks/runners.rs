@@ -157,9 +157,7 @@ pub fn create_read_runner(
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
             table_info, case_name, read_spec, config, engine,
         )?)),
-        ReadOperation::ReadData => {
-            todo!("ReadDataRunner not yet implemented")
-        }
+        ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
 }
 
