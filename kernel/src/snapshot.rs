@@ -2021,10 +2021,7 @@ mod tests {
     }
 
     // Helper: create a minimal test table with commits 0-N
-    async fn setup_test_table_with_commits(
-        store: &InMemory,
-        num_commits: u64,
-    ) -> DeltaResult<()> {
+    async fn setup_test_table_with_commits(store: &InMemory, num_commits: u64) -> DeltaResult<()> {
         // Commit 0: protocol + metadata + first file
         let commit0 = vec![
             json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
