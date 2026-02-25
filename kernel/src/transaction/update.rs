@@ -179,7 +179,7 @@ impl Transaction {
     /// Helper function to convert scan metadata iterator to filtered engine data iterator.
     ///
     /// This adapter extracts the `scan_files` field from each [`crate::scan::ScanMetadata`] item,
-    /// making it easy to pass scan results directly to [`Self::update_deletion_vectors`].
+    /// making it easy to pass scan results directly to `update_deletion_vectors`.
     ///
     /// # Example
     ///

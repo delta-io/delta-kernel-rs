@@ -320,7 +320,7 @@ pub enum RowEvent {
 /// of `n` consecutive deselected rows, or a [`RowEvent::Row(range)`] for a contiguous
 /// run of selected rows.
 ///
-/// Constructed by [`FilteredVisitorBridge`] and passed (alongside the column getters) to
+/// Constructed internally and passed (alongside the column getters) to
 /// [`FilteredRowVisitor::visit_filtered`].
 pub struct RowIndexIterator<'sv> {
     sv_pos: usize,
@@ -437,7 +437,7 @@ pub trait FilteredRowVisitor {
     /// Visit the rows of a [`FilteredEngineData`], automatically respecting the selection vector.
     ///
     /// Selected rows appear as [`RowEvent::Row(range)`] values yielded by the
-    /// [`RowIndexIterator`] handed to [`visit_filtered`]; deselected rows appear as
+    /// [`RowIndexIterator`] handed to [`FilteredRowVisitor::visit_filtered`]; deselected rows appear as
     /// [`RowEvent::Skipped(n)`].
     fn visit_rows_of(&mut self, data: &FilteredEngineData) -> DeltaResult<()>
     where
