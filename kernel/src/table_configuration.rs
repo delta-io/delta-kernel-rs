@@ -20,7 +20,7 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
+    get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
     FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
     LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
@@ -78,7 +78,6 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     schema: SchemaRef,
     table_properties: TableProperties,
-    column_mapping_mode: ColumnMappingMode,
     table_root: Url,
     version: Version,
 }
@@ -112,14 +111,12 @@ impl TableConfiguration {
     ) -> DeltaResult<Self> {
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
-        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let table_config = Self {
             schema,
             metadata,
             protocol,
             table_properties,
-            column_mapping_mode,
             table_root,
             version,
         };
@@ -326,7 +323,9 @@ impl TableConfiguration {
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+        self.table_properties
+            .column_mapping_mode
+            .unwrap_or(ColumnMappingMode::None)
     }
 
     /// The partition columns of this table (empty if non-partitioned)

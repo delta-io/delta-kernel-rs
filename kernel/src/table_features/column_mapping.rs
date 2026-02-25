@@ -1,16 +1,15 @@
 //! Code to handle column mapping, including modes and schema transforms
 //!
 //! This module provides:
-//! - Read-side: Mode detection and schema validation
+//! - Read-side: Mode validation and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
 use super::TableFeature;
-use crate::actions::Protocol;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, Schema,
     SchemaTransform, StructField, StructType,
 };
 use crate::table_configuration::TableConfiguration;
-use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
+use crate::table_properties::COLUMN_MAPPING_MODE;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
@@ -33,27 +32,17 @@ pub enum ColumnMappingMode {
     Name,
 }
 
-/// Determine the column mapping mode for a table based on the [`Protocol`] and [`TableProperties`]
-pub(crate) fn column_mapping_mode(
-    protocol: &Protocol,
-    table_properties: &TableProperties,
-) -> ColumnMappingMode {
-    match (
-        table_properties.column_mapping_mode,
-        protocol.min_reader_version(),
-    ) {
-        // NOTE: The table property is optional even when the feature is supported, and is allowed
-        // (but should be ignored) even when the feature is not supported. For details see
-        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
-        (Some(mode), 2) => mode,
-        (Some(mode), 3) if protocol.has_table_feature(&TableFeature::ColumnMapping) => mode,
-        _ => ColumnMappingMode::None,
-    }
-}
-
-/// Validates that the schema annotations are consistent with the column mapping mode.
+/// Validates that schema annotations are consistent with the column mapping mode, and that
+/// an enabled mode (id or name) has protocol support.
 pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
-    validate_schema_column_mapping(&tc.schema(), tc.column_mapping_mode())
+    let mode = tc.column_mapping_mode();
+    if mode != ColumnMappingMode::None && !tc.is_feature_supported(&TableFeature::ColumnMapping) {
+        return Err(Error::invalid_column_mapping_mode(format!(
+            "Column mapping mode '{mode:?}' requires protocol support \
+             (reader version 2 or ColumnMapping table feature)"
+        )));
+    }
+    validate_schema_column_mapping(&tc.schema(), mode)
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
@@ -325,6 +314,7 @@ pub(crate) fn get_any_level_column_physical_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::Protocol;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructType};
     use crate::utils::test_utils::make_test_tc;
@@ -355,11 +345,10 @@ mod tests {
         .unwrap();
         assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        // v3 + empty features + mode=id => None (mode ignored without CM feature)
+        // v3 + empty features + mode=id => Error (mode set but protocol doesn't support CM)
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert!(make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).is_err());
 
         // v3 + empty features + no mode => None
         let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
@@ -376,14 +365,13 @@ mod tests {
         let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
         assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        // v3 + DV feature (no CM) + mode=id => None (mode ignored)
+        // v3 + DV feature (no CM) + mode=id => Error (mode set but protocol doesn't support CM)
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors],
             [TableFeature::DeletionVectors],
         )
         .unwrap();
-        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
-        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        assert!(make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).is_err());
 
         // v3 + DV feature + no mode => None
         let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
