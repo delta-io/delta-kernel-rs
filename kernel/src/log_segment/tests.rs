@@ -1085,6 +1085,12 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         read_schema.clone(),
     );
 
+    let sidecar_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
+    let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
+        vec![("sidecarfile1.parquet", sidecar_size)],
+        read_schema.clone(),
+    );
+
     // Filter out sidecar files that do not contain remove actions
     let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
         Some(Arc::new(
