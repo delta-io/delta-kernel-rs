@@ -15,8 +15,8 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, ArrayRef, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::{
@@ -1297,17 +1297,6 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     unsafe { StructArray::new_unchecked(fields, columns, nulls) }
 }
 
-/// Cast an array to `StringArray`, handling `LargeStringArray` and `StringViewArray` transparently.
-/// Returns the original array (via `Arc::clone`) if it's already a `StringArray`, avoiding any
-/// conversion overhead on the common path.
-pub(crate) fn ensure_string_array(col: &ArrayRef) -> DeltaResult<ArrayRef> {
-    if col.data_type() == &ArrowDataType::Utf8 {
-        Ok(Arc::clone(col))
-    } else {
-        Ok(crate::arrow::compute::cast(col, &ArrowDataType::Utf8)?)
-    }
-}
-
 /// Arrow lacks the functionality to json-parse a string column into a struct column, so we
 /// implement it here. This method is for json-parsing each string in a column of strings (add.stats
 /// to be specific) to produce a nested column of strongly typed values. We require that N rows in
@@ -1318,32 +1307,57 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let col = ensure_string_array(json_strings.column(0))?;
-    let json_strings = col
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::generic("Expected json_strings to be castable to StringArray"))?;
     let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-    let result = parse_json_impl(json_strings, schema)?;
+    let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
-// Raw arrow implementation of the json parsing. Separate from the public function for testing.
-// Also used by ParseJson expression evaluation.
+/// Raw arrow implementation of the json parsing. Separate from the public function for testing.
+/// Also used by ParseJson expression evaluation.
+///
+/// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to avoid
+/// narrowing casts that could overflow (e.g. `LargeStringArray` → `StringArray`).
 pub(crate) fn parse_json_impl(
-    json_strings: &StringArray,
+    json_strings: &dyn ArrowArray,
     schema: ArrowSchemaRef,
 ) -> DeltaResult<RecordBatch> {
-    if json_strings.is_empty() {
+    match json_strings.data_type() {
+        ArrowDataType::Utf8 => parse_json_inner(
+            json_strings.as_string::<i32>().iter(),
+            json_strings.len(),
+            schema,
+        ),
+        ArrowDataType::LargeUtf8 => parse_json_inner(
+            json_strings.as_string::<i64>().iter(),
+            json_strings.len(),
+            schema,
+        ),
+        ArrowDataType::Utf8View => parse_json_inner(
+            json_strings.as_string_view().iter(),
+            json_strings.len(),
+            schema,
+        ),
+        dt => Err(Error::generic(format!(
+            "Expected string array for JSON parsing, got {dt}"
+        ))),
+    }
+}
+
+fn parse_json_inner<'a>(
+    json_strings: impl Iterator<Item = Option<&'a str>>,
+    num_rows: usize,
+    schema: ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
+    if num_rows == 0 {
         return Ok(RecordBatch::new_empty(schema));
     }
 
     let mut decoder = ReaderBuilder::new(schema.clone())
-        .with_batch_size(json_strings.len())
+        .with_batch_size(num_rows)
         .with_coerce_primitive(true)
         .build_decoder()?;
 
-    for (json, row_number) in json_strings.iter().zip(1..) {
+    for (json, row_number) in json_strings.zip(1..) {
         let line = json.unwrap_or("{}");
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
@@ -1361,11 +1375,11 @@ pub(crate) fn parse_json_impl(
     }
     // Get the final batch out
     if let Some(batch) = decoder.flush()? {
-        if batch.num_rows() != json_strings.len() {
+        if batch.num_rows() != num_rows {
             return Err(Error::Generic(format!(
                 "Unexpected number of rows decoded. Got {}, expected{}",
                 batch.num_rows(),
-                json_strings.len()
+                num_rows
             )));
         }
         return Ok(batch);
@@ -1522,7 +1536,7 @@ mod tests {
             schema: ArrowSchemaRef,
             expected_start: &str,
         ) {
-            let result = parse_json_impl(&input.into(), schema);
+            let result = parse_json_impl(&StringArray::from(input), schema);
             let err = result.expect_err("Expected an error");
             let msg = err.to_string();
             assert!(
@@ -1537,7 +1551,7 @@ mod tests {
             ArrowField::new("c", ArrowDataType::Int32, true),
         ]));
         let input: Vec<&str> = vec![];
-        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
         for input in [
@@ -1560,7 +1574,7 @@ mod tests {
         );
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
-        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.column(0).null_count(), 2);
         assert_eq!(result.column(1).null_count(), 2);
@@ -1579,7 +1593,7 @@ mod tests {
         let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
 
-        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        let batch = parse_json_impl(&StringArray::from(input), schema.clone()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
