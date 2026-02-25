@@ -764,15 +764,17 @@ fn test_build_actions_meta_predicate_with_physical_predicate() {
         .unwrap();
 
     let meta_pred = scan.build_actions_meta_predicate();
-    assert!(
-        meta_pred.is_some(),
-        "should build a checkpoint meta-predicate when physical predicate + stats schema exist"
-    );
-    assert_eq!(
-        meta_pred.as_ref(),
-        Some(&predicate),
-        "meta-predicate should pass through the original physical predicate"
-    );
+    match meta_pred {
+        crate::FilePredicate::Checkpoint {
+            predicate: pred,
+            partition_columns,
+        } => {
+            assert_eq!(pred, predicate);
+            // parsed-stats table is not partitioned
+            assert!(partition_columns.is_empty());
+        }
+        other => panic!("expected Checkpoint, got {:?}", other),
+    }
 }
 
 #[test]
@@ -784,7 +786,10 @@ fn test_build_actions_meta_predicate_no_predicate() {
     let scan = snapshot.scan_builder().build().unwrap();
 
     assert!(
-        scan.build_actions_meta_predicate().is_none(),
+        matches!(
+            scan.build_actions_meta_predicate(),
+            crate::FilePredicate::None
+        ),
         "no scan predicate should produce no checkpoint meta-predicate"
     );
 }
@@ -804,225 +809,12 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         .unwrap();
 
     assert!(
-        scan.build_actions_meta_predicate().is_none(),
+        matches!(
+            scan.build_actions_meta_predicate(),
+            crate::FilePredicate::None
+        ),
         "static-skip-all scans should not build a checkpoint meta-predicate"
     );
-}
-
-/// Helper to build a parquet file with the nested `add.stats_parsed.*` structure that
-/// checkpoint files have. Returns the parquet bytes and the arrow schema.
-///
-/// Each call to `write_row_group` writes one row group. Each row represents one add action's
-/// stats with maxValues.id, minValues.id, nullCount.id, and numRecords.
-struct CheckpointParquetBuilder {
-    arrow_schema: Arc<ArrowSchema>,
-    id_fields: Fields,
-    stats_fields: Fields,
-    buffer: Vec<u8>,
-    writer: Option<ArrowWriter<Vec<u8>>>,
-}
-
-impl CheckpointParquetBuilder {
-    fn new() -> Self {
-        let id_fields = Fields::from(vec![Field::new("id", ArrowDataType::Int64, true)]);
-        let stats_fields = Fields::from(vec![
-            Field::new("maxValues", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("minValues", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("nullCount", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("numRecords", ArrowDataType::Int64, true),
-        ]);
-        let add_fields = Fields::from(vec![Field::new(
-            "stats_parsed",
-            ArrowDataType::Struct(stats_fields.clone()),
-            true,
-        )]);
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "add",
-            ArrowDataType::Struct(add_fields.clone()),
-            true,
-        )]));
-        let buffer = Vec::new();
-        let writer = ArrowWriter::try_new(buffer, arrow_schema.clone(), None).unwrap();
-        // ArrowWriter takes ownership of buffer, so we use a placeholder here.
-        Self {
-            arrow_schema,
-            id_fields,
-            stats_fields,
-            buffer: Vec::new(),
-            writer: Some(writer),
-        }
-    }
-
-    /// Writes one row group with the given per-file stats.
-    fn write_row_group(
-        &mut self,
-        max_ids: &[Option<i64>],
-        min_ids: &[Option<i64>],
-        null_counts: &[Option<i64>],
-        num_records: &[i64],
-    ) {
-        let make_id_struct = |vals: &[Option<i64>]| -> StructArray {
-            StructArray::from(vec![(
-                Arc::new(Field::new("id", ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(vals.to_vec())) as Arc<dyn Array>,
-            )])
-        };
-        let stats_parsed = StructArray::from(vec![
-            (
-                Arc::new(Field::new(
-                    "maxValues",
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(max_ids)) as Arc<dyn Array>,
-            ),
-            (
-                Arc::new(Field::new(
-                    "minValues",
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(min_ids)) as Arc<dyn Array>,
-            ),
-            (
-                Arc::new(Field::new(
-                    "nullCount",
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(null_counts)) as Arc<dyn Array>,
-            ),
-            (
-                Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(num_records.to_vec())) as Arc<dyn Array>,
-            ),
-        ]);
-        let add = StructArray::from(vec![(
-            Arc::new(Field::new(
-                "stats_parsed",
-                ArrowDataType::Struct(self.stats_fields.clone()),
-                true,
-            )),
-            Arc::new(stats_parsed) as Arc<dyn Array>,
-        )]);
-        let batch = RecordBatch::try_new(self.arrow_schema.clone(), vec![Arc::new(add)]).unwrap();
-        let writer = self.writer.as_mut().unwrap();
-        writer.write(&batch).unwrap();
-        writer.flush().unwrap();
-    }
-
-    /// Finishes writing and returns the parquet bytes.
-    fn finish(mut self) -> Bytes {
-        let writer = self.writer.take().unwrap();
-        self.buffer = writer.into_inner().unwrap();
-        Bytes::from(self.buffer)
-    }
-}
-
-/// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
-fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    Some(
-        prefixer
-            .transform_pred(&skipping_pred)
-            .unwrap()
-            .into_owned(),
-    )
-}
-
-/// Applies a meta predicate as a row group filter and returns the total rows read.
-fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize {
-    ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
-        .unwrap()
-        .with_row_group_filter(meta_predicate, None)
-        .build()
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum()
-}
-
-/// Tests checkpoint row group skipping end-to-end with the parquet row group filter.
-///
-/// Shared parquet layout (4 row groups):
-///   - RG 0 (2 rows): maxValues.id = [100, NULL], nullCount.id = [5, NULL]
-///   - RG 1 (1 row):  maxValues.id = 300, nullCount.id = 0
-///   - RG 2 (1 row):  maxValues.id = 50, nullCount.id = 10
-///   - RG 3 (2 rows): maxValues.id = [150, 40], nullCount.id = [0, NULL]
-///
-/// | Predicate      | RG 0 (2 rows)         | RG 1 (1 row)       | RG 2 (1 row)       | RG 3 (2 rows)        | Total |
-/// |----------------|-----------------------|--------------------|--------------------|-----------------------|-------|
-/// | id > 200       | keep (null max stats) | keep (max=300>200) | skip (max=50<200)  | skip (max=150<200)    | 3     |
-/// | id IS NULL     | keep (nullCount>0)    | skip (nullCount=0) | keep (nullCount=10)| keep (null nullCount) | 5     |
-/// | id IS NOT NULL | no predicate (col vs col, #1873)                                                       | 6     |
-#[rstest]
-#[case::comparison(
-    Pred::gt(column_expr!("id"), Expr::literal(200i64)),
-    // Should skip RG2 and RG3, but https://github.com/apache/arrow-rs/issues/9451
-    Some(6), // Some(3),
-    "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
-)]
-#[case::is_null(
-    Pred::is_null(column_expr!("id")),
-    // Should skip RG 1 (nullCount=0), but https://github.com/apache/arrow-rs/issues/9451
-    Some(6), // Some(5),
-    "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
-)]
-#[case::is_not_null(
-    Pred::not(Pred::is_null(column_expr!("id"))),
-    None,
-    "IS NOT NULL produces no skipping predicate — column vs column (#1873)"
-)]
-fn test_checkpoint_row_group_skipping(
-    #[case] pred: Pred,
-    #[case] expected_rows: Option<usize>,
-    #[case] description: &str,
-) {
-    let mut builder = CheckpointParquetBuilder::new();
-    // RG 0: mixed null/non-null stats. maxValues.id = [100, NULL], nullCount.id = [5, NULL].
-    builder.write_row_group(
-        &[Some(100), None],
-        &[Some(1), None],
-        &[Some(5), None],
-        &[100, 50],
-    );
-    // RG 1: maxValues.id = 300, nullCount.id = 0.
-    builder.write_row_group(&[Some(300)], &[Some(201)], &[Some(0)], &[100]);
-    // RG 2: maxValues.id = 50, nullCount.id = 10.
-    builder.write_row_group(&[Some(50)], &[Some(1)], &[Some(10)], &[100]);
-    // RG 3: maxValues.id = [150, 40], nullCount.id = [0, NULL].
-    // Tests that null nullCount stats are conservatively kept for IS NULL.
-    builder.write_row_group(
-        &[Some(150), Some(40)],
-        &[Some(1), Some(1)],
-        &[Some(0), None],
-        &[100, 50],
-    );
-    let parquet_bytes = builder.finish();
-
-    let meta_predicate = build_prefixed_checkpoint_predicate(&pred);
-
-    match expected_rows {
-        Some(expected) => {
-            let meta_predicate =
-                meta_predicate.expect("predicate should produce a checkpoint skipping predicate");
-            let total_rows = apply_row_group_filter(parquet_bytes, &meta_predicate);
-            assert_eq!(total_rows, expected, "{description}");
-        }
-        None => {
-            assert!(meta_predicate.is_none(), "{description}");
-            // Without a predicate, all row groups are read.
-            let total_rows: usize = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
-                .unwrap()
-                .build()
-                .unwrap()
-                .map(|b| b.unwrap().num_rows())
-                .sum();
-            assert_eq!(total_rows, 6, "all rows should be read without a predicate");
-        }
-    }
 }
 
 #[test]

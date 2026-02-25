@@ -688,7 +688,7 @@ impl Scan {
         } else {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
-                FilePredicate::data(self.build_actions_meta_predicate()),
+                self.build_actions_meta_predicate(),
             )
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
@@ -746,7 +746,7 @@ impl Scan {
         } else {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
-                FilePredicate::data(self.build_actions_meta_predicate()),
+                self.build_actions_meta_predicate(),
             )
         };
         self.snapshot
@@ -763,17 +763,38 @@ impl Scan {
             )
     }
 
-    /// Builds a checkpoint/sidecar metadata pruning predicate.
+    /// Builds a checkpoint/sidecar metadata pruning predicate with partition column identification.
     ///
-    /// We pass the original physical predicate as-is. The parquet row group skipping layer
-    /// decides how to evaluate it against footer stats for checkpoint-style layouts.
-    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
-        if self.state_info.physical_stats_schema.is_some() {
-            if let PhysicalPredicate::Some(predicate, _) = &self.state_info.physical_predicate {
-                return Some(predicate.clone());
-            }
+    /// Returns `FilePredicate::Checkpoint` when there is a physical predicate and either a stats
+    /// schema (for data column skipping) or partition columns (for partition value skipping).
+    fn build_actions_meta_predicate(&self) -> FilePredicate {
+        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+            return FilePredicate::None;
+        };
+
+        let partition_cols = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let column_mapping_mode = self.state_info.column_mapping_mode;
+        let partition_columns: HashSet<ColumnName> = self
+            .state_info
+            .logical_schema
+            .fields()
+            .filter(|f| partition_cols.contains(f.name()))
+            .map(|f| ColumnName::new([f.physical_name(column_mapping_mode)]))
+            .collect();
+
+        // Need either stats schema (for data column skipping) or partition columns
+        if self.state_info.physical_stats_schema.is_none() && partition_columns.is_empty() {
+            return FilePredicate::None;
         }
-        None
+
+        FilePredicate::Checkpoint {
+            predicate: predicate.clone(),
+            partition_columns,
+        }
     }
 
     /// Start a parallel scan metadata processing for the table.

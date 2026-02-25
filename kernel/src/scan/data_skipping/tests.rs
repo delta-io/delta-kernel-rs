@@ -2,7 +2,6 @@ use super::*;
 
 use crate::expressions::column_name;
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
-use rstest::rstest;
 use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);

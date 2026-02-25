@@ -5,10 +5,21 @@ use crate::expressions::{column_expr, column_name, column_pred, Expression};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::properties::WriterProperties;
 use crate::Predicate;
 use std::fs::File;
 use std::sync::Arc;
+
+/// Convenience wrapper for checkpoint meta-skipping in tests.
+fn apply_checkpoint_meta_skipping_filter(
+    row_group: &RowGroupMetaData,
+    predicate: &Predicate,
+) -> bool {
+    let empty = HashSet::new();
+    let inner = RowGroupFilter::new(row_group);
+    CheckpointMetaSkippingFilter::apply(inner, predicate, &empty)
+}
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
 ///
@@ -445,79 +456,6 @@ fn test_get_stat_values() {
 }
 
 #[test]
-fn test_checkpoint_layout_detection() {
-    let value_field = Field::new("value", ArrowDataType::Int64, true);
-    let min_values = StructArray::new(
-        Fields::from(vec![value_field.clone()]),
-        vec![Arc::new(Int64Array::from(vec![Some(0)])) as ArrayRef],
-        None,
-    );
-    let max_values = StructArray::new(
-        Fields::from(vec![value_field.clone()]),
-        vec![Arc::new(Int64Array::from(vec![Some(10)])) as ArrayRef],
-        None,
-    );
-    let stats_parsed = StructArray::new(
-        Fields::from(vec![
-            Field::new(
-                "minValues",
-                ArrowDataType::Struct(Fields::from(vec![value_field.clone()])),
-                true,
-            ),
-            Field::new(
-                "maxValues",
-                ArrowDataType::Struct(Fields::from(vec![value_field])),
-                true,
-            ),
-        ]),
-        vec![
-            Arc::new(min_values) as ArrayRef,
-            Arc::new(max_values) as ArrayRef,
-        ],
-        None,
-    );
-    let add = StructArray::new(
-        Fields::from(vec![Field::new(
-            "stats_parsed",
-            ArrowDataType::Struct(stats_parsed.fields().clone()),
-            true,
-        )]),
-        vec![Arc::new(stats_parsed) as ArrayRef],
-        None,
-    );
-    let batch = RecordBatch::try_new(
-        Arc::new(ArrowSchema::new(vec![Field::new(
-            "add",
-            ArrowDataType::Struct(add.fields().clone()),
-            true,
-        )])),
-        vec![Arc::new(add) as ArrayRef],
-    )
-    .unwrap();
-
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    {
-        let mut writer = ArrowWriter::try_new(tmp.reopen().unwrap(), batch.schema(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    }
-    let checkpoint_md =
-        ArrowReaderMetadata::load(&tmp.reopen().unwrap(), Default::default()).unwrap();
-    assert!(has_checkpoint_stats_layout(
-        checkpoint_md.metadata().row_group(0)
-    ));
-
-    let regular = File::open(
-        "./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet",
-    )
-    .unwrap();
-    let regular_md = ArrowReaderMetadata::load(&regular, Default::default()).unwrap();
-    assert!(!has_checkpoint_stats_layout(
-        regular_md.metadata().row_group(0)
-    ));
-}
-
-#[test]
 fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
     fn checkpoint_batch(min: Option<i64>, max: Option<i64>) -> RecordBatch {
         let value_field = Field::new("value", ArrowDataType::Int64, true);
@@ -599,15 +537,18 @@ fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
         metadata.metadata().row_group(0),
         &pred_gt
     ));
-    // maxValues is complete in row group 1 and max=10 proves no row can satisfy value > 50.
-    assert!(!apply_checkpoint_meta_skipping_filter(
+    // maxValues is complete in row group 1 (max=10) and could theoretically prune, but
+    // https://github.com/apache/arrow-rs/issues/9451 makes nullcount=0 indistinguishable
+    // from missing stats, so the checkpoint filter conservatively keeps all row groups.
+    assert!(apply_checkpoint_meta_skipping_filter(
         metadata.metadata().row_group(1),
         &pred_gt
     ));
 
     let pred_lt = Predicate::lt(column_expr!("value"), Expression::literal(50i64));
-    // LT relies on minValues. min=100 in row group 0 proves no row can satisfy value < 50.
-    assert!(!apply_checkpoint_meta_skipping_filter(
+    // LT relies on minValues. min=100 in row group 0 could theoretically prune, but
+    // https://github.com/apache/arrow-rs/issues/9451 prevents trusting nullcount=0.
+    assert!(apply_checkpoint_meta_skipping_filter(
         metadata.metadata().row_group(0),
         &pred_lt
     ));

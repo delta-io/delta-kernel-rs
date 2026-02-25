@@ -3,19 +3,23 @@ use crate::expressions::{
     column_name, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
     OpaquePredicateOpRef, Predicate, Scalar,
 };
-use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
+use crate::kernel_predicates::{
+    DataSkippingPredicateEvaluator, KernelPredicateEvaluator as _, KernelPredicateEvaluatorDefaults,
+};
 use crate::schema::DataType;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 mod tests;
 
-/// A helper trait (mostly exposed for testing). It provides the four stats getters needed by
-/// [`DataSkippingStatsProvider`]. From there, we can automatically derive a
-/// [`DataSkippingPredicateEvaluator`].
-pub(crate) trait ParquetStatsProvider {
+/// Provides the four stats getters needed by [`DataSkippingPredicateEvaluator`]. From there,
+/// we can automatically derive a [`DataSkippingPredicateEvaluator`].
+///
+/// Implement this trait to plug in custom stats sources (e.g., a different parquet reader)
+/// and gain data-skipping predicate evaluation for free via [`DataSkippingPredicateEvaluator`].
+pub trait ParquetStatsProvider {
     /// Pre-registers a set of columns that may be queried shortly after. Callers are not strictly
     /// required to invoke this method, but some providers may choose to only provide stats for
     /// prepared columns because repeatedly traversing parquet footers can be expensive.
@@ -126,44 +130,67 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
 /// - min-stat: footer min of `add.stats_parsed.minValues.x`
 /// - max-stat: footer max of `add.stats_parsed.maxValues.x`
 ///
+/// Partition columns are supported: they resolve to `add.partitionValues_parsed.<col>` where
+/// both min and max stats come from the same column (the actual partition value stored in the
+/// checkpoint). Partition values are never null.
+///
 /// To prevent unsound pruning when nested stat entries are NULL/missing, min/max are only exposed
 /// if parquet footer nullcount for the nested stat column exists and is exactly 0.
-pub(crate) struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
+///
+/// NOTE: Due to <https://github.com/apache/arrow-rs/issues/9451>, arrow-rs currently reports
+/// `nullcount = 0` even when column statistics are entirely missing, making the nullcount
+/// guard ineffective. Until the upstream fix lands, checkpoint row group skipping will
+/// conservatively keep all row groups (no pruning) for nested stat columns.
+pub struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
     inner: T,
     min_stats: HashMap<ColumnName, ColumnName>,
     max_stats: HashMap<ColumnName, ColumnName>,
+    /// The set of partition columns referenced by the predicate.
+    partition_columns: HashSet<ColumnName>,
 }
 
 impl<T: ParquetStatsProvider> CheckpointMetaSkippingFilter<T> {
-    pub(crate) fn new(mut inner: T, predicate: &Predicate) -> Self {
+    pub fn new(
+        mut inner: T,
+        predicate: &Predicate,
+        partition_columns: &HashSet<ColumnName>,
+    ) -> Self {
         let min_prefix = column_name!("add.stats_parsed.minValues");
         let max_prefix = column_name!("add.stats_parsed.maxValues");
-        let mapped: Vec<_> = predicate
-            .references()
-            .iter()
-            .map(|&col| {
-                (
-                    (col.clone(), min_prefix.join(col)),
-                    (col.clone(), max_prefix.join(col)),
-                )
-            })
-            .collect();
+        let partition_prefix = column_name!("add.partitionValues_parsed");
 
-        let cols = mapped.iter().flat_map(|((_, min), (_, max))| [min, max]);
-        inner.prepare_stats(cols);
+        let mut min_stats = HashMap::new();
+        let mut max_stats = HashMap::new();
+        let mut matched_partition_columns = HashSet::new();
 
-        let (min_stats, max_stats) = mapped.into_iter().unzip();
+        for col in predicate.references() {
+            if partition_columns.contains(col) {
+                // Partition column: min and max both map to the same partitionValues_parsed path.
+                let partition_path = partition_prefix.join(col);
+                min_stats.insert(col.clone(), partition_path.clone());
+                max_stats.insert(col.clone(), partition_path);
+                matched_partition_columns.insert(col.clone());
+            } else {
+                // Data column: map to stats_parsed paths.
+                min_stats.insert(col.clone(), min_prefix.join(col));
+                max_stats.insert(col.clone(), max_prefix.join(col));
+            }
+        }
+
+        inner.prepare_stats(min_stats.values().chain(max_stats.values()));
 
         Self {
             inner,
             min_stats,
             max_stats,
+            partition_columns: matched_partition_columns,
         }
     }
 
-    pub(crate) fn apply(inner: T, predicate: &Predicate) -> bool {
-        use crate::kernel_predicates::KernelPredicateEvaluator as _;
-        CheckpointMetaSkippingFilter::new(inner, predicate).eval_sql_where(predicate) != Some(false)
+    pub fn apply(inner: T, predicate: &Predicate, partition_columns: &HashSet<ColumnName>) -> bool {
+        CheckpointMetaSkippingFilter::new(inner, predicate, partition_columns)
+            .eval_sql_where(predicate)
+            != Some(false)
     }
 }
 
@@ -171,6 +198,8 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for CheckpointMetaS
     type Output = bool;
     type ColumnStat = Scalar;
 
+    // NOTE: The nullcount guard is currently ineffective due to arrow-rs #9451
+    // (see struct-level doc comment). Once the upstream fix lands, this will begin pruning.
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         let nested_col = self.min_stats.get(col)?;
         match self.inner.get_parquet_nullcount_stat(nested_col) {
@@ -179,6 +208,7 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for CheckpointMetaS
         }
     }
 
+    // NOTE: See get_min_stat comment about arrow-rs #9451.
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         let nested_col = self.max_stats.get(col)?;
         match self.inner.get_parquet_nullcount_stat(nested_col) {
@@ -187,8 +217,13 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for CheckpointMetaS
         }
     }
 
-    // Delta nullcount semantics are not safely derivable from checkpoint footer stats.
-    fn get_nullcount_stat(&self, _col: &ColumnName) -> Option<Scalar> {
+    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Scalar> {
+        if self.partition_columns.contains(col) {
+            // Partition values are never null — always report zero nulls.
+            return Some(Scalar::from(0i64));
+        }
+        // Delta nullcount semantics are not safely derivable from checkpoint footer stats
+        // for data columns.
         None
     }
 
@@ -215,9 +250,13 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for CheckpointMetaS
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
     }
 
-    // Delta IS [NOT] NULL semantics rely on file-level nullcount/rowcount stats, which are not
-    // safely derivable from checkpoint footer stats.
-    fn eval_pred_is_null(&self, _col: &ColumnName, _inverted: bool) -> Option<bool> {
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
+        if self.partition_columns.contains(col) {
+            // Partition values are never null: IS NULL → false, IS NOT NULL → true.
+            return Some(inverted);
+        }
+        // Delta IS [NOT] NULL semantics rely on file-level nullcount/rowcount stats, which are
+        // not safely derivable from checkpoint footer stats for data columns.
         None
     }
 

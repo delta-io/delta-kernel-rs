@@ -317,4 +317,3 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(collect_junction_preds(op, preds, inverted))
     }
 }
-

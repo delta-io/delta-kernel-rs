@@ -18,7 +18,7 @@ use tracing::debug;
 mod tests;
 
 /// An extension trait for [`ArrowReaderBuilder`] that injects row group skipping capability.
-pub(crate) trait ParquetRowGroupSkipping {
+pub trait ParquetRowGroupSkipping {
     /// Instructs the parquet reader to perform row group skipping, eliminating any row group whose
     /// stats prove that none of the group's rows can satisfy the given `predicate`.
     ///
@@ -30,9 +30,19 @@ pub(crate) trait ParquetRowGroupSkipping {
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
 
-    /// Applies row group filtering based on a [`FilePredicate`]. For `Data` predicates, this
-    /// delegates to [`with_row_group_filter`](Self::with_row_group_filter). For `None`, this is
-    /// a no-op.
+    /// Instructs the parquet reader to perform checkpoint-aware row group skipping. Data column
+    /// predicates are remapped to `add.stats_parsed.{minValues,maxValues}.<col>` in the parquet
+    /// footer, while partition column predicates are remapped to
+    /// `add.partitionValues_parsed.<col>`.
+    fn with_checkpoint_row_group_filter(
+        self,
+        predicate: &Predicate,
+        partition_columns: &HashSet<ColumnName>,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self;
+
+    /// Applies row group filtering based on a [`FilePredicate`]. Dispatches to the appropriate
+    /// filter method depending on the variant.
     fn with_file_predicate_filter(
         self,
         predicate: &FilePredicate,
@@ -51,19 +61,34 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .iter()
             .enumerate()
             .filter_map(|(ordinal, row_group)| {
-                // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
-                //
-                // ========================================================================
-                // HACK ALERT - NEED A BETTER WAY TO OPT INTO CHECKPOINT META SKIPPING
-                // ========================================================================
-                if has_checkpoint_stats_layout(row_group) {
-                    apply_checkpoint_meta_skipping_filter(row_group, predicate).then_some(ordinal)
-                } else {
-                    RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
-                }
+                RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
             })
             .collect();
         debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
+        if let Some(row_indexes) = row_indexes {
+            row_indexes.select_row_groups(&ordinals);
+        }
+        self.with_row_groups(ordinals)
+    }
+
+    fn with_checkpoint_row_group_filter(
+        self,
+        predicate: &Predicate,
+        partition_columns: &HashSet<ColumnName>,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self {
+        let ordinals: Vec<_> = self
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, row_group)| {
+                let inner = RowGroupFilter::new(row_group);
+                CheckpointMetaSkippingFilter::apply(inner, predicate, partition_columns)
+                    .then_some(ordinal)
+            })
+            .collect();
+        debug!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -78,36 +103,30 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
         match predicate {
             FilePredicate::None => self,
             FilePredicate::Data(pred) => self.with_row_group_filter(pred, row_indexes),
+            FilePredicate::Checkpoint {
+                predicate,
+                partition_columns,
+            } => self.with_checkpoint_row_group_filter(predicate, partition_columns, row_indexes),
         }
     }
-}
-
-fn has_checkpoint_stats_layout(row_group: &RowGroupMetaData) -> bool {
-    row_group.schema_descr().columns().iter().any(|col| {
-        let parts = col.path().parts();
-        parts.len() >= 3 && parts[0] == "add" && parts[1] == "stats_parsed"
-    })
-}
-
-// Convenience wrapper since unit tests add a lot of call sites
-fn apply_checkpoint_meta_skipping_filter(
-    row_group: &RowGroupMetaData,
-    predicate: &Predicate,
-) -> bool {
-    let inner = RowGroupFilter::new(row_group);
-    CheckpointMetaSkippingFilter::apply(inner, predicate)
 }
 
 /// A ParquetStatsSkippingFilter for row group skipping. It obtains stats from a parquet
 /// [`RowGroupMetaData`] and pre-computes the mapping of each referenced column path to its
 /// corresponding field index, for O(1) stats lookups.
-struct RowGroupFilter<'a> {
+pub struct RowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
     field_indices: HashMap<ColumnName, usize>,
 }
 
 impl<'a> RowGroupFilter<'a> {
-    fn new(row_group: &'a RowGroupMetaData) -> Self {
+    /// Creates a new row group filter with an empty field-index mapping.
+    ///
+    /// Callers must invoke [`prepare_stats`](ParquetStatsProvider::prepare_stats) before
+    /// querying stats, otherwise all lookups will return `None` (safe but no pruning).
+    /// Prefer [`CheckpointMetaSkippingFilter::apply`] or [`RowGroupFilter::apply`] which
+    /// handle this automatically.
+    pub(crate) fn new(row_group: &'a RowGroupMetaData) -> Self {
         Self {
             row_group,
             field_indices: HashMap::new(),
