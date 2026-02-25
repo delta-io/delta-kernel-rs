@@ -22,8 +22,8 @@ use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
-    get_top_level_column_physical_name, ColumnMappingMode, FeatureType, TableFeature,
+    assign_column_mapping_metadata, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, ColumnMappingMode, FeatureType, TableFeature,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
@@ -213,28 +213,13 @@ fn maybe_enable_clustering(
             // (Schema field names are always logical, even with column mapping)
             validate_clustering_columns(effective_schema, columns)?;
 
-            // Resolve logical to physical column names for domain metadata
-            // When column mapping is enabled, clustering stores physical names
-            // Clustering columns are always top-level (validated above), so we just
-            // need to resolve single names, not nested paths.
+            // Resolve logical to physical column names for domain metadata.
+            // When column mapping is enabled, clustering stores physical names.
+            // Supports both top-level and nested columns.
             let physical_columns: Vec<ColumnName> = columns
                 .iter()
                 .map(|c| {
-                    // validate_clustering_columns guarantees each path is exactly 1 element
-                    if c.path().len() != 1 {
-                        return Err(Error::generic(format!(
-                            "Expected single-element path for clustering column '{}', got {} elements",
-                            c,
-                            c.path().len()
-                        )));
-                    }
-                    let logical_name = &c.path()[0];
-                    let physical_name = get_top_level_column_physical_name(
-                        logical_name,
-                        effective_schema,
-                        column_mapping_mode,
-                    )?;
-                    Ok(ColumnName::new([physical_name]))
+                    get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
                 })
                 .try_collect()?;
 
@@ -816,35 +801,37 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Clustering column 'nonexistent' not found in schema"));
+            .contains("not found in schema"));
     }
 
     #[test]
-    fn test_clustering_nested_column_rejected() {
+    fn test_clustering_nested_column_accepted() {
+        use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::ColumnName;
 
+        let address_struct = StructType::new_unchecked(vec![
+            StructField::new("city", DataType::STRING, true),
+            StructField::new("zip", DataType::STRING, true),
+        ]);
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
-            StructField::new("nested", DataType::STRING, true),
+            StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
         ]));
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        // Create a nested column path
-        let nested_col = ColumnName::new(["nested", "field"]);
-        let result = apply_clustering_for_table_create(
+        let nested_col = ColumnName::new(["address", "city"]);
+        let dm = apply_clustering_for_table_create(
             &schema,
             &[nested_col],
             &mut reader_features,
             &mut writer_features,
-        );
+        )
+        .unwrap();
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be a top-level column"));
+        assert_eq!(dm.domain(), CLUSTERING_DOMAIN_NAME);
+        assert!(writer_features.contains(&TableFeature::ClusteredTable));
     }
 
     #[test]
