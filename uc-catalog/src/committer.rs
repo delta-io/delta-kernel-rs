@@ -6,18 +6,6 @@ use tracing::{info, instrument};
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::UCCommitsClient;
 
-fn max_published_version_for_uc(max_published_version: Option<u64>) -> DeltaResult<Option<i64>> {
-    max_published_version
-        .map(|v| {
-            v.try_into().map_err(|_| {
-                DeltaError::Generic(format!(
-                    "Max published version {v} does not fit into i64 for UC commit"
-                ))
-            })
-        })
-        .transpose()
-}
-
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
@@ -68,7 +56,6 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
 
         let committed = engine.storage_handler().head(&staged_commit_path)?;
         info!(
-            staged_commit_path = %staged_commit_path,
             staged_file = ?committed,
             "Wrote staged commit file"
         );
@@ -122,7 +109,10 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
     #[instrument(
         name = "uc_committer.publish",
         skip_all,
-        fields(num_commits = publish_metadata.commits_to_publish().len()),
+        fields(
+            num_commits = publish_metadata.commits_to_publish().len(),
+            publish_to_version = publish_metadata.publish_version()
+        ),
         err
     )]
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
@@ -154,6 +144,18 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
 
         Ok(())
     }
+}
+
+fn max_published_version_for_uc(max_published_version: Option<u64>) -> DeltaResult<Option<i64>> {
+    max_published_version
+        .map(|v| {
+            v.try_into().map_err(|_| {
+                DeltaError::Generic(format!(
+                    "Max published version {v} does not fit into i64 for UC commit"
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]
