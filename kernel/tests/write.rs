@@ -3327,14 +3327,14 @@ async fn test_column_mapping_write(
         let footer_schema = footer.schema;
 
         let logical_schema = latest_snapshot.schema();
-        for logical_path in [vec!["row_number"], vec!["address", "street"]] {
+        for logical_path in [&["row_number"][..], &["address", "street"]] {
             let col = ColumnName::new(logical_path.iter().copied());
             let physical =
                 get_any_level_column_physical_name(logical_schema.as_ref(), &col, cm)?.into_inner();
             assert_schema_has_field(&footer_schema, &physical);
 
             let field_id = get_parquet_field_id(&local_path, &physical);
-            let logical_field = resolve_field(logical_schema.as_ref(), &logical_path).unwrap();
+            let logical_field = resolve_field(logical_schema.as_ref(), logical_path).unwrap();
             match cm_mode {
                 ColumnMappingMode::Id | ColumnMappingMode::Name => {
                     let expected_id =
