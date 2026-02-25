@@ -3331,8 +3331,7 @@ async fn test_column_mapping_write(
         let footer_schema = footer.schema;
 
         let logical_schema = latest_snapshot.schema();
-        let logical_paths = [vec!["row_number"], vec!["address", "street"]];
-        for logical_path in logical_paths {
+        for logical_path in [vec!["row_number"], vec!["address", "street"]] {
             let col = ColumnName::new(logical_path.iter().copied());
             let physical =
                 get_any_level_column_physical_name(logical_schema.as_ref(), &col, cm)?.into_inner();
