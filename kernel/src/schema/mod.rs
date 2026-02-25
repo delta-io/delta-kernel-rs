@@ -338,7 +338,7 @@ impl StructField {
     /// metadata if present, otherwise returns the logical name.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
@@ -415,7 +415,7 @@ impl StructField {
     /// removed.
     ///
     /// NOTE: The caller must ensure that the schema has been validated by
-    /// [`crate::table_features::validate_schema_column_mapping`] to ensure that annotations are
+    /// [`crate::table_configuration::TableConfiguration::try_new`] to ensure that annotations are
     /// present only when column mapping mode is enabled.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
@@ -482,7 +482,7 @@ impl StructField {
     /// based on the specified `column_mapping_mode`.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// [`crate::table_features::validate_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
@@ -496,7 +496,7 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `validate_schema_column_mapping` should have verified that this has a field Id
+                    // `validate_column_mapping` should have verified that this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -884,7 +884,7 @@ impl StructType {
     /// [`ColumnMetadataKey::ParquetFieldId`] metadata field.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[allow(unused)]
     #[internal_api]
