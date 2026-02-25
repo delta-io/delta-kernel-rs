@@ -28,7 +28,7 @@ process to ensure high-quality code:
    each PR is easily review-able and thoroughly tested.
 
 ## Getting your PR reviewed
-We want to invite everyone who would like their PRs reviewed to review _other_ open PRs as
+We invite everyone who would like their PRs reviewed to review _other_ open PRs as
 well. Like most open source projects, our review bandwidth is limited, and help from users is
 greatly appreciated. This helps increase the overall review rate, and allows contributors to build
 credibility within the project.
