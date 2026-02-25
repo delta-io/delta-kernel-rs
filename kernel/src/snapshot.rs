@@ -237,6 +237,11 @@ impl Snapshot {
         new_log_segment
             .ascending_commit_files
             .retain(|log_path| old_version < log_path.version);
+        // Deduplicate compaction files the same way: the new listing re-lists from
+        // checkpoint_version, so it includes compaction files already in the old segment.
+        new_log_segment
+            .ascending_compaction_files
+            .retain(|log_path| old_version < log_path.version);
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
