@@ -663,8 +663,8 @@ pub struct ParquetFooter {
 
 /// Compression codec to use when writing Parquet files.
 ///
-/// Parsed case-insensitively from the `delta.parquet.compression.codec` table property.
 /// Supports the aliases `"none"` and `"uncompressed"` for [`ParquetCompression::Uncompressed`].
+/// String parsing is case-insensitive.
 #[derive(Debug, strum::EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {
@@ -825,15 +825,13 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Write data to a Parquet file at the specified URL.
-    ///
-    /// This method writes the provided `data` to a Parquet file at the given `url`.
+    /// Write data to a Parquet file at the specified location.
     ///
     /// This will overwrite the file if it already exists.
     ///
     /// # Parameters
     ///
-    /// - `url` - The full URL path where the Parquet file should be written
+    /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     /// - `write_config` - Configuration controlling how the Parquet file is written (e.g.
