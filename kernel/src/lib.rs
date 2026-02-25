@@ -677,10 +677,7 @@ impl FilePredicate {
     /// Creates a `FilePredicate` from an optional predicate. Returns `Data(pred)` if `Some`,
     /// or `None` if the predicate is absent.
     pub fn data(predicate: Option<PredicateRef>) -> Self {
-        match predicate {
-            Some(pred) => Self::Data(pred),
-            None => Self::None,
-        }
+        predicate.map_or(Self::None, Self::Data)
     }
 }
 
