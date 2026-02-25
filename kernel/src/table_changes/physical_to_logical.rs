@@ -168,6 +168,7 @@ mod tests {
             commit_timestamp: 1000000000000,
             dv_info: DvInfo::default(),
             remove_dv: None,
+            size: None,
         }
     }
 
@@ -183,6 +184,8 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            logical_stats_schema: None,
         }
     }
 
@@ -379,6 +382,7 @@ mod tests {
             commit_timestamp: 1000000000000,
             dv_info: DvInfo::default(),
             remove_dv: None,
+            size: None,
         };
 
         // Create a simple schema without CDF metadata columns
@@ -401,6 +405,8 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            logical_stats_schema: None,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);

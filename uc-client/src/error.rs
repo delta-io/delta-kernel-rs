@@ -31,6 +31,12 @@ pub enum Error {
 
     #[error("Max retries exceeded")]
     MaxRetriesExceeded,
+
+    #[error("Max unpublished commits exceeded (max: {0})")]
+    MaxUnpublishedCommitsExceeded(u16),
+
+    #[error("Generic Error: {0}")]
+    Generic(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

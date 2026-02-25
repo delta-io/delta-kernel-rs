@@ -7,7 +7,8 @@ use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use url::Url;
 use uuid::Uuid;
 
-use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -16,10 +17,14 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
 
@@ -32,14 +37,50 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
+use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::FileMeta;
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_default_engine, create_table,
-    engine_store_setup, setup_test_tables, test_read,
+    assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
+    copy_directory, create_add_files_metadata, create_default_engine, create_table,
+    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
+    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
+    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
 };
 
 mod common;
+
+/// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
+/// or `None` if the field has no `field_id` set.
+///
+/// Panics if the file cannot be read or the physical path doesn't exist in the parquet schema.
+fn get_parquet_field_id(parquet_file: &std::path::Path, physical_path: &[String]) -> Option<i32> {
+    let file = std::fs::File::open(parquet_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let root = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone();
+
+    let mut current = &root;
+    for name in physical_path {
+        current = current
+            .get_fields()
+            .iter()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("parquet schema missing field '{name}'"));
+    }
+
+    let info = current.get_basic_info();
+    info.has_id().then(|| info.id())
+}
 
 fn validate_txn_id(commit_info: &serde_json::Value) {
     let txn_id = commit_info["txnId"]
@@ -50,16 +91,169 @@ fn validate_txn_id(commit_info: &serde_json::Value) {
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// Creates a table with deletion vector support and writes the specified files
+async fn create_dv_table_with_files(
+    table_name: &str,
+    schema: Arc<StructType>,
+    file_paths: &[&str],
+) -> Result<
+    (
+        Arc<dyn ObjectStore>,
+        Arc<dyn delta_kernel::Engine>,
+        Url,
+        Vec<String>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (store, engine, table_url) = engine_store_setup(table_name, None);
+    let engine = Arc::new(engine);
+
+    // Create table with DV support (protocol 3/7 with deletionVectors feature)
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true, // use_37_protocol
+        vec!["deletionVectors"],
+        vec!["deletionVectors"],
+    )
+    .await?;
+
+    // Write files
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
+
+    let add_files_schema = txn.add_files_schema();
+
+    // Build metadata for all files at once
+    let files: Vec<(&str, i64, i64, i64)> = file_paths
+        .iter()
+        .enumerate()
+        .map(|(i, &path)| {
+            (
+                path,
+                1024 + i as i64 * 100, // size
+                1000000 + i as i64,    // mod_time
+                3,                     // num_records
+            )
+        })
+        .collect();
+    let metadata = create_add_files_metadata(add_files_schema, files)?;
+    txn.add_files(metadata);
+
+    let _ = txn.commit(engine.as_ref())?;
+
+    let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
+    Ok((store, engine, table_url, paths))
+}
+
+/// Extracts scan files from a snapshot for use in deletion vector updates
+fn get_scan_files(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<Vec<FilteredEngineData>> {
+    let scan = snapshot.scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+
+    Ok(all_scan_metadata
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect())
+}
+
+fn get_simple_int_schema() -> Arc<StructType> {
+    Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
+}
+
+/// Write a metadata-update commit that sets a table property on the existing table.
+/// Returns a fresh snapshot reflecting the new commit.
+/// Used in tests as a hack to set table properties when create table doesn't support the property.
+fn set_table_property(
+    table_path: &str,
+    table_url: &Url,
+    engine: &dyn Engine,
+    current_version: Version,
+    key: &str,
+    value: &str,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|v| v.get("metaData").is_some())
+        })
+        .expect("version 0 should contain a metaData action");
+
+    meta["metaData"]["configuration"][key] = json!(value);
+
+    let new_commit = std::path::Path::new(table_path)
+        .join(format!("_delta_log/{:020}.json", current_version + 1));
+    std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+}
+
+/// Resolve a nested column inside a [`StructArray`] by walking the given field-name path,
+/// and downcast the leaf to the requested array type.
+fn resolve_struct_field<'a, T: 'static>(root: &'a StructArray, path: &[String]) -> &'a T {
+    assert!(!path.is_empty(), "path must be non-empty");
+    let mut current: &StructArray = root;
+    for (i, name) in path.iter().enumerate() {
+        let col = current
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing field: {name}"));
+        if i == path.len() - 1 {
+            return col
+                .as_any()
+                .downcast_ref::<T>()
+                .expect("leaf array type mismatch");
+        }
+        current = col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap_or_else(|| panic!("expected StructArray at field: {name}"));
+    }
+    unreachable!()
+}
+
+/// Navigate into a nested JSON value by following a sequence of object keys.
+/// E.g. `resolve_json_path(stats, &["address", "street"])` returns `stats["address"]["street"]`.
+fn resolve_json_path<'a>(root: &'a serde_json::Value, path: &[String]) -> &'a serde_json::Value {
+    path.iter().fold(root, |v, key| &v[key])
+}
+
+/// Assert that `stats["minValues"]` and `stats["maxValues"]` at the given physical path equal the
+/// expected values.
+fn assert_min_max_stats(
+    stats: &serde_json::Value,
+    physical_path: &[String],
+    expected_min: impl Into<serde_json::Value>,
+    expected_max: impl Into<serde_json::Value>,
+) {
+    assert_eq!(
+        *resolve_json_path(&stats["minValues"], physical_path),
+        expected_min.into()
+    );
+    assert_eq!(
+        *resolve_json_path(&stats["maxValues"], physical_path),
+        expected_max.into()
+    );
+}
+
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
@@ -68,7 +262,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let committer = Box::new(FileSystemCommitter::new());
         let txn = snapshot
-            .transaction(committer)?
+            .transaction(committer, &engine)?
             .with_engine_info("default engine");
 
         // commit!
@@ -153,7 +347,9 @@ async fn write_data_and_check_result_and_stats(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot.transaction(committer)?.with_data_change(true);
+    let mut txn = snapshot
+        .transaction(committer, engine.as_ref())?
+        .with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -210,17 +406,14 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         let _ = txn.commit(&engine)?;
@@ -263,10 +456,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -321,7 +511,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": true,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":1},\"maxValues\":{\"number\":3},\"tightBounds\":true}"
                 }
             }),
             json!({
@@ -331,7 +521,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": true,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":4},\"maxValues\":{\"number\":6},\"tightBounds\":true}"
                 }
             }),
         ];
@@ -355,17 +545,14 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         // Commit without adding any add files
@@ -393,10 +580,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _, _) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -444,7 +628,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine")
             .with_data_change(false);
 
@@ -535,7 +719,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": false,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":1},\"maxValues\":{\"number\":3},\"tightBounds\":true}"
                 }
             }),
             json!({
@@ -547,7 +731,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": false,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":4},\"maxValues\":{\"number\":6},\"tightBounds\":true}"
                 }
             }),
         ];
@@ -589,7 +773,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -621,9 +805,12 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
+            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
-                if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+                if matches!(
+                    &*source,
+                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+                ) =>
                 true,
             _ => false,
         }));
@@ -637,10 +824,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
@@ -649,7 +833,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
             snapshot
-                .transaction(Box::new(FileSystemCommitter::new()))?
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
@@ -658,7 +842,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);
@@ -669,18 +853,9 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id1", &engine)?,
-            Some(1)
-        );
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id2", &engine)?,
-            Some(2)
-        );
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id3", &engine)?,
-            None
-        );
+        assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
+        assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
+        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -792,7 +967,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -915,7 +1090,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1015,6 +1190,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
+            Some(write_context.stats_columns()),
         )
         .await?;
 
@@ -1126,7 +1302,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1188,6 +1364,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
+            Some(write_context.stats_columns()),
         )
         .await?;
 
@@ -1225,10 +1402,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_basic";
 
@@ -1246,7 +1420,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
     // write context does not conflict with domain metadata
     let _write_context = txn.get_write_context();
@@ -1304,10 +1478,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
 async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_errors";
     let (store, engine, table_location) = engine_store_setup(table_name, None);
@@ -1327,7 +1498,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     // System domain rejection
     let txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?;
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
         .commit(&engine);
@@ -1339,7 +1510,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     // Duplicate domain rejection
     let txn2 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?;
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
@@ -1357,10 +1528,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1379,7 +1547,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
@@ -1393,10 +1561,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_remove_domain_metadata_unsupported";
 
@@ -1415,7 +1580,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_domain_metadata_removed("app.config".to_string())
         .commit(&engine);
 
@@ -1429,10 +1594,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
 {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1449,7 +1611,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
     let domain = "app.deprecated";
 
@@ -1486,10 +1648,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
 async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1510,7 +1669,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // set then remove same domain
     let txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?;
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let err = txn
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata_removed("app.config".to_string())
@@ -1523,7 +1682,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // remove then set same domain
     let txn2 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?;
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let err = txn2
         .with_domain_metadata_removed("test.domain".to_string())
         .with_domain_metadata("test.domain".to_string(), "v1".to_string())
@@ -1536,7 +1695,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // remove same domain twice
     let txn3 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?;
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let err = txn3
         .with_domain_metadata_removed("another.domain".to_string())
         .with_domain_metadata_removed("another.domain".to_string())
@@ -1549,7 +1708,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // remove system domain
     let txn4 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?;
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let err = txn4
         .with_domain_metadata_removed("delta.system".to_string())
         .commit(&engine)
@@ -1565,10 +1724,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
 async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1589,14 +1745,14 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
 
     // txn 1: set domain metadata
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let _ = txn
         .with_domain_metadata(domain.to_string(), configuration.to_string())
         .commit(&engine)?;
 
     // txn 2: remove the same domain metadata
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
     let _ = txn
         .with_domain_metadata_removed(domain.to_string())
         .commit(&engine)?;
@@ -1696,10 +1852,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number' with ICT enabled
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let tmp_dir = TempDir::new()?;
     let tmp_test_dir_url = Url::from_file_path(&tmp_dir).unwrap();
@@ -1728,7 +1881,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("ict test");
 
     // Add some data
@@ -1773,7 +1926,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut txn2 = snapshot2
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("ict test 2");
 
     // Add more data
@@ -1842,7 +1995,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test engine")
         .with_data_change(true);
 
@@ -1982,6 +2135,469 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
+async fn test_update_deletion_vectors_adds_expected_entries(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that deletion vector updates write proper Remove and Add actions
+    // to the transaction log.
+    //
+    // NOTE: Additional unit tests for update_deletion_vectors exist in kernel/src/transaction/mod.rs
+    //
+    // The test validates:
+    // 1. Transaction setup for DV updates
+    // 2. Scanning and extracting scan files with DV data
+    // 3. Creating new DV descriptors for the files
+    // 4. Calling update_deletion_vectors to update the DVs
+    // 5. Committing and verifying the generated actions
+    //
+    // Expected commit log structure:
+    // - commitInfo: Contains metadata about the transaction
+    // - remove: Contains OLD deletion vector data and original file metadata
+    // - add: Contains NEW deletion vector data and updated file metadata
+    //
+    // The test ensures:
+    // - Remove action has the OLD DV descriptor with all 5 fields
+    // - Add action has the NEW DV descriptor with all 5 fields
+    // - All file metadata is preserved (size, stats, tags, partitionValues)
+    // - dataChange is properly set to true
+    // - deletionTimestamp matches commit timestamp
+    use std::path::PathBuf;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let tmp_dir = tempdir()?;
+    let tmp_table_path = tmp_dir.path().join("table-with-dv-small");
+    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
+    copy_directory(&source_path, &tmp_table_path)?;
+
+    let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone())
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // Create transaction with DV update mode enabled
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    // Build scan and collect all scan metadata
+    let scan = snapshot.clone().scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine.as_ref())?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Extract scan files for DV update
+    let scan_files: Vec<_> = all_scan_metadata
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect();
+
+    // Create new DV descriptors for the files
+    let file_path = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
+    let mut dv_map = HashMap::new();
+
+    // Create a NEW deletion vector descriptor (different from the original)
+    let new_dv = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "cd^-aqEH.-t@S}K{vb[*k^".to_string(),
+        offset: Some(10),
+        size_in_bytes: 40,
+        cardinality: 3,
+    };
+    dv_map.insert(file_path.to_string(), new_dv);
+
+    // Call update_deletion_vectors to exercise the API
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+
+    // Commit the transaction
+    let result = txn.commit(engine.as_ref())?;
+
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            let commit_version = committed.commit_version();
+
+            // Read the original version 1 log to get original file metadata
+            let original_log_path = tmp_table_path.join("_delta_log/00000000000000000001.json");
+            let original_log_content = std::fs::read_to_string(original_log_path)?;
+            let original_commits: Vec<_> = Deserializer::from_str(&original_log_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            let file_path = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
+
+            // Extract original file metadata from version 1
+            let original_add = original_commits
+                .iter()
+                .find(|action| {
+                    action
+                        .get("add")
+                        .and_then(|add| add.get("path").and_then(|p| p.as_str()))
+                        == Some(file_path)
+                })
+                .expect("Missing original add action in version 1")
+                .get("add")
+                .expect("Should have add field");
+
+            let original_size = original_add["size"]
+                .as_i64()
+                .expect("Original add action should have size");
+            let original_partition_values = original_add["partitionValues"]
+                .as_object()
+                .expect("Original add action should have partitionValues");
+            let original_tags = original_add.get("tags");
+            let original_stats = original_add.get("stats");
+
+            // Read the commit log directly
+            let commit_path =
+                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_content = std::fs::read_to_string(commit_path)?;
+
+            let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            // Should have commitInfo, remove, and add actions
+            assert!(
+                parsed_commits.len() >= 3,
+                "Expected at least 3 actions (commitInfo + remove + add), got {}",
+                parsed_commits.len()
+            );
+
+            // Extract commitInfo timestamp
+            let commit_info_action = parsed_commits
+                .iter()
+                .find(|action| action.get("commitInfo").is_some())
+                .expect("Missing commitInfo action");
+            let commit_info = &commit_info_action["commitInfo"];
+            let commit_timestamp = commit_info["timestamp"]
+                .as_i64()
+                .expect("Missing timestamp in commitInfo");
+
+            // Verify remove action contains OLD DV information
+            let remove_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .collect();
+
+            assert_eq!(
+                remove_actions.len(),
+                1,
+                "Expected exactly one remove action"
+            );
+
+            let remove_action = remove_actions[0];
+            let remove = &remove_action["remove"];
+
+            assert_eq!(
+                remove["path"].as_str(),
+                Some(file_path),
+                "Remove path should match"
+            );
+            assert_eq!(remove["dataChange"].as_bool(), Some(true));
+            assert_eq!(
+                remove["deletionTimestamp"].as_i64(),
+                Some(commit_timestamp),
+                "deletionTimestamp should match commit timestamp"
+            );
+
+            // Verify OLD deletion vector in remove action
+            let old_dv = remove["deletionVector"]
+                .as_object()
+                .expect("Remove action should have deletionVector");
+            assert_eq!(
+                old_dv.get("storageType").and_then(|v| v.as_str()),
+                Some("u"),
+                "Old DV storage type should be 'u'"
+            );
+            assert_eq!(
+                old_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                Some("vBn[lx{q8@P<9BNH/isA"),
+                "Old DV path should match original"
+            );
+            assert_eq!(
+                old_dv.get("offset").and_then(|v| v.as_i64()),
+                Some(1),
+                "Old DV offset should be 1"
+            );
+            assert_eq!(
+                old_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
+                Some(36),
+                "Old DV size should be 36"
+            );
+            assert_eq!(
+                old_dv.get("cardinality").and_then(|v| v.as_i64()),
+                Some(2),
+                "Old DV cardinality should be 2"
+            );
+
+            // Verify file metadata is preserved in remove action
+            let remove_size = remove["size"]
+                .as_i64()
+                .expect("Remove action should have size");
+            let remove_partition_values = remove["partitionValues"]
+                .as_object()
+                .expect("Remove action should have partitionValues");
+            let remove_tags = remove.get("tags");
+            let remove_stats = remove.get("stats");
+
+            // Verify add action contains NEW DV information
+            let add_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("add").is_some())
+                .collect();
+
+            assert_eq!(add_actions.len(), 1, "Expected exactly one add action");
+
+            let add_action = add_actions[0];
+            let add = &add_action["add"];
+
+            assert_eq!(
+                add["path"].as_str(),
+                Some(file_path),
+                "Add path should match"
+            );
+            assert_eq!(add["dataChange"].as_bool(), Some(true));
+
+            // Verify NEW deletion vector in add action
+            let new_dv = add["deletionVector"]
+                .as_object()
+                .expect("Add action should have deletionVector");
+            assert_eq!(
+                new_dv.get("storageType").and_then(|v| v.as_str()),
+                Some("u"),
+                "New DV storage type should be 'u'"
+            );
+            assert_eq!(
+                new_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                Some("cd^-aqEH.-t@S}K{vb[*k^"),
+                "New DV path should match updated value"
+            );
+            assert_eq!(
+                new_dv.get("offset").and_then(|v| v.as_i64()),
+                Some(10),
+                "New DV offset should be 10"
+            );
+            assert_eq!(
+                new_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
+                Some(40),
+                "New DV size should be 40"
+            );
+            assert_eq!(
+                new_dv.get("cardinality").and_then(|v| v.as_i64()),
+                Some(3),
+                "New DV cardinality should be 3"
+            );
+
+            // Verify file metadata is preserved in add action
+            let add_size = add["size"].as_i64().expect("Add action should have size");
+            let add_partition_values = add["partitionValues"]
+                .as_object()
+                .expect("Add action should have partitionValues");
+            let add_tags = add.get("tags");
+            let add_stats = add.get("stats");
+
+            // Ensure metadata is consistent between remove and add actions
+            assert_eq!(
+                remove_size, add_size,
+                "File size should be preserved between remove and add"
+            );
+            assert_eq!(
+                remove_partition_values, add_partition_values,
+                "Partition values should be preserved between remove and add"
+            );
+            assert_eq!(
+                remove_tags, add_tags,
+                "Tags should be preserved between remove and add"
+            );
+            assert_eq!(
+                remove_stats, add_stats,
+                "Stats should be preserved between remove and add"
+            );
+
+            // Ensure metadata matches the original file metadata from version 1
+            assert_eq!(
+                remove_size, original_size,
+                "Remove action size should match original file size"
+            );
+            assert_eq!(
+                add_size, original_size,
+                "Add action size should match original file size"
+            );
+            assert_eq!(
+                remove_partition_values, original_partition_values,
+                "Remove action partition values should match original"
+            );
+            assert_eq!(
+                add_partition_values, original_partition_values,
+                "Add action partition values should match original"
+            );
+            assert_eq!(
+                remove_tags, original_tags,
+                "Remove action tags should match original"
+            );
+            assert_eq!(
+                add_tags, original_tags,
+                "Add action tags should match original"
+            );
+            assert_eq!(
+                remove_stats, original_stats,
+                "Remove action stats should match original"
+            );
+            assert_eq!(
+                add_stats, original_stats,
+                "Add action stats should match original"
+            );
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that update_deletion_vectors can update multiple files
+    // in a single call, creating proper Remove and Add actions for each file.
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    // Setup: Create table with 3 files
+    let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
+    let (store, engine, table_url, file_paths) =
+        create_dv_table_with_files("test_table", schema, file_names).await?;
+
+    // Create DV update transaction
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+
+    // Update deletion vectors for all 3 files in a single call
+    let mut dv_map = HashMap::new();
+    for (idx, file_path) in file_paths.iter().enumerate() {
+        let descriptor = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: format!("dv_file_{}.bin", idx),
+            offset: Some(idx as i32 * 10),
+            size_in_bytes: 40 + idx as i32,
+            cardinality: idx as i64 + 1,
+        };
+        dv_map.insert(file_path.to_string(), descriptor);
+    }
+
+    txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
+
+    // Commit the transaction
+    let result = txn.commit(engine.as_ref())?;
+
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            let commit_version = committed.commit_version();
+
+            // Read the commit log directly from object store
+            let final_commit_path =
+                table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
+            let commit_content = store
+                .get(&Path::from_url_path(final_commit_path.path())?)
+                .await?
+                .bytes()
+                .await?;
+
+            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            // Extract all remove and add actions
+            let remove_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .collect();
+
+            let add_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("add").is_some())
+                .collect();
+
+            // Should have 3 remove and 3 add actions
+            assert_eq!(
+                remove_actions.len(),
+                3,
+                "Expected 3 remove actions for 3 files"
+            );
+            assert_eq!(add_actions.len(), 3, "Expected 3 add actions for 3 files");
+
+            // Verify each file has a DV in both remove and add
+            for (idx, file_path) in file_paths.iter().enumerate() {
+                // Find the remove action for this file
+                let remove_action = remove_actions
+                    .iter()
+                    .find(|action| action["remove"]["path"].as_str() == Some(file_path.as_str()))
+                    .unwrap_or_else(|| panic!("Should find remove action for {}", file_path));
+
+                // Find the add action for this file
+                let add_action = add_actions
+                    .iter()
+                    .find(|action| action["add"]["path"].as_str() == Some(file_path.as_str()))
+                    .unwrap_or_else(|| panic!("Should find add action for {}", file_path));
+
+                // Verify remove action does NOT have a DV (since these were newly written files)
+                assert!(
+                    remove_action["remove"]["deletionVector"].is_null(),
+                    "Remove action for newly written file should not have a DV"
+                );
+
+                // Verify add action has the NEW DV
+                let add_dv = add_action["add"]["deletionVector"]
+                    .as_object()
+                    .expect("Add action should have deletionVector");
+
+                let expected_path = format!("dv_file_{}.bin", idx);
+                assert_eq!(
+                    add_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                    Some(expected_path.as_str()),
+                    "DV path should match for file {}",
+                    file_path
+                );
+                assert_eq!(
+                    add_dv.get("offset").and_then(|v| v.as_i64()),
+                    Some(idx as i64 * 10),
+                    "DV offset should match for file {}",
+                    file_path
+                );
+                assert_eq!(
+                    add_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
+                    Some(40 + idx as i64),
+                    "DV size should match for file {}",
+                    file_path
+                );
+                assert_eq!(
+                    add_dv.get("cardinality").and_then(|v| v.as_i64()),
+                    Some(idx as i64 + 1),
+                    "DV cardinality should match for file {}",
+                    file_path
+                );
+            }
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_remove_files_verify_files_excluded_from_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Adds and then removes files and then verifies they don't appear in the scan.
@@ -1990,10 +2606,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -2015,10 +2628,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         // Now create a transaction to remove files
         let mut txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()))?
-            .with_engine_info("default engine")
-            .with_operation("DELETE".to_string())
-            .with_data_change(true);
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
         // Create a new scan to get file metadata for removal
         let scan2 = snapshot.scan_builder().build()?;
@@ -2073,10 +2683,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -2118,7 +2725,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         // Create a transaction to remove files in two batches
         let mut txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()))?
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_engine_info("selective remove test")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
@@ -2243,7 +2850,7 @@ async fn write_data_to_table(
 ) -> Result<Version, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test");
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
@@ -2284,10 +2891,7 @@ async fn test_cdf_write_all_adds_succeeds() -> Result<(), Box<dyn std::error::Er
     // This test verifies that add-only transactions work with CDF enabled
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_all_adds", schema.clone()).await?;
@@ -2304,10 +2908,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     // This test verifies that remove-only transactions work with CDF enabled
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_all_removes", schema.clone()).await?;
@@ -2319,7 +2920,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("cdf remove test")
         .with_data_change(true);
 
@@ -2347,10 +2948,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
     // This can happen when a table is being optimized/compacted.
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_mixed_no_data_change", schema.clone()).await?;
@@ -2362,7 +2960,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("cdf mixed test")
         .with_data_change(false); // dataChange=false is key here
 
@@ -2392,10 +2990,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     // This test verifies that mixed add+remove transactions fail with helpful error when dataChange=true
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_mixed_with_data_change", schema.clone()).await?;
@@ -2407,7 +3002,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()))?
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("cdf mixed fail test")
         .with_data_change(true); // dataChange=true - this should fail
 
@@ -2429,4 +3024,559 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let temp_dir = tempdir().unwrap();
+    let table_url = Url::from_directory_path(temp_dir.path()).unwrap();
+    let engine = create_default_engine(&table_url)?;
+    let schema = get_simple_int_schema();
+
+    // Create table and verify post_commit_snapshot
+    let create_result = create_table_txn(table_url.as_str(), schema, env!("CARGO_PKG_VERSION"))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let mut current_snapshot = match create_result {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 0);
+            let post_snapshot = committed
+                .post_commit_snapshot()
+                .expect("should have post_commit_snapshot");
+            assert_eq!(post_snapshot.version(), 0);
+            post_snapshot.clone()
+        }
+        _ => panic!("Create should succeed"),
+    };
+
+    // Do 10 inserts and verify post_commit_snapshot for each
+    for i in 1..11 {
+        let base_version = current_snapshot.version();
+
+        let txn = current_snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_engine_info("test");
+
+        match txn.commit(engine.as_ref())? {
+            CommitResult::CommittedTransaction(committed) => {
+                let post_snapshot = committed
+                    .post_commit_snapshot()
+                    .expect("should have post_commit_snapshot");
+
+                assert_eq!(post_snapshot.version(), base_version + 1);
+                assert_eq!(post_snapshot.version(), committed.commit_version());
+                assert_eq!(post_snapshot.schema(), current_snapshot.schema());
+                assert_eq!(post_snapshot.table_root(), current_snapshot.table_root());
+
+                current_snapshot = post_snapshot.clone();
+            }
+            _ => panic!("Commit {} should succeed", i),
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_parquet_succeed_with_logical_partition_names(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("letter", DataType::STRING),
+    ])?);
+
+    for (table_url, engine, _store, _table_name) in setup_test_tables(
+        schema.clone(),
+        &["letter"],
+        None,
+        "test_partition_translate",
+    )
+    .await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        // Create data with only the non-partition column
+        let data_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(data_schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        // Pass partition values with logical name — should succeed
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("letter".to_string(), "a".to_string())]),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "write_parquet should succeed with valid logical partition name"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_parquet_rejects_unknown_partition_column(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
+        )
+        .await;
+        let err = result.expect_err("write_parquet should fail with unknown partition column");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Partition column 'nonexistent' not found in table schema"),
+            "Error should mention the unknown column name, got: {err_msg}"
+        );
+    }
+    Ok(())
+}
+
+/// 1. Creates a table with the given column mapping mode
+/// 2. Writes two batches of data
+/// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
+/// 4. Reads a parquet footer to verify physical names/IDs
+/// 5. Reads data back to verify correctness
+/// 6. Removes files and verifies remove.stats matches the original add.stats
+#[rstest::rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_write(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = nested_schema()?;
+
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    // Step 1: Create table
+    let mode_str = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Id => "id",
+        ColumnMappingMode::Name => "name",
+    };
+    let mut latest_snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", mode_str)],
+    )?;
+
+    // Get physical field paths for stats verification (top-level and nested)
+    let cm = latest_snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let row_number_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["row_number"]),
+        cm,
+    )?
+    .into_inner();
+    let street_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["address", "street"]),
+        cm,
+    )?
+    .into_inner();
+
+    // Step 2: Write two batches
+    for data in nested_batches()? {
+        latest_snapshot =
+            write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
+    }
+
+    // Enable writeStatsAsStruct so the checkpoint contains native stats_parsed.
+    // CREATE TABLE doesn't allow this property yet, so we write a metadata-update commit directly.
+    latest_snapshot = set_table_property(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        latest_snapshot.version(),
+        "delta.checkpoint.writeStatsAsStruct",
+        "true",
+    )?;
+
+    // Step 3: Checkpoint and verify add.stats uses correct column names
+    let snapshot_for_checkpoint = latest_snapshot.clone();
+    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
+    let mut all_stats: Vec<_> = add_actions
+        .iter()
+        .filter_map(|a| a.stats.as_ref())
+        .filter(|s| s.get("minValues").is_some())
+        .collect();
+    assert_eq!(all_stats.len(), 2, "should have stats for 2 files");
+    all_stats.sort_by_key(|s| s["minValues"][&row_number_physical[0]].as_i64().unwrap());
+
+    // Batch 1: row_number 1..3, address.street "st1".."st3"
+    assert_min_max_stats(all_stats[0], &row_number_physical, 1, 3);
+    assert_min_max_stats(all_stats[0], &street_physical, "st1", "st3");
+
+    // Batch 2: row_number 4..6, address.street "st4".."st6"
+    assert_min_max_stats(all_stats[1], &row_number_physical, 4, 6);
+    assert_min_max_stats(all_stats[1], &street_physical, "st4", "st6");
+
+    // Step 3b: Verify stats_parsed in scan metadata uses correct physical column names
+    {
+        let scan = ckpt_snapshot
+            .scan_builder()
+            .include_stats_columns()
+            .build()?;
+        let scan_metadata_results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
+        for sm in scan_metadata_results {
+            let (data, sel) = sm.scan_files.into_parts();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
+
+            let batch_struct = StructArray::from(batch.clone());
+            let stats_parsed: &StructArray =
+                resolve_struct_field(&batch_struct, &["stats_parsed".into()]);
+
+            let min_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "minValues".into()], field].concat()
+            };
+            let max_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "maxValues".into()], field].concat()
+            };
+            let min_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &min_path(&row_number_physical));
+            let max_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &max_path(&row_number_physical));
+            let min_st: &StringArray =
+                resolve_struct_field(&batch_struct, &min_path(&street_physical));
+            let max_st: &StringArray =
+                resolve_struct_field(&batch_struct, &max_path(&street_physical));
+
+            for (i, &selected) in sel.iter().enumerate().take(batch.num_rows()) {
+                if selected && !stats_parsed.is_null(i) {
+                    stats_rows.push((
+                        min_row_num.value(i),
+                        max_row_num.value(i),
+                        min_st.value(i).to_string(),
+                        max_st.value(i).to_string(),
+                    ));
+                }
+            }
+        }
+
+        stats_rows.sort_by_key(|r| r.0);
+        assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
+        assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
+        assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
+    }
+
+    // Step 4: Read parquet footer to verify physical names and native field_id
+    {
+        let parquet_path = &add_actions
+            .first()
+            .expect("should have at least one add file")
+            .path;
+        let parquet_url = table_url.join(parquet_path)?;
+        let local_path = parquet_url.to_file_path().unwrap();
+
+        let obj_meta = store
+            .head(&Path::from_url_path(parquet_url.path())?)
+            .await?;
+        let file_meta = FileMeta::new(
+            parquet_url,
+            0, /* last_modified */
+            obj_meta.size as u64,
+        );
+        let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
+        let footer_schema = footer.schema;
+
+        let logical_schema = latest_snapshot.schema();
+        for logical_path in [&["row_number"][..], &["address", "street"]] {
+            let col = ColumnName::new(logical_path.iter().copied());
+            let physical =
+                get_any_level_column_physical_name(logical_schema.as_ref(), &col, cm)?.into_inner();
+            assert_schema_has_field(&footer_schema, &physical);
+
+            let field_id = get_parquet_field_id(&local_path, &physical);
+            let logical_field = resolve_field(logical_schema.as_ref(), logical_path).unwrap();
+            match cm_mode {
+                ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                    let expected_id =
+                        match logical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                            Some(MetadataValue::Number(n)) => *n as i32,
+                            other => panic!("expected ColumnMappingId number, got {other:?}"),
+                        };
+                    assert_eq!(
+                        field_id,
+                        Some(expected_id),
+                        "parquet field_id mismatch for {logical_path:?}"
+                    );
+                }
+                ColumnMappingMode::None => {
+                    assert_eq!(
+                        field_id, None,
+                        "parquet field_id should not be set in None column mapping mode"
+                    );
+                }
+            }
+        }
+    }
+
+    // Step 5: Read data back to verify correctness
+    {
+        let post_ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = post_ckpt_snapshot.scan_builder().build()?;
+        let batches: Vec<RecordBatch> = scan
+            .execute(engine.clone())?
+            .map(|r| {
+                let data = r.unwrap();
+                let arrow = ArrowEngineData::try_from_engine_data(data).unwrap();
+                arrow.record_batch().clone()
+            })
+            .collect();
+
+        let result_schema = batches[0].schema();
+        let combined = delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
+        assert_eq!(
+            combined.num_rows(),
+            6,
+            "Should have 6 rows from two written batches"
+        );
+
+        // Verify logical column names and data values
+        let combined_struct = StructArray::from(combined);
+
+        // Top-level: row_number should contain [1..=6]
+        let row_numbers: &Int64Array =
+            resolve_struct_field(&combined_struct, &["row_number".into()]);
+        let mut vals: Vec<i64> = (0..row_numbers.len())
+            .map(|i| row_numbers.value(i))
+            .collect();
+        vals.sort();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+
+        // Nested: address.street should contain ["st1"..="st6"]
+        let streets: &StringArray =
+            resolve_struct_field(&combined_struct, &["address".into(), "street".into()]);
+        let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
+        street_vals.sort();
+        assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
+    }
+
+    // Step 6: Remove files and verify remove.stats matches original add.stats
+    {
+        let original_add_stats: Vec<serde_json::Value> =
+            add_actions.iter().filter_map(|a| a.stats.clone()).collect();
+        assert!(
+            !original_add_stats.is_empty(),
+            "should have at least one add with stats"
+        );
+
+        let remove_actions =
+            remove_all_and_get_remove_actions(&latest_snapshot, &table_url, engine.as_ref())?;
+        assert!(
+            !remove_actions.is_empty(),
+            "Expected at least one remove action"
+        );
+
+        let remove_stats: Vec<serde_json::Value> = remove_actions
+            .iter()
+            .filter_map(|r| {
+                r["stats"]
+                    .as_str()
+                    .map(|s| serde_json::from_str(s).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            remove_stats, original_add_stats,
+            "remove.stats should match original add.stats"
+        );
+    }
+
+    Ok(())
+}
+
+/// Verifies that partitioned writes use physical column names in add.partitionValues.
+#[rstest::rstest]
+#[case::cm_none("./tests/data/partition_cm/none")]
+#[case::cm_id("./tests/data/partition_cm/id")]
+#[case::cm_name("./tests/data/partition_cm/name")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_partitioned_write(
+    #[case] table_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy test data to a temp dir so we can write to it
+    let tmp_dir = tempdir()?;
+    copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let cm = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let physical_name = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["category"]),
+        cm,
+    )?
+    .into_inner()
+    .remove(0);
+
+    // Verify physical name for column mapping mode
+    if table_dir.ends_with("none") {
+        assert_eq!(physical_name, "category");
+    } else {
+        assert_ne!(
+            physical_name, "category",
+            "physical name should differ from logical name under column mapping"
+        );
+    }
+
+    // Write data with partition value
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let batch = RecordBatch::try_new(
+        Arc::new(data_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // Read commit log and verify add.partitionValues key uses physical name
+    let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+    assert!(!add_actions.is_empty(), "no add action found in commit log");
+    for add in &add_actions {
+        assert_partition_values(add, &physical_name, "A");
+    }
+
+    // Remove the written file and verify remove action preserves physical names
+    let post_write_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let remove_actions =
+        remove_all_and_get_remove_actions(&post_write_snapshot, &table_url, engine.as_ref())?;
+    assert!(
+        !remove_actions.is_empty(),
+        "no remove action found in commit log"
+    );
+    for remove in &remove_actions {
+        assert_partition_values(remove, &physical_name, "A");
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_non_kernel_written_table() {
+    // Table written by a non-kernel-integrated connector: 7 rows with columns (i, j, k), where
+    // parquet field nullabilities differ from the Delta schema. DefaultEngine reads it, coerces
+    // nullabilities to match the Delta schema, creates a checkpoint, and verifies the data is
+    // unchanged.
+    let source_path = std::path::Path::new("./tests/data/external-table-different-nullability");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("test-checkpoint-table");
+    test_utils::copy_directory(source_path, &table_path).unwrap();
+
+    let url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let executor = Arc::new(
+        delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    let engine: Arc<delta_kernel::engine::default::DefaultEngine<_>> = Arc::new(
+        delta_kernel::engine::default::DefaultEngineBuilder::new(store)
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    // Read data before checkpoint
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan_before = Arc::clone(&snapshot).scan_builder().build().unwrap();
+    let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
+
+    // Create checkpoint via snapshot.checkpoint()
+    Arc::clone(&snapshot).checkpoint(engine.as_ref()).unwrap();
+
+    // Read data after checkpoint
+    let snapshot_after = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan_after = snapshot_after.scan_builder().build().unwrap();
+    let batches_after = test_utils::read_scan(&scan_after, engine.clone()).unwrap();
+
+    // Verify data unchanged
+    let formatted_before =
+        delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_before)
+            .unwrap()
+            .to_string();
+    let formatted_after = delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_after)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        formatted_before, formatted_after,
+        "Row data changed after checkpoint creation!"
+    );
+
+    // Verify checkpoint file exists
+    let delta_log_path = table_path.join("_delta_log");
+    let has_checkpoint = std::fs::read_dir(&delta_log_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".checkpoint.parquet"))
+        });
+    assert!(has_checkpoint, "Expected at least one checkpoint file");
 }

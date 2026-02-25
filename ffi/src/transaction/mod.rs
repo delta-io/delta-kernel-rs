@@ -2,13 +2,15 @@
 mod transaction_id;
 mod write_context;
 
+use std::sync::Arc;
+
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
-use delta_kernel::committer::FileSystemCommitter;
+use crate::{KernelStringSlice, SharedSnapshot};
+use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -19,6 +21,10 @@ use delta_kernel_ffi_macros::handle_descriptor;
 /// to stage changes and commit them atomically to the Delta table.
 #[handle_descriptor(target=Transaction, mutable=true, sized=true)]
 pub struct ExclusiveTransaction;
+
+/// Handle for a mutable boxed committer that can be passed across FFI
+#[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
+pub struct MutableCommitter;
 
 /// Start a transaction on the latest snapshot of the table.
 ///
@@ -39,9 +45,38 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
+    let engine = extern_engine.engine();
+    let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer);
+    let transaction = snapshot.transaction(committer, engine.as_ref());
+    Ok(Box::new(transaction?).into())
+}
+
+/// Start a transaction with a custom committer
+/// NOTE: This consumes the committer handle
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles
+#[no_mangle]
+pub unsafe extern "C" fn transaction_with_committer(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    committer: Handle<MutableCommitter>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    let engine = unsafe { engine.as_ref() };
+    let committer = unsafe { committer.into_inner() };
+    transaction_with_committer_impl(snapshot, engine, committer).into_extern_result(&engine)
+}
+
+fn transaction_with_committer_impl(
+    snapshot: Arc<Snapshot>,
+    extern_engine: &dyn ExternEngine,
+    committer: Box<dyn Committer>,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let engine = extern_engine.engine();
+    let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
 
@@ -406,6 +441,214 @@ mod tests {
             unsafe { free_schema(write_schema) };
             unsafe { free_write_context(write_context) };
             unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "uc-catalog")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)]
+    async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::uc_catalog::{
+            free_uc_commit_client, get_uc_commit_client, get_uc_committer,
+            tests::{cast_test_context, get_test_context, recover_test_context},
+            CommitRequest,
+        };
+        use crate::{Handle, NullableCvoid, OptionalValue};
+
+        #[no_mangle]
+        extern "C" fn test_uc_commit(
+            context: NullableCvoid,
+            request: CommitRequest,
+        ) -> OptionalValue<Handle<crate::ExclusiveRustString>> {
+            let context = cast_test_context(context).unwrap();
+            context.commit_called = true;
+
+            let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
+            let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
+
+            context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+
+            // Capture the staged commit file name if present
+            if let OptionalValue::Some(commit_info) = request.commit_info {
+                let file_name = unsafe { String::try_from_slice(&commit_info.file_name).unwrap() };
+                context.last_staged_filename = Some(file_name);
+            }
+
+            OptionalValue::None
+        }
+
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("string", DataType::STRING),
+        ]));
+
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let partition_columns = vec![];
+
+        for (table_url, _engine, store, _table_name) in setup_test_tables(
+            schema,
+            &partition_columns,
+            Some(&tmp_dir_local_url),
+            "test_uc_table",
+        )
+        .await?
+        {
+            let table_path = table_url.to_file_path().unwrap();
+            let table_path_str = table_path.to_str().unwrap();
+            let engine = get_default_engine(table_path_str);
+
+            let snapshot = unsafe {
+                ok_or_panic(crate::snapshot(
+                    kernel_string_slice!(table_path_str),
+                    engine.shallow_copy(),
+                ))
+            };
+
+            let context = get_test_context(false);
+
+            let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
+            let table_id = "foo";
+            let uc_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    crate::ffi_test_utils::allocate_err,
+                ))
+            };
+
+            let txn = ok_or_panic(unsafe {
+                transaction_with_committer(snapshot, engine.shallow_copy(), uc_committer)
+            });
+            unsafe { set_data_change(txn.shallow_copy(), false) };
+
+            let engine_info = "uc_test_engine";
+            let engine_info_kernel_string = kernel_string_slice!(engine_info);
+            let txn_with_engine_info = unsafe {
+                ok_or_panic(with_engine_info(
+                    txn,
+                    engine_info_kernel_string,
+                    engine.shallow_copy(),
+                ))
+            };
+
+            let write_context = unsafe { get_write_context(txn_with_engine_info.shallow_copy()) };
+
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "number",
+                    Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+                ),
+                (
+                    "string",
+                    Arc::new(StringArray::from(vec!["uc-1", "uc-2", "uc-3"])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+
+            let parquet_schema = unsafe {
+                txn_with_engine_info
+                    .shallow_copy()
+                    .as_ref()
+                    .add_files_schema()
+            };
+            let file_info = write_parquet_file(
+                table_path_str,
+                "uc_test_file.parquet",
+                &batch,
+                parquet_schema.as_ref().try_into_arrow()?,
+            )?;
+
+            let file_info_engine_data = ok_or_panic(unsafe {
+                get_engine_data(
+                    file_info.array,
+                    &file_info.schema,
+                    crate::ffi_test_utils::allocate_err,
+                )
+            });
+
+            unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
+
+            let commit_result = unsafe { commit(txn_with_engine_info, engine.shallow_copy()) };
+
+            // UC committer returns success from our mock callback
+            assert!(commit_result.is_ok(), "Commit should succeed");
+
+            let context = recover_test_context(context).unwrap();
+
+            assert!(
+                context.commit_called,
+                "Commit callback should be called after commit"
+            );
+
+            {
+                // scope so we don't hold mutex across the await lower down
+                let (last_table_id, _) = context.last_commit_request.unwrap();
+                assert_eq!(
+                    last_table_id, "foo",
+                    "Table ID should match the one passed to UCCommitter"
+                );
+            }
+
+            let staged_file_name = {
+                // scope so we don't hold mutex across await
+                assert!(
+                    context.last_staged_filename.is_some(),
+                    "Staged commit file name should be captured"
+                );
+
+                context.last_staged_filename.clone().unwrap()
+            };
+
+            // Read the staged commit
+            let staged_commit_url = table_url
+                .join(&format!("_delta_log/_staged_commits/{}", staged_file_name))
+                .unwrap();
+            let staged_commit = store
+                .get(&Path::from_url_path(staged_commit_url.path()).unwrap())
+                .await?;
+            let staged_content = staged_commit.bytes().await?;
+            let staged_actions: Vec<_> = Deserializer::from_slice(&staged_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            assert!(
+                !staged_actions.is_empty(),
+                "Staged commit should have actions"
+            );
+
+            // Should have commitInfo and add action
+            let has_commit_info = staged_actions.iter().any(|a| a.get("commitInfo").is_some());
+            let has_add = staged_actions.iter().any(|a| a.get("add").is_some());
+
+            assert!(has_commit_info, "Staged commit should contain commitInfo");
+            assert!(has_add, "Staged commit should contain add action");
+
+            let add_action = staged_actions
+                .iter()
+                .find(|a| a.get("add").is_some())
+                .unwrap();
+            assert_eq!(
+                add_action["add"]["path"].as_str().unwrap(),
+                "uc_test_file.parquet",
+                "Add action should reference the correct file"
+            );
+
+            let commit_info = staged_actions
+                .iter()
+                .find(|a| a.get("commitInfo").is_some())
+                .unwrap();
+            assert_eq!(
+                commit_info["commitInfo"]["engineInfo"].as_str().unwrap(),
+                "uc_test_engine",
+                "CommitInfo should contain the engine info"
+            );
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_engine(engine) };
+            unsafe { free_uc_commit_client(uc_client) };
         }
 
         Ok(())

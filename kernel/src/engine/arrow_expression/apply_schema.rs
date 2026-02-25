@@ -10,14 +10,21 @@ use crate::arrow::array::{
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
+use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
 use super::super::arrow_utils::make_arrow_error;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
+use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
 
-// Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
-// names of fields, nullable, and metadata in the struct have been transformed to match those in
-// schema specified by `schema`
+// Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
+// the names of fields, nullable, and metadata in the struct have been transformed to match those
+// in the schema specified by `schema`.
+//
+// Note: If the struct array has top-level nulls, the child columns are expected to already have
+// those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
+// through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
+// buffer since RecordBatch cannot have top-level nulls.
 pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(Error::generic(
@@ -25,14 +32,8 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
-    let (fields, columns, nulls) = applied.into_parts();
-    if let Some(nulls) = nulls {
-        if nulls.null_count() != 0 {
-            return Err(Error::invalid_struct_data(
-                "Top-level nulls in struct are not supported",
-            ));
-        }
-    }
+    let (fields, columns, _nulls) = applied.into_parts();
+
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(fields)),
         columns,
@@ -64,23 +65,37 @@ fn transform_struct(
     struct_array: &StructArray,
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
 ) -> DeltaResult<StructArray> {
-    let (_, arrow_cols, nulls) = struct_array.clone().into_parts();
+    let (input_fields, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
-    let result_iter =
-        arrow_cols
-            .into_iter()
-            .zip(target_fields)
-            .map(|(sa_col, target_field)| -> DeltaResult<_> {
-                let target_field = target_field.borrow();
-                let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
-                let transformed_field = new_field_with_metadata(
-                    &target_field.name,
-                    transformed_col.data_type(),
-                    target_field.nullable,
-                    Some(target_field.metadata_with_string_values()),
-                );
-                Ok((transformed_field, transformed_col))
-            });
+    let result_iter = arrow_cols
+        .into_iter()
+        .zip(input_fields.iter())
+        .zip(target_fields)
+        .map(|((sa_col, input_field), target_field)| -> DeltaResult<_> {
+            let target_field = target_field.borrow();
+            let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
+            let arrow_metadata = kernel_metadata_to_arrow_metadata(target_field)?;
+            // If both the input field and the target field carry a field ID they must agree,
+            // otherwise we would silently overwrite one field ID with another.
+            if let (Some(input_id), Some(target_id)) = (
+                input_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+                arrow_metadata.get(PARQUET_FIELD_ID_META_KEY),
+            ) {
+                if input_id != target_id {
+                    return Err(Error::generic(format!(
+                        "Field '{}': input field ID {} conflicts with target field ID {}",
+                        target_field.name, input_id, target_id
+                    )));
+                }
+            }
+            let transformed_field = new_field_with_metadata(
+                &target_field.name,
+                transformed_col.data_type(),
+                target_field.nullable,
+                Some(arrow_metadata),
+            );
+            Ok((transformed_field, transformed_col))
+        });
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
@@ -191,10 +206,13 @@ mod apply_schema_validation_tests {
     use std::sync::Arc;
 
     use crate::arrow::array::{Int32Array, StructArray};
+    use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_apply_schema_basic_functionality() {
@@ -237,5 +255,161 @@ mod apply_schema_validation_tests {
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
         ])
+    }
+
+    /// Test that apply_schema handles structs with top-level nulls correctly.
+    ///
+    /// This simulates a Delta log scenario where each row is one action type (add, remove, etc.).
+    /// When extracting `add.stats_parsed`, rows where `add` is null (e.g., remove actions) should
+    /// have null child columns. The child columns are expected to already have nulls propagated
+    /// (Arrow's JSON reader does this, and parquet data goes through `fix_nested_null_masks`).
+    #[test]
+    fn test_apply_schema_handles_top_level_nulls() {
+        // Create a struct array with 4 rows where rows 1 and 3 have top-level nulls.
+        // This simulates: [add_action, remove_action, add_action, remove_action]
+        // where remove_action rows have null for the entire struct.
+        let field_a = ArrowField::new("a", ArrowDataType::Int32, true);
+        let field_b = ArrowField::new("b", ArrowDataType::Int32, true);
+        let schema = ArrowSchema::new(vec![field_a, field_b]);
+
+        // Child columns with nulls already propagated (simulating what Arrow readers do).
+        // Rows 1 and 3 are null because the parent struct is null at those positions.
+        let a_data = Int32Array::from(vec![Some(1), None, Some(3), None]);
+        let b_data = Int32Array::from(vec![Some(10), None, Some(30), None]);
+
+        // Top-level struct nulls: rows 0 and 2 are valid, rows 1 and 3 are null
+        let null_buffer = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false]));
+
+        let struct_array = StructArray::try_new(
+            schema.fields.clone(),
+            vec![Arc::new(a_data), Arc::new(b_data)],
+            Some(null_buffer),
+        )
+        .unwrap();
+
+        // Target schema with nullable fields
+        let target_schema = DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, true),
+            StructField::new("b", DataType::INTEGER, true),
+        ])));
+
+        // Apply schema - should successfully convert to RecordBatch
+        let result = apply_schema(&struct_array, &target_schema).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.num_columns(), 2);
+
+        // Verify columns preserve nulls from child arrays
+        let col_a = result.column(0);
+        assert!(col_a.is_valid(0), "Row 0 should be valid");
+        assert!(col_a.is_null(1), "Row 1 should be null");
+        assert!(col_a.is_valid(2), "Row 2 should be valid");
+        assert!(col_a.is_null(3), "Row 3 should be null");
+
+        let col_b = result.column(1);
+        assert!(col_b.is_valid(0), "Row 0 should be valid");
+        assert!(col_b.is_null(1), "Row 1 should be null");
+        assert!(col_b.is_valid(2), "Row 2 should be valid");
+        assert!(col_b.is_null(3), "Row 3 should be null");
+
+        // Verify the actual values for valid rows
+        let col_a = col_a
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("column a should be Int32Array");
+        let col_b = col_b
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("column b should be Int32Array");
+
+        assert_eq!(col_a.value(0), 1);
+        assert_eq!(col_a.value(2), 3);
+        assert_eq!(col_b.value(0), 10);
+        assert_eq!(col_b.value(2), 30);
+    }
+
+    /// Test that apply_schema translates "parquet.field.id" kernel metadata to the Arrow-specific
+    /// "PARQUET:field_id" key. This ensures the same key translation applied during schema
+    /// conversion (`TryFromKernel<&StructField> for ArrowField`) is also applied when
+    /// `apply_schema` is used to map data onto an existing schema (e.g. in the arrow expression
+    /// evaluator).
+    #[test]
+    fn test_apply_schema_transforms_parquet_field_id_metadata() {
+        let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
+        let target_schema =
+            StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)
+                .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])]);
+
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false);
+        let input_array = StructArray::try_new(
+            vec![arrow_field].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        )
+        .unwrap();
+
+        let result = apply_schema_to_struct(&input_array, &target_schema).unwrap();
+
+        let (_, output_field) = result.fields().find("a").unwrap();
+        // "parquet.field.id" must be translated to the Arrow/Parquet native key
+        assert_eq!(
+            output_field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("42"),
+            "parquet.field.id should be translated to PARQUET:field_id"
+        );
+        // The original key must not be present
+        assert!(
+            !output_field.metadata().contains_key(field_id_key),
+            "original parquet.field.id key should not be present after translation"
+        );
+    }
+
+    /// Test that apply_schema succeeds when the input Arrow field already carries the same field
+    /// ID as the target kernel schema field (no conflict).
+    #[test]
+    fn test_apply_schema_matching_field_ids_succeed() {
+        let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
+        let target_schema =
+            StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)
+                .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])]);
+
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())].into());
+        let input_array = StructArray::try_new(
+            vec![arrow_field].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        )
+        .unwrap();
+
+        let result = apply_schema_to_struct(&input_array, &target_schema);
+        assert!(result.is_ok(), "Matching field IDs should succeed");
+    }
+
+    /// Test that apply_schema fails when the input Arrow field already carries a *different* field
+    /// ID than the target kernel schema field.
+    #[test]
+    fn test_apply_schema_conflicting_field_ids_fail() {
+        let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
+        let target_schema =
+            StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)
+                .with_metadata([(field_id_key.to_string(), MetadataValue::Number(42))])]);
+
+        let arrow_field = ArrowField::new("a", ArrowDataType::Int32, false)
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "99".to_string())].into());
+        let input_array = StructArray::try_new(
+            vec![arrow_field].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        )
+        .unwrap();
+
+        assert_result_error_with_message(
+            apply_schema_to_struct(&input_array, &target_schema),
+            "conflicts with",
+        );
     }
 }

@@ -2,16 +2,15 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-use crate::schema::{
-    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+use crate::expressions::{MapData, Scalar, StructData};
+use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::table_features::{
+    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use crate::table_features::{FeatureType, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
@@ -32,7 +31,6 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
-pub(crate) mod crc;
 pub(crate) mod domain_metadata;
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -86,6 +84,8 @@ static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ))
 });
 
+/// Schema for Add actions in the Delta log.
+/// Wraps the Add action schema in a top-level struct with "add" field name.
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,
@@ -93,6 +93,8 @@ static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Schema for Remove actions in the Delta log.
+/// Wraps the Remove action schema in a top-level struct with "remove" field name.
 static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         REMOVE_NAME,
@@ -100,6 +102,8 @@ static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Schema for CommitInfo actions in the Delta log.
+/// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
@@ -107,6 +111,8 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Schema for transaction (txn) actions in the Delta log.
+/// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         SET_TRANSACTION_NAME,
@@ -251,7 +257,7 @@ impl Metadata {
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
-        schema: StructType,
+        schema: SchemaRef,
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
@@ -321,13 +327,17 @@ impl Metadata {
     }
 
     #[internal_api]
+    pub(crate) fn schema_string(&self) -> &String {
+        &self.schema_string
+    }
+
+    #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
 
     #[internal_api]
-    #[allow(dead_code)]
-    pub(crate) fn partition_columns(&self) -> &Vec<String> {
+    pub(crate) fn partition_columns(&self) -> &[String] {
         &self.partition_columns
     }
 
@@ -338,9 +348,34 @@ impl Metadata {
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_unchecked(
+        id: impl Into<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format: Format,
+        schema_string: impl Into<String>,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name,
+            description,
+            format,
+            schema_string: schema_string.into(),
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
 }
 
-// TODO: derive IntoEngineData instead (see issue #1083)
+// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
+// and create_one expects flattened values for nested schemas.
 impl IntoEngineData for Metadata {
     fn into_engine_data(
         self,
@@ -364,7 +399,9 @@ impl IntoEngineData for Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[derive(
+    Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -386,42 +423,155 @@ pub(crate) struct Protocol {
     writer_features: Option<Vec<TableFeature>>,
 }
 
-fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
-where
-    T: FromStr,
-    T::Err: Debug,
-{
-    features
-        .map(|fs| {
-            fs.into_iter()
-                .map(|f| T::from_str(&f.to_string()))
-                .collect()
-        })
-        .transpose()
-        .ok()?
+/// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
+/// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
+fn parse_features(
+    features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+) -> Option<Vec<TableFeature>> {
+    let features = features?.into_iter().map(|f| f.into_table_feature());
+    Some(features.collect())
 }
 
 impl Protocol {
-    /// Try to create a new Protocol instance from reader/writer versions and table features. This
-    /// can fail if the protocol is invalid.
+    /// Try to create a new modern Protocol instance with the given table feature lists
+    pub(crate) fn try_new_modern(
+        reader_features: impl IntoIterator<Item = impl IntoTableFeature>,
+        writer_features: impl IntoIterator<Item = impl IntoTableFeature>,
+    ) -> DeltaResult<Self> {
+        Self::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features),
+            Some(writer_features),
+        )
+    }
+
+    /// Try to create a new legacy Protocol instance with the given reader/writer versions
+    #[cfg(test)]
+    pub(crate) fn try_new_legacy(
+        min_reader_version: i32,
+        min_writer_version: i32,
+    ) -> DeltaResult<Self> {
+        Self::try_new(
+            min_reader_version,
+            min_writer_version,
+            TableFeature::NO_LIST,
+            TableFeature::NO_LIST,
+        )
+    }
+
+    /// Try to create a new Protocol instance from reader/writer versions and table features.
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl ToString>>,
-        writer_features: Option<impl IntoIterator<Item = impl ToString>>,
+        reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+        writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
     ) -> DeltaResult<Self> {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
-        let protocol = Protocol {
+        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
+        if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
+            require!(
+                reader_features.is_some(),
+                Error::invalid_protocol(
+                    "Reader features must be present when minimum reader version = 3"
+                )
+            );
+        } else {
+            require!(
+                reader_features.is_none(),
+                Error::invalid_protocol(
+                    "Reader features must not be present when minimum reader version != 3"
+                )
+            );
+        }
+
+        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
+        if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
+            require!(
+                writer_features.is_some(),
+                Error::invalid_protocol(
+                    "Writer features must be present when minimum writer version = 7"
+                )
+            );
+        } else {
+            require!(
+                writer_features.is_none(),
+                Error::invalid_protocol(
+                    "Writer features must not be present when minimum writer version != 7"
+                )
+            );
+        }
+
+        // Self- and cross-validate the reader and writer feature lists.
+        match (&reader_features, &writer_features) {
+            (Some(reader_features), Some(writer_features)) => {
+                // Check all reader features are ReaderWriter and present in writer features.
+                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
+                let check_r = reader_features.iter().all(|feature| {
+                    matches!(
+                        feature.feature_type(),
+                        FeatureType::ReaderWriter | FeatureType::Unknown
+                    ) && writer_features.contains(feature)
+                });
+                require!(
+                    check_r,
+                    Error::invalid_protocol(
+                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
+                    )
+                );
+
+                // Check all writer features that are ReaderWriter must also be in reader features
+                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                let check_w = writer_features
+                    .iter()
+                    .all(|feature| match feature.feature_type() {
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => reader_features.contains(feature),
+                    });
+                require!(
+                    check_w,
+                    Error::invalid_protocol(
+                        "Writer features must be Writer-only or also listed in reader features"
+                    )
+                );
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(writer_features)) => {
+                // Special case: reader version 2 implies ColumnMapping support.
+                // All other ReaderWriter features require explicit reader_features list (reader version 3).
+                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                let is_valid = writer_features.iter().all(|feature| {
+                    match feature.feature_type() {
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => {
+                            // ColumnMapping is allowed when reader version is 2 (implied support)
+                            min_reader_version == 2 && feature == &TableFeature::ColumnMapping
+                        }
+                    }
+                });
+
+                require!(
+                    is_valid,
+                    Error::invalid_protocol(
+                        "Writer features must be Writer-only or also listed in reader features"
+                    )
+                );
+                Ok(())
+            }
+            (Some(_), None) => Err(Error::invalid_protocol(
+                "Reader features should be present in writer features",
+            )),
+        }?;
+
+        Ok(Protocol {
             min_reader_version,
             min_writer_version,
             reader_features,
             writer_features,
-        };
-        protocol.validate_table_features()?;
-
-        Ok(protocol)
+        })
     }
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
@@ -463,151 +613,23 @@ impl Protocol {
             .is_some_and(|features| features.contains(feature))
     }
 
-    /// Validates the relationship between reader features and writer features in the protocol.
-    pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
-        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
-        if self.min_reader_version == 3 {
-            require!(
-                self.reader_features.is_some(),
-                Error::invalid_protocol(
-                    "Reader features must be present when minimum reader version = 3"
-                )
-            );
-        } else {
-            require!(
-                self.reader_features.is_none(),
-                Error::invalid_protocol(
-                    "Reader features must not be present when minimum reader version != 3"
-                )
-            );
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<Vec<TableFeature>>,
+        writer_features: Option<Vec<TableFeature>>,
+    ) -> Self {
+        Self {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
         }
-
-        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
-        if self.min_writer_version == 7 {
-            require!(
-                self.writer_features.is_some(),
-                Error::invalid_protocol(
-                    "Writer features must be present when minimum writer version = 7"
-                )
-            );
-        } else {
-            require!(
-                self.writer_features.is_none(),
-                Error::invalid_protocol(
-                    "Writer features must not be present when minimum writer version != 7"
-                )
-            );
-        }
-
-        match (&self.reader_features, &self.writer_features) {
-            (Some(reader_features), Some(writer_features)) => {
-                // Check all reader features are ReaderWriter and present in writer features.
-                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
-                let check_r = reader_features.iter().all(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::ReaderWriter | FeatureType::Unknown
-                    ) && writer_features.contains(feature)
-                });
-                require!(
-                    check_r,
-                    Error::invalid_protocol(
-                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
-                    )
-                );
-
-                // Check all writer features that are ReaderWriter must also be in reader features
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
-                let check_w = writer_features
-                    .iter()
-                    .all(|feature| match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => reader_features.contains(feature),
-                    });
-                require!(
-                    check_w,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            (None, Some(writer_features)) => {
-                // Special case: reader version 2 implies ColumnMapping support.
-                // All other ReaderWriter features require explicit reader_features list (reader version 3).
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
-                let is_valid = writer_features.iter().all(|feature| {
-                    match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => {
-                            // ColumnMapping is allowed when reader version is 2 (implied support)
-                            self.min_reader_version == 2 && feature == &TableFeature::ColumnMapping
-                        }
-                    }
-                });
-
-                require!(
-                    is_valid,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
-                Ok(())
-            }
-            (Some(_), None) => Err(Error::invalid_protocol(
-                "Reader features should be present in writer features",
-            )),
-        }
-    }
-
-    #[cfg(feature = "catalog-managed")]
-    pub(crate) fn is_catalog_managed(&self) -> bool {
-        self.has_table_feature(&TableFeature::CatalogManaged)
-            || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
 }
 
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for Protocol {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        fn features_to_scalar<T>(
-            features: Option<impl IntoIterator<Item = T>>,
-        ) -> DeltaResult<Scalar>
-        where
-            T: Into<Scalar>,
-        {
-            match features {
-                Some(features) => {
-                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
-                    Ok(Scalar::Array(ArrayData::try_new(
-                        ArrayType::new(DataType::STRING, false),
-                        features,
-                    )?))
-                }
-                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-                    DataType::STRING,
-                    false,
-                ))))),
-            }
-        }
-
-        let values = [
-            self.min_reader_version.into(),
-            self.min_writer_version.into(),
-            features_to_scalar(self.reader_features)?,
-            features_to_scalar(self.writer_features)?,
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -630,6 +652,8 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
+    /// Whether this commit is a blind append.
+    pub(crate) is_blind_append: Option<bool>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
@@ -642,37 +666,18 @@ impl CommitInfo {
         in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
+        is_blind_append: bool,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
             in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
-            operation_parameters: None,
+            operation_parameters: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
-    }
-}
-
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for CommitInfo {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
-            self.timestamp.into(),
-            self.in_commit_timestamp.into(),
-            self.operation.into(),
-            self.operation_parameters.unwrap_or_default().try_into()?,
-            self.kernel_version.into(),
-            self.engine_info.into(),
-            self.txn_id.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -997,7 +1002,7 @@ mod tests {
         },
         engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
-        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
 
@@ -1245,6 +1250,7 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
+                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
             ]),
@@ -1315,41 +1321,42 @@ mod tests {
         let invalid_features = [
             // ReaderWriter feature not present in writer features
             (
-                Some(vec![TableFeature::DeletionVectors]),
-                Some(vec![TableFeature::AppendOnly]),
+                vec![TableFeature::DeletionVectors],
+                vec![TableFeature::AppendOnly],
                 "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
-            (Some(vec![TableFeature::DeletionVectors]), Some(vec![]), "Reader features must contain only ReaderWriter features that are also listed in writer features"),
-            // ReaderWriter feature not present in reader features
-            (Some(vec![]), Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
             (
-                Some(vec![TableFeature::VariantType]),
-                Some(vec![
-                    TableFeature::VariantType,
-                    TableFeature::DeletionVectors,
-                ]),
+                vec![TableFeature::DeletionVectors],
+                vec![],
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+            // ReaderWriter feature not present in reader features
+            (
+                vec![],
+                vec![TableFeature::DeletionVectors],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
-            // Writer only feature present in reader features
             (
-                Some(vec![TableFeature::AppendOnly]),
-                Some(vec![TableFeature::AppendOnly]),
+                vec![TableFeature::VariantType],
+                vec![
+                    TableFeature::VariantType,
+                    TableFeature::DeletionVectors,
+                ],
+                "Writer features must be Writer-only or also listed in reader features",
+            ),
+            // WriterOnly feature present in reader features
+            (
+                vec![TableFeature::AppendOnly],
+                vec![TableFeature::AppendOnly],
                 "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
         ];
 
         for (reader_features, writer_features, error_msg) in invalid_features {
-            let protocol = Protocol {
-                min_reader_version: 3,
-                min_writer_version: 7,
-                reader_features,
-                writer_features,
-            };
-
-            let res = protocol.validate_table_features();
+            let res = Protocol::try_new_modern(reader_features, writer_features);
             assert!(
                 matches!(
-                    protocol.validate_table_features(),
+                    &res,
                     Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
                 ),
                 "Expected:\t{error_msg}\nBut got:{res:?}\n"
@@ -1363,22 +1370,18 @@ mod tests {
         // but will be rejected when trying to use the protocol (ensure_operation_supported)
 
         // Test unknown features in reader - validation passes
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
-            writer_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new_modern(
+            vec![TableFeature::Unknown("unknown_reader".to_string())],
+            vec![TableFeature::Unknown("unknown_reader".to_string())],
+        );
+        assert!(protocol.is_ok());
 
         // Test unknown features in writer - validation passes
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![]),
-            writer_features: Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::Unknown("unknown_writer".to_string())],
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
@@ -1386,37 +1389,30 @@ mod tests {
         // (reader_feature, writer_feature)
         let valid_features = [
             // ReaderWriter feature present in both reader/writer features,
-            // Writer only feature present in writer feature
+            // WriterOnly feature present in writer feature
             (
-                Some(vec![TableFeature::DeletionVectors]),
-                Some(vec![TableFeature::DeletionVectors]),
+                vec![TableFeature::DeletionVectors],
+                vec![TableFeature::DeletionVectors],
             ),
-            (Some(vec![]), Some(vec![TableFeature::AppendOnly])),
+            (vec![], vec![TableFeature::AppendOnly]),
             (
-                Some(vec![TableFeature::VariantType]),
-                Some(vec![TableFeature::VariantType, TableFeature::AppendOnly]),
+                vec![TableFeature::VariantType],
+                vec![TableFeature::VariantType, TableFeature::AppendOnly],
             ),
-            // Unknown feature may be ReaderWriter or Writer only (for forward compatibility)
+            // Unknown feature may be ReaderWriter or WriterOnly (for forward compatibility)
             (
-                Some(vec![TableFeature::Unknown("rw".to_string())]),
-                Some(vec![
+                vec![TableFeature::Unknown("rw".to_string())],
+                vec![
                     TableFeature::Unknown("rw".to_string()),
                     TableFeature::Unknown("w".to_string()),
-                ]),
+                ],
             ),
             // Empty feature set is valid
-            (Some(vec![]), Some(vec![])),
+            (vec![], vec![]),
         ];
 
         for (reader_features, writer_features) in valid_features {
-            let protocol = Protocol {
-                min_reader_version: 3,
-                min_writer_version: 7,
-                reader_features,
-                writer_features,
-            };
-
-            assert!(matches!(protocol.validate_table_features(), Ok(()),));
+            assert!(Protocol::try_new_modern(reader_features, writer_features).is_ok());
         }
     }
 
@@ -1425,81 +1421,77 @@ mod tests {
         // Valid: ColumnMapping with reader v2
         // Reader version 2 implies columnMapping support (no explicit reader_features)
         // Writer version 7 requires explicit writer_features list
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::ColumnMapping]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
     fn test_validate_legacy_writer_only_features_valid() {
         // Valid: Writer-only features with reader v1
-        let protocol = Protocol {
-            min_reader_version: 1,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::AppendOnly]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::AppendOnly]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
     fn test_validate_legacy_column_mapping_with_writer_features_valid() {
         // Valid: Mix of Writer-only and ColumnMapping with reader v2
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
-        };
-        assert!(protocol.validate_table_features().is_ok());
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_ok());
     }
 
     #[test]
     fn test_validate_column_mapping_reader_v1_invalid() {
         // Invalid: ColumnMapping with reader v1
         // Reader v1 doesn't imply any ReaderWriter features
-        let protocol = Protocol {
-            min_reader_version: 1,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![TableFeature::ColumnMapping]),
-        };
-        assert!(protocol.validate_table_features().is_err());
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_err());
     }
 
     #[test]
     fn test_validate_multiple_readerwriter_features_reader_v2_invalid() {
         // Invalid: Multiple ReaderWriter features with reader v2
         // Only ColumnMapping alone is allowed with reader v2
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: Some(vec![
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![
                 TableFeature::ColumnMapping,
                 TableFeature::DeletionVectors,
             ]),
-        };
-        assert!(protocol.validate_table_features().is_err());
+        );
+        assert!(protocol.is_err());
     }
 
     #[test]
     fn test_parse_table_feature_never_fails() {
-        // parse a non-str
-        let features = Some([5]);
-        let expected = Some(vec![TableFeature::unknown("5")]);
-        assert_eq!(parse_features::<TableFeature>(features), expected);
         // weird strs
         let features = Some(["", "absurD_)(+13%^⚙️"]);
-        let expected = Some(vec![
+        let expected = Some(FromIterator::from_iter([
             TableFeature::unknown(""),
             TableFeature::unknown("absurD_)(+13%^⚙️"),
-        ]);
-        assert_eq!(parse_features::<TableFeature>(features), expected);
+        ]));
+        assert_eq!(parse_features(features), expected);
     }
 
     #[test]
@@ -1539,7 +1531,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None, false);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1557,6 +1549,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
             ],
@@ -1595,7 +1588,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1620,7 +1616,10 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1630,7 +1629,10 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1717,7 +1719,10 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1765,7 +1770,10 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "id",
+            DataType::INTEGER,
+        )]));
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),
@@ -1814,11 +1822,9 @@ mod tests {
     #[test]
     fn test_protocol_into_engine_data() {
         let engine = ExprEngine::new();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
 
@@ -1920,9 +1926,8 @@ mod tests {
     #[test]
     fn test_protocol_into_engine_data_empty_features() {
         let engine = ExprEngine::new();
-        let empty_features: Vec<String> = vec![];
         let protocol =
-            Protocol::try_new(3, 7, Some(empty_features.clone()), Some(empty_features)).unwrap();
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
         let engine_data = protocol
             .into_engine_data(Protocol::to_schema().into(), &engine)
@@ -1952,7 +1957,7 @@ mod tests {
     #[test]
     fn test_protocol_into_engine_data_no_features() {
         let engine = ExprEngine::new();
-        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
 
         let engine_data = protocol
             .into_engine_data(Protocol::to_schema().into(), &engine)

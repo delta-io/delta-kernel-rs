@@ -5,7 +5,9 @@ use crate::utils::test_utils::string_array_to_engine_data;
 use itertools::Itertools;
 use std::sync::Arc;
 
+use crate::actions::get_log_add_schema;
 use crate::log_replay::ActionsBatch;
+use crate::log_segment::CheckpointReadInfo;
 use crate::{
     actions::get_commit_schema,
     engine::{
@@ -28,13 +30,24 @@ pub(crate) fn sidecar_batch_with_given_paths(
     paths: Vec<&str>,
     output_schema: SchemaRef,
 ) -> Box<ArrowEngineData> {
+    // Use default size of 9268 for backward compatibility
+    let paths_with_sizes: Vec<_> = paths.into_iter().map(|p| (p, 9268u64)).collect();
+    sidecar_batch_with_given_paths_and_sizes(paths_with_sizes, output_schema)
+}
+
+// Generates a batch of sidecar actions with the given paths and sizes.
+// The schema is provided as null columns affect equality checks.
+pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
+    paths_and_sizes: Vec<(&str, u64)>,
+    output_schema: SchemaRef,
+) -> Box<ArrowEngineData> {
     let handler = SyncJsonHandler {};
 
-    let mut json_strings: Vec<String> = paths
+    let mut json_strings: Vec<String> = paths_and_sizes
         .iter()
-        .map(|path| {
+        .map(|(path, size)| {
             format!(
-                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
+                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":{size},"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
             )
         })
         .collect();
@@ -135,13 +148,21 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         physical_predicate: PhysicalPredicate::None,
         transform_spec,
         column_mapping_mode: ColumnMappingMode::None,
+        physical_stats_schema: None,
+        logical_stats_schema: None,
     });
+    let checkpoint_info = CheckpointReadInfo {
+        has_stats_parsed: false,
+        checkpoint_read_schema: get_log_add_schema().clone(),
+    };
     let iter = scan_action_iter(
         &SyncEngine::new(),
         batch
             .into_iter()
             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
         state_info,
+        checkpoint_info,
+        false,
     )
     .unwrap();
     let mut batch_count = 0;

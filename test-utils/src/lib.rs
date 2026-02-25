@@ -1,28 +1,41 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
+    StringArray, StructArray,
 };
-
+use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
-use serde_json::{json, to_vec};
+use serde_json::{json, to_vec, Deserializer};
+use std::sync::Mutex;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
 
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
@@ -238,7 +251,74 @@ pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngine::new(store)))
+    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+}
+
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine_mt_executor(
+    table_root: &url::Url,
+) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
+    let store = store_from_url(table_root)?;
+    let task_executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    Ok(Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_task_executor(task_executor)
+            .build(),
+    ))
+}
+
+/// Test setup helper that creates a temporary directory and a `DefaultEngine` backed by
+/// [`TokioBackgroundExecutor`].
+///
+/// Returns `(temp_dir, table_path, engine)` for use in integration tests.
+/// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
+///
+/// # Example
+///
+/// ```ignore
+/// let (_temp_dir, table_path, engine) = test_table_setup()?;
+/// ```
+pub fn test_table_setup() -> DeltaResult<(
+    tempfile::TempDir,
+    String,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+)> {
+    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let table_path = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let table_url = url::Url::from_directory_path(&table_path)
+        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+    let engine = create_default_engine(&table_url)?;
+    Ok((temp_dir, table_path, engine))
+}
+
+/// Test setup helper that creates a temporary directory and a `DefaultEngine` backed by
+/// [`TokioMultiThreadExecutor`].
+///
+/// Returns `(temp_dir, table_path, engine)` for use in integration tests.
+/// The `temp_dir` must be kept alive for the duration of the test to prevent cleanup.
+pub fn test_table_setup_mt() -> DeltaResult<(
+    tempfile::TempDir,
+    String,
+    Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+)> {
+    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let table_path = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .to_string();
+    let table_url = url::Url::from_directory_path(&table_path)
+        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+    let engine = create_default_engine_mt_executor(&table_url)?;
+    Ok((temp_dir, table_path, engine))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -260,7 +340,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let engine = DefaultEngine::new(Arc::clone(&storage));
+    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
 
     (storage, engine, url)
 }
@@ -390,9 +470,9 @@ pub async fn create_table(
     Ok(table_path)
 }
 
-/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.
-/// the tables will be named {table_base_name}_11 and table_base_name}_37. The local_directory param
-/// can be set to write out the tables to the local filesystem, passing in None will create in-memory tables
+/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.  the tables will
+/// be named {table_base_name}_11 and {table_base_name}_37. The local_directory param can be set to
+/// write out the tables to the local filesystem, passing in None will create in-memory tables
 pub async fn setup_test_tables(
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -475,6 +555,39 @@ pub fn test_read(
     Ok(())
 }
 
+/// Insert column arrays into an existing table in a single commit.
+///
+/// Takes a snapshot and column arrays, constructs a [`RecordBatch`] from the snapshot schema,
+/// opens a transaction, writes the batch as a parquet file, and commits.
+/// Useful for quickly seeding test tables without writing the transaction boilerplate each time.
+///
+/// # Example
+///
+/// ```ignore
+/// let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+/// insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![1]))]).await?;
+/// ```
+pub async fn insert_data<E: TaskExecutor>(
+    snapshot: Arc<Snapshot>,
+    engine: &Arc<DefaultEngine<E>>,
+    columns: Vec<ArrayRef>,
+) -> DeltaResult<CommitResult> {
+    let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+
+    let write_context = txn.get_write_context();
+    let add_files_metadata = engine
+        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+        .await?;
+    txn.add_files(add_files_metadata);
+
+    txn.commit(engine.as_ref())
+}
+
 // Helper function to set json values in a serde_json Values
 pub fn set_json_value(
     value: &mut serde_json::Value,
@@ -490,6 +603,125 @@ pub fn set_json_value(
     Ok(())
 }
 
+/// Returns a nested schema with 6 top-level fields including a nested struct:
+/// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag: string, value: int]`
+pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::not_null("row_number", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("score", DataType::DOUBLE),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![
+                StructField::not_null("street", DataType::STRING),
+                StructField::nullable("city", DataType::STRING),
+            ])?,
+        ),
+        StructField::nullable("tag", DataType::STRING),
+        StructField::nullable("value", DataType::INTEGER),
+    ])?))
+}
+
+/// Returns two [`RecordBatch`]es with hardcoded test data matching [`nested_schema`].
+///
+/// Batch 1: rows 1..3, names alice/bob/charlie, streets st1..st3
+/// Batch 2: rows 4..6, names dave/eve/frank, streets st4..st6
+pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let schema = nested_schema()?;
+    let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(schema.as_ref())?;
+    let address_fields = match arrow_schema.field_with_name("address").unwrap().data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        _ => panic!("expected struct"),
+    };
+
+    let build = |ids: Vec<i64>,
+                 names: Vec<&str>,
+                 scores: Vec<f64>,
+                 streets: Vec<&str>,
+                 cities: Vec<Option<&str>>,
+                 tags: Vec<Option<&str>>,
+                 values: Vec<Option<i32>>|
+     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let address_array = StructArray::new(
+            address_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(streets)) as ArrayRef,
+                Arc::new(StringArray::from(cities)) as ArrayRef,
+            ],
+            None,
+        );
+        Ok(RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(Float64Array::from(scores)) as ArrayRef,
+                Arc::new(address_array) as ArrayRef,
+                Arc::new(StringArray::from(tags)) as ArrayRef,
+                Arc::new(Int32Array::from(values)) as ArrayRef,
+            ],
+        )?)
+    };
+
+    Ok(vec![
+        build(
+            vec![1, 2, 3],
+            vec!["alice", "bob", "charlie"],
+            vec![1.0, 2.0, 3.0],
+            vec!["st1", "st2", "st3"],
+            vec![Some("c1"), None, Some("c3")],
+            vec![Some("t1"), Some("t2"), None],
+            vec![Some(10), Some(20), None],
+        )?,
+        build(
+            vec![4, 5, 6],
+            vec!["dave", "eve", "frank"],
+            vec![4.0, 5.0, 6.0],
+            vec!["st4", "st5", "st6"],
+            vec![Some("c4"), Some("c5"), Some("c6")],
+            vec![None, Some("t5"), Some("t6")],
+            vec![Some(40), None, Some(60)],
+        )?,
+    ])
+}
+
+/// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
+/// segment is missing or a non-terminal segment is not a struct type.
+pub fn resolve_field<'a>(
+    schema: &'a delta_kernel::schema::StructType,
+    path: &[impl AsRef<str>],
+) -> Result<&'a delta_kernel::schema::StructField, String> {
+    let path_str: Vec<&str> = path.iter().map(|s| s.as_ref()).collect();
+    let display = path_str.join(".");
+    let (last, rest) = path.split_last().ok_or_else(|| "empty path".to_string())?;
+    let mut current = schema;
+    for name in rest {
+        let field = current
+            .field(name.as_ref())
+            .ok_or_else(|| format!("schema missing field '{display}'"))?;
+        current = match field.data_type() {
+            delta_kernel::schema::DataType::Struct(s) => s,
+            _ => return Err(format!("expected struct at '{display}'")),
+        };
+    }
+    current
+        .field(last.as_ref())
+        .ok_or_else(|| format!("schema missing field '{display}'"))
+}
+
+/// Asserts that a field exists at the given path in a [`StructType`] schema,
+/// traversing into nested structs as needed.
+///
+/// # Example
+///
+/// ```ignore
+/// // Given schema: { address: { street: string, city: string } }
+/// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
+/// ```
+pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
+    resolve_field(schema, path).unwrap();
+}
+
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
     match res {
         Ok(_) => panic!("Expected error, but got Ok result"),
@@ -501,4 +733,318 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
             );
         }
     }
+}
+
+/// Creates add file metadata for one or more files without partition values.
+/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+pub fn create_add_files_metadata(
+    add_files_schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+    let num_files = files.len();
+
+    // Build arrays for each file
+    let path_array = StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
+    let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
+    let num_records_array =
+        Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+
+    // Create empty map for partitionValues (repeated for each file)
+    let entries_field = Arc::new(Field::new(
+        "key_value",
+        ArrowDataType::Struct(
+            vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let empty_keys = StringArray::from(Vec::<&str>::new());
+    let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+    let empty_entries = StructArray::from(vec![
+        (
+            Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+            Arc::new(empty_keys) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            Arc::new(empty_values) as ArrayRef,
+        ),
+    ]);
+    let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+    let partition_values_array = Arc::new(MapArray::new(
+        entries_field,
+        offsets,
+        empty_entries,
+        None,
+        false,
+    ));
+
+    // Build stats struct with all fields: numRecords, nullCount, minValues, maxValues, tightBounds
+    // nullCount, minValues, maxValues are empty structs (structure depends on data schema)
+    let empty_struct_fields: delta_kernel::arrow::datatypes::Fields =
+        Vec::<Arc<Field>>::new().into();
+    let empty_struct = StructArray::new_empty_fields(num_files, None);
+    let tight_bounds_array = BooleanArray::from(vec![true; num_files]);
+
+    let stats_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            Arc::new(num_records_array) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "nullCount",
+                ArrowDataType::Struct(empty_struct_fields.clone()),
+                true,
+            )),
+            Arc::new(empty_struct.clone()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "minValues",
+                ArrowDataType::Struct(empty_struct_fields.clone()),
+                true,
+            )),
+            Arc::new(empty_struct.clone()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                "maxValues",
+                ArrowDataType::Struct(empty_struct_fields),
+                true,
+            )),
+            Arc::new(empty_struct) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("tightBounds", ArrowDataType::Boolean, true)),
+            Arc::new(tight_bounds_array) as ArrayRef,
+        ),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        vec![
+            Arc::new(path_array) as ArrayRef,
+            partition_values_array as ArrayRef,
+            Arc::new(size_array) as ArrayRef,
+            Arc::new(mod_time_array) as ArrayRef,
+            Arc::new(stats_struct) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Box::new(ArrowEngineData::new(batch)))
+}
+
+/// Writes a [`RecordBatch`] to a table, commits the transaction, and returns the post-commit
+/// snapshot.
+pub async fn write_batch_to_table(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    data: RecordBatch,
+    partition_values: std::collections::HashMap<String, String>,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            &write_context,
+            partition_values,
+        )
+        .await?;
+    txn.add_files(add_meta);
+    match txn.commit(engine)? {
+        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+            .post_commit_snapshot()
+            .expect("Failed to get post_commit_snapshot")
+            .clone()),
+        _ => panic!("Write commit should succeed"),
+    }
+}
+
+/// An add info extracted from the log segment.
+pub struct AddInfo {
+    pub path: String,
+    pub stats: Option<serde_json::Value>,
+}
+
+/// Reads all [`AddInfo`]s from a snapshot's log segment.
+///
+/// # Example (conceptual)
+///
+/// Given a delta log entry like:
+/// ```json
+/// {"add": {"path": "part-00000.parquet", "stats": "{\"numRecords\":10}"}}
+/// ```
+/// This function would return:
+/// ```text
+/// vec![AddInfo { path: "part-00000.parquet", stats: Some({"numRecords": 10}) }]
+/// ```
+pub fn read_add_infos(
+    snapshot: &Snapshot,
+    engine: &impl Engine,
+) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
+    let schema = get_log_add_schema().clone();
+    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
+    let mut actions = Vec::new();
+    for batch_result in batches {
+        let actions_batch = batch_result?;
+        let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
+        let record_batch = engine_data.record_batch();
+        let add_struct = match record_batch.schema().index_of("add").ok().and_then(|idx| {
+            record_batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StructArray>()
+        }) {
+            Some(s) => s,
+            None => continue,
+        };
+        let path_arr = add_struct
+            .column_by_name("path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let stats_arr = add_struct
+            .column_by_name("stats")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let len = add_struct.len();
+        for i in 0..len {
+            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
+                let stats = stats_arr
+                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                    .map(serde_json::from_str)
+                    .transpose()?;
+                actions.push(AddInfo {
+                    path: path.to_string(),
+                    stats,
+                });
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// Helper to create a table with the given properties, then load and return its snapshot.
+pub fn create_table_and_load_snapshot(
+    table_path: &str,
+    schema: SchemaRef,
+    engine: &dyn Engine,
+    properties: &[(&str, &str)],
+) -> DeltaResult<Arc<Snapshot>> {
+    use delta_kernel::committer::FileSystemCommitter;
+    use delta_kernel::transaction::create_table::create_table;
+
+    let _ = create_table(table_path, schema, "Test/1.0")
+        .with_table_properties(properties.to_vec())
+        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .commit(engine)?;
+
+    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    Snapshot::builder_for(table_url).build(engine)
+}
+
+// Writer that captures log output into a shared buffer for test assertions
+pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+// Test helper that sets up tracing to capture log output
+// The guard keeps the tracing subscriber active for the lifetime of the struct
+pub struct LoggingTest {
+    logs: Arc<Mutex<Vec<u8>>>,
+    _guard: DefaultGuard,
+}
+
+impl Default for LoggingTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoggingTest {
+    pub fn new() -> Self {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs_clone = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || LogWriter(logs_clone.clone()))
+                    .with_ansi(false),
+            ),
+        );
+        Self { logs, _guard }
+    }
+
+    pub fn logs(&self) -> String {
+        String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// Reads a commit log file and returns all actions of the given type (e.g. "add" or "remove").
+pub fn read_actions_from_commit(
+    table_url: &Url,
+    version: u64,
+    action_type: &str,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let table_path = table_url.to_file_path().expect("should be a file URL");
+    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let content = std::fs::read_to_string(commit_path)?;
+    let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+    Ok(parsed
+        .into_iter()
+        .filter_map(|v| v.get(action_type).cloned())
+        .collect())
+}
+
+/// Removes all scan files from the snapshot, commits the transaction, and returns
+/// the parsed remove actions from the resulting commit log.
+pub fn remove_all_and_get_remove_actions(
+    snapshot: &Arc<Snapshot>,
+    table_url: &Url,
+    engine: &impl Engine,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let scan = snapshot.clone().scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("DefaultEngine")
+        .with_data_change(true);
+    for sm in all_scan_metadata {
+        txn.remove_files(sm.scan_files);
+    }
+    let committed = match txn.commit(engine)? {
+        CommitResult::CommittedTransaction(c) => c,
+        _ => panic!("Transaction should be committed"),
+    };
+    read_actions_from_commit(table_url, committed.commit_version(), "remove")
+}
+
+/// Asserts that `action["partitionValues"]` contains the given key with the expected value.
+pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_value: &str) {
+    let pv = action["partitionValues"]
+        .as_object()
+        .expect("action should have partitionValues");
+    assert!(
+        pv.contains_key(key),
+        "partitionValues should contain key '{key}', got: {pv:?}"
+    );
+    assert_eq!(pv[key], expected_value);
 }

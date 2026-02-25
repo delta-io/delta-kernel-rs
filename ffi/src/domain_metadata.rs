@@ -93,7 +93,7 @@ mod tests {
         recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
-    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::DeltaResult;
     use object_store::memory::InMemory;
     use serde_json::json;
@@ -106,7 +106,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
 
-        let engine = DefaultEngine::new(storage.clone());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 

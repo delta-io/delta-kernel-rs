@@ -24,10 +24,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install cargo-msrv
-        shell: bash
-        run: |
-          cargo install cargo-msrv --locked
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-msrv
       - name: verify-msrv
         run: |
           cargo msrv --path kernel/ verify --all-features
@@ -41,23 +41,22 @@ jobs:
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-msrv
-        shell: bash
-        run: |
-          cargo install cargo-msrv --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-msrv
+      - uses: taiki-e/install-action@nextest
       - name: Get rust-version from Cargo.toml
         id: rust-version
         run: echo "RUST_VERSION=$(cargo msrv show --path kernel/ --output-format minimal)" >> $GITHUB_ENV
       - name: Install specified rust version
-        uses: actions-rs/toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          profile: minimal
       - name: run tests
         run: |
           pushd kernel
           echo "Testing with $(cargo msrv show --output-format minimal)"
-          cargo +$(cargo msrv show --output-format minimal) test
+          cargo +$(cargo msrv show --output-format minimal) nextest run
   docs:
     runs-on: ubuntu-latest
     env:
@@ -66,6 +65,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
       - name: build docs
         run: cargo doc --workspace --all-features
 
@@ -105,6 +105,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
@@ -127,8 +128,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: test
-        run: cargo test --workspace --verbose --all-features -- --skip read_table_version_hdfs
+        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs)'
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -143,7 +146,7 @@ jobs:
         uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: '3.30.x'
-      - name: Install arrow-glib
+      - name: Install arrow-glib-linux
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
               sudo apt update
@@ -156,19 +159,14 @@ jobs:
               sudo apt install -y -V libarrow-dev # For C++
               sudo apt install -y -V libarrow-glib-dev # For GLib (C)
               sudo apt install -y -V valgrind # For memory leak test
-          elif [ "$RUNNER_OS" == "macOS" ]; then
-              brew install apache-arrow
-              brew install apache-arrow-glib
-          else
-              echo "$RUNNER_OS not supported"
-              exit 1
            fi
-      - name: Install minimal stable with clippy and rustfmt
-        uses: actions-rs/toolchain@v1
+      - name: Install arrow-glib-macOS
+        if: runner.os == 'macOS'
+        uses: tecolicom/actions-use-homebrew-tools@v1
         with:
-          profile: default
-          toolchain: stable
-          override: true
+          tools: 'apache-arrow apache-arrow-glib'
+      - name: Install minimal stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
@@ -178,7 +176,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine-rustls,test-ffi,tracing
+          cargo b --features default-engine-rustls,test-ffi,tracing,uc-catalog
           popd
       - name: build and run read-table test
         run: |
@@ -196,7 +194,14 @@ jobs:
           cmake ..
           make
           make test
-
+      - name: build and run uc-catalog-ffi test
+        run: |
+          pushd ffi/examples/uc-catalog-example
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri"
     runs-on: ubuntu-latest
@@ -207,10 +212,12 @@ jobs:
           rustup toolchain install nightly --component miri
           rustup override set nightly
           cargo miri setup
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls,uc-catalog
 
   coverage:
     runs-on: ubuntu-latest
@@ -220,6 +227,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage

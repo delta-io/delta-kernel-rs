@@ -114,7 +114,7 @@ pub fn transform_to_logical(
 }
 
 /// A `ScanFile` represents information about one file that needs to be scanned to read a table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanFile {
     /// Path to the file
     pub path: String,
@@ -186,7 +186,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 13,
+            getters.len() == 14,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()

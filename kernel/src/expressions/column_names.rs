@@ -7,7 +7,7 @@ use std::iter::Peekable;
 use std::ops::Deref;
 
 /// A (possibly nested) column name.
-#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct ColumnName {
     path: Vec<String>,
 }
@@ -96,6 +96,26 @@ impl ColumnName {
     /// Consumes this column name and returns the path of field names.
     pub fn into_inner(self) -> Vec<String> {
         self.path
+    }
+
+    /// Returns the parent of this column name, or `None` if this is a top-level column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use delta_kernel::expressions::ColumnName;
+    /// let path = ColumnName::new(["user", "address", "street"]);
+    /// assert_eq!(path.parent(), Some(ColumnName::new(["user", "address"])));
+    ///
+    /// let path = ColumnName::new(["user"]);
+    /// assert_eq!(path.parent(), None);
+    /// ```
+    pub fn parent(&self) -> Option<ColumnName> {
+        if self.path.len() > 1 {
+            Some(ColumnName::new(&self.path[..self.path.len() - 1]))
+        } else {
+            None
+        }
     }
 }
 
@@ -449,6 +469,7 @@ macro_rules! __joined_column_expr {
 }
 #[doc(inline)]
 pub use __joined_column_expr as joined_column_expr;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod test {
@@ -537,6 +558,18 @@ mod test {
         let name = column_name!("x.y.z");
         let name = ColumnName::new(name);
         assert_eq!(name, column_name!("x.y.z"));
+
+        // parent()
+        let simple_for_parent = column_name!("x");
+        let nested_for_parent = column_name!("x.y");
+        assert_eq!(simple_for_parent.parent(), None);
+        assert_eq!(nested_for_parent.parent(), Some(column_name!("x")));
+
+        let deep = column_name!("user.address.street");
+        assert_eq!(deep.parent(), Some(column_name!("user.address")));
+
+        let single = ColumnName::new(["field"]);
+        assert_eq!(single.parent(), None);
     }
 
     #[test]
