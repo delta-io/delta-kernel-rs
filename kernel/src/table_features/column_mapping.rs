@@ -13,7 +13,6 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::{DeltaResult, Error};
 
-use itertools::Itertools;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -303,28 +302,10 @@ fn process_nested_data_type(data_type: &DataType, max_id: &mut i64) -> DeltaResu
     }
 }
 
-/// Resolves a clustering column's logical name to its physical name using column mapping metadata.
-///
-/// Uses [`StructField::physical_name`] to resolve the name based on the column mapping mode.
-/// When column mapping is disabled (mode = None), returns the logical name. When enabled,
-/// returns the physical name from the field's metadata.
-///
-/// This function only handles top-level columns. Note: the top-level restriction for
-/// clustering columns is an opinionated choice (matching delta-spark behavior), not a
-/// requirement of the Delta protocol itself.
-pub(crate) fn get_top_level_column_physical_name(
-    logical_name: &str,
-    schema: &StructType,
-    mode: ColumnMappingMode,
-) -> DeltaResult<String> {
-    let field = schema
-        .field(logical_name)
-        .ok_or_else(|| Error::generic(format!("Column '{}' not found in schema", logical_name)))?;
-
-    Ok(field.physical_name(mode).to_string())
-}
-
 /// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
+///
+/// Uses `StructType::walk_column_fields` to walk the column path through nested structs,
+/// then maps each field to its physical name based on the column mapping mode.
 ///
 /// Returns an error if the column name cannot be resolved in the schema.
 #[delta_kernel_derive::internal_api]
@@ -333,26 +314,11 @@ pub(crate) fn get_any_level_column_physical_name(
     col_name: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let mut current_struct: Option<&StructType> = Some(schema);
-    let physical_path: Vec<String> = col_name
-        .path()
+    let fields = schema.walk_column_fields(col_name)?;
+    let physical_path: Vec<String> = fields
         .iter()
-        .map(|segment| -> DeltaResult<String> {
-            let field = current_struct
-                .and_then(|s| s.field(segment))
-                .ok_or_else(|| {
-                    Error::generic(format!(
-                        "Could not resolve column {col_name} in schema {schema}"
-                    ))
-                })?;
-            current_struct = if let DataType::Struct(s) = field.data_type() {
-                Some(s)
-            } else {
-                None
-            };
-            Ok(field.physical_name(column_mapping_mode).to_string())
-        })
-        .try_collect()?;
+        .map(|f| f.physical_name(column_mapping_mode).to_string())
+        .collect();
     Ok(ColumnName::new(physical_path))
 }
 
@@ -992,67 +958,5 @@ mod tests {
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_top_level_column_physical_name_no_mapping() {
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::STRING, true),
-        ]);
-
-        let result =
-            get_top_level_column_physical_name("a", &schema, ColumnMappingMode::None).unwrap();
-
-        // Should return logical name as-is when column mapping is disabled
-        assert_eq!(result, "a");
-    }
-
-    #[test]
-    fn test_get_top_level_column_physical_name_with_mapping() {
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false).add_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-abc123".to_string()),
-                ),
-            ]),
-            StructField::new("b", DataType::STRING, true).add_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-def456".to_string()),
-                ),
-            ]),
-        ]);
-
-        let result =
-            get_top_level_column_physical_name("a", &schema, ColumnMappingMode::Name).unwrap();
-
-        // Should return physical name
-        assert_eq!(result, "col-abc123");
-    }
-
-    #[test]
-    fn test_get_top_level_column_physical_name_not_found() {
-        let schema = StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
-
-        let result =
-            get_top_level_column_physical_name("nonexistent", &schema, ColumnMappingMode::Name);
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("not found in schema"),
-            "Expected 'not found in schema' error, got: {}",
-            err_msg
-        );
     }
 }

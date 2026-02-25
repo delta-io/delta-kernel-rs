@@ -17,7 +17,6 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 pub(crate) use column_mapping::validate_column_mapping;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_top_level_column_physical_name,
 };
 // TODO: validate_schema_column_mapping should not be pub; always use TableConfiguration instead.
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};

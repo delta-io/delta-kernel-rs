@@ -187,11 +187,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -308,11 +308,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -396,11 +396,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -471,11 +471,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -550,11 +550,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
