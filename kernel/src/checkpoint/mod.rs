@@ -113,10 +113,10 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
-mod stats_transform;
+mod checkpoint_transform;
 
-use stats_transform::{
-    build_checkpoint_output_schema, build_checkpoint_read_schema_with_stats, build_stats_transform,
+use checkpoint_transform::{
+    build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
 
@@ -291,16 +291,24 @@ impl CheckpointWriter {
             &CHECKPOINT_ACTIONS_SCHEMA_V1
         };
 
+        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
+        let partition_schema = self
+            .snapshot
+            .table_configuration()
+            .build_partition_values_parsed_schema();
+
         // The read schema and output schema differ because the transform needs access to
         // both stats formats as input, but may only write one format as output.
         //
         // read_schema: Always includes both `stats` and `stats_parsed` fields in the Add
         // action, so COALESCE expressions can read from either source. For commit files,
-        // `stats_parsed` doesn't exist and is read as nulls.
+        // `stats_parsed` doesn't exist and is read as nulls. For partitioned tables,
+        // `partitionValues_parsed` is also included.
         //
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema = build_checkpoint_read_schema_with_stats(base_schema, &stats_schema)?;
+        let read_schema =
+            build_checkpoint_read_schema(base_schema, &stats_schema, partition_schema.as_deref())?;
 
         // Read actions from log segment
         let actions =
@@ -315,11 +323,17 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = build_checkpoint_output_schema(&config, base_schema, &stats_schema)?;
+        let output_schema = build_checkpoint_output_schema(
+            &config,
+            base_schema,
+            &stats_schema,
+            partition_schema.as_deref(),
+        )?;
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let transform_expr = build_stats_transform(&config, &stats_schema);
+        let transform_expr =
+            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref());
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             read_schema,
             transform_expr,

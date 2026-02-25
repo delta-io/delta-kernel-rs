@@ -301,7 +301,7 @@ pub fn evaluate_expression(
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
 
             for expr in exprs {
-                let array = evaluate_expression(expr, batch, None)?;
+                let array = evaluate_expression(expr, batch, result_type)?;
                 let null_count = array.null_count();
                 arrays.push(array);
                 // Short-circuit: if this array has no nulls, we can stop evaluating

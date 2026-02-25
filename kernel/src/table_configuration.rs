@@ -18,7 +18,7 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
@@ -277,6 +277,29 @@ impl TableConfiguration {
                 .ok()
             })
             .collect()
+    }
+
+    /// Returns the physical partition schema for `partitionValues_parsed`.
+    ///
+    /// Field names are physical column names (respecting column mapping mode),
+    /// and field types are the actual partition column data types (all nullable).
+    /// Returns `None` if the table has no partition columns.
+    pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
+        let partition_columns = self.metadata().partition_columns();
+        if partition_columns.is_empty() {
+            return None;
+        }
+        let partition_fields: Vec<StructField> = partition_columns
+            .iter()
+            .filter_map(|col_name| self.schema.field(col_name))
+            .map(|field| {
+                StructField::nullable(
+                    field.physical_name(self.column_mapping_mode).to_owned(),
+                    field.data_type().clone(),
+                )
+            })
+            .collect();
+        Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
