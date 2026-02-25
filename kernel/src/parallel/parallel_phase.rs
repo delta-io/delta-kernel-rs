@@ -569,30 +569,47 @@ mod tests {
 
             // Extract Phase 2 counter values
             // Note: There may be multiple "Completed Phase 2" logs (from multiple test configurations)
-            // Find all occurrences and check that at least one has the expected adds
-            let mut max_phase2_adds = 0u64;
+            // Validate that EVERY Phase 2 log has the expected counter values
+            let mut total_phase2_adds = 0u64;
             let mut search_start = 0;
+            let mut phase2_count = 0;
+
             while let Some(pos) = logs[search_start..].find("Completed Phase 2 scan metadata") {
                 let absolute_pos = search_start + pos;
                 let remaining = &logs[absolute_pos..];
+                phase2_count += 1;
 
-                if let Some(num_adds_pos) = remaining.find("num_adds=") {
-                    let after = &remaining[num_adds_pos + 9..];
-                    if let Some(space_pos) = after.find(char::is_whitespace) {
-                        if let Ok(adds) = after[..space_pos].parse::<u64>() {
-                            max_phase2_adds = max_phase2_adds.max(adds);
-                        }
-                    }
-                }
+                // Extract and validate num_adds
+                let adds = extract_metric(remaining, "num_adds");
+                total_phase2_adds += adds;
+
+                // Extract and validate num_removes - should ALWAYS be 0
+                let removes = extract_metric(remaining, "num_removes");
+                assert_eq!(
+                    removes, 0,
+                    "Expected num_removes=0 in Phase 2 log #{} for {} (checkpoint sidecars only have adds), found {}",
+                    phase2_count, table_name, removes
+                );
+
+                // Extract and validate num_non_file_actions - should ALWAYS be 0
+                let non_file_actions = extract_metric(remaining, "num_non_file_actions");
+                assert_eq!(
+                    non_file_actions, 0,
+                    "Expected num_non_file_actions=0 in Phase 2 log #{} for {} (checkpoint sidecars only have adds), found {}",
+                    phase2_count, table_name, non_file_actions
+                );
+
                 search_start = absolute_pos + 1;
             }
 
             if table_name == "v2-checkpoints-json-with-sidecars" {
-                // At least one test configuration should have processed 101 adds in Phase 2
+                // The test runs 4 configurations (with_serde × one_file_per_worker),
+                // and each configuration processes all 101 adds from the checkpoint sidecars.
+                // So the total across all Phase 2 logs should be 4 × 101 = 404
                 assert_eq!(
-                    max_phase2_adds, 101,
-                    "Expected at least one Phase 2 run with 101 adds for {} (max found: {})",
-                    table_name, max_phase2_adds
+                    total_phase2_adds, 404,
+                    "Expected total of 404 adds across all Phase 2 runs for {} (4 configs × 101 adds each, found: {})",
+                    table_name, total_phase2_adds
                 );
             }
         }
