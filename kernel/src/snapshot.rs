@@ -239,7 +239,9 @@ impl Snapshot {
             .retain(|log_path| old_version < log_path.version);
         // Deduplicate compaction files the same way: the new listing re-lists from
         // checkpoint_version, so it includes compaction files already in the old segment.
-        // Note: This removes all _new_ compaction files that start at or before `old_version`
+        // Note: This removes all _new_ compaction files that start at or before `old_version`,
+        // which may drop useful compaction files that span across the old/new boundary
+        // (e.g. a new compaction(1, 3) when old_version=2). This is conservative but safe.
         new_log_segment
             .ascending_compaction_files
             .retain(|log_path| old_version < log_path.version);
