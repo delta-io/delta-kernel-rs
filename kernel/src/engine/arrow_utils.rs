@@ -235,6 +235,102 @@ pub(crate) fn coerce_batch_nullability(
         return Ok(batch);
     }
 
+    fn coerce_struct(
+        src_column: &Arc<dyn ArrowArray>,
+        src_children: &ArrowFields,
+        target_children: &ArrowFields,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<Arc<dyn ArrowArray>> {
+        let src_struct = src_column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::generic("expected Struct array during nullability coercion"))?;
+        let (coerced_columns, coerced_fields): (Vec<Arc<dyn ArrowArray>>, Vec<ArrowFieldRef>) =
+            src_struct
+                .columns()
+                .iter()
+                .zip(src_children.iter())
+                .zip(target_children.iter())
+                .map(|((src_child_col, src_child), target_child)| {
+                    coerce(
+                        src_child_col.clone(),
+                        src_child,
+                        target_child,
+                        type_mismatch_validator,
+                    )
+                })
+                .try_collect::<Vec<_>>()?
+                .into_iter()
+                .unzip();
+        Ok(Arc::new(StructArray::try_new(
+            coerced_fields.into(),
+            coerced_columns,
+            src_struct.nulls().cloned(),
+        )?))
+    }
+
+    fn coerce_map(
+        src_column: &Arc<dyn ArrowArray>,
+        src_entries_field: &ArrowFieldRef,
+        target_entries_field: &ArrowFieldRef,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<Arc<dyn ArrowArray>> {
+        let src_map = src_column
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| Error::generic("expected Map array during nullability coercion"))?;
+        // Discard the source entries field; the recursive `coerce` call below
+        // produces `coerced_entries_field` with the target's nullability applied.
+        let (_, src_offsets, src_entries, src_nulls, src_ordered) = src_map.clone().into_parts();
+        let (coerced_entries_col, coerced_entries_field) = coerce(
+            Arc::new(src_entries),
+            src_entries_field,
+            target_entries_field,
+            type_mismatch_validator,
+        )?;
+        let coerced_entries = coerced_entries_col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::generic("expected Struct array for Map entries during nullability coercion")
+            })?
+            .clone();
+        Ok(Arc::new(MapArray::try_new(
+            coerced_entries_field,
+            src_offsets,
+            coerced_entries,
+            src_nulls,
+            src_ordered,
+        )?))
+    }
+
+    fn coerce_list(
+        src_column: &Arc<dyn ArrowArray>,
+        src_element: &ArrowFieldRef,
+        target_element: &ArrowFieldRef,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<Arc<dyn ArrowArray>> {
+        let src_list = src_column
+            .as_any()
+            .downcast_ref::<GenericListArray<i32>>()
+            .ok_or_else(|| Error::generic("expected List array during nullability coercion"))?;
+        // Discard the source element field; the recursive `coerce` call below
+        // produces `coerced_element_field` with the target's nullability applied.
+        let (_, src_offsets, src_values, src_nulls) = src_list.clone().into_parts();
+        let (coerced_values, coerced_element_field) = coerce(
+            src_values,
+            src_element,
+            target_element,
+            type_mismatch_validator,
+        )?;
+        Ok(Arc::new(GenericListArray::<i32>::try_new(
+            coerced_element_field,
+            src_offsets,
+            coerced_values,
+            src_nulls,
+        )?))
+    }
+
     // Recursively coerces nullability for a column+field pair. For struct columns, recurses
     // into children; for leaf columns, just adjusts the field's nullability flag.
     fn coerce(
@@ -248,125 +344,47 @@ pub(crate) fn coerce_batch_nullability(
                 (ArrowDataType::Struct(src_children), ArrowDataType::Struct(target_children))
                     if src_children != target_children =>
                 {
-                    let src_struct = src_column
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .ok_or_else(|| {
-                            Error::generic("expected Struct array during nullability coercion")
-                        })?;
-                    let (coerced_columns, coerced_fields): (
-                        Vec<Arc<dyn ArrowArray>>,
-                        Vec<ArrowFieldRef>,
-                    ) = src_struct
-                        .columns()
-                        .iter()
-                        .zip(src_children.iter())
-                        .zip(target_children.iter())
-                        .map(|((src_child_col, src_child), target_child)| {
-                            coerce(
-                                src_child_col.clone(),
-                                src_child,
-                                target_child,
-                                type_mismatch_validator,
-                            )
-                        })
-                        .collect::<DeltaResult<Vec<_>>>()?
-                        .into_iter()
-                        .unzip();
-                    Arc::new(StructArray::try_new(
-                        coerced_fields.into(),
-                        coerced_columns,
-                        src_struct.nulls().cloned(),
-                    )?)
+                    coerce_struct(
+                        &src_column,
+                        src_children,
+                        target_children,
+                        type_mismatch_validator,
+                    )?
                 }
-                // Map type: recurse into entries struct to fix nested nullability
                 (
                     ArrowDataType::Map(src_entries_field, _),
                     ArrowDataType::Map(target_entries_field, _),
-                ) if src_entries_field != target_entries_field => {
-                    let src_map =
-                        src_column
-                            .as_any()
-                            .downcast_ref::<MapArray>()
-                            .ok_or_else(|| {
-                                Error::generic("expected Map array during nullability coercion")
-                            })?;
-                    // Discard the source entries field; the recursive `coerce` call below
-                    // produces `coerced_entries_field` with the target's nullability applied.
-                    let (_, src_offsets, src_entries, src_nulls, src_ordered) =
-                        src_map.clone().into_parts();
-                    let (coerced_entries_col, coerced_entries_field) = coerce(
-                        Arc::new(src_entries),
-                        src_entries_field,
-                        target_entries_field,
-                        type_mismatch_validator,
-                    )?;
-                    let coerced_entries = coerced_entries_col
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .ok_or_else(|| {
-                            Error::generic(
-                                "expected Struct array for Map entries during nullability coercion",
-                            )
-                        })?
-                        .clone();
-                    Arc::new(MapArray::try_new(
-                        coerced_entries_field,
-                        src_offsets,
-                        coerced_entries,
-                        src_nulls,
-                        src_ordered,
-                    )?)
-                }
-                // List type: recurse into element to fix nested nullability
+                ) if src_entries_field != target_entries_field => coerce_map(
+                    &src_column,
+                    src_entries_field,
+                    target_entries_field,
+                    type_mismatch_validator,
+                )?,
                 (ArrowDataType::List(src_element), ArrowDataType::List(target_element))
                     if src_element != target_element =>
                 {
-                    let src_list = src_column
-                        .as_any()
-                        .downcast_ref::<GenericListArray<i32>>()
-                        .ok_or_else(|| {
-                            Error::generic("expected List array during nullability coercion")
-                        })?;
-                    // Discard the source element field; the recursive `coerce` call below
-                    // produces `coerced_element_field` with the target's nullability applied.
-                    let (_, src_offsets, src_values, src_nulls) = src_list.clone().into_parts();
-                    let (coerced_values, coerced_element_field) = coerce(
-                        src_values,
+                    coerce_list(
+                        &src_column,
                         src_element,
                         target_element,
                         type_mismatch_validator,
-                    )?;
-                    Arc::new(GenericListArray::<i32>::try_new(
-                        coerced_element_field,
-                        src_offsets,
-                        coerced_values,
-                        src_nulls,
-                    )?)
+                    )?
                 }
-                (src_type, target_type) if src_type != target_type => {
-                    if let Some(validator) = type_mismatch_validator {
-                        validator(src_field, target_field)?;
-                    } else {
-                        return Err(Error::internal_error(format!(
-                            "data type mismatch for field '{}': \
-                             source has {src_type:?} but target has {target_type:?}",
-                            src_field.name(),
-                        )));
+
+                (src_type, target_type) => {
+                    if src_type != target_type {
+                        // Delegate to the caller-provided validator if present
+                        // (some callers tolerate certain mismatches), otherwise reject.
+                        if let Some(validator) = type_mismatch_validator {
+                            validator(src_field, target_field)?;
+                        } else {
+                            return Err(Error::internal_error(format!(
+                                "data type mismatch for field '{}': \
+                                 source has {src_type:?} but target has {target_type:?}",
+                                src_field.name(),
+                            )));
+                        }
                     }
-                    let coerced_field = if src_field.is_nullable() == target_field.is_nullable() {
-                        src_field.clone()
-                    } else {
-                        Arc::new(
-                            src_field
-                                .as_ref()
-                                .clone()
-                                .with_nullable(target_field.is_nullable()),
-                        )
-                    };
-                    return Ok((src_column, coerced_field));
-                }
-                _ => {
                     let coerced_field = if src_field.is_nullable() == target_field.is_nullable() {
                         src_field.clone()
                     } else {
@@ -402,7 +420,7 @@ pub(crate) fn coerce_batch_nullability(
             .map(|((src_column, src_field), target_field)| {
                 coerce(src_column, src_field, target_field, type_mismatch_validator)
             })
-            .collect::<DeltaResult<Vec<_>>>()?
+            .try_collect::<Vec<_>>()?
             .into_iter()
             .unzip();
 
