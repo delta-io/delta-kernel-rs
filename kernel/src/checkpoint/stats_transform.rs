@@ -1,5 +1,4 @@
-#![allow(dead_code)] // TODO: Remove when integrated in checkpoint_data()
-//! Transforms for populating `stats_parsed` and `stats` fields on the `Add` action in checkpoint data.
+//! Transforms for populating stats_parsed and stats fields in checkpoint data.
 //!
 //! This module ensures that Add actions in checkpoints have the correct statistics format
 //! based on the table configuration. Statistics can be stored in two formats as fields on
@@ -67,7 +66,7 @@ impl StatsTransformConfig {
 /// [`expected_stats_schema`]: crate::scan::data_skipping::stats_schema::expected_stats_schema
 pub(crate) fn build_stats_transform(
     config: &StatsTransformConfig,
-    stats_schema: SchemaRef,
+    stats_schema: &SchemaRef,
 ) -> ExpressionRef {
     let mut add_transform = Transform::new_nested([ADD_NAME]);
 
@@ -122,7 +121,7 @@ pub(crate) fn build_checkpoint_read_schema_with_stats(
                 "stats_parsed field already exists in Add schema",
             ));
         }
-        Ok(add_stats_parsed_to_add_schema(add_struct, stats_schema))
+        add_stats_parsed_to_add_schema(add_struct, stats_schema)
     })
 }
 
@@ -141,7 +140,7 @@ pub(crate) fn build_checkpoint_output_schema(
     stats_schema: &StructType,
 ) -> DeltaResult<SchemaRef> {
     transform_add_schema(base_schema, |add_struct| {
-        Ok(build_add_output_schema(config, add_struct, stats_schema))
+        build_add_output_schema(config, add_struct, stats_schema)
     })
 }
 
@@ -157,10 +156,13 @@ pub(crate) fn build_checkpoint_output_schema(
 ///
 /// Column paths are relative to the full batch (not the nested Add struct), so we use
 /// ["add", "stats"] instead of just ["stats"].
-fn build_stats_parsed_expr(stats_schema: SchemaRef) -> ExpressionRef {
+fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
         Expression::column([ADD_NAME, STATS_PARSED_FIELD]),
-        Expression::parse_json(Expression::column([ADD_NAME, STATS_FIELD]), stats_schema),
+        Expression::parse_json(
+            Expression::column([ADD_NAME, STATS_FIELD]),
+            stats_schema.clone(),
+        ),
     ]))
 }
 
@@ -209,75 +211,55 @@ fn transform_add_schema(
     };
 
     let modified_add = transform_fn(add_struct)?;
-    let fields: Vec<StructField> = base_schema
-        .fields()
-        .map(|field| {
-            if field.name == ADD_NAME {
-                StructField {
-                    name: field.name.clone(),
-                    data_type: DataType::Struct(Box::new(modified_add.clone())),
-                    nullable: field.nullable,
-                    metadata: field.metadata.clone(),
-                }
-            } else {
-                field.clone()
-            }
-        })
-        .collect();
+    let new_schema = base_schema.clone().with_field_replaced(
+        ADD_NAME,
+        StructField {
+            name: ADD_NAME.to_string(),
+            data_type: DataType::Struct(Box::new(modified_add)),
+            nullable: add_field.nullable,
+            metadata: add_field.metadata.clone(),
+        },
+    )?;
 
-    Ok(Arc::new(StructType::new_unchecked(fields)))
+    Ok(Arc::new(new_schema))
 }
 
 /// Adds `stats_parsed` field after `stats` in the Add action schema.
 fn add_stats_parsed_to_add_schema(
     add_schema: &StructType,
     stats_schema: &StructType,
-) -> StructType {
-    let mut fields: Vec<StructField> = Vec::with_capacity(add_schema.num_fields() + 1);
-
-    for field in add_schema.fields() {
-        fields.push(field.clone());
-        if field.name == STATS_FIELD {
-            // Insert stats_parsed right after stats
-            fields.push(StructField::nullable(
-                STATS_PARSED_FIELD,
-                DataType::Struct(Box::new(stats_schema.clone())),
-            ));
-        }
-    }
-
-    StructType::new_unchecked(fields)
+) -> DeltaResult<StructType> {
+    let new_schema = add_schema.clone();
+    new_schema.with_field_inserted_after(
+        Some(STATS_FIELD),
+        StructField::nullable(
+            STATS_PARSED_FIELD,
+            DataType::Struct(Box::new(stats_schema.clone())),
+        ),
+    )
 }
 
 fn build_add_output_schema(
     config: &StatsTransformConfig,
     add_schema: &StructType,
     stats_schema: &StructType,
-) -> StructType {
-    let capacity = add_schema.num_fields()
-        - if config.write_stats_as_json { 0 } else { 1 } // dropping stats?
-        + if config.write_stats_as_struct { 1 } else { 0 }; // adding stats_parsed?
-    let mut fields: Vec<StructField> = Vec::with_capacity(capacity);
-
-    for field in add_schema.fields() {
-        if field.name == STATS_FIELD {
-            // Include stats if writing as JSON
-            if config.write_stats_as_json {
-                fields.push(field.clone());
-            }
-            // Add stats_parsed after stats position if writing as struct
-            if config.write_stats_as_struct {
-                fields.push(StructField::nullable(
-                    STATS_PARSED_FIELD,
-                    DataType::Struct(Box::new(stats_schema.clone())),
-                ));
-            }
-        } else {
-            fields.push(field.clone());
-        }
+) -> DeltaResult<StructType> {
+    let mut new_schema = add_schema.clone();
+    if config.write_stats_as_struct {
+        new_schema = new_schema.with_field_inserted_after(
+            Some(STATS_FIELD),
+            StructField::nullable(
+                STATS_PARSED_FIELD,
+                DataType::Struct(Box::new(stats_schema.clone())),
+            ),
+        )?
     }
 
-    StructType::new_unchecked(fields)
+    if config.write_stats_as_json {
+        Ok(new_schema)
+    } else {
+        Ok(new_schema.with_field_removed(STATS_FIELD))
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +353,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -397,7 +379,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -418,7 +400,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -442,7 +424,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, &stats_schema);
 
         let (_, inner) = extract_transforms(&transform_expr);
 
@@ -467,7 +449,8 @@ mod tests {
         let stats_schema =
             StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
 
-        let result = add_stats_parsed_to_add_schema(&add_schema, &stats_schema);
+        let result = add_stats_parsed_to_add_schema(&add_schema, &stats_schema)
+            .expect("add stats_parsed to add schema should produce a valid schema");
 
         // Should have 4 fields: path, stats, stats_parsed, tags
         assert_eq!(result.fields().count(), 4);
@@ -490,7 +473,8 @@ mod tests {
 
         let stats_schema = StructType::new_unchecked([]);
 
-        let result = build_add_output_schema(&config, &add_schema, &stats_schema);
+        let result = build_add_output_schema(&config, &add_schema, &stats_schema)
+            .expect("build add output schema should produce a valid schema");
 
         // Should have path and stats, no stats_parsed
         let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
@@ -512,7 +496,8 @@ mod tests {
         let stats_schema =
             StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
 
-        let result = build_add_output_schema(&config, &add_schema, &stats_schema);
+        let result = build_add_output_schema(&config, &add_schema, &stats_schema)
+            .expect("build add output schema should produce a valid schema");
 
         // Should have path and stats_parsed (stats dropped)
         let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
@@ -534,7 +519,8 @@ mod tests {
         let stats_schema =
             StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
 
-        let result = build_add_output_schema(&config, &add_schema, &stats_schema);
+        let result = build_add_output_schema(&config, &add_schema, &stats_schema)
+            .expect("build add output schema should produce a valid schema");
 
         // Should have path, stats, and stats_parsed
         let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();

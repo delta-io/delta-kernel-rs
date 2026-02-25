@@ -196,6 +196,11 @@ pub trait GetData<'a> {
         (get_bool, bool),
         (get_int, i32),
         (get_long, i64),
+        (get_float, f32),
+        (get_double, f64),
+        (get_date, i32),
+        (get_timestamp, i64),
+        (get_decimal, i128),
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
@@ -218,6 +223,11 @@ impl<'a> GetData<'a> for () {
         (get_bool, bool),
         (get_int, i32),
         (get_long, i64),
+        (get_float, f32),
+        (get_double, f64),
+        (get_date, i32),
+        (get_timestamp, i64),
+        (get_decimal, i128),
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
@@ -249,10 +259,16 @@ macro_rules! impl_typed_get_data {
     };
 }
 
+// Note: get_date and get_timestamp are intentionally excluded because their return types (i32 and
+// i64) collide with get_int and get_long, which would produce conflicting TypedGetData impls.
+// Use get_date/get_timestamp directly instead of through TypedGetData.
 impl_typed_get_data!(
     (get_bool, bool),
     (get_int, i32),
     (get_long, i64),
+    (get_float, f32),
+    (get_double, f64),
+    (get_decimal, i128),
     (get_str, &'a str),
     (get_binary, &'a [u8]),
     (get_list, ListItem<'a>),

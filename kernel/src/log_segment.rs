@@ -31,7 +31,10 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+mod domain_metadata_replay;
 mod protocol_metadata_replay;
+
+pub(crate) use domain_metadata_replay::DomainMetadataMap;
 
 #[cfg(test)]
 mod crc_tests;
@@ -791,6 +794,8 @@ impl LogSegment {
 
         // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
         // The sidecar column will be null in sidecar batches, which is harmless.
+        // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
+        // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
             parquet_handler.read_parquet_files(
                 &sidecar_files,
