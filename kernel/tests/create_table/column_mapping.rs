@@ -16,7 +16,7 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use test_utils::test_table_setup;
+use test_utils::{create_table_and_load_snapshot, test_table_setup};
 
 use super::simple_schema;
 
@@ -58,22 +58,6 @@ fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
         .map(|f| strip_field(f, cm_id, cm_name))
         .collect();
     StructType::new_unchecked(fields)
-}
-
-/// Helper to create a table, load its snapshot, and return it for verification.
-fn create_table_and_load_snapshot(
-    table_path: &str,
-    schema: Arc<StructType>,
-    engine: &dyn delta_kernel::Engine,
-    properties: &[(&str, &str)],
-) -> DeltaResult<Arc<Snapshot>> {
-    let _ = create_table(table_path, schema, "Test/1.0")
-        .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
-
-    let table_url = delta_kernel::try_parse_uri(table_path)?;
-    Snapshot::builder_for(table_url).build(engine)
 }
 
 /// Assert column mapping configuration on a snapshot.
