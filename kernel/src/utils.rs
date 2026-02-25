@@ -298,12 +298,12 @@ pub(crate) mod test_utils {
         }
     }
 
-    /// Asserts the 2×2 matrix of (schema_has_feature, protocol_supports_feature) outcomes
+    /// Asserts the 2x2 matrix of (schema_has_feature, protocol_supports_feature) outcomes
     /// for schema-level feature validators. The expected pattern is:
-    /// - schema + protocol → Ok
-    /// - no schema + no protocol → Ok
-    /// - no schema + protocol → Ok
-    /// - schema + no protocol → Err (orphaned schema presence)
+    /// - schema + protocol => Ok
+    /// - no schema + no protocol => Ok
+    /// - no schema + protocol => Ok
+    /// - schema + no protocol => Err (orphaned schema presence)
     ///
     /// Additional error schemas (e.g. nested) are also tested against `protocol_without`.
     #[track_caller]
