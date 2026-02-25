@@ -269,6 +269,7 @@ pub(crate) fn coerce_batch_nullability(
         )?))
     }
 
+    // Map type: recurse into entries struct to fix nested nullability
     fn coerce_map(
         src_column: &Arc<dyn ArrowArray>,
         src_entries_field: &ArrowFieldRef,
@@ -304,6 +305,7 @@ pub(crate) fn coerce_batch_nullability(
         )?))
     }
 
+    // List type: recurse into element to fix nested nullability
     fn coerce_list(
         src_column: &Arc<dyn ArrowArray>,
         src_element: &ArrowFieldRef,
