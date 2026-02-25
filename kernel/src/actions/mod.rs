@@ -288,6 +288,35 @@ impl Metadata {
         })
     }
 
+    /// Create a new Metadata with a different schema and partition columns, preserving the table
+    /// identity (id, name, description, format). Used for schema overwrite operations where the
+    /// table ID must remain stable across schema changes.
+    pub(crate) fn try_with_new_schema(
+        &self,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
+        // Validate that the schema does not contain metadata columns
+        if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
+            return Err(Error::Schema(format!(
+                "Table schema must not contain metadata columns. Found metadata column: '{}'",
+                metadata_field.name
+            )));
+        }
+
+        Ok(Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            format: self.format.clone(),
+            schema_string: serde_json::to_string(&schema)?,
+            partition_columns,
+            created_time: self.created_time,
+            configuration,
+        })
+    }
+
     #[internal_api]
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();

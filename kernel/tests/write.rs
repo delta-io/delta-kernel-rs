@@ -25,6 +25,7 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::transaction::overwrite_schema::overwrite_schema;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
 
@@ -3460,6 +3461,473 @@ async fn test_column_mapping_partitioned_write(
     for remove in &remove_actions {
         assert_partition_values(remove, &physical_name, "A");
     }
+
+    Ok(())
+}
+
+// =============================================================================
+// Schema overwrite tests
+// =============================================================================
+
+/// Helper: create a table with initial schema on the filesystem, write data, and return
+/// the table path (string), URL, engine, and temp_dir (must be kept alive).
+async fn create_table_with_data(
+    schema: SchemaRef,
+    data: RecordBatch,
+    properties: &[(&str, &str)],
+) -> Result<
+    (
+        tempfile::TempDir,
+        String,
+        Url,
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), properties)?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
+
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            &write_context,
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_meta);
+    match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(_) => {}
+        _ => panic!("Initial write commit should succeed"),
+    }
+
+    Ok((_tmp_dir, table_path, table_url, engine))
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_basic() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Create initial table with schema (id: int, name: string)
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) =
+        create_table_with_data(initial_schema.clone(), initial_data, &[]).await?;
+
+    // Overwrite schema to (new_id: long, new_name: string)
+    let new_schema: SchemaRef = Arc::new(StructType::try_new(vec![
+        StructField::nullable("new_id", DataType::LONG),
+        StructField::nullable("new_name", DataType::STRING),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = overwrite_schema(snapshot.clone(), new_schema.clone(), vec![])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    // WriteContext should return the new schema
+    let write_context = txn.get_write_context();
+    assert_eq!(write_context.logical_schema().fields().len(), 2);
+    assert!(write_context.logical_schema().field("new_id").is_some());
+    assert!(write_context.logical_schema().field("new_name").is_some());
+
+    // Write new data with the new schema
+    let new_data = RecordBatch::try_new(
+        Arc::new(new_schema.as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ],
+    )?;
+
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(new_data.clone()),
+            &write_context,
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_meta);
+
+    match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 2);
+        }
+        _ => panic!("Overwrite commit should succeed"),
+    }
+
+    // Verify: new snapshot should have the new schema
+    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let schema = new_snapshot.schema();
+    assert_eq!(schema.fields().len(), 2);
+    assert!(schema.field("new_id").is_some());
+    assert!(schema.field("new_name").is_some());
+    // Old fields should not exist
+    assert!(schema.field("id").is_none());
+    assert!(schema.field("name").is_none());
+
+    // Verify: scanning should return only the new data (2 rows, not the old 3)
+    let expected = ArrowEngineData::new(new_data);
+    test_read(
+        &expected,
+        &table_url,
+        engine.clone() as Arc<dyn Engine>,
+    )?;
+
+    // Verify: table ID is preserved
+    let old_meta_actions = read_actions_from_commit(&table_url, 0, "metaData")?;
+    let new_meta_actions = read_actions_from_commit(&table_url, 2, "metaData")?;
+    let old_table_id = old_meta_actions
+        .first()
+        .and_then(|m| m.get("id"))
+        .and_then(|id| id.as_str());
+    let new_table_id = new_meta_actions
+        .first()
+        .and_then(|m| m.get("id"))
+        .and_then(|id| id.as_str());
+    assert!(old_table_id.is_some());
+    assert_eq!(old_table_id, new_table_id, "Table ID should be preserved across schema overwrite");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_empty_table() -> Result<(), Box<dyn std::error::Error>> {
+    // Test overwriting schema without writing any new data (creates empty table with new schema)
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) =
+        create_table_with_data(initial_schema.clone(), initial_data, &[]).await?;
+
+    // Overwrite schema without writing any new data
+    let new_schema: SchemaRef = Arc::new(StructType::try_new(vec![
+        StructField::nullable("col_a", DataType::LONG),
+        StructField::nullable("col_b", DataType::STRING),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let txn = overwrite_schema(snapshot.clone(), new_schema.clone(), vec![])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    // Don't add any files - this should create an empty table with the new schema
+    match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 2);
+        }
+        _ => panic!("Empty overwrite commit should succeed"),
+    }
+
+    // Verify: new snapshot should have the new schema and no data
+    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let schema = new_snapshot.schema();
+    assert_eq!(schema.fields().len(), 2);
+    assert!(schema.field("col_a").is_some());
+    assert!(schema.field("col_b").is_some());
+
+    // Verify: scanning should return no data
+    let scan = new_snapshot.scan_builder().build()?;
+    let mut file_count = 0;
+    for metadata in scan.scan_metadata(engine.as_ref())? {
+        let metadata = metadata?;
+        let selected = metadata
+            .scan_files
+            .selection_vector()
+            .iter()
+            .filter(|&&x| x)
+            .count();
+        file_count += selected;
+    }
+    assert_eq!(file_count, 0, "Empty overwrite should have no data files");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_with_partitions() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Create initial unpartitioned table
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) =
+        create_table_with_data(initial_schema.clone(), initial_data, &[]).await?;
+
+    // Overwrite with a partitioned schema
+    let new_schema: SchemaRef = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::nullable("partition_col", DataType::STRING),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = overwrite_schema(
+        snapshot.clone(),
+        new_schema.clone(),
+        vec!["partition_col".to_string()],
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    // WriteContext should exclude partition columns from physical schema
+    let write_context = txn.get_write_context();
+    assert!(write_context.logical_schema().field("value").is_some());
+    assert!(write_context.logical_schema().field("partition_col").is_some());
+
+    // Write data with partition values
+    let data_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+    ])?);
+    let data = RecordBatch::try_new(
+        Arc::new(data_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![42]))],
+    )?;
+
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            &write_context,
+            HashMap::from([("partition_col".to_string(), "test_partition".to_string())]),
+        )
+        .await?;
+    txn.add_files(add_meta);
+
+    match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 2);
+        }
+        _ => panic!("Partitioned overwrite commit should succeed"),
+    }
+
+    // Verify new snapshot has new schema with partition columns
+    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    assert!(new_snapshot.schema().field("value").is_some());
+    assert!(new_snapshot.schema().field("partition_col").is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_get_write_context_returns_new_schema(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("old_col", DataType::INTEGER),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) =
+        create_table_with_data(initial_schema.clone(), initial_data, &[]).await?;
+
+    let new_schema: SchemaRef = Arc::new(StructType::try_new(vec![
+        StructField::nullable("new_col_a", DataType::LONG),
+        StructField::nullable("new_col_b", DataType::STRING),
+        StructField::nullable("new_col_c", DataType::BOOLEAN),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let txn = overwrite_schema(snapshot.clone(), new_schema.clone(), vec![])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    let write_context = txn.get_write_context();
+    let logical_schema = write_context.logical_schema();
+
+    // Verify write context has exactly the new schema fields
+    assert_eq!(logical_schema.fields().len(), 3);
+    assert!(logical_schema.field("new_col_a").is_some());
+    assert!(logical_schema.field("new_col_b").is_some());
+    assert!(logical_schema.field("new_col_c").is_some());
+    assert!(logical_schema.field("old_col").is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_validation_empty_schema() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) =
+        create_table_with_data(initial_schema.clone(), initial_data, &[]).await?;
+
+    // Attempt to overwrite with an empty schema - should fail
+    let empty_schema: SchemaRef = Arc::new(StructType::new_unchecked(vec![]));
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let result = overwrite_schema(snapshot.clone(), empty_schema, vec![])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Schema cannot be empty"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_validation_bad_partition_col(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1]))],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) =
+        create_table_with_data(initial_schema.clone(), initial_data, &[]).await?;
+
+    let new_schema: SchemaRef = Arc::new(StructType::try_new(vec![
+        StructField::nullable("val", DataType::INTEGER),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let result = overwrite_schema(
+        snapshot.clone(),
+        new_schema,
+        vec!["nonexistent".to_string()],
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Partition column 'nonexistent' not found in schema"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_overwrite_schema_with_column_mapping() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Create a table with column mapping enabled
+    let initial_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+    ])?);
+
+    let initial_data = RecordBatch::try_new(
+        Arc::new(initial_schema.as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )?;
+
+    let (_tmp_dir, _table_path, table_url, engine) = create_table_with_data(
+        initial_schema.clone(),
+        initial_data,
+        &[("delta.columnMapping.mode", "name")],
+    )
+    .await?;
+
+    // Now overwrite schema
+    let new_schema: SchemaRef = Arc::new(StructType::try_new(vec![
+        StructField::nullable("new_col", DataType::LONG),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = overwrite_schema(snapshot.clone(), new_schema.clone(), vec![])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    // Write new data
+    let write_context = txn.get_write_context();
+    let new_data = RecordBatch::try_new(
+        Arc::new(new_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int64Array::from(vec![100]))],
+    )?;
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(new_data),
+            &write_context,
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_meta);
+
+    match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 2);
+        }
+        _ => panic!("Column mapping overwrite should succeed"),
+    }
+
+    // Verify: new snapshot has new schema
+    let new_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let schema = new_snapshot.schema();
+    assert_eq!(schema.fields().len(), 1);
+    assert!(schema.field("new_col").is_some());
+
+    // Verify: column mapping metadata was assigned (new schema field has column mapping metadata)
+    let meta_actions = read_actions_from_commit(&table_url, 2, "metaData")?;
+    let metadata_action = meta_actions
+        .first()
+        .expect("Should have metaData action");
+    let config = metadata_action
+        .get("configuration")
+        .expect("Should have configuration");
+    let max_col_id = config
+        .get("delta.columnMapping.maxColumnId")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<i64>().ok());
+    // The new schema has 1 field, so maxColumnId should be at least 3
+    // (initial schema had 2 fields with IDs 1,2, new schema adds ID 3)
+    assert!(
+        max_col_id.unwrap_or(0) >= 3,
+        "maxColumnId should continue from existing IDs, got: {:?}",
+        max_col_id
+    );
 
     Ok(())
 }

@@ -6,3 +6,4 @@
 #![allow(unreachable_pub, dead_code)]
 
 pub mod create_table;
+pub mod overwrite_schema;

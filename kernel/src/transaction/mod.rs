@@ -11,7 +11,8 @@ use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_commit_info_schema,
     get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
+    DomainMetadata, Metadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME,
+    PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
@@ -29,7 +30,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -52,6 +53,11 @@ pub(crate) mod create_table;
 pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
+
+#[cfg(feature = "internal-api")]
+pub mod overwrite_schema;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod overwrite_schema;
 
 mod update;
 
@@ -167,6 +173,14 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
+/// Marker type for overwrite-schema transactions.
+///
+/// Transactions in this state have a restricted API surface — operations like file removal,
+/// blind append, setting operation, and domain metadata removal are not available at compile time.
+/// The operation is hardcoded to `"OVERWRITE"` and files to remove are collected during build.
+#[derive(Debug)]
+pub struct OverwriteSchema;
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -175,6 +189,8 @@ pub struct CreateTable;
 /// - [`ExistingTable`] (default): Full API for modifying existing tables.
 /// - [`CreateTable`]: Restricted API for table creation (see
 ///   [`CreateTableTransaction`](create_table::CreateTableTransaction)).
+/// - [`OverwriteSchema`]: Restricted API for schema overwrite (see
+///   [`OverwriteSchemaTransaction`](overwrite_schema::OverwriteSchemaTransaction)).
 ///
 /// # Examples
 ///
@@ -225,7 +241,11 @@ pub struct Transaction<S = ExistingTable> {
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection.
     clustering_columns: Option<Vec<ColumnName>>,
-    // PhantomData marker for transaction state (ExistingTable or CreateTable).
+    // Override metadata for schema overwrite operations. When set, commit() emits this as a new
+    // Metadata action, and get_write_context() returns the new schema. Set via
+    // `OverwriteSchemaTransactionBuilder::build()`.
+    override_metadata: Option<Metadata>,
+    // PhantomData marker for transaction state (ExistingTable, CreateTable, or OverwriteSchema).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
 }
@@ -288,12 +308,27 @@ impl<S> Transaction<S> {
 
         self.validate_blind_append_semantics()?;
 
-        // CDF check only applies to existing tables (not create table)
+        // The type system prevents combining override_metadata with blind append or
+        // create table (OverwriteSchema state doesn't expose those methods), so these
+        // are defensive debug assertions rather than runtime checks.
+        debug_assert!(
+            self.override_metadata.is_none() || !self.is_blind_append,
+            "Schema overwrite is incompatible with blind append"
+        );
+        debug_assert!(
+            self.override_metadata.is_none() || !self.is_create_table(),
+            "Schema overwrite is incompatible with create table"
+        );
+
+        // CDF check only applies to existing tables (not create table or overwrite-schema).
+        // Overwrite-schema always removes all existing files and may add new ones — this is a
+        // full table replacement, not a row-level DML that requires CDC file generation.
         // If there are add and remove files with data change in the same transaction, we block it.
         // This is because kernel does not yet have a way to discern DML operations. For DML
         // operations that perform updates on rows, ChangeDataFeed requires that a `cdc` file be
         // written to the delta log.
         if !self.is_create_table()
+            && !self.is_overwrite_schema()
             && !self.add_files_metadata.is_empty()
             && !self.remove_files_metadata.is_empty()
             && self.data_change
@@ -332,7 +367,7 @@ impl<S> Transaction<S> {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // Step 3: Generate Protocol and Metadata actions for create-table
+        // Step 3: Generate Protocol and Metadata actions for create-table or schema overwrite
         let (protocol_action, metadata_action) = if self.is_create_table() {
             let table_config = self.read_snapshot.table_configuration();
             let protocol = table_config.protocol().clone();
@@ -345,6 +380,12 @@ impl<S> Transaction<S> {
             let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
 
             (Some(protocol_data), Some(metadata_data))
+        } else if let Some(ref new_metadata) = self.override_metadata {
+            // Schema overwrite: emit new Metadata action (no Protocol change)
+            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+            let metadata_data =
+                new_metadata.clone().into_engine_data(metadata_schema, engine)?;
+            (None, Some(metadata_data))
         } else {
             (None, None)
         };
@@ -516,6 +557,11 @@ impl<S> Transaction<S> {
             "CREATE TABLE transaction must have PRE_COMMIT_VERSION snapshot"
         );
         is_create
+    }
+
+    /// Returns true if this is an overwrite-schema transaction.
+    fn is_overwrite_schema(&self) -> bool {
+        self.override_metadata.is_some()
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
@@ -846,19 +892,61 @@ impl<S> Transaction<S> {
     /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
     #[allow(unused)]
     pub fn stats_columns(&self) -> Vec<ColumnName> {
+        // For schema overwrite, compute stats columns from the new schema and resolve
+        // logical names to physical names (matching the normal path's behavior).
+        if let Some(ref new_metadata) = self.override_metadata {
+            let table_properties = new_metadata.parse_table_properties();
+            let new_schema = new_metadata
+                .parse_schema()
+                .expect("override_metadata schema was validated during build");
+            let partition_columns = new_metadata.partition_columns();
+            // Get data columns (exclude partitions) for stats computation
+            let data_fields: Vec<_> = new_schema
+                .fields()
+                .filter(|f| !partition_columns.contains(&f.name().to_string()))
+                .cloned()
+                .collect();
+            let data_schema = StructType::new_unchecked(data_fields);
+            let logical_names = crate::scan::data_skipping::stats_schema::stats_column_names(
+                &data_schema,
+                &table_properties,
+                self.clustering_columns.as_deref(),
+            );
+            // Resolve logical names to physical names for column mapping compatibility.
+            // The new_schema has column mapping metadata assigned by the builder.
+            let column_mapping_mode = self
+                .read_snapshot
+                .table_configuration()
+                .column_mapping_mode();
+            return logical_names
+                .into_iter()
+                .filter_map(|col_name| {
+                    get_any_level_column_physical_name(&new_schema, &col_name, column_mapping_mode)
+                        .ok()
+                })
+                .collect();
+        }
         self.read_snapshot
             .table_configuration()
             .stats_column_names_physical(self.clustering_columns.as_deref())
     }
 
+    /// Returns the partition columns for this transaction, accounting for schema overwrite.
+    fn effective_partition_columns(&self) -> Vec<String> {
+        if let Some(ref new_metadata) = self.override_metadata {
+            new_metadata.partition_columns().to_vec()
+        } else {
+            self.read_snapshot
+                .table_configuration()
+                .partition_columns()
+                .to_vec()
+        }
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
-        let partition_cols = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
+        let partition_cols = self.effective_partition_columns();
         // Check if materializePartitionColumns feature is enabled
         let materialize_partition_columns = self
             .read_snapshot
@@ -884,21 +972,28 @@ impl<S> Transaction<S> {
     // have invalid metadata.
     pub fn get_write_context(&self) -> WriteContext {
         let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
         let column_mapping_mode = self
             .read_snapshot
             .table_configuration()
             .column_mapping_mode();
 
+        // Use override schema if present (schema overwrite), otherwise snapshot schema
+        let snapshot_schema = if let Some(ref new_metadata) = self.override_metadata {
+            Arc::new(
+                new_metadata
+                    .parse_schema()
+                    .expect("override_metadata schema was validated during build"),
+            )
+        } else {
+            self.read_snapshot.schema()
+        };
+
+        let logical_to_physical = self.generate_logical_to_physical();
+
         // Compute physical schema: exclude partition columns since they're stored in the path
         // (unless materializePartitionColumns is enabled), and apply column mapping to transform
         // logical field names to physical names.
-        let partition_columns: Vec<String> = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
+        let partition_columns = self.effective_partition_columns();
         let materialize_partition_columns = self
             .read_snapshot
             .table_configuration()
