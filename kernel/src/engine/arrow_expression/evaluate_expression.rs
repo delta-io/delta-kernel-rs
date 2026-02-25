@@ -1739,6 +1739,92 @@ mod tests {
     }
 
     #[test]
+    fn test_struct_with_nullability_predicate_nested_schema() {
+        // Nested struct as schema: outer struct has one field that is itself a struct.
+        let batch = create_batch_with_bool_col(
+            vec![Some(1), Some(2), Some(3)],
+            vec![Some(true), Some(false), Some(true)],
+        );
+        let inner_schema =
+            StructType::new_unchecked(vec![StructField::new("a", DataType::INTEGER, true)]);
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+            "nested",
+            DataType::Struct(Box::new(inner_schema)),
+            true,
+        )])));
+        let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
+        let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(struct_result.is_valid(0));
+        assert!(struct_result.is_null(1));
+        assert!(struct_result.is_valid(2));
+        // The "nested" column should itself be a StructArray with 3 rows
+        let nested = struct_result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(nested.len(), 3);
+    }
+
+    #[test]
+    fn test_struct_with_nullability_predicate_multiple_fields() {
+        // Multiple expressions: [column_expr_ref!("a"), column_expr_ref!("b")] with predicate.
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+            ArrowField::new("is_valid", ArrowDataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![
+            StructField::new("a", DataType::INTEGER, true),
+            StructField::new("b", DataType::INTEGER, true),
+        ])));
+        let expr = Expr::struct_with_nullability_from(
+            [column_expr_ref!("a"), column_expr_ref!("b")],
+            column_expr_ref!("is_valid"),
+        );
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(struct_result.is_valid(0), "row 0 should be valid");
+        assert!(struct_result.is_null(1), "row 1 should be null");
+        assert!(struct_result.is_valid(2), "row 2 should be valid");
+        validate_i32_column(struct_result, 0, &[1, 2, 3]);
+        validate_i32_column(struct_result, 1, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_struct_nullability_non_boolean_predicate_errors() {
+        // Non-boolean expression (Int32 column) as nullability predicate should error.
+        let batch = create_batch_with_bool_col(
+            vec![Some(1), Some(2), Some(3)],
+            vec![Some(true), Some(false), Some(true)],
+        );
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+            "a",
+            DataType::INTEGER,
+            true,
+        )])));
+        let expr =
+            Expr::struct_with_nullability_from([column_expr_ref!("a")], column_expr_ref!("a"));
+        let result = evaluate_expression(&expr, &batch, Some(&schema));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
     fn test_struct_no_result_type_errors() {
         // struct_from with result_type = None should return an error
         let batch = create_test_batch();
