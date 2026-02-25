@@ -259,7 +259,7 @@ pub(crate) fn coerce_batch_nullability(
                         type_mismatch_validator,
                     )
                 })
-                .try_collect::<Vec<_>>()?
+                .collect::<DeltaResult<Vec<_>>>()?
                 .into_iter()
                 .unzip();
         Ok(Arc::new(StructArray::try_new(
@@ -420,7 +420,7 @@ pub(crate) fn coerce_batch_nullability(
             .map(|((src_column, src_field), target_field)| {
                 coerce(src_column, src_field, target_field, type_mismatch_validator)
             })
-            .try_collect::<Vec<_>>()?
+            .collect::<DeltaResult<Vec<_>>>()?
             .into_iter()
             .unzip();
 
