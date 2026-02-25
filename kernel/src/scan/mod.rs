@@ -75,7 +75,7 @@ static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 #[allow(unused)]
 pub use crate::parallel::scan_metadata::{
-    AfterPhase1 as AfterPhase1ScanMetadata, Phase1ScanMetadata, Phase2ScanMetadata, Phase2State,
+    AfterPhase1ScanMetadata, Phase1ScanMetadata, Phase2ScanMetadata, Phase2State,
 };
 
 /// Builder to scan a snapshot of a table.

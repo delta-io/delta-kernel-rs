@@ -15,7 +15,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
 /// This enum indicates whether distributed processing is needed:
 /// - `Done`: All processing completed sequentially - no distributed phase needed.
 /// - `Phase2`: Contains state and files for parallel processing.
-pub enum AfterPhase1 {
+pub enum AfterPhase1ScanMetadata {
     Done,
     Phase2 {
         state: Phase2State,
@@ -39,11 +39,11 @@ impl Phase1ScanMetadata {
         Self { sequential, span }
     }
 
-    pub fn finish(self) -> DeltaResult<AfterPhase1> {
+    pub fn finish(self) -> DeltaResult<AfterPhase1ScanMetadata> {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterPhase1::Done),
-            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1::Phase2 {
+            AfterSequential::Done(_) => Ok(AfterPhase1ScanMetadata::Done),
+            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
                 state: Phase2State {
                     inner: processor.into(),
                     log_on_drop: Cell::new(false),

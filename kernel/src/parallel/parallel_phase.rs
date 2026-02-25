@@ -128,7 +128,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
-    use crate::parallel::scan_metadata::AfterPhase1;
+    use crate::parallel::scan_metadata::AfterPhase1ScanMetadata;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -405,8 +405,8 @@ mod tests {
         })?;
 
         match phase1.finish()? {
-            AfterPhase1::Done => {}
-            AfterPhase1::Phase2 { state, files } => {
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 use crate::parallel::scan_metadata::{Phase2ScanMetadata, Phase2State};
 
                 let processor = if with_serde {
