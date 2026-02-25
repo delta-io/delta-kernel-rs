@@ -316,8 +316,8 @@ pub enum RowEvent {
 
 /// An iterator over runs of selected and skipped rows in an engine-data batch.
 ///
-/// Each call to [`Iterator::next`] returns either a [`RowEvent::Skipped(n)`] for a run
-/// of `n` consecutive deselected rows, or a [`RowEvent::Row(range)`] for a contiguous
+/// Each call to [`Iterator::next`] returns either a [`RowEvent::Skipped`] for a run
+/// of `n` consecutive deselected rows, or a [`RowEvent::Row`] for a contiguous
 /// run of selected rows.
 ///
 /// Constructed internally and passed (alongside the column getters) to
@@ -425,8 +425,8 @@ pub trait FilteredRowVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]);
 
     /// Process this batch. `getters` contains one [`GetData`] item per requested column.
-    /// Iterate `rows` to receive [`RowEvent::Skipped(n)`] for runs of deselected rows and
-    /// [`RowEvent::Row(range)`] for contiguous runs of selected rows. Use
+    /// Iterate `rows` to receive [`RowEvent::Skipped`] for runs of deselected rows and
+    /// [`RowEvent::Row`] for contiguous runs of selected rows. Use
     /// `for row_index in range` to access individual rows within a run via `getters`.
     fn visit_filtered<'a>(
         &mut self,
@@ -436,9 +436,9 @@ pub trait FilteredRowVisitor {
 
     /// Visit the rows of a [`FilteredEngineData`], automatically respecting the selection vector.
     ///
-    /// Selected rows appear as [`RowEvent::Row(range)`] values yielded by the
+    /// Selected rows appear as [`RowEvent::Row`] values yielded by the
     /// [`RowIndexIterator`] handed to [`FilteredRowVisitor::visit_filtered`]; deselected rows appear as
-    /// [`RowEvent::Skipped(n)`].
+    /// [`RowEvent::Skipped`].
     fn visit_rows_of(&mut self, data: &FilteredEngineData) -> DeltaResult<()>
     where
         Self: Sized,
