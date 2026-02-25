@@ -2069,12 +2069,9 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: incremental snapshot panics when compaction files exist.
-    ///
-    /// The incremental snapshot path (try_new_from_impl) re-lists files from
-    /// the checkpoint version onwards. Before the fix, it deduplicated commit files but not
-    /// compaction files, producing duplicates that violated the sort invariant in
-    /// ListedLogFilesBuilder::build().
+    /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
+    /// version onwards. We must ensure that it deduplicates compaction files, since producing
+    /// duplicates violated the sort invariant in ListedLogFilesBuilder::build().
     #[tokio::test]
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
@@ -2111,11 +2108,10 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: incremental snapshot with new compaction files added after base snapshot.
-    ///
-    /// This test documents a limitation: the deduplication logic only checks the start version (lo),
-    /// not the hi version. So a new compaction file (1,3) added after building the base snapshot
-    /// at v2 gets filtered out because its start version (1) <= old_version (2).
+    /// This test documents a limitation: When deduplicating compactions, the deduplication logic
+    /// only checks the start version (lo), not the hi version. So a new compaction file (1,3)
+    /// added after building the base snapshot at v2 gets filtered out because its start version
+    /// (1) <= old_version (2).
     #[tokio::test]
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
