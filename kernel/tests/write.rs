@@ -79,11 +79,7 @@ fn get_parquet_field_id(parquet_file: &std::path::Path, physical_path: &[String]
     }
 
     let info = current.get_basic_info();
-    if info.has_id() {
-        Some(info.id())
-    } else {
-        None
-    }
+    info.has_id().then(|| info.id())
 }
 
 fn validate_txn_id(commit_info: &serde_json::Value) {
