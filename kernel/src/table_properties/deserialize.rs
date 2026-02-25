@@ -9,6 +9,7 @@ use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
+use crate::ParquetCompression;
 
 use tracing::warn;
 
@@ -93,6 +94,9 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
+        }
+        PARQUET_COMPRESSION_CODEC => {
+            props.parquet_compression_codec = ParquetCompression::from_str(v).ok()
         }
         _ => return None,
     }
@@ -218,6 +222,38 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table_properties::TableProperties;
+
+    #[test]
+    fn test_parse_parquet_compression_codec() {
+        let cases = [
+            ("uncompressed", ParquetCompression::Uncompressed),
+            ("UNCOMPRESSED", ParquetCompression::Uncompressed),
+            ("none", ParquetCompression::Uncompressed),
+            ("NONE", ParquetCompression::Uncompressed),
+            ("snappy", ParquetCompression::Snappy),
+            ("SNAPPY", ParquetCompression::Snappy),
+            ("gzip", ParquetCompression::Gzip),
+            ("GZIP", ParquetCompression::Gzip),
+            ("lz4", ParquetCompression::Lz4),
+            ("LZ4", ParquetCompression::Lz4),
+            ("zstd", ParquetCompression::Zstd),
+            ("ZSTD", ParquetCompression::Zstd),
+            ("Zstd", ParquetCompression::Zstd),
+        ];
+        for (input, expected) in cases {
+            let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, input)]);
+            assert_eq!(
+                props.parquet_compression_codec,
+                Some(expected),
+                "failed for input '{input}'"
+            );
+        }
+        // Unknown value: field stays None (key consumed, not in unknown_properties)
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "brotli")]);
+        assert_eq!(props.parquet_compression_codec, None);
+        assert!(!props.unknown_properties.contains_key(PARQUET_COMPRESSION_CODEC));
+    }
 
     #[test]
     fn test_parse_bool() {

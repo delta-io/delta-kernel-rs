@@ -34,7 +34,7 @@ use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
+    ParquetWriterConfig, RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -914,6 +914,15 @@ impl<S> Transaction<S> {
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
 
+        // Derive parquet writer config from table properties
+        let compression = self
+            .read_snapshot
+            .table_configuration()
+            .table_properties()
+            .parquet_compression_codec
+            .unwrap_or_default();
+        let parquet_writer_config = ParquetWriterConfig { compression };
+
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
@@ -921,6 +930,7 @@ impl<S> Transaction<S> {
             Arc::new(logical_to_physical),
             column_mapping_mode,
             stats_columns,
+            parquet_writer_config,
         )
     }
 
@@ -1214,6 +1224,8 @@ pub struct WriteContext {
     column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
+    /// Parquet writer configuration derived from table properties.
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 impl WriteContext {
@@ -1224,6 +1236,7 @@ impl WriteContext {
         logical_to_physical: ExpressionRef,
         column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
+        parquet_writer_config: ParquetWriterConfig,
     ) -> Self {
         WriteContext {
             target_dir,
@@ -1232,6 +1245,7 @@ impl WriteContext {
             logical_to_physical,
             column_mapping_mode,
             stats_columns,
+            parquet_writer_config,
         }
     }
 
@@ -1261,6 +1275,13 @@ impl WriteContext {
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
         &self.stats_columns
+    }
+
+    /// Returns the Parquet writer configuration derived from table properties.
+    ///
+    /// Based on `delta.parquet.compression.codec` table property.
+    pub fn parquet_writer_config(&self) -> &ParquetWriterConfig {
+        &self.parquet_writer_config
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.

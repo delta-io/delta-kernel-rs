@@ -1161,6 +1161,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            write_context.parquet_writer_config(),
         )
         .await?;
 
@@ -1335,6 +1336,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            write_context.parquet_writer_config(),
         )
         .await?;
 
