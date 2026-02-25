@@ -75,6 +75,7 @@ pub(crate) fn table_changes_action_iter(
                 stats_schema,
                 get_log_add_schema().clone(),
                 stats_expr,
+                Default::default(), // no partition columns for table changes
             )
         })
         .map(Arc::new);
