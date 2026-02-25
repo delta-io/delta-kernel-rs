@@ -685,18 +685,8 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
     ])
 }
 
-/// Asserts that a field exists at the given dot-separated path in a [`StructType`] schema,
-/// traversing into nested structs as needed. Panics if any segment of the path is missing
-/// or if a non-terminal segment is not a struct type.
-///
-/// # Example
-///
-/// ```ignore
-/// // Given schema: { address: { street: string, city: string } }
-/// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
-/// ```
-/// Resolves a nested field in a schema by path. Returns an error if any segment is missing
-/// or a non-terminal segment is not a struct type.
+/// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
+/// segment is missing or a non-terminal segment is not a struct type.
 pub fn resolve_field<'a>(
     schema: &'a delta_kernel::schema::StructType,
     path: &[impl AsRef<str>],
@@ -719,6 +709,15 @@ pub fn resolve_field<'a>(
         .ok_or_else(|| format!("schema missing field '{display}'"))
 }
 
+/// Asserts that a field exists at the given path in a [`StructType`] schema,
+/// traversing into nested structs as needed.
+///
+/// # Example
+///
+/// ```ignore
+/// // Given schema: { address: { street: string, city: string } }
+/// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
+/// ```
 pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
     resolve_field(schema, path).unwrap();
 }
