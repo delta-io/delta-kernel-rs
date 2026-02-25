@@ -307,7 +307,10 @@ fn process_nested_data_type(data_type: &DataType, max_id: &mut i64) -> DeltaResu
 /// Uses `StructType::walk_column_fields` to walk the column path through nested structs,
 /// then maps each field to its physical name based on the column mapping mode.
 ///
-/// Returns an error if the column name cannot be resolved in the schema.
+/// Returns an error if the column name cannot be resolved in the schema, or if column mapping is
+/// enabled but any field in the path lacks the required
+/// [`ColumnMetadataKey::ColumnMappingPhysicalName`] or [`ColumnMetadataKey::ColumnMappingId`]
+/// annotations.
 #[delta_kernel_derive::internal_api]
 pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
@@ -317,8 +320,27 @@ pub(crate) fn get_any_level_column_physical_name(
     let fields = schema.walk_column_fields(col_name)?;
     let physical_path: Vec<String> = fields
         .iter()
-        .map(|f| f.physical_name(column_mapping_mode).to_string())
-        .collect();
+        .map(|field| -> DeltaResult<String> {
+            if column_mapping_mode != ColumnMappingMode::None {
+                if !field.has_physical_name_annotation() {
+                    return Err(Error::Schema(format!(
+                        "Column mapping is enabled but field '{}' lacks the {} annotation",
+                        schema,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
+                    )));
+                }
+                if !field.has_id_annotation() {
+                    return Err(Error::Schema(format!(
+                        "Column mapping is enabled but field '{}' lacks the {} annotation",
+                        schema,
+                        ColumnMetadataKey::ColumnMappingId.as_ref()
+                    )));
+                }
+            }
+
+            Ok(field.physical_name(column_mapping_mode).to_string())
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
     Ok(ColumnName::new(physical_path))
 }
 
@@ -896,20 +918,32 @@ mod tests {
     #[test]
     fn test_get_any_level_column_physical_name_success() {
         let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
-            .add_metadata([(
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-inner-y".to_string()),
-            )])]);
+            .add_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-inner-y".to_string()),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+            ])]);
 
         let schema = StructType::new_unchecked([StructField::new(
             "a",
             DataType::Struct(Box::new(inner)),
             true,
         )
-        .add_metadata([(
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::String("col-outer-a".to_string()),
-        )])]);
+        .add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-outer-a".to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+        ])]);
 
         // Top-level column
         let result = get_any_level_column_physical_name(
@@ -930,7 +964,7 @@ mod tests {
             ColumnName::new(["col-outer-a", "col-inner-y"])
         );
 
-        // No mapping mode returns logical names
+        // No mapping mode returns logical names (annotations are ignored)
         let result = get_any_level_column_physical_name(
             &schema,
             &ColumnName::new(["a", "y"]),
@@ -958,5 +992,93 @@ mod tests {
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
+    }
+
+    // Verifies the invariant that `get_any_level_column_physical_name` always returns a
+    // `ColumnName` with the same number of path segments as the input. This is what makes
+    // the `.expect()` in `get_top_level_column_physical_name` unreachable.
+    #[test]
+    fn test_get_any_level_column_physical_name_preserves_path_length() {
+        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
+            .add_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String("col-y".to_string()),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(2),
+                ),
+            ])]);
+        let schema = StructType::new_unchecked([StructField::new(
+            "a",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-a".to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+        ])]);
+
+        for input in [ColumnName::new(["a"]), ColumnName::new(["a", "y"])] {
+            for mode in [
+                ColumnMappingMode::None,
+                ColumnMappingMode::Name,
+                ColumnMappingMode::Id,
+            ] {
+                let result = get_any_level_column_physical_name(&schema, &input, mode).unwrap();
+                assert_eq!(
+                    result.path().len(),
+                    input.path().len(),
+                    "path length must be preserved for input {input:?} in mode {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_any_level_column_physical_name_missing_id_annotation() {
+        // physicalName is present but id is missing on a nested field
+        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
+            .add_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-inner-y".to_string()),
+            )])]);
+
+        let schema = StructType::new_unchecked([StructField::new(
+            "a",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-outer-a".to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+        ])]);
+
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "y"]),
+            ColumnMappingMode::Name,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("delta.columnMapping.id"),
+            "Expected missing id annotation error, got: {}",
+            err_msg
+        );
     }
 }
