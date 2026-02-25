@@ -193,10 +193,7 @@ mod tests {
             .map(|path| FileActionKey::new(*path, None))
             .collect();
 
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        };
+        let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
 
         ScanLogReplayProcessor::new_with_seen_files(
             engine,

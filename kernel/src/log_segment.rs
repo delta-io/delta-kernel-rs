@@ -57,6 +57,14 @@ pub(crate) struct CheckpointReadInfo {
 
 impl Default for CheckpointReadInfo {
     fn default() -> Self {
+        Self::without_stats_parsed()
+    }
+}
+
+impl CheckpointReadInfo {
+    /// Create a CheckpointReadInfo configured to read checkpoints without using stats_parsed.
+    /// This is the standard configuration when stats_parsed optimization is not available.
+    pub(crate) fn without_stats_parsed() -> Self {
         Self {
             has_stats_parsed: false,
             checkpoint_read_schema: get_log_add_schema().clone(),

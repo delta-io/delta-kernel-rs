@@ -813,7 +813,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use crate::actions::{get_commit_schema, get_log_add_schema};
+    use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
@@ -847,10 +847,7 @@ mod tests {
     };
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
-        CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        }
+        CheckpointReadInfo::without_stats_parsed()
     }
 
     /// A minimal opaque predicate op for testing serialization behavior
