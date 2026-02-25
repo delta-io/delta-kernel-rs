@@ -38,7 +38,10 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
 
@@ -46,11 +49,38 @@ use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
     copy_directory, create_add_files_metadata, create_default_engine, create_table,
     create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
-    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, setup_test_tables,
-    test_read, test_table_setup, write_batch_to_table,
+    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
+    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
 };
 
 mod common;
+
+/// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
+/// or `None` if the field has no `field_id` set.
+///
+/// Panics if the file cannot be read or the physical path doesn't exist in the parquet schema.
+fn get_parquet_field_id(parquet_file: &std::path::Path, physical_path: &[String]) -> Option<i32> {
+    let file = std::fs::File::open(parquet_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let root = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone();
+
+    let mut current = &root;
+    for name in physical_path {
+        current = current
+            .get_fields()
+            .iter()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("parquet schema missing field '{name}'"));
+    }
+
+    let info = current.get_basic_info();
+    info.has_id().then(|| info.id())
+}
 
 fn validate_txn_id(commit_info: &serde_json::Value) {
     let txn_id = commit_info["txnId"]
@@ -3278,15 +3308,14 @@ async fn test_column_mapping_write(
         assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
     }
 
-    // Step 4: Read the parquet file footer (SchemaElement entries in the file metadata)
-    // to verify that columns are stored under their physical names, not logical names.
-    // Ref: https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
+    // Step 4: Read parquet footer to verify physical names and native field_id
     {
         let parquet_path = &add_actions
             .first()
             .expect("should have at least one add file")
             .path;
         let parquet_url = table_url.join(parquet_path)?;
+        let local_path = parquet_url.to_file_path().unwrap();
 
         let obj_meta = store
             .head(&Path::from_url_path(parquet_url.path())?)
@@ -3299,15 +3328,35 @@ async fn test_column_mapping_write(
         let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
         let footer_schema = footer.schema;
 
-        // Verify top-level "row_number" and nested "address.street" use correct (physical) names
-        for path in [
-            ColumnName::new(["row_number"]),
-            ColumnName::new(["address", "street"]),
-        ] {
+        let logical_schema = latest_snapshot.schema();
+        for logical_path in [&["row_number"][..], &["address", "street"]] {
+            let col = ColumnName::new(logical_path.iter().copied());
             let physical =
-                get_any_level_column_physical_name(latest_snapshot.schema().as_ref(), &path, cm)?
-                    .into_inner();
+                get_any_level_column_physical_name(logical_schema.as_ref(), &col, cm)?.into_inner();
             assert_schema_has_field(&footer_schema, &physical);
+
+            let field_id = get_parquet_field_id(&local_path, &physical);
+            let logical_field = resolve_field(logical_schema.as_ref(), logical_path).unwrap();
+            match cm_mode {
+                ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                    let expected_id =
+                        match logical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                            Some(MetadataValue::Number(n)) => *n as i32,
+                            other => panic!("expected ColumnMappingId number, got {other:?}"),
+                        };
+                    assert_eq!(
+                        field_id,
+                        Some(expected_id),
+                        "parquet field_id mismatch for {logical_path:?}"
+                    );
+                }
+                ColumnMappingMode::None => {
+                    assert_eq!(
+                        field_id, None,
+                        "parquet field_id should not be set in None column mapping mode"
+                    );
+                }
+            }
         }
     }
 

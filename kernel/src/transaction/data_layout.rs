@@ -28,9 +28,8 @@ pub enum DataLayout {
     None,
 
     /// Data files optimized for queries on clustering columns.
-    ///
-    /// Clustering columns must be top-level columns in the schema.
-    /// Maximum of 4 columns allowed.
+    /// Both top-level and nested columns are supported. Each column's leaf field must
+    /// have a stats-eligible primitive type.
     Clustered {
         /// Columns to cluster by (in order).
         columns: Vec<ColumnName>,
@@ -38,20 +37,30 @@ pub enum DataLayout {
 }
 
 impl DataLayout {
-    /// Create a clustered layout with the given columns.
+    /// Create a clustered layout with the given top-level column names.
+    ///
+    /// Each string is treated as a single top-level column name. For nested columns,
+    /// construct the [`DataLayout::Clustered`] variant directly with multi-segment
+    /// [`ColumnName`] values.
     ///
     /// This method constructs the layout without validation. Full validation
-    /// (column count, duplicates, schema compatibility, data types) is performed
-    /// during `CreateTableTransactionBuilder::build()` via `validate_clustering_columns()`.
+    /// (duplicates, schema compatibility, data types) is performed during
+    /// `CreateTableTransactionBuilder::build()` via `validate_clustering_columns()`.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `columns` - Column names to cluster by.
-    ///
-    /// # Example
+    /// Top-level columns:
     ///
     /// ```ignore
     /// let layout = DataLayout::clustered(["id", "timestamp"]);
+    /// ```
+    ///
+    /// Nested columns (construct the variant directly):
+    ///
+    /// ```ignore
+    /// let layout = DataLayout::Clustered {
+    ///     columns: vec![ColumnName::new(["user", "address", "city"])],
+    /// };
     /// ```
     pub fn clustered<I, S>(columns: I) -> Self
     where
