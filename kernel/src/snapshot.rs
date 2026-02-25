@@ -2018,4 +2018,137 @@ mod tests {
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }
+
+    /// Regression test: incremental snapshot panics when compaction files exist.
+    ///
+    /// The incremental snapshot path (try_new_from_impl) re-lists files from
+    /// the checkpoint version onwards. Before the fix, it deduplicated commit files but not
+    /// compaction files, producing duplicates that violated the sort invariant in
+    /// ListedLogFilesBuilder::build().
+    #[tokio::test]
+    async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create 3 commits.
+        let commit0 = vec![
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+            json!({
+                "add": {
+                    "path": "file1.parquet",
+                    "partitionValues": {},
+                    "size": 100,
+                    "modificationTime": 1000,
+                    "dataChange": true
+                }
+            }),
+        ];
+        commit(store.as_ref(), 0, commit0).await;
+
+        let commit1 = vec![json!({
+            "add": {
+                "path": "file2.parquet",
+                "partitionValues": {},
+                "size": 200,
+                "modificationTime": 2000,
+                "dataChange": true
+            }
+        })];
+        commit(store.as_ref(), 1, commit1).await;
+
+        let commit2 = vec![json!({
+            "add": {
+                "path": "file3.parquet",
+                "partitionValues": {},
+                "size": 300,
+                "modificationTime": 3000,
+                "dataChange": true
+            }
+        })];
+        commit(store.as_ref(), 2, commit2).await;
+
+        // Add two compaction files at the same lo version with different hi values.
+        // Both hi values are <= 2 (the base snapshot version), so both appear in the
+        // base segment. When the incremental listing re-lists these, the old
+        // extend-without-dedup produces [compact(1,1), compact(1,2), compact(1,1), compact(1,2)].
+        // The assertion checks consecutive pairs and fails at (1,2) vs (1,1) since hi 2 > 1.
+        let compaction_1_1 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        let compaction_1_2 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+
+        store
+            .put(
+                &test_utils::compacted_log_path_for_versions(1, 1, "json"),
+                compaction_1_1.into(),
+            )
+            .await?;
+        store
+            .put(
+                &test_utils::compacted_log_path_for_versions(1, 2, "json"),
+                compaction_1_2.into(),
+            )
+            .await?;
+
+        // Build version 2. The snapshot picks up both compaction files.
+        let snapshot_v2 = Snapshot::builder_for(url.clone())
+            .at_version(2)
+            .build(&engine)?;
+
+        // Verify the snapshot includes both compaction files
+        assert_eq!(
+            snapshot_v2.log_segment.ascending_compaction_files.len(),
+            2,
+            "Snapshot at version 2 should have 2 compaction files"
+        );
+
+        // Write version 3.
+        let commit3 = vec![json!({
+            "add": {
+                "path": "file4.parquet",
+                "partitionValues": {},
+                "size": 400,
+                "modificationTime": 4000,
+                "dataChange": true
+            }
+        })];
+        commit(store.as_ref(), 3, commit3).await;
+
+        // Build version 3 incrementally from version 2.
+        // Before the fix, this panicked because compaction files were duplicated in
+        // try_new_from_impl, violating the sort invariant in ListedLogFilesBuilder::build().
+        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+            .at_version(3)
+            .build(&engine)?;
+
+        // Verify the incremental build succeeded and has the correct version
+        assert_eq!(
+            snapshot_v3.version(),
+            3,
+            "Incremental snapshot should be at version 3"
+        );
+
+        // Verify compaction files are still present and not duplicated
+        assert_eq!(
+            snapshot_v3.log_segment.ascending_compaction_files.len(),
+            2,
+            "Snapshot at version 3 should still have 2 compaction files"
+        );
+
+        Ok(())
+    }
 }
