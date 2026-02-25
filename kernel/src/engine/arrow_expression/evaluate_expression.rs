@@ -25,7 +25,6 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::ensure_string_array;
 use crate::engine::arrow_utils::parse_json_impl;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::engine::ensure_data_types::ensure_data_types;
@@ -327,18 +326,10 @@ pub fn evaluate_expression(
         (ParseJson(p), _) => {
             // Evaluate the JSON string expression
             let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
-            let json_arr = ensure_string_array(&json_arr)?;
-            let json_strings =
-                json_arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Error::generic("ParseJson input must evaluate to a STRING column")
-                    })?;
 
             // Convert kernel schema to Arrow schema and parse
             let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(p.output_schema.as_ref())?);
-            let result = parse_json_impl(json_strings, arrow_schema)?;
+            let result = parse_json_impl(json_arr.as_ref(), arrow_schema)?;
 
             // Return as StructArray
             Ok(Arc::new(StructArray::from(result)) as ArrayRef)
