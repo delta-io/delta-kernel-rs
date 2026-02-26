@@ -10,4 +10,4 @@ pub mod sequential_phase;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod sequential_phase;
 
-pub mod parallel_scan_metadata;
+pub(crate) mod parallel_scan_metadata;

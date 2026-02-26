@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
+use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
@@ -75,6 +76,14 @@ impl AsRef<Phase2State> for Phase2State {
     }
 }
 
+impl ParallelLogReplayProcessor for Phase2State {
+    type Output = ScanMetadata;
+
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        self.inner.process_actions_batch(actions_batch)
+    }
+}
+
 impl Phase2State {
     /// Get the schema to use for reading checkpoint files.
     ///
@@ -93,9 +102,8 @@ impl Phase2State {
     /// Returns an error if the state cannot be serialized (e.g., contains opaque predicates).
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(&self) -> DeltaResult<SerializableScanState> {
-        let mut state = self.inner.into_serializable_state()?;
-        Ok(state)
+    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+        Arc::clone(&self.inner).as_ref().into_serializable_state()
     }
 
     /// Reconstruct a Phase2State from serialized state.
@@ -122,7 +130,7 @@ impl Phase2State {
     /// # Errors
     /// Returns an error if the state cannot be serialized.
     #[allow(unused)]
-    pub fn into_bytes(&self) -> DeltaResult<Vec<u8>> {
+    pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
         serde_json::to_vec(&state)
             .map_err(|e| Error::generic(format!("Failed to serialize Phase2State to bytes: {}", e)))
