@@ -42,10 +42,8 @@ struct InternalScanState {
     logical_stats_schema: Option<SchemaRef>,
     #[serde(default)]
     skip_stats: bool,
-    /// Physical names of partition columns referenced by the predicate
-    #[serde(default)]
-    partition_columns: HashSet<String>,
-    /// Schema of typed partition columns referenced by the predicate (physical names)
+    /// Schema of typed partition columns referenced by the predicate (physical names).
+    /// Used to build the partition extraction expression for data skipping.
     #[serde(default)]
     partition_stats_schema: Option<SchemaRef>,
 }
@@ -188,61 +186,31 @@ impl ScanLogReplayProcessor {
         // This avoids double JSON parsing - the transform parses JSON once, then data skipping
         // reads the already-parsed stats_parsed column from the transform output.
         //
-        // When partition columns are referenced by the predicate, we build a unified stats
-        // schema (data stats + partitionValues) and a combined extraction expression that
-        // projects both data stats from stats_parsed and partition values from the string map.
+        // When partition columns are referenced by the predicate, the filter also receives
+        // a partition schema + expression to extract typed partition values from the string map.
         // This enables mixed predicates (e.g. `WHERE part_col = 'X' OR data_col > 100`)
         // to be evaluated in a single columnar pass.
         let data_skipping_filter = if skip_stats {
             None
         } else {
-            let partition_stats_schema = state_info.partition_stats_schema.as_ref();
-            let has_partitions = partition_stats_schema.is_some_and(|s| s.num_fields() > 0);
-
-            if has_partitions || state_info.physical_stats_schema.is_some() {
-                // Build the unified stats schema: data stats + partition values.
-                // physical_stats_schema is already a full stats schema
-                // ({numRecords, nullCount, minValues, maxValues}), so we just
-                // append the partitionValues field when partition columns are present.
-                let unified_stats_schema = match (
-                    state_info.physical_stats_schema.as_ref(),
-                    partition_stats_schema.filter(|s| s.num_fields() > 0),
-                ) {
-                    (Some(stats), Some(pv_schema)) => {
-                        let mut fields: Vec<StructField> = stats.fields().cloned().collect();
-                        fields.push(StructField::nullable(
-                            "partitionValues",
-                            DataType::Struct(Box::new(pv_schema.as_ref().clone())),
-                        ));
-                        Some(Arc::new(StructType::new_unchecked(fields)))
-                    }
-                    (Some(stats), None) => Some(stats.clone()),
-                    (None, Some(pv_schema)) => Some(Arc::new(StructType::new_unchecked([
-                        StructField::nullable(
-                            "partitionValues",
-                            DataType::Struct(Box::new(pv_schema.as_ref().clone())),
-                        ),
-                    ]))),
-                    (None, None) => None,
-                };
-
-                unified_stats_schema.and_then(|schema| {
-                    let stats_expr = build_stats_extraction_expr(
-                        state_info.physical_stats_schema.as_ref(),
-                        partition_stats_schema,
-                    );
-                    DataSkippingFilter::new(
-                        engine,
-                        physical_predicate.clone(),
-                        schema,
-                        output_schema.clone(),
-                        stats_expr,
-                        state_info.partition_columns.clone(),
-                    )
-                })
-            } else {
-                None
-            }
+            let partition_schema = state_info.partition_stats_schema.as_ref();
+            let partition_expr = partition_schema
+                .filter(|s| s.num_fields() > 0)
+                .map(|pv_schema| {
+                    Arc::new(Expression::map_to_struct(
+                        Expression::column(["fileConstantValues", "partitionValues"]),
+                        Arc::new(pv_schema.as_ref().clone()),
+                    )) as ExpressionRef
+                });
+            DataSkippingFilter::new(
+                engine,
+                physical_predicate.clone(),
+                state_info.physical_stats_schema.as_ref(),
+                column_expr_ref!("stats_parsed"),
+                partition_schema,
+                partition_expr,
+                output_schema.clone(),
+            )
         };
 
         Ok(Self {
@@ -292,7 +260,6 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
-            partition_columns,
             partition_stats_schema,
         } = self.state_info.as_ref().clone();
 
@@ -312,7 +279,6 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             logical_stats_schema,
             skip_stats: self.skip_stats,
-            partition_columns,
             partition_stats_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
@@ -370,7 +336,6 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             logical_stats_schema: internal_state.logical_stats_schema,
-            partition_columns: internal_state.partition_columns,
             partition_stats_schema: internal_state.partition_stats_schema,
         });
 
@@ -630,47 +595,6 @@ fn get_add_transform_expr(
     }
 
     Arc::new(Expression::Struct(fields))
-}
-
-/// Builds an expression that extracts the unified stats struct (data stats + partition values)
-/// from the transformed scan row batch.
-///
-/// When partition columns are referenced by the predicate, the expression projects individual
-/// fields from `stats_parsed` and combines them with partition values extracted from the
-/// `fileConstantValues.partitionValues` string map.
-///
-/// When no partition columns are present, returns `column_expr!("stats_parsed")` directly.
-fn build_stats_extraction_expr(
-    data_stats_schema: Option<&SchemaRef>,
-    partition_schema: Option<&SchemaRef>,
-) -> ExpressionRef {
-    let pv_schema = partition_schema.filter(|s| s.num_fields() > 0);
-
-    let Some(pv_schema) = pv_schema else {
-        // No partition columns -- just read stats_parsed directly
-        return column_expr_ref!("stats_parsed");
-    };
-
-    // Convert the string-valued partition values map into a native typed struct in a single pass
-    let pv_struct = Arc::new(Expression::map_to_struct(
-        Expression::column(["fileConstantValues", "partitionValues"]),
-        Arc::new(pv_schema.as_ref().clone()),
-    ));
-
-    if data_stats_schema.is_some() {
-        // Combine data stats fields + partition values into a unified struct.
-        // Use separate path segments for nested column access (not dotted strings).
-        Arc::new(Expression::Struct(vec![
-            Arc::new(Expression::column(["stats_parsed", "numRecords"])),
-            Arc::new(Expression::column(["stats_parsed", "nullCount"])),
-            Arc::new(Expression::column(["stats_parsed", "minValues"])),
-            Arc::new(Expression::column(["stats_parsed", "maxValues"])),
-            pv_struct,
-        ]))
-    } else {
-        // Only partition columns, no data stats
-        Arc::new(Expression::Struct(vec![pv_struct]))
-    }
 }
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
@@ -995,7 +919,6 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
-            partition_columns: Default::default(),
             partition_stats_schema: None,
         });
         let iter = scan_action_iter(
@@ -1325,7 +1248,6 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 logical_stats_schema: None,
-                partition_columns: Default::default(),
                 partition_stats_schema: None,
             });
             let checkpoint_info = test_checkpoint_info();
@@ -1359,7 +1281,6 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
-            partition_columns: Default::default(),
             partition_stats_schema: None,
         });
         let processor =
@@ -1406,7 +1327,6 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
             skip_stats: false,
-            partition_columns: Default::default(),
             partition_stats_schema: None,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
@@ -1440,7 +1360,6 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
             skip_stats: false,
-            partition_columns: Default::default(),
             partition_stats_schema: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();

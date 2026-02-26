@@ -14,7 +14,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, SchemaRef};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
@@ -85,21 +85,25 @@ impl DataSkippingFilter {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators
     /// - `predicate`: Optional predicate for data skipping
-    /// - `stats_schema`: The stats schema (numRecords, nullCount, minValues, maxValues,
-    ///   and optionally partitionValues)
-    /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
-    /// - `stats_expr`: Expression to extract stats from the batch, producing output matching
+    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues).
+    ///   Pass `None` if no data stats are available.
+    /// - `stats_expr`: Expression to extract data stats from the batch, producing output matching
     ///   `stats_schema`. For example, `column_expr!("stats_parsed")` for pre-parsed stats, or
     ///   `Expression::parse_json(column_expr!("add.stats"), stats_schema)` for JSON parsing.
-    /// - `partition_columns`: Physical names of partition columns referenced by the predicate.
-    ///   These columns are rewritten to `partitionValues.*` instead of `minValues.*`/`maxValues.*`.
+    /// - `partition_schema`: Schema of typed partition columns referenced by the predicate
+    ///   (physical names). Pass `None` if no partition columns are referenced.
+    /// - `partition_expr`: Expression to extract partition values from the batch, producing output
+    ///   matching `partition_schema`. Typically a `MapToStruct` expression that converts the
+    ///   `partitionValues` string map into a typed struct.
+    /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
     pub(crate) fn new(
         engine: &dyn Engine,
         predicate: Option<PredicateRef>,
-        stats_schema: SchemaRef,
-        input_schema: SchemaRef,
+        stats_schema: Option<&SchemaRef>,
         stats_expr: ExpressionRef,
-        partition_columns: HashSet<String>,
+        partition_schema: Option<&SchemaRef>,
+        partition_expr: Option<ExpressionRef>,
+        input_schema: SchemaRef,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
@@ -107,12 +111,21 @@ impl DataSkippingFilter {
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
 
+        // Build the unified evaluation schema and extraction expression. Data stats and partition
+        // values are conceptually separate, but the evaluator needs a single schema/expression.
+        let (unified_schema, unified_expr, partition_columns) = Self::build_unified_schema_and_expr(
+            stats_schema,
+            stats_expr,
+            partition_schema,
+            partition_expr,
+        )?;
+
         let stats_evaluator = engine
             .evaluation_handler()
             .new_expression_evaluator(
                 input_schema,
-                stats_expr,
-                stats_schema.as_ref().clone().into(),
+                unified_expr,
+                unified_schema.as_ref().clone().into(),
             )
             .inspect_err(|e| error!("Failed to create stats evaluator: {e}"))
             .ok()?;
@@ -133,7 +146,7 @@ impl DataSkippingFilter {
         let skipping_evaluator = engine
             .evaluation_handler()
             .new_predicate_evaluator(
-                stats_schema.clone(),
+                unified_schema.clone(),
                 Arc::new(as_sql_data_skipping_predicate(
                     &predicate,
                     &partition_columns,
@@ -144,7 +157,7 @@ impl DataSkippingFilter {
 
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(stats_schema, FILTER_PRED.clone())
+            .new_predicate_evaluator(unified_schema, FILTER_PRED.clone())
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
@@ -153,6 +166,64 @@ impl DataSkippingFilter {
             skipping_evaluator,
             filter_evaluator,
         })
+    }
+
+    /// Builds the unified schema and extraction expression from separate data stats and partition
+    /// value inputs. Returns `None` if neither stats nor partition values are available.
+    fn build_unified_schema_and_expr(
+        stats_schema: Option<&SchemaRef>,
+        stats_expr: ExpressionRef,
+        partition_schema: Option<&SchemaRef>,
+        partition_expr: Option<ExpressionRef>,
+    ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
+        let has_stats = stats_schema.is_some();
+        let pv_schema = partition_schema.filter(|s| s.num_fields() > 0);
+        let has_partitions = pv_schema.is_some();
+
+        if !has_stats && !has_partitions {
+            return None;
+        }
+
+        let partition_columns: HashSet<String> = pv_schema
+            .map(|s| s.fields().map(|f| f.name().to_string()).collect())
+            .unwrap_or_default();
+
+        let unified_schema = match (stats_schema, pv_schema) {
+            (Some(stats), Some(pv)) => {
+                let mut fields: Vec<StructField> = stats.fields().cloned().collect();
+                fields.push(StructField::nullable(
+                    "partitionValues",
+                    DataType::Struct(Box::new(pv.as_ref().clone())),
+                ));
+                Arc::new(StructType::new_unchecked(fields))
+            }
+            (Some(stats), None) => stats.clone(),
+            (None, Some(pv)) => Arc::new(StructType::new_unchecked([StructField::nullable(
+                "partitionValues",
+                DataType::Struct(Box::new(pv.as_ref().clone())),
+            )])),
+            (None, None) => unreachable!("checked above"),
+        };
+
+        let unified_expr = match (has_stats, pv_schema, partition_expr) {
+            (true, Some(_), Some(pv_expr)) => {
+                // Combine data stats fields + partition values into a unified struct
+                Arc::new(Expr::Struct(vec![
+                    Arc::new(Expr::column(["stats_parsed", "numRecords"])),
+                    Arc::new(Expr::column(["stats_parsed", "nullCount"])),
+                    Arc::new(Expr::column(["stats_parsed", "minValues"])),
+                    Arc::new(Expr::column(["stats_parsed", "maxValues"])),
+                    pv_expr,
+                ]))
+            }
+            (false, Some(_), Some(pv_expr)) => {
+                // Only partition columns, no data stats
+                Arc::new(Expr::Struct(vec![pv_expr]))
+            }
+            _ => stats_expr,
+        };
+
+        Some((unified_schema, unified_expr, partition_columns))
     }
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector

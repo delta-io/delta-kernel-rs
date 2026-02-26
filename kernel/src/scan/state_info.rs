@@ -36,12 +36,9 @@ pub(crate) struct StateInfo {
     /// the engine receives stats with physical column names (for column mapping). This
     /// logical schema maps those stats back to the table's logical column names.
     pub(crate) logical_stats_schema: Option<SchemaRef>,
-    /// Physical names of partition columns referenced by the predicate.
-    /// Used by data skipping to rewrite partition column references to `partitionValues.*`
-    /// instead of `minValues.*`/`maxValues.*`.
-    pub(crate) partition_columns: HashSet<String>,
     /// Schema of typed partition columns referenced by the predicate (physical names).
-    /// Used to build the `partitionValues` struct in the unified stats schema for data skipping.
+    /// Used by `DataSkippingFilter` to build the partition extraction expression and to
+    /// derive which columns should be rewritten to `partitionValues.*`.
     pub(crate) partition_stats_schema: Option<SchemaRef>,
 }
 
@@ -293,12 +290,6 @@ impl StateInfo {
                 (None, _) => (None, None, None),
             };
 
-        // Collect the physical partition column names that are actually referenced by the predicate
-        let partition_columns_in_predicate: HashSet<String> = partition_stats_schema
-            .as_ref()
-            .map(|s| s.fields().map(|f| f.name().to_string()).collect())
-            .unwrap_or_default();
-
         let transform_spec =
             if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
                 Some(Arc::new(transform_spec))
@@ -314,7 +305,6 @@ impl StateInfo {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
-            partition_columns: partition_columns_in_predicate,
             partition_stats_schema,
         })
     }

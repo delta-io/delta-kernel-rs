@@ -150,7 +150,6 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
         logical_stats_schema: None,
-        partition_columns: Default::default(),
         partition_stats_schema: None,
     });
     let checkpoint_info = CheckpointReadInfo {

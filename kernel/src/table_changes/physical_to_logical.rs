@@ -186,7 +186,6 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
-            partition_columns: Default::default(),
             partition_stats_schema: None,
         }
     }
@@ -409,7 +408,6 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
-            partition_columns: Default::default(),
             partition_stats_schema: None,
         };
 
