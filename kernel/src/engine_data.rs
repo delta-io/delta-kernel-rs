@@ -1,7 +1,7 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
 use std::collections::HashMap;
-use std::ops::Range;
+use std::iter::Peekable;
 
 use tracing::debug;
 
@@ -309,9 +309,8 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
 pub enum RowEvent {
     /// A run of consecutive rows that were filtered out by the selection vector.
     Skipped(usize),
-    /// A contiguous run of selected rows as a half-open range of absolute row indices.
-    /// Use `for row_index in range` to iterate over the individual rows.
-    Row(Range<usize>),
+    /// A single selected row index.
+    Row(usize),
 }
 
 /// An iterator over the indices of selected rows in an engine-data batch.
@@ -342,7 +341,12 @@ impl<'sv> RowIndexIterator<'sv> {
     /// and skipped rows. Use when you need to account for deselected row positions — for
     /// example to emit `null` values for alignment.
     pub fn row_events(self) -> impl Iterator<Item = RowEvent> + 'sv {
-        RowEventIter(self)
+        let row_count = self.row_count;
+        RowEventIter {
+            inner: self.peekable(),
+            next_expected: 0,
+            row_count,
+        }
     }
 }
 
@@ -364,48 +368,27 @@ impl<'sv> Iterator for RowIndexIterator<'sv> {
 /// An iterator that yields [`RowEvent`] items (runs of selected/skipped rows).
 ///
 /// Produced by [`RowIndexIterator::row_events`].
-struct RowEventIter<'sv>(RowIndexIterator<'sv>);
+struct RowEventIter<'sv> {
+    inner: Peekable<RowIndexIterator<'sv>>,
+    next_expected: usize,
+    row_count: usize,
+}
 
 impl<'sv> Iterator for RowEventIter<'sv> {
     type Item = RowEvent;
 
     fn next(&mut self) -> Option<RowEvent> {
-        let inner = &mut self.0;
-        if inner.sv_pos < inner.selection_vector.len() {
-            if !inner.selection_vector[inner.sv_pos] {
-                // Count the consecutive deselected run.
-                let mut count = 0;
-                while inner.sv_pos < inner.selection_vector.len()
-                    && !inner.selection_vector[inner.sv_pos]
-                {
-                    inner.sv_pos += 1;
-                    count += 1;
-                }
-                return Some(RowEvent::Skipped(count));
-            }
-            // Extend the selected run to its end.
-            let start = inner.sv_pos;
-            while inner.sv_pos < inner.selection_vector.len()
-                && inner.selection_vector[inner.sv_pos]
-            {
-                inner.sv_pos += 1;
-            }
-            // If the run reaches the end of the selection vector, fold in the implicit
-            // tail rows (rows beyond sv.len() are always selected).
-            if inner.sv_pos == inner.selection_vector.len() {
-                inner.sv_pos = inner.row_count; // sentinel: tail consumed
-                return Some(RowEvent::Row(start..inner.row_count));
-            }
-            return Some(RowEvent::Row(start..inner.sv_pos));
+        // Yield a Skipped event if there's a gap before the next selected index (or end of data).
+        let gap_end = self.inner.peek().copied().unwrap_or(self.row_count);
+        if gap_end > self.next_expected {
+            let n = gap_end - self.next_expected;
+            self.next_expected = gap_end;
+            return Some(RowEvent::Skipped(n));
         }
-        // Tail rows beyond the selection vector: all implicitly selected.
-        // Only reached when the skip loop exhausted the sv (trailing deselected rows).
-        if inner.sv_pos < inner.row_count {
-            let range = inner.sv_pos..inner.row_count;
-            inner.sv_pos = inner.row_count;
-            return Some(RowEvent::Row(range));
-        }
-        None
+        self.inner.next().map(|idx| {
+            self.next_expected = idx + 1;
+            RowEvent::Row(idx)
+        })
     }
 }
 
@@ -833,17 +816,17 @@ mod tests {
 
     #[rstest]
     #[case(0, &[], vec![])]
-    #[case(3, &[], vec![RowEvent::Row(0..3)])]
-    #[case(3, &[true, true, true], vec![RowEvent::Row(0..3)])]
+    #[case(3, &[], vec![RowEvent::Row(0), RowEvent::Row(1), RowEvent::Row(2)])]
+    #[case(3, &[true, true, true], vec![RowEvent::Row(0), RowEvent::Row(1), RowEvent::Row(2)])]
     #[case(3, &[false, false, false], vec![RowEvent::Skipped(3)])]
-    #[case(5, &[true, false, false, true, true], vec![RowEvent::Row(0..1), RowEvent::Skipped(2), RowEvent::Row(3..5)])]
-    #[case(4, &[false, false, true, true], vec![RowEvent::Skipped(2), RowEvent::Row(2..4)])]
-    #[case(3, &[true, false, false], vec![RowEvent::Row(0..1), RowEvent::Skipped(2)])]
-    // sv shorter than row_count: trailing true run folds in implicit tail rows
-    #[case(4, &[false, true], vec![RowEvent::Skipped(1), RowEvent::Row(1..4)])]
-    // sv shorter than row_count: tail rows emitted as a separate run after a skipped block
-    #[case(4, &[true, false], vec![RowEvent::Row(0..1), RowEvent::Skipped(1), RowEvent::Row(2..4)])]
-    #[case(4, &[false, true, false, true], vec![RowEvent::Skipped(1), RowEvent::Row(1..2), RowEvent::Skipped(1), RowEvent::Row(3..4)])]
+    #[case(5, &[true, false, false, true, true], vec![RowEvent::Row(0), RowEvent::Skipped(2), RowEvent::Row(3), RowEvent::Row(4)])]
+    #[case(4, &[false, false, true, true], vec![RowEvent::Skipped(2), RowEvent::Row(2), RowEvent::Row(3)])]
+    #[case(3, &[true, false, false], vec![RowEvent::Row(0), RowEvent::Skipped(2)])]
+    #[case(3, &[false, true, false], vec![RowEvent::Skipped(1), RowEvent::Row(1), RowEvent::Skipped(1)])]
+    // sv shorter than row_count: tail rows implicitly selected
+    #[case(4, &[false, true], vec![RowEvent::Skipped(1), RowEvent::Row(1), RowEvent::Row(2), RowEvent::Row(3)])]
+    #[case(4, &[true, false], vec![RowEvent::Row(0), RowEvent::Skipped(1), RowEvent::Row(2), RowEvent::Row(3)])]
+    #[case(4, &[false, true, false, true], vec![RowEvent::Skipped(1), RowEvent::Row(1), RowEvent::Skipped(1), RowEvent::Row(3)])]
     fn row_event_iter(
         #[case] row_count: usize,
         #[case] selection: &[bool],

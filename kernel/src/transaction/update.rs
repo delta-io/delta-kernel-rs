@@ -583,32 +583,30 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                         self.new_dv_entries.push(null_dv());
                     }
                 }
-                RowEvent::Row(range) => {
-                    for row_index in range {
-                        let path_opt: Option<String> =
-                            getters[Self::PATH_INDEX].get_opt(row_index, "path")?;
-                        let Some(path) = path_opt else {
-                            // Null path means a non-add action row (remove, metadata, etc.)
-                            self.new_dv_entries.push(null_dv());
-                            continue;
-                        };
-                        if let Some(dv_result) = self.dv_updates.get(&path) {
-                            self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
-                                DeletionVectorDescriptor::to_schema()
-                                    .into_fields()
-                                    .collect(),
-                                vec![
-                                    Scalar::from(dv_result.storage_type.to_string()),
-                                    Scalar::from(dv_result.path_or_inline_dv.clone()),
-                                    Scalar::from(dv_result.offset),
-                                    Scalar::from(dv_result.size_in_bytes),
-                                    Scalar::from(dv_result.cardinality),
-                                ],
-                            )?));
-                            self.matched_file_indexes.push(row_index);
-                        } else {
-                            self.new_dv_entries.push(null_dv());
-                        }
+                RowEvent::Row(row_index) => {
+                    let path_opt: Option<String> =
+                        getters[Self::PATH_INDEX].get_opt(row_index, "path")?;
+                    let Some(path) = path_opt else {
+                        // Null path means a non-add action row (remove, metadata, etc.)
+                        self.new_dv_entries.push(null_dv());
+                        continue;
+                    };
+                    if let Some(dv_result) = self.dv_updates.get(&path) {
+                        self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
+                            DeletionVectorDescriptor::to_schema()
+                                .into_fields()
+                                .collect(),
+                            vec![
+                                Scalar::from(dv_result.storage_type.to_string()),
+                                Scalar::from(dv_result.path_or_inline_dv.clone()),
+                                Scalar::from(dv_result.offset),
+                                Scalar::from(dv_result.size_in_bytes),
+                                Scalar::from(dv_result.cardinality),
+                            ],
+                        )?));
+                        self.matched_file_indexes.push(row_index);
+                    } else {
+                        self.new_dv_entries.push(null_dv());
                     }
                 }
             }
