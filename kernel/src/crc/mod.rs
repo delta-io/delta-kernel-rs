@@ -50,7 +50,6 @@ pub(crate) struct Crc {
     #[serde(skip)]
     pub(crate) set_transactions: Option<Vec<SetTransaction>>,
     /// Live [`DomainMetadata`] actions at this version, excluding tombstones.
-    #[serde(skip)]
     pub(crate) domain_metadata: Option<Vec<DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
     #[serde(skip)]
