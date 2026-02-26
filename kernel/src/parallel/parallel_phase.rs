@@ -386,6 +386,7 @@ mod tests {
         predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
+        skip_stats: bool,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
@@ -395,6 +396,7 @@ mod tests {
         if let Some(pred) = predicate {
             builder = builder.with_predicate(pred);
         }
+        builder = builder.with_skip_stats(skip_stats);
         let scan = builder.build()?;
         let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
 
@@ -479,6 +481,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    false,
                 )?;
             }
         }
@@ -494,6 +497,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    false,
                 )?;
             }
         }
@@ -509,6 +513,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    false,
                 )?;
             }
         }
@@ -527,6 +532,23 @@ mod tests {
                     Some(predicate.clone()),
                     with_serde,
                     one_file_per_worker,
+                    false,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+        for with_serde in [false, true] {
+            for one_file_per_worker in [false, true] {
+                verify_parallel_workflow(
+                    "v2-checkpoints-json-with-sidecars",
+                    None,
+                    with_serde,
+                    one_file_per_worker,
+                    true,
                 )?;
             }
         }
