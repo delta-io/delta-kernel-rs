@@ -821,10 +821,11 @@ impl Scan {
     ///     }
     ///     AfterPhase1ScanMetadata::Phase2 { state, files } => {
     ///         // Distribute files for parallel processing (e.g., one file per worker)
+    ///         let state = Arc::new(state);
     ///         for file in files {
     ///             let phase2 = Phase2ScanMetadata::try_new(
     ///                 engine.clone(),
-    ///                 &state,
+    ///                 state.clone(),
     ///                 vec![file],
     ///             )?;
     ///             for result in phase2 {

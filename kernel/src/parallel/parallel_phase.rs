@@ -254,8 +254,12 @@ mod tests {
             size: get_file_size(&store, sidecar_path).await,
         };
 
-        let mut parallel =
-            ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta], CHECKPOINT_READ_SCHEMA.clone())?;
+        let mut parallel = ParallelPhase::try_new(
+            Arc::new(engine),
+            processor.clone(),
+            vec![file_meta],
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -341,7 +345,12 @@ mod tests {
             },
         ];
 
-        let mut parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas, CHECKPOINT_READ_SCHEMA.clone())?;
+        let mut parallel = ParallelPhase::try_new(
+            Arc::new(engine),
+            processor.clone(),
+            file_metas,
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -430,7 +439,7 @@ mod tests {
                     .into_iter()
                     .map(|partition_files| {
                         let engine = engine.clone();
-                        let state = Arc::clone(&final_state);
+                        let state = final_state.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
@@ -574,7 +583,8 @@ mod tests {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 // Verify stats is None in phase2 results and collect paths
-                let mut phase2 = Phase2ScanMetadata::try_new(engine.clone(), Arc::new(state), files)?;
+                let mut phase2 =
+                    Phase2ScanMetadata::try_new(engine.clone(), Arc::new(state), files)?;
 
                 let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
