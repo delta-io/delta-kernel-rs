@@ -321,6 +321,7 @@ pub(crate) fn get_top_level_column_physical_name(
 /// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
 ///
 /// Returns an error if the column name cannot be resolved in the schema.
+#[delta_kernel_derive::internal_api]
 pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
     col_name: &ColumnName,

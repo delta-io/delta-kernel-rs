@@ -124,7 +124,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("A catalog committer must be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
+            crate::Error::Generic(e) if e.contains("A catalog committer must be used to commit to catalog-managed tables. Please provide a catalog committer via Snapshot::transaction().")
         ));
     }
 
