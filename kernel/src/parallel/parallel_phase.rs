@@ -386,7 +386,6 @@ mod tests {
         predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
-        skip_stats: bool,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
@@ -396,7 +395,6 @@ mod tests {
         if let Some(pred) = predicate {
             builder = builder.with_predicate(pred);
         }
-        builder = builder.with_skip_stats(skip_stats);
         let scan = builder.build()?;
         let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
 
@@ -410,30 +408,6 @@ mod tests {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
-
-                // Verify checkpoint schema contains stats field iff skip_stats is false
-                let checkpoint_schema = &state.checkpoint_info.checkpoint_read_schema;
-                let add_field = checkpoint_schema
-                    .fields()
-                    .find(|f| f.name() == "add")
-                    .expect("checkpoint schema should contain add field");
-                let add_struct = match add_field.data_type() {
-                    crate::schema::DataType::Struct(s) => s,
-                    _ => panic!("add field should be a struct"),
-                };
-                let has_stats = add_struct.fields().any(|f| f.name() == "stats");
-
-                if skip_stats {
-                    assert!(
-                        !has_stats,
-                        "When skip_stats=true, checkpoint schema should NOT contain stats field"
-                    );
-                } else {
-                    assert!(
-                        has_stats,
-                        "When skip_stats=false, checkpoint schema should contain stats field"
-                    );
-                }
 
                 let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
@@ -503,7 +477,6 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
-                    false,
                 )?;
             }
         }
@@ -519,7 +492,6 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
-                    false,
                 )?;
             }
         }
@@ -535,7 +507,6 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
-                    false,
                 )?;
             }
         }
@@ -554,7 +525,6 @@ mod tests {
                     Some(predicate.clone()),
                     with_serde,
                     one_file_per_worker,
-                    false,
                 )?;
             }
         }
@@ -563,18 +533,68 @@ mod tests {
 
     #[test]
     fn test_parallel_with_skip_stats() -> DeltaResult<()> {
-        // verify_parallel_workflow validates that stats field is excluded when skip_stats=true
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                    true,
+        use crate::scan::CHECKPOINT_READ_SCHEMA_NO_STATS;
+
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+
+        let scan = snapshot
+            .scan_builder()
+            .with_skip_stats(true)
+            .build()?;
+
+        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+
+        // Verify stats is None in phase1 results
+        let _: Vec<()> = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<()>, scan_file| {
+                assert!(
+                    scan_file.stats.is_none(),
+                    "When skip_stats=true, scan_file.stats should be None"
+                );
+                ps.push(());
+            })
+        })?;
+
+        match phase1.finish()? {
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+                use crate::parallel::parallel_scan_metadata::Phase2ScanMetadata;
+
+                // Verify checkpoint schema does NOT contain stats field
+                let checkpoint_schema = &state.checkpoint_info.checkpoint_read_schema;
+                let add_field = checkpoint_schema
+                    .fields()
+                    .find(|f| f.name() == "add")
+                    .expect("checkpoint schema should contain add field");
+                let add_struct = match add_field.data_type() {
+                    crate::schema::DataType::Struct(s) => s,
+                    _ => panic!("add field should be a struct"),
+                };
+                let has_stats = add_struct.fields().any(|f| f.name() == "stats");
+                assert!(
+                    !has_stats,
+                    "When skip_stats=true, checkpoint schema should NOT contain stats field"
+                );
+
+                // Verify stats is None in phase2 results
+                let mut phase2 = Phase2ScanMetadata::try_new(
+                    engine.clone(),
+                    state,
+                    files,
                 )?;
+
+                let _: Vec<()> = phase2.try_fold(Vec::new(), |acc, metadata_res| {
+                    metadata_res?.visit_scan_files(acc, |ps: &mut Vec<()>, scan_file| {
+                        assert!(
+                            scan_file.stats.is_none(),
+                            "When skip_stats=true, scan_file.stats should be None in phase2"
+                        );
+                        ps.push(());
+                    })
+                })?;
             }
         }
+
         Ok(())
     }
 }
