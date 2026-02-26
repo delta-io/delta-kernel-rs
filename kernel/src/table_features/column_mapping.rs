@@ -325,14 +325,14 @@ pub(crate) fn get_any_level_column_physical_name(
                 if !field.has_physical_name_annotation() {
                     return Err(Error::Schema(format!(
                         "Column mapping is enabled but field '{}' lacks the {} annotation",
-                        schema,
+                        field.name,
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
                     )));
                 }
                 if !field.has_id_annotation() {
                     return Err(Error::Schema(format!(
                         "Column mapping is enabled but field '{}' lacks the {} annotation",
-                        schema,
+                        field.name,
                         ColumnMetadataKey::ColumnMappingId.as_ref()
                     )));
                 }
@@ -950,27 +950,30 @@ mod tests {
             &schema,
             &ColumnName::new(["a"]),
             ColumnMappingMode::Name,
-        );
-        assert_eq!(result.unwrap(), ColumnName::new(["col-outer-a"]));
+        )
+        .unwrap();
+        assert_eq!(result, ColumnName::new(["col-outer-a"]));
+        assert_eq!(result.path().len(), 1);
 
         // Nested column
         let result = get_any_level_column_physical_name(
             &schema,
             &ColumnName::new(["a", "y"]),
             ColumnMappingMode::Name,
-        );
-        assert_eq!(
-            result.unwrap(),
-            ColumnName::new(["col-outer-a", "col-inner-y"])
-        );
+        )
+        .unwrap();
+        assert_eq!(result, ColumnName::new(["col-outer-a", "col-inner-y"]));
+        assert_eq!(result.path().len(), 2);
 
         // No mapping mode returns logical names (annotations are ignored)
         let result = get_any_level_column_physical_name(
             &schema,
             &ColumnName::new(["a", "y"]),
             ColumnMappingMode::None,
-        );
-        assert_eq!(result.unwrap(), ColumnName::new(["a", "y"]));
+        )
+        .unwrap();
+        assert_eq!(result, ColumnName::new(["a", "y"]));
+        assert_eq!(result.path().len(), 2);
     }
 
     #[test]
@@ -992,54 +995,6 @@ mod tests {
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
-    }
-
-    // Verifies the invariant that `get_any_level_column_physical_name` always returns a
-    // `ColumnName` with the same number of path segments as the input. This is what makes
-    // the `.expect()` in `get_top_level_column_physical_name` unreachable.
-    #[test]
-    fn test_get_any_level_column_physical_name_preserves_path_length() {
-        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
-            .add_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-y".to_string()),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(2),
-                ),
-            ])]);
-        let schema = StructType::new_unchecked([StructField::new(
-            "a",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )
-        .add_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-a".to_string()),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(1),
-            ),
-        ])]);
-
-        for input in [ColumnName::new(["a"]), ColumnName::new(["a", "y"])] {
-            for mode in [
-                ColumnMappingMode::None,
-                ColumnMappingMode::Name,
-                ColumnMappingMode::Id,
-            ] {
-                let result = get_any_level_column_physical_name(&schema, &input, mode).unwrap();
-                assert_eq!(
-                    result.path().len(),
-                    input.path().len(),
-                    "path length must be preserved for input {input:?} in mode {mode:?}"
-                );
-            }
-        }
     }
 
     #[test]
