@@ -1,13 +1,15 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
-    NullBufferBuilder, RecordBatch, StringArray, StructArray,
+    self as arrow_array, make_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray,
+    BooleanArray, Datum, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
+    StructArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
@@ -35,7 +37,7 @@ use crate::expressions::{
     Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::schema::{DataType, StructType};
+use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
 pub(super) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
@@ -341,6 +343,11 @@ pub fn evaluate_expression(
             // Return as StructArray
             Ok(Arc::new(StructArray::from(result)) as ArrayRef)
         }
+        (MapToStruct(m), _) => {
+            let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
+            let result = evaluate_map_to_struct(&map_arr, m.output_schema.as_ref())?;
+            Ok(Arc::new(result) as ArrayRef)
+        }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
 }
@@ -630,6 +637,109 @@ pub fn coalesce_arrays(
     }
 
     Ok(make_array(mutable.freeze()))
+}
+
+/// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
+/// and parses each value into its target type using Delta's partition value serialization rules,
+/// producing a `StructArray`.
+///
+/// - Missing keys produce null values
+/// - Parse errors are propagated (indicating a broken table)
+/// - Duplicate map keys are resolved by taking the rightmost entry
+fn evaluate_map_to_struct(
+    map_arr: &ArrayRef,
+    output_schema: &StructType,
+) -> DeltaResult<StructArray> {
+    let map_array = map_arr
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| Error::generic("MapToStruct requires a MapArray as input"))?;
+
+    let map_keys = map_array
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::generic("MapToStruct requires maps with string keys"))?;
+    let map_values = map_array
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::generic("MapToStruct requires maps with string values"))?;
+
+    let num_rows = map_array.len();
+    let fields: Vec<&StructField> = output_schema.fields().collect();
+
+    // Pre-build a builder and resolve the PrimitiveType for each output field.
+    let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::with_capacity(fields.len());
+    let mut primitive_types: Vec<&PrimitiveType> = Vec::with_capacity(fields.len());
+    for field in &fields {
+        let prim = match field.data_type() {
+            DataType::Primitive(p) => p,
+            other => {
+                return Err(Error::generic(format!(
+                    "MapToStruct only supports primitive target types, got {other:?}"
+                )));
+            }
+        };
+        primitive_types.push(prim);
+        let arrow_type = ArrowDataType::try_from_kernel(field.data_type())?;
+        builders.push(arrow_array::make_builder(&arrow_type, num_rows));
+    }
+
+    // Reusable HashMap to avoid allocating a new one per row.
+    let mut lookup: HashMap<&str, Option<&str>> = HashMap::new();
+
+    for row in 0..num_rows {
+        if map_array.is_null(row) {
+            for (i, field) in fields.iter().enumerate() {
+                Scalar::Null(field.data_type().clone()).append_to(&mut *builders[i], 1)?;
+            }
+            continue;
+        }
+
+        let start = map_array.value_offsets()[row] as usize;
+        let end = map_array.value_offsets()[row + 1] as usize;
+
+        // Build lookup from map entries. Forward iteration means rightmost key wins via overwrite.
+        lookup.clear();
+        for entry_idx in start..end {
+            if map_keys.is_valid(entry_idx) {
+                let key = map_keys.value(entry_idx);
+                let val = if map_values.is_valid(entry_idx) {
+                    Some(map_values.value(entry_idx))
+                } else {
+                    None
+                };
+                lookup.insert(key, val);
+            }
+        }
+
+        // Look up each output field from the same lookup table.
+        for (i, field) in fields.iter().enumerate() {
+            match lookup.get(field.name().as_str()) {
+                Some(Some(raw)) => {
+                    let scalar = primitive_types[i].parse_scalar(raw)?;
+                    scalar.append_to(&mut *builders[i], 1)?;
+                }
+                _ => {
+                    // Missing key or null value → null
+                    Scalar::Null(field.data_type().clone()).append_to(&mut *builders[i], 1)?;
+                }
+            }
+        }
+    }
+
+    let output_columns: Vec<ArrayRef> = builders.iter_mut().map(|b| b.finish()).collect();
+    let arrow_fields: Vec<ArrowField> = fields
+        .iter()
+        .map(|f| ArrowField::try_from_kernel(*f))
+        .try_collect()?;
+
+    Ok(StructArray::try_new(
+        arrow_fields.into(),
+        output_columns,
+        None,
+    )?)
 }
 
 fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
@@ -1660,6 +1770,186 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, None);
 
         // Type mismatch should produce an error
+        assert!(result.is_err());
+    }
+
+    // ==================== MapToStruct Tests ====================
+
+    /// Helper: creates a RecordBatch with a `pv` column of type Map<String, String>.
+    fn create_partition_map_batch() -> RecordBatch {
+        use crate::arrow::array::{MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+
+        // Row 0: {"date": "2024-01-15", "region": "us", "id": "42"}
+        builder.keys().append_value("date");
+        builder.values().append_value("2024-01-15");
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.keys().append_value("id");
+        builder.values().append_value("42");
+        builder.append(true).unwrap();
+
+        // Row 1: {"date": "", "region": "eu", "id": "-7"}
+        builder.keys().append_value("date");
+        builder.values().append_value("");
+        builder.keys().append_value("region");
+        builder.values().append_value("eu");
+        builder.keys().append_value("id");
+        builder.values().append_value("-7");
+        builder.append(true).unwrap();
+
+        // Row 2: null map
+        builder.append(false).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap()
+    }
+
+    #[test]
+    fn test_map_to_struct_basic() {
+        use crate::arrow::array::Date32Array;
+
+        let batch = create_partition_map_batch();
+        let output_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("date", DataType::DATE),
+        ]));
+        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        let regions = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ids = structs
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let dates = structs
+            .column(2)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+
+        // Row 0: all values present and parseable
+        assert_eq!(regions.value(0), "us");
+        assert_eq!(ids.value(0), 42);
+        assert_eq!(dates.value(0), 19737); // 2024-01-15
+
+        // Row 1: date is empty string → null, region and id are valid
+        assert_eq!(regions.value(1), "eu");
+        assert_eq!(ids.value(1), -7);
+        assert!(dates.is_null(1));
+
+        // Row 2: null map → all null
+        assert!(regions.is_null(2));
+        assert!(ids.is_null(2));
+        assert!(dates.is_null(2));
+    }
+
+    #[test]
+    fn test_map_to_struct_missing_key() {
+        let batch = create_partition_map_batch();
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "nonexistent",
+            DataType::STRING,
+        )]));
+        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let col = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(col.is_null(0));
+        assert!(col.is_null(1));
+        assert!(col.is_null(2));
+    }
+
+    #[test]
+    fn test_map_to_struct_parse_error() {
+        use crate::arrow::array::{MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("count");
+        builder.values().append_value("not_a_number");
+        builder.append(true).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "count",
+            DataType::INTEGER,
+        )]));
+        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_map_to_struct_duplicate_keys() {
+        use crate::arrow::array::{MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("x");
+        builder.values().append_value("first");
+        builder.keys().append_value("x");
+        builder.values().append_value("last");
+        builder.append(true).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "x",
+            DataType::STRING,
+        )]));
+        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let col = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Rightmost entry wins
+        assert_eq!(col.value(0), "last");
+    }
+
+    #[test]
+    fn test_map_to_struct_non_map_input() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let strings = StringArray::from(vec![Some("hello")]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
+
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "x",
+            DataType::STRING,
+        )]));
+        let expr = Expr::map_to_struct(column_expr!("s"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None);
         assert!(result.is_err());
     }
 }

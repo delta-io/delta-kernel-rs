@@ -452,9 +452,28 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
+/// Visit a MapToStruct expression. The `child_expr` is the map expression, and
+/// `output_schema` is the schema handle describing the struct to extract from the map.
+///
+/// # Safety
+/// The output_schema handle must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_map_to_struct(
+    state: &mut KernelExpressionVisitorState,
+    child_expr: usize,
+    output_schema: Handle<SharedSchema>,
+) -> usize {
+    let schema = output_schema.as_ref();
+    let schema_ref = std::sync::Arc::new(schema.clone());
+    unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
+        wrap_expression(state, Expression::map_to_struct(expr, schema_ref))
+    })
+}
+
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
+use crate::SharedSchema;
 use std::sync::Arc;
 
 /// Convert an engine expression to a kernel expression using the visitor

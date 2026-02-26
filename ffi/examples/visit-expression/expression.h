@@ -64,6 +64,7 @@ enum ExpressionType {
   OpaqueExpression,
   OpaquePredicate,
   Unknown,
+  MapToStruct,
 };
 enum VariadicType {
   And,
@@ -110,6 +111,10 @@ struct OpaquePredicate {
 };
 struct Unknown {
   char* name;
+};
+struct MapToStructExpr {
+  ExpressionItemList child_expr;
+  HandleSharedSchema output_schema;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -380,6 +385,16 @@ void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSli
   put_expr_item(data, sibling_list_id, unknown, Unknown);
 }
 
+void visit_map_to_struct_expr(void* data,
+                              uintptr_t sibling_list_id,
+                              uintptr_t child_list_id,
+                              HandleSharedSchema output_schema) {
+  struct MapToStructExpr* m2s = malloc(sizeof(struct MapToStructExpr));
+  m2s->child_expr = get_expr_list(data, child_list_id);
+  m2s->output_schema = output_schema;
+  put_expr_item(data, sibling_list_id, m2s, MapToStruct);
+}
+
 void visit_expr_array_literal(void* data, uintptr_t sibling_list_id, uintptr_t child_list_id) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Array;
@@ -487,6 +502,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_opaque_pred = visit_opaque_pred,
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
+    .visit_map_to_struct = visit_map_to_struct_expr,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -533,6 +549,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_opaque_pred = visit_opaque_pred,
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
+    .visit_map_to_struct = visit_map_to_struct_expr,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -643,6 +660,13 @@ void free_expression_item(ExpressionItem ref) {
     }
     case Column: {
       free(ref.ref);
+      break;
+    }
+    case MapToStruct: {
+      struct MapToStructExpr* m2s = ref.ref;
+      free_expression_list(m2s->child_expr);
+      free_schema(m2s->output_schema);
+      free(m2s);
       break;
     }
   }

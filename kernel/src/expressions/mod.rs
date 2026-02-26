@@ -473,6 +473,9 @@ pub enum Expression {
     Unknown(String),
     /// Parse a JSON string expression into a struct with the given schema.
     ParseJson(ParseJsonExpression),
+    /// Extract keys from a `Map<String, String>` and parse values into a typed struct using
+    /// Delta's partition value serialization rules.
+    MapToStruct(MapToStructExpression),
 }
 
 /// A SQL predicate.
@@ -590,6 +593,35 @@ impl ParseJsonExpression {
     fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self {
             json_expr: Box::new(json_expr.into()),
+            output_schema,
+        }
+    }
+}
+
+/// Extracts keys from a `Map<String, String>` column and parses each value into its target type
+/// using Delta's partition value serialization rules, producing a struct.
+///
+/// For each field in the output schema:
+/// - The field name is used as the map key to look up
+/// - If found, the string value is parsed via [`PrimitiveType::parse_scalar`]
+/// - Missing keys produce null values
+/// - Parse errors are propagated (indicating a broken table)
+/// - Duplicate map keys are resolved by taking the rightmost entry
+///
+/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+    /// The output struct schema. Each field's name corresponds to a map key, and its type
+    /// determines how to parse the string value.
+    pub output_schema: SchemaRef,
+}
+
+impl MapToStructExpression {
+    fn new(map_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
             output_schema,
         }
     }
@@ -737,6 +769,12 @@ impl Expression {
     /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
+    }
+
+    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct using
+    /// Delta's partition value serialization rules.
+    pub fn map_to_struct(map_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr, output_schema))
     }
 }
 
@@ -1000,6 +1038,14 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
+            MapToStruct(m) => {
+                write!(
+                    f,
+                    "MAP_TO_STRUCT({}, <schema:{} fields>)",
+                    m.map_expr,
+                    m.output_schema.fields().len()
+                )
+            }
         }
     }
 }
@@ -1179,7 +1225,7 @@ mod tests {
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
             Expression, Predicate, Scalar, Transform, UnaryExpressionOp,
         };
-        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField, StructType};
         use crate::utils::test_utils::assert_result_error_with_message;
 
         use super::assert_roundtrip;
@@ -1397,6 +1443,22 @@ mod tests {
         fn test_expression_unknown_roundtrip() {
             let expr = Expression::unknown("some_unknown_function()");
             assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_map_to_struct_expression_roundtrip() {
+            let schema = Arc::new(StructType::new_unchecked(vec![
+                StructField::nullable("date", DataType::DATE),
+                StructField::nullable("region", DataType::STRING),
+            ]));
+            let cases: Vec<Expression> = vec![
+                Expression::map_to_struct(column_expr!("pv"), schema.clone()),
+                Expression::map_to_struct(Expression::literal("ignored"), schema),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
         }
 
         // ==================== Predicate Tests ====================
