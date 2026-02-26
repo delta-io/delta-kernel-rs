@@ -1268,6 +1268,7 @@ impl ColumnNamesAndTypes {
         (&self.0, &self.1)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn extend(&mut self, other: ColumnNamesAndTypes) {
         self.0.extend(other.0);
         self.1.extend(other.1);
