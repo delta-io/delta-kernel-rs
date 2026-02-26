@@ -32,6 +32,7 @@
 24. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
 25. Use CRC for In-Commit-Timestamp reading ([#1806])
 26. Implement the read metadata workload runner ([#1919])
+   - No migration needed; this introduces new benchmarking infrastructure not yet used anywhere
 27. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
 28. Fix get_app_id_version to take &self ([#1770])
 63. Add ability to  'enter' the runtime to the default engine ([#1847])
