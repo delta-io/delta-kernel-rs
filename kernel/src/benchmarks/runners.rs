@@ -5,6 +5,7 @@
 //! Currently only supports reading metadata
 
 use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, ReadSpec, TableInfo};
+use crate::parallel::scan_metadata::Phase2ScanMetadata;
 use crate::scan::AfterPhase1ScanMetadata;
 use crate::snapshot::Snapshot;
 use crate::Engine;
@@ -80,8 +81,6 @@ impl ReadMetadataRunner {
         match phase1.finish()? {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
-                use crate::parallel::scan_metadata::Phase2ScanMetadata;
-
                 if num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
