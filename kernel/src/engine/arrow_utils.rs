@@ -1577,6 +1577,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_json_impl_propagates_type_errors() {
+        // Verify that parse_json_impl surfaces errors for values that don't match the schema,
+        // so the expression-level caller can catch them and return nulls.
+
+        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Decimal128(4, 2),
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": 99999}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
+
+        // Type mismatch: string where integer expected
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
+    }
+
+    #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([

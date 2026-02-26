@@ -3,11 +3,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use tracing::warn;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
-    NullBufferBuilder, RecordBatch, StringArray, StructArray,
+    make_array, new_null_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
+    MutableArrayData, NullBufferBuilder, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
@@ -336,10 +337,16 @@ pub fn evaluate_expression(
 
             // Convert kernel schema to Arrow schema and parse
             let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(p.output_schema.as_ref())?);
-            let result = parse_json_impl(json_strings, arrow_schema)?;
-
-            // Return as StructArray
-            Ok(Arc::new(StructArray::from(result)) as ArrayRef)
+            match parse_json_impl(json_strings, arrow_schema.clone()) {
+                Ok(batch) => Ok(Arc::new(StructArray::from(batch)) as ArrayRef),
+                Err(e) => {
+                    warn!("Failed to parse JSON stats ({e}), using null stats");
+                    Ok(new_null_array(
+                        &ArrowDataType::Struct(arrow_schema.fields().clone()),
+                        json_strings.len(),
+                    ))
+                }
+            }
         }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
@@ -1642,24 +1649,47 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_json_type_mismatch_error() {
-        // Schema expects LONG but JSON has a string value - should error
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings = StringArray::from(vec![
-            Some(r#"{"a": "not_a_number"}"#), // string instead of number
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
+    fn test_parse_json_errors_return_nulls() {
+        // ParseJson is used for stats parsing. Corrupt or unparseable values should produce
+        // null output rather than failing the query -- files with null stats simply skip data
+        // skipping and are always included in scan results.
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "a",
-            DataType::LONG,
-            true,
-        )]));
+        // Helper to verify ParseJson returns all-null output for the given inputs
+        fn assert_parse_json_nulls(
+            json_strings: Vec<Option<&str>>,
+            output_schema: Arc<StructType>,
+        ) {
+            let schema =
+                ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
+            let len = json_strings.len();
+            let json_arr = StringArray::from(json_strings);
+            let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_arr)]).unwrap();
 
-        let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None);
+            let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
+            let result = evaluate_expression(&expr, &batch, None).unwrap();
 
-        // Type mismatch should produce an error
-        assert!(result.is_err());
+            assert_eq!(result.len(), len);
+            assert_eq!(result.null_count(), len);
+        }
+
+        // Type mismatch: string value where integer is expected
+        assert_parse_json_nulls(
+            vec![Some(r#"{"a": "not_a_number"}"#)],
+            Arc::new(StructType::new_unchecked(vec![StructField::new(
+                "a",
+                DataType::LONG,
+                true,
+            )])),
+        );
+
+        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
+        assert_parse_json_nulls(
+            vec![Some(r#"{"a": 99999}"#)],
+            Arc::new(StructType::new_unchecked(vec![StructField::new(
+                "a",
+                DataType::decimal(4, 2).unwrap(),
+                true,
+            )])),
+        );
     }
 }
