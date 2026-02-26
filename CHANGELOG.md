@@ -6,10 +6,11 @@
 
 ### 🏗️ Breaking changes
 1. Add checkpoint schema discovery for stats_parsed detection ([#1550])
-2. Add deletion vector APIs to transaction ([#1430])
 3. Remove `DefaultEngine::new` ([#1583])
+   - Use `DefaultEngineBuilder` instead like: `DefaultEngineBuilder::new(store).build()`
 4. Include max known published commit version inside of `LogSegment` ([#1587])
 5. Add ParseJson expression  ([#1586])
+   - Implementors of the ExpressionHandler trait now need to handle this expression
 6. Change CommitResponse::Committed to return a FileMeta ([#1599])
 7. Add function to check if schema supports parsed stats ([#1573])
 8. Add serialization/deserialization support for Predicates and Expressions ([#1543])
@@ -34,15 +35,16 @@
 27. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
 28. Fix get_app_id_version to take &self ([#1770])
 63. Add ability to  'enter' the runtime to the default engine ([#1847])
+    - Implementors of the `TaskExecutor` trait now need to support this
 
 #### In uc-catalog crate
 1. `Committer::publish()` API and `PublishMetadata`/`CatalogCommit` types ([#1625])
 2. Extract UCCommitsClient trait from UCClient ([#1591])
 
 ### 🚀 Features / new APIs
-1. Add doctests for `IntoEngineData` derive macro ([#1580]) KRENEL
-2. Create `DefaultEngineBuilder` to build `DefaultEngine` ([#1582]) KERNEL
-3. Implement `Scalar::From<HashMap<K, V>>` ([#1541]) K<ERNEL
+1. Add doctests for `IntoEngineData` derive macro ([#1580])
+2. Create `DefaultEngineBuilder` to build `DefaultEngine` ([#1582])
+3. Implement `Scalar::From<HashMap<K, V>>` ([#1541])
 4. Add `logSegment.new_with_commit_appended` API ([#1602])
 5. `snapshot.new_post_commit` ([#1604])
 6. Enable Arrow to convert nullable StructArray to RecordBatch ([#1635])
@@ -103,6 +105,7 @@
 61. Allow to change tracing level and callback more than once ([#1111])
 62. Simplify checkpoint-table with Snapshot::checkpoint ([#1813])
 63. Add size metadata to the CdfScanFile ([#1935])
+64. Add deletion vector APIs to transaction ([#1430])
 
 
 #### In uc-catalog crate
