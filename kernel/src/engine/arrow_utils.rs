@@ -1629,6 +1629,60 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_json_string_view_array() {
+        use crate::arrow::array::StringViewArray;
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let view_strings = StringViewArray::from(vec![
+            Some(r#"{"a": 1, "b": "hello"}"#),
+            None,
+            Some(r#"{"a": 3, "b": "world"}"#),
+        ]);
+        let field = Arc::new(ArrowField::new("s", ArrowDataType::Utf8View, true));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(view_strings) as ArrowArrayRef]).unwrap();
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ]));
+        let result = parse_json(engine_data, output_schema).unwrap();
+        let result = ArrowEngineData::try_from_engine_data(result).unwrap();
+        let batch: RecordBatch = result.into();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 1);
+        assert_eq!(batch.column(1).null_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_json_rejects_non_string_array() {
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let int_array = Int32Array::from(vec![1, 2, 3]);
+        let field = Arc::new(ArrowField::new("s", ArrowDataType::Int32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(int_array) as ArrowArrayRef]).unwrap();
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let output_schema: crate::schema::SchemaRef =
+            Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+                "a",
+                DataType::INTEGER,
+            )]));
+        let err = match parse_json(engine_data, output_schema) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected error for non-string array input"),
+        };
+        assert!(
+            err.contains("Expected string array for JSON parsing"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
