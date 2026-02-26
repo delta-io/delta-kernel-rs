@@ -356,6 +356,26 @@ impl StructField {
         }
     }
 
+    /// Returns true if this field has a physical name annotation
+    /// in its column mapping metadata.
+    pub(crate) fn has_physical_name_annotation(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()),
+            Some(MetadataValue::String(_))
+        )
+    }
+
+    /// Returns true if this field has a column mapping ID annotation
+    /// in its column mapping metadata.
+    pub(crate) fn has_id_annotation(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::ColumnMappingId.as_ref()),
+            Some(MetadataValue::Number(_))
+        )
+    }
+
     /// Change the name of a field. The field will preserve its data type and nullability. Note that
     /// this allocates a new field.
     pub fn with_name(&self, new_name: impl Into<String>) -> Self {
