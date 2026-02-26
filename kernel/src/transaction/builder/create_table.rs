@@ -18,12 +18,13 @@ use crate::committer::Committer;
 use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
-use crate::schema::SchemaRef;
+use crate::schema::variant_utils::UsesVariant;
+use crate::schema::{SchemaRef, SchemaTransform};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, get_column_mapping_mode_from_properties,
-    get_top_level_column_physical_name, ColumnMappingMode, FeatureType, TableFeature,
+    assign_column_mapping_metadata, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, ColumnMappingMode, FeatureType, TableFeature,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
@@ -213,28 +214,13 @@ fn maybe_enable_clustering(
             // (Schema field names are always logical, even with column mapping)
             validate_clustering_columns(effective_schema, columns)?;
 
-            // Resolve logical to physical column names for domain metadata
-            // When column mapping is enabled, clustering stores physical names
-            // Clustering columns are always top-level (validated above), so we just
-            // need to resolve single names, not nested paths.
+            // Resolve logical to physical column names for domain metadata.
+            // When column mapping is enabled, clustering stores physical names.
+            // Supports both top-level and nested columns.
             let physical_columns: Vec<ColumnName> = columns
                 .iter()
                 .map(|c| {
-                    // validate_clustering_columns guarantees each path is exactly 1 element
-                    if c.path().len() != 1 {
-                        return Err(Error::generic(format!(
-                            "Expected single-element path for clustering column '{}', got {} elements",
-                            c,
-                            c.path().len()
-                        )));
-                    }
-                    let logical_name = &c.path()[0];
-                    let physical_name = get_top_level_column_physical_name(
-                        logical_name,
-                        effective_schema,
-                        column_mapping_mode,
-                    )?;
-                    Ok(ColumnName::new([physical_name]))
+                    get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
                 })
                 .try_collect()?;
 
@@ -257,6 +243,21 @@ fn maybe_enable_clustering(
             Ok((vec![dm], Some(columns.clone())))
         }
         DataLayout::None => Ok((vec![], None)),
+    }
+}
+
+/// Conditionally adds the `variantType` feature to the protocol when the schema contains
+/// Variant columns. Uses the [`UsesVariant`] schema visitor to detect Variant data types
+/// anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    let mut visitor = UsesVariant::default();
+    let _ = visitor.transform_struct(schema);
+    if visitor.found() {
+        add_feature_to_lists(
+            TableFeature::VariantType,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
     }
 }
 
@@ -541,6 +542,9 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
+        // Auto-enable variantType feature if schema contains Variant columns
+        maybe_enable_variant_type(&effective_schema, &mut validated);
+
         // Create Protocol action with table features support
         let protocol =
             Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
@@ -816,35 +820,37 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Clustering column 'nonexistent' not found in schema"));
+            .contains("not found in schema"));
     }
 
     #[test]
-    fn test_clustering_nested_column_rejected() {
+    fn test_clustering_nested_column_accepted() {
+        use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::ColumnName;
 
+        let address_struct = StructType::new_unchecked(vec![
+            StructField::new("city", DataType::STRING, true),
+            StructField::new("zip", DataType::STRING, true),
+        ]);
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
-            StructField::new("nested", DataType::STRING, true),
+            StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
         ]));
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        // Create a nested column path
-        let nested_col = ColumnName::new(["nested", "field"]);
-        let result = apply_clustering_for_table_create(
+        let nested_col = ColumnName::new(["address", "city"]);
+        let dm = apply_clustering_for_table_create(
             &schema,
             &[nested_col],
             &mut reader_features,
             &mut writer_features,
-        );
+        )
+        .unwrap();
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be a top-level column"));
+        assert_eq!(dm.domain(), CLUSTERING_DOMAIN_NAME);
+        assert!(writer_features.contains(&TableFeature::ClusteredTable));
     }
 
     #[test]
@@ -855,5 +861,72 @@ mod tests {
             .with_data_layout(DataLayout::clustered(["id"]));
 
         assert!(builder.data_layout.is_clustered());
+    }
+
+    #[test]
+    fn test_variant_auto_enabled_from_schema() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("v", DataType::unshredded_variant(), true),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_variant_type(&schema, &mut validated);
+
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantType));
+    }
+
+    #[test]
+    fn test_variant_not_enabled_without_variant_columns() {
+        let schema = test_schema();
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_variant_type(&schema, &mut validated);
+
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[test]
+    fn test_variant_auto_enabled_nested() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(
+                "nested",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                    "inner_v",
+                    DataType::unshredded_variant(),
+                    true,
+                )]))),
+                true,
+            ),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_variant_type(&schema, &mut validated);
+
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantType));
     }
 }
