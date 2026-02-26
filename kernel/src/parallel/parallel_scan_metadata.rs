@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::log_segment::CheckpointReadInfo;
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
+use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
 
 /// Result of Phase 1 scan metadata processing.
@@ -42,16 +42,12 @@ impl Phase1ScanMetadata {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(_) => Ok(AfterPhase1ScanMetadata::Done),
-            AfterSequential::Parallel { processor, files } => {
-                let checkpoint_info = processor.checkpoint_info().clone();
-                Ok(AfterPhase1ScanMetadata::Phase2 {
-                    state: Phase2State {
-                        inner: processor.into(),
-                        checkpoint_info,
-                    },
-                    files,
-                })
-            }
+            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
+                state: Phase2State {
+                    inner: processor.into(),
+                },
+                files,
+            }),
         }
     }
 }
@@ -71,7 +67,6 @@ impl Iterator for Phase1ScanMetadata {
 #[derive(Clone)]
 pub struct Phase2State {
     inner: Arc<ScanLogReplayProcessor>,
-    checkpoint_info: CheckpointReadInfo,
 }
 
 impl AsRef<Phase2State> for Phase2State {
@@ -81,6 +76,14 @@ impl AsRef<Phase2State> for Phase2State {
 }
 
 impl Phase2State {
+    /// Get the schema to use for reading checkpoint files.
+    ///
+    /// Returns the checkpoint read schema which may have stats excluded
+    /// if skip_stats was enabled when the scan was created.
+    pub fn file_read_schema(&self) -> SchemaRef {
+        self.inner.checkpoint_info().checkpoint_read_schema.clone()
+    }
+
     /// Serialize the processor state for distributed processing.
     ///
     /// Returns a `SerializableScanState` containing all information needed to
@@ -92,7 +95,6 @@ impl Phase2State {
     #[allow(unused)]
     pub(crate) fn into_serializable_state(&self) -> DeltaResult<SerializableScanState> {
         let mut state = self.inner.into_serializable_state()?;
-        state.checkpoint_info = self.checkpoint_info.clone();
         Ok(state)
     }
 
@@ -107,12 +109,8 @@ impl Phase2State {
         engine: &dyn Engine,
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
-        let checkpoint_info = state.checkpoint_info.clone();
         let processor = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        Ok(Self {
-            inner: processor,
-            checkpoint_info,
-        })
+        Ok(Self { inner: processor })
     }
 
     /// Serialize the processor state directly to bytes.
@@ -156,8 +154,10 @@ impl Phase2ScanMetadata {
         state: impl AsRef<Phase2State>,
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
+        let state_ref = state.as_ref();
+        let read_schema = state_ref.file_read_schema();
         Ok(Self {
-            processor: ParallelPhase::try_new(engine, state.as_ref().inner.clone(), leaf_files)?,
+            processor: ParallelPhase::try_new(engine, state_ref.inner.clone(), leaf_files, read_schema)?,
         })
     }
 

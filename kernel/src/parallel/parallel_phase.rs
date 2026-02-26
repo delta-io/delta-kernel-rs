@@ -47,16 +47,18 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     /// - `engine`: Engine for reading parquet files
     /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
     /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
+    /// - `read_schema`: Schema to use for reading checkpoint files
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         processor: P,
         leaf_files: Vec<FileMeta>,
+        read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
-            .read_parquet_files(&leaf_files, Self::file_read_schema(), None)?
+            .read_parquet_files(&leaf_files, read_schema, None)?
             .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,
@@ -253,7 +255,7 @@ mod tests {
         };
 
         let mut parallel =
-            ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta])?;
+            ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta], CHECKPOINT_READ_SCHEMA.clone())?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -339,7 +341,7 @@ mod tests {
             },
         ];
 
-        let mut parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas)?;
+        let mut parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas, CHECKPOINT_READ_SCHEMA.clone())?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
