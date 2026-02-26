@@ -20,14 +20,17 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
-    KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
+    column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
+    FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
+    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
+    MAX_VALID_WRITER_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
+use tracing::warn;
 
 /// Expected schemas for file statistics.
 ///
@@ -111,13 +114,6 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
-        validate_schema_column_mapping(&schema, column_mapping_mode)?;
-
-        validate_timestamp_ntz_feature_support(&schema, &protocol)?;
-
-        validate_variant_type_feature_support(&schema, &protocol)?;
-
         let table_config = Self {
             schema,
             metadata,
@@ -127,6 +123,11 @@ impl TableConfiguration {
             table_root,
             version,
         };
+
+        // Validate schema against protocol features now that we have a TC instance.
+        validate_column_mapping(&table_config)?;
+        validate_timestamp_ntz_feature_support(&table_config)?;
+        validate_variant_type_feature_support(&table_config)?;
 
         Ok(table_config)
     }
@@ -238,9 +239,7 @@ impl TableConfiguration {
     /// Per the Delta protocol, clustering columns are always included in statistics,
     /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
     /// settings.
-    #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn stats_column_names(
+    pub(crate) fn stats_column_names_logical(
         &self,
         clustering_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
@@ -251,15 +250,40 @@ impl TableConfiguration {
         )
     }
 
+    /// Returns the list of physical column names that should have statistics collected.
+    ///
+    /// Similar to [`stats_column_names_logical`], but returns physical column names.
+    pub(crate) fn stats_column_names_physical(
+        &self,
+        clustering_columns: Option<&[ColumnName]>,
+    ) -> Vec<ColumnName> {
+        let logical_names = self.stats_column_names_logical(clustering_columns);
+        let column_mapping_mode = self.column_mapping_mode();
+        logical_names
+            .into_iter()
+            .filter_map(|col_name| {
+                get_any_level_column_physical_name(
+                    self.schema.as_ref(),
+                    &col_name,
+                    column_mapping_mode,
+                )
+                .inspect_err(|e| {
+                    warn!("Couldn't find physical name for {col_name}: {e}");
+                })
+                .ok()
+            })
+            .collect()
+    }
+
     /// Returns the logical schema for data columns (excludes partition columns).
     ///
     /// Partition columns are excluded because statistics are only collected for data columns
     /// that are physically stored in the parquet files. Partition values are stored in the
     /// file path, not in the file content, so they don't have file-level statistics.
     fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.metadata().partition_columns();
+        let partition_columns = self.partition_columns();
         Arc::new(StructType::new_unchecked(
-            self.schema
+            self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
@@ -291,10 +315,24 @@ impl TableConfiguration {
         &self.table_properties
     }
 
+    /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
+    /// table feature).
+    #[internal_api]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.is_feature_supported(&TableFeature::CatalogManaged)
+            || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
+    }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
+    }
+
+    /// The partition columns of this table (empty if non-partitioned)
+    #[internal_api]
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        self.metadata().partition_columns()
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
@@ -393,7 +431,7 @@ impl TableConfiguration {
     /// For legacy protocol (v1-2), infers features from the version number.
     fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
         match self.protocol.min_reader_version() {
-            3 => {
+            TABLE_FEATURES_MIN_READER_VERSION => {
                 // Table features reader: use explicit reader_features list
                 self.protocol
                     .reader_features()
@@ -421,7 +459,7 @@ impl TableConfiguration {
     /// For legacy protocol (v1-6), infers features from the version number.
     fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
         match self.protocol.min_writer_version() {
-            7 => {
+            TABLE_FEATURES_MIN_WRITER_VERSION => {
                 // Table features writer: use explicit writer_features list
                 self.protocol
                     .writer_features()
@@ -459,8 +497,8 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        // Version check: kernel supports reader versions 1-3
-        if self.protocol.min_reader_version() > 3 {
+        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
+        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum reader version {}",
                 self.protocol.min_reader_version()
@@ -477,8 +515,8 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: kernel supports writer versions 1-7
-        if self.protocol.min_writer_version() > 7 {
+        // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
+        if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
                 "Unsupported minimum writer version {}",
                 self.protocol.min_writer_version()
@@ -565,13 +603,13 @@ impl TableConfiguration {
     /// Returns true if the protocol uses legacy reader version (< 3)
     #[allow(dead_code)]
     fn is_legacy_reader_version(&self) -> bool {
-        self.protocol.min_reader_version() < 3
+        self.protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
     }
 
     /// Returns true if the protocol uses legacy writer version (< 7)
     #[allow(dead_code)]
     fn is_legacy_writer_version(&self) -> bool {
-        self.protocol.min_writer_version() < 7
+        self.protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION
     }
 
     /// Helper to check if a feature is present in a feature list.
@@ -586,7 +624,7 @@ impl TableConfiguration {
     #[allow(dead_code)]
     fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
         match info.feature_type {
-            FeatureType::Writer => {
+            FeatureType::WriterOnly => {
                 if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
                     self.protocol.min_writer_version() >= info.min_writer_version
@@ -670,10 +708,17 @@ mod test {
     use crate::table_features::ColumnMappingMode;
     use crate::table_features::{
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::TableProperties;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
+        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        test_schema_with_array_and_column_mapping, test_schema_with_map,
+        test_schema_with_map_and_column_mapping,
+    };
     use crate::Error;
+    use rstest::rstest;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
 
@@ -681,7 +726,12 @@ mod test {
         props_to_enable: &[(&str, &str)],
         features: &[TableFeature],
     ) -> TableConfiguration {
-        create_mock_table_config_with_version(props_to_enable, Some(features), 3, 7)
+        create_mock_table_config_with_version(
+            props_to_enable,
+            Some(features),
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+        )
     }
 
     fn create_mock_table_config_with_version(
@@ -709,49 +759,33 @@ mod test {
         .unwrap();
 
         let (reader_features_opt, writer_features_opt) = if let Some(features) = features_opt {
+            // This helper only handles known features. Unknown features would need
+            // explicit placement on reader vs writer lists.
+            assert!(
+                features
+                    .iter()
+                    .all(|f| f.feature_type() != FeatureType::Unknown),
+                "Test helper does not support unknown features"
+            );
             let reader_features = features
                 .iter()
-                .filter(|feature| matches!(feature.feature_type(), FeatureType::ReaderWriter))
-                .cloned()
-                .collect::<Vec<_>>();
-            let writer_features = features
-                .iter()
-                .filter(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::Writer | FeatureType::ReaderWriter
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
             (
                 // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                // Protocol requires Some (even if empty) when reader = 3
-                if min_reader_version >= 3 {
-                    Some(reader_features)
-                } else {
-                    None
-                },
+                (min_reader_version >= TABLE_FEATURES_MIN_READER_VERSION)
+                    .then_some(reader_features),
                 // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                // Protocol requires Some (even if empty) when writer = 7
-                if min_writer_version >= 7 {
-                    Some(writer_features)
-                } else {
-                    None
-                },
+                (min_writer_version >= TABLE_FEATURES_MIN_WRITER_VERSION).then_some(features),
             )
         } else {
             (None, None)
         };
 
-        let reader_features_iter = reader_features_opt.as_ref().map(|f| f.iter());
-        let writer_features_iter = writer_features_opt.as_ref().map(|f| f.iter());
-
         let protocol = Protocol::try_new(
             min_reader_version,
             min_writer_version,
-            reader_features_iter,
-            writer_features_iter,
+            reader_features_opt,
+            writer_features_opt,
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -775,11 +809,9 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -808,11 +840,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -857,28 +887,22 @@ mod test {
                 ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
-            // NOTE: The following cases should be updated if column mapping for writes is
-            // supported before cdc is.
+            // Column mapping is now supported for writes.
             (
-                // Should fail since change data feed and column mapping features cannot both be
-                // present.
+                // CDF + column mapping: both supported, should succeed
                 create_mock_table_config(
                     &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
-                // The table does not require writing CDC files, so it is safe to write to it.
+                // Column mapping + AppendOnly, no CDF enabled: should succeed
                 create_mock_table_config(
                     &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled
@@ -919,13 +943,9 @@ mod test {
             HashMap::from_iter([(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -968,13 +988,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1013,13 +1029,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1036,13 +1048,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([TableFeature::InCommitTimestamp]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
@@ -1057,7 +1065,7 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
+        let protocol = Protocol::try_new_modern(["unknown"], ["unknown"]).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         table_config
@@ -1081,11 +1089,12 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [
+                TableFeature::TimestampWithoutTimezone,
+                TableFeature::ChangeDataFeed,
+            ],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1111,11 +1120,9 @@ mod test {
             HashMap::from_iter([(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string())]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1137,15 +1144,14 @@ mod test {
             ]),
         )
         .unwrap();
-        let new_protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::V2Checkpoint]),
-            Some([
+        let new_protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::V2Checkpoint],
+            [
                 TableFeature::DeletionVectors,
                 TableFeature::V2Checkpoint,
                 TableFeature::AppendOnly,
-            ]),
+                TableFeature::ChangeDataFeed,
+            ],
         )
         .unwrap();
         let new_version = 1;
@@ -1185,19 +1191,12 @@ mod test {
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let protocol_without_timestamp_ntz_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_timestamp_ntz_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let protocol_with_timestamp_ntz_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TimestampWithoutTimezone]),
-            Some([TableFeature::TimestampWithoutTimezone]),
+        let protocol_with_timestamp_ntz_features = Protocol::try_new_modern(
+            [TableFeature::TimestampWithoutTimezone],
+            [TableFeature::TimestampWithoutTimezone],
         )
         .unwrap();
 
@@ -1232,21 +1231,12 @@ mod test {
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let protocol_without_variant_features = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        let protocol_without_variant_features =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
 
-        let protocol_with_variant_features = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::VariantType]),
-            Some([TableFeature::VariantType]),
-        )
-        .unwrap();
+        let protocol_with_variant_features =
+            Protocol::try_new_modern([TableFeature::VariantType], [TableFeature::VariantType])
+                .unwrap();
 
         let table_root = Url::try_from("file:///").unwrap();
 
@@ -1282,15 +1272,15 @@ mod test {
 
     #[test]
     fn test_is_feature_info_supported_writer() {
-        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as Writer type
+        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as WriterOnly type
         let feature = TableFeature::ColumnMapping;
 
-        // Custom FeatureInfo that treats ColumnMapping as Writer-only with min_writer_version = 2
+        // Custom FeatureInfo that treats ColumnMapping as WriterOnly with min_writer_version = 2
         let custom_feature_info = FeatureInfo {
             name: "columnMapping",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1305,14 +1295,14 @@ mod test {
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
 
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
-        // For this to work with a Writer-only FeatureInfo, we need a real Writer-only feature
+        // For this to work with a WriterOnly FeatureInfo, we need a real WriterOnly feature
         // Use AppendOnly instead of ColumnMapping for the 2,7 test cases
         let writer_only_feature = TableFeature::AppendOnly;
         let writer_only_info = FeatureInfo {
             name: "appendOnly",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1324,7 +1314,7 @@ mod test {
         assert!(config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
-        // Use ChangeDataFeed which is also a Writer-only feature
+        // Use ChangeDataFeed which is also a WriterOnly feature
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
         assert!(!config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
@@ -1371,7 +1361,7 @@ mod test {
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
         // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
         // But we still need to test that the code correctly identifies them as NOT supported
-        // Create a table with only Writer-only features (e.g., AppendOnly)
+        // Create a table with only WriterOnly features (e.g., AppendOnly)
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
         // ColumnMapping (ReaderWriter) should NOT be supported because:
@@ -1398,7 +1388,7 @@ mod test {
             name: "customPropertyFeature",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
@@ -1424,7 +1414,7 @@ mod test {
             name: "alwaysEnabledFeature",
             min_reader_version: 1,
             min_writer_version: 3,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1492,13 +1482,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![TableFeature::RowTracking]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, vec![TableFeature::RowTracking])
+                .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert_result_error_with_message(
@@ -1514,14 +1500,9 @@ mod test {
             DataType::INTEGER,
         )]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ]),
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::RowTracking, TableFeature::DomainMetadata],
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1588,7 +1569,7 @@ mod test {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
 
         // Use reader version 2 which supports column mapping
-        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
     }
@@ -1601,7 +1582,7 @@ mod test {
             StructField::nullable("col_b", DataType::STRING),
         ]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
@@ -1743,18 +1724,127 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_returns_logical_names() {
-        // stats_column_names should return logical column names
+    fn test_stats_column_names_logical_returns_logical_names() {
+        // stats_column_names_logical should return logical column names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names(None);
+        let column_names = config.stats_column_names_logical(None /* clustering_columns */);
 
         // Should return logical names, not physical names
         assert!(column_names.contains(&ColumnName::new(["col_a"])));
         assert!(column_names.contains(&ColumnName::new(["col_b"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
         assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_returns_physical_names() {
+        // stats_column_names_physical should return physical column names
+        let schema = schema_with_column_mapping();
+        let config = create_table_config_with_column_mapping(schema, "name");
+
+        let column_names = config.stats_column_names_physical(None /* clustering_columns */);
+
+        // Should return physical names, not logical names
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["phys_col_a"]),
+                ColumnName::new(["phys_col_b"]),
+            ],
+            "Expected physical column names, not logical names"
+        );
+    }
+
+    #[rstest]
+    // --- flat schema ---
+    #[case::flat_none(
+        test_schema_flat(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::flat_name(
+        test_schema_flat_with_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::flat_id(
+        test_schema_flat_with_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    // --- nested schema ---
+    #[case::nested_none(
+        test_schema_nested(),
+        "none",
+        vec![
+            ColumnName::new(["id"]),
+            ColumnName::new(["info", "name"]),
+            ColumnName::new(["info", "age"]),
+        ],
+    )]
+    #[case::nested_name(
+        test_schema_nested_with_column_mapping(),
+        "name",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    #[case::nested_id(
+        test_schema_nested_with_column_mapping(),
+        "id",
+        vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+            ColumnName::new(["phys_info", "phys_age"]),
+        ],
+    )]
+    // --- schema with map (map fields excluded from stats) ---
+    #[case::map_none(
+        test_schema_with_map(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::map_name(
+        test_schema_with_map_and_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::map_id(
+        test_schema_with_map_and_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    // --- schema with array (array fields excluded from stats) ---
+    #[case::array_none(
+        test_schema_with_array(),
+        "none",
+        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+    )]
+    #[case::array_name(
+        test_schema_with_array_and_column_mapping(),
+        "name",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    #[case::array_id(
+        test_schema_with_array_and_column_mapping(),
+        "id",
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+    )]
+    fn test_stats_column_names_physical_all_schemas(
+        #[case] schema: SchemaRef,
+        #[case] mode: &str,
+        #[case] expected_physical: Vec<ColumnName>,
+    ) {
+        let config = create_table_config_with_column_mapping(schema, mode);
+        let physical_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            physical_names, expected_physical,
+            "Incorrect physical column names for mode '{mode}'"
+        );
     }
 
     #[cfg(feature = "clustered-table")]

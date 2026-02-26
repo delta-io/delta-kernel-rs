@@ -251,7 +251,7 @@ impl LogReplayScanner {
                 info!(
                     version = commit_file.version,
                     id = table_configuration.metadata().id(),
-                    //Writer features is always a superset of reader features, so writer features is logged to trace the full set of table features
+                    // Writer features are always a superset of reader features, so we log writer features to trace the full set of table features.
                     writerFeatures = %writer_features_str,
                     minReaderVersion = table_configuration.protocol().min_reader_version(),
                     minWriterVersion = table_configuration.protocol().min_writer_version(),

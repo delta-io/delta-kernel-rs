@@ -9,11 +9,12 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -61,6 +62,22 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
 
+/// Checkpoint schema WITHOUT stats for column projection pushdown.
+/// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
+static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let add_schema = Add::to_schema();
+    let fields_no_stats: Vec<_> = add_schema
+        .fields()
+        .filter(|f| f.name() != "stats")
+        .cloned()
+        .collect();
+    let add_no_stats = StructType::new_unchecked(fields_no_stats);
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        add_no_stats,
+    )]))
+});
+
 /// Type alias for the sequential (Phase 1) scan metadata processing.
 ///
 /// This phase processes commits and single-part checkpoint manifests sequentially.
@@ -93,6 +110,7 @@ pub struct ScanBuilder {
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats_columns: Option<Vec<ColumnName>>,
+    skip_stats: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -101,6 +119,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("schema", &self.schema)
             .field("predicate", &self.predicate)
             .field("stats_columns", &self.stats_columns)
+            .field("skip_stats", &self.skip_stats)
             .finish()
     }
 }
@@ -113,6 +132,7 @@ impl ScanBuilder {
             schema: None,
             predicate: None,
             stats_columns: None,
+            skip_stats: false,
         }
     }
 
@@ -175,6 +195,27 @@ impl ScanBuilder {
         self
     }
 
+    /// Skip reading file statistics from checkpoint files.
+    ///
+    /// When enabled:
+    /// - Parquet checkpoint reads use column projection to skip the stats column
+    /// - The `stats` field in scan results will be `None`
+    /// - Data skipping is disabled (predicates still filter partitions, but not files)
+    ///
+    /// This option is mutually exclusive with [`include_stats_columns`] — setting both
+    /// will cause [`build`] to return an error.
+    ///
+    /// Use this when data skipping is handled externally (e.g., by the query engine).
+    ///
+    /// Default is `false` (stats are read).
+    ///
+    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
+    /// [`build`]: ScanBuilder::build
+    pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
+        self.skip_stats = skip_stats;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -182,6 +223,12 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
+        if self.skip_stats && self.stats_columns.is_some() {
+            return Err(Error::generic(
+                "Cannot set both skip_stats and include_stats_columns",
+            ));
+        }
+
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
@@ -200,6 +247,7 @@ impl ScanBuilder {
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
+            skip_stats: self.skip_stats,
         })
     }
 }
@@ -319,6 +367,19 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
+/// Prefixes all column references in a predicate with a fixed path.
+/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
+/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+struct PrefixColumns {
+    prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixColumns {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Owned(self.prefix.join(name)))
+    }
+}
+
 struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
@@ -417,6 +478,7 @@ impl HasSelectionVector for ScanMetadata {
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
+    skip_stats: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -424,6 +486,7 @@ impl std::fmt::Debug for Scan {
         f.debug_struct("Scan")
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
+            .field("skip_stats", &self.skip_stats)
             .finish()
     }
 }
@@ -632,11 +695,19 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
+        let (checkpoint_schema, meta_predicate) = if self.skip_stats {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+        } else {
+            (
+                CHECKPOINT_READ_SCHEMA.clone(),
+                self.build_actions_meta_predicate(),
+            )
+        };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None,
+            checkpoint_schema,
+            meta_predicate,
             self.state_info
                 .physical_stats_schema
                 .as_ref()
@@ -670,6 +741,7 @@ impl Scan {
             actions_with_checkpoint_info.actions,
             self.state_info.clone(),
             actions_with_checkpoint_info.checkpoint_info,
+            self.skip_stats,
         )?;
         Ok(Some(it).into_iter().flatten())
     }
@@ -681,20 +753,58 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
-        // when ~every checkpoint file will contain the adds and removes we are looking for.
+        let (checkpoint_schema, meta_predicate) = if self.skip_stats {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+        } else {
+            (
+                CHECKPOINT_READ_SCHEMA.clone(),
+                self.build_actions_meta_predicate(),
+            )
+        };
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
-                None,
+                checkpoint_schema,
+                meta_predicate,
                 self.state_info
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
+    }
+
+    /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
+    ///
+    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
+    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
+    /// references are prefixed with `add.stats_parsed` to match the physical column layout
+    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
+    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
+    /// contain matching files.
+    ///
+    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
+    /// values. Without them, row groups containing files with missing stats (null stat columns)
+    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+            return None;
+        };
+        self.state_info.physical_stats_schema.as_ref()?;
+
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+
+        let mut prefixer = PrefixColumns {
+            prefix: ColumnName::new(["add", "stats_parsed"]),
+        };
+        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        Some(Arc::new(prefixed.into_owned()))
     }
 
     /// Start a parallel scan metadata processing for the table.
@@ -763,12 +873,21 @@ impl Scan {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
+        let checkpoint_read_schema = if self.skip_stats {
+            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
-            checkpoint_read_schema: CHECKPOINT_READ_SCHEMA.clone(),
+            checkpoint_read_schema,
         };
-        let processor =
-            ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone(), checkpoint_info)?;
+        let processor = ScanLogReplayProcessor::new(
+            engine.as_ref(),
+            self.state_info.clone(),
+            checkpoint_info,
+            self.skip_stats,
+        )?;
         SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
     }
 

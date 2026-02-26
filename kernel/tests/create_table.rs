@@ -4,6 +4,8 @@
 mod clustering;
 #[path = "create_table/column_mapping.rs"]
 mod column_mapping;
+#[path = "create_table/variant.rs"]
+mod variant;
 
 use std::sync::Arc;
 
@@ -14,7 +16,7 @@ use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use delta_kernel::table_properties::TableProperties;
-use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::DeltaResult;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
@@ -294,5 +296,35 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
         "Kernel version should start with 'v'"
     );
 
+    Ok(())
+}
+
+/// Helper to create a `CreateTableTransaction` for tests.
+fn create_test_create_table_txn() -> DeltaResult<(
+    Arc<impl delta_kernel::Engine>,
+    CreateTableTransaction,
+    tempfile::TempDir,
+)> {
+    let (tempdir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ])
+        .expect("valid schema"),
+    );
+    let txn = create_table(&table_path, schema, "test_engine")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    Ok((engine, txn, tempdir))
+}
+
+#[tokio::test]
+async fn test_create_table_txn_debug() -> DeltaResult<()> {
+    let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
+    let debug_str = format!("{:?}", txn);
+    assert!(
+        debug_str.contains("Transaction") && debug_str.contains("create_table"),
+        "Debug output should contain Transaction info: {debug_str}"
+    );
     Ok(())
 }

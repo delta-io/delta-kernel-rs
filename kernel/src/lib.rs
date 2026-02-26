@@ -154,6 +154,10 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
+// Benchmarking infrastructure (only public for benchmarks and tests)
+#[cfg(any(test, feature = "internal-api"))]
+pub mod benchmarks;
+
 #[cfg(feature = "internal-api")]
 pub mod parallel;
 #[cfg(not(feature = "internal-api"))]
@@ -741,9 +745,11 @@ pub trait ParquetHandler: AsAny {
     /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
-    /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"parquet.field.id": 1`
+    /// - Column 0:  `"i_logical"` (integer, non-null) with field ID 1 (via [`ColumnMetadataKey::ParquetFieldId`])
     /// - Column 1: `"s"` (string, nullable) with no field ID metadata
     /// - Column 2: `"i2"` (integer, nullable) with no field ID metadata
+    ///
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     ///
     /// And a Parquet file containing these columns:
     /// - Column 0: `"i2"` (integer, nullable) with field ID 3
@@ -832,9 +838,8 @@ pub trait ParquetHandler: AsAny {
     /// # Field IDs
     ///
     /// If the Parquet file contains field IDs (written when column mapping is enabled), they are
-    /// preserved in each [`StructField`]'s metadata under the key `"PARQUET:field_id"`. Callers
-    /// can access field IDs via [`StructField::get_config_value`] with
-    /// [`ColumnMetadataKey::ParquetFieldId`].
+    /// preserved in each [`StructField`]'s metadata. Callers can access field IDs via
+    /// [`StructField::get_config_value`] with [`ColumnMetadataKey::ParquetFieldId`].
     ///
     /// # Errors
     ///

@@ -449,12 +449,14 @@ async fn open_parquet_file(
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
+    let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
             rbr?,
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
+            Some(&arrow_schema),
         )
     });
     Ok(stream.boxed())
@@ -529,6 +531,7 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
+            let arrow_schema: Arc<Schema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(
@@ -536,6 +539,7 @@ impl FileOpener for PresignedUrlOpener {
                     &requested_ordering,
                     row_indexes.as_mut(),
                     Some(&file_location),
+                    Some(&arrow_schema),
                 )
             });
             Ok(stream.boxed())
@@ -551,13 +555,15 @@ mod tests {
 
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int8Array, RecordBatch, TimestampMicrosecondArray,
+        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -835,6 +841,7 @@ mod tests {
 
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -845,7 +852,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1023,6 +1030,7 @@ mod tests {
 
         // Read it back
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1033,7 +1041,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url.clone(),
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1227,6 +1235,7 @@ mod tests {
 
         // Read back and verify it contains the second data set
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1237,7 +1246,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1306,6 +1315,7 @@ mod tests {
 
         // Verify the file was overwritten with the new data
         let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1316,7 +1326,7 @@ mod tests {
         let file_meta = FileMeta {
             location: file_url,
             last_modified: 0,
-            size: 0,
+            size: metadata.size,
         };
 
         let data: Vec<RecordBatch> = parquet_handler
@@ -1385,17 +1395,174 @@ mod tests {
 
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
 
-        // Verify field IDs are preserved
+        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
+        // The field IDs should be accessible using get_config_value (the documented API)
         let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        assert_eq!(
-            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"1".into())
-        );
+        let id_value = id_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
+        assert!(id_value.is_some(), "Field ID should be present");
+        assert_eq!(id_value.unwrap().to_string(), "1");
 
         let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
+        let name_value =
+            name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
+        assert!(name_value.is_some(), "Field ID should be present");
+        assert_eq!(name_value.unwrap().to_string(), "2");
+    }
+
+    /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.
+    ///
+    /// Per trait definitions in lib.rs, field IDs should be accessible via StructField::get_config_value
+    /// with ColumnMetadataKey::ParquetFieldId.
+    #[test]
+    fn test_parquet_footer_read_with_field_id() {
+        // Write parquet file with field ID
+        let field = Field::new("value", ArrowDataType::Int64, false).with_metadata(HashMap::from(
+            [(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string())],
+        ));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("field_id_test.parquet");
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read footer and verify field ID accessibility
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let file_meta = FileMeta {
+            location: Url::from_file_path(&file_path).unwrap(),
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+        let field = footer
+            .schema
+            .fields()
+            .find(|f| f.name() == "value")
+            .unwrap();
+
+        // Field ID is transformed to kernel key when reading
         assert_eq!(
-            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"2".into())
+            field
+                .metadata()
+                .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
+            Some(&"42".into())
         );
+
+        // Field ID should be accessible via documented API
+        let field_id = field.get_config_value(&ColumnMetadataKey::ParquetFieldId)
+            .expect("Field ID should be accessible via ColumnMetadataKey::ParquetFieldId per lib.rs:836-837");
+
+        match field_id {
+            crate::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
+            crate::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
+            other => panic!("Expected String or Number, got {:?}", other),
+        }
+    }
+
+    /// Test that columns are matched by field ID when column names differ.
+    ///
+    /// Per lib.rs:676-680, field IDs (via [`ColumnMetadataKey::ParquetFieldId`]) should take
+    /// precedence over field names for column matching.
+    ///
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    #[test]
+    fn test_read_parquet_with_field_id_matching() {
+        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+
+        // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
+        // The kernel will transform these to parquet.field.id when reading
+        let fields = vec![
+            Field::new("id", ArrowDataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", ArrowDataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(fields));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("field_id_matching.parquet");
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Create kernel schema with DIFFERENT names but SAME field IDs
+        let kernel_schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::new("user_id", crate::schema::DataType::LONG, false).with_metadata([
+                    (
+                        ColumnMetadataKey::ParquetFieldId.as_ref(),
+                        MetadataValue::Number(1),
+                    ),
+                ]),
+                StructField::new("user_name", crate::schema::DataType::STRING, false)
+                    .with_metadata([(
+                        ColumnMetadataKey::ParquetFieldId.as_ref(),
+                        MetadataValue::Number(2),
+                    )]),
+            ])
+            .unwrap(),
+        );
+
+        // Read using kernel schema with different column names
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let file_meta = FileMeta {
+            location: Url::from_file_path(&file_path).unwrap(),
+            last_modified: 0,
+            size: std::fs::metadata(&file_path).unwrap().len(),
+        };
+
+        // Should successfully match by field ID despite different names
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(slice::from_ref(&file_meta), kernel_schema, None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify data was correctly matched by field ID
+        assert_eq!(data.len(), 1);
+        let batch = &data[0];
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[1, 2, 3], "Should match by field ID 1");
+
+        let name_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "alice", "Should match by field ID 2");
+        assert_eq!(name_col.value(1), "bob");
+        assert_eq!(name_col.value(2), "charlie");
     }
 }
