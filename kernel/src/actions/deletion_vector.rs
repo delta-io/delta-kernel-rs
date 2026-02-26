@@ -1,6 +1,7 @@
 //! Code relating to parsing and using deletion vectors
 
 use std::io::{Cursor, Read};
+use std::mem::size_of;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use bytes::Bytes;
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::ToSchema;
 use roaring::RoaringTreemap;
+use static_assertions::const_assert;
 use url::Url;
 
 use crc::{Crc, CRC_32_ISO_HDLC};
@@ -15,6 +17,11 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
+
+// Platform safety: deletion vectors require 64-bit platforms because treemap_to_bools_with
+// combines u32 high/low bits into u64, then casts to usize for vector indexing.
+// On 32-bit platforms this cast would truncate, causing silent data corruption.
+const_assert!(size_of::<usize>() >= size_of::<u64>());
 
 /// Magic number for portable RoaringBitmap serialization format.
 /// This is the standard format defined in the RoaringBitmap Specification
@@ -421,8 +428,6 @@ fn treemap_to_bools_with(treemap: RoaringTreemap, set_bit: bool) -> Vec<bool> {
 
     match treemap.max() {
         Some(max) => {
-            // there are values in the map
-            //TODO(nick) panic if max is > MAX_USIZE
             let mut result = vec![!set_bit; max as usize + 1];
             let bitmaps = treemap.bitmaps();
             for (index, bitmap) in bitmaps {
