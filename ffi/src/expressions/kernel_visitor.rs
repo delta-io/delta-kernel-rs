@@ -1,14 +1,21 @@
 //! Defines [`KernelExpressionVisitorState`]. This is a visitor that can be used to convert an
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
-use crate::{
-    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
-};
+use std::sync::Arc;
+
 use delta_kernel::expressions::{
     BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
     UnaryPredicateOp,
 };
 use delta_kernel::DeltaResult;
+
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::handle::Handle;
+use crate::scan::{EngineExpression, EnginePredicate};
+use crate::SharedSchema;
+use crate::{
+    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
+    ReferenceSet, TryFromStringSlice,
+};
 
 pub(crate) enum ExpressionOrPredicate {
     Expression(Expression),
@@ -463,18 +470,11 @@ pub unsafe extern "C" fn visit_expression_map_to_struct(
     child_expr: usize,
     output_schema: Handle<SharedSchema>,
 ) -> usize {
-    let schema = output_schema.as_ref();
-    let schema_ref = std::sync::Arc::new(schema.clone());
+    let schema_ref = output_schema.clone_as_arc();
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
         wrap_expression(state, Expression::map_to_struct(expr, schema_ref))
     })
 }
-
-use crate::expressions::{SharedExpression, SharedPredicate};
-use crate::handle::Handle;
-use crate::scan::{EngineExpression, EnginePredicate};
-use crate::SharedSchema;
-use std::sync::Arc;
 
 /// Convert an engine expression to a kernel expression using the visitor
 /// pattern.

@@ -686,45 +686,50 @@ fn evaluate_map_to_struct(
         builders.push(arrow_array::make_builder(&arrow_type, num_rows));
     }
 
-    // Reusable HashMap to avoid allocating a new one per row.
-    let mut lookup: HashMap<&str, Option<&str>> = HashMap::new();
+    // Reverse lookup from field name to field index. Each map key is compared against this once
+    // per row, avoiding repeated string comparisons and storing only entries we care about.
+    let field_indices: HashMap<&str, usize> = HashMap::from_iter(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name().as_str(), i)),
+    );
+
+    // Track the offset of the most recent match per field. Because Arrow enforces monotonically
+    // increasing offsets, we can check `found >= entry_start` to determine if a match belongs
+    // to the current row without clearing or reinitializing each iteration.
+    let mut found_values: Vec<i32> = vec![-1; fields.len()];
+
+    let offsets = map_array.value_offsets();
+    let mut entry_end = offsets[0];
 
     for row in 0..num_rows {
-        if map_array.is_null(row) {
-            for (i, field) in fields.iter().enumerate() {
-                Scalar::Null(field.data_type().clone()).append_to(&mut *builders[i], 1)?;
-            }
-            continue;
-        }
+        let entry_start = entry_end;
+        entry_end = offsets[row + 1];
 
-        let start = map_array.value_offsets()[row] as usize;
-        let end = map_array.value_offsets()[row + 1] as usize;
-
-        // Build lookup from map entries. Forward iteration means rightmost key wins via overwrite.
-        lookup.clear();
-        for entry_idx in start..end {
-            if map_keys.is_valid(entry_idx) {
-                let key = map_keys.value(entry_idx);
-                let val = if map_values.is_valid(entry_idx) {
-                    Some(map_values.value(entry_idx))
-                } else {
-                    None
-                };
-                lookup.insert(key, val);
+        // Scan this row's map entries (skipped entirely for null rows since offsets still
+        // increase monotonically — the empty range means no matches are recorded).
+        if map_array.is_valid(row) {
+            for entry_idx in entry_start..entry_end {
+                let key = map_keys.value(entry_idx as usize);
+                if let Some(&i) = field_indices.get(key) {
+                    found_values[i] = entry_idx;
+                }
             }
         }
 
-        // Look up each output field from the same lookup table.
         for (i, field) in fields.iter().enumerate() {
-            match lookup.get(field.name().as_str()) {
-                Some(Some(raw)) => {
-                    let scalar = primitive_types[i].parse_scalar(raw)?;
-                    scalar.append_to(&mut *builders[i], 1)?;
-                }
-                _ => {
-                    // Missing key or null value → null
-                    Scalar::Null(field.data_type().clone()).append_to(&mut *builders[i], 1)?;
-                }
+            let entry_idx = found_values[i];
+            let builder = builders[i].as_mut();
+
+            // Only process values belonging to the current row (entry_idx >= entry_start)
+            // and where the value is non-null.
+            if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
+                let raw = map_values.value(entry_idx as usize);
+                let scalar = primitive_types[i].parse_scalar(raw)?;
+                scalar.append_to(builder, 1)?;
+            } else {
+                Scalar::append_null(builder, field.data_type(), 1)?;
             }
         }
     }

@@ -1038,14 +1038,12 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => {
-                write!(
-                    f,
-                    "MAP_TO_STRUCT({}, <schema:{} fields>)",
-                    m.map_expr,
-                    m.output_schema.fields().len()
-                )
-            }
+            MapToStruct(m) => write!(
+                f,
+                "MAP_TO_STRUCT({}, <schema:{} fields>)",
+                m.map_expr,
+                m.output_schema.fields().len()
+            ),
         }
     }
 }

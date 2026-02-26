@@ -643,6 +643,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
+            // ParseJson and MapToStruct produce structured output, not scalar values
             Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
         }
