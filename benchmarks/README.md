@@ -1,4 +1,4 @@
-# delta-kernel-rs Benchmarks
+# Delta Kernel Benchmarking
 
 This crate contains benchmarking infratsructure for Delta Kernel using Criterion and JSON workload specs. It is separate from the `kernel` crate to keep benchmark-specific code and dependencies out of the core library.
 
@@ -41,7 +41,7 @@ For remote tables (S3/cloud), include `table_path`:
 
 Deserialized from a JSON file in a table's `specs/` directory. Describes a single operation to benchmark against a table. Two variants are supported:
 
-- **`Read`** — scan a table at an optional version (defaults to latest)
+- **`Read`** — scan a table at an optional version (defaults to latest). A single `Read` spec expands into one benchmark per `ReadOperation` × `ReadConfig` combination — every relevant operation and parallelism mode is benchmarked. Currently only `ReadMetadata` is implemented; `ReadData` is not yet supported.
 - **`SnapshotConstruction`** — measure the cost of building a `Snapshot` from scratch at an optional version (defaults to latest)
 
 Read specs:
@@ -80,7 +80,7 @@ Includes `TableInfo`, `case_name`, and `Spec` — the unit of work that gets ben
 
 ### `ReadConfig`
 
-Specifies runtime parameters for `Read` workloads that are not part of the spec JSON — currently whether to scan serially or in parallel, and how many threads to use. Multiple configs can be applied to the same workload to compare modes.
+Specifies runtime parameters for `Read` workloads that are not part of the spec JSON — currently whether to scan serially or in parallel, and how many threads to use. Multiple configs can be applied to the same workload to compare modes. By default all workloads run serial log replay; workloads with sidecar files additionally run parallel configs to benchmark parallel scanning.
 
 ### `WorkloadRunner`
 
