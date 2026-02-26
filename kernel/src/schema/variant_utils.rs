@@ -9,7 +9,13 @@ use std::borrow::Cow;
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 #[derive(Debug, Default)]
-pub(crate) struct UsesVariant(pub(crate) bool);
+pub(crate) struct UsesVariant(bool);
+
+impl UsesVariant {
+    pub(crate) fn found(&self) -> bool {
+        self.0
+    }
+}
 
 impl<'a> SchemaTransform<'a> for UsesVariant {
     fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
@@ -28,7 +34,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
         let mut uses_variant = UsesVariant::default();
         let _ = uses_variant.transform_struct(&tc.schema());
         require!(
-            !uses_variant.0,
+            !uses_variant.found(),
             Error::unsupported(
                 "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features"
             )
