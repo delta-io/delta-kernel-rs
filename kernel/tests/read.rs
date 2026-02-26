@@ -1401,7 +1401,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::test]
 async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
-    use delta_kernel::arrow::array::{Array, AsArray, RunArray};
+    use delta_kernel::arrow::array::{Array, StringArray};
 
     // Set up an in-memory table with multiple data files
     let batch1 = generate_batch(vec![
@@ -1478,41 +1478,24 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         let expected_file_name = expected_files[file_count];
         let expected_path = format!("{}{}", location, expected_file_name);
 
-        // The file path array should be run-end encoded
-        let run_array = file_path_array
+        // The file path array should be a plain StringArray with the path repeated for each row.
+        let string_array = file_path_array
             .as_any()
-            .downcast_ref::<RunArray<Int64Type>>()
-            .expect("File path column should be run-end encoded");
+            .downcast_ref::<StringArray>()
+            .expect("File path column should be a StringArray");
 
-        // Verify each logical row has the correct file path
         assert_eq!(
-            run_array.len(),
+            string_array.len(),
             expected_row_counts[file_count],
             "File {} should have {} rows",
             expected_file_name,
             expected_row_counts[file_count]
         );
-
-        // Verify the physical representation is efficient (single run)
-        let run_ends = run_array.run_ends().values();
-        assert_eq!(
-            run_ends.len(),
-            1,
-            "File path should be encoded as a single run"
-        );
-        assert_eq!(
-            run_ends[0], expected_row_counts[file_count] as i64,
-            "Run should end at position {}",
-            expected_row_counts[file_count]
-        );
-
-        // Verify the value is the expected file path
-        let values = run_array.values().as_string::<i32>();
-        assert_eq!(values.len(), 1, "Should have only 1 unique file path value");
-        assert_eq!(
-            values.value(0),
-            expected_path,
-            "File path should be '{}'",
+        assert!(
+            string_array
+                .iter()
+                .all(|v| v == Some(expected_path.as_str())),
+            "All rows should contain file path '{}'",
             expected_path
         );
 

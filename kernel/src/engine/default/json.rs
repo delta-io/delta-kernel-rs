@@ -17,7 +17,8 @@ use url::Url;
 use super::executor::TaskExecutor;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json, to_json_bytes,
+    build_json_reorder_indices, json_arrow_schema, parse_json as arrow_parse_json,
+    reorder_struct_array, to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
@@ -95,12 +96,14 @@ async fn read_json_files_impl(
     // Build Arrow schema from only the real JSON columns, omitting any metadata columns
     // (e.g. FilePath) that the JSON reader cannot populate from the file content.
     let json_arrow_schema = Arc::new(json_arrow_schema(&physical_schema)?);
+    // Build the reorder index vec once; apply it to every batch via reorder_struct_array.
+    let reorder_indices: Arc<[_]> = build_json_reorder_indices(&physical_schema)?.into();
 
     // An iterator of futures that open each file and post-process each resulting batch.
     let file_futures = files.into_iter().map(move |file| {
         let store = store.clone();
         let json_arrow_schema = json_arrow_schema.clone();
-        let physical_schema = physical_schema.clone();
+        let reorder_indices = reorder_indices.clone();
         async move {
             let file_path = file.location.to_string();
             let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
@@ -108,7 +111,12 @@ async fn read_json_files_impl(
             let tagged = batch_stream
                 .map(move |result| -> DeltaResult<Box<dyn EngineData>> {
                     let batch = result?;
-                    let batch = fixup_json_read(batch, &physical_schema, &file_path)?;
+                    let batch = RecordBatch::from(reorder_struct_array(
+                        batch.into(),
+                        &reorder_indices,
+                        None,
+                        Some(&file_path),
+                    )?);
                     Ok(Box::new(ArrowEngineData::new(batch)))
                 })
                 .boxed();
@@ -891,8 +899,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_json_files_injects_file_path_column() {
-        use crate::arrow::array::RunArray;
-        use crate::arrow::datatypes::Int64Type;
         use crate::schema::MetadataColumnSpec;
 
         // Write a temp JSON file with two simple rows.
@@ -934,22 +940,14 @@ mod tests {
         assert_eq!(batch.schema().field(0).name(), "x");
         assert_eq!(batch.schema().field(1).name(), "_file");
 
-        // _file should be run-end encoded: one run covering all rows, value = the file URL.
-        let run_array = batch
+        // _file should be a plain StringArray with the file URL repeated for each row.
+        let string_array = batch
             .column(1)
             .as_any()
-            .downcast_ref::<RunArray<Int64Type>>()
-            .expect("Expected RunArray<Int64Type> for _file column");
-        assert_eq!(run_array.len(), 2);
-        let run_ends = run_array.run_ends().values();
-        assert_eq!(
-            run_ends.len(),
-            1,
-            "Should have exactly one run (constant path)"
-        );
-        assert_eq!(run_ends[0], 2, "Run end should equal number of rows");
-        let values = run_array.values().as_string::<i32>();
-        assert_eq!(values.value(0), file_url.as_str());
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray for _file column");
+        assert_eq!(string_array.len(), 2);
+        assert!(string_array.iter().all(|v| v == Some(file_url.as_str())));
     }
 
     async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
