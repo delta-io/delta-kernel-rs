@@ -244,7 +244,9 @@ mod tests {
         // Unknown value: field stays None (key consumed, not in unknown_properties)
         let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "gzip")]);
         assert_eq!(props.parquet_compression_codec, None);
-        assert!(!props.unknown_properties.contains_key(PARQUET_COMPRESSION_CODEC));
+        assert!(!props
+            .unknown_properties
+            .contains_key(PARQUET_COMPRESSION_CODEC));
     }
 
     #[test]

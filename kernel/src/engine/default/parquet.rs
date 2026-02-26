@@ -785,7 +785,12 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[], &Default::default())
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -865,7 +870,12 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[], &Default::default())
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    &Default::default(),
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );

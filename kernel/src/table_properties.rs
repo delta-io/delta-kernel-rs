@@ -389,10 +389,7 @@ mod tests {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
             "delta.inCommitTimestampEnablementTimestamp"
         );
-        assert_eq!(
-            PARQUET_COMPRESSION_CODEC,
-            "delta.parquet.compression.codec"
-        );
+        assert_eq!(PARQUET_COMPRESSION_CODEC, "delta.parquet.compression.codec");
     }
 
     #[test]
