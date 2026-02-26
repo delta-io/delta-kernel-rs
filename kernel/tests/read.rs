@@ -56,7 +56,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
             TestAction::Add(PARQUET_FILE2.to_string()),
         ]),
@@ -103,7 +103,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
         ]),
     )
@@ -156,7 +156,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
         ]),
     )
@@ -208,7 +208,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .map(|test_action| match test_action {
                 TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 5}},\"maxValues\":{{\"id\":7}}}}"}}}}"#, action = "add", path = path),
                 TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
-                TestAction::Metadata => METADATA.into(),
+                TestAction::AllMetadata => METADATA.into(),
             })
             .fold(String::new(), |a, b| a + &b + "\n")
     }
@@ -224,7 +224,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
         ]),
     )
@@ -1340,7 +1340,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
             TestAction::Add(PARQUET_FILE2.to_string()),
             TestAction::Add(PARQUET_FILE3.to_string()),
@@ -1435,7 +1435,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
             TestAction::Add(PARQUET_FILE2.to_string()),
         ]),
@@ -1549,7 +1549,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
         ]),
     )
@@ -1608,7 +1608,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         storage.as_ref(),
         0,
         actions_to_string(vec![
-            TestAction::Metadata,
+            TestAction::AllMetadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
             TestAction::Add(PARQUET_FILE2.to_string()),
         ]),

@@ -150,6 +150,7 @@ walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
+rstest = "0.26.1"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
