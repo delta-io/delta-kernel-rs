@@ -1442,12 +1442,12 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
+    use crate::table_properties::PARQUET_COMPRESSION_CODEC;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
-    use crate::table_properties::PARQUET_COMPRESSION_CODEC;
     use crate::EvaluationHandler;
     use crate::ParquetCompression;
     use crate::Snapshot;
@@ -2204,7 +2204,10 @@ mod tests {
         let url = url::Url::from_directory_path(tempdir.path()).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        assert_eq!(txn.get_write_context().parquet_writer_config().compression, expected);
+        assert_eq!(
+            txn.get_write_context().parquet_writer_config().compression,
+            expected
+        );
         Ok(())
     }
 }
