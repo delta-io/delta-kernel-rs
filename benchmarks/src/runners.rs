@@ -10,7 +10,7 @@ use crate::models::{
 use delta_kernel::parallel::parallel_phase::ParallelPhase;
 use delta_kernel::parallel::sequential_phase::AfterSequential;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::Engine;
+use delta_kernel::{Engine, Error, try_parse_uri};
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ impl ReadMetadataRunner {
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let table_root = table_info.resolved_table_root();
-        let url = delta_kernel::try_parse_uri(table_root)?;
+        let url = try_parse_uri(table_root)?;
 
         let mut builder = Snapshot::builder_for(url);
         if let Some(version) = read_spec.version {
@@ -103,7 +103,7 @@ impl ReadMetadataRunner {
                         let engine = self.engine.clone();
                         let processor = processor.clone();
 
-                        thread::spawn(move || -> Result<(), delta_kernel::Error> {
+                        thread::spawn(move || -> Result<(), Error> {
                             if partition_files.is_empty() {
                                 return Ok(());
                             }
@@ -180,7 +180,7 @@ impl SnapshotConstructionRunner {
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let table_root = table_info.resolved_table_root();
-        let url = delta_kernel::try_parse_uri(table_root)?;
+        let url = try_parse_uri(table_root)?;
 
         let name = format!(
             "{}/{}/{}",
