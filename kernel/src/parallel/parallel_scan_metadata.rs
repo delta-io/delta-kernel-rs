@@ -34,8 +34,16 @@ pub struct Phase1ScanMetadata {
 }
 
 impl Phase1ScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
-        let span = tracing::info_span!("scan_metadata_phase1");
+    pub(crate) fn new(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        table_root: &str,
+        version: u64,
+    ) -> Self {
+        let span = tracing::info_span!(
+            "scan_metadata_phase1",
+            table_root = %table_root,
+            version = %version
+        );
         Self { sequential, span }
     }
 

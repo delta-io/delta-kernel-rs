@@ -22,6 +22,8 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::parallel::sequential_phase::SequentialPhase;
+use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -837,7 +839,6 @@ impl Scan {
     /// }
     /// # Ok(())
     /// # }
-    #[allow(unused)]
     pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
@@ -845,10 +846,6 @@ impl Scan {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
-
-        use crate::parallel::sequential_phase::SequentialPhase;
-        use crate::scan::log_replay::ScanLogReplayProcessor;
-
         let checkpoint_read_schema = if self.skip_stats {
             CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
         } else {
@@ -866,7 +863,11 @@ impl Scan {
         )?;
         let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
 
-        Ok(Phase1ScanMetadata::new(sequential))
+        Ok(Phase1ScanMetadata::new(
+            sequential,
+            self.snapshot.table_root().as_str(),
+            self.snapshot.version(),
+        ))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
