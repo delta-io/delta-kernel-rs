@@ -863,11 +863,13 @@ impl Scan {
         )?;
         let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
 
-        Ok(Phase1ScanMetadata::new(
-            sequential,
-            self.snapshot.table_root().as_str(),
-            self.snapshot.version(),
-        ))
+        let parent_span = tracing::info_span!(
+            "scan_metadata",
+            table_root = %self.snapshot.table_root(),
+            version = %self.snapshot.version()
+        );
+
+        Ok(Phase1ScanMetadata::new(sequential, parent_span))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
