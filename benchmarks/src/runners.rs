@@ -10,7 +10,7 @@ use crate::models::{
 use delta_kernel::parallel::parallel_phase::ParallelPhase;
 use delta_kernel::parallel::sequential_phase::AfterSequential;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, Error, try_parse_uri};
+use delta_kernel::{try_parse_uri, Engine, Error};
 
 use std::hint::black_box;
 use std::sync::Arc;

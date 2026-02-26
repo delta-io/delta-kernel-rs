@@ -1,12 +1,12 @@
 [package]
 name = "delta_kernel_benchmarks"
+publish = false
 edition.workspace = true
-version.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
+version.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["arrow", "default-engine-rustls", "internal-api"] }
