@@ -863,10 +863,18 @@ impl Scan {
         )?;
         let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
 
+        let predicate_display = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(pred, _) => format!("{:?}", pred),
+            PhysicalPredicate::StaticSkipAll => "StaticSkipAll".to_string(),
+            PhysicalPredicate::None => "None".to_string(),
+        };
+
         let parent_span = tracing::info_span!(
             "scan_metadata",
             table_root = %self.snapshot.table_root(),
-            version = %self.snapshot.version()
+            version = %self.snapshot.version(),
+            schema = ?self.state_info.logical_schema,
+            predicate = %predicate_display
         );
 
         Ok(Phase1ScanMetadata::new(sequential, parent_span))
