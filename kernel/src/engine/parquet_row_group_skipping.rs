@@ -18,7 +18,7 @@ use tracing::debug;
 mod tests;
 
 /// An extension trait for [`ArrowReaderBuilder`] that injects row group skipping capability.
-pub trait ParquetRowGroupSkipping {
+pub(crate) trait ParquetRowGroupSkipping {
     /// Instructs the parquet reader to perform row group skipping, eliminating any row group whose
     /// stats prove that none of the group's rows can satisfy the given `predicate`.
     ///
@@ -114,7 +114,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
 /// A ParquetStatsSkippingFilter for row group skipping. It obtains stats from a parquet
 /// [`RowGroupMetaData`] and pre-computes the mapping of each referenced column path to its
 /// corresponding field index, for O(1) stats lookups.
-pub struct RowGroupFilter<'a> {
+pub(crate) struct RowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
     field_indices: HashMap<ColumnName, usize>,
 }

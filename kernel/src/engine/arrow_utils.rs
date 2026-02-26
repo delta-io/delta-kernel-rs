@@ -100,13 +100,13 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
 }
 
 /// Prepares to enumerate row indexes of rows in a parquet file, accounting for row group skipping.
-pub struct RowIndexBuilder {
+pub(crate) struct RowIndexBuilder {
     row_group_row_index_ranges: Vec<Range<i64>>,
     row_group_ordinals: Option<Vec<usize>>,
 }
 
 impl RowIndexBuilder {
-    pub fn new(row_groups: &[RowGroupMetaData]) -> Self {
+    pub(crate) fn new(row_groups: &[RowGroupMetaData]) -> Self {
         let mut row_group_row_index_ranges = Vec::with_capacity(row_groups.len());
         let mut offset = 0;
         for row_group in row_groups {
@@ -122,7 +122,7 @@ impl RowIndexBuilder {
 
     /// Only produce row indexes for the row groups specified by the ordinals that survived row
     /// group skipping. The ordinals must be in 0..num_row_groups.
-    pub fn select_row_groups(&mut self, ordinals: &[usize]) {
+    pub(crate) fn select_row_groups(&mut self, ordinals: &[usize]) {
         // NOTE: Don't apply the filtering until we actually build the iterator, because the
         // filtering is not idempotent and `with_row_groups` could be called more than once.
         self.row_group_ordinals = Some(ordinals.to_vec())
@@ -133,7 +133,7 @@ impl RowIndexBuilder {
     /// # Errors
     ///
     /// Returns an error if there are duplicate or out of bounds row group ordinals.
-    pub fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
+    pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
                 let mut seen_ordinals = HashSet::with_capacity(ordinals.len());

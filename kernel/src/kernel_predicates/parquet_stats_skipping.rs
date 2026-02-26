@@ -19,10 +19,11 @@ mod tests;
 ///
 /// Implement this trait to plug in custom stats sources (e.g., a different parquet reader)
 /// and gain data-skipping predicate evaluation for free via [`DataSkippingPredicateEvaluator`].
-pub trait ParquetStatsProvider {
+pub(crate) trait ParquetStatsProvider {
     /// Pre-registers a set of columns that may be queried shortly after. Callers are not strictly
     /// required to invoke this method, but some providers may choose to only provide stats for
     /// prepared columns because repeatedly traversing parquet footers can be expensive.
+    #[allow(dead_code)] // Used by CheckpointMetaSkippingFilter (requires default-engine-base)
     fn prepare_stats<'a, I>(&mut self, _cols: I)
     where
         I: IntoIterator<Item = &'a ColumnName>,
@@ -141,7 +142,8 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
 /// `nullcount = 0` even when column statistics are entirely missing, making the nullcount
 /// guard ineffective. Until the upstream fix lands, checkpoint row group skipping will
 /// conservatively keep all row groups (no pruning) for nested stat columns.
-pub struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
+#[allow(dead_code)] // Only constructed when default-engine-base is enabled
+pub(crate) struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
     inner: T,
     min_stats: HashMap<ColumnName, ColumnName>,
     max_stats: HashMap<ColumnName, ColumnName>,
@@ -149,8 +151,9 @@ pub struct CheckpointMetaSkippingFilter<T: ParquetStatsProvider> {
     partition_columns: HashSet<ColumnName>,
 }
 
+#[allow(dead_code)] // Only used when default-engine-base is enabled
 impl<T: ParquetStatsProvider> CheckpointMetaSkippingFilter<T> {
-    pub fn new(
+    pub(crate) fn new(
         mut inner: T,
         predicate: &Predicate,
         partition_columns: &HashSet<ColumnName>,
@@ -187,7 +190,11 @@ impl<T: ParquetStatsProvider> CheckpointMetaSkippingFilter<T> {
         }
     }
 
-    pub fn apply(inner: T, predicate: &Predicate, partition_columns: &HashSet<ColumnName>) -> bool {
+    pub(crate) fn apply(
+        inner: T,
+        predicate: &Predicate,
+        partition_columns: &HashSet<ColumnName>,
+    ) -> bool {
         CheckpointMetaSkippingFilter::new(inner, predicate, partition_columns)
             .eval_sql_where(predicate)
             != Some(false)

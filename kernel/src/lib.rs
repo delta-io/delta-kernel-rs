@@ -186,18 +186,6 @@ use schema::{SchemaTransform, StructField, StructType};
 ))]
 pub mod engine;
 
-// Re-export row group filtering types at the crate root so they are accessible without
-// going through the `engine` module. This prepares for an eventual crate split where
-// the default engine moves to its own crate while these types stay in the kernel core.
-#[cfg(feature = "default-engine-base")]
-pub use engine::arrow_utils::RowIndexBuilder;
-#[cfg(feature = "default-engine-base")]
-pub use engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-#[cfg(feature = "default-engine-base")]
-pub use kernel_predicates::parquet_stats_skipping::{
-    CheckpointMetaSkippingFilter, ParquetStatsProvider,
-};
-
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
 
