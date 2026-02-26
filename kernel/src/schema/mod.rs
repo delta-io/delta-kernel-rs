@@ -1296,10 +1296,6 @@ impl ColumnNamesAndTypes {
         (&self.0, &self.1)
     }
 
-    pub(crate) fn extend(&mut self, other: ColumnNamesAndTypes) {
-        self.0.extend(other.0);
-        self.1.extend(other.1);
-    }
 }
 
 impl From<(Vec<ColumnName>, Vec<DataType>)> for ColumnNamesAndTypes {
