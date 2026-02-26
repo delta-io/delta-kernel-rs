@@ -129,6 +129,7 @@ mod tests {
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::parallel::parallel_scan_metadata::AfterPhase1ScanMetadata;
+    use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -407,8 +408,6 @@ mod tests {
         match phase1.finish()? {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
-                use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
-
                 let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
                     let serialized_bytes = state.into_bytes()?;
@@ -533,67 +532,67 @@ mod tests {
 
     #[test]
     fn test_parallel_with_skip_stats() -> DeltaResult<()> {
-        use crate::scan::CHECKPOINT_READ_SCHEMA_NO_STATS;
-
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
+        // Get expected paths using single-node scan_metadata with skip_stats=true
         let scan = snapshot
+            .clone()
             .scan_builder()
             .with_skip_stats(true)
             .build()?;
-
-        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
-
-        // Verify stats is None in phase1 results
-        let _: Vec<()> = phase1.try_fold(Vec::new(), |acc, metadata_res| {
-            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<()>, scan_file| {
+        let mut single_node_iter = scan.scan_metadata(engine.as_ref())?;
+        let mut expected_paths = single_node_iter.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "When skip_stats=true, scan_file.stats should be None"
+                    "Single-node: scan_file.stats should be None when skip_stats=true"
                 );
-                ps.push(());
+                ps.push(scan_file.path);
+            })
+        })?;
+        expected_paths.sort();
+
+        // Run parallel workflow with skip_stats=true
+        let scan = snapshot.scan_builder().with_skip_stats(true).build()?;
+        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+
+        // Verify stats is None in phase1 results and collect paths
+        let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                assert!(
+                    scan_file.stats.is_none(),
+                    "Phase1: scan_file.stats should be None when skip_stats=true"
+                );
+                ps.push(scan_file.path);
             })
         })?;
 
         match phase1.finish()? {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
-                use crate::parallel::parallel_scan_metadata::Phase2ScanMetadata;
+                // Verify stats is None in phase2 results and collect paths
+                let mut phase2 = Phase2ScanMetadata::try_new(engine.clone(), state, files)?;
 
-                // Verify checkpoint schema does NOT contain stats field
-                let checkpoint_schema = &state.checkpoint_info.checkpoint_read_schema;
-                let add_field = checkpoint_schema
-                    .fields()
-                    .find(|f| f.name() == "add")
-                    .expect("checkpoint schema should contain add field");
-                let add_struct = match add_field.data_type() {
-                    crate::schema::DataType::Struct(s) => s,
-                    _ => panic!("add field should be a struct"),
-                };
-                let has_stats = add_struct.fields().any(|f| f.name() == "stats");
-                assert!(
-                    !has_stats,
-                    "When skip_stats=true, checkpoint schema should NOT contain stats field"
-                );
-
-                // Verify stats is None in phase2 results
-                let mut phase2 = Phase2ScanMetadata::try_new(
-                    engine.clone(),
-                    state,
-                    files,
-                )?;
-
-                let _: Vec<()> = phase2.try_fold(Vec::new(), |acc, metadata_res| {
-                    metadata_res?.visit_scan_files(acc, |ps: &mut Vec<()>, scan_file| {
+                let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
+                    metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                         assert!(
                             scan_file.stats.is_none(),
-                            "When skip_stats=true, scan_file.stats should be None in phase2"
+                            "Phase2: scan_file.stats should be None when skip_stats=true"
                         );
-                        ps.push(());
+                        ps.push(scan_file.path);
                     })
                 })?;
+
+                all_paths.extend(phase2_paths);
             }
         }
+
+        // Verify parallel workflow returns same files as single-node
+        all_paths.sort();
+        assert_eq!(
+            all_paths, expected_paths,
+            "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
+        );
 
         Ok(())
     }

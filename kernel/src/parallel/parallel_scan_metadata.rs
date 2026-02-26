@@ -71,7 +71,7 @@ impl Iterator for Phase1ScanMetadata {
 #[derive(Clone)]
 pub struct Phase2State {
     inner: Arc<ScanLogReplayProcessor>,
-    pub(crate) checkpoint_info: CheckpointReadInfo,
+    checkpoint_info: CheckpointReadInfo,
 }
 
 impl AsRef<Phase2State> for Phase2State {
