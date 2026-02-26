@@ -35,6 +35,7 @@ For remote tables (S3/cloud), include `table_path`:
   "description": "A table on S3",
   "table_path": "s3://bucket/path/to/table/"
 }
+```
 
 ### `Spec`
 
