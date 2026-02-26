@@ -304,7 +304,7 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     }
 }
 
-/// An item yielded by a [`RowIndexIterator`] during filtered iteration.
+/// An item yielded by [`RowIndexIterator::row_events`] during filtered iteration.
 #[derive(Debug, PartialEq)]
 pub enum RowEvent {
     /// A run of consecutive rows that were filtered out by the selection vector.
@@ -314,11 +314,12 @@ pub enum RowEvent {
     Row(Range<usize>),
 }
 
-/// An iterator over runs of selected and skipped rows in an engine-data batch.
+/// An iterator over the indices of selected rows in an engine-data batch.
 ///
-/// Each call to [`Iterator::next`] returns either a [`RowEvent::Skipped`] for a run
-/// of `n` consecutive deselected rows, or a [`RowEvent::Row`] for a contiguous
-/// run of selected rows.
+/// Each call to [`Iterator::next`] returns the index of the next selected row.
+///
+/// Use [`RowIndexIterator::row_events`] instead when you need to track deselected row
+/// positions — for example to emit `null` values for alignment.
 ///
 /// Constructed internally and passed (alongside the column getters) to
 /// [`FilteredRowVisitor::visit_filtered`].
@@ -337,85 +338,81 @@ impl<'sv> RowIndexIterator<'sv> {
         }
     }
 
-    /// Convert into an iterator that yields one `Range<usize>` per contiguous run of selected
-    /// rows, silently discarding deselected rows.
-    ///
-    /// Prefer this over iterating `self` directly in visitors that only need to process
-    /// selected rows and do not need to track deselected row positions.
-    ///
-    /// Use `self` (full [`RowEvent`]-based iteration) when you need to account for skipped
-    /// rows — for example to emit `null` values for them.
-    pub fn selected_runs(self) -> impl Iterator<Item = Range<usize>> + 'sv {
-        SelectedRunIter { inner: self }
+    /// Convert into an iterator that yields [`RowEvent`] items for tracking runs of selected
+    /// and skipped rows. Use when you need to account for deselected row positions — for
+    /// example to emit `null` values for alignment.
+    pub fn row_events(self) -> impl Iterator<Item = RowEvent> + 'sv {
+        RowEventIter(self)
     }
 }
 
 impl<'sv> Iterator for RowIndexIterator<'sv> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        while self.sv_pos < self.row_count {
+            let pos = self.sv_pos;
+            self.sv_pos += 1;
+            if pos >= self.selection_vector.len() || self.selection_vector[pos] {
+                return Some(pos);
+            }
+        }
+        None
+    }
+}
+
+/// An iterator that yields [`RowEvent`] items (runs of selected/skipped rows).
+///
+/// Produced by [`RowIndexIterator::row_events`].
+struct RowEventIter<'sv>(RowIndexIterator<'sv>);
+
+impl<'sv> Iterator for RowEventIter<'sv> {
     type Item = RowEvent;
 
     fn next(&mut self) -> Option<RowEvent> {
-        if self.sv_pos < self.selection_vector.len() {
-            if !self.selection_vector[self.sv_pos] {
+        let inner = &mut self.0;
+        if inner.sv_pos < inner.selection_vector.len() {
+            if !inner.selection_vector[inner.sv_pos] {
                 // Count the consecutive deselected run.
                 let mut count = 0;
-                while self.sv_pos < self.selection_vector.len()
-                    && !self.selection_vector[self.sv_pos]
+                while inner.sv_pos < inner.selection_vector.len()
+                    && !inner.selection_vector[inner.sv_pos]
                 {
-                    self.sv_pos += 1;
+                    inner.sv_pos += 1;
                     count += 1;
                 }
                 return Some(RowEvent::Skipped(count));
             }
             // Extend the selected run to its end.
-            let start = self.sv_pos;
-            while self.sv_pos < self.selection_vector.len() && self.selection_vector[self.sv_pos] {
-                self.sv_pos += 1;
+            let start = inner.sv_pos;
+            while inner.sv_pos < inner.selection_vector.len()
+                && inner.selection_vector[inner.sv_pos]
+            {
+                inner.sv_pos += 1;
             }
             // If the run reaches the end of the selection vector, fold in the implicit
             // tail rows (rows beyond sv.len() are always selected).
-            if self.sv_pos == self.selection_vector.len() {
-                self.sv_pos = self.row_count; // sentinel: tail consumed
-                return Some(RowEvent::Row(start..self.row_count));
+            if inner.sv_pos == inner.selection_vector.len() {
+                inner.sv_pos = inner.row_count; // sentinel: tail consumed
+                return Some(RowEvent::Row(start..inner.row_count));
             }
-            return Some(RowEvent::Row(start..self.sv_pos));
+            return Some(RowEvent::Row(start..inner.sv_pos));
         }
         // Tail rows beyond the selection vector: all implicitly selected.
         // Only reached when the skip loop exhausted the sv (trailing deselected rows).
-        if self.sv_pos < self.row_count {
-            let range = self.sv_pos..self.row_count;
-            self.sv_pos = self.row_count;
+        if inner.sv_pos < inner.row_count {
+            let range = inner.sv_pos..inner.row_count;
+            inner.sv_pos = inner.row_count;
             return Some(RowEvent::Row(range));
         }
         None
     }
 }
 
-/// An iterator over contiguous ranges of selected rows, silently skipping deselected rows.
-///
-/// Produced by [`RowIndexIterator::selected_runs`]. Unlike iterating a [`RowIndexIterator`]
-/// directly (which yields both [`RowEvent::Row`] and [`RowEvent::Skipped`] events), this
-/// iterator yields only a `Range<usize>` per contiguous selected run.
-struct SelectedRunIter<'sv> {
-    inner: RowIndexIterator<'sv>,
-}
-
-impl<'sv> Iterator for SelectedRunIter<'sv> {
-    type Item = Range<usize>;
-
-    fn next(&mut self) -> Option<Range<usize>> {
-        loop {
-            match self.inner.next()? {
-                RowEvent::Row(range) => return Some(range),
-                RowEvent::Skipped(_) => continue,
-            }
-        }
-    }
-}
-
 /// A visitor that processes [`FilteredEngineData`] with automatic row filtering.
 ///
 /// Implementors provide [`visit_filtered`] which receives the column getters and a
-/// [`RowIndexIterator`] that yields either skipped row counts or selected row indices.
+/// [`RowIndexIterator`] that yields the index of each selected row.
 /// The default [`visit_rows_of`] method handles all the plumbing: extracting the selection
 /// vector, building the bridge, and calling [`EngineData::visit_rows`].
 ///
@@ -425,9 +422,9 @@ pub trait FilteredRowVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]);
 
     /// Process this batch. `getters` contains one [`GetData`] item per requested column.
-    /// Iterate `rows` to receive [`RowEvent::Skipped`] for runs of deselected rows and
-    /// [`RowEvent::Row`] for contiguous runs of selected rows. Use
-    /// `for row_index in range` to access individual rows within a run via `getters`.
+    /// Iterate `rows` to receive the index of each selected row. Call
+    /// [`RowIndexIterator::row_events`] instead if you need to track deselected row positions
+    /// — for example to emit `null` values for alignment.
     fn visit_filtered<'a>(
         &mut self,
         getters: &[&'a dyn GetData<'a>],
@@ -804,35 +801,34 @@ mod tests {
         assert_eq!(data.len(), 3);
     }
 
-    fn collect_events(row_count: usize, selection: &[bool]) -> Vec<RowEvent> {
+    fn collect_indices(row_count: usize, selection: &[bool]) -> Vec<usize> {
         RowIndexIterator::new(row_count, selection).collect()
     }
 
-    fn collect_runs(row_count: usize, selection: &[bool]) -> Vec<Range<usize>> {
+    fn collect_events(row_count: usize, selection: &[bool]) -> Vec<RowEvent> {
         RowIndexIterator::new(row_count, selection)
-            .selected_runs()
+            .row_events()
             .collect()
     }
 
     #[rstest]
     #[case(0, &[], vec![])]
-    #[case(3, &[], vec![0..3])]
-    #[case(3, &[true, true, true], vec![0..3])]
+    #[case(3, &[], vec![0, 1, 2])]
+    #[case(3, &[true, true, true], vec![0, 1, 2])]
     #[case(3, &[false, false, false], vec![])]
-    #[case(5, &[true, false, false, true, true], vec![0..1, 3..5])]
-    #[case(4, &[false, false, true, true], vec![2..4])]
-    #[case(3, &[true, false, false], vec![0..1])]
-    // sv shorter than row_count: trailing true run folds in implicit tail rows
-    #[case(4, &[false, true], vec![1..4])]
-    // sv shorter than row_count: tail rows emitted as a separate run after a skipped block
-    #[case(4, &[true, false], vec![0..1, 2..4])]
-    #[case(4, &[false, true, false, true], vec![1..2, 3..4])]
-    fn selected_run_iter(
+    #[case(5, &[true, false, false, true, true], vec![0, 3, 4])]
+    #[case(4, &[false, false, true, true], vec![2, 3])]
+    #[case(3, &[true, false, false], vec![0])]
+    // sv shorter than row_count: tail rows implicitly selected
+    #[case(4, &[false, true], vec![1, 2, 3])]
+    #[case(4, &[true, false], vec![0, 2, 3])]
+    #[case(4, &[false, true, false, true], vec![1, 3])]
+    fn row_index_iter(
         #[case] row_count: usize,
         #[case] selection: &[bool],
-        #[case] expected: Vec<Range<usize>>,
+        #[case] expected: Vec<usize>,
     ) {
-        assert_eq!(collect_runs(row_count, selection), expected);
+        assert_eq!(collect_indices(row_count, selection), expected);
     }
 
     #[rstest]
@@ -848,7 +844,7 @@ mod tests {
     // sv shorter than row_count: tail rows emitted as a separate run after a skipped block
     #[case(4, &[true, false], vec![RowEvent::Row(0..1), RowEvent::Skipped(1), RowEvent::Row(2..4)])]
     #[case(4, &[false, true, false, true], vec![RowEvent::Skipped(1), RowEvent::Row(1..2), RowEvent::Skipped(1), RowEvent::Row(3..4)])]
-    fn row_index_iter(
+    fn row_event_iter(
         #[case] row_count: usize,
         #[case] selection: &[bool],
         #[case] expected: Vec<RowEvent>,

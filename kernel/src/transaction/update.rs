@@ -575,7 +575,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
         let null_dv = || Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema()));
-        for event in rows {
+        for event in rows.row_events() {
             match event {
                 RowEvent::Skipped(n) => {
                     // These rows were deselected — emit nulls to keep new_dv_entries aligned.
