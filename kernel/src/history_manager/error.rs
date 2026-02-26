@@ -9,7 +9,7 @@ use super::Timestamp;
 
 /// Represents errors that can occur when converting commit timestamps to version
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum LogHistoryError {
+pub enum LogHistoryError {
     #[allow(dead_code)]
     #[error("Invalid timestamp: {0}")]
     InvalidTimestamp(Timestamp),
@@ -52,7 +52,7 @@ pub(crate) enum LogHistoryError {
 }
 
 #[derive(Debug)]
-pub(crate) struct TimestampOutOfRangeError {
+pub struct TimestampOutOfRangeError {
     pub(crate) timestamp: Timestamp,
     pub(crate) nearest_timestamp: Timestamp,
     pub(crate) nearest_version: Version,
