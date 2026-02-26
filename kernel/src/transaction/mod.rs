@@ -1447,7 +1447,9 @@ mod tests {
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
+    use crate::table_properties::PARQUET_COMPRESSION_CODEC;
     use crate::EvaluationHandler;
+    use crate::ParquetCompression;
     use crate::Snapshot;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -2171,6 +2173,38 @@ mod tests {
         for col in expected_partition_cols {
             assert!(rb.schema().fields().iter().any(|f| f.name() == *col));
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(None, ParquetCompression::Snappy)]
+    #[case(Some("zstd"), ParquetCompression::Zstd)]
+    fn test_write_context_parquet_compression(
+        #[case] codec: Option<&str>,
+        #[case] expected: ParquetCompression,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempfile::tempdir()?;
+        let engine = SyncEngine::new();
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let mut builder = create_table(
+            tempdir.path().to_str().expect("valid path"),
+            schema,
+            "test_engine",
+        );
+        if let Some(codec) = codec {
+            builder = builder.with_table_properties([(PARQUET_COMPRESSION_CODEC, codec)]);
+        }
+        let _commit_result = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+
+        let url = url::Url::from_directory_path(tempdir.path()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        assert_eq!(txn.get_write_context().parquet_writer_config().compression, expected);
         Ok(())
     }
 }

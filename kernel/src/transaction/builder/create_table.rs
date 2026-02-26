@@ -28,6 +28,7 @@ use crate::table_features::{
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
+    PARQUET_COMPRESSION_CODEC,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -60,6 +61,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
 const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
+    // Parquet compression codec for data files
+    PARQUET_COMPRESSION_CODEC,
     // As features are supported, add them here:
     // "delta.enableDeletionVectors",
 ];
