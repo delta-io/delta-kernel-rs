@@ -248,7 +248,7 @@ impl ScanLogReplayProcessor {
     /// undefined behaviour!
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(&self) -> DeltaResult<SerializableScanState> {
+    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
         let StateInfo {
             logical_schema,
             physical_schema,
@@ -282,8 +282,8 @@ impl ScanLogReplayProcessor {
         Ok(SerializableScanState {
             predicate,
             internal_state_blob,
-            seen_file_keys: self.seen_file_keys.clone(),
-            checkpoint_info: self.checkpoint_info.clone(),
+            seen_file_keys: self.seen_file_keys,
+            checkpoint_info: self.checkpoint_info,
         })
     }
 
@@ -305,7 +305,7 @@ impl ScanLogReplayProcessor {
     pub(crate) fn from_serializable_state(
         engine: &dyn Engine,
         state: SerializableScanState,
-    ) -> DeltaResult<Arc<Self>> {
+    ) -> DeltaResult<Self> {
         // Deserialize internal state from json
         let internal_state: InternalScanState =
             serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
@@ -333,15 +333,13 @@ impl ScanLogReplayProcessor {
             logical_stats_schema: internal_state.logical_stats_schema,
         });
 
-        let processor = Self::new_with_seen_files(
+        Self::new_with_seen_files(
             engine,
             state_info,
             state.checkpoint_info,
             state.seen_file_keys,
             internal_state.skip_stats,
-        )?;
-
-        Ok(Arc::new(processor))
+        )
     }
 }
 

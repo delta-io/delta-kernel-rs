@@ -418,6 +418,7 @@ mod tests {
                     // Non-serde: just use the state directly
                     state
                 };
+                let final_state = Arc::new(final_state);
 
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
                     files.into_iter().map(|f| vec![f]).collect()
@@ -429,7 +430,7 @@ mod tests {
                     .into_iter()
                     .map(|partition_files| {
                         let engine = engine.clone();
-                        let state = final_state.clone();
+                        let state = Arc::clone(&final_state);
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
@@ -573,7 +574,7 @@ mod tests {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 // Verify stats is None in phase2 results and collect paths
-                let mut phase2 = Phase2ScanMetadata::try_new(engine.clone(), state, files)?;
+                let mut phase2 = Phase2ScanMetadata::try_new(engine.clone(), Arc::new(state), files)?;
 
                 let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {

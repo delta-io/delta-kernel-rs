@@ -44,9 +44,7 @@ impl Phase1ScanMetadata {
         match self.sequential.finish()? {
             AfterSequential::Done(_) => Ok(AfterPhase1ScanMetadata::Done),
             AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
-                state: Phase2State {
-                    inner: processor.into(),
-                },
+                state: Phase2State { inner: processor },
                 files,
             }),
         }
@@ -63,20 +61,13 @@ impl Iterator for Phase1ScanMetadata {
 
 /// State for Phase 2 parallel scan metadata processing.
 ///
-/// This state can be serialized and distributed to remote workers, or shared
-/// directly across threads for local parallel processing.
-#[derive(Clone)]
+/// This state can be serialized and distributed to remote workers, or wrapped
+/// in Arc and shared across threads for local parallel processing.
 pub struct Phase2State {
-    inner: Arc<ScanLogReplayProcessor>,
+    inner: ScanLogReplayProcessor,
 }
 
-impl AsRef<Phase2State> for Phase2State {
-    fn as_ref(&self) -> &Phase2State {
-        self
-    }
-}
-
-impl ParallelLogReplayProcessor for Phase2State {
+impl ParallelLogReplayProcessor for Arc<Phase2State> {
     type Output = ScanMetadata;
 
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
@@ -103,7 +94,7 @@ impl Phase2State {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
-        Arc::clone(&self.inner).as_ref().into_serializable_state()
+        self.inner.into_serializable_state()
     }
 
     /// Reconstruct a Phase2State from serialized state.
@@ -117,8 +108,8 @@ impl Phase2State {
         engine: &dyn Engine,
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
-        let processor = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        Ok(Self { inner: processor })
+        let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
+        Ok(Self { inner })
     }
 
     /// Serialize the processor state directly to bytes.
@@ -153,28 +144,27 @@ impl Phase2State {
 }
 
 pub struct Phase2ScanMetadata {
-    pub(crate) processor: ParallelPhase<Arc<ScanLogReplayProcessor>>,
+    pub(crate) processor: ParallelPhase<Arc<Phase2State>>,
 }
 
 impl Phase2ScanMetadata {
     pub fn try_new(
         engine: Arc<dyn Engine>,
-        state: impl AsRef<Phase2State>,
+        state: Arc<Phase2State>,
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
-        let state_ref = state.as_ref();
-        let read_schema = state_ref.file_read_schema();
+        let read_schema = state.file_read_schema();
         Ok(Self {
-            processor: ParallelPhase::try_new(engine, state_ref.inner.clone(), leaf_files, read_schema)?,
+            processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
         })
     }
 
     pub fn new_from_iter(
-        state: Phase2State,
+        state: Arc<Phase2State>,
         iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
         Self {
-            processor: ParallelPhase::new_from_iter(state.inner.clone(), iter),
+            processor: ParallelPhase::new_from_iter(state, iter),
         }
     }
 }
