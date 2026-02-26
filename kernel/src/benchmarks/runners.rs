@@ -5,7 +5,7 @@
 //! Currently only supports reading metadata
 
 use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, ReadSpec, TableInfo};
-use crate::parallel::scan_metadata::Phase2ScanMetadata;
+use crate::parallel::parallel_scan_metadata::Phase2ScanMetadata;
 use crate::scan::AfterPhase1ScanMetadata;
 use crate::snapshot::Snapshot;
 use crate::Engine;

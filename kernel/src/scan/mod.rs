@@ -74,7 +74,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLoc
 });
 
 #[allow(unused)]
-pub use crate::parallel::scan_metadata::{
+pub use crate::parallel::parallel_scan_metadata::{
     AfterPhase1ScanMetadata, Phase1ScanMetadata, Phase2ScanMetadata, Phase2State,
 };
 

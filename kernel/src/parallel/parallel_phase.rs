@@ -128,7 +128,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
-    use crate::parallel::scan_metadata::AfterPhase1ScanMetadata;
+    use crate::parallel::parallel_scan_metadata::AfterPhase1ScanMetadata;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -409,7 +409,7 @@ mod tests {
         match phase1.finish()? {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
-                use crate::parallel::scan_metadata::{Phase2ScanMetadata, Phase2State};
+                use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
 
                 // Verify checkpoint schema contains stats field iff skip_stats is false
                 let checkpoint_schema = &state.checkpoint_info.checkpoint_read_schema;
