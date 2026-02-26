@@ -59,7 +59,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
 
 /// Checkpoint schema WITHOUT stats for column projection pushdown.
 /// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
-static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
     let fields_no_stats: Vec<_> = add_schema
         .fields()

@@ -5,7 +5,6 @@
 //! Currently only supports reading metadata
 
 use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, ReadSpec, TableInfo};
-use crate::parallel::parallel_phase::ParallelPhase;
 use crate::scan::AfterPhase1ScanMetadata;
 use crate::snapshot::Snapshot;
 use crate::Engine;
@@ -81,6 +80,8 @@ impl ReadMetadataRunner {
         match phase1.finish()? {
             AfterPhase1ScanMetadata::Done => {}
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
+                use crate::parallel::scan_metadata::Phase2ScanMetadata;
+
                 if num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
@@ -91,21 +92,18 @@ impl ReadMetadataRunner {
                     .map(|chunk| chunk.to_vec())
                     .collect();
 
-                let processor = state.processor().clone();
-
                 let handles: Vec<_> = partitions
                     .into_iter()
                     .map(|partition_files| {
                         let engine = self.engine.clone();
-                        let processor = processor.clone();
+                        let state = state.clone();
 
                         thread::spawn(move || -> Result<(), crate::Error> {
                             if partition_files.is_empty() {
                                 return Ok(());
                             }
 
-                            let parallel =
-                                ParallelPhase::try_new(engine, processor, partition_files)?;
+                            let parallel = Phase2ScanMetadata::try_new(engine, state, partition_files)?;
                             for result in parallel {
                                 black_box(result?);
                             }

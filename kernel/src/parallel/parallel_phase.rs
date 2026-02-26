@@ -411,15 +411,13 @@ mod tests {
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 use crate::parallel::scan_metadata::{Phase2ScanMetadata, Phase2State};
 
-                let processor = if with_serde {
+                let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
                     let serialized_bytes = state.into_bytes()?;
-                    let deserialized_state =
-                        Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?;
-                    deserialized_state.processor().clone()
+                    Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?
                 } else {
-                    // Non-serde: just extract the processor directly
-                    state.processor().clone()
+                    // Non-serde: just use the state directly
+                    state
                 };
 
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
@@ -432,14 +430,14 @@ mod tests {
                     .into_iter()
                     .map(|partition_files| {
                         let engine = engine.clone();
-                        let processor = processor.clone();
+                        let state = final_state.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
 
-                            let mut phase2 = Phase2ScanMetadata::from_processor(
+                            let mut phase2 = Phase2ScanMetadata::try_new(
                                 engine.clone(),
-                                processor,
+                                state,
                                 partition_files,
                             )?;
 
@@ -541,6 +539,45 @@ mod tests {
 
     #[test]
     fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+        use crate::scan::{CHECKPOINT_READ_SCHEMA, CHECKPOINT_READ_SCHEMA_NO_STATS};
+
+        // Verify that CHECKPOINT_READ_SCHEMA_NO_STATS excludes the "stats" field
+        let schema_with_stats = CHECKPOINT_READ_SCHEMA.clone();
+        let schema_no_stats = CHECKPOINT_READ_SCHEMA_NO_STATS.clone();
+
+        // Get the Add struct from both schemas
+        let add_with_stats = schema_with_stats
+            .fields()
+            .find(|f| f.name() == "add")
+            .expect("add field should exist");
+        let add_no_stats = schema_no_stats
+            .fields()
+            .find(|f| f.name() == "add")
+            .expect("add field should exist");
+
+        // Get the inner struct types
+        let add_struct_with_stats = match add_with_stats.data_type() {
+            crate::schema::DataType::Struct(s) => s,
+            _ => panic!("add field should be a struct"),
+        };
+        let add_struct_no_stats = match add_no_stats.data_type() {
+            crate::schema::DataType::Struct(s) => s,
+            _ => panic!("add field should be a struct"),
+        };
+
+        // Verify schema with stats contains the "stats" field
+        assert!(
+            add_struct_with_stats.fields().any(|f| f.name() == "stats"),
+            "CHECKPOINT_READ_SCHEMA should contain stats field in Add"
+        );
+
+        // Verify schema without stats does NOT contain the "stats" field
+        assert!(
+            !add_struct_no_stats.fields().any(|f| f.name() == "stats"),
+            "CHECKPOINT_READ_SCHEMA_NO_STATS should NOT contain stats field in Add"
+        );
+
+        // Verify the workflow works correctly with skip_stats=true
         for with_serde in [false, true] {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(

@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -46,7 +45,6 @@ impl Phase1ScanMetadata {
             AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
                 state: Phase2State {
                     inner: processor.into(),
-                    log_on_drop: Cell::new(false),
                     checkpoint_info: CheckpointReadInfo::default(),
                 },
                 files,
@@ -67,9 +65,9 @@ impl Iterator for Phase1ScanMetadata {
 ///
 /// This state can be serialized and distributed to remote workers, or shared
 /// directly across threads for local parallel processing.
+#[derive(Clone)]
 pub struct Phase2State {
     inner: Arc<ScanLogReplayProcessor>,
-    log_on_drop: Cell<bool>,
     checkpoint_info: CheckpointReadInfo,
 }
 
@@ -80,12 +78,6 @@ impl AsRef<Phase2State> for Phase2State {
 }
 
 impl Phase2State {
-    /// Get a reference to the inner processor.
-    #[allow(dead_code)]
-    pub(crate) fn processor(&self) -> &Arc<ScanLogReplayProcessor> {
-        &self.inner
-    }
-
     /// Serialize the processor state for distributed processing.
     ///
     /// Returns a `SerializableScanState` containing all information needed to
@@ -95,24 +87,9 @@ impl Phase2State {
     /// Returns an error if the state cannot be serialized (e.g., contains opaque predicates).
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
-        // Disable logging since we're serializing, not completing
-        self.log_on_drop.set(false);
-
-        // Clone the Arc and checkpoint_info then drop self to work around Drop preventing moves
-        let inner = self.inner.clone();
-        let checkpoint_info = self.checkpoint_info.clone();
-        drop(self);
-
-        // We need to unwrap the Arc to consume the processor.
-        // This will fail if there are other references to the Arc.
-        let processor = Arc::try_unwrap(inner).map_err(|_| {
-            Error::generic(
-                "Cannot serialize Phase2State: there are still other references to the processor",
-            )
-        })?;
-        let mut state = processor.into_serializable_state()?;
-        state.checkpoint_info = checkpoint_info;
+    pub(crate) fn into_serializable_state(&self) -> DeltaResult<SerializableScanState> {
+        let mut state = self.inner.into_serializable_state()?;
+        state.checkpoint_info = self.checkpoint_info.clone();
         Ok(state)
     }
 
@@ -131,7 +108,6 @@ impl Phase2State {
         let processor = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
         Ok(Self {
             inner: processor,
-            log_on_drop: Cell::new(true),
             checkpoint_info,
         })
     }
@@ -145,7 +121,7 @@ impl Phase2State {
     /// # Errors
     /// Returns an error if the state cannot be serialized.
     #[allow(unused)]
-    pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
+    pub fn into_bytes(&self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
         serde_json::to_vec(&state)
             .map_err(|e| Error::generic(format!("Failed to serialize Phase2State to bytes: {}", e)))
@@ -167,12 +143,6 @@ impl Phase2State {
     }
 }
 
-impl Drop for Phase2State {
-    fn drop(&mut self) {
-        // Metrics logging will be added in scan-metrics branch
-    }
-}
-
 pub struct Phase2ScanMetadata {
     pub(crate) processor: ParallelPhase<Arc<ScanLogReplayProcessor>>,
 }
@@ -185,21 +155,6 @@ impl Phase2ScanMetadata {
     ) -> DeltaResult<Self> {
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state.as_ref().inner.clone(), leaf_files)?,
-        })
-    }
-
-    /// Create a Phase2ScanMetadata directly from a processor.
-    ///
-    /// This is useful for tests or when you already have a processor Arc to share
-    /// across multiple workers without serialization.
-    #[cfg(test)]
-    pub(crate) fn from_processor(
-        engine: Arc<dyn Engine>,
-        processor: Arc<ScanLogReplayProcessor>,
-        leaf_files: Vec<FileMeta>,
-    ) -> DeltaResult<Self> {
-        Ok(Self {
-            processor: ParallelPhase::try_new(engine, processor, leaf_files)?,
         })
     }
 

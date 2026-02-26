@@ -243,7 +243,7 @@ impl ScanLogReplayProcessor {
     /// undefined behaviour!
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+    pub(crate) fn into_serializable_state(&self) -> DeltaResult<SerializableScanState> {
         let StateInfo {
             logical_schema,
             physical_schema,
@@ -277,8 +277,8 @@ impl ScanLogReplayProcessor {
         Ok(SerializableScanState {
             predicate,
             internal_state_blob,
-            seen_file_keys: self.seen_file_keys,
-            checkpoint_info: self.checkpoint_info,
+            seen_file_keys: self.seen_file_keys.clone(),
+            checkpoint_info: self.checkpoint_info.clone(),
         })
     }
 
