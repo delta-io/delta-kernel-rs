@@ -40,6 +40,7 @@ pub(crate) enum LogHistoryError {
         #[source]
         error: Box<crate::Error>,
     },
+    #[allow(dead_code)]
     #[error("No In-commit timestamp found for commit at version {version}")]
     InCommitTimestampNotFoundError { version: Version },
     #[error("Failed to construct Log Segment with end version {version}: {error}")]

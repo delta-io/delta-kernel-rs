@@ -20,11 +20,10 @@ use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
-use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
-use crate::{Engine, Error as DeltaError, RowVisitor, Version};
+use crate::{Engine, Version};
 
 pub(crate) mod search;
 
@@ -47,51 +46,6 @@ enum TimestampSearchBounds {
     },
 }
 
-/// Reads the in-commit timestamp for the given `commit_file`.
-///
-/// This returns a [`LogHistoryError::FailedToReadTimestampForCommit`] if this encounters an
-/// error while reading the file or visiting the rows.
-///
-/// This returns a [`LogHistoryError::InCommitTimestampNotFoundError`] if the in-commit timestamp
-/// is not present in the commit file, or if the CommitInfo is not the first action in the
-/// commit.
-#[allow(unused)]
-fn read_in_commit_timestamp(
-    engine: &dyn Engine,
-    commit_file: &ParsedLogPath,
-) -> Result<Timestamp, LogHistoryError> {
-    debug_assert!(commit_file.is_commit(), "File should be a commit");
-    let wrap_err = |error: DeltaError| LogHistoryError::FailedToReadTimestampForCommit {
-        version: commit_file.version,
-        error: Box::new(error),
-    };
-
-    // Get an iterator over the actions in the commit file
-    let mut action_iter = engine
-        .json_handler()
-        .read_json_files(
-            std::slice::from_ref(&commit_file.location),
-            InCommitTimestampVisitor::schema(),
-            None,
-        )
-        .map_err(wrap_err)?;
-
-    let not_found = || LogHistoryError::InCommitTimestampNotFoundError {
-        version: commit_file.version,
-    };
-
-    // Take the first non-empty engine data batch
-    match action_iter.next() {
-        Some(Ok(batch)) => {
-            // Visit the rows and get the in-commit timestamp if present
-            let mut visitor = InCommitTimestampVisitor::default();
-            visitor.visit_rows_of(batch.as_ref()).map_err(wrap_err)?;
-            visitor.in_commit_timestamp.ok_or_else(not_found)
-        }
-        Some(Err(err)) => Err(wrap_err(err)),
-        None => Err(not_found()),
-    }
-}
 
 /// Given a timestamp, this function determines the commit range that timestamp conversion
 /// should search. A timestamp search may be conducted over one of two version ranges:
@@ -221,7 +175,12 @@ fn timestamp_to_version(
     // Declare the key function of the search that finds the timestamp given a commit.
     let commit_to_ts = |commit: &ParsedLogPath| -> Result<Timestamp, LogHistoryError> {
         if read_ict {
-            read_in_commit_timestamp(engine, commit)
+            commit
+                .read_in_commit_timestamp(engine)
+                .map_err(|error| LogHistoryError::FailedToReadTimestampForCommit {
+                    version: commit.version,
+                    error: Box::new(error),
+                })
         } else {
             Ok(commit.location.last_modified)
         }
@@ -537,14 +496,8 @@ mod tests {
         let commits = log_segment.ascending_commit_files;
 
         // File that has no In-commit timestamps
-        let mut res = read_in_commit_timestamp(&engine, &commits[0]);
-        assert!(
-            matches!(
-                res,
-                Err(LogHistoryError::InCommitTimestampNotFoundError { version: 0 })
-            ),
-            "{res:?} failed"
-        );
+        let mut res = commits[0].read_in_commit_timestamp(&engine);
+        assert!(res.is_err(), "Expected error for file without ICT: {res:?}");
 
         // File that doesn't exist
         let mut fake_log_path = commits[0].clone();
@@ -556,22 +509,16 @@ mod tests {
         };
 
         fake_log_path.location.location = Url::from_file_path(failing_path).unwrap();
-        res = read_in_commit_timestamp(&engine, &fake_log_path);
+        res = fake_log_path.read_in_commit_timestamp(&engine);
         assert!(
-            matches!(
-                res,
-                Err(LogHistoryError::FailedToReadTimestampForCommit {
-                    version: 0,
-                    error: _
-                })
-            ),
-            "{res:?} failed"
+            res.is_err(),
+            "Expected error for non-existent file: {res:?}"
         );
 
         // Files with In-commit timestamps
-        res = read_in_commit_timestamp(&engine, &commits[3]);
+        res = commits[3].read_in_commit_timestamp(&engine);
         assert!(matches!(res, Ok(300)), "{res:?}");
-        res = read_in_commit_timestamp(&engine, &commits[4]);
+        res = commits[4].read_in_commit_timestamp(&engine);
         assert!(matches!(res, Ok(400)), "{res:?}");
     }
 
@@ -601,9 +548,9 @@ mod tests {
         assert!(matches!(ts, Ok(250)));
 
         // Read the in-commit timestamps
-        let ts = read_in_commit_timestamp(&engine, &commits[3]);
+        let ts = commits[3].read_in_commit_timestamp(&engine);
         assert!(matches!(ts, Ok(300)));
-        let ts = read_in_commit_timestamp(&engine, &commits[4]);
+        let ts = commits[4].read_in_commit_timestamp(&engine);
         assert!(matches!(ts, Ok(400)));
     }
 
