@@ -75,6 +75,7 @@
 31. Add clustering support for CREATE TABLE ([#1763])
 32. Support owned runtime in `TokioMultiThreadExecutor` ([#1719])
 33. *(transaction)* Support blind append commit metadata ([#1783])
+    - Adds `set_is_blind_append()` API to `Transaction`, includes `isBlindAppend` in generated `CommitInfo`, and validates blind-append semantics (add-only, no removals/DV updates, `dataChange` must be true) before commit.
 34. Add stats transform module for checkpoint stats population ([#1646])
 35. Refactor data skipping to use stats_parsed directly ([#1715])
 36. Support using stats_columns and predicate together in scans ([#1691])
@@ -95,6 +96,7 @@
 51. Expand add files schema to include all stats fields ([#1748])
 52. Support write with both partition columns and column mapping in `DefaultEngine` ([#1870])
 53. Feat: support scanning for multiple specific domains in domain metadata replay ([#1881])
+    - Allows callers to request multiple domain names in a single metadata replay pass, with early termination once all requested domains are found. Includes optimized skip of domain metadata fields when a domain has already been seen in a newer commit.
 54. Allow ffi for uc_catalog stuff ([#1711])
 55. Support column mapping on writes ([#1863])
 56. Coerce parquet read nullability to match table schema ([#1903])
@@ -122,7 +124,8 @@
 6. Include domain metadata in checkpoints ([#1718])
 7. Propagate struct-level nulls when computing nested column stats ([#1745])
 8. Express One Zone URLs do not support lexicographical ordering ([#1753])
-9. Preserve non-commit files (CRC, checkpoints, compactions) at log… ([#1817])
+9. Preserve non-commit files (CRC, checkpoints, compactions) at log tail versions ([#1817])
+    - Fixes `list_log_files` to no longer discard CRC, checkpoint, and compaction files at the log tail boundary, ensuring these auxiliary files are preserved alongside their commit files.
 10. Fix Miri CI failure by cleaning stale Miri artifacts before test run ([#1845])
 11. Strip parquet field IDs from physical stats schema for checkpoint reading ([#1839])
 12. Unify v2 checkpoint batch schemas ([#1833])
@@ -151,16 +154,21 @@
 10. Add checkpoint info to ScanLogReplayProcessor ([#1752])
 11. Extract protocol & metadata replay into log_segment submodule ([#1782])
 12. Define constants for table property keys ([#1797])
+    - Replaces scattered string literals for Delta table property keys (e.g. `delta.appendOnly`, `delta.enableChangeDataFeed`) with named constants, improving maintainability and preventing typos.
 13. Update metadata schema to be a SchemaRef and add appropriate Arcs ([#1802])
-14. Rename set_is_blind_append to with_blind_append, returning Self ([#1838])
+14. Rename `set_is_blind_append` to `with_blind_append`, returning `Self` ([#1838])
+    - Adopts builder-style API for the blind append flag, allowing method chaining (e.g. `txn.with_blind_append(true).commit(...)`).
 15. Extract clustering tests into sub-module ([#1828])
-16. Split UCCommitsClient into UCCommitClient and UCGetCommitsClient ([#1854])
-17. Use type-state pattern for CreateTableTransaction compile-time API safety  ([#1842])
+16. Split `UCCommitsClient` into `UCCommitClient` and `UCGetCommitsClient` ([#1854])
+    - Separates the Unity Catalog commits client into two focused traits — one for committing and one for reading commits — enabling cleaner dependency boundaries and testability.
+17. Use type-state pattern for `CreateTableTransaction` compile-time API safety ([#1842])
+    - Encodes the create-table workflow states (building → ready → committed) in the type system, so invalid transitions (e.g. committing before setting schema) are caught at compile time. Reorganizes create-table code and moves tests to integration tests.
 18. Simplify table feature parsing ([#1878])
 19. Define and use new TableConfiguration methods ([#1905])
 20. Improve Protocol::try_new and make tests call it reliably ([#1907])
 21. Simplify GetData impls with bool::then() ([#1918])
-22. Split transaction module into mod.rs and update.rs ([#1877])
+22. Split transaction module into `mod.rs` and `update.rs` ([#1877])
+    - Breaks the growing transaction module into separate files: core transaction logic in `mod.rs` and update/DV-related logic in `update.rs`, improving navigability.
 23. Rename FeatureType::Writer as WriterOnly ([#1934])
 24. Clean up TableConfiguration validation and unit tests ([#1947])
 26. StructType modification method and stat_transform schema boilerplate code refactor. ([#1872])
