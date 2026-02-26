@@ -10,8 +10,8 @@ use tar::Archive;
 const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads.tar.gz");
 const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads");
 const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads/.done");
-const TABLE_INFO_FILE: &str = "table_info.json";
-const SPECS_DIR: &str = "specs";
+const TABLE_INFO_FILE_NAME: &str = "table_info.json";
+const SPECS_DIR_NAME: &str = "specs";
 
 /// Loads all workload specifications from OUTPUT_FOLDER
 /// On first run, extracts from WORKLOAD_TAR if it exists.
@@ -93,13 +93,13 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 }
 
 fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
-    let specs_dir = table_dir.join(SPECS_DIR);
+    let specs_dir = table_dir.join(SPECS_DIR_NAME);
 
     if !specs_dir.is_dir() {
         return Err(format!("Specs directory not found: {}", specs_dir.display()).into());
     }
 
-    let table_info_path = table_dir.join(TABLE_INFO_FILE);
+    let table_info_path = table_dir.join(TABLE_INFO_FILE_NAME);
     let table_info = TableInfo::from_json_path(&table_info_path).map_err(|e| {
         format!(
             "Failed to parse table_info.json at {}: {}",
