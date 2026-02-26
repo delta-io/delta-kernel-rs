@@ -104,7 +104,8 @@ impl ReadMetadataRunner {
                                 return Ok(());
                             }
 
-                            let parallel = Phase2ScanMetadata::try_new(engine, state, partition_files)?;
+                            let parallel =
+                                Phase2ScanMetadata::try_new(engine, state, partition_files)?;
                             for result in parallel {
                                 black_box(result?);
                             }
