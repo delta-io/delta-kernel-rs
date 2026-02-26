@@ -223,24 +223,24 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
 mod tests {
     use super::*;
     use crate::table_properties::TableProperties;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("snappy", ParquetCompression::Snappy)]
+    #[case("SNAPPY", ParquetCompression::Snappy)]
+    #[case("zstd", ParquetCompression::Zstd)]
+    #[case("ZSTD", ParquetCompression::Zstd)]
+    #[case("Zstd", ParquetCompression::Zstd)]
+    fn test_parse_parquet_compression_codec(
+        #[case] input: &str,
+        #[case] expected: ParquetCompression,
+    ) {
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, input)]);
+        assert_eq!(props.parquet_compression_codec, Some(expected));
+    }
 
     #[test]
-    fn test_parse_parquet_compression_codec() {
-        let cases = [
-            ("snappy", ParquetCompression::Snappy),
-            ("SNAPPY", ParquetCompression::Snappy),
-            ("zstd", ParquetCompression::Zstd),
-            ("ZSTD", ParquetCompression::Zstd),
-            ("Zstd", ParquetCompression::Zstd),
-        ];
-        for (input, expected) in cases {
-            let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, input)]);
-            assert_eq!(
-                props.parquet_compression_codec,
-                Some(expected),
-                "failed for input '{input}'"
-            );
-        }
+    fn test_parse_parquet_compression_codec_unknown_value() {
         // Unknown value: field stays None (key consumed, not in unknown_properties)
         let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "gzip")]);
         assert_eq!(props.parquet_compression_codec, None);

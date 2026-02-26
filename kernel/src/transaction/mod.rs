@@ -2197,9 +2197,13 @@ mod tests {
         if let Some(codec) = codec {
             builder = builder.with_table_properties([(PARQUET_COMPRESSION_CODEC, codec)]);
         }
-        let _commit_result = builder
+        let commit_result = builder
             .build(&engine, Box::new(FileSystemCommitter::new()))?
             .commit(&engine)?;
+        assert!(
+            commit_result.is_committed(),
+            "table creation commit failed: {commit_result:?}"
+        );
 
         let url = url::Url::from_directory_path(tempdir.path()).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
