@@ -154,7 +154,6 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-
 #[cfg(feature = "internal-api")]
 pub mod parallel;
 #[cfg(not(feature = "internal-api"))]
