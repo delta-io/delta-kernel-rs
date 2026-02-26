@@ -6,15 +6,13 @@ use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
-mod utils;
-
-use delta_kernel::benchmarks::models::{
+use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
 };
-use delta_kernel::benchmarks::runners::{
+use delta_kernel_benchmarks::runners::{
     create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
 };
-use utils::load_all_workloads;
+use delta_kernel_benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
     use object_store::local::LocalFileSystem;

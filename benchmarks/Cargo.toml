@@ -1,0 +1,26 @@
+[package]
+name = "delta_kernel_benchmarks"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+delta_kernel = { path = "../kernel", features = ["arrow", "default-engine-rustls", "internal-api"] }
+flate2 = "1"
+object_store = "0.12.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+url = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+rstest = "0.23"
+
+[[bench]]
+name = "workload_bench"
+harness = false

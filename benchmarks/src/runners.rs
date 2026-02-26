@@ -1,23 +1,24 @@
 //! Benchmark runners for executing Delta table operations.
 //!
-//! Each runner handles setup and execution of a specific operation (e.g., reading metadata)
+//! Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
+//! so that `execute` measures only the operation itself
 //! Results are discarded for benchmarking purposes
 
-use crate::benchmarks::models::{
+use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
-use crate::parallel::parallel_phase::ParallelPhase;
-use crate::parallel::sequential_phase::AfterSequential;
-use crate::snapshot::Snapshot;
-use crate::Engine;
+use delta_kernel::parallel::parallel_phase::ParallelPhase;
+use delta_kernel::parallel::sequential_phase::AfterSequential;
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::Engine;
 
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 use url::Url;
 
-/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
-/// so that `execute` measures only the operation itself
+// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
+// so that `execute` measures only the operation itself
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
@@ -39,7 +40,7 @@ impl ReadMetadataRunner {
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let table_root = table_info.resolved_table_root();
-        let url = crate::try_parse_uri(table_root)?;
+        let url = delta_kernel::try_parse_uri(table_root)?;
 
         let mut builder = Snapshot::builder_for(url);
         if let Some(version) = read_spec.version {
@@ -102,7 +103,7 @@ impl ReadMetadataRunner {
                         let engine = self.engine.clone();
                         let processor = processor.clone();
 
-                        thread::spawn(move || -> Result<(), crate::Error> {
+                        thread::spawn(move || -> Result<(), delta_kernel::Error> {
                             if partition_files.is_empty() {
                                 return Ok(());
                             }
@@ -179,7 +180,7 @@ impl SnapshotConstructionRunner {
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let table_root = table_info.resolved_table_root();
-        let url = crate::try_parse_uri(table_root)?;
+        let url = delta_kernel::try_parse_uri(table_root)?;
 
         let name = format!(
             "{}/{}/{}",
@@ -216,8 +217,9 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
-    use crate::engine::sync::SyncEngine;
+    use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
+    use delta_kernel::engine::default::DefaultEngine;
+    use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
 
     fn test_table_info() -> TableInfo {
@@ -225,7 +227,7 @@ mod tests {
             name: "basic_partitioned".to_string(),
             description: None,
             table_path: Some(format!(
-                "{}/tests/data/basic_partitioned",
+                "{}/../kernel/tests/data/basic_partitioned",
                 env!("CARGO_MANIFEST_DIR")
             )),
             table_info_dir: PathBuf::new(),
@@ -251,7 +253,8 @@ mod tests {
     }
 
     fn test_engine() -> Arc<dyn Engine> {
-        Arc::new(SyncEngine::new())
+        let store = Arc::new(LocalFileSystem::new());
+        Arc::new(DefaultEngine::builder(store).build())
     }
 
     #[test]

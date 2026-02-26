@@ -1,15 +1,15 @@
 //! Utility functions for loading workload specifications
 
-use delta_kernel::benchmarks::models::{Spec, TableInfo, Workload};
+use crate::models::{Spec, TableInfo, Workload};
 use flate2::read::GzDecoder;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use tar::Archive;
 
 // Workload extraction configuration
-const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads.tar.gz");
-const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads");
-const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads/.done");
+const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads.tar.gz");
+const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads");
+const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads/.done");
 const TABLE_INFO_FILE_NAME: &str = "table_info.json";
 const SPECS_DIR_NAME: &str = "specs";
 
