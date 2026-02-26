@@ -997,9 +997,39 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_get_any_level_column_physical_name_missing_annotations() {
-        let outer_metadata = [
+    #[rstest::rstest]
+    // physicalName present, id missing → id error
+    #[case::missing_id(true, false, "delta.columnMapping.id")]
+    // id present, physicalName missing → physicalName error
+    #[case::missing_physical_name(false, true, "delta.columnMapping.physicalName")]
+    // both missing → physicalName checked first, so physicalName error
+    #[case::missing_both(false, false, "delta.columnMapping.physicalName")]
+    fn test_get_any_level_column_physical_name_missing_annotations(
+        #[case] has_physical_name: bool,
+        #[case] has_id: bool,
+        #[case] expected_err: &str,
+    ) {
+        let mut inner_field = StructField::new("y", DataType::INTEGER, false);
+        if has_physical_name {
+            inner_field = inner_field.add_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-inner-y".to_string()),
+            )]);
+        }
+        if has_id {
+            inner_field = inner_field.add_metadata([(
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(2),
+            )]);
+        }
+
+        let inner = StructType::new_unchecked([inner_field]);
+        let schema = StructType::new_unchecked([StructField::new(
+            "a",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 MetadataValue::String("col-outer-a".to_string()),
@@ -1008,20 +1038,8 @@ mod tests {
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(1),
             ),
-        ];
+        ])]);
 
-        // physicalName present, id missing on nested field
-        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
-            .add_metadata([(
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-inner-y".to_string()),
-            )])]);
-        let schema = StructType::new_unchecked([StructField::new(
-            "a",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )
-        .add_metadata(outer_metadata.clone())]);
         let err = get_any_level_column_physical_name(
             &schema,
             &ColumnName::new(["a", "y"]),
@@ -1030,32 +1048,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("delta.columnMapping.id"),
-            "Expected missing id annotation error, got: {err}"
-        );
-
-        // id present, physicalName missing on nested field
-        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
-            .add_metadata([(
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(2),
-            )])]);
-        let schema = StructType::new_unchecked([StructField::new(
-            "a",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )
-        .add_metadata(outer_metadata)]);
-        let err = get_any_level_column_physical_name(
-            &schema,
-            &ColumnName::new(["a", "y"]),
-            ColumnMappingMode::Name,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("delta.columnMapping.physicalName"),
-            "Expected missing physicalName annotation error, got: {err}"
+            err.contains(expected_err),
+            "Expected error containing '{expected_err}', got: {err}"
         );
     }
 }
