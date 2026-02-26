@@ -44,10 +44,7 @@ use crate::{
 
 pub(crate) fn build_writer_properties(config: &ParquetWriterConfig) -> WriterProperties {
     let compression = match config.compression {
-        ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
         ParquetCompression::Snappy => Compression::SNAPPY,
-        ParquetCompression::Gzip => Compression::GZIP(Default::default()),
-        ParquetCompression::Lz4 => Compression::LZ4,
         ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
     };
     WriterProperties::builder()
@@ -724,6 +721,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual.record_batch(), &expected);
+    }
+
+    #[rstest::rstest]
+    #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
+    #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
+    #[tokio::test]
+    async fn test_write_parquet_compression(
+        #[case] kernel_compression: ParquetCompression,
+        #[case] expected: Compression,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(data)));
+
+        let file_url = Url::parse("memory:///test/compression.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(
+                file_url.clone(),
+                data_iter,
+                &ParquetWriterConfig {
+                    compression: kernel_compression,
+                },
+            )
+            .unwrap();
+
+        // Read back the parquet metadata and verify the compression codec was applied
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store, path);
+        let metadata = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .metadata()
+            .clone();
+        let actual = metadata.row_group(0).column(0).compression();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

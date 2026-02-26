@@ -663,21 +663,13 @@ pub struct ParquetFooter {
 
 /// Compression codec to use when writing Parquet files.
 ///
-/// Supports the aliases `"none"` and `"uncompressed"` for [`ParquetCompression::Uncompressed`].
 /// String parsing is case-insensitive.
 #[derive(Debug, strum::EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {
-    /// No compression.
-    #[strum(serialize = "uncompressed", serialize = "none")]
-    Uncompressed,
     /// Snappy compression (default).
     #[default]
     Snappy,
-    /// Gzip compression.
-    Gzip,
-    /// LZ4 compression.
-    Lz4,
     /// Zstandard compression.
     Zstd,
 }

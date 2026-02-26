@@ -227,16 +227,8 @@ mod tests {
     #[test]
     fn test_parse_parquet_compression_codec() {
         let cases = [
-            ("uncompressed", ParquetCompression::Uncompressed),
-            ("UNCOMPRESSED", ParquetCompression::Uncompressed),
-            ("none", ParquetCompression::Uncompressed),
-            ("NONE", ParquetCompression::Uncompressed),
             ("snappy", ParquetCompression::Snappy),
             ("SNAPPY", ParquetCompression::Snappy),
-            ("gzip", ParquetCompression::Gzip),
-            ("GZIP", ParquetCompression::Gzip),
-            ("lz4", ParquetCompression::Lz4),
-            ("LZ4", ParquetCompression::Lz4),
             ("zstd", ParquetCompression::Zstd),
             ("ZSTD", ParquetCompression::Zstd),
             ("Zstd", ParquetCompression::Zstd),
@@ -250,7 +242,7 @@ mod tests {
             );
         }
         // Unknown value: field stays None (key consumed, not in unknown_properties)
-        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "brotli")]);
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "gzip")]);
         assert_eq!(props.parquet_compression_codec, None);
         assert!(!props.unknown_properties.contains_key(PARQUET_COMPRESSION_CODEC));
     }
