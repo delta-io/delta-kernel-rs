@@ -228,6 +228,11 @@ impl ScanLogReplayProcessor {
         })
     }
 
+    /// Get a reference to the checkpoint info.
+    pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
+        &self.checkpoint_info
+    }
+
     /// Serialize the processor state for distributed processing.
     ///
     /// Consumes the processor and returns a `SerializableScanState` containing:

@@ -42,13 +42,16 @@ impl Phase1ScanMetadata {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(_) => Ok(AfterPhase1ScanMetadata::Done),
-            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
-                state: Phase2State {
-                    inner: processor.into(),
-                    checkpoint_info: CheckpointReadInfo::default(),
-                },
-                files,
-            }),
+            AfterSequential::Parallel { processor, files } => {
+                let checkpoint_info = processor.checkpoint_info().clone();
+                Ok(AfterPhase1ScanMetadata::Phase2 {
+                    state: Phase2State {
+                        inner: processor.into(),
+                        checkpoint_info,
+                    },
+                    files,
+                })
+            }
         }
     }
 }
@@ -68,7 +71,7 @@ impl Iterator for Phase1ScanMetadata {
 #[derive(Clone)]
 pub struct Phase2State {
     inner: Arc<ScanLogReplayProcessor>,
-    checkpoint_info: CheckpointReadInfo,
+    pub(crate) checkpoint_info: CheckpointReadInfo,
 }
 
 impl AsRef<Phase2State> for Phase2State {
