@@ -28,15 +28,13 @@ fn try_create_from_json(
     // Build Arrow schema from only the real JSON columns, omitting any metadata columns
     // (e.g. FilePath) that the JSON reader cannot populate from the file content.
     let json_schema = Arc::new(json_arrow_schema(&schema)?);
-    // Build the reorder index vec once; apply it to every batch via reorder_struct_array.
+    // Build the reorder index vec once; apply it to every batch to re-insert synthesized metadata
+    // columns (e.g. file path) at their schema positions.
     let reorder_indices = build_json_reorder_indices(&schema)?;
     let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
         .build(BufReader::new(file))?
-        .map(move |data| {
-            // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
-            fixup_json_read(data?, &reorder_indices, &file_location)
-        });
+        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
     Ok(json)
 }
 
