@@ -222,7 +222,7 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
-    // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
+    // Logical [`ColumnName`]s of clustering columns. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection.
     clustering_columns_logical: Option<Vec<ColumnName>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).

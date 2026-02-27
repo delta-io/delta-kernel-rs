@@ -13,7 +13,7 @@ use crate::actions::domain_metadata::{
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
-use crate::clustering::get_clustering_columns;
+use crate::clustering::get_clustering_columns_from_domain_metadata;
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
@@ -661,7 +661,7 @@ impl Snapshot {
             .protocol()
             .has_table_feature(&TableFeature::ClusteredTable)
         {
-            get_clustering_columns(&self.log_segment, engine)
+            get_clustering_columns_from_domain_metadata(&self.log_segment, engine)
         } else {
             Ok(None)
         }

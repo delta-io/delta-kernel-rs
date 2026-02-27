@@ -348,10 +348,8 @@ pub(crate) fn get_any_level_column_physical_name(
 /// Translates a batch of physical [`ColumnName`]s back to logical. Supports nested columns.
 ///
 /// This is the batch reverse of [`get_any_level_column_physical_name`]. It pre-builds a flat
-/// `HashMap<physical_name, logical_name>` at each schema depth (up to max column depth),
-/// so every component of every column resolves in O(1). This works because physical names
-/// are globally unique (UUID-based) across the entire schema.
-#[delta_kernel_derive::internal_api]
+/// `HashMap<physical_name, logical_name>` at each schema depth (up to the deepest [`ColumnName`] in `physical_cols`),
+/// so every level of every [`ColumnName`] resolves in O(1).
 pub(crate) fn get_any_level_columns_logical_names(
     schema: &StructType,
     physical_cols: &[ColumnName],
@@ -367,7 +365,7 @@ pub(crate) fn get_any_level_columns_logical_names(
         .max()
         .unwrap_or(0);
 
-    // Build one physical->logical map per depth level
+    // Build one physical->logical map per level
     let mut physical_to_logical_on_level: Vec<HashMap<&str, &str>> = Vec::with_capacity(max_depth);
     let mut current_level_structs: Vec<&StructType> = vec![schema];
     for _ in 0..max_depth {
@@ -392,15 +390,15 @@ pub(crate) fn get_any_level_columns_logical_names(
                 .path()
                 .iter()
                 .enumerate()
-                .map(|(depth, component)| {
-                    let key: &str = component;
+                .map(|(depth, field_name_physical)| {
+                    let field_name_physical: &str = field_name_physical;
                     physical_to_logical_on_level[depth]
-                        .get(key)
+                        .get(field_name_physical)
                         .copied()
                         .ok_or_else(|| {
                             Error::generic(format!(
                                 "Could not resolve physical column '{col}': \
-                             no field with physical name '{component}' found in schema",
+                             no field with physical name '{field_name_physical}' found in schema",
                             ))
                         })
                 })
@@ -1089,12 +1087,12 @@ mod tests {
     fn test_get_any_level_columns_logical_names_missing() {
         let schema = test_schema_nested_with_column_mapping();
 
-        let physical = vec![ColumnName::new(["col-nonexistent"])];
+        let physical = vec![ColumnName::new(["phys_info", "nonexistent"])];
         let err = get_any_level_columns_logical_names(&schema, &physical, ColumnMappingMode::Name)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("col-nonexistent"),
+            err.contains("nonexistent"),
             "Expected error mentioning the missing physical name, got: {err}"
         );
     }

@@ -3616,20 +3616,16 @@ async fn test_clustered_table_write_has_stats(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    // Patch the CREATE TABLE commit to disable stats for all non-clustering columns.
-    // (dataSkippingNumIndexedCols is not in the CREATE TABLE allow list.)
-    let commit_path =
-        std::path::Path::new(&table_path).join("_delta_log/00000000000000000000.json");
-    let content = std::fs::read_to_string(&commit_path)?;
-    let patched = content.replace(
-        r#""configuration":{""#,
-        r#""configuration":{"delta.dataSkippingNumIndexedCols":"0",""#,
-    );
-    assert_ne!(content, patched, "patch should have modified the commit");
-    std::fs::write(&commit_path, patched)?;
-
-    // Write data
-    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    // Disable stats for all non-clustering columns.
+    // (dataSkippingNumIndexedCols is not in the CREATE TABLE allow list. so we use set_table_property to update the property.)
+    let mut snapshot = set_table_property(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        0,
+        "delta.dataSkippingNumIndexedCols",
+        "0",
+    )?;
     for batch in nested_batches()? {
         snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     }
@@ -3656,12 +3652,12 @@ async fn test_clustered_table_write_has_stats(
     )?
     .into_inner();
 
-    // Verify stats for each write commit.
-    // Batch 1 (v1): row_number 1..3, address.street "st1".."st3"
-    // Batch 2 (v2): row_number 4..6, address.street "st4".."st6"
+    // Verify stats for each write commit (v2 and v3, since v1 is the property update).
+    // Batch 1 (v2): row_number 1..3, address.street "st1".."st3"
+    // Batch 2 (v3): row_number 4..6, address.street "st4".."st6"
     let expected: [(i64, i64, &str, &str); 2] = [(1, 3, "st1", "st3"), (4, 6, "st4", "st6")];
     for (version, (min_rn, max_rn, min_st, max_st)) in expected.iter().enumerate() {
-        let version = (version + 1) as u64;
+        let version = (version + 2) as u64;
         let add_actions = read_actions_from_commit(&table_url, version, "add")?;
         assert!(
             !add_actions.is_empty(),
