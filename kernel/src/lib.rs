@@ -598,6 +598,8 @@ pub trait JsonHandler: AsAny {
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
     ///
+    /// Additionally, engines may not merge engine data across file boundaries.
+    ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
@@ -787,6 +789,8 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines must not merge engine data across file boundaries.
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(

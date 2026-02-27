@@ -26,7 +26,7 @@ pub(crate) struct SyncParquetHandler;
 fn try_create_from_parquet(
     file: File,
     schema: SchemaRef,
-    _arrow_schema: ArrowSchemaRef,
+    arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
@@ -55,6 +55,7 @@ fn try_create_from_parquet(
             &requested_ordering,
             row_indexes.as_mut(),
             Some(&file_location),
+            Some(&arrow_schema),
         )
     }))
 }
@@ -186,11 +187,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -307,11 +308,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -395,11 +396,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -470,11 +471,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler
@@ -549,11 +550,11 @@ mod tests {
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                 .unwrap();
         let schema = reader.schema().clone();
-
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         let mut result = handler

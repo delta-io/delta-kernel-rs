@@ -261,7 +261,7 @@ fn read_scan_file(
     let location = table_root.join(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
-        size: 0,
+        size: 0, // TODO: use the actual size of the file
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
