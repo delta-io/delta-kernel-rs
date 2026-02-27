@@ -15,7 +15,6 @@ use crate::{Engine, Version};
 ///
 /// The "not yet loaded" state is represented by `OnceLock::get()` returning `None`, not as an enum
 /// variant.
-#[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug, Clone)]
 pub(crate) enum CrcLoadResult {
     /// No CRC file exists for this log segment.
@@ -26,9 +25,9 @@ pub(crate) enum CrcLoadResult {
     Loaded(Arc<Crc>),
 }
 
-#[allow(unused)] // TODO: remove after we complete CRC support
 impl CrcLoadResult {
     /// Returns the CRC if successfully loaded.
+    #[allow(dead_code)] // Used in future phases (domain metadata, ICT)
     pub(crate) fn get(&self) -> Option<&Arc<Crc>> {
         match self {
             CrcLoadResult::Loaded(crc) => Some(crc),
@@ -40,7 +39,6 @@ impl CrcLoadResult {
 /// Lazy loader for CRC info that ensures it's only read once.
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
-#[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
@@ -49,7 +47,6 @@ pub(crate) struct LazyCrc {
     cached: OnceLock<CrcLoadResult>,
 }
 
-#[allow(unused)] // TODO: remove after we complete CRC support
 impl LazyCrc {
     /// Create a new lazy CRC loader.
     ///
@@ -72,7 +69,7 @@ impl LazyCrc {
                 Ok(crc) => CrcLoadResult::Loaded(Arc::new(crc)),
                 Err(e) => {
                     warn!(
-                        "Failed to read CRC file {:?}: {}. Falling back to log replay.",
+                        "Failed to read CRC file {:?}: {}.",
                         crc_path.location.location, e
                     );
                     CrcLoadResult::CorruptOrFailed
@@ -81,7 +78,20 @@ impl LazyCrc {
         })
     }
 
+    /// Returns the CRC only if the CRC file is at the given version, loading if necessary.
+    pub(crate) fn get_or_load_if_at_version(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> Option<&Arc<Crc>> {
+        if self.crc_version() != Some(version) {
+            return None;
+        }
+        self.get_or_load(engine).get()
+    }
+
     /// Check if CRC has been loaded (without triggering loading).
+    #[allow(dead_code)] // Used in future phases (domain metadata, ICT)
     pub(crate) fn is_loaded(&self) -> bool {
         self.cached.get().is_some()
     }

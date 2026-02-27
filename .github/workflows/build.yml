@@ -146,7 +146,7 @@ jobs:
         uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: '3.30.x'
-      - name: Install arrow-glib
+      - name: Install arrow-glib-linux
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
               sudo apt update
@@ -159,13 +159,12 @@ jobs:
               sudo apt install -y -V libarrow-dev # For C++
               sudo apt install -y -V libarrow-glib-dev # For GLib (C)
               sudo apt install -y -V valgrind # For memory leak test
-          elif [ "$RUNNER_OS" == "macOS" ]; then
-              brew install apache-arrow
-              brew install apache-arrow-glib
-          else
-              echo "$RUNNER_OS not supported"
-              exit 1
            fi
+      - name: Install arrow-glib-macOS
+        if: runner.os == 'macOS'
+        uses: tecolicom/actions-use-homebrew-tools@v1
+        with:
+          tools: 'apache-arrow apache-arrow-glib'
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
@@ -177,7 +176,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine-rustls,test-ffi,tracing
+          cargo b --features default-engine-rustls,test-ffi,tracing,uc-catalog
           popd
       - name: build and run read-table test
         run: |
@@ -195,7 +194,14 @@ jobs:
           cmake ..
           make
           make test
-
+      - name: build and run uc-catalog-ffi test
+        run: |
+          pushd ffi/examples/uc-catalog-example
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri"
     runs-on: ubuntu-latest
@@ -207,10 +213,11 @@ jobs:
           rustup override set nightly
           cargo miri setup
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls,uc-catalog
 
   coverage:
     runs-on: ubuntu-latest

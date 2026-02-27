@@ -66,9 +66,11 @@ fn test_get_stat_values() {
         filter.get_nullcount_stat(&column_name!("bool")),
         Some(3i64.into())
     );
+
+    // Should be Some(0), but https://github.com/apache/arrow-rs/issues/9451
     assert_eq!(
         filter.get_nullcount_stat(&column_name!("varlen.utf8")),
-        Some(0i64.into())
+        None // Some(0i64.into())
     );
 
     assert_eq!(

@@ -12,8 +12,9 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{column_expr, column_name, ColumnName, Expression};
 use crate::path::{AsUrl, ParsedLogPath};
+use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
@@ -58,7 +59,25 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    let filter = physical_predicate
+        .and_then(|(predicate, ref_schema)| {
+            let stats_schema = build_stats_schema(&ref_schema)?;
+            // Parse JSON stats from the raw action batch's `add.stats` column. Unlike the scan
+            // path (which transforms first and reads pre-parsed stats), table_changes must
+            // resolve deletion vector pairs before filtering, so it operates on raw batches.
+            let stats_expr = Arc::new(Expression::parse_json(
+                column_expr!("add.stats"),
+                stats_schema.clone(),
+            ));
+            DataSkippingFilter::new(
+                engine.as_ref(),
+                Some(predicate),
+                stats_schema,
+                get_log_add_schema().clone(),
+                stats_expr,
+            )
+        })
+        .map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
@@ -232,7 +251,7 @@ impl LogReplayScanner {
                 info!(
                     version = commit_file.version,
                     id = table_configuration.metadata().id(),
-                    //Writer features is always a superset of reader features, so writer features is logged to trace the full set of table features
+                    // Writer features are always a superset of reader features, so we log writer features to trace the full set of table features.
                     writerFeatures = %writer_features_str,
                     minReaderVersion = table_configuration.protocol().min_reader_version(),
                     minWriterVersion = table_configuration.protocol().min_writer_version(),

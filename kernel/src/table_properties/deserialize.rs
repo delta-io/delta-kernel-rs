@@ -37,68 +37,64 @@ where
 // attempt to parse a key-value pair into a `TableProperties` struct. Returns Some(()) if the key
 // was successfully parsed, and None otherwise.
 fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
+    // Table property key constants are imported via `use super::*` at the top of this file.
+
     // NOTE!! we do Some(parse(v)?) instead of just parse(v) because we want to return None if the
     // parsing fails. If we simply call 'parse(v)', then we would (incorrectly) return Some(()) and
     // just set the property to None.
     match k {
-        "delta.appendOnly" => props.append_only = Some(parse_bool(v)?),
-        "delta.autoOptimize.autoCompact" => props.auto_compact = Some(parse_bool(v)?),
-        "delta.autoOptimize.optimizeWrite" => props.optimize_write = Some(parse_bool(v)?),
-        "delta.checkpointInterval" => props.checkpoint_interval = Some(parse_positive_int(v)?),
-        "delta.checkpoint.writeStatsAsJson" => {
+        APPEND_ONLY => props.append_only = Some(parse_bool(v)?),
+        AUTO_COMPACT => props.auto_compact = Some(parse_bool(v)?),
+        OPTIMIZE_WRITE => props.optimize_write = Some(parse_bool(v)?),
+        CHECKPOINT_INTERVAL => props.checkpoint_interval = Some(parse_positive_int(v)?),
+        CHECKPOINT_WRITE_STATS_AS_JSON => {
             props.checkpoint_write_stats_as_json = Some(parse_bool(v)?)
         }
-        "delta.checkpoint.writeStatsAsStruct" => {
+        CHECKPOINT_WRITE_STATS_AS_STRUCT => {
             props.checkpoint_write_stats_as_struct = Some(parse_bool(v)?)
         }
-        "delta.columnMapping.mode" => {
-            props.column_mapping_mode = ColumnMappingMode::try_from(v).ok()
-        }
-        "delta.dataSkippingNumIndexedCols" => {
+        COLUMN_MAPPING_MODE => props.column_mapping_mode = ColumnMappingMode::try_from(v).ok(),
+        DATA_SKIPPING_NUM_INDEXED_COLS => {
             props.data_skipping_num_indexed_cols = DataSkippingNumIndexedCols::try_from(v).ok()
         }
-        "delta.dataSkippingStatsColumns" => {
+        DATA_SKIPPING_STATS_COLUMNS => {
             props.data_skipping_stats_columns = Some(parse_column_names(v)?)
         }
-        "delta.dataSkippingStringPrefixLength" => {
+        DATA_SKIPPING_STRING_PREFIX_LENGTH => {
             props.data_skipping_string_prefix_length = Some(parse_non_negative(v)?)
         }
-        "delta.deletedFileRetentionDuration" => {
+        DELETED_FILE_RETENTION_DURATION => {
             props.deleted_file_retention_duration = Some(parse_interval(v)?)
         }
-        "delta.enableChangeDataFeed" => props.enable_change_data_feed = Some(parse_bool(v)?),
-        "delta.enableDeletionVectors" => props.enable_deletion_vectors = Some(parse_bool(v)?),
-        "delta.enableTypeWidening" => props.enable_type_widening = Some(parse_bool(v)?),
-        "delta.enableIcebergCompatV1" => props.enable_iceberg_compat_v1 = Some(parse_bool(v)?),
-        "delta.enableIcebergCompatV2" => props.enable_iceberg_compat_v2 = Some(parse_bool(v)?),
-        "delta.isolationLevel" => props.isolation_level = IsolationLevel::try_from(v).ok(),
-        "delta.logRetentionDuration" => props.log_retention_duration = Some(parse_interval(v)?),
-        "delta.enableExpiredLogCleanup" => props.enable_expired_log_cleanup = Some(parse_bool(v)?),
-        "delta.randomizeFilePrefixes" => props.randomize_file_prefixes = Some(parse_bool(v)?),
-        "delta.randomPrefixLength" => props.random_prefix_length = Some(parse_positive_int(v)?),
-        "delta.setTransactionRetentionDuration" => {
+        ENABLE_CHANGE_DATA_FEED => props.enable_change_data_feed = Some(parse_bool(v)?),
+        ENABLE_DELETION_VECTORS => props.enable_deletion_vectors = Some(parse_bool(v)?),
+        ENABLE_TYPE_WIDENING => props.enable_type_widening = Some(parse_bool(v)?),
+        ENABLE_ICEBERG_COMPAT_V1 => props.enable_iceberg_compat_v1 = Some(parse_bool(v)?),
+        ENABLE_ICEBERG_COMPAT_V2 => props.enable_iceberg_compat_v2 = Some(parse_bool(v)?),
+        ISOLATION_LEVEL => props.isolation_level = IsolationLevel::try_from(v).ok(),
+        LOG_RETENTION_DURATION => props.log_retention_duration = Some(parse_interval(v)?),
+        ENABLE_EXPIRED_LOG_CLEANUP => props.enable_expired_log_cleanup = Some(parse_bool(v)?),
+        RANDOMIZE_FILE_PREFIXES => props.randomize_file_prefixes = Some(parse_bool(v)?),
+        RANDOM_PREFIX_LENGTH => props.random_prefix_length = Some(parse_positive_int(v)?),
+        SET_TRANSACTION_RETENTION_DURATION => {
             props.set_transaction_retention_duration = Some(parse_interval(v)?)
         }
-        "delta.targetFileSize" => props.target_file_size = Some(parse_positive_int(v)?),
-        "delta.tuneFileSizesForRewrites" => {
-            props.tune_file_sizes_for_rewrites = Some(parse_bool(v)?)
-        }
-        "delta.checkpointPolicy" => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
-        "delta.enableRowTracking" => props.enable_row_tracking = Some(parse_bool(v)?),
-        "delta.rowTracking.materializedRowIdColumnName" => {
+        TARGET_FILE_SIZE => props.target_file_size = Some(parse_positive_int(v)?),
+        TUNE_FILE_SIZES_FOR_REWRITES => props.tune_file_sizes_for_rewrites = Some(parse_bool(v)?),
+        CHECKPOINT_POLICY => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
+        ENABLE_ROW_TRACKING => props.enable_row_tracking = Some(parse_bool(v)?),
+        MATERIALIZED_ROW_ID_COLUMN_NAME => {
             props.materialized_row_id_column_name = Some(v.to_string())
         }
-        "delta.rowTracking.materializedRowCommitVersionColumnName" => {
+        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME => {
             props.materialized_row_commit_version_column_name = Some(v.to_string())
         }
-        "delta.rowTrackingSuspended" => props.row_tracking_suspended = Some(parse_bool(v)?),
-        "delta.enableInCommitTimestamps" => {
-            props.enable_in_commit_timestamps = Some(parse_bool(v)?)
-        }
-        "delta.inCommitTimestampEnablementVersion" => {
+        ROW_TRACKING_SUSPENDED => props.row_tracking_suspended = Some(parse_bool(v)?),
+        ENABLE_IN_COMMIT_TIMESTAMPS => props.enable_in_commit_timestamps = Some(parse_bool(v)?),
+        IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION => {
             props.in_commit_timestamp_enablement_version = Some(parse_non_negative(v)?)
         }
-        "delta.inCommitTimestampEnablementTimestamp" => {
+        IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
         _ => return None,

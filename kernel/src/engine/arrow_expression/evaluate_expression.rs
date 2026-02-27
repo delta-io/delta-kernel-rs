@@ -142,7 +142,7 @@ fn evaluate_transform_expression(
     let mut used_field_transforms = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
-    let mut output_cols = Vec::new();
+    let mut output_cols = Vec::with_capacity(output_schema.num_fields());
 
     // Helper lambda to get the next output field type
     let mut output_schema_iter = output_schema.fields();
@@ -199,10 +199,15 @@ fn evaluate_transform_expression(
         }
     }
 
-    // Verify that all field transforms were used
-    if used_field_transforms != transform.field_transforms.len() {
+    // Verify that all non-optional field transforms were used
+    let required_count = transform
+        .field_transforms
+        .values()
+        .filter(|ft| !ft.optional)
+        .count();
+    if used_field_transforms < required_count {
         return Err(Error::generic(
-            "Some field transforms reference invalid input field names",
+            "Some non-optional field transforms reference invalid input field names",
         ));
     }
 
@@ -985,6 +990,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Data type is required"));
+    }
+
+    #[test]
+    fn test_drop_field_if_exists_present() {
+        let batch = create_test_batch();
+        let transform = Transform::new_top_level().with_dropped_field_if_exists("a");
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[10, 20, 30]);
+        validate_i32_column(result, 1, &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_drop_field_if_exists_missing() {
+        let batch = create_test_batch();
+        let transform = Transform::new_top_level().with_dropped_field_if_exists("nonexistent");
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[1, 2, 3]);
+        validate_i32_column(result, 1, &[10, 20, 30]);
+        validate_i32_column(result, 2, &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_drop_field_non_optional_missing_still_errors() {
+        let batch = create_test_batch();
+        let transform = Transform::new_top_level().with_dropped_field("nonexistent");
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
     }
 
     #[test]
