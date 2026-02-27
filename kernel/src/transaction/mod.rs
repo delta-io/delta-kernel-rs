@@ -463,9 +463,7 @@ impl<S> Transaction<S> {
         }
 
         // Validate clustering column stats if ClusteredTable feature is enabled
-        if !self.add_files_metadata.is_empty() {
-            self.validate_add_files_stats(&self.add_files_metadata)?;
-        }
+        self.validate_add_files_stats(&self.add_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -1241,6 +1239,9 @@ impl<S> Transaction<S> {
     /// - Clustering columns are configured but stats are missing for any file
     /// - A file has no stats at all when clustering requires stats
     fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+        if add_files.is_empty() {
+            return Ok(());
+        }
         if let Some(ref clustering_cols) = self.clustering_columns {
             if !clustering_cols.is_empty() {
                 let schema = self.read_snapshot.schema();
