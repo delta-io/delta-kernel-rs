@@ -53,6 +53,8 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub(crate) mod txn_changes;
+
 mod update;
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -322,9 +324,10 @@ impl<S> Transaction<S> {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
+        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
-            self.get_in_commit_timestamp(engine)?,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
@@ -406,7 +409,7 @@ impl<S> Transaction<S> {
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(file_meta)?,
+                self.into_committed(file_meta, in_commit_timestamp)?,
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -1065,7 +1068,11 @@ impl<S> Transaction<S> {
         }
     }
 
-    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+    fn into_committed(
+        self,
+        file_meta: FileMeta,
+        in_commit_timestamp: Option<i64>,
+    ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1080,12 +1087,15 @@ impl<S> Transaction<S> {
                 + 1,
         };
 
+        let txn_changes = txn_changes::TxnChangesContext {
+            parsed_commit,
+            in_commit_timestamp,
+        };
+
         Ok(CommittedTransaction {
             commit_version,
             post_commit_stats,
-            post_commit_snapshot: Some(Arc::new(
-                self.read_snapshot.new_post_commit(parsed_commit)?,
-            )),
+            post_commit_snapshot: Some(Arc::new(self.read_snapshot.new_post_commit(txn_changes)?)),
         })
     }
 
