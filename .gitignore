@@ -1,0 +1,26 @@
+# OS
+.DS_Store
+
+# IDE
+.claude/
+.dir-locals.el
+.idea/
+.vscode/
+.vim
+.zed
+.cache/
+.clangd
+
+# Rust
+target/
+/Cargo.lock
+integration-tests/Cargo.lock
+
+# Project
+acceptance/tests/dat/
+ffi/examples/read-table/build
+/build
+/kernel/target
+/target
+
+/kernel/tests/data/workloads/
