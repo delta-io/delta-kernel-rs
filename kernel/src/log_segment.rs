@@ -6,10 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{
-    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
-    PROTOCOL_NAME, SIDECAR_NAME,
-};
+use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
 use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
@@ -19,8 +16,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version, PRE_COMMIT_VERSION,
+    DeltaResult, Engine, Error, FileMeta, PredicateRef, RowVisitor, StorageHandler, Version,
+    PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -34,6 +31,13 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+mod domain_metadata_replay;
+mod protocol_metadata_replay;
+
+pub(crate) use domain_metadata_replay::DomainMetadataMap;
+
+#[cfg(test)]
+mod crc_tests;
 #[cfg(test)]
 mod tests;
 
@@ -88,7 +92,7 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file
+    /// Latest CRC (checksum) file, only if version >= checkpoint version.
     pub latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
@@ -790,6 +794,8 @@ impl LogSegment {
 
         // Read sidecars with the same schema as checkpoint (including stats_parsed if available).
         // The sidecar column will be null in sidecar batches, which is harmless.
+        // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
+        // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
             parquet_handler.read_parquet_files(
                 &sidecar_files,
@@ -853,56 +859,78 @@ impl LogSegment {
             .try_collect()
     }
 
-    /// Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    /// the LogSegment.
-    #[instrument(name = "log_seg.load_p_m", skip_all, err)]
-    pub(crate) fn protocol_and_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let actions_batches = self.replay_for_metadata(engine)?;
-        let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
-            if metadata_opt.is_some() && protocol_opt.is_some() {
-                // we've found both, we can stop
-                break;
-            }
-        }
-        Ok((metadata_opt, protocol_opt))
-    }
-
-    // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
-        match self.protocol_and_metadata(engine)? {
-            (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
+    /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
+    ///
+    /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
+    /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
+    /// in `(start_v_exclusive, end_version]` are retained.
+    pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: None,
+            log_root: self.log_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: None,
+            max_published_version: None,
         }
     }
 
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
-    fn replay_for_metadata(
+    /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
+    ///
+    /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
+    /// checkpoint-based replay, so checkpoint files and schema are preserved. Only commits
+    /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
+    /// needed for this replay path (CRC file, latest commit file) are dropped.
+    pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
+        let (commits, compactions) =
+            self.filtered_commits_and_compactions(self.checkpoint_version, end_v_inclusive);
+        LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: self.checkpoint_version,
+            log_root: self.log_root.clone(),
+            ascending_commit_files: commits,
+            ascending_compaction_files: compactions,
+            checkpoint_parts: self.checkpoint_parts.clone(),
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: self.checkpoint_schema.clone(),
+            max_published_version: None,
+        }
+    }
+
+    /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
+    /// If `lo_exclusive` is `None`, there is no lower bound.
+    fn filtered_commits_and_compactions(
         &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-            )))
-        });
-        // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema, META_PREDICATE.clone())
+        lo_exclusive: Option<Version>,
+        hi_inclusive: Version,
+    ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
+        let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
+        let commits = self
+            .ascending_commit_files
+            .iter()
+            .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
+            .cloned()
+            .collect();
+        let compactions = self
+            .ascending_compaction_files
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.file_type,
+                    LogPathFileType::CompactedCommit { hi }
+                        if above_lo(c.version) && hi <= hi_inclusive
+                )
+            })
+            .cloned()
+            .collect();
+        (commits, compactions)
     }
 
     /// How many commits since a checkpoint, according to this log segment.

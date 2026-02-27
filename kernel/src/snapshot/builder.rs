@@ -86,7 +86,7 @@ impl SnapshotBuilder {
     #[instrument(
         name = "snap.build",
         skip_all,
-        fields(table_path = %self.table_path()),
+        fields(path = %self.table_path()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
