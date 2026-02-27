@@ -137,18 +137,20 @@ fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
 }
 
 /// Reads clustering columns from the log segment's domain metadata.
+/// When column mapping is enabled, the returned columns are physical names.
+/// Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-clustered-table
 ///
 /// This function performs a log scan to find the clustering domain metadata.
 /// Callers should first check if the `ClusteredTable` feature is enabled via
 /// the protocol before calling this function to avoid unnecessary I/O.
-/// See [`Snapshot::get_clustering_columns`] which performs this check.
+/// See [`Snapshot::get_clustering_columns_physical`] which performs this check.
 ///
 /// Returns `Ok(Some(columns))` if clustering domain metadata exists,
 /// `Ok(None)` if no clustering domain metadata is found, or an error if the
 /// metadata is malformed.
 ///
-/// [`Snapshot::get_clustering_columns`]: crate::snapshot::Snapshot::get_clustering_columns
-pub(crate) fn get_clustering_columns(
+/// [`Snapshot::get_clustering_columns_physical`]: crate::snapshot::Snapshot::get_clustering_columns_physical
+pub(crate) fn get_clustering_columns_from_domain_metadata(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<Vec<ColumnName>>> {

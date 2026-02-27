@@ -13,7 +13,7 @@ use crate::actions::domain_metadata::{
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
-use crate::clustering::get_clustering_columns;
+use crate::clustering::get_clustering_columns_from_domain_metadata;
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
@@ -24,6 +24,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
+use crate::table_features::get_any_level_columns_logical_names;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
@@ -617,7 +618,7 @@ impl Snapshot {
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 
-    /// Get the clustering columns for this snapshot, if the table has clustering enabled.
+    /// Get the clustering columns as logical names for this snapshot.
     ///
     /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
     /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
@@ -625,7 +626,33 @@ impl Snapshot {
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     #[internal_api]
-    pub(crate) fn get_clustering_columns(
+    pub(crate) fn get_clustering_columns_logical(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        let Some(physical_columns) = self.get_clustering_columns_physical(engine)? else {
+            return Ok(None);
+        };
+
+        let schema = self.table_configuration.schema();
+        let mode = self.table_configuration.column_mapping_mode();
+        let logical_columns =
+            get_any_level_columns_logical_names(&schema, &physical_columns, mode)?;
+
+        Ok(Some(logical_columns))
+    }
+
+    /// Get the clustering columns as physical names for this snapshot.
+    ///
+    /// Returns the raw physical column names as stored in domain metadata.
+    ///
+    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
+    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
+    /// clustering metadata is malformed.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    #[internal_api]
+    pub(crate) fn get_clustering_columns_physical(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
@@ -634,7 +661,7 @@ impl Snapshot {
             .protocol()
             .has_table_feature(&TableFeature::ClusteredTable)
         {
-            get_clustering_columns(&self.log_segment, engine)
+            get_clustering_columns_from_domain_metadata(&self.log_segment, engine)
         } else {
             Ok(None)
         }

@@ -14,6 +14,7 @@ use delta_kernel_derive::internal_api;
 pub use column_mapping::get_any_level_column_physical_name;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
+pub(crate) use column_mapping::get_any_level_columns_logical_names;
 pub(crate) use column_mapping::validate_column_mapping;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
