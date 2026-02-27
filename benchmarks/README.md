@@ -18,22 +18,12 @@ cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_table_name"
 
 ### `TableInfo`
 
-Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, an optional human-readable description, and either an explicit `table_path` (for remote tables) or a convention-based local path (`delta/` subdirectory alongside `table_info.json`).
+Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, an optional human-readable description, and either an explicit `table_path` (for remote tables) or a convention-based local path (`delta/` subdirectory alongside `table_info.json`). Note that `table_path` is mainly intended for remote storage (e.g. S3), but S3 support is not yet implemented; all current workloads are under `delta/` as described.
 
 ```json
 {
   "name": "basic_append",
   "description": "A basic table with two append writes.",
-}
-```
-
-For remote tables (S3/cloud), include `table_path`:
-
-```json
-{
-  "name": "s3_table",
-  "description": "A table on S3",
-  "table_path": "s3://bucket/path/to/table/"
 }
 ```
 
