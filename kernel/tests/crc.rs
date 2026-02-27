@@ -10,7 +10,7 @@ use delta_kernel::snapshot::{FileStats, Snapshot};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::DeltaResult;
 use object_store::local::LocalFileSystem;
-use test_utils::test_table_setup;
+use test_utils::{copy_directory, test_table_setup};
 
 #[tokio::test]
 async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
@@ -50,6 +50,38 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
 
+    let file_stats = snapshot.get_file_stats(engine.as_ref());
+    assert_eq!(file_stats, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
+    // ===== GIVEN =====
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Copy crc-full table (has CRC at version 0) into the temp dir
+    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
+    copy_directory(&source_path, _temp_dir.path()).unwrap();
+
+    // Verify the table starts at version 0 with valid CRC stats
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+    assert!(snapshot.get_file_stats(engine.as_ref()).is_some());
+
+    // ===== WHEN =====
+    // Empty commit to advance to version 1 (no new CRC file written)
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let _ = txn.commit(engine.as_ref())?;
+
+    // ===== THEN =====
+    // Load a fresh snapshot at version 1
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+
+    // No CRC at version 1, so file stats should be None
     let file_stats = snapshot.get_file_stats(engine.as_ref());
     assert_eq!(file_stats, None);
 
