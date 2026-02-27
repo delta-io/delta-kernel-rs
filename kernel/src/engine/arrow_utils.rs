@@ -1378,6 +1378,23 @@ pub(crate) fn to_json_bytes(
     Ok(writer.into_inner())
 }
 
+/// Applies post-processing to data read from a JSON file. Inserts synthesized metadata columns
+/// (e.g. [`MetadataColumnSpec::FilePath`]) at the positions specified by `reorder_indices`.
+///
+/// `reorder_indices` should be built once per schema via [`build_json_reorder_indices`] and
+/// reused for every batch from the same file.
+pub(crate) fn fixup_json_read<T>(
+    batch: RecordBatch,
+    reorder_indices: &[ReorderIndex],
+    file_location: &str,
+) -> DeltaResult<T>
+where
+    StructArray: Into<T>,
+{
+    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
+    Ok(data.into())
+}
+
 /// Builds the [`ReorderIndex`] vec for post-processing JSON read batches.
 ///
 /// The JSON reader is given a schema with metadata columns stripped (see [`json_arrow_schema`]).
@@ -1393,43 +1410,29 @@ pub(crate) fn to_json_bytes(
 /// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
 ///   reader.
 pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec<ReorderIndex>> {
+    // Real columns: position in reorder_indices IS the source column index (0..N in schema
+    // order), and reorder_index.index carries the output position.
     let mut reorder_indices = Vec::with_capacity(schema.num_fields());
-    // Metadata entries are collected separately and appended after all real columns, because
-    // reorder_struct_array uses the position in the vec as the source column index — so real
-    // columns must occupy the leading positions.
+    // Metadata columns are appended after all real columns. reorder_struct_array never reads
+    // source data for metadata transforms, so their vec position doesn't correspond to a source
+    // column. Unsupported specs use Missing (null fill); non-nullable violations surface
+    // naturally via StructArray::try_new.
     let mut metadata_entries = Vec::new();
 
     for (output_pos, field) in schema.fields().enumerate() {
         match field.get_metadata_column_spec() {
-            None => {
-                // Real column: its position in reorder_indices is its source index.
-                // reorder_index.index carries the output position.
-                reorder_indices.push(ReorderIndex::identity(output_pos));
-            }
+            None => reorder_indices.push(ReorderIndex::identity(output_pos)),
             Some(spec) => metadata_entries.push((output_pos, field, spec)),
         }
     }
 
-    // Append metadata columns. reorder_struct_array never accesses input_cols for these
-    // transforms, so their position in the vec doesn't correspond to a source column.
     for (output_pos, field, spec) in metadata_entries {
-        match spec {
-            MetadataColumnSpec::FilePath => {
-                reorder_indices.push(ReorderIndex::file_path(
-                    output_pos,
-                    Arc::new(field.try_into_arrow()?),
-                ));
-            }
-            _ => {
-                // Unsupported metadata column spec: insert a null (Missing) column.
-                // The field's nullability is preserved so non-nullable violations surface
-                // naturally when reorder_struct_array constructs the output StructArray.
-                reorder_indices.push(ReorderIndex::missing(
-                    output_pos,
-                    Arc::new(field.try_into_arrow()?),
-                ));
-            }
-        }
+        let field = Arc::new(field.try_into_arrow()?);
+        let rindex = match spec {
+            MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
+            _ => ReorderIndex::missing(output_pos, field),
+        };
+        reorder_indices.push(rindex);
     }
 
     Ok(reorder_indices)

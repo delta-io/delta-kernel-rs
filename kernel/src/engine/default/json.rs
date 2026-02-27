@@ -17,8 +17,8 @@ use url::Url;
 use super::executor::TaskExecutor;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    build_json_reorder_indices, json_arrow_schema, parse_json as arrow_parse_json,
-    reorder_struct_array, to_json_bytes,
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
@@ -109,16 +109,7 @@ async fn read_json_files_impl(
             let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
             let tagged = batch_stream
-                .map(move |result| -> DeltaResult<Box<dyn EngineData>> {
-                    let batch = result?;
-                    let batch = RecordBatch::from(reorder_struct_array(
-                        batch.into(),
-                        &reorder_indices,
-                        None,
-                        Some(&file_path),
-                    )?);
-                    Ok(Box::new(ArrowEngineData::new(batch)))
-                })
+                .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
                 .boxed();
             Ok::<_, Error>(tagged)
         }
@@ -127,7 +118,8 @@ async fn read_json_files_impl(
     // Create a stream from that iterator which buffers up to `buffer_size` futures at a time.
     let result_stream = stream::iter(file_futures)
         .buffered(buffer_size)
-        .try_flatten();
+        .try_flatten()
+        .map_ok(|e: ArrowEngineData| -> Box<dyn EngineData> { Box::new(e) });
 
     Ok(Box::pin(result_stream))
 }

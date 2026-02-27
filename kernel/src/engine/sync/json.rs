@@ -1,17 +1,15 @@
 use std::sync::Arc;
 use std::{fs::File, io::BufReader, io::Write};
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use tempfile::NamedTempFile;
 use url::Url;
 
 use super::read_files;
-use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    build_json_reorder_indices, json_arrow_schema, parse_json as arrow_parse_json,
-    reorder_struct_array, to_json_bytes,
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
@@ -21,14 +19,9 @@ use crate::{
 
 pub(crate) struct SyncJsonHandler;
 
-/// Note: This function must match the signature expected by `read_files` helper function,
-/// which is also used by `try_create_from_parquet`. The `_arrow_schema` parameter is ignored
-/// here — we rebuild the Arrow schema ourselves so we can strip out metadata columns
-/// (e.g. [`MetadataColumnSpec::FilePath`]) before passing it to Arrow's JSON reader.
 fn try_create_from_json(
     file: File,
     schema: SchemaRef,
-    _arrow_schema: ArrowSchemaRef,
     _predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
@@ -41,15 +34,8 @@ fn try_create_from_json(
         .with_coerce_primitive(true)
         .build(BufReader::new(file))?
         .map(move |data| {
-            let batch = data?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
-            let batch = RecordBatch::from(reorder_struct_array(
-                batch.into(),
-                &reorder_indices,
-                None,
-                Some(&file_location),
-            )?);
-            Ok(ArrowEngineData::new(batch))
+            fixup_json_read(data?, &reorder_indices, &file_location)
         });
     Ok(json)
 }
