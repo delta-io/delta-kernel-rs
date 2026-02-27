@@ -343,11 +343,12 @@ fn compute_has_breaking_changes(
         })
 }
 
-/// Filters field changes to keep only the least common ancestors (LCA).
+/// Filters field changes by removing descendants of already-reported ancestors.
 ///
-/// This filters out descendant fields when their parent is also in the set.
-/// For example, if both "user" and "user.name" are in the input, this returns only "user"
-/// since reporting "user.name" would be redundant.
+/// A field is dropped if any of its ancestors is also present in the input:
+/// reporting both would be redundant.
+/// Two fields that merely share a common ancestor not present in the input
+/// are both kept.
 ///
 /// The algorithm is O(n * d) where n is the number of fields and d is max path depth:
 /// 1. Put all paths in a HashSet for O(1) lookup
