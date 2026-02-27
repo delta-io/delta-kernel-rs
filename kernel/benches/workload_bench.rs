@@ -62,7 +62,7 @@ fn run_benchmark(group: &mut BenchmarkGroup<WallTime>, runner: &dyn WorkloadRunn
 }
 
 fn build_read_configs() -> Vec<ReadConfig> {
-    //Choose which benchmark configurations to run for a given table
+    // Choose which benchmark configurations to run for a given table
     // TODO: This function will take in table info to choose the appropriate configs for a given table
     default_read_configs()
 }
