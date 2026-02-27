@@ -458,6 +458,7 @@ async fn open_parquet_file(
             Some(&file_location),
             Some(&arrow_schema),
         )
+        .map(Into::into)
     });
     Ok(stream.boxed())
 }
@@ -541,6 +542,7 @@ impl FileOpener for PresignedUrlOpener {
                     Some(&file_location),
                     Some(&arrow_schema),
                 )
+                .map(Into::into)
             });
             Ok(stream.boxed())
         }))
