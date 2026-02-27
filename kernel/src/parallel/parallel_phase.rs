@@ -502,7 +502,30 @@ mod tests {
         }
     }
 
-    fn verify_metrics_in_logs(logs: &str, table_name: &str, verify_phase2: bool) {
+    /// Expected metric values for a test case
+    #[derive(Debug, Clone)]
+    struct ExpectedMetrics {
+        // Phase 1 counter metrics
+        phase1_adds: u64,
+        phase1_removes: u64,
+        phase1_non_file_actions: u64,
+        phase1_data_skipping_filtered: u64,
+        phase1_partition_pruning_filtered: u64,
+
+        // Phase 2 counter metrics (None if Phase 2 not expected)
+        phase2_adds_per_run: Option<u64>,
+        phase2_removes_per_run: Option<u64>,
+        phase2_non_file_actions_per_run: Option<u64>,
+        phase2_data_skipping_filtered_per_run: Option<u64>,
+        phase2_partition_pruning_filtered_per_run: Option<u64>,
+    }
+
+    fn verify_metrics_in_logs(
+        logs: &str,
+        table_name: &str,
+        expected: &ExpectedMetrics,
+        num_test_runs: usize,
+    ) {
         // Verify Phase 1 metrics were logged
         assert!(
             logs.contains("Completed Phase 1 scan metadata"),
@@ -514,29 +537,34 @@ mod tests {
         let phase1_adds = extract_metric(logs, "num_adds");
         let phase1_removes = extract_metric(logs, "num_removes");
         let phase1_non_file_actions = extract_metric(logs, "num_non_file_actions");
-        let _data_skipping_filtered = extract_metric(logs, "data_skipping_filtered");
-        let _partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
+        let data_skipping_filtered = extract_metric(logs, "data_skipping_filtered");
+        let partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
 
-        // For v2-checkpoints-json-with-sidecars:
-        // Phase 1 processes commits and single-part checkpoints (0 adds, 5 non-file actions)
-        // Phase 2 processes multi-part checkpoint sidecars (101 adds)
-        if table_name == "v2-checkpoints-json-with-sidecars" {
-            assert_eq!(
-                phase1_adds, 0,
-                "Expected 0 adds in Phase 1 for {}",
-                table_name
-            );
-            assert_eq!(
-                phase1_removes, 0,
-                "Expected 0 removes in Phase 1 for {}",
-                table_name
-            );
-            assert_eq!(
-                phase1_non_file_actions, 5,
-                "Expected 5 non-file actions in Phase 1 for {}",
-                table_name
-            );
-        }
+        assert_eq!(
+            phase1_adds, expected.phase1_adds,
+            "Phase 1 num_adds mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            phase1_removes, expected.phase1_removes,
+            "Phase 1 num_removes mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            phase1_non_file_actions, expected.phase1_non_file_actions,
+            "Phase 1 num_non_file_actions mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            data_skipping_filtered, expected.phase1_data_skipping_filtered,
+            "Phase 1 data_skipping_filtered mismatch for {}",
+            table_name
+        );
+        assert_eq!(
+            partition_pruning_filtered, expected.phase1_partition_pruning_filtered,
+            "Phase 1 partition_pruning_filtered mismatch for {}",
+            table_name
+        );
 
         // Verify timing metrics are present and parseable
         let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
@@ -544,8 +572,13 @@ mod tests {
         let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
         let _phase1_duration = extract_metric(logs, "phase1_duration_ms");
 
-        // Verify Phase 2 metrics if requested
-        if verify_phase2 && logs.contains("Phase 2 needed") {
+        // Verify Phase 2 metrics if expected
+        if let Some(expected_adds_per_run) = expected.phase2_adds_per_run {
+            assert!(
+                logs.contains("Phase 2 needed"),
+                "Expected 'Phase 2 needed' in logs for table '{}'",
+                table_name
+            );
             assert!(
                 logs.contains("Completed Phase 2 scan metadata"),
                 "Expected Phase 2 completion log for table '{}'",
@@ -582,45 +615,113 @@ mod tests {
                 // Extract and validate num_adds
                 let adds = extract_metric(remaining, "num_adds");
                 total_phase2_adds += adds;
-
-                // Extract and validate num_removes - should ALWAYS be 0
-                let removes = extract_metric(remaining, "num_removes");
                 assert_eq!(
-                    removes, 0,
-                    "Expected num_removes=0 in Phase 2 log #{} for {} (checkpoint sidecars only have adds), found {}",
-                    phase2_count, table_name, removes
+                    adds, expected_adds_per_run,
+                    "Phase 2 log #{} num_adds mismatch for {}",
+                    phase2_count, table_name
                 );
 
-                // Extract and validate num_non_file_actions - should ALWAYS be 0
+                // Extract and validate num_removes
+                let removes = extract_metric(remaining, "num_removes");
+                assert_eq!(
+                    removes,
+                    expected.phase2_removes_per_run.unwrap(),
+                    "Phase 2 log #{} num_removes mismatch for {}",
+                    phase2_count,
+                    table_name
+                );
+
+                // Extract and validate num_non_file_actions
                 let non_file_actions = extract_metric(remaining, "num_non_file_actions");
                 assert_eq!(
-                    non_file_actions, 0,
-                    "Expected num_non_file_actions=0 in Phase 2 log #{} for {} (checkpoint sidecars only have adds), found {}",
-                    phase2_count, table_name, non_file_actions
+                    non_file_actions,
+                    expected.phase2_non_file_actions_per_run.unwrap(),
+                    "Phase 2 log #{} num_non_file_actions mismatch for {}",
+                    phase2_count,
+                    table_name
+                );
+
+                // Extract and validate data_skipping_filtered
+                let data_skipping_filtered = extract_metric(remaining, "data_skipping_filtered");
+                assert_eq!(
+                    data_skipping_filtered,
+                    expected.phase2_data_skipping_filtered_per_run.unwrap(),
+                    "Phase 2 log #{} data_skipping_filtered mismatch for {}",
+                    phase2_count,
+                    table_name
+                );
+
+                // Extract and validate partition_pruning_filtered
+                let partition_pruning_filtered =
+                    extract_metric(remaining, "partition_pruning_filtered");
+                assert_eq!(
+                    partition_pruning_filtered,
+                    expected.phase2_partition_pruning_filtered_per_run.unwrap(),
+                    "Phase 2 log #{} partition_pruning_filtered mismatch for {}",
+                    phase2_count,
+                    table_name
                 );
 
                 search_start = absolute_pos + 1;
             }
 
-            if table_name == "v2-checkpoints-json-with-sidecars" {
-                // The test runs 4 configurations (with_serde × one_file_per_worker),
-                // and each configuration processes all 101 adds from the checkpoint sidecars.
-                // So the total across all Phase 2 logs should be 4 × 101 = 404
-                assert_eq!(
-                    total_phase2_adds, 404,
-                    "Expected total of 404 adds across all Phase 2 runs for {} (4 configs × 101 adds each, found: {})",
-                    table_name, total_phase2_adds
-                );
-            }
+            // Verify total adds across all Phase 2 runs
+            let expected_total = expected_adds_per_run * num_test_runs as u64;
+            assert_eq!(
+                total_phase2_adds, expected_total,
+                "Expected total of {} adds across all Phase 2 runs for {} ({} runs × {} adds each), found: {}",
+                expected_total, table_name, num_test_runs, expected_adds_per_run, total_phase2_adds
+            );
         }
     }
 
-    /// Tests parallel workflow with JSON sidecars and verifies metrics logging.
+    /// Tests parallel workflow with sidecars and verifies metrics logging.
+    ///
+    /// This parameterized test covers both JSON and Parquet checkpoint sidecars,
+    /// with all combinations of serialization and worker configurations.
     ///
     /// Note: This test captures logs from spawned threads by sharing the tracing dispatcher.
     /// If running with other tests in parallel causes flakiness, use `--test-threads=1`.
-    #[test]
-    fn test_parallel_with_json_sidecars() -> DeltaResult<()> {
+    #[rstest::rstest]
+    #[case::json_sidecars(
+        "v2-checkpoints-json-with-sidecars",
+        None,
+        ExpectedMetrics {
+            phase1_adds: 0,
+            phase1_removes: 0,
+            phase1_non_file_actions: 5,
+            phase1_data_skipping_filtered: 0,
+            phase1_partition_pruning_filtered: 0,
+            phase2_adds_per_run: Some(101),
+            phase2_removes_per_run: Some(0),
+            phase2_non_file_actions_per_run: Some(0),
+            phase2_data_skipping_filtered_per_run: Some(0),
+            phase2_partition_pruning_filtered_per_run: Some(0),
+        }
+    )]
+    #[case::parquet_sidecars(
+        "v2-checkpoints-parquet-with-sidecars",
+        None,
+        ExpectedMetrics {
+            phase1_adds: 0,
+            phase1_removes: 0,
+            phase1_non_file_actions: 5,
+            phase1_data_skipping_filtered: 0,
+            phase1_partition_pruning_filtered: 0,
+            phase2_adds_per_run: Some(101),
+            phase2_removes_per_run: Some(0),
+            phase2_non_file_actions_per_run: Some(0),
+            phase2_data_skipping_filtered_per_run: Some(0),
+            phase2_partition_pruning_filtered_per_run: Some(0),
+        }
+    )]
+    fn test_parallel_workflow_with_metrics(
+        #[case] table_name: &str,
+        #[case] predicate: Option<PredicateRef>,
+        #[case] expected: ExpectedMetrics,
+        #[values(false, true)] with_serde: bool,
+        #[values(false, true)] one_file_per_worker: bool,
+    ) -> DeltaResult<()> {
         use test_utils::LoggingTest;
 
         // Set up log capture
@@ -629,76 +730,58 @@ mod tests {
         // Capture the dispatcher to share with spawned threads
         let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
 
-        // Run all test configurations
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                    Some(dispatcher.clone()),
-                )?;
-            }
-        }
+        verify_parallel_workflow(
+            table_name,
+            predicate,
+            with_serde,
+            one_file_per_worker,
+            Some(dispatcher),
+        )?;
 
-        // Verify metrics were logged (Phase 2 logs should be captured from spawned threads)
+        // Verify metrics were logged
         let logs = logging_test.logs();
-        verify_metrics_in_logs(&logs, "v2-checkpoints-json-with-sidecars", true);
+        verify_metrics_in_logs(&logs, table_name, &expected, 1);
 
         Ok(())
     }
 
-    #[test]
-    fn test_parallel_with_parquet_sidecars() -> DeltaResult<()> {
-        // No log verification needed - test_parallel_with_json_sidecars already verifies
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-parquet-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                    None,
-                )?;
-            }
-        }
-        Ok(())
+    /// Tests parallel workflow with a table that doesn't need Phase 2.
+    ///
+    /// This test verifies that tables with single-part checkpoints complete
+    /// in Phase 1 without requiring distributed processing.
+    #[rstest::rstest]
+    fn test_no_parallel_phase_needed(
+        #[values(false, true)] with_serde: bool,
+        #[values(false, true)] one_file_per_worker: bool,
+    ) -> DeltaResult<()> {
+        verify_parallel_workflow(
+            "table-without-dv-small",
+            None,
+            with_serde,
+            one_file_per_worker,
+            None,
+        )
     }
 
-    #[test]
-    fn test_no_parallel_phase_needed() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "table-without-dv-small",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                    None,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_parallel_with_dataskipping_predicate() -> DeltaResult<()> {
+    /// Tests parallel workflow with a data skipping predicate.
+    ///
+    /// This test verifies that predicates work correctly in both
+    /// serialized and non-serialized parallel workflows.
+    #[rstest::rstest]
+    fn test_parallel_with_dataskipping_predicate(
+        #[values(false, true)] with_serde: bool,
+        #[values(false, true)] one_file_per_worker: bool,
+    ) -> DeltaResult<()> {
         use crate::expressions::{column_expr, Expression as Expr};
 
         let predicate = Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)));
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    Some(predicate.clone()),
-                    with_serde,
-                    one_file_per_worker,
-                    None,
-                )?;
-            }
-        }
-        Ok(())
+        verify_parallel_workflow(
+            "v2-checkpoints-json-with-sidecars",
+            Some(predicate),
+            with_serde,
+            one_file_per_worker,
+            None,
+        )
     }
 
     #[test]
