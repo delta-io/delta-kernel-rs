@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use url::Url;
 
-// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
-// so that `execute` measures only the operation itself
+/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
+/// so that `execute` measures only the operation itself
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
