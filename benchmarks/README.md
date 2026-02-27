@@ -14,6 +14,21 @@ cargo bench -p delta_kernel_benchmarks --bench workload_bench
 cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_table_name"
 ```
 
+## Workload data layout
+
+Each table lives in its own subdirectory under `workloads/benchmarks/`:
+
+```
+workloads/
+├── benchmarks/
+│   └── <table_name>/
+│       ├── table_info.json       # describes the table (name, path, etc.)
+│       ├── delta/                # Delta table data (if no explicit table_path)
+│       └── specs/
+│           └── <case_name>.json  # one file per benchmark operation
+└── tests/                        # reserved for future test workloads (currently empty)
+```
+
 ## Entities
 
 ### `TableInfo`
@@ -29,7 +44,7 @@ Deserialized from a `table_info.json` file. Describes a Delta table and includes
 
 ### `Spec`
 
-Deserialized from a JSON file in a table's `specs/` directory. Describes a single operation to benchmark against a table. Two variants are supported:
+Deserialized from a JSON file in a table's `specs/` directory. Describes a single operation to benchmark (what to do, e.g. read at version 3). Two variants are supported:
 
 - **`Read`** — scan a table at an optional version (defaults to latest). A single `Read` spec expands into one benchmark per `ReadOperation` × `ReadConfig` combination — every relevant operation and parallelism mode is benchmarked. Currently only `ReadMetadata` is implemented; `ReadData` is not yet supported.
 - **`SnapshotConstruction`** — measure the cost of building a `Snapshot` from scratch at an optional version (defaults to latest)
@@ -66,7 +81,7 @@ Or with a specific version:
 
 ### `Workload`
 
-Includes `TableInfo`, `case_name`, and `Spec` — the unit of work that gets benchmarked. A single table can have multiple workloads (one per spec file).
+The concrete unit of work that gets benchmarked. Assembled when loading workloads by pairing a `Spec` (the operation) with a `TableInfo` (the table) and a `case_name`. A `Spec` file on its own solely describes an operation without context of the table it is performed on; when combined with a table, it becomes a `Workload`. A single table therefore produces multiple workloads, one for each spec file in its `specs/` directory.
 
 ### `ReadConfig`
 
@@ -77,24 +92,11 @@ Specifies runtime parameters for `Read` workloads that are not part of the spec 
 Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so that `execute()` measures only the target operation. Each runner corresponds to one `Workload` plus whatever additional configuration that workload type requires — `Read` workloads take a `ReadConfig`, while `SnapshotConstruction` workloads require no extra configuration.
 
 
-## Workload Data
+## Loading workloads
 
 Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
 
-Workloads are discovered automatically by path — there is no explicit registry. `load_all_workloads()` scans every subdirectory of `workloads/benchmarks/`, and for each one loads `table_info.json` and every spec file found under `specs/`. Each `(table, spec file)` pair becomes one `Workload`, with the spec filename (without extension) used as the `case_name`.
-
-The expected layout inside the archive is:
-
-```
-workloads/
-├── benchmarks/
-│   └── <table_name>/
-│       ├── table_info.json
-│       ├── delta/              # Delta table (if no explicit table_path)
-│       └── specs/
-│           └── <case_name>.json
-└── tests/                      # reserved for future test workloads (currently empty)
-```
+Workloads are discovered automatically by path — there is no explicit registry. `load_all_workloads()` scans every subdirectory of `workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
 ## Source Layout
 
