@@ -104,6 +104,7 @@ fn evaluate_struct_expression(
     fields: &[ExpressionRef],
     batch: &RecordBatch,
     output_schema: &StructType,
+    nullability_predicate: Option<&ExpressionRef>,
 ) -> DeltaResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
         return Err(Error::generic(format!(
@@ -125,11 +126,33 @@ fn evaluate_struct_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_col.is_nullable(),
+                output_field.nullable, // Use schema's nullability; Arrow will validate any mismatch
             )
         })
         .collect();
-    let data = StructArray::try_new(output_fields.into(), output_cols, None)?;
+    let null_buffer = if let Some(predicate_expr) = nullability_predicate {
+        let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))?;
+        let bool_array = predicate_array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| Error::generic("Nullability predicate must evaluate to boolean"))?;
+        if bool_array.null_count() == 0 {
+            // Fast path: no nulls in predicate, use values directly
+            Some(crate::arrow::buffer::NullBuffer::new(
+                bool_array.values().clone(),
+            ))
+        } else {
+            // Slow path: predicate has nulls — null treated as false (Kleene AND)
+            let validity_array = is_not_null(&predicate_array)?;
+            let combined = and_kleene(&validity_array, bool_array)?;
+            Some(crate::arrow::buffer::NullBuffer::new(
+                combined.values().clone(),
+            ))
+        }
+    } else {
+        None
+    };
+    let data = StructArray::try_new(output_fields.into(), output_cols, null_buffer)?;
     Ok(Arc::new(data))
 }
 
@@ -247,10 +270,10 @@ pub fn evaluate_expression(
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
         }
         (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
-        (Struct(fields), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_expression(fields, batch, output_schema)
+        (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
+            evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
-        (Struct(_), dt) => Err(Error::Generic(format!(
+        (Struct(..), dt) => Err(Error::Generic(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
         ))),
         (Transform(transform), Some(DataType::Struct(output_schema))) => {
@@ -642,7 +665,9 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
+    use crate::arrow::array::{
+        ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray,
+    };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
@@ -650,6 +675,7 @@ mod tests {
     use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -1062,7 +1088,7 @@ mod tests {
         let test_cases = vec![
             (
                 "too many schema fields",
-                Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")]),
+                Expr::struct_from([column_expr_ref!("a"), column_expr_ref!("b")]),
                 StructType::new_unchecked(vec![
                     StructField::not_null("a", DataType::INTEGER),
                     StructField::not_null("b", DataType::INTEGER),
@@ -1071,7 +1097,7 @@ mod tests {
             ),
             (
                 "too few schema fields",
-                Expr::Struct(vec![
+                Expr::struct_from([
                     column_expr_ref!("a"),
                     column_expr_ref!("b"),
                     column_expr_ref!("c"),
@@ -1660,6 +1686,150 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, None);
 
         // Type mismatch should produce an error
+        assert!(result.is_err());
+    }
+
+    /// Helper to build a batch with Int32 column `a` and a Boolean column `is_valid`.
+    fn create_batch_with_bool_col(
+        a_vals: Vec<Option<i32>>,
+        is_valid_vals: Vec<Option<bool>>,
+    ) -> RecordBatch {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("is_valid", ArrowDataType::Boolean, true),
+        ]);
+        let a_array: ArrayRef = Arc::new(Int32Array::from(a_vals));
+        let bool_array: ArrayRef = Arc::new(BooleanArray::from(is_valid_vals));
+        RecordBatch::try_new(Arc::new(schema), vec![a_array, bool_array]).unwrap()
+    }
+
+    #[rstest]
+    // Fast path: no nulls in predicate array — values bitmap used directly.
+    #[case::fast_path(
+        vec![Some(1), Some(2), Some(3)],
+        vec![Some(true), Some(false), Some(true)],
+        vec![true, false, true],
+    )]
+    // Slow path: predicate has nulls — Kleene AND; both false and null → null struct.
+    #[case::slow_path(
+        vec![Some(1), Some(2), Some(3), Some(4)],
+        vec![Some(true), Some(false), None, Some(true)],
+        vec![true, false, false, true],
+    )]
+    fn test_struct_with_nullability_predicate(
+        #[case] a_vals: Vec<Option<i32>>,
+        #[case] pred_vals: Vec<Option<bool>>,
+        #[case] expected_valid: Vec<bool>,
+    ) {
+        let batch = create_batch_with_bool_col(a_vals, pred_vals);
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+            "a",
+            DataType::INTEGER,
+            true,
+        )])));
+        let expr = Expr::struct_with_nullability_from(
+            [column_expr_ref!("a")],
+            column_expr_ref!("is_valid"),
+        );
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        for (i, valid) in expected_valid.iter().enumerate() {
+            assert_eq!(struct_result.is_valid(i), *valid, "row {i}");
+        }
+    }
+
+    #[test]
+    fn test_struct_with_nullability_predicate_nested_schema() {
+        // Nested struct as schema: outer struct has one field that is itself a struct.
+        let batch = create_batch_with_bool_col(
+            vec![Some(1), Some(2), Some(3)],
+            vec![Some(true), Some(false), Some(true)],
+        );
+        let inner_schema =
+            StructType::new_unchecked(vec![StructField::new("a", DataType::INTEGER, true)]);
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+            "nested",
+            DataType::Struct(Box::new(inner_schema)),
+            true,
+        )])));
+        let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
+        let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(struct_result.is_valid(0));
+        assert!(struct_result.is_null(1));
+        assert!(struct_result.is_valid(2));
+        // The "nested" column should itself be a StructArray with 3 rows
+        let nested = struct_result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(nested.len(), 3);
+    }
+
+    #[test]
+    fn test_struct_with_nullability_predicate_multiple_fields() {
+        // Multiple expressions: [column_expr_ref!("a"), column_expr_ref!("b")] with predicate.
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+            ArrowField::new("is_valid", ArrowDataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![
+            StructField::new("a", DataType::INTEGER, true),
+            StructField::new("b", DataType::INTEGER, true),
+        ])));
+        let expr = Expr::struct_with_nullability_from(
+            [column_expr_ref!("a"), column_expr_ref!("b")],
+            column_expr_ref!("is_valid"),
+        );
+        let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(struct_result.is_valid(0), "row 0 should be valid");
+        assert!(struct_result.is_null(1), "row 1 should be null");
+        assert!(struct_result.is_valid(2), "row 2 should be valid");
+        validate_i32_column(struct_result, 0, &[1, 2, 3]);
+        validate_i32_column(struct_result, 1, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_struct_nullability_non_boolean_predicate_errors() {
+        // Non-boolean expression (Int32 column) as nullability predicate should error.
+        let batch = create_batch_with_bool_col(
+            vec![Some(1), Some(2), Some(3)],
+            vec![Some(true), Some(false), Some(true)],
+        );
+        let schema = DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+            "a",
+            DataType::INTEGER,
+            true,
+        )])));
+        let expr =
+            Expr::struct_with_nullability_from([column_expr_ref!("a")], column_expr_ref!("a"));
+        let result = evaluate_expression(&expr, &batch, Some(&schema));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
+    fn test_struct_no_result_type_errors() {
+        // struct_from with result_type = None should return an error
+        let batch = create_test_batch();
+        let expr = Expr::struct_from([column_expr_ref!("a")]);
+        let result = evaluate_expression(&expr, &batch, None);
         assert!(result.is_err());
     }
 }

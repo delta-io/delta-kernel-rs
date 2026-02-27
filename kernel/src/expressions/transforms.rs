@@ -174,9 +174,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Predicate(p) => self
                 .transform_expr_pred(p)?
                 .map_owned_or_else(expr, Expression::from),
-            Expression::Struct(s) => self
+            Expression::Struct(s, nullability) => self
                 .transform_expr_struct(s)?
-                .map_owned_or_else(expr, Expression::Struct),
+                .map_owned_or_else(expr, |exprs| Expression::Struct(exprs, nullability.clone())),
             Expression::Transform(t) => self
                 .transform_expr_transform(t)?
                 .map_owned_or_else(expr, Expression::Transform),
