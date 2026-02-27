@@ -822,14 +822,15 @@ impl<S> Transaction<S> {
     ///
     /// Engines should collect statistics matching this schema structure when writing files.
     ///
-    /// Per the Delta protocol, clustering columns are always included in statistics,
-    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
+    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
+    /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
+    /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         let stats_schemas = self
             .read_snapshot
             .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns.as_deref())?;
+            .build_expected_stats_schemas(self.clustering_columns.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
