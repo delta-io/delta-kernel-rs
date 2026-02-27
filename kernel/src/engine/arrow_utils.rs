@@ -166,16 +166,13 @@ impl RowIndexBuilder {
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
 /// If `target_schema` is provided, coerces the batch's field nullability to match it.
-pub(crate) fn fixup_parquet_read<T>(
+pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
     target_schema: Option<&ArrowSchemaRef>,
-) -> DeltaResult<T>
-where
-    StructArray: Into<T>,
-{
+) -> DeltaResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
@@ -1383,14 +1380,11 @@ pub(crate) fn to_json_bytes(
 ///
 /// `reorder_indices` should be built once per schema via [`build_json_reorder_indices`] and
 /// reused for every batch from the same file.
-pub(crate) fn fixup_json_read<T>(
+pub(crate) fn fixup_json_read(
     batch: RecordBatch,
     reorder_indices: &[ReorderIndex],
     file_location: &str,
-) -> DeltaResult<T>
-where
-    StructArray: Into<T>,
-{
+) -> DeltaResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
     Ok(data.into())
 }

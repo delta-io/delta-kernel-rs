@@ -15,7 +15,6 @@ use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use url::Url;
 
 use super::executor::TaskExecutor;
-use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
     to_json_bytes,
@@ -119,7 +118,7 @@ async fn read_json_files_impl(
     let result_stream = stream::iter(file_futures)
         .buffered(buffer_size)
         .try_flatten()
-        .map_ok(|e: ArrowEngineData| -> Box<dyn EngineData> { Box::new(e) });
+        .map_ok(|e| -> Box<dyn EngineData> { Box::new(e) });
 
     Ok(Box::pin(result_stream))
 }
