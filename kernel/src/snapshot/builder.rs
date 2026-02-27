@@ -166,10 +166,9 @@ mod tests {
 
     use itertools::Itertools;
     use object_store::memory::InMemory;
-    use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::json;
-    use test_utils::delta_path_for_version;
+    use test_utils::delta_path_for_version_with_table_root;
 
     use super::*;
 
@@ -182,19 +181,6 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
         (engine, store, table_root)
-    }
-
-    fn delta_path_for_table_version(table_root: &Url, version: u64, suffix: &str) -> Path {
-        let table_prefix = table_root
-            .path()
-            .trim_start_matches('/')
-            .trim_end_matches('/');
-        let file_path = delta_path_for_version(version, suffix);
-        if table_prefix.is_empty() {
-            file_path
-        } else {
-            Path::from(format!("{table_prefix}/{}", file_path.as_ref()).as_str())
-        }
     }
 
     async fn create_table(store: &Arc<dyn ObjectStore>, table_root: &Url) -> DeltaResult<()> {
@@ -234,7 +220,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = delta_path_for_table_version(table_root, 0, "json");
+        let path = delta_path_for_version_with_table_root(table_root, 0, "json");
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -257,7 +243,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = delta_path_for_table_version(table_root, 1, "json");
+        let path = delta_path_for_version_with_table_root(table_root, 1, "json");
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())

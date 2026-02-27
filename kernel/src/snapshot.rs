@@ -795,7 +795,7 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::json;
-    use test_utils::{add_commit, delta_path_for_version};
+    use test_utils::{add_commit, delta_path_for_version, delta_path_for_version_with_table_root};
 
     use crate::actions::Protocol;
     use crate::arrow::array::StringArray;
@@ -937,20 +937,6 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    // TODO: unify this and lots of stuff in LogSegment tests and test_utils
-    fn delta_path_for_table_version(table_root: &Url, version: u64, suffix: &str) -> Path {
-        let table_prefix = table_root
-            .path()
-            .trim_start_matches('/')
-            .trim_end_matches('/');
-        let file_path = delta_path_for_version(version, suffix);
-        if table_prefix.is_empty() {
-            file_path
-        } else {
-            Path::from(format!("{table_prefix}/{}", file_path.as_ref()).as_str())
-        }
-    }
-
     async fn commit(
         store: &InMemory,
         table_root: Option<&Url>,
@@ -963,7 +949,7 @@ mod tests {
             .collect::<Vec<String>>()
             .join("\n");
         if let Some(table_root) = table_root {
-            let path = delta_path_for_table_version(table_root, version, "json");
+            let path = delta_path_for_version_with_table_root(table_root, version, "json");
             store.put(&path, commit_data.into()).await.unwrap();
         } else {
             add_commit(store, version, commit_data).await.unwrap();
@@ -1852,7 +1838,7 @@ mod tests {
         writer.write(&checkpoint)?;
         writer.close()?;
 
-        let checkpoint_path = delta_path_for_table_version(&url, 1, "checkpoint.parquet");
+        let checkpoint_path = delta_path_for_version_with_table_root(&url, 1, "checkpoint.parquet");
         store.put(&checkpoint_path, buffer.into()).await?;
 
         // Create 00000000000000000001.json with ICT
@@ -2072,7 +2058,7 @@ mod tests {
             }),
             json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
         ];
-        commit(store, 0, commit0).await;
+        commit(store, None, 0, commit0).await;
 
         // Additional commits with just add actions
         for i in 1..num_commits {
@@ -2085,7 +2071,7 @@ mod tests {
                     "dataChange": true
                 }
             })];
-            commit(store, i, commit_i).await;
+            commit(store, None, i, commit_i).await;
         }
         Ok(())
     }
@@ -2125,6 +2111,7 @@ mod tests {
         // Add commit 3
         commit(
             &store,
+            None,
             3,
             vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
         )
