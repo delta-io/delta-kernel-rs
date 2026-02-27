@@ -200,9 +200,14 @@ fn compute_schema_diff(
 ) -> Result<SchemaDiff, SchemaDiffError> {
     // Collect all fields with their paths from both schemas
     let empty_path: Vec<String> = vec![];
-    let before_fields =
-        collect_all_fields_with_paths(before, &ColumnName::new(empty_path.clone()))?;
-    let after_fields = collect_all_fields_with_paths(after, &ColumnName::new(empty_path))?;
+    let mut before_fields = Vec::new();
+    collect_all_fields_with_paths(
+        before,
+        &ColumnName::new(empty_path.clone()),
+        &mut before_fields,
+    )?;
+    let mut after_fields = Vec::new();
+    collect_all_fields_with_paths(after, &ColumnName::new(empty_path), &mut after_fields)?;
 
     // Build maps by field ID
     let before_by_id = build_field_map_by_id(&before_fields)?;
@@ -344,31 +349,18 @@ fn compute_has_breaking_changes(
 /// For example, if both "user" and "user.name" are in the input, this returns only "user"
 /// since reporting "user.name" would be redundant.
 ///
-/// The algorithm is O(n) where n is the number of fields:
+/// The algorithm is O(n * d) where n is the number of fields and d is max path depth:
 /// 1. Put all paths in a HashSet for O(1) lookup
-/// 2. For each field, check if its immediate parent is in the set
-/// 3. Keep only fields whose parent is NOT in the set
+/// 2. For each field, walk up its parent chain
+/// 3. Keep only fields with no ancestor present in the set
 fn filter_ancestor_fields(fields: Vec<FieldChange>) -> Vec<FieldChange> {
     // Build a set of all paths for O(1) lookup (owned to avoid lifetime issues)
     let all_paths: HashSet<ColumnName> = fields.iter().map(|f| f.path.clone()).collect();
 
-    // Filter to keep only fields whose parent is NOT in the set
+    // Filter to keep only fields whose ancestors are NOT in the set
     fields
         .into_iter()
-        .filter(|field_change| {
-            let path_parts = field_change.path.path();
-
-            // Top-level fields (length 1) have no parent, so keep them
-            if path_parts.len() == 1 {
-                return true;
-            }
-
-            // Construct parent path by removing the last component
-            let parent_path = ColumnName::new(&path_parts[..path_parts.len() - 1]);
-
-            // Keep this field only if its parent was NOT in the input set
-            !all_paths.contains(&parent_path)
-        })
+        .filter(|field_change| !has_added_ancestor(&field_change.path, &all_paths))
         .collect()
 }
 
@@ -443,20 +435,19 @@ fn validate_physical_name(
     }
 }
 
-/// Recursively collects all struct fields from a data type with their paths
+/// Recursively collects all reachable struct fields from a data type with their paths
 ///
 /// This helper function handles deep nesting like `array<array<struct<...>>>` or
 /// `map<array<struct<...>>, array<struct<...>>>` by recursing through container layers.
 fn collect_fields_from_datatype(
     data_type: &DataType,
     parent_path: &ColumnName,
-) -> Result<Vec<FieldWithPath>, SchemaDiffError> {
-    let mut fields = Vec::new();
-
+    out: &mut Vec<FieldWithPath>,
+) -> Result<(), SchemaDiffError> {
     match data_type {
         DataType::Struct(struct_type) => {
             // Collect fields from this struct
-            fields.extend(collect_all_fields_with_paths(struct_type, parent_path)?);
+            collect_all_fields_with_paths(struct_type, parent_path, out)?;
         }
         DataType::Array(array_type) => {
             // TODO: Add IcebergCompatV2 support - check that array nested field IDs remain stable
@@ -466,10 +457,7 @@ fn collect_fields_from_datatype(
 
             // For arrays, we use "element" as the path segment and recurse into element type
             let element_path = parent_path.join(&ColumnName::new(["element"]));
-            fields.extend(collect_fields_from_datatype(
-                array_type.element_type(),
-                &element_path,
-            )?);
+            collect_fields_from_datatype(array_type.element_type(), &element_path, out)?;
         }
         DataType::Map(map_type) => {
             // TODO: Add IcebergCompatV2 support - check that map nested field IDs remain stable
@@ -479,52 +467,42 @@ fn collect_fields_from_datatype(
 
             // For maps, we use "key" and "value" as path segments and recurse into both types
             let key_path = parent_path.join(&ColumnName::new(["key"]));
-            fields.extend(collect_fields_from_datatype(
-                map_type.key_type(),
-                &key_path,
-            )?);
+            collect_fields_from_datatype(map_type.key_type(), &key_path, out)?;
 
             let value_path = parent_path.join(&ColumnName::new(["value"]));
-            fields.extend(collect_fields_from_datatype(
-                map_type.value_type(),
-                &value_path,
-            )?);
+            collect_fields_from_datatype(map_type.value_type(), &value_path, out)?;
         }
         _ => {
             // Primitive types don't have nested fields
         }
     }
 
-    Ok(fields)
+    Ok(())
 }
 
 /// Recursively collects all struct fields with their paths from a schema
 fn collect_all_fields_with_paths(
     schema: &StructType,
     parent_path: &ColumnName,
-) -> Result<Vec<FieldWithPath>, SchemaDiffError> {
-    let mut fields = Vec::new();
-
+    out: &mut Vec<FieldWithPath>,
+) -> Result<(), SchemaDiffError> {
     for field in schema.fields() {
         let field_path = parent_path.join(&ColumnName::new([field.name()]));
 
         // Only struct fields can have field IDs in column mapping
         let field_id = get_field_id_for_path(field, &field_path)?;
 
-        fields.push(FieldWithPath {
+        out.push(FieldWithPath {
             field: field.clone(),
             path: field_path.clone(),
             field_id,
         });
 
         // Recursively collect nested struct fields from the field's data type
-        fields.extend(collect_fields_from_datatype(
-            field.data_type(),
-            &field_path,
-        )?);
+        collect_fields_from_datatype(field.data_type(), &field_path, out)?;
     }
 
-    Ok(fields)
+    Ok(())
 }
 
 /// Builds a map from field ID to FieldWithPath
@@ -1120,6 +1098,37 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
         assert!(!diff.has_breaking_changes()); // Removing fields is safe
+    }
+
+    #[test]
+    fn test_array_of_struct_addition_reports_only_ancestor_field() {
+        // Before: no fields. After: items: array<struct<name: string>>
+        // Expected: added_fields == [items], not [items, items.element.name]
+        let before = StructType::new_unchecked([]);
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            true,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["items"]));
+
+        let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
+        assert_eq!(nested_added.len(), 0);
+        assert_eq!(nested_removed.len(), 0);
+        assert_eq!(nested_updated.len(), 0);
     }
 
     #[test]
