@@ -1,19 +1,20 @@
-//! Validates that add file statistics contain required clustering columns.
+//! Validates that add file statistics contain required columns.
 //!
-//! Per the Delta protocol, writers MUST write per-file statistics for clustering columns
-//! when the `ClusteredTable` feature is enabled. This module validates that `nullCount`,
-//! `minValues`, and `maxValues` entries exist for each required column.
+//! Per the Delta protocol, writers MUST write per-file statistics (nullCount, minValues,
+//! maxValues) for certain required columns. For example, clustering columns require stats when
+//! the `ClusteredTable` feature is enabled. This module validates that those stat entries
+//! exist for each required column.
 
 use std::sync::LazyLock;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
-use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
 use crate::DeltaResult;
 
-/// Verifies that add file statistics contain the required clustering columns.
+/// Verifies that add file statistics contain required columns.
 ///
 /// For each required column, validates that `nullCount`, `minValues`, and `maxValues`
 /// entries are present (non-null) in every add file's statistics.
@@ -22,14 +23,14 @@ pub(crate) struct StatsVerifier {
 }
 
 impl StatsVerifier {
-    /// Create a new verifier that requires statistics for the given columns and their types.
+    /// Create a new verifier that checks statistics for the given required columns and types.
     pub(crate) fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
         Self { required_columns }
     }
 
     /// Verify that all files in the provided batches have required statistics.
     ///
-    /// For each clustering column, extracts all three stat columns (nullCount, minValues,
+    /// For each required column, extracts all three stat columns (nullCount, minValues,
     /// maxValues) in a single `visit_rows` call per batch.
     pub(crate) fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
         if self.required_columns.is_empty() {
@@ -43,7 +44,7 @@ impl StatsVerifier {
         Ok(())
     }
 
-    /// Verify a single clustering column has nullCount, minValues, and maxValues stats in
+    /// Verify a single required column has nullCount, minValues, and maxValues stats in
     /// every file. Extracts all three stat columns in a single `visit_rows` call per batch.
     fn verify_column(
         &self,
@@ -76,19 +77,19 @@ impl StatsVerifier {
 
         if !missing_null_count.is_empty() {
             return Err(Error::stats_validation(format!(
-                "Clustering column '{column}' is missing 'nullCount' statistics for files: [{}]",
+                "Required column '{column}' is missing 'nullCount' statistics for files: [{}]",
                 missing_null_count.join(", ")
             )));
         }
         if !missing_min.is_empty() {
             return Err(Error::stats_validation(format!(
-                "Clustering column '{column}' is missing 'minValues' statistics for files: [{}]",
+                "Required column '{column}' is missing 'minValues' statistics for files: [{}]",
                 missing_min.join(", ")
             )));
         }
         if !missing_max.is_empty() {
             return Err(Error::stats_validation(format!(
-                "Clustering column '{column}' is missing 'maxValues' statistics for files: [{}]",
+                "Required column '{column}' is missing 'maxValues' statistics for files: [{}]",
                 missing_max.join(", ")
             )));
         }
@@ -101,42 +102,6 @@ fn build_stat_path(column: &ColumnName, category: &str) -> ColumnName {
     let mut path = vec!["stats".to_string(), category.to_string()];
     path.extend(column.iter().map(|s| s.to_string()));
     ColumnName::new(path)
-}
-
-/// Resolve a column's data type from the table schema by walking nested struct fields.
-pub(crate) fn resolve_column_type(
-    schema: &StructType,
-    column: &ColumnName,
-) -> DeltaResult<DataType> {
-    let path = column.path();
-    require!(
-        !path.is_empty(),
-        Error::internal_error(format!("Empty clustering column name: {column}"))
-    );
-
-    let mut current_struct = schema;
-    for (i, part) in path.iter().enumerate() {
-        let field = current_struct.field(part).ok_or_else(|| {
-            Error::internal_error(format!(
-                "Clustering column '{column}' not found in table schema"
-            ))
-        })?;
-        if i == path.len() - 1 {
-            return Ok(field.data_type().clone());
-        }
-        match field.data_type() {
-            DataType::Struct(s) => current_struct = s,
-            _ => {
-                return Err(Error::internal_error(format!(
-                    "Expected struct type at '{part}' in column '{column}'"
-                )));
-            }
-        }
-    }
-
-    Err(Error::internal_error(format!(
-        "Failed to resolve type for clustering column '{column}'"
-    )))
 }
 
 // Predefined static type arrays for per-column validation. Each array contains types for
@@ -286,7 +251,6 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::StructField;
     use crate::EngineData;
 
     /// Creates test add file data with stats.nullCount.col, stats.minValues.col,
@@ -528,44 +492,5 @@ mod tests {
         assert!(err_msg.contains("col_b"));
         assert!(err_msg.contains("minValues"));
         assert!(!err_msg.contains("col_a"));
-    }
-
-    #[test]
-    fn test_resolve_column_type_simple() {
-        let schema = StructType::try_new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        assert_eq!(
-            resolve_column_type(&schema, &ColumnName::new(["id"])).unwrap(),
-            DataType::LONG
-        );
-        assert_eq!(
-            resolve_column_type(&schema, &ColumnName::new(["name"])).unwrap(),
-            DataType::STRING
-        );
-    }
-
-    #[test]
-    fn test_resolve_column_type_nested() {
-        let inner =
-            StructType::try_new([StructField::new("value", DataType::INTEGER, true)]).unwrap();
-        let schema = StructType::try_new([StructField::new(
-            "outer",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )])
-        .unwrap();
-        assert_eq!(
-            resolve_column_type(&schema, &ColumnName::new(["outer", "value"])).unwrap(),
-            DataType::INTEGER
-        );
-    }
-
-    #[test]
-    fn test_resolve_column_type_not_found() {
-        let schema = StructType::try_new([StructField::new("id", DataType::LONG, false)]).unwrap();
-        assert!(resolve_column_type(&schema, &ColumnName::new(["missing"])).is_err());
     }
 }

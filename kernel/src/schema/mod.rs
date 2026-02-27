@@ -749,6 +749,29 @@ impl StructType {
         self.fields.get(name.as_ref())
     }
 
+    /// Looks up a nested column by path, returning its data type if found.
+    ///
+    /// Navigates through nested struct fields following the path components.
+    /// For example, given path `["user", "address", "city"]`:
+    /// 1. Find field "user" in this struct
+    /// 2. Find field "address" in user's struct type
+    /// 3. Find field "city" in address's struct type
+    /// 4. Return city's data type
+    pub fn column_type(&self, column: &ColumnName) -> Option<&DataType> {
+        let mut parts = column.iter();
+        let first = parts.next()?;
+        let mut current_field = self.field(first)?;
+        for part in parts {
+            match current_field.data_type() {
+                DataType::Struct(struct_type) => {
+                    current_field = struct_type.field(part)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(current_field.data_type())
+    }
+
     /// Gets the field with the given name and its index.
     pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
         self.fields
@@ -3330,5 +3353,44 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_column_type_simple() {
+        let schema = StructType::try_new([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        assert_eq!(
+            schema.column_type(&ColumnName::new(["id"])),
+            Some(&DataType::LONG)
+        );
+        assert_eq!(
+            schema.column_type(&ColumnName::new(["name"])),
+            Some(&DataType::STRING)
+        );
+    }
+
+    #[test]
+    fn test_column_type_nested() {
+        let inner =
+            StructType::try_new([StructField::new("value", DataType::INTEGER, true)]).unwrap();
+        let schema = StructType::try_new([StructField::new(
+            "outer",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )])
+        .unwrap();
+        assert_eq!(
+            schema.column_type(&ColumnName::new(["outer", "value"])),
+            Some(&DataType::INTEGER)
+        );
+    }
+
+    #[test]
+    fn test_column_type_not_found() {
+        let schema = StructType::try_new([StructField::new("id", DataType::LONG, false)]).unwrap();
+        assert_eq!(schema.column_type(&ColumnName::new(["missing"])), None);
     }
 }

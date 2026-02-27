@@ -1226,18 +1226,11 @@ impl<S> Transaction<S> {
 
     /// Validate that add files have required statistics for clustering columns.
     ///
-    /// This method checks that if clustering columns are configured for the table,
-    /// all provided add file batches contain statistics for those columns.
+    /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
+    /// when the `ClusteredTable` feature is enabled. Other stat columns (e.g. the conventional
+    /// "first 32 columns") are not validated here because they are not protocol-required.
     ///
-    /// # Arguments
-    ///
-    /// * `add_files` - Slice of engine data batches containing add file metadata
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Clustering columns are configured but stats are missing for any file
-    /// - A file has no stats at all when clustering requires stats
+    /// Only add files are validated — remove files do not carry statistics.
     fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         if add_files.is_empty() {
             return Ok(());
@@ -1248,7 +1241,11 @@ impl<S> Transaction<S> {
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
                     .iter()
                     .map(|col| {
-                        let data_type = stats_verifier::resolve_column_type(&schema, col)?;
+                        let data_type = schema.column_type(col).cloned().ok_or_else(|| {
+                            Error::internal_error(format!(
+                                "Required column '{col}' not found in table schema"
+                            ))
+                        })?;
                         Ok((col.clone(), data_type))
                     })
                     .collect::<DeltaResult<_>>()?;
@@ -1979,18 +1976,6 @@ pub struct RetryableTransaction<S = ExistingTable> {
     pub error: Error,
 }
 
-// Test-only methods for Transaction
-#[cfg(test)]
-impl Transaction {
-    /// Set clustering columns for testing purposes.
-    /// This allows testing the stats validation logic without needing a table
-    /// with the ClusteredTable feature enabled.
-    pub(crate) fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-        self.clustering_columns = Some(columns);
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2013,6 +1998,15 @@ mod tests {
     use crate::Snapshot;
     use rstest::rstest;
     use std::path::PathBuf;
+
+    impl Transaction {
+        /// Set clustering columns for testing purposes without needing a table
+        /// with the ClusteredTable feature enabled.
+        fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
+            self.clustering_columns = Some(columns);
+            self
+        }
+    }
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
     struct IoErrorCommitter;
@@ -2752,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_validation_fails_when_clustering_requires_stats() {
+    fn test_stats_validation_when_clustering_cols_missing_stats() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
@@ -2781,7 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_validation_passes_when_stats_present() {
+    fn test_stats_validation_when_clustering_stats_present() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
