@@ -53,6 +53,8 @@ pub(crate) struct CdfScanFile {
     pub commit_version: i64,
     /// The timestamp of the commit that this action was performed in
     pub commit_timestamp: i64,
+    /// The size of the file in bytes
+    pub size: Option<i64>,
 }
 
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
@@ -126,7 +128,7 @@ struct CdfScanFileVisitor<'a, T> {
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 18,
+            getters.len() == 21,
             Error::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
@@ -137,26 +139,29 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 continue;
             }
 
-            let (scan_type, path, deletion_vector, partition_values) =
+            let (scan_type, path, deletion_vector, partition_values, size) =
                 if let Some(path) = getters[0].get_opt(row_index, "scanFile.add.path")? {
                     let scan_type = CdfScanFileType::Add;
                     let deletion_vector = visit_deletion_vector_at(row_index, &getters[1..=5])?;
                     let partition_values = getters[6]
                         .get_opt(row_index, "scanFile.add.fileConstantValues.partitionValues")?;
-                    (scan_type, path, deletion_vector, partition_values)
-                } else if let Some(path) = getters[7].get_opt(row_index, "scanFile.remove.path")? {
+                    let size = getters[7].get_opt(row_index, "scanFile.add.size")?;
+                    (scan_type, path, deletion_vector, partition_values, size)
+                } else if let Some(path) = getters[8].get_opt(row_index, "scanFile.remove.path")? {
                     let scan_type = CdfScanFileType::Remove;
-                    let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..=12])?;
-                    let partition_values = getters[13].get_opt(
+                    let deletion_vector = visit_deletion_vector_at(row_index, &getters[9..=13])?;
+                    let partition_values = getters[14].get_opt(
                         row_index,
                         "scanFile.remove.fileConstantValues.partitionValues",
                     )?;
-                    (scan_type, path, deletion_vector, partition_values)
-                } else if let Some(path) = getters[14].get_opt(row_index, "scanFile.cdc.path")? {
+                    let size = getters[15].get_opt(row_index, "scanFile.remove.size")?;
+                    (scan_type, path, deletion_vector, partition_values, size)
+                } else if let Some(path) = getters[16].get_opt(row_index, "scanFile.cdc.path")? {
                     let scan_type = CdfScanFileType::Cdc;
-                    let partition_values = getters[15]
+                    let partition_values = getters[17]
                         .get_opt(row_index, "scanFile.cdc.fileConstantValues.partitionValues")?;
-                    (scan_type, path, None, partition_values)
+                    let size = getters[18].get_opt(row_index, "scanFile.cdc.size")?;
+                    (scan_type, path, None, partition_values, size)
                 } else {
                     continue;
                 };
@@ -167,8 +172,9 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 path,
                 dv_info: DvInfo { deletion_vector },
                 partition_values,
-                commit_timestamp: getters[16].get(row_index, "scanFile.timestamp")?,
-                commit_version: getters[17].get(row_index, "scanFile.commit_version")?,
+                commit_timestamp: getters[19].get(row_index, "scanFile.timestamp")?,
+                commit_version: getters[20].get(row_index, "scanFile.commit_version")?,
+                size,
             };
             (self.callback)(&mut self.context, scan_file)
         }
@@ -200,15 +206,18 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector.clone()),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
+            StructField::nullable("size", DataType::LONG),
         ]);
         let remove = StructType::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
+            StructField::nullable("size", DataType::LONG),
         ]);
         let cdc = StructType::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("fileConstantValues", file_constant_values),
+            StructField::nullable("size", DataType::LONG),
         ]);
 
         Arc::new(StructType::new_unchecked([
@@ -230,15 +239,18 @@ pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64)
             column_expr!("add.path"),
             column_expr!("add.deletionVector"),
             Expression::struct_from([column_expr!("add.partitionValues")]),
+            column_expr!("add.size"),
         ]),
         Expression::struct_from([
             column_expr!("remove.path"),
             column_expr!("remove.deletionVector"),
             Expression::struct_from([column_expr!("remove.partitionValues")]),
+            column_expr!("remove.size"),
         ]),
         Expression::struct_from([
             column_expr!("cdc.path"),
             Expression::struct_from([column_expr!("cdc.partitionValues")]),
+            column_expr!("cdc.size"),
         ]),
         Expression::literal(commit_timestamp),
         Expression::literal(commit_number),
@@ -281,6 +293,7 @@ mod tests {
             deletion_vector: Some(dv_info.clone()),
             partition_values: add_partition_values,
             data_change: true,
+            size: 100i64,
             ..Default::default()
         };
         let remove_paired = Remove {
@@ -288,6 +301,7 @@ mod tests {
             deletion_vector: None,
             partition_values: None,
             data_change: true,
+            size: Some(200i64),
             ..Default::default()
         };
 
@@ -304,6 +318,7 @@ mod tests {
             deletion_vector: Some(rm_dv),
             partition_values: rm_partition_values,
             data_change: true,
+            size: None,
             ..Default::default()
         };
 
@@ -319,6 +334,7 @@ mod tests {
             deletion_vector: None,
             partition_values: None,
             data_change: true,
+            size: None,
             ..Default::default()
         };
 
@@ -339,14 +355,16 @@ mod tests {
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
                 .unwrap();
-        let table_schema = StructType::new_unchecked([
+        let table_schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
-        ]);
+        ]));
 
         // Create a TableConfiguration for testing
         use crate::actions::{Metadata, Protocol};
         use crate::table_configuration::TableConfiguration;
+        use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED};
+
         let metadata = Metadata::try_new(
             None,
             None,
@@ -354,12 +372,13 @@ mod tests {
             vec![],
             0,
             HashMap::from([
-                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
+                (COLUMN_MAPPING_MODE.to_string(), "none".to_string()),
             ]),
         )
         .unwrap();
-        let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        // CDF (enableChangeDataFeed) requires min_writer_version = 4
+        let protocol = Protocol::try_new_legacy(1, 4).unwrap();
         let table_config =
             TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
 
@@ -367,7 +386,7 @@ mod tests {
             Arc::new(engine),
             &table_config,
             log_segment.ascending_commit_files.clone(),
-            table_schema.into(),
+            table_schema,
             None,
         )
         .unwrap();
@@ -395,6 +414,7 @@ mod tests {
                 commit_version: 0,
                 commit_timestamp: timestamps[0],
                 remove_dv: Some(expected_remove_dv),
+                size: Some(add_paired.size),
             },
             CdfScanFile {
                 scan_type: CdfScanFileType::Remove,
@@ -406,6 +426,7 @@ mod tests {
                 commit_version: 0,
                 commit_timestamp: timestamps[0],
                 remove_dv: None,
+                size: remove.size,
             },
             CdfScanFile {
                 scan_type: CdfScanFileType::Cdc,
@@ -417,6 +438,7 @@ mod tests {
                 commit_version: 1,
                 commit_timestamp: timestamps[1],
                 remove_dv: None,
+                size: Some(cdc.size),
             },
             CdfScanFile {
                 scan_type: CdfScanFileType::Remove,
@@ -428,6 +450,7 @@ mod tests {
                 commit_version: 2,
                 commit_timestamp: timestamps[2],
                 remove_dv: None,
+                size: remove_no_partition.size,
             },
         ];
 

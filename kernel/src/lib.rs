@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -95,7 +96,6 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
-pub(crate) mod parallel;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -109,6 +109,8 @@ pub(crate) mod transforms;
 pub use log_path::LogPath;
 
 mod row_tracking;
+
+pub(crate) mod clustering;
 
 mod arrow_compat;
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
@@ -151,6 +153,15 @@ pub(crate) mod listed_log_files;
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
+
+// Benchmarking infrastructure (only public for benchmarks and tests)
+#[cfg(any(test, feature = "internal-api"))]
+pub mod benchmarks;
+
+#[cfg(feature = "internal-api")]
+pub mod parallel;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
@@ -588,6 +599,8 @@ pub trait JsonHandler: AsAny {
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
     ///
+    /// Additionally, engines may not merge engine data across file boundaries.
+    ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
@@ -734,9 +747,11 @@ pub trait ParquetHandler: AsAny {
     /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
-    /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"parquet.field.id": 1`
+    /// - Column 0:  `"i_logical"` (integer, non-null) with field ID 1 (via [`ColumnMetadataKey::ParquetFieldId`])
     /// - Column 1: `"s"` (string, nullable) with no field ID metadata
     /// - Column 2: `"i2"` (integer, nullable) with no field ID metadata
+    ///
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     ///
     /// And a Parquet file containing these columns:
     /// - Column 0: `"i2"` (integer, nullable) with field ID 3
@@ -775,6 +790,8 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines must not merge engine data across file boundaries.
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(
@@ -825,9 +842,8 @@ pub trait ParquetHandler: AsAny {
     /// # Field IDs
     ///
     /// If the Parquet file contains field IDs (written when column mapping is enabled), they are
-    /// preserved in each [`StructField`]'s metadata under the key `"PARQUET:field_id"`. Callers
-    /// can access field IDs via [`StructField::get_config_value`] with
-    /// [`ColumnMetadataKey::ParquetFieldId`].
+    /// preserved in each [`StructField`]'s metadata. Callers can access field IDs via
+    /// [`StructField::get_config_value`] with [`ColumnMetadataKey::ParquetFieldId`].
     ///
     /// # Errors
     ///

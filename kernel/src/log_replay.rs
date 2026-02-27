@@ -92,7 +92,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     }
 }
 
-impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
+impl Deduplicator for FileActionDeduplicator<'_> {
     /// Checks if log replay already processed this logical file (in which case the current action
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
@@ -205,7 +205,6 @@ impl ActionsBatch {
 }
 
 #[internal_api]
-#[allow(unused)]
 pub(crate) trait ParallelLogReplayProcessor {
     type Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
@@ -275,6 +274,8 @@ where
 ///   filtered by the **selection vector** to determine which rows are included in the final checkpoint.
 ///
 /// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
+#[internal_api]
 pub(crate) trait LogReplayProcessor: Sized {
     /// The type of results produced by this processor must implement the
     /// [`HasSelectionVector`] trait to allow filtering out batches with no selected rows.
@@ -348,6 +349,7 @@ pub(crate) trait LogReplayProcessor: Sized {
 
 /// This trait is used to determine if a processor's output contains any selected rows.
 /// This is used to filter out batches with no selected rows from the log replay results.
+#[internal_api]
 pub(crate) trait HasSelectionVector {
     /// Check if the selection vector contains at least one selected row
     fn has_selected_rows(&self) -> bool;

@@ -113,10 +113,12 @@ impl TableChangesScanBuilder {
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
 
         // Create StateInfo using CDF field classifier
+        // CDF doesn't support stats_columns
         let state_info = StateInfo::try_new(
             logical_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
+            None, // stats_columns
             CdfTransformFieldClassifier,
         )?;
 
@@ -259,7 +261,7 @@ fn read_scan_file(
     let location = table_root.join(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
-        size: 0,
+        size: 0, // TODO: use the actual size of the file
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
