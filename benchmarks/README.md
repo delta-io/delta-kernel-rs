@@ -96,7 +96,7 @@ Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so t
 
 Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
 
-Workloads are discovered automatically by path — there is no explicit registry. `load_all_workloads()` scans every subdirectory of `workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
+Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
 ## Source Layout
 
