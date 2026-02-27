@@ -96,7 +96,7 @@ impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
     /// using
-    pub fn builder_for(table_root: Url) -> SnapshotBuilder {
+    pub fn builder_for(table_root: impl AsRef<str>) -> SnapshotBuilder {
         SnapshotBuilder::new_for(table_root)
     }
 
