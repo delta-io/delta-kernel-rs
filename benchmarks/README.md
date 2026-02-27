@@ -1,6 +1,6 @@
 # Delta Kernel Benchmarking
 
-This crate contains benchmarking infratsructure for Delta Kernel using Criterion and JSON workload specs. It is separate from the `kernel` crate to keep benchmark-specific code and dependencies out of the core library.
+This crate contains benchmarking infrastructure for Delta Kernel using Criterion and JSON workload specs. It is separate from the `kernel` crate to keep benchmark-specific code and dependencies out of the core library.
 
 ## Running benchmarks
 ```bash
