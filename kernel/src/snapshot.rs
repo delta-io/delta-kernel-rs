@@ -41,6 +41,19 @@ use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
 
+/// File-level statistics for a table snapshot.
+///
+/// NOTE: This is an unstable API expected to change in future releases.
+#[allow(unused)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct FileStats {
+    /// Total size of the table in bytes (sum of all active AddFile sizes).
+    pub table_size_bytes: i64,
+    /// Number of active AddFile actions in this table version.
+    pub num_files: i64,
+}
+
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
@@ -625,6 +638,22 @@ impl Snapshot {
         } else {
             Ok(None)
         }
+    }
+
+    /// Returns file-level statistics from the CRC file, or `None` if no CRC exists at this
+    /// snapshot's version.
+    ///
+    /// NOTE: This is an unstable API expected to change in future releases.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
+        let crc = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())?;
+        Some(FileStats {
+            table_size_bytes: crc.table_size_bytes,
+            num_files: crc.num_files,
+        })
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
