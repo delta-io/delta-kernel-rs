@@ -264,13 +264,12 @@ impl ListedLogFiles {
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
     /// If successful, this returns a `ListedLogFiles`.
     ///
-    /// The `log_tail` may originate from a catalog (e.g. from `SnapshotBuilder::with_log_tail`) or
-    /// from the connector itself, if it cached log state internally (e.g. from `Snapshot::try_new_from`).
-    /// It may contain either published or staged commits. The `log_tail` must strictly adhere to
-    /// being a 'tail' — a contiguous cover of versions `X..=Y` where `Y` is the latest version of
-    /// the table. If it overlaps with commits listed from the filesystem, the `log_tail` will take
-    /// precedence for commits; non-commit files (CRC, checkpoints, compactions) are always taken
-    /// from the filesystem.
+    /// The `log_tail` is an optional sequence of commits provided by the caller, e.g. via
+    /// [`SnapshotBuilder::with_log_tail`]. It may contain either published or staged commits. The
+    /// `log_tail` must strictly adhere to being a 'tail' — a contiguous cover of versions `X..=Y`
+    /// where `Y` is the latest version of the table. If it overlaps with commits listed from the
+    /// filesystem, the `log_tail` will take precedence for commits; non-commit files (CRC,
+    /// checkpoints, compactions) are always taken from the filesystem.
     // TODO: encode some of these guarantees in the output types. e.g. we could have:
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
     // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same version)
@@ -342,8 +341,10 @@ impl ListedLogFiles {
                 }
             }
 
-            /// Flush the current version group and start a new one if the version changed.
-            /// Returns the updated group_version.
+            /// Called before processing each new file. If `file_version` differs from the current
+            /// `group_version`, finalizes the current group by calling `flush_checkpoint_group`,
+            /// then advances `group_version` to the new version. On the first call (when
+            /// `group_version` is `None`), simply initializes it.
             fn maybe_flush_and_advance(
                 &mut self,
                 file_version: Version,
@@ -431,7 +432,12 @@ impl ListedLogFiles {
             builder.process_file(file);
         }
 
-        // Phase 2: Process log_tail entries (catalog-provided commits).
+        // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
+        // start at log_tail_start_version and are in ascending version order — they always extend
+        // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
+        // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
+        // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
+        // versions, so there's no duplication here.
         let filtered_log_tail = log_tail
             .into_iter()
             .filter(|entry| entry.version >= start && entry.version <= end);
