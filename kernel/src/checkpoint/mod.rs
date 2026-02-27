@@ -269,14 +269,14 @@ impl CheckpointWriter {
         let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        let clustering_columns = self.snapshot.get_clustering_columns(engine)?;
+        let clustering_columns_logical = self.snapshot.get_clustering_columns_logical(engine)?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
         let stats_schema = self
             .snapshot
             .table_configuration()
-            .build_expected_stats_schemas(clustering_columns.as_deref())?
+            .build_expected_stats_schemas(clustering_columns_logical.as_deref())?
             .physical;
 
         // Select schema based on V2 checkpoint support

@@ -224,7 +224,7 @@ pub struct Transaction<S = ExistingTable> {
     dv_matched_files: Vec<FilteredEngineData>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection.
-    clustering_columns: Option<Vec<ColumnName>>,
+    clustering_columns_logical: Option<Vec<ColumnName>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -829,7 +829,7 @@ impl<S> Transaction<S> {
         let stats_schemas = self
             .read_snapshot
             .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns.as_deref())?;
+            .build_expected_stats_schemas(self.clustering_columns_logical.as_deref())?;
         Ok(stats_schemas.physical)
     }
 
@@ -848,7 +848,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names_physical(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns_logical.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data

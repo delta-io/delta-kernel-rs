@@ -3580,3 +3580,112 @@ async fn test_checkpoint_non_kernel_written_table() {
         });
     assert!(has_checkpoint, "Expected at least one checkpoint file");
 }
+
+/// E2E test: create a clustered table with column mapping, write data, and verify that
+/// add.stats in the commit log contains min/max statistics for the clustering columns
+/// (including a nested column).
+#[cfg(feature = "clustered-table")]
+#[rstest::rstest]
+#[case::cm_none("none")]
+#[case::cm_name("name")]
+#[case::cm_id("id")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_clustered_table_write_has_stats(
+    #[case] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::transaction::data_layout::DataLayout;
+    use test_utils::create_default_engine_mt_executor;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let engine = create_default_engine_mt_executor(&table_url)?;
+    let schema = nested_schema()?;
+
+    // Cluster on top-level "row_number" and nested "address.street"
+    let clustering_cols = vec![
+        ColumnName::new(["row_number"]),
+        ColumnName::new(["address", "street"]),
+    ];
+    let _ = create_table_txn(table_url.as_str(), schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
+        .with_data_layout(DataLayout::Clustered {
+            columns: clustering_cols.clone(),
+        })
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Patch the CREATE TABLE commit to disable stats for all non-clustering columns.
+    // (dataSkippingNumIndexedCols is not in the CREATE TABLE allow list.)
+    let commit_path =
+        std::path::Path::new(&table_path).join("_delta_log/00000000000000000000.json");
+    let content = std::fs::read_to_string(&commit_path)?;
+    let patched = content.replace(
+        r#""configuration":{""#,
+        r#""configuration":{"delta.dataSkippingNumIndexedCols":"0",""#,
+    );
+    assert_ne!(content, patched, "patch should have modified the commit");
+    std::fs::write(&commit_path, patched)?;
+
+    // Write data
+    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    for batch in nested_batches()? {
+        snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    }
+
+    // Resolve clustering columns to physical names for stats verification
+    let cm = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let physical_paths: Vec<Vec<String>> = clustering_cols
+        .iter()
+        .map(|c| {
+            get_any_level_column_physical_name(snapshot.schema().as_ref(), c, cm)
+                .unwrap()
+                .into_inner()
+        })
+        .collect();
+
+    // Resolve a non-clustering column to verify it's excluded from stats
+    let non_clustering_physical = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["name"]),
+        cm,
+    )?
+    .into_inner();
+
+    // Verify stats for each write commit.
+    // Batch 1 (v1): row_number 1..3, address.street "st1".."st3"
+    // Batch 2 (v2): row_number 4..6, address.street "st4".."st6"
+    let expected: [(i64, i64, &str, &str); 2] = [(1, 3, "st1", "st3"), (4, 6, "st4", "st6")];
+    for (version, (min_rn, max_rn, min_st, max_st)) in expected.iter().enumerate() {
+        let version = (version + 1) as u64;
+        let add_actions = read_actions_from_commit(&table_url, version, "add")?;
+        assert!(
+            !add_actions.is_empty(),
+            "v{version}: should have add actions"
+        );
+
+        for add in &add_actions {
+            let stats: serde_json::Value = serde_json::from_str(
+                add.get("stats")
+                    .and_then(|s| s.as_str())
+                    .expect("add action should have stats"),
+            )?;
+            // Clustering columns should have stats despite numIndexedCols=0
+            assert_min_max_stats(&stats, &physical_paths[0], *min_rn, *max_rn);
+            assert_min_max_stats(&stats, &physical_paths[1], *min_st, *max_st);
+
+            // Non-clustering column "name" should NOT have stats
+            let non_cluster_min = resolve_json_path(&stats["minValues"], &non_clustering_physical);
+            assert!(
+                non_cluster_min.is_null(),
+                "v{version}: non-clustering column 'name' should not have stats"
+            );
+        }
+    }
+
+    Ok(())
+}
