@@ -2,14 +2,14 @@
 use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::{
-    CheckpointMetaSkippingFilter, ParquetStatsProvider,
+    MetadataSkippingFilter, ParquetStatsProvider,
 };
 use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
-use crate::FilePredicate;
+use crate::{FilePredicate, MetadataStatResolver};
 use chrono::{DateTime, Days};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
@@ -30,14 +30,13 @@ pub(crate) trait ParquetRowGroupSkipping {
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
 
-    /// Instructs the parquet reader to perform checkpoint-aware row group skipping. Data column
-    /// predicates are remapped to `add.stats_parsed.{minValues,maxValues}.<col>` in the parquet
-    /// footer, while partition column predicates are remapped to
-    /// `add.partitionValues_parsed.<col>`.
-    fn with_checkpoint_row_group_filter(
+    /// Instructs the parquet reader to perform metadata-aware row group skipping. The provided
+    /// [`MetadataStatResolver`] maps predicate columns to their physical stat locations in the
+    /// metadata file.
+    fn with_metadata_row_group_filter(
         self,
         predicate: &Predicate,
-        partition_columns: &HashSet<ColumnName>,
+        resolver: &MetadataStatResolver,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
 
@@ -71,10 +70,10 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
         self.with_row_groups(ordinals)
     }
 
-    fn with_checkpoint_row_group_filter(
+    fn with_metadata_row_group_filter(
         self,
         predicate: &Predicate,
-        partition_columns: &HashSet<ColumnName>,
+        resolver: &MetadataStatResolver,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self {
         let ordinals: Vec<_> = self
@@ -84,11 +83,10 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .enumerate()
             .filter_map(|(ordinal, row_group)| {
                 let inner = RowGroupFilter::new(row_group);
-                CheckpointMetaSkippingFilter::apply(inner, predicate, partition_columns)
-                    .then_some(ordinal)
+                MetadataSkippingFilter::apply(inner, predicate, resolver).then_some(ordinal)
             })
             .collect();
-        debug!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
+        debug!("with_metadata_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -103,10 +101,10 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
         match predicate {
             FilePredicate::None => self,
             FilePredicate::Data(pred) => self.with_row_group_filter(pred, row_indexes),
-            FilePredicate::Checkpoint {
+            FilePredicate::Metadata {
                 predicate,
-                partition_columns,
-            } => self.with_checkpoint_row_group_filter(predicate, partition_columns, row_indexes),
+                resolver,
+            } => self.with_metadata_row_group_filter(predicate, resolver, row_indexes),
         }
     }
 }
@@ -124,7 +122,7 @@ impl<'a> RowGroupFilter<'a> {
     ///
     /// Callers must invoke [`prepare_stats`](ParquetStatsProvider::prepare_stats) before
     /// querying stats, otherwise all lookups will return `None` (safe but no pruning).
-    /// Prefer [`CheckpointMetaSkippingFilter::apply`] or [`RowGroupFilter::apply`] which
+    /// Prefer [`MetadataSkippingFilter::apply`] or [`RowGroupFilter::apply`] which
     /// handle this automatically.
     pub(crate) fn new(row_group: &'a RowGroupMetaData) -> Self {
         Self {

@@ -1,6 +1,7 @@
 use super::*;
 use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use crate::DataType;
+use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
 const FALSE: Option<bool> = Some(false);
@@ -249,9 +250,19 @@ fn test_eval_is_null() {
     do_test(2, &[TRUE, FALSE]);
 }
 
-// --- CheckpointMetaSkippingFilter tests ---
+// --- MetadataSkippingFilter tests ---
 
 use crate::expressions::column_name;
+use crate::MetadataStatResolver;
+use std::collections::HashSet;
+
+/// Builds a checkpoint resolver for tests.
+fn checkpoint_resolver(
+    predicate: &Predicate,
+    partition_columns: &HashSet<ColumnName>,
+) -> MetadataStatResolver {
+    MetadataStatResolver::for_checkpoint(predicate, partition_columns)
+}
 
 /// A mock stats provider keyed by column name, with per-column nullcounts.
 struct MockStatsProvider {
@@ -311,7 +322,7 @@ impl ParquetStatsProvider for MockStatsProvider {
 }
 
 #[test]
-fn test_checkpoint_filter_data_column_with_zero_nullcount() {
+fn test_metadata_filter_data_column_with_zero_nullcount() {
     // When the nested stat column has nullcount=0, we trust the stat values.
     let inner = MockStatsProvider::new()
         .with_stat(
@@ -329,16 +340,13 @@ fn test_checkpoint_filter_data_column_with_zero_nullcount() {
 
     let pred = Pred::gt(column_expr!("id"), Expr::literal(1000i64));
     let partition_cols = HashSet::new();
+    let resolver = checkpoint_resolver(&pred, &partition_cols);
     // max=500, predicate is id > 1000 → should prune (return false)
-    assert!(!CheckpointMetaSkippingFilter::apply(
-        inner,
-        &pred,
-        &partition_cols
-    ));
+    assert!(!MetadataSkippingFilter::apply(inner, &pred, &resolver));
 }
 
 #[test]
-fn test_checkpoint_filter_data_column_with_nonzero_nullcount() {
+fn test_metadata_filter_data_column_with_nonzero_nullcount() {
     // When the nested stat column has nullcount > 0, stats are unreliable → conservatively keep.
     let inner = MockStatsProvider::new()
         .with_stat(
@@ -356,16 +364,13 @@ fn test_checkpoint_filter_data_column_with_nonzero_nullcount() {
 
     let pred = Pred::lt(column_expr!("id"), Expr::literal(0i64));
     let partition_cols = HashSet::new();
+    let resolver = checkpoint_resolver(&pred, &partition_cols);
     // min has non-zero nullcount → min stat not trusted → can't prune
-    assert!(CheckpointMetaSkippingFilter::apply(
-        inner,
-        &pred,
-        &partition_cols
-    ));
+    assert!(MetadataSkippingFilter::apply(inner, &pred, &resolver));
 }
 
 #[test]
-fn test_checkpoint_filter_partition_column_pruning() {
+fn test_metadata_filter_partition_column_pruning() {
     // Partition columns resolve to add.partitionValues_parsed.<logical_name>.
     // Both min and max come from the same partition value column.
     let inner = MockStatsProvider::new().with_stat(
@@ -379,15 +384,12 @@ fn test_checkpoint_filter_partition_column_pruning() {
 
     // Predicate: region = "eu-west" — all partition values are "us-east" → should prune
     let pred = Pred::eq(column_expr!("region"), Expr::literal("eu-west"));
-    assert!(!CheckpointMetaSkippingFilter::apply(
-        inner,
-        &pred,
-        &partition_cols
-    ));
+    let resolver = checkpoint_resolver(&pred, &partition_cols);
+    assert!(!MetadataSkippingFilter::apply(inner, &pred, &resolver));
 }
 
 #[test]
-fn test_checkpoint_filter_partition_column_keeps_matching() {
+fn test_metadata_filter_partition_column_keeps_matching() {
     let inner = MockStatsProvider::new().with_stat(
         column_name!("add.partitionValues_parsed.region"),
         Some(Scalar::from("us-east")),
@@ -399,15 +401,12 @@ fn test_checkpoint_filter_partition_column_keeps_matching() {
 
     // Predicate: region = "us-east" — matches → should keep
     let pred = Pred::eq(column_expr!("region"), Expr::literal("us-east"));
-    assert!(CheckpointMetaSkippingFilter::apply(
-        inner,
-        &pred,
-        &partition_cols
-    ));
+    let resolver = checkpoint_resolver(&pred, &partition_cols);
+    assert!(MetadataSkippingFilter::apply(inner, &pred, &resolver));
 }
 
 #[test]
-fn test_checkpoint_filter_partition_nullcount_always_zero() {
+fn test_metadata_filter_partition_nullcount_always_zero() {
     // Partition values are never null, so IS NULL should be false and IS NOT NULL should be true.
     let inner = MockStatsProvider::new().with_stat(
         column_name!("add.partitionValues_parsed.region"),
@@ -417,13 +416,11 @@ fn test_checkpoint_filter_partition_nullcount_always_zero() {
     );
 
     let partition_cols = HashSet::from([column_name!("region")]);
+    // Use a dummy predicate that references the partition column
+    let dummy_pred = Pred::is_null(column_expr!("region"));
+    let resolver = checkpoint_resolver(&dummy_pred, &partition_cols);
 
-    let filter = CheckpointMetaSkippingFilter::new(
-        inner,
-        // Use a dummy predicate that references the partition column
-        &Pred::is_null(column_expr!("region")),
-        &partition_cols,
-    );
+    let filter = MetadataSkippingFilter::new(inner, &resolver);
 
     // IS NULL on a partition column → false (partition values are never null)
     expect_eq!(
@@ -440,7 +437,7 @@ fn test_checkpoint_filter_partition_nullcount_always_zero() {
 }
 
 #[test]
-fn test_checkpoint_filter_partition_with_column_mapping() {
+fn test_metadata_filter_partition_with_column_mapping() {
     // With column mapping, the predicate uses the physical name and partitionValues_parsed
     // also stores values under the physical name.
     let inner = MockStatsProvider::new().with_stat(
@@ -453,15 +450,12 @@ fn test_checkpoint_filter_partition_with_column_mapping() {
     let partition_cols = HashSet::from([column_name!("col_abc123")]);
 
     let pred = Pred::eq(column_expr!("col_abc123"), Expr::literal("eu-west"));
-    assert!(!CheckpointMetaSkippingFilter::apply(
-        inner,
-        &pred,
-        &partition_cols
-    ));
+    let resolver = checkpoint_resolver(&pred, &partition_cols);
+    assert!(!MetadataSkippingFilter::apply(inner, &pred, &resolver));
 }
 
 #[test]
-fn test_checkpoint_filter_mixed_partition_and_data_columns() {
+fn test_metadata_filter_mixed_partition_and_data_columns() {
     // Conjunction: partition column AND data column.
     let inner = MockStatsProvider::new()
         .with_stat(
@@ -490,9 +484,6 @@ fn test_checkpoint_filter_mixed_partition_and_data_columns() {
         Pred::eq(column_expr!("region"), Expr::literal("us-east")),
         Pred::gt(column_expr!("id"), Expr::literal(1000i64)),
     );
-    assert!(!CheckpointMetaSkippingFilter::apply(
-        inner,
-        &pred,
-        &partition_cols
-    ));
+    let resolver = checkpoint_resolver(&pred, &partition_cols);
+    assert!(!MetadataSkippingFilter::apply(inner, &pred, &resolver));
 }

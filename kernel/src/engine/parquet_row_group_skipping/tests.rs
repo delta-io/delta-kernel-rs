@@ -11,14 +11,12 @@ use crate::Predicate;
 use std::fs::File;
 use std::sync::Arc;
 
-/// Convenience wrapper for checkpoint meta-skipping in tests.
-fn apply_checkpoint_meta_skipping_filter(
-    row_group: &RowGroupMetaData,
-    predicate: &Predicate,
-) -> bool {
+/// Convenience wrapper for metadata skipping in tests.
+fn apply_metadata_skipping_filter(row_group: &RowGroupMetaData, predicate: &Predicate) -> bool {
     let empty = HashSet::new();
+    let resolver = crate::MetadataStatResolver::for_checkpoint(predicate, &empty);
     let inner = RowGroupFilter::new(row_group);
-    CheckpointMetaSkippingFilter::apply(inner, predicate, &empty)
+    MetadataSkippingFilter::apply(inner, predicate, &resolver)
 }
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
@@ -533,14 +531,14 @@ fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
 
     let pred_gt = Predicate::gt(column_expr!("value"), Expression::literal(50i64));
     // GT relies on maxValues. With max missing in row group 0, pruning fails (group is kept).
-    assert!(apply_checkpoint_meta_skipping_filter(
+    assert!(apply_metadata_skipping_filter(
         metadata.metadata().row_group(0),
         &pred_gt
     ));
     // maxValues is complete in row group 1 (max=10) and could theoretically prune, but
     // https://github.com/apache/arrow-rs/issues/9451 makes nullcount=0 indistinguishable
     // from missing stats, so the checkpoint filter conservatively keeps all row groups.
-    assert!(apply_checkpoint_meta_skipping_filter(
+    assert!(apply_metadata_skipping_filter(
         metadata.metadata().row_group(1),
         &pred_gt
     ));
@@ -548,12 +546,12 @@ fn test_checkpoint_stats_filter_handles_missing_min_max_independently() {
     let pred_lt = Predicate::lt(column_expr!("value"), Expression::literal(50i64));
     // LT relies on minValues. min=100 in row group 0 could theoretically prune, but
     // https://github.com/apache/arrow-rs/issues/9451 prevents trusting nullcount=0.
-    assert!(apply_checkpoint_meta_skipping_filter(
+    assert!(apply_metadata_skipping_filter(
         metadata.metadata().row_group(0),
         &pred_lt
     ));
     // With min missing in row group 1, pruning fails (group is kept).
-    assert!(apply_checkpoint_meta_skipping_filter(
+    assert!(apply_metadata_skipping_filter(
         metadata.metadata().row_group(1),
         &pred_lt
     ));

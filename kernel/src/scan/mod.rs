@@ -31,7 +31,8 @@ use crate::schema::{
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FileMeta, FilePredicate, SnapshotRef, Version,
+    DeltaResult, Engine, EngineData, Error, FileMeta, FilePredicate, MetadataStatResolver,
+    SnapshotRef, Version,
 };
 
 use self::log_replay::scan_action_iter;
@@ -763,9 +764,9 @@ impl Scan {
             )
     }
 
-    /// Builds a checkpoint/sidecar metadata pruning predicate with partition column identification.
+    /// Builds a metadata pruning predicate with a stat resolver for checkpoint/sidecar files.
     ///
-    /// Returns `FilePredicate::Checkpoint` when there is a physical predicate and either a stats
+    /// Returns `FilePredicate::Metadata` when there is a physical predicate and either a stats
     /// schema (for data column skipping) or partition columns (for partition value skipping).
     fn build_actions_meta_predicate(&self) -> FilePredicate {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
@@ -791,9 +792,11 @@ impl Scan {
             return FilePredicate::None;
         }
 
-        FilePredicate::Checkpoint {
+        let resolver = MetadataStatResolver::for_checkpoint(predicate, &partition_columns);
+
+        FilePredicate::Metadata {
             predicate: predicate.clone(),
-            partition_columns,
+            resolver,
         }
     }
 

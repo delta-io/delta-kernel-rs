@@ -74,7 +74,7 @@
 extern crate self as delta_kernel;
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::DirEntry;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -664,6 +664,113 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
+/// The type of statistic being requested for a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StatType {
+    /// The minimum value of the column.
+    Min,
+    /// The maximum value of the column.
+    Max,
+}
+
+/// Details about where a particular column statistic is stored in the metadata file.
+#[derive(Clone, Debug)]
+pub struct ColumnStatDetail {
+    /// The physical column name in the metadata file that holds this statistic.
+    pub stat_column_name: expressions::ColumnName,
+    /// Whether this column is a partition column. Partition values are never null, so
+    /// nullcount guards can be bypassed.
+    pub is_partition: bool,
+}
+
+/// Maps predicate columns to their physical stat locations in a metadata file (e.g. checkpoint
+/// or sidecar). The engine uses this to locate min/max statistics without needing to understand
+/// the internal layout of metadata files.
+#[derive(Clone, Debug, Default)]
+pub struct MetadataStatResolver {
+    min_details: HashMap<expressions::ColumnName, ColumnStatDetail>,
+    max_details: HashMap<expressions::ColumnName, ColumnStatDetail>,
+}
+
+impl MetadataStatResolver {
+    /// Builds a resolver for checkpoint/sidecar files. Data columns are mapped to
+    /// `add.stats_parsed.{minValues,maxValues}.<col>` and partition columns to
+    /// `add.partitionValues_parsed.<col>` (where both min and max point to the same column).
+    pub fn for_checkpoint(
+        predicate: &expressions::Predicate,
+        partition_columns: &HashSet<expressions::ColumnName>,
+    ) -> Self {
+        use expressions::column_name;
+
+        let min_prefix = column_name!("add.stats_parsed.minValues");
+        let max_prefix = column_name!("add.stats_parsed.maxValues");
+        let partition_prefix = column_name!("add.partitionValues_parsed");
+
+        let mut min_details = HashMap::new();
+        let mut max_details = HashMap::new();
+
+        for col in predicate.references() {
+            if partition_columns.contains(col) {
+                let partition_path = partition_prefix.join(col);
+                min_details.insert(
+                    col.clone(),
+                    ColumnStatDetail {
+                        stat_column_name: partition_path.clone(),
+                        is_partition: true,
+                    },
+                );
+                max_details.insert(
+                    col.clone(),
+                    ColumnStatDetail {
+                        stat_column_name: partition_path,
+                        is_partition: true,
+                    },
+                );
+            } else {
+                min_details.insert(
+                    col.clone(),
+                    ColumnStatDetail {
+                        stat_column_name: min_prefix.join(col),
+                        is_partition: false,
+                    },
+                );
+                max_details.insert(
+                    col.clone(),
+                    ColumnStatDetail {
+                        stat_column_name: max_prefix.join(col),
+                        is_partition: false,
+                    },
+                );
+            }
+        }
+
+        Self {
+            min_details,
+            max_details,
+        }
+    }
+
+    /// Resolves the physical stat location for a given column and stat type.
+    pub fn resolve(
+        &self,
+        column: &expressions::ColumnName,
+        stat_type: StatType,
+    ) -> Option<&ColumnStatDetail> {
+        match stat_type {
+            StatType::Min => self.min_details.get(column),
+            StatType::Max => self.max_details.get(column),
+        }
+    }
+
+    /// Returns an iterator over all physical stat columns that the engine needs to provide.
+    pub fn all_stat_columns(&self) -> impl Iterator<Item = &expressions::ColumnName> {
+        self.min_details
+            .values()
+            .chain(self.max_details.values())
+            .map(|d| &d.stat_column_name)
+    }
+}
+
 /// Data-skipping and filtering semantics can change depending on whether a file contains data
 /// or metadata about a table. This enum conveys to the engine how the predicate should apply.
 #[derive(Clone, Debug, Default)]
@@ -675,20 +782,14 @@ pub enum FilePredicate {
     /// referenced. Example: the predicate `x > 10` keeps a row-group if `rowgroup.x.max > 10`
     /// is true or null.
     Data(PredicateRef),
-    /// Checkpoint row group skipping — predicate references data columns by physical name
-    /// and the reader remaps them to `add.stats_parsed.{minValues,maxValues}.col`
-    /// in the parquet footer for row group filtering.
-    ///
-    /// Partition column predicates are remapped to `add.partitionValues_parsed.<col>` where
-    /// both min and max stats come from the same column (the actual partition value stored
-    /// in the checkpoint). Partition values are never null.
-    Checkpoint {
+    /// Metadata row group skipping — predicate references data columns by physical name and the
+    /// kernel-provided [`MetadataStatResolver`] maps them to physical stat locations in the
+    /// metadata file (e.g. checkpoint or sidecar). The engine never needs to know the internal
+    /// layout of metadata files.
+    Metadata {
         predicate: PredicateRef,
-        /// Physical names of partition columns referenced by the predicate. Used to
-        /// distinguish partition columns (remapped to `partitionValues_parsed`) from
-        /// data columns (remapped to `stats_parsed`). Empty if no partition columns
-        /// are referenced.
-        partition_columns: HashSet<expressions::ColumnName>,
+        /// Resolves predicate columns to their physical stat locations.
+        resolver: MetadataStatResolver,
     },
 }
 

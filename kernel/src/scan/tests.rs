@@ -7,7 +7,9 @@ use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+use crate::expressions::{
+    column_expr, column_name, column_pred, Expression as Expr, Predicate as Pred,
+};
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, Snapshot};
@@ -765,15 +767,17 @@ fn test_build_actions_meta_predicate_with_physical_predicate() {
 
     let meta_pred = scan.build_actions_meta_predicate();
     match meta_pred {
-        crate::FilePredicate::Checkpoint {
+        crate::FilePredicate::Metadata {
             predicate: pred,
-            partition_columns,
+            resolver,
         } => {
             assert_eq!(pred, predicate);
-            // parsed-stats table is not partitioned
-            assert!(partition_columns.is_empty());
+            // parsed-stats table is not partitioned, so no partition columns in the resolver
+            assert!(resolver
+                .resolve(&column_name!("id"), crate::StatType::Min)
+                .is_some_and(|d| !d.is_partition));
         }
-        other => panic!("expected Checkpoint, got {:?}", other),
+        other => panic!("expected Metadata, got {:?}", other),
     }
 }
 
