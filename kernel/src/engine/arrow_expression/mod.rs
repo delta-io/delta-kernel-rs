@@ -283,6 +283,9 @@ pub struct DefaultExpressionEvaluator {
     _input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
+    // Cached Arrow schema derived from `output_type`. Converting a kernel schema to Arrow requires
+    // allocating fields and metadata, so repeated conversion for large schemas can have non-trivial
+    // overhead. The cache ensures we pay that cost at most once per evaluator instance.
     output_schema: OnceLock<Arc<ArrowSchema>>,
 }
 
