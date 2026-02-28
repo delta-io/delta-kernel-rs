@@ -286,6 +286,26 @@ async fn copy_atomic_impl(
     Ok(())
 }
 
+/// Native async implementation for put
+async fn put_impl(
+    store: Arc<DynObjectStore>,
+    path: Path,
+    data: Bytes,
+    overwrite: bool,
+) -> DeltaResult<()> {
+    let put_mode = if overwrite {
+        PutMode::Overwrite
+    } else {
+        PutMode::Create
+    };
+    let result = store.put_opts(&path, data.into(), put_mode.into()).await;
+    result.map_err(|e| match e {
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.into()),
+        e => e.into(),
+    })?;
+    Ok(())
+}
+
 /// Native async implementation for head
 async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
     let meta = store.head(&Path::from_url_path(url.path())?).await?;
@@ -324,6 +344,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         );
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
+    }
+
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+        let path = Path::from_url_path(path.path())?;
+        self.task_executor
+            .block_on(put_impl(self.inner.clone(), path, data, overwrite))
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
