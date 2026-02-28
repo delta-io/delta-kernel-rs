@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
+use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -36,92 +37,25 @@ async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> Del
     Ok(())
 }
 
-/// Builds a JSON commit string with protocol + metadata for a non-partitioned table.
-fn build_initial_commit(write_stats_as_json: bool, write_stats_as_struct: bool) -> String {
-    let protocol = json!({
-        "protocol": {
-            "minReaderVersion": 3,
-            "minWriterVersion": 7,
-            "readerFeatures": [],
-            "writerFeatures": []
-        }
-    });
-    let metadata = json!({
-        "metaData": {
-            "id": "test-table",
-            "format": { "provider": "parquet", "options": {} },
-            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#,
-            "partitionColumns": [],
-            "configuration": {
-                "delta.checkpoint.writeStatsAsJson": write_stats_as_json.to_string(),
-                "delta.checkpoint.writeStatsAsStruct": write_stats_as_struct.to_string()
-            },
-            "createdTime": 1587968585495i64
-        }
-    });
-    format!("{}\n{}", protocol, metadata)
-}
+const NON_PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
-/// Builds a JSON commit string with only metadata (for config changes).
-fn build_metadata_commit(write_stats_as_json: bool, write_stats_as_struct: bool) -> String {
-    let metadata = json!({
-        "metaData": {
-            "id": "test-table",
-            "format": { "provider": "parquet", "options": {} },
-            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#,
-            "partitionColumns": [],
-            "configuration": {
-                "delta.checkpoint.writeStatsAsJson": write_stats_as_json.to_string(),
-                "delta.checkpoint.writeStatsAsStruct": write_stats_as_struct.to_string()
-            },
-            "createdTime": 1587968585495i64
-        }
-    });
-    metadata.to_string()
-}
+const PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"binary","nullable":true,"metadata":{}}]}"#;
 
-/// Builds a JSON commit string with protocol + metadata for a partitioned table.
-/// The table has two partition columns: `created_at` (timestamp) and `tag` (binary),
-/// exercising MapToStruct for non-trivial partition value parsing.
-fn build_partitioned_initial_commit(
+/// Builds a JSON commit string with optional protocol, metadata, and stats config.
+/// When `include_protocol` is true, includes the protocol action (for version 0 commits).
+fn build_commit(
+    schema_string: &str,
+    partition_columns: &[&str],
     write_stats_as_json: bool,
     write_stats_as_struct: bool,
-) -> String {
-    let protocol = json!({
-        "protocol": {
-            "minReaderVersion": 3,
-            "minWriterVersion": 7,
-            "readerFeatures": [],
-            "writerFeatures": []
-        }
-    });
-    let metadata = json!({
-        "metaData": {
-            "id": "test-table",
-            "format": { "provider": "parquet", "options": {} },
-            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"binary","nullable":true,"metadata":{}}]}"#,
-            "partitionColumns": ["created_at", "tag"],
-            "configuration": {
-                "delta.checkpoint.writeStatsAsJson": write_stats_as_json.to_string(),
-                "delta.checkpoint.writeStatsAsStruct": write_stats_as_struct.to_string()
-            },
-            "createdTime": 1587968585495i64
-        }
-    });
-    format!("{}\n{}", protocol, metadata)
-}
-
-/// Builds a JSON commit string with only metadata for a partitioned table config change.
-fn build_partitioned_metadata_commit(
-    write_stats_as_json: bool,
-    write_stats_as_struct: bool,
+    include_protocol: bool,
 ) -> String {
     let metadata = json!({
         "metaData": {
             "id": "test-table",
             "format": { "provider": "parquet", "options": {} },
-            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"binary","nullable":true,"metadata":{}}]}"#,
-            "partitionColumns": ["created_at", "tag"],
+            "schemaString": schema_string,
+            "partitionColumns": partition_columns,
             "configuration": {
                 "delta.checkpoint.writeStatsAsJson": write_stats_as_json.to_string(),
                 "delta.checkpoint.writeStatsAsStruct": write_stats_as_struct.to_string()
@@ -129,7 +63,19 @@ fn build_partitioned_metadata_commit(
             "createdTime": 1587968585495i64
         }
     });
-    metadata.to_string()
+    if include_protocol {
+        let protocol = json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": []
+            }
+        });
+        format!("{}\n{}", protocol, metadata)
+    } else {
+        metadata.to_string()
+    }
 }
 
 /// Tests all 16 combinations of writeStatsAsJson/writeStatsAsStruct settings with real
@@ -161,7 +107,12 @@ async fn test_checkpoint_stats_config_with_real_data(
     );
 
     // Version 0: protocol + metadata with initial stats config
-    write_commit(&store, &build_initial_commit(json1, struct1), 0).await?;
+    write_commit(
+        &store,
+        &build_commit(NON_PARTITIONED_SCHEMA, &[], json1, struct1, true),
+        0,
+    )
+    .await?;
 
     // Version 1: write real data (generates actual parquet files with stats)
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -194,7 +145,12 @@ async fn test_checkpoint_stats_config_with_real_data(
     assert!(result.is_committed());
 
     // Version 3: change stats config
-    write_commit(&store, &build_metadata_commit(json2, struct2), 3).await?;
+    write_commit(
+        &store,
+        &build_commit(NON_PARTITIONED_SCHEMA, &[], json2, struct2, false),
+        3,
+    )
+    .await?;
 
     // Checkpoint 2 with (json2, struct2) settings (reads from checkpoint 1 + commits 2-3)
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -242,7 +198,18 @@ async fn test_checkpoint_partitioned_with_real_data(
     );
 
     // Version 0: protocol + partitioned metadata with initial stats config
-    write_commit(&store, &build_partitioned_initial_commit(json1, struct1), 0).await?;
+    write_commit(
+        &store,
+        &build_commit(
+            PARTITIONED_SCHEMA,
+            &["created_at", "tag"],
+            json1,
+            struct1,
+            true,
+        ),
+        0,
+    )
+    .await?;
 
     // Version 1: write data for partition created_at=2024-01-15 10:30:00, tag=hello
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -316,7 +283,13 @@ async fn test_checkpoint_partitioned_with_real_data(
     // Version 3: change stats config
     write_commit(
         &store,
-        &build_partitioned_metadata_commit(json2, struct2),
+        &build_commit(
+            PARTITIONED_SCHEMA,
+            &["created_at", "tag"],
+            json2,
+            struct2,
+            false,
+        ),
         3,
     )
     .await?;
@@ -329,11 +302,39 @@ async fn test_checkpoint_partitioned_with_real_data(
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine.clone())?;
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        total_rows, 4,
-        "All 4 rows should be readable after checkpoints"
-    );
+
+    // Merge all batches and sort by id to get deterministic ordering
+    let schema = batches[0].schema();
+    let merged = concat_batches(&schema, &batches)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let id_col = merged.column_by_name("id").unwrap();
+    let sort_indices = delta_kernel::arrow::compute::sort_to_indices(id_col, None, None)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let sorted_columns: Vec<ArrayRef> = merged
+        .columns()
+        .iter()
+        .map(|col| delta_kernel::arrow::compute::take(col.as_ref(), &sort_indices, None).unwrap())
+        .collect();
+    let sorted = RecordBatch::try_new(schema, sorted_columns)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    assert_eq!(sorted.num_rows(), 4, "All 4 rows should be readable");
+
+    // Verify partition values are correctly round-tripped
+    let ids: Vec<i64> = sorted
+        .column_by_name("id")
+        .unwrap()
+        .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4]);
+
+    let tags = sorted.column_by_name("tag").unwrap();
+    let tags: Vec<&[u8]> = (0..4).map(|i| tags.as_binary::<i32>().value(i)).collect();
+    // Rows 1,2 have tag=hello; rows 3,4 have tag=world
+    assert_eq!(tags, vec![b"hello", b"hello", b"world", b"world"]);
 
     Ok(())
 }

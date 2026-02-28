@@ -51,7 +51,7 @@ impl StatsTransformConfig {
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
 ///
 /// For partitioned tables when `writeStatsAsStruct=true`, it also populates:
-/// - `partitionValues_parsed = COALESCE(partitionValues_parsed, STRUCT(CAST(ELEMENT_AT(pv, col), type), ...))`
+/// - `partitionValues_parsed = COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues))`
 ///
 /// Returns a top-level transform that wraps the nested Add transform, ensuring the
 /// full checkpoint batch is produced with the modified Add action.
@@ -105,9 +105,9 @@ pub(crate) fn build_checkpoint_transform(
     }
 
     // Handle partitionValues_parsed field (only for partitioned tables)
-    if let Some(pv_schema) = partition_schema {
+    if partition_schema.is_some() {
         if config.write_stats_as_struct {
-            let pv_parsed_expr = build_partition_values_parsed_expr(pv_schema);
+            let pv_parsed_expr = build_partition_values_parsed_expr();
             add_transform =
                 add_transform.with_replaced_field(PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
         } else {
@@ -225,7 +225,7 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 ///
 /// Column paths are relative to the full batch (not the nested Add struct), so we use
 /// `["add", "partitionValues"]` instead of just `["partitionValues"]`.
-fn build_partition_values_parsed_expr(partition_schema: &SchemaRef) -> ExpressionRef {
+fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
         Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
         Expression::map_to_struct(Expression::column([ADD_NAME, PARTITION_VALUES_FIELD])),

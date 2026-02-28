@@ -291,7 +291,13 @@ impl TableConfiguration {
         }
         let partition_fields: Vec<StructField> = partition_columns
             .iter()
-            .filter_map(|col_name| self.schema.field(col_name))
+            .filter_map(|col_name| {
+                let field = self.schema.field(col_name);
+                if field.is_none() {
+                    warn!("Partition column '{col_name}' not found in table schema");
+                }
+                field
+            })
             .map(|field| {
                 StructField::nullable(
                     field.physical_name(self.column_mapping_mode).to_owned(),
