@@ -7,8 +7,6 @@ use crate::{
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
 
-use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use crate::engine::arrow_conversion::TryFromKernel as _;
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
@@ -65,15 +63,12 @@ fn read_files<F, I>(
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>, String) -> DeltaResult<I>
-        + Send
-        + 'static,
+    F: FnMut(File, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     if files.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
-    let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let files = files.to_vec();
     let result = files
         .into_iter()
@@ -88,7 +83,6 @@ where
             try_create_from_file(
                 File::open(path)?,
                 schema.clone(),
-                arrow_schema.clone(),
                 predicate.clone(),
                 location_string,
             )

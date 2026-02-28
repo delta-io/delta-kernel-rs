@@ -66,6 +66,8 @@ StructExpression
     Integer(42)
     Double(1.111000)
   Unknown(mystery)
+  MapToStruct
+    Column(pv)
   Divide
     Integer(0)
     Integer(0)
@@ -167,6 +169,8 @@ StructExpression
     Integer(1)
     Long(2)
     Double(3.000000)
+  MapToStruct
+    Column(partitionValues)
 
 === Expression Round-trip Test ===
 SUCCESS: Round-trip expression matches original!

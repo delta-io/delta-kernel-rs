@@ -1,11 +1,10 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
-use crate::engine::arrow_conversion::TryFromArrow as _;
+use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
@@ -26,10 +25,10 @@ pub(crate) struct SyncParquetHandler;
 fn try_create_from_parquet(
     file: File,
     schema: SchemaRef,
-    arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let parquet_schema = metadata.schema();
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
