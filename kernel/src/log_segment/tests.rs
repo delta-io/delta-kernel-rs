@@ -16,9 +16,9 @@ use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::listed_log_files::ListedLogFilesBuilder;
+use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::ActionsBatch;
-use crate::log_segment::{ListedLogFiles, LogSegment};
+use crate::log_segment::LogSegment;
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
@@ -1112,12 +1112,12 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let v2_checkpoint_read_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        ListedLogFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
-        .build()?,
+        .validate()?,
         log_root,
         None,
         None,
@@ -1179,7 +1179,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        ListedLogFiles {
             checkpoint_parts: vec![
                 create_log_path(&checkpoint_one_file),
                 create_log_path(&checkpoint_two_file),
@@ -1187,7 +1187,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
-        .build()?,
+        .validate()?,
         log_root,
         None,
         None,
@@ -1244,7 +1244,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        ListedLogFiles {
             checkpoint_parts: vec![create_log_path_with_size(
                 &checkpoint_one_file,
                 checkpoint_size,
@@ -1252,7 +1252,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
-        .build()?,
+        .validate()?,
         log_root,
         None,
         None,
@@ -1301,12 +1301,12 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        ListedLogFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
-        .build()?,
+        .validate()?,
         log_root,
         None,
         None,
@@ -1387,7 +1387,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        ListedLogFiles {
             checkpoint_parts: vec![create_log_path_with_size(
                 &checkpoint_file_path,
                 checkpoint_size,
@@ -1395,7 +1395,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
-        .build()?,
+        .validate()?,
         log_root,
         None,
         None,
@@ -1887,9 +1887,8 @@ async fn test_commit_cover_minimal_overlap() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
-fn test_debug_assert_listed_log_file_in_order_compaction_files() {
-    let _ = ListedLogFilesBuilder {
+fn test_validate_listed_log_file_in_order_compaction_files() {
+    assert!(ListedLogFiles {
         ascending_compaction_files: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
@@ -1903,14 +1902,14 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
         )),
         ..Default::default()
     }
-    .build();
+    .validate()
+    .is_ok());
 }
 
 #[test]
-#[should_panic]
 #[cfg(debug_assertions)]
-fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
-    let _ = ListedLogFilesBuilder {
+fn test_validate_listed_log_file_out_of_order_compaction_files() {
+    assert!(ListedLogFiles {
         ascending_compaction_files: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
@@ -1924,14 +1923,14 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
         )),
         ..Default::default()
     }
-    .build();
+    .validate()
+    .is_err());
 }
 
 #[test]
-#[should_panic]
 #[cfg(debug_assertions)]
-fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
-    let _ = ListedLogFilesBuilder {
+fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
+    assert!(ListedLogFiles {
         checkpoint_parts: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
@@ -1945,14 +1944,14 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
         )),
         ..Default::default()
     }
-    .build();
+    .validate()
+    .is_err());
 }
 
 #[test]
-#[should_panic]
 #[cfg(debug_assertions)]
-fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
-    let _ = ListedLogFilesBuilder {
+fn test_validate_listed_log_file_invalid_multipart_checkpoint() {
+    assert!(ListedLogFiles {
         checkpoint_parts: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
@@ -1966,7 +1965,54 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
         )),
         ..Default::default()
     }
-    .build();
+    .validate()
+    .is_err());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn test_validate_listed_log_file_out_of_order_commit_files() {
+    assert!(ListedLogFiles {
+        ascending_commit_files: vec![
+            create_log_path("file:///_delta_log/00000000000000000003.json"),
+            create_log_path("file:///_delta_log/00000000000000000001.json"),
+        ],
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
+    assert!(ListedLogFiles {
+        checkpoint_parts: vec![create_log_path(
+            "file:///_delta_log/00000000000000000010.json"
+        ),],
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
+    // Two parts that agree on version but claim num_parts=3 (count mismatch: 2 != 3)
+    assert!(ListedLogFiles {
+        checkpoint_parts: vec![
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000002.0000000003.parquet",
+            ),
+        ],
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
 }
 
 #[tokio::test]
@@ -2355,7 +2401,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
 
 #[test]
 fn test_log_segment_contiguous_commit_files() {
-    let res = ListedLogFilesBuilder {
+    let res = ListedLogFiles {
         ascending_commit_files: vec![
             create_log_path("file:///_delta_log/00000000000000000001.json"),
             create_log_path("file:///_delta_log/00000000000000000002.json"),
@@ -2366,11 +2412,11 @@ fn test_log_segment_contiguous_commit_files() {
         )),
         ..Default::default()
     }
-    .build();
+    .validate();
     assert!(res.is_ok());
 
     // allow gaps in ListedLogFiles
-    let listed = ListedLogFilesBuilder {
+    let listed = ListedLogFiles {
         ascending_commit_files: vec![
             create_log_path("file:///_delta_log/00000000000000000001.json"),
             create_log_path("file:///_delta_log/00000000000000000003.json"),
@@ -2380,7 +2426,7 @@ fn test_log_segment_contiguous_commit_files() {
         )),
         ..Default::default()
     }
-    .build();
+    .validate();
 
     // disallow gaps in LogSegment
     let log_segment =
@@ -2476,12 +2522,12 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     ]));
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        ListedLogFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
             ..Default::default()
         }
-        .build()?,
+        .validate()?,
         log_root,
         None,
         Some(hint_schema.clone()), // V1 hint schema (no sidecar field)

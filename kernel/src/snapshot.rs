@@ -17,7 +17,7 @@ use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
-use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
+use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -293,7 +293,7 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFilesBuilder {
+            ListedLogFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
@@ -303,7 +303,7 @@ impl Snapshot {
                     .max_published_version
                     .max(old_log_segment.max_published_version),
             }
-            .build()?,
+            .validate()?,
             log_root,
             new_version,
             // Preserve checkpoint schema from old segment
@@ -835,7 +835,7 @@ mod tests {
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFilesBuilder;
+    use crate::listed_log_files::ListedLogFiles;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
@@ -1778,11 +1778,11 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFilesBuilder {
+        let listed_files = ListedLogFiles {
             checkpoint_parts,
             ..Default::default()
         }
-        .build()?;
+        .validate()?;
 
         let log_segment =
             LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
