@@ -227,7 +227,7 @@ impl StateInfo {
                 // reads stats_parsed from the transformed batch, which uses this schema.
                 (Some(columns), _) if columns.is_empty() => {
                     let expected_stats_schemas =
-                        table_configuration.build_expected_stats_schemas(None)?;
+                        table_configuration.build_expected_stats_schemas(None, None)?;
                     (
                         Some(expected_stats_schemas.physical),
                         Some(expected_stats_schemas.logical),
