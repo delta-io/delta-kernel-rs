@@ -179,12 +179,9 @@ pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
     )]))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
@@ -219,12 +216,9 @@ impl TryFrom<Format> for Scalar {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
@@ -849,6 +843,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
+// TODO: Add serde Deserialize with rename_all = "camelCase" for CRC file reads.
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct SetTransaction {
@@ -942,6 +937,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
+// TODO: Add serde Deserialize for CRC file reads.
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
