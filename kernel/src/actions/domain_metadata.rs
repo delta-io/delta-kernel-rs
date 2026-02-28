@@ -5,6 +5,7 @@
 //! termination), or all domains from the log.
 
 use crate::actions::DomainMetadata;
+use crate::crc::LazyCrc;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine};
 use delta_kernel_derive::internal_api;
@@ -16,15 +17,20 @@ pub(crate) use crate::log_segment::DomainMetadataMap;
 /// accounts for 'removed' domain metadata: if the domain is removed, then the configuration is
 /// `None`. Additionally, this includes 'internal' (delta.*) domains. The consumer must filter
 /// these before returning domains to the user.
+///
+/// Uses CRC acceleration when available: if the CRC file contains domain metadata, it is used
+/// directly (or as a base with incremental replay) to avoid full log replay.
 // TODO we should have some finer-grained unit tests here instead of relying on the top-level
 // snapshot tests.
 pub(crate) fn domain_metadata_configuration(
     log_segment: &LogSegment,
+    lazy_crc: &LazyCrc,
     domain: &str,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<String>> {
     let domains = HashSet::from([domain]);
-    let mut domain_metadatas = log_segment.scan_domain_metadatas(Some(&domains), engine)?;
+    let mut domain_metadatas =
+        log_segment.scan_domain_metadatas_with_crc(lazy_crc, Some(&domains), engine)?;
     Ok(domain_metadatas
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
@@ -34,8 +40,9 @@ pub(crate) fn domain_metadata_configuration(
 #[internal_api]
 pub(crate) fn all_domain_metadata_configuration(
     log_segment: &LogSegment,
+    lazy_crc: &LazyCrc,
     engine: &dyn Engine,
 ) -> DeltaResult<Vec<DomainMetadata>> {
-    let domain_metadatas = log_segment.scan_domain_metadatas(None, engine)?;
+    let domain_metadatas = log_segment.scan_domain_metadatas_with_crc(lazy_crc, None, engine)?;
     Ok(domain_metadatas.into_values().collect())
 }

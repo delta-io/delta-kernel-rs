@@ -6,11 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use tracing::instrument;
+use tracing::{info, instrument};
 
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
+use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
 
@@ -52,6 +53,83 @@ impl LogSegment {
         }
 
         Ok(visitor.into_domain_metadatas())
+    }
+
+    /// Scan for domain metadata with CRC acceleration. This follows the same pattern as the
+    /// CRC-accelerated P&M loading in `read_protocol_metadata_opt`:
+    ///
+    /// 1. CRC at target version with domain metadata -> use directly (zero log replay)
+    /// 2. CRC at earlier version -> replay only commits after CRC, merge with CRC's domains
+    /// 3. No CRC or CRC without domain metadata -> full log replay (existing behavior)
+    #[instrument(name = "domain_metadata.scan_with_crc", skip_all, err)]
+    pub(crate) fn scan_domain_metadatas_with_crc(
+        &self,
+        lazy_crc: &LazyCrc,
+        domains: Option<&HashSet<&str>>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<DomainMetadataMap> {
+        // Case 1: CRC at target version with domain metadata -> use directly
+        if lazy_crc.crc_version() == Some(self.end_version) {
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                if let Some(ref dm_list) = crc.domain_metadata {
+                    info!(
+                        "Domain metadata from CRC at target version {}",
+                        self.end_version
+                    );
+                    let map: DomainMetadataMap = dm_list
+                        .iter()
+                        .map(|dm| (dm.domain().to_string(), dm.clone()))
+                        .collect();
+                    // Apply domain filter if provided
+                    if let Some(filter) = domains {
+                        return Ok(map
+                            .into_iter()
+                            .filter(|(k, _)| filter.contains(k.as_str()))
+                            .collect());
+                    }
+                    return Ok(map);
+                }
+            }
+            // CRC at target version but no domain metadata (or failed to load) -> full replay
+        }
+
+        // Case 2: CRC at earlier version -> replay only commits after CRC, merge
+        if let Some(crc_v) = lazy_crc.crc_version().filter(|&v| v < self.end_version) {
+            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
+                if let Some(ref dm_list) = crc.domain_metadata {
+                    info!(
+                        "Domain metadata: CRC at {}, replaying commits {}..{}",
+                        crc_v,
+                        crc_v + 1,
+                        self.end_version
+                    );
+                    // Replay only commits after CRC version
+                    let pruned = self.segment_after_crc(crc_v);
+                    let mut replay_dm = pruned.scan_domain_metadatas(domains, engine)?;
+
+                    // Merge: CRC domains as base, replay domains override
+                    // Start with CRC domains
+                    let mut merged: DomainMetadataMap = dm_list
+                        .iter()
+                        .map(|dm| (dm.domain().to_string(), dm.clone()))
+                        .collect();
+
+                    // Replay domains override CRC (they're newer)
+                    for (domain, dm) in replay_dm.drain() {
+                        merged.insert(domain, dm);
+                    }
+
+                    // Apply domain filter if provided
+                    if let Some(filter) = domains {
+                        merged.retain(|k, _| filter.contains(k.as_str()));
+                    }
+                    return Ok(merged);
+                }
+            }
+        }
+
+        // Case 3: No CRC or CRC without domain metadata -> full log replay
+        self.scan_domain_metadatas(domains, engine)
     }
 
     /// Read action batches from the log, projecting rows to only contain domain metadata columns.

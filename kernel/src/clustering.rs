@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::DomainMetadata;
+use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
@@ -150,9 +151,11 @@ fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
 /// [`Snapshot::get_clustering_columns`]: crate::snapshot::Snapshot::get_clustering_columns
 pub(crate) fn get_clustering_columns(
     log_segment: &LogSegment,
+    lazy_crc: &LazyCrc,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<Vec<ColumnName>>> {
-    let config = domain_metadata_configuration(log_segment, CLUSTERING_DOMAIN_NAME, engine)?;
+    let config =
+        domain_metadata_configuration(log_segment, lazy_crc, CLUSTERING_DOMAIN_NAME, engine)?;
     match config {
         Some(json_str) => Ok(Some(parse_clustering_columns(&json_str)?)),
         None => Ok(None),

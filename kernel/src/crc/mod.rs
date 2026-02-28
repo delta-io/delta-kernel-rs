@@ -7,6 +7,9 @@
 
 mod lazy;
 mod reader;
+pub(crate) mod writer;
+#[cfg(test)]
+mod writer_tests;
 
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
