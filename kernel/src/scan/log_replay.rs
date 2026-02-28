@@ -199,7 +199,6 @@ impl ScanLogReplayProcessor {
                 .map(|pv_schema| {
                     Arc::new(Expression::map_to_struct(
                         Expression::column(["fileConstantValues", "partitionValues"]),
-                        Arc::new(pv_schema.as_ref().clone()),
                     )) as ExpressionRef
                 });
             DataSkippingFilter::new(
