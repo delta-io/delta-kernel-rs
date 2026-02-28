@@ -269,17 +269,15 @@ pub trait ExpressionTransform<'a> {
         }))
     }
 
-    /// Recursively transforms the child expression of a [`MapToStructExpression`]. The schema is
-    /// not transformed. Returns `None` if the child was removed, `Some(Cow::Owned)` if the child
-    /// was changed, and `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms the child expression of a [`MapToStructExpression`]. Returns `None`
+    /// if the child was removed, `Some(Cow::Owned)` if the child was changed, and
+    /// `Some(Cow::Borrowed)` otherwise.
     fn recurse_into_expr_map_to_struct(
         &mut self,
         expr: &'a MapToStructExpression,
     ) -> Option<Cow<'a, MapToStructExpression>> {
         let nested = self.transform_expr(&expr.map_expr)?;
-        Some(nested.map_owned_or_else(expr, |map_expr| {
-            MapToStructExpression::new(map_expr, expr.output_schema.clone())
-        }))
+        Some(nested.map_owned_or_else(expr, MapToStructExpression::new))
     }
 
     /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all

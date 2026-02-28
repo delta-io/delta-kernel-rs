@@ -151,8 +151,8 @@ pub struct EngineExpressionVisitor {
     pub visit_parse_json: VisitParseJsonFn,
     /// Visits the `MapToStruct` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (map column) will be in a _one_ item list identified by `child_list_id`.
-    /// The `output_schema` handle specifies the struct schema to extract and parse map values into.
-    pub visit_map_to_struct: VisitParseJsonFn,
+    /// The output struct schema is determined by the evaluator's result type.
+    pub visit_map_to_struct: VisitUnaryFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_lt: VisitBinaryFn,
@@ -657,20 +657,10 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
-        Expression::MapToStruct(MapToStructExpression {
-            map_expr,
-            output_schema,
-        }) => {
+        Expression::MapToStruct(MapToStructExpression { map_expr }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, map_expr, child_list_id);
-            let schema_handle = Handle::from(output_schema.clone());
-            call!(
-                visitor,
-                visit_map_to_struct,
-                sibling_list_id,
-                child_list_id,
-                schema_handle
-            );
+            call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
         }
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }

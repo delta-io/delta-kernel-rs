@@ -343,11 +343,14 @@ pub fn evaluate_expression(
             // Return as StructArray
             Ok(Arc::new(StructArray::from(result)) as ArrayRef)
         }
-        (MapToStruct(m), _) => {
+        (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let result = evaluate_map_to_struct(&map_arr, m.output_schema.as_ref())?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
             Ok(Arc::new(result) as ArrayRef)
         }
+        (MapToStruct(_), dt) => Err(Error::Generic(format!(
+            "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
+        ))),
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
 }
@@ -671,7 +674,7 @@ fn evaluate_map_to_struct(
 
     // Pre-build a builder and resolve the PrimitiveType for each output field.
     let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::with_capacity(fields.len());
-    let mut primitive_types: Vec<&PrimitiveType> = Vec::with_capacity(fields.len());
+    let mut target_types: Vec<&PrimitiveType> = Vec::with_capacity(fields.len());
     for field in &fields {
         let prim = match field.data_type() {
             DataType::Primitive(p) => p,
@@ -681,7 +684,7 @@ fn evaluate_map_to_struct(
                 )));
             }
         };
-        primitive_types.push(prim);
+        target_types.push(prim);
         let arrow_type = ArrowDataType::try_from_kernel(field.data_type())?;
         builders.push(arrow_array::make_builder(&arrow_type, num_rows));
     }
@@ -695,10 +698,13 @@ fn evaluate_map_to_struct(
             .map(|(i, f)| (f.name().as_str(), i)),
     );
 
-    // Track the offset of the most recent match per field. Because Arrow enforces monotonically
-    // increasing offsets, we can check `found >= entry_start` to determine if a match belongs
-    // to the current row without clearing or reinitializing each iteration.
-    let mut found_values: Vec<i32> = vec![-1; fields.len()];
+    // Per-field index into the flat `map_keys`/`map_values` arrays, tracking the most recently
+    // matched map entry for each output field. For a given row with entry range
+    // `[entry_start, entry_end)`, checking `matched_entry_idx[i] >= entry_start` tells us whether
+    // field `i` was found in that row's map. Because Arrow enforces monotonically increasing
+    // offsets, stale matches from earlier rows are naturally below the current row's `entry_start`,
+    // so we never need to clear or reinitialize this vector between rows.
+    let mut matched_entry_idx: Vec<i32> = vec![-1; fields.len()];
 
     let offsets = map_array.value_offsets();
     let mut entry_end = offsets[0];
@@ -713,20 +719,20 @@ fn evaluate_map_to_struct(
             for entry_idx in entry_start..entry_end {
                 let key = map_keys.value(entry_idx as usize);
                 if let Some(&i) = field_indices.get(key) {
-                    found_values[i] = entry_idx;
+                    matched_entry_idx[i] = entry_idx;
                 }
             }
         }
 
         for (i, field) in fields.iter().enumerate() {
-            let entry_idx = found_values[i];
+            let entry_idx = matched_entry_idx[i];
             let builder = builders[i].as_mut();
 
             // Only process values belonging to the current row (entry_idx >= entry_start)
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                let scalar = primitive_types[i].parse_scalar(raw)?;
+                let scalar = target_types[i].parse_scalar(raw)?;
                 scalar.append_to(builder, 1)?;
             } else {
                 Scalar::append_null(builder, field.data_type(), 1)?;
@@ -1821,13 +1827,14 @@ mod tests {
         use crate::arrow::array::Date32Array;
 
         let batch = create_partition_map_batch();
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
+        let output_schema = StructType::new_unchecked(vec![
             StructField::nullable("region", DataType::STRING),
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("date", DataType::DATE),
-        ]));
-        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        ]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
         let regions = structs
@@ -1865,12 +1872,11 @@ mod tests {
     #[test]
     fn test_map_to_struct_missing_key() {
         let batch = create_partition_map_batch();
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "nonexistent",
-            DataType::STRING,
-        )]));
-        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("nonexistent", DataType::STRING)]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
             .column(0)
@@ -1899,12 +1905,11 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "count",
-            DataType::INTEGER,
-        )]));
-        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None);
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("count", DataType::INTEGER)]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
 
@@ -1927,12 +1932,11 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "x",
-            DataType::STRING,
-        )]));
-        let expr = Expr::map_to_struct(column_expr!("pv"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("x", DataType::STRING)]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let col = structs
             .column(0)
@@ -1949,12 +1953,11 @@ mod tests {
         let strings = StringArray::from(vec![Some("hello")]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "x",
-            DataType::STRING,
-        )]));
-        let expr = Expr::map_to_struct(column_expr!("s"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None);
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("x", DataType::STRING)]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("s"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type));
         assert!(result.is_err());
     }
 }

@@ -114,7 +114,6 @@ struct Unknown {
 };
 struct MapToStructExpr {
   ExpressionItemList child_expr;
-  HandleSharedSchema output_schema;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -387,11 +386,9 @@ void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSli
 
 void visit_map_to_struct_expr(void* data,
                               uintptr_t sibling_list_id,
-                              uintptr_t child_list_id,
-                              HandleSharedSchema output_schema) {
+                              uintptr_t child_list_id) {
   struct MapToStructExpr* m2s = malloc(sizeof(struct MapToStructExpr));
   m2s->child_expr = get_expr_list(data, child_list_id);
-  m2s->output_schema = output_schema;
   put_expr_item(data, sibling_list_id, m2s, MapToStruct);
 }
 
@@ -665,7 +662,6 @@ void free_expression_item(ExpressionItem ref) {
     case MapToStruct: {
       struct MapToStructExpr* m2s = ref.ref;
       free_expression_list(m2s->child_expr);
-      free_schema(m2s->output_schema);
       free(m2s);
       break;
     }

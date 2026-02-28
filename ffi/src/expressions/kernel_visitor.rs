@@ -11,7 +11,6 @@ use delta_kernel::DeltaResult;
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use crate::scan::{EngineExpression, EnginePredicate};
-use crate::SharedSchema;
 use crate::{
     AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
     ReferenceSet, TryFromStringSlice,
@@ -459,20 +458,14 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
-/// Visit a MapToStruct expression. The `child_expr` is the map expression, and
-/// `output_schema` is the schema handle describing the struct to extract from the map.
-///
-/// # Safety
-/// The output_schema handle must be valid.
+/// Visit a MapToStruct expression. The `child_expr` is the map expression.
 #[no_mangle]
-pub unsafe extern "C" fn visit_expression_map_to_struct(
+pub extern "C" fn visit_expression_map_to_struct(
     state: &mut KernelExpressionVisitorState,
     child_expr: usize,
-    output_schema: Handle<SharedSchema>,
 ) -> usize {
-    let schema_ref = output_schema.clone_as_arc();
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
-        wrap_expression(state, Expression::map_to_struct(expr, schema_ref))
+        wrap_expression(state, Expression::map_to_struct(expr))
     })
 }
 
