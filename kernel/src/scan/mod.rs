@@ -903,8 +903,12 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
+        fn scan_metadata_callback(
+            batches: &mut Vec<state::ScanFile>,
+            file: state::ScanFile,
+        ) -> bool {
             batches.push(file);
+            true
         }
 
         debug!(

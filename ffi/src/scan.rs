@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
+use delta_kernel::{DeltaResult, Error, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -330,9 +330,22 @@ pub struct Stats {
 /// dv to consider or not.  This allows engines to ignore dv info if there isn't any without needing
 /// to make another ffi call at all.
 #[repr(C)]
-pub struct CDvInfo<'a> {
-    info: &'a DvInfo,
+pub struct CDvInfo {
+    info: DvInfo,
     has_vector: bool,
+}
+
+#[handle_descriptor(target=CDvInfo, mutable=false, sized=true)]
+pub struct SharedDvInfo;
+
+/// Check if a deletion vector is present in the [`SharedDvInfo`].
+///
+/// # Safety
+/// Engine is responsible for passing a valid `SharedDvInfo` handle.
+#[no_mangle]
+pub unsafe extern "C" fn dv_info_has_vector(dv_info: Handle<SharedDvInfo>) -> bool {
+    let dv_info = unsafe { dv_info.as_ref() };
+    dv_info.has_vector
 }
 
 /// This callback will be invoked for each valid file that needs to be read for a scan.
@@ -342,20 +355,26 @@ pub struct CDvInfo<'a> {
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `mod_time`: an `i64` which is the time the file was created, as milliseconds since the epoch
-/// * `dv_info`: a [`CDvInfo`] struct, which allows getting the selection vector for this file
-/// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
-///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
+/// * `dv_info`: a [`Handle<SharedDvInfo>`] which allows getting the selection vector for this file.
+///   The engine can store this handle and parse it later in a different thread for better parallelization.
+///   The engine must call `free_kernel_dv_info` when done with it.
+/// * `transform`: An optional expression handle. If present, it _must_ be applied to physical data to
+///   convert it to the correct logical format. The engine can store this handle and parse it later in
+///   a different thread for better parallelization. The engine must call `free_kernel_expression` when
+///   done with it.
 /// * `partition_values`: [DEPRECATED] a `HashMap<String, String>` which are partition values
+///
+/// The callback should return `true` to continue iteration, or `false` to stop early.
 type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
     mod_time: i64,
     stats: Option<&Stats>,
-    dv_info: &CDvInfo,
-    transform: Option<&Expression>,
+    dv_info: Handle<SharedDvInfo>,
+    transform: OptionalValue<Handle<SharedExpression>>,
     partition_map: &CStringMap,
-);
+) -> bool;
 
 #[derive(Default)]
 pub struct CStringMap {
@@ -462,13 +481,14 @@ pub unsafe extern "C" fn get_transform_for_row(
 /// Engine is responsible for providing valid pointers for each argument
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_dv(
-    dv_info: &DvInfo,
+    dv_info: Handle<SharedDvInfo>,
     engine: Handle<SharedExternEngine>,
     root_url: KernelStringSlice,
 ) -> ExternResult<KernelBoolSlice> {
+    let dv_info_ref = unsafe { dv_info.as_ref() };
     let engine = unsafe { engine.as_ref() };
     let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    selection_vector_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
+    selection_vector_from_dv_impl(&dv_info_ref.info, engine, root_url).into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
@@ -488,13 +508,14 @@ fn selection_vector_from_dv_impl(
 /// Engine is responsible for providing valid pointers for each argument
 #[no_mangle]
 pub unsafe extern "C" fn row_indexes_from_dv(
-    dv_info: &DvInfo,
+    dv_info: Handle<SharedDvInfo>,
     engine: Handle<SharedExternEngine>,
     root_url: KernelStringSlice,
 ) -> ExternResult<KernelRowIndexArray> {
+    let dv_info_ref = unsafe { dv_info.as_ref() };
     let engine = unsafe { engine.as_ref() };
     let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    row_indexes_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
+    row_indexes_from_dv_impl(&dv_info_ref.info, engine, root_url).into_extern_result(&engine)
 }
 
 fn row_indexes_from_dv_impl(
@@ -508,20 +529,31 @@ fn row_indexes_from_dv_impl(
     }
 }
 
+/// Free the memory for the passed SharedDvInfo
+///
+/// # Safety
+/// Engine is responsible for passing a valid SharedDvInfo
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_dv_info(data: Handle<SharedDvInfo>) {
+    data.drop_handle();
+}
+
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
-// and then calls the ffi specified callback
-fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
-    let transform = scan_file.transform.map(|e| e.as_ref().clone());
+// and then calls the ffi specified callback. Returns true to continue iteration, false to stop.
+fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) -> bool {
+    let transform = scan_file.transform.map(|e| e.into());
     let partition_map = CStringMap {
         values: scan_file.partition_values,
     };
     let stats = scan_file.stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
-    let cdv_info = CDvInfo {
-        info: &scan_file.dv_info,
-        has_vector: scan_file.dv_info.has_vector(),
+    let has_vector = scan_file.dv_info.has_vector();
+    let dv_info = CDvInfo {
+        info: scan_file.dv_info,
+        has_vector,
     };
+    let dv_info_handle: Handle<SharedDvInfo> = Arc::new(dv_info).into();
     let path = scan_file.path.as_str();
     (context.callback)(
         context.engine_context,
@@ -529,10 +561,10 @@ fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
         scan_file.size,
         scan_file.modification_time,
         stats.as_ref(),
-        &cdv_info,
-        transform.as_ref(),
+        dv_info_handle,
+        transform.into(),
         &partition_map,
-    );
+    )
 }
 
 // Wrap up stuff from C so we can pass it through to our callback

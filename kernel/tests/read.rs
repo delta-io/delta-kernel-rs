@@ -333,8 +333,9 @@ fn read_with_execute(
     Ok(())
 }
 
-fn scan_metadata_callback(batches: &mut Vec<ScanFile>, scan_file: ScanFile) {
+fn scan_metadata_callback(batches: &mut Vec<ScanFile>, scan_file: ScanFile) -> bool {
     batches.push(scan_file);
+    true
 }
 
 fn read_with_scan_metadata(

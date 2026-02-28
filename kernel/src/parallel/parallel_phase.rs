@@ -260,6 +260,7 @@ mod tests {
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 ps.push(scan_file.path);
+                true
             })
         })?;
 
@@ -346,6 +347,7 @@ mod tests {
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 ps.push(scan_file.path);
+                true
             })
         })?;
 
@@ -378,6 +380,7 @@ mod tests {
         let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file: ScanFile| {
                 ps.push(scan_file.path);
+                true
             })
         })?;
         paths.sort();
@@ -404,6 +407,7 @@ mod tests {
         let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 ps.push(scan_file.path);
+                true
             })
         })?;
 
@@ -451,6 +455,7 @@ mod tests {
                                     acc,
                                     |ps: &mut Vec<String>, scan_file| {
                                         ps.push(scan_file.path);
+                                        true
                                     },
                                 )
                             })
