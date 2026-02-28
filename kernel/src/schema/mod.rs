@@ -1295,7 +1295,6 @@ impl ColumnNamesAndTypes {
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
     }
-
 }
 
 impl From<(Vec<ColumnName>, Vec<DataType>)> for ColumnNamesAndTypes {
