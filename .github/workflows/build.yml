@@ -219,7 +219,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls,uc-catalog --partition count:${{ matrix.partition }} / 3
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls,uc-catalog --partition count:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest
