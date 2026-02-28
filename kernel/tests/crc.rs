@@ -10,7 +10,7 @@ use delta_kernel::snapshot::{FileStats, Snapshot};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::DeltaResult;
 use object_store::local::LocalFileSystem;
-use test_utils::{copy_directory, test_table_setup};
+use test_utils::test_table_setup;
 
 #[tokio::test]
 async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
@@ -56,8 +56,11 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "clustered-table")]
 #[tokio::test]
 async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
+    use test_utils::copy_directory;
+
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
