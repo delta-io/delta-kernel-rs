@@ -39,12 +39,16 @@ impl CrcLoadResult {
 /// Lazy loader for CRC info that ensures it's only read once.
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
+/// Can also hold a precomputed CRC (e.g. from post-commit CRC merge) without a backing file.
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
     crc_file: Option<ParsedLogPath>,
     /// Cached load result (loaded lazily, at most once).
     cached: OnceLock<CrcLoadResult>,
+    /// Version of a precomputed CRC (set when CRC was computed rather than read from file).
+    /// When set, this takes priority over `crc_file` for version checks.
+    precomputed_version: Option<Version>,
 }
 
 impl LazyCrc {
@@ -55,6 +59,23 @@ impl LazyCrc {
         Self {
             crc_file,
             cached: OnceLock::new(),
+            precomputed_version: None,
+        }
+    }
+
+    /// Create a `LazyCrc` with a precomputed CRC value (no backing file).
+    ///
+    /// The CRC is immediately available via `get_or_load` without any I/O. The `version`
+    /// parameter records which table version this CRC corresponds to, enabling
+    /// `get_if_loaded_at_version` to work for chained commits.
+    pub(crate) fn new_precomputed(crc: Crc, version: Version) -> Self {
+        let cached = OnceLock::new();
+        // OnceLock::set cannot fail here because we just created it
+        let _ = cached.set(CrcLoadResult::Loaded(Arc::new(crc)));
+        Self {
+            crc_file: None,
+            cached,
+            precomputed_version: Some(version),
         }
     }
 
@@ -90,18 +111,30 @@ impl LazyCrc {
         self.get_or_load(engine).get()
     }
 
+    /// Returns the CRC only if it is already loaded (no I/O) and matches the given version.
+    ///
+    /// This is purely opportunistic: it returns `Some` only when the CRC was previously loaded
+    /// (via `get_or_load`) or precomputed (via `new_precomputed`) AND the version matches.
+    pub(crate) fn get_if_loaded_at_version(&self, version: Version) -> Option<&Arc<Crc>> {
+        if self.crc_version() != Some(version) {
+            return None;
+        }
+        self.cached.get()?.get()
+    }
+
     /// Check if CRC has been loaded (without triggering loading).
     #[allow(dead_code)] // Used in future phases (domain metadata, ICT)
     pub(crate) fn is_loaded(&self) -> bool {
         self.cached.get().is_some()
     }
 
-    /// Returns the CRC version if a CRC file exists (without loading content).
+    /// Returns the CRC version, checking precomputed version first, then CRC file version.
     ///
-    /// This can be used to check if a CRC exists at the snapshot version before deciding whether
-    /// to load it.
+    /// This enables chaining: a post-commit snapshot with a precomputed CRC at version N+1
+    /// can serve as the read snapshot for a transaction targeting version N+2.
     pub(crate) fn crc_version(&self) -> Option<Version> {
-        self.crc_file.as_ref().map(|f| f.version)
+        self.precomputed_version
+            .or_else(|| self.crc_file.as_ref().map(|f| f.version))
     }
 }
 
@@ -222,5 +255,74 @@ mod tests {
         assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
         assert!(result.get().is_none());
         assert!(lazy.is_loaded());
+    }
+
+    // ===== Precomputed LazyCrc Tests =====
+
+    fn test_crc(table_size_bytes: i64) -> Crc {
+        Crc {
+            table_size_bytes,
+            num_files: 1,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata: Metadata::default(),
+            protocol: Protocol::default(),
+            txn_id: None,
+            in_commit_timestamp_opt: None,
+            set_transactions: None,
+            domain_metadata: None,
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
+
+    #[test]
+    fn test_lazy_crc_precomputed() {
+        let crc = test_crc(42);
+        let lazy = LazyCrc::new_precomputed(crc, 5);
+
+        assert!(lazy.is_loaded());
+        assert_eq!(lazy.crc_version(), Some(5));
+
+        // get_if_loaded_at_version should return the CRC at the correct version
+        let loaded = lazy.get_if_loaded_at_version(5);
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().table_size_bytes, 42);
+
+        // Wrong version should return None
+        assert!(lazy.get_if_loaded_at_version(4).is_none());
+        assert!(lazy.get_if_loaded_at_version(6).is_none());
+    }
+
+    #[test]
+    fn test_lazy_crc_precomputed_version_takes_priority() {
+        // Even if there's no crc_file, precomputed_version should be returned
+        let crc = test_crc(100);
+        let lazy = LazyCrc::new_precomputed(crc, 3);
+        assert_eq!(lazy.crc_version(), Some(3));
+    }
+
+    #[test]
+    fn test_get_if_loaded_at_version_not_loaded() {
+        // CRC file exists but not yet loaded -> should return None (no I/O)
+        let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root(), 5)));
+        assert!(!lazy.is_loaded());
+        assert!(lazy.get_if_loaded_at_version(5).is_none());
+    }
+
+    #[test]
+    fn test_get_if_loaded_at_version_wrong_version() {
+        let crc = test_crc(100);
+        let lazy = LazyCrc::new_precomputed(crc, 5);
+        assert!(lazy.get_if_loaded_at_version(3).is_none());
+    }
+
+    #[test]
+    fn test_get_if_loaded_at_version_no_crc() {
+        let lazy = LazyCrc::new(None);
+        assert!(lazy.get_if_loaded_at_version(0).is_none());
     }
 }

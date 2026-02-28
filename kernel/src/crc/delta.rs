@@ -1,5 +1,3 @@
-// TODO: remove after crc_write_2 integrates these types
-#![allow(dead_code)]
 //! CRC delta: the change a single commit introduces to CRC state.
 //!
 //! Note: "delta" here means "difference/change", not a Delta commit (.json) file.

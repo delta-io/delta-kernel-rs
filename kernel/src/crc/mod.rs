@@ -9,6 +9,7 @@ pub(crate) mod delta;
 mod lazy;
 mod reader;
 
+pub(crate) use delta::{CrcDelta, FileStatsDelta};
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 
@@ -109,6 +110,68 @@ pub(crate) struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
+}
+
+impl Crc {
+    /// Apply a [`CrcDelta`] to produce a new CRC at the next version.
+    ///
+    /// Updates file counts and sizes from the delta. Protocol and Metadata are carried forward
+    /// from the existing CRC (unchanged by the commit in the MVP; future: replaced if the
+    /// delta contains new P&M).
+    pub(crate) fn apply_delta(&self, delta: &CrcDelta) -> Crc {
+        let stats = &delta.file_stats;
+        Crc {
+            table_size_bytes: self.table_size_bytes + stats.size_bytes_adds
+                - stats.size_bytes_removes,
+            num_files: self.num_files + stats.num_adds - stats.num_removes,
+            num_metadata: 1,
+            num_protocol: 1,
+            // TODO: propagate P&M changes once kernel supports protocol/metadata evolution
+            metadata: self.metadata.clone(),
+            protocol: self.protocol.clone(),
+            txn_id: None,
+            in_commit_timestamp_opt: delta.in_commit_timestamp,
+            // TODO: merge set_transactions from delta
+            set_transactions: None,
+            // TODO: merge domain_metadata from delta
+            domain_metadata: None,
+            // TODO: compute file_size_histogram from delta
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
+
+    /// Create a new initial CRC for a newly created table (version 0).
+    pub(crate) fn new_for_created_table(
+        protocol: Protocol,
+        metadata: Metadata,
+        delta: &CrcDelta,
+    ) -> Crc {
+        let stats = &delta.file_stats;
+        Crc {
+            table_size_bytes: stats.size_bytes_adds,
+            num_files: stats.num_adds,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata,
+            protocol,
+            txn_id: None,
+            in_commit_timestamp_opt: delta.in_commit_timestamp,
+            // TODO: capture set_transactions from create-table delta
+            set_transactions: None,
+            // TODO: capture domain_metadata from create-table delta
+            domain_metadata: None,
+            // TODO: compute file_size_histogram from initial adds
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
 }
 
 /// Visitor for extracting data from CRC files.
@@ -221,7 +284,6 @@ impl RowVisitor for CrcVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
 
@@ -278,5 +340,68 @@ mod tests {
             ),
         ]);
         assert_eq!(schema, expected);
+    }
+
+    fn test_crc() -> Crc {
+        Crc {
+            table_size_bytes: 1000,
+            num_files: 5,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata: Metadata::default(),
+            protocol: Protocol::default(),
+            txn_id: None,
+            in_commit_timestamp_opt: Some(100),
+            set_transactions: None,
+            domain_metadata: None,
+            file_size_histogram: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_delta() {
+        let crc = test_crc();
+        let delta = CrcDelta {
+            file_stats: FileStatsDelta {
+                num_adds: 3,
+                num_removes: 1,
+                size_bytes_adds: 600,
+                size_bytes_removes: 200,
+            },
+            in_commit_timestamp: Some(200),
+        };
+
+        let merged = crc.apply_delta(&delta);
+        assert_eq!(merged.table_size_bytes, 1400); // 1000 + 600 - 200
+        assert_eq!(merged.num_files, 7); // 5 + 3 - 1
+        assert_eq!(merged.in_commit_timestamp_opt, Some(200));
+        assert_eq!(merged.metadata, Metadata::default());
+        assert_eq!(merged.protocol, Protocol::default());
+        assert!(merged.domain_metadata.is_none());
+    }
+
+    #[test]
+    fn test_new_for_created_table() {
+        let delta = CrcDelta {
+            file_stats: FileStatsDelta {
+                num_adds: 3,
+                num_removes: 0,
+                size_bytes_adds: 900,
+                size_bytes_removes: 0,
+            },
+            in_commit_timestamp: Some(12345),
+        };
+
+        let crc = Crc::new_for_created_table(Protocol::default(), Metadata::default(), &delta);
+        assert_eq!(crc.table_size_bytes, 900);
+        assert_eq!(crc.num_files, 3);
+        assert_eq!(crc.num_metadata, 1);
+        assert_eq!(crc.num_protocol, 1);
+        assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
+        assert!(crc.domain_metadata.is_none());
     }
 }
