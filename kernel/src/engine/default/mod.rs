@@ -261,6 +261,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 physical_data,
                 physical_partition_values,
                 Some(write_context.stats_columns()),
+                write_context.parquet_writer_config(),
             )
             .await
     }

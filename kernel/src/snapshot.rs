@@ -29,7 +29,7 @@ use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, ParquetWriterConfig, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -494,14 +494,21 @@ impl Snapshot {
     /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
+        let compression = self
+            .table_configuration()
+            .table_properties()
+            .parquet_compression_codec
+            .unwrap_or_default();
         let writer = self.create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+        engine.parquet_handler().write_parquet_file(
+            checkpoint_path.clone(),
+            Box::new(lazy_data),
+            &ParquetWriterConfig { compression },
+        )?;
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
