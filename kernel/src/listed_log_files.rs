@@ -797,6 +797,9 @@ mod list_log_files_with_log_tail_tests {
             ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
                 panic!("read_files should not be called during listing");
             }
+            fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+                panic!("put should not be called during listing");
+            }
             fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
                 panic!("copy_atomic should not be called during listing");
             }
