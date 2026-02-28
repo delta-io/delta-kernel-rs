@@ -47,16 +47,18 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     /// - `engine`: Engine for reading parquet files
     /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
     /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
+    /// - `read_schema`: Schema to use for reading checkpoint files
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         processor: P,
         leaf_files: Vec<FileMeta>,
+        read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
-            .read_parquet_files(&leaf_files, Self::file_read_schema(), None)?
+            .read_parquet_files(&leaf_files, read_schema, None)?
             .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,
@@ -128,7 +130,8 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
-    use crate::parallel::sequential_phase::AfterSequential;
+    use crate::parallel::parallel_scan_metadata::AfterPhase1ScanMetadata;
+    use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -193,10 +196,7 @@ mod tests {
             .map(|path| FileActionKey::new(*path, None))
             .collect();
 
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        };
+        let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
 
         ScanLogReplayProcessor::new_with_seen_files(
             engine,
@@ -254,8 +254,12 @@ mod tests {
             size: get_file_size(&store, sidecar_path).await,
         };
 
-        let mut parallel =
-            ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta])?;
+        let mut parallel = ParallelPhase::try_new(
+            Arc::new(engine),
+            processor.clone(),
+            vec![file_meta],
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -341,7 +345,12 @@ mod tests {
             },
         ];
 
-        let mut parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas)?;
+        let mut parallel = ParallelPhase::try_new(
+            Arc::new(engine),
+            processor.clone(),
+            file_metas,
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -408,23 +417,18 @@ mod tests {
         })?;
 
         match phase1.finish()? {
-            AfterSequential::Done(_) => {}
-            AfterSequential::Parallel { processor, files } => {
-                let processor = if with_serde {
-                    // TODO: Properly integrate checkpoint_info from parallel_scan_metadata API
-                    // For now, use a default checkpoint_info for serialization tests
-                    let checkpoint_info = CheckpointReadInfo {
-                        has_stats_parsed: false,
-                        checkpoint_read_schema: get_log_add_schema().clone(),
-                    };
-                    let serialized_state = processor.into_serializable_state(checkpoint_info)?;
-                    ScanLogReplayProcessor::from_serializable_state(
-                        engine.as_ref(),
-                        serialized_state,
-                    )?
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+                let final_state = if with_serde {
+                    // Serialize and then deserialize to test the serde path
+                    let scan_span = state.scan_span.clone();
+                    let serialized_bytes = state.into_bytes()?;
+                    Phase2State::from_bytes(engine.as_ref(), &serialized_bytes, scan_span)?
                 } else {
-                    Arc::new(processor)
+                    // Non-serde: just use the state directly
+                    state
                 };
+                let final_state = Arc::new(final_state);
 
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
                     files.into_iter().map(|f| vec![f]).collect()
@@ -436,17 +440,18 @@ mod tests {
                     .into_iter()
                     .map(|partition_files| {
                         let engine = engine.clone();
-                        let processor = processor.clone();
+                        let state = final_state.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
-                            let mut parallel = ParallelPhase::try_new(
+
+                            let mut phase2 = Phase2ScanMetadata::try_new(
                                 engine.clone(),
-                                processor.clone(),
+                                state,
                                 partition_files,
                             )?;
 
-                            parallel.try_fold(Vec::new(), |acc, metadata_res| {
+                            phase2.try_fold(Vec::new(), |acc, metadata_res| {
                                 metadata_res?.visit_scan_files(
                                     acc,
                                     |ps: &mut Vec<String>, scan_file| {
@@ -535,6 +540,74 @@ mod tests {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+
+        // Get expected paths using single-node scan_metadata with skip_stats=true
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_skip_stats(true)
+            .build()?;
+        let mut single_node_iter = scan.scan_metadata(engine.as_ref())?;
+        let mut expected_paths = single_node_iter.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                assert!(
+                    scan_file.stats.is_none(),
+                    "Single-node: scan_file.stats should be None when skip_stats=true"
+                );
+                ps.push(scan_file.path);
+            })
+        })?;
+        expected_paths.sort();
+
+        // Run parallel workflow with skip_stats=true
+        let scan = snapshot.scan_builder().with_skip_stats(true).build()?;
+        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+
+        // Verify stats is None in phase1 results and collect paths
+        let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                assert!(
+                    scan_file.stats.is_none(),
+                    "Phase1: scan_file.stats should be None when skip_stats=true"
+                );
+                ps.push(scan_file.path);
+            })
+        })?;
+
+        match phase1.finish()? {
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+                // Verify stats is None in phase2 results and collect paths
+                let mut phase2 =
+                    Phase2ScanMetadata::try_new(engine.clone(), Arc::new(state), files)?;
+
+                let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
+                    metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                        assert!(
+                            scan_file.stats.is_none(),
+                            "Phase2: scan_file.stats should be None when skip_stats=true"
+                        );
+                        ps.push(scan_file.path);
+                    })
+                })?;
+
+                all_paths.extend(phase2_paths);
+            }
+        }
+
+        // Verify parallel workflow returns same files as single-node
+        all_paths.sort();
+        assert_eq!(
+            all_paths, expected_paths,
+            "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
+        );
+
         Ok(())
     }
 }
