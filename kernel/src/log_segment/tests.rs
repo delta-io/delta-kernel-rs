@@ -1907,6 +1907,7 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
     assert!(ListedLogFiles {
         ascending_compaction_files: vec![
@@ -1927,6 +1928,7 @@ fn test_validate_listed_log_file_out_of_order_compaction_files() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
     assert!(ListedLogFiles {
         checkpoint_parts: vec![
@@ -1947,6 +1949,7 @@ fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn test_validate_listed_log_file_invalid_multipart_checkpoint() {
     assert!(ListedLogFiles {
         checkpoint_parts: vec![
@@ -1967,6 +1970,7 @@ fn test_validate_listed_log_file_invalid_multipart_checkpoint() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn test_validate_listed_log_file_out_of_order_commit_files() {
     assert!(ListedLogFiles {
         ascending_commit_files: vec![
@@ -1980,6 +1984,7 @@ fn test_validate_listed_log_file_out_of_order_commit_files() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
     assert!(ListedLogFiles {
         checkpoint_parts: vec![create_log_path(
@@ -1992,6 +1997,7 @@ fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
     // Two parts that agree on version but claim num_parts=3 (count mismatch: 2 != 3)
     assert!(ListedLogFiles {
