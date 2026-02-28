@@ -276,7 +276,7 @@ impl CheckpointWriter {
         let stats_schema = self
             .snapshot
             .table_configuration()
-            .build_expected_stats_schemas(clustering_columns.as_deref())?
+            .build_expected_stats_schemas(clustering_columns.as_deref(), None)?
             .physical;
 
         // Select schema based on V2 checkpoint support
