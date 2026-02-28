@@ -202,7 +202,7 @@ jobs:
           make
           make test
   miri:
-    name: "Miri"
+    name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest
     strategy:
       matrix:
