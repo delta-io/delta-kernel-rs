@@ -117,6 +117,7 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
 
+const DEFAULT_DATA_SKIPPING_STRING_PREFIX_LENGTH: usize = 32;
 /// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
 static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
     let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
@@ -914,6 +915,13 @@ impl<S> Transaction<S> {
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
+        let string_prefix_length = self
+            .read_snapshot
+            .table_configuration()
+            .table_properties()
+            .data_skipping_string_prefix_length
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or(DEFAULT_DATA_SKIPPING_STRING_PREFIX_LENGTH);
 
         WriteContext::new(
             target_dir.clone(),
@@ -922,6 +930,7 @@ impl<S> Transaction<S> {
             Arc::new(logical_to_physical),
             column_mapping_mode,
             stats_columns,
+            string_prefix_length,
         )
     }
 
@@ -1215,6 +1224,8 @@ pub struct WriteContext {
     column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
+    /// Maximum number of chars used for string min/max statistics truncation.
+    string_prefix_length: usize,
 }
 
 impl WriteContext {
@@ -1225,6 +1236,7 @@ impl WriteContext {
         logical_to_physical: ExpressionRef,
         column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
+        string_prefix_length: usize,
     ) -> Self {
         WriteContext {
             target_dir,
@@ -1233,6 +1245,7 @@ impl WriteContext {
             logical_to_physical,
             column_mapping_mode,
             stats_columns,
+            string_prefix_length,
         }
     }
 
@@ -1262,6 +1275,11 @@ impl WriteContext {
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
         &self.stats_columns
+    }
+
+    /// Returns the configured string prefix length for data skipping statistics.
+    pub fn string_prefix_length(&self) -> usize {
+        self.string_prefix_length
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.

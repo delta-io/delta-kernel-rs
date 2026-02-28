@@ -261,6 +261,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 physical_data,
                 physical_partition_values,
                 Some(write_context.stats_columns()),
+                Some(write_context.string_prefix_length()),
             )
             .await
     }

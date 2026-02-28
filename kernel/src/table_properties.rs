@@ -37,6 +37,7 @@ pub(crate) const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
 pub(crate) const COLUMN_MAPPING_MAX_COLUMN_ID: &str = "delta.columnMapping.maxColumnId";
 pub(crate) const DATA_SKIPPING_NUM_INDEXED_COLS: &str = "delta.dataSkippingNumIndexedCols";
 pub(crate) const DATA_SKIPPING_STATS_COLUMNS: &str = "delta.dataSkippingStatsColumns";
+pub(crate) const DATA_SKIPPING_STRING_PREFIX_LENGTH: &str = "delta.dataSkippingStringPrefixLength";
 pub(crate) const DELETED_FILE_RETENTION_DURATION: &str = "delta.deletedFileRetentionDuration";
 pub(crate) const ENABLE_CHANGE_DATA_FEED: &str = "delta.enableChangeDataFeed";
 pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
@@ -110,6 +111,10 @@ pub struct TableProperties {
     /// data skipping functionality. This property takes precedence over
     /// `delta.dataSkippingNumIndexedCols`.
     pub data_skipping_stats_columns: Option<Vec<ColumnName>>,
+
+    /// For string columns, the prefix length to store in the data skipping index. When set,
+    /// overrides the default prefix length of 32 characters.
+    pub data_skipping_string_prefix_length: Option<u64>,
 
     /// The shortest duration for Delta Lake to keep logically deleted data files before deleting
     /// them physically. This is to prevent failures in stale readers after compactions or partition
@@ -422,6 +427,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_data_skipping_string_prefix_length() {
+        let properties = HashMap::from([(
+            "delta.dataSkippingStringPrefixLength".to_string(),
+            "64".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(
+            table_properties.data_skipping_string_prefix_length,
+            Some(64)
+        );
+    }
+
+    #[test]
     fn known_key_unknown_val() {
         let properties = HashMap::from([(APPEND_ONLY.to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
@@ -464,6 +482,7 @@ mod tests {
             (COLUMN_MAPPING_MODE, "id"),
             (DATA_SKIPPING_NUM_INDEXED_COLS, "-1"),
             (DATA_SKIPPING_STATS_COLUMNS, "col1,col2"),
+            (DATA_SKIPPING_STRING_PREFIX_LENGTH, "64"),
             (DELETED_FILE_RETENTION_DURATION, "interval 1 second"),
             (ENABLE_CHANGE_DATA_FEED, "true"),
             (ENABLE_DELETION_VECTORS, "true"),
@@ -501,6 +520,7 @@ mod tests {
             column_mapping_mode: Some(ColumnMappingMode::Id),
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
             data_skipping_stats_columns: Some(vec![column_name!("col1"), column_name!("col2")]),
+            data_skipping_string_prefix_length: Some(64),
             deleted_file_retention_duration: Some(Duration::new(1, 0)),
             enable_change_data_feed: Some(true),
             enable_deletion_vectors: Some(true),
