@@ -215,6 +215,10 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Error during timestamp to version conversion
+    #[error("History manager error: {0}")]
+    LogHistory(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -359,5 +363,11 @@ impl From<object_store::Error> for Error {
 impl From<Infallible> for Error {
     fn from(value: Infallible) -> Self {
         match value {}
+    }
+}
+
+impl From<crate::history_manager::error::LogHistoryError> for Error {
+    fn from(value: crate::history_manager::error::LogHistoryError) -> Self {
+        Self::LogHistory(value.to_string())
     }
 }
