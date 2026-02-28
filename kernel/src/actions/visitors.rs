@@ -43,6 +43,7 @@ impl RowVisitor for MetadataVisitor {
 #[derive(Default)]
 pub(crate) struct SelectionVectorVisitor {
     pub(crate) selection_vector: Vec<bool>,
+    pub(crate) num_filtered: u64,
 }
 
 /// A single non-nullable BOOL column
@@ -61,8 +62,11 @@ impl RowVisitor for SelectionVectorVisitor {
             ))
         );
         for i in 0..row_count {
-            self.selection_vector
-                .push(getters[0].get(i, "selectionvector.output")?);
+            let selected: bool = getters[0].get(i, "selectionvector.output")?;
+            if !selected {
+                self.num_filtered += 1;
+            }
+            self.selection_vector.push(selected);
         }
         Ok(())
     }

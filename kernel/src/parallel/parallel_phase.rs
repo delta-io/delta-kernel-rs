@@ -47,16 +47,18 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     /// - `engine`: Engine for reading parquet files
     /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
     /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
+    /// - `read_schema`: Schema to use for reading checkpoint files
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         processor: P,
         leaf_files: Vec<FileMeta>,
+        read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
-            .read_parquet_files(&leaf_files, Self::file_read_schema(), None)?
+            .read_parquet_files(&leaf_files, read_schema, None)?
             .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,
@@ -128,7 +130,8 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
-    use crate::parallel::sequential_phase::AfterSequential;
+    use crate::parallel::parallel_scan_metadata::AfterPhase1ScanMetadata;
+    use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -193,10 +196,7 @@ mod tests {
             .map(|path| FileActionKey::new(*path, None))
             .collect();
 
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        };
+        let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
 
         ScanLogReplayProcessor::new_with_seen_files(
             engine,
@@ -254,8 +254,12 @@ mod tests {
             size: get_file_size(&store, sidecar_path).await,
         };
 
-        let mut parallel =
-            ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta])?;
+        let mut parallel = ParallelPhase::try_new(
+            Arc::new(engine),
+            processor.clone(),
+            vec![file_meta],
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -341,7 +345,12 @@ mod tests {
             },
         ];
 
-        let mut parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas)?;
+        let mut parallel = ParallelPhase::try_new(
+            Arc::new(engine),
+            processor.clone(),
+            file_metas,
+            CHECKPOINT_READ_SCHEMA.clone(),
+        )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
@@ -389,6 +398,7 @@ mod tests {
         predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
+        dispatcher: Option<tracing::Dispatch>,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
@@ -408,23 +418,23 @@ mod tests {
         })?;
 
         match phase1.finish()? {
-            AfterSequential::Done(_) => {}
-            AfterSequential::Parallel { processor, files } => {
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+                use crate::parallel::scan_metadata::{Phase2ScanMetadata, Phase2State};
+
+                // Extract the processor Arc to share across threads
+                // Note: We can't share Phase2State directly because it contains Cell<bool>
+                // which is not Sync. But the processor (Arc<ScanLogReplayProcessor>) is already
+                // Arc-wrapped and thread-safe.
                 let processor = if with_serde {
-                    // TODO: Properly integrate checkpoint_info from parallel_scan_metadata API
-                    // For now, use a default checkpoint_info for serialization tests
-                    let checkpoint_info = CheckpointReadInfo {
-                        has_stats_parsed: false,
-                        checkpoint_read_schema: get_log_add_schema().clone(),
-                    };
-                    let serialized_state = processor.into_serializable_state(checkpoint_info)?;
-                    ScanLogReplayProcessor::from_serializable_state(
-                        engine.as_ref(),
-                        serialized_state,
-                    )?
+                    // Serialize and then deserialize to test the serde path
+                    let serialized_bytes = state.into_bytes()?;
+                    Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?
                 } else {
-                    Arc::new(processor)
+                    // Non-serde: just use the state directly
+                    state
                 };
+                let final_state = Arc::new(final_state);
 
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
                     files.into_iter().map(|f| vec![f]).collect()
@@ -436,17 +446,22 @@ mod tests {
                     .into_iter()
                     .map(|partition_files| {
                         let engine = engine.clone();
-                        let processor = processor.clone();
+                        let state = final_state.clone();
+                        let dispatcher = dispatcher.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
+                            // Set the dispatcher in this thread to capture logs
+                            let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
+
                             assert!(!partition_files.is_empty());
-                            let mut parallel = ParallelPhase::try_new(
+
+                            let mut phase2 = Phase2ScanMetadata::try_new(
                                 engine.clone(),
-                                processor.clone(),
+                                state,
                                 partition_files,
                             )?;
 
-                            parallel.try_fold(Vec::new(), |acc, metadata_res| {
+                            phase2.try_fold(Vec::new(), |acc, metadata_res| {
                                 metadata_res?.visit_scan_files(
                                     acc,
                                     |ps: &mut Vec<String>, scan_file| {
@@ -475,8 +490,151 @@ mod tests {
         Ok(())
     }
 
+    /// Extract a metric value from logs by searching for "metric_name=value"
+    fn extract_metric(logs: &str, metric_name: &str) -> u64 {
+        if let Some(pos) = logs.find(&format!("{}=", metric_name)) {
+            let after = &logs[pos + metric_name.len() + 1..];
+            if let Some(space_pos) = after.find(char::is_whitespace) {
+                let value_str = &after[..space_pos];
+                value_str.parse().unwrap_or_else(|_| {
+                    panic!("Failed to parse {} value: {}", metric_name, value_str)
+                })
+            } else {
+                panic!("Failed to find end of {} value", metric_name);
+            }
+        } else {
+            panic!("Failed to find {} in logs", metric_name);
+        }
+    }
+
+    fn verify_metrics_in_logs(logs: &str, table_name: &str, verify_phase2: bool) {
+        // Verify Phase 1 metrics were logged
+        assert!(
+            logs.contains("Completed Phase 1 scan metadata"),
+            "Expected Phase 1 completion log for table '{}'",
+            table_name
+        );
+
+        // Extract and verify counter values from Phase 1
+        let phase1_adds = extract_metric(logs, "num_adds");
+        let phase1_removes = extract_metric(logs, "num_removes");
+        let phase1_non_file_actions = extract_metric(logs, "num_non_file_actions");
+        let _data_skipping_filtered = extract_metric(logs, "data_skipping_filtered");
+        let _partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
+
+        // For v2-checkpoints-json-with-sidecars:
+        // Phase 1 processes commits and single-part checkpoints (0 adds, 5 non-file actions)
+        // Phase 2 processes multi-part checkpoint sidecars (101 adds)
+        if table_name == "v2-checkpoints-json-with-sidecars" {
+            assert_eq!(
+                phase1_adds, 0,
+                "Expected 0 adds in Phase 1 for {}",
+                table_name
+            );
+            assert_eq!(
+                phase1_removes, 0,
+                "Expected 0 removes in Phase 1 for {}",
+                table_name
+            );
+            assert_eq!(
+                phase1_non_file_actions, 5,
+                "Expected 5 non-file actions in Phase 1 for {}",
+                table_name
+            );
+        }
+
+        // Verify timing metrics are present and parseable
+        let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
+        let _data_skipping_time = extract_metric(logs, "data_skipping_time_ms");
+        let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
+        let _phase1_duration = extract_metric(logs, "phase1_duration_ms");
+
+        // Verify Phase 2 metrics if requested
+        if verify_phase2 && logs.contains("Phase 2 needed") {
+            assert!(
+                logs.contains("Completed Phase 2 scan metadata"),
+                "Expected Phase 2 completion log for table '{}'",
+                table_name
+            );
+            assert!(
+                logs.contains("phase2_duration_ms"),
+                "Expected phase2_duration_ms in logs for table '{}'",
+                table_name
+            );
+            assert!(
+                logs.contains("thread_id"),
+                "Expected thread_id in Phase 2 logs for table '{}'",
+                table_name
+            );
+            assert!(
+                logs.contains("Phase 2 (parallel) completed"),
+                "Expected Phase 2 timing log for table '{}'",
+                table_name
+            );
+
+            // Extract Phase 2 counter values
+            // Note: There may be multiple "Completed Phase 2" logs (from multiple test configurations)
+            // Validate that EVERY Phase 2 log has the expected counter values
+            let mut total_phase2_adds = 0u64;
+            let mut search_start = 0;
+            let mut phase2_count = 0;
+
+            while let Some(pos) = logs[search_start..].find("Completed Phase 2 scan metadata") {
+                let absolute_pos = search_start + pos;
+                let remaining = &logs[absolute_pos..];
+                phase2_count += 1;
+
+                // Extract and validate num_adds
+                let adds = extract_metric(remaining, "num_adds");
+                total_phase2_adds += adds;
+
+                // Extract and validate num_removes - should ALWAYS be 0
+                let removes = extract_metric(remaining, "num_removes");
+                assert_eq!(
+                    removes, 0,
+                    "Expected num_removes=0 in Phase 2 log #{} for {} (checkpoint sidecars only have adds), found {}",
+                    phase2_count, table_name, removes
+                );
+
+                // Extract and validate num_non_file_actions - should ALWAYS be 0
+                let non_file_actions = extract_metric(remaining, "num_non_file_actions");
+                assert_eq!(
+                    non_file_actions, 0,
+                    "Expected num_non_file_actions=0 in Phase 2 log #{} for {} (checkpoint sidecars only have adds), found {}",
+                    phase2_count, table_name, non_file_actions
+                );
+
+                search_start = absolute_pos + 1;
+            }
+
+            if table_name == "v2-checkpoints-json-with-sidecars" {
+                // The test runs 4 configurations (with_serde × one_file_per_worker),
+                // and each configuration processes all 101 adds from the checkpoint sidecars.
+                // So the total across all Phase 2 logs should be 4 × 101 = 404
+                assert_eq!(
+                    total_phase2_adds, 404,
+                    "Expected total of 404 adds across all Phase 2 runs for {} (4 configs × 101 adds each, found: {})",
+                    table_name, total_phase2_adds
+                );
+            }
+        }
+    }
+
+    /// Tests parallel workflow with JSON sidecars and verifies metrics logging.
+    ///
+    /// Note: This test captures logs from spawned threads by sharing the tracing dispatcher.
+    /// If running with other tests in parallel causes flakiness, use `--test-threads=1`.
     #[test]
     fn test_parallel_with_json_sidecars() -> DeltaResult<()> {
+        use test_utils::LoggingTest;
+
+        // Set up log capture
+        let logging_test = LoggingTest::new();
+
+        // Capture the dispatcher to share with spawned threads
+        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
+        // Run all test configurations
         for with_serde in [false, true] {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
@@ -484,14 +642,21 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    Some(dispatcher.clone()),
                 )?;
             }
         }
+
+        // Verify metrics were logged (Phase 2 logs should be captured from spawned threads)
+        let logs = logging_test.logs();
+        verify_metrics_in_logs(&logs, "v2-checkpoints-json-with-sidecars", true);
+
         Ok(())
     }
 
     #[test]
     fn test_parallel_with_parquet_sidecars() -> DeltaResult<()> {
+        // No log verification needed - test_parallel_with_json_sidecars already verifies
         for with_serde in [false, true] {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
@@ -499,6 +664,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    None,
                 )?;
             }
         }
@@ -514,6 +680,7 @@ mod tests {
                     None,
                     with_serde,
                     one_file_per_worker,
+                    None,
                 )?;
             }
         }
@@ -532,9 +699,78 @@ mod tests {
                     Some(predicate.clone()),
                     with_serde,
                     one_file_per_worker,
+                    None,
                 )?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+
+        // Get expected paths using single-node scan_metadata with skip_stats=true
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_skip_stats(true)
+            .build()?;
+        let mut single_node_iter = scan.scan_metadata(engine.as_ref())?;
+        let mut expected_paths = single_node_iter.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                assert!(
+                    scan_file.stats.is_none(),
+                    "Single-node: scan_file.stats should be None when skip_stats=true"
+                );
+                ps.push(scan_file.path);
+            })
+        })?;
+        expected_paths.sort();
+
+        // Run parallel workflow with skip_stats=true
+        let scan = snapshot.scan_builder().with_skip_stats(true).build()?;
+        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+
+        // Verify stats is None in phase1 results and collect paths
+        let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                assert!(
+                    scan_file.stats.is_none(),
+                    "Phase1: scan_file.stats should be None when skip_stats=true"
+                );
+                ps.push(scan_file.path);
+            })
+        })?;
+
+        match phase1.finish()? {
+            AfterPhase1ScanMetadata::Done => {}
+            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+                // Verify stats is None in phase2 results and collect paths
+                let mut phase2 =
+                    Phase2ScanMetadata::try_new(engine.clone(), Arc::new(state), files)?;
+
+                let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
+                    metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                        assert!(
+                            scan_file.stats.is_none(),
+                            "Phase2: scan_file.stats should be None when skip_stats=true"
+                        );
+                        ps.push(scan_file.path);
+                    })
+                })?;
+
+                all_paths.extend(phase2_paths);
+            }
+        }
+
+        // Verify parallel workflow returns same files as single-node
+        all_paths.sort();
+        assert_eq!(
+            all_paths, expected_paths,
+            "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
+        );
+
         Ok(())
     }
 }

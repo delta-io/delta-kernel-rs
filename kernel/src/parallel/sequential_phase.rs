@@ -239,14 +239,14 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = sequential.finish()?;
         match (expected_sidecars, result) {
-            (sidecars, AfterPhase1ScanMetadata::Done(_)) => {
+            (sidecars, AfterPhase1ScanMetadata::Done) => {
                 assert!(
                     sidecars.is_empty(),
                     "Expected Done but got sidecars {:?}",
                     sidecars
                 );
             }
-            (expected_sidecars, AfterSequential::Parallel { files, .. }) => {
+            (expected_sidecars, AfterPhase1ScanMetadata::Phase2 { files, .. }) => {
                 assert_eq!(
                     files.len(),
                     expected_sidecars.len(),
