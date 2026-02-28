@@ -1,39 +1,24 @@
 //! CRC file reading functionality.
 
-use std::sync::Arc;
-
-use super::{Crc, CrcVisitor};
-use crate::path::ParsedLogPath;
-use crate::schema::ToSchema as _;
-use crate::{DeltaResult, Engine, Error, RowVisitor as _};
+use super::Crc;
+use crate::path::{AsUrl as _, ParsedLogPath};
+use crate::{DeltaResult, Engine, Error};
 
 /// Attempt to read and parse a CRC file.
+///
+/// Reads raw bytes via the storage handler and deserializes with serde_json.
 ///
 /// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON, missing
 /// required fields). The caller should handle errors gracefully by falling back to log replay.
 pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
-    let json_handler = engine.json_handler();
-    let file_meta = crc_path.location.clone();
-    let output_schema = Arc::new(Crc::to_schema());
-
-    let mut batches = json_handler.read_json_files(&[file_meta], output_schema, None)?;
-
-    // CRC file should have exactly one batch with one row
-    let batch = batches
+    let storage = engine.storage_handler();
+    let url = crc_path.location.as_url().clone();
+    let data = storage
+        .read_files(vec![(url, None)])?
         .next()
-        .ok_or_else(|| Error::generic("CRC file is empty"))??;
-
-    if batch.len() != 1 {
-        return Err(Error::generic(format!(
-            "CRC file should have exactly 1 row, found {}",
-            batch.len()
-        )));
-    }
-
-    // Use visitor to extract CRC fields
-    let mut visitor = CrcVisitor::default();
-    visitor.visit_rows_of(batch.as_ref())?;
-    visitor.into_crc()
+        .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
+    let crc: Crc = serde_json::from_slice(&data)?;
+    Ok(crc)
 }
 
 #[cfg(test)]
@@ -116,6 +101,16 @@ mod tests {
             ]),
         );
         assert_eq!(crc.metadata, expected_metadata);
+
+        // Skipped fields are always None (pending serde support on their types)
+        assert!(crc.txn_id.is_none());
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
+        assert!(crc.file_size_histogram.is_none());
+        assert!(crc.all_files.is_none());
+        assert!(crc.num_deleted_records_opt.is_none());
+        assert!(crc.num_deletion_vectors_opt.is_none());
+        assert!(crc.deleted_record_counts_histogram_opt.is_none());
     }
 
     #[test]
@@ -124,6 +119,6 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "Json error");
+        assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "expected value");
     }
 }
