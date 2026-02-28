@@ -19,7 +19,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::listed_log_files::ListedLogFilesBuilder;
+use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::parallel::parallel_phase::ParallelPhase;
@@ -680,12 +680,12 @@ impl Scan {
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
-        let listed_log_files = ListedLogFilesBuilder {
+        let listed_log_files = ListedLogFiles {
             ascending_commit_files,
             latest_commit_file: log_segment.latest_commit_file.clone(),
             ..Default::default()
         }
-        .build()?;
+        .validate()?;
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
             log_segment.log_root.clone(),
