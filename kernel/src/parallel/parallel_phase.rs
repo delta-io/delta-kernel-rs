@@ -715,6 +715,26 @@ mod tests {
             phase2_partition_pruning_filtered_per_run: Some(0),
         }
     )]
+    #[case::json_sidecars_with_predicate(
+        "v2-checkpoints-json-with-sidecars",
+        Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+        }),
+        ExpectedMetrics {
+            phase1_adds: 0,
+            phase1_removes: 0,
+            phase1_non_file_actions: 5,
+            phase1_data_skipping_filtered: 0,
+            phase1_partition_pruning_filtered: 0,
+            // Data skipping predicate filters 4 files (101 → 97)
+            phase2_adds_per_run: Some(97),
+            phase2_removes_per_run: Some(0),
+            phase2_non_file_actions_per_run: Some(0),
+            phase2_data_skipping_filtered_per_run: Some(4),
+            phase2_partition_pruning_filtered_per_run: Some(0),
+        }
+    )]
     fn test_parallel_workflow_with_metrics(
         #[case] table_name: &str,
         #[case] predicate: Option<PredicateRef>,
@@ -757,27 +777,6 @@ mod tests {
         verify_parallel_workflow(
             "table-without-dv-small",
             None,
-            with_serde,
-            one_file_per_worker,
-            None,
-        )
-    }
-
-    /// Tests parallel workflow with a data skipping predicate.
-    ///
-    /// This test verifies that predicates work correctly in both
-    /// serialized and non-serialized parallel workflows.
-    #[rstest::rstest]
-    fn test_parallel_with_dataskipping_predicate(
-        #[values(false, true)] with_serde: bool,
-        #[values(false, true)] one_file_per_worker: bool,
-    ) -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression as Expr};
-
-        let predicate = Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)));
-        verify_parallel_workflow(
-            "v2-checkpoints-json-with-sidecars",
-            Some(predicate),
             with_serde,
             one_file_per_worker,
             None,
