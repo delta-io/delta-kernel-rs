@@ -18,8 +18,9 @@ use tracing::instrument;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::committer::Committer;
-use crate::engine_data::FilteredEngineData;
-use crate::engine_data::{GetData, TypedGetData};
+use crate::engine_data::{
+    FilteredEngineData, FilteredRowVisitor, GetData, RowEvent, RowIndexIterator, TypedGetData,
+};
 use crate::error::Error;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
 use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
@@ -29,7 +30,7 @@ use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::current_time_ms;
-use crate::{DataType, DeltaResult, Engine, Expression, RowVisitor, SchemaTransform};
+use crate::{DataType, DeltaResult, Engine, Expression, SchemaTransform};
 use delta_kernel_derive::internal_api;
 
 use super::Transaction;
@@ -178,7 +179,7 @@ impl Transaction {
     /// Helper function to convert scan metadata iterator to filtered engine data iterator.
     ///
     /// This adapter extracts the `scan_files` field from each [`crate::scan::ScanMetadata`] item,
-    /// making it easy to pass scan results directly to [`Self::update_deletion_vectors`].
+    /// making it easy to pass scan results directly to `update_deletion_vectors`.
     ///
     /// # Example
     ///
@@ -278,8 +279,8 @@ impl Transaction {
             let scan_file = scan_file_result?;
             visitor.new_dv_entries.clear();
             visitor.matched_file_indexes.clear();
+            visitor.visit_rows_of(&scan_file)?;
             let (data, mut selection_vector) = scan_file.into_parts();
-            visitor.visit_rows_of(data.as_ref())?;
 
             // Update selection vector to keep only files that matched DV descriptors.
             // This ensures we only generate remove/add actions for files being updated.
@@ -554,8 +555,8 @@ impl<'a> DvMatchVisitor<'a> {
     }
 }
 
-/// A `RowVisitor` that matches file paths against the provided DV updates map.
-impl RowVisitor for DvMatchVisitor<'_> {
+/// A `FilteredRowVisitor` that matches file paths against the provided DV updates map.
+impl FilteredRowVisitor for DvMatchVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
             let names = vec![column_name!("path")];
@@ -565,41 +566,47 @@ impl RowVisitor for DvMatchVisitor<'_> {
         (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
     }
 
-    /// For each path checks if it is in the hash-map and if it is, extract DV
-    /// details that can be appended back to the EngineData.  Also track matched
-    /// rows so the selected rows can be updated to only contain matches.
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        for i in 0..row_count {
-            // Use get_opt since path is nullable in the schema
-            let path_opt: Option<String> = getters[Self::PATH_INDEX].get_opt(i, "path")?;
-
-            // Skip rows with null paths (these are rows that were deselected by the selection vector,
-            // but still appear in the EngineData since visitors operate on the full EngineData)
-            let Some(path) = path_opt else {
-                self.new_dv_entries.push(Scalar::Null(DataType::from(
-                    DeletionVectorDescriptor::to_schema(),
-                )));
-                continue;
-            };
-
-            if let Some(dv_result) = self.dv_updates.get(&path) {
-                self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
-                    DeletionVectorDescriptor::to_schema()
-                        .into_fields()
-                        .collect(),
-                    vec![
-                        Scalar::from(dv_result.storage_type.to_string()),
-                        Scalar::from(dv_result.path_or_inline_dv.clone()),
-                        Scalar::from(dv_result.offset),
-                        Scalar::from(dv_result.size_in_bytes),
-                        Scalar::from(dv_result.cardinality),
-                    ],
-                )?));
-                self.matched_file_indexes.push(i);
-            } else {
-                self.new_dv_entries.push(Scalar::Null(DataType::from(
-                    DeletionVectorDescriptor::to_schema(),
-                )));
+    /// For each selected row checks if the path is in the hash-map and if so, extracts DV
+    /// details that can be appended back to the EngineData. Also tracks matched row indexes
+    /// so the selection vector can be updated to contain only DV-matched files.
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
+        let null_dv = || Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema()));
+        for event in rows.row_events() {
+            match event {
+                RowEvent::Skipped(range) => {
+                    // These rows were deselected — emit nulls to keep new_dv_entries aligned.
+                    self.new_dv_entries.extend(range.map(|_| null_dv()));
+                }
+                RowEvent::Row(row_index) => {
+                    let path_opt: Option<String> =
+                        getters[Self::PATH_INDEX].get_opt(row_index, "path")?;
+                    let Some(path) = path_opt else {
+                        // Null path means a non-add action row (remove, metadata, etc.)
+                        self.new_dv_entries.push(null_dv());
+                        continue;
+                    };
+                    if let Some(dv_result) = self.dv_updates.get(&path) {
+                        self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
+                            DeletionVectorDescriptor::to_schema()
+                                .into_fields()
+                                .collect(),
+                            vec![
+                                Scalar::from(dv_result.storage_type.to_string()),
+                                Scalar::from(dv_result.path_or_inline_dv.clone()),
+                                Scalar::from(dv_result.offset),
+                                Scalar::from(dv_result.size_in_bytes),
+                                Scalar::from(dv_result.cardinality),
+                            ],
+                        )?));
+                        self.matched_file_indexes.push(row_index);
+                    } else {
+                        self.new_dv_entries.push(null_dv());
+                    }
+                }
             }
         }
         Ok(())
