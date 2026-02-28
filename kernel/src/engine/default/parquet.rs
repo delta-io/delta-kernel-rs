@@ -1355,60 +1355,215 @@ mod tests {
 
     #[test]
     fn test_read_parquet_footer_preserves_field_ids() {
-        // Create Arrow schema with field IDs in metadata
-        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-        );
-        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-        );
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
+        use crate::arrow::array::{
+            builder::{Int64Builder, ListBuilder, MapBuilder, StringBuilder},
+            ListArray, MapArray, StructArray,
+        };
+        use crate::schema::DataType;
 
-        // Write a parquet file with this schema
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_field_ids.parquet");
+        let field_id_meta =
+            |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+
+        // Schema:
+        //   id: int64 (field_id=1)
+        //   name: string (field_id=2)
+        //   tags: list<item: string> (field_id=3, element field_id=4)
+        //   properties: map<key: string, value: int64> (field_id=5, key field_id=6, value field_id=7)
+        //   address: struct { street: string (field_id=9), city: string (field_id=10) } (field_id=8)
+        let id_field =
+            Field::new("id", ArrowDataType::Int64, false).with_metadata(field_id_meta("1"));
+        let name_field =
+            Field::new("name", ArrowDataType::Utf8, true).with_metadata(field_id_meta("2"));
+
+        let list_element_field =
+            Field::new("item", ArrowDataType::Utf8, true).with_metadata(field_id_meta("4"));
+        let tags_field = Field::new(
+            "tags",
+            ArrowDataType::List(Arc::new(list_element_field)),
+            true,
+        )
+        .with_metadata(field_id_meta("3"));
+
+        let map_key_field = Arc::new(
+            Field::new("key", ArrowDataType::Utf8, false).with_metadata(field_id_meta("6")),
+        );
+        let map_value_field = Arc::new(
+            Field::new("value", ArrowDataType::Int64, true).with_metadata(field_id_meta("7")),
+        );
+        let map_entry_field = Field::new(
+            "entries",
+            ArrowDataType::Struct(vec![map_key_field, map_value_field].into()),
+            false,
+        );
+        let properties_field = Field::new(
+            "properties",
+            ArrowDataType::Map(Arc::new(map_entry_field), false),
+            true,
+        )
+        .with_metadata(field_id_meta("5"));
+
+        let street_field =
+            Field::new("street", ArrowDataType::Utf8, true).with_metadata(field_id_meta("9"));
+        let city_field =
+            Field::new("city", ArrowDataType::Utf8, true).with_metadata(field_id_meta("10"));
+        let address_field = Field::new(
+            "address",
+            ArrowDataType::Struct(vec![Arc::new(street_field), Arc::new(city_field)].into()),
+            true,
+        )
+        .with_metadata(field_id_meta("8"));
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            name_field,
+            tags_field,
+            properties_field,
+            address_field,
+        ]));
+
+        // Build data arrays
+        let ids = Int64Array::from(vec![1, 2]);
+        let names = StringArray::from(vec!["alice", "bob"]);
+
+        // list<string>
+        let mut tags_builder = ListBuilder::new(StringBuilder::new()).with_field(
+            Field::new("item", ArrowDataType::Utf8, true).with_metadata(field_id_meta("4")),
+        );
+        tags_builder.values().append_value("rust");
+        tags_builder.values().append_value("delta");
+        tags_builder.append(true);
+        tags_builder.values().append_value("kernel");
+        tags_builder.append(true);
+        let tags: ListArray = tags_builder.finish();
+
+        // map<string, int64>
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new())
+            .with_keys_field(
+                Field::new("key", ArrowDataType::Utf8, false).with_metadata(field_id_meta("6")),
+            )
+            .with_values_field(
+                Field::new("value", ArrowDataType::Int64, true).with_metadata(field_id_meta("7")),
+            );
+        map_builder.keys().append_value("k1");
+        map_builder.values().append_value(100);
+        map_builder.append(true).unwrap();
+        map_builder.keys().append_value("k2");
+        map_builder.values().append_value(200);
+        map_builder.append(true).unwrap();
+        let properties: MapArray = map_builder.finish();
+
+        // struct { street, city }
+        let streets = StringArray::from(vec!["123 Main St", "456 Oak Ave"]);
+        let cities = StringArray::from(vec!["Springfield", "Shelbyville"]);
+        let address: StructArray = StructArray::from(vec![
+            (
+                Arc::new(
+                    Field::new("street", ArrowDataType::Utf8, true)
+                        .with_metadata(field_id_meta("9")),
+                ),
+                Arc::new(streets) as _,
+            ),
+            (
+                Arc::new(
+                    Field::new("city", ArrowDataType::Utf8, true)
+                        .with_metadata(field_id_meta("10")),
+                ),
+                Arc::new(cities) as _,
+            ),
+        ]);
 
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(tags),
+                Arc::new(properties),
+                Arc::new(address),
             ],
         )
         .unwrap();
 
+        // Write parquet
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_field_ids.parquet");
         let file = std::fs::File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        // Read footer and verify schema
+        // Read footer
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let url = Url::from_file_path(&file_path).unwrap();
-
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
             size: file_size,
         };
-
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
 
-        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
-        // The field IDs should be accessible using get_config_value (the documented API)
-        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        let id_value = id_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
-        assert!(id_value.is_some(), "Field ID should be present");
-        assert_eq!(id_value.unwrap().to_string(), "1");
+        // Helper to assert a field ID on a StructField
+        let assert_field_id = |field: &crate::schema::StructField, expected_id: &str| {
+            let value = field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
+            assert!(
+                value.is_some(),
+                "Field '{}' should have a field ID",
+                field.name()
+            );
+            assert_eq!(
+                value.unwrap().to_string(),
+                expected_id,
+                "Field '{}' has wrong field ID",
+                field.name()
+            );
+        };
 
-        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        let name_value =
-            name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
-        assert!(name_value.is_some(), "Field ID should be present");
-        assert_eq!(name_value.unwrap().to_string(), "2");
+        // Verify top-level primitive fields
+        let id_f = footer.schema.fields().find(|f| f.name() == "id").unwrap();
+        assert_field_id(id_f, "1");
+
+        let name_f = footer.schema.fields().find(|f| f.name() == "name").unwrap();
+        assert_field_id(name_f, "2");
+
+        // Verify list field
+        let tags_f = footer.schema.fields().find(|f| f.name() == "tags").unwrap();
+        assert_field_id(tags_f, "3");
+        assert!(
+            matches!(tags_f.data_type(), DataType::Array(_)),
+            "tags should be an array type"
+        );
+
+        // Verify map field
+        let props_f = footer
+            .schema
+            .fields()
+            .find(|f| f.name() == "properties")
+            .unwrap();
+        assert_field_id(props_f, "5");
+        assert!(
+            matches!(props_f.data_type(), DataType::Map(_)),
+            "properties should be a map type"
+        );
+
+        // Verify nested struct field and its children
+        let addr_f = footer
+            .schema
+            .fields()
+            .find(|f| f.name() == "address")
+            .unwrap();
+        assert_field_id(addr_f, "8");
+        match addr_f.data_type() {
+            DataType::Struct(inner) => {
+                let street_f = inner.fields().find(|f| f.name() == "street").unwrap();
+                assert_field_id(street_f, "9");
+
+                let city_f = inner.fields().find(|f| f.name() == "city").unwrap();
+                assert_field_id(city_f, "10");
+            }
+            other => panic!("Expected struct type for address, got {:?}", other),
+        }
     }
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.
@@ -1480,33 +1635,141 @@ mod tests {
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+        use crate::arrow::array::{
+            builder::{Int64Builder, ListBuilder, MapBuilder, StringBuilder},
+            ListArray, MapArray, StructArray,
+        };
+        use crate::schema::{
+            ArrayType, ColumnMetadataKey, MapType, MetadataValue, StructField, StructType,
+        };
 
-        // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
-        // The kernel will transform these to parquet.field.id when reading
-        let fields = vec![
-            Field::new("id", ArrowDataType::Int64, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-            Field::new("name", ArrowDataType::Utf8, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )])),
-        ];
-        let arrow_schema = Arc::new(ArrowSchema::new(fields));
+        let field_id_meta =
+            |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("field_id_matching.parquet");
+        // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key).
+        // Schema written to parquet:
+        //   id: int64                          (field_id=1)
+        //   name: string                       (field_id=2)
+        //   tags: list<item: string>            (field_id=3, element field_id=8)
+        //   properties: map<key: string, value: int64>  (field_id=4, key field_id=9, value field_id=10)
+        //   address: struct { street: string (field_id=6), city: string (field_id=7) } (field_id=5)
+        let id_field =
+            Field::new("id", ArrowDataType::Int64, false).with_metadata(field_id_meta("1"));
+        let name_field =
+            Field::new("name", ArrowDataType::Utf8, false).with_metadata(field_id_meta("2"));
+
+        let list_element_field =
+            Field::new("item", ArrowDataType::Utf8, true).with_metadata(field_id_meta("8"));
+        let tags_field = Field::new(
+            "tags",
+            ArrowDataType::List(Arc::new(list_element_field)),
+            true,
+        )
+        .with_metadata(field_id_meta("3"));
+
+        let map_key_field = Arc::new(
+            Field::new("key", ArrowDataType::Utf8, false).with_metadata(field_id_meta("9")),
+        );
+        let map_value_field = Arc::new(
+            Field::new("value", ArrowDataType::Int64, true).with_metadata(field_id_meta("10")),
+        );
+        let map_entry_field = Field::new(
+            "entries",
+            ArrowDataType::Struct(vec![map_key_field, map_value_field].into()),
+            false,
+        );
+        let properties_field = Field::new(
+            "properties",
+            ArrowDataType::Map(Arc::new(map_entry_field), false),
+            true,
+        )
+        .with_metadata(field_id_meta("4"));
+
+        let street_field =
+            Field::new("street", ArrowDataType::Utf8, true).with_metadata(field_id_meta("6"));
+        let city_field =
+            Field::new("city", ArrowDataType::Utf8, true).with_metadata(field_id_meta("7"));
+        let address_field = Field::new(
+            "address",
+            ArrowDataType::Struct(vec![Arc::new(street_field), Arc::new(city_field)].into()),
+            true,
+        )
+        .with_metadata(field_id_meta("5"));
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            name_field,
+            tags_field,
+            properties_field,
+            address_field,
+        ]));
+
+        // Build data arrays
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let names = StringArray::from(vec!["alice", "bob", "charlie"]);
+
+        // list<string>
+        let mut tags_builder = ListBuilder::new(StringBuilder::new()).with_field(
+            Field::new("item", ArrowDataType::Utf8, true).with_metadata(field_id_meta("8")),
+        );
+        tags_builder.values().append_value("rust");
+        tags_builder.values().append_value("delta");
+        tags_builder.append(true);
+        tags_builder.values().append_value("kernel");
+        tags_builder.append(true);
+        tags_builder.append(false); // null for third row
+        let tags: ListArray = tags_builder.finish();
+
+        // map<string, int64>
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new())
+            .with_keys_field(
+                Field::new("key", ArrowDataType::Utf8, false).with_metadata(field_id_meta("9")),
+            )
+            .with_values_field(
+                Field::new("value", ArrowDataType::Int64, true).with_metadata(field_id_meta("10")),
+            );
+        map_builder.keys().append_value("k1");
+        map_builder.values().append_value(100);
+        map_builder.append(true).unwrap();
+        map_builder.keys().append_value("k2");
+        map_builder.values().append_value(200);
+        map_builder.append(true).unwrap();
+        map_builder.append(false).unwrap(); // null for third row
+        let properties: MapArray = map_builder.finish();
+
+        // struct { street, city }
+        let streets = StringArray::from(vec![Some("123 Main St"), Some("456 Oak Ave"), None]);
+        let cities = StringArray::from(vec![Some("Springfield"), Some("Shelbyville"), None]);
+        let address: StructArray = StructArray::from(vec![
+            (
+                Arc::new(
+                    Field::new("street", ArrowDataType::Utf8, true)
+                        .with_metadata(field_id_meta("6")),
+                ),
+                Arc::new(streets) as _,
+            ),
+            (
+                Arc::new(
+                    Field::new("city", ArrowDataType::Utf8, true).with_metadata(field_id_meta("7")),
+                ),
+                Arc::new(cities) as _,
+            ),
+        ]);
+
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(tags),
+                Arc::new(properties),
+                Arc::new(address),
             ],
         )
         .unwrap();
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("field_id_matching.parquet");
         let file = std::fs::File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
         writer.write(&batch).unwrap();
@@ -1515,17 +1778,70 @@ mod tests {
         // Create kernel schema with DIFFERENT names but SAME field IDs
         let kernel_schema = Arc::new(
             StructType::try_new(vec![
+                // "id" -> "user_id", field_id=1
                 StructField::new("user_id", crate::schema::DataType::LONG, false).with_metadata([
                     (
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
                     ),
                 ]),
+                // "name" -> "user_name", field_id=2
                 StructField::new("user_name", crate::schema::DataType::STRING, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),
                     )]),
+                // "tags" -> "labels", field_id=3
+                StructField::new(
+                    "labels",
+                    crate::schema::DataType::Array(Box::new(ArrayType::new(
+                        crate::schema::DataType::STRING,
+                        true,
+                    ))),
+                    true,
+                )
+                .with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(3),
+                )]),
+                // "properties" -> "attributes", field_id=4
+                StructField::new(
+                    "attributes",
+                    crate::schema::DataType::Map(Box::new(MapType::new(
+                        crate::schema::DataType::STRING,
+                        crate::schema::DataType::LONG,
+                        true,
+                    ))),
+                    true,
+                )
+                .with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(4),
+                )]),
+                // "address" -> "location", field_id=5
+                //   "street" -> "road", field_id=6
+                //   "city" -> "town", field_id=7
+                StructField::new(
+                    "location",
+                    StructType::try_new(vec![
+                        StructField::new("road", crate::schema::DataType::STRING, true)
+                            .with_metadata([(
+                                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                                MetadataValue::Number(6),
+                            )]),
+                        StructField::new("town", crate::schema::DataType::STRING, true)
+                            .with_metadata([(
+                                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                                MetadataValue::Number(7),
+                            )]),
+                    ])
+                    .unwrap(),
+                    true,
+                )
+                .with_metadata([(
+                    ColumnMetadataKey::ParquetFieldId.as_ref(),
+                    MetadataValue::Number(5),
+                )]),
             ])
             .unwrap(),
         );
@@ -1551,6 +1867,7 @@ mod tests {
         assert_eq!(data.len(), 1);
         let batch = &data[0];
 
+        // Primitive fields matched by field ID
         let id_col = batch
             .column(0)
             .as_any()
@@ -1566,5 +1883,55 @@ mod tests {
         assert_eq!(name_col.value(0), "alice", "Should match by field ID 2");
         assert_eq!(name_col.value(1), "bob");
         assert_eq!(name_col.value(2), "charlie");
+
+        // List field matched by field ID
+        let list_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list_col.len(), 3, "Should have 3 rows");
+        assert!(!list_col.is_null(0), "First row should not be null");
+        assert!(!list_col.is_null(1), "Second row should not be null");
+        assert!(list_col.is_null(2), "Third row should be null");
+
+        // Map field matched by field ID
+        let map_col = batch.column(3).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_col.len(), 3, "Should have 3 rows");
+        assert!(!map_col.is_null(0));
+        assert!(!map_col.is_null(1));
+        assert!(map_col.is_null(2), "Third row should be null");
+
+        // Struct field matched by field ID, including nested children
+        let struct_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(struct_col.len(), 3, "Should have 3 rows");
+
+        let road_col = struct_col
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            road_col.value(0),
+            "123 Main St",
+            "Should match by field ID 6"
+        );
+        assert_eq!(road_col.value(1), "456 Oak Ave");
+
+        let town_col = struct_col
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            town_col.value(0),
+            "Springfield",
+            "Should match by field ID 7"
+        );
+        assert_eq!(town_col.value(1), "Shelbyville");
     }
 }
