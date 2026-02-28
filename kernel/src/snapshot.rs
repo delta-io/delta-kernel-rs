@@ -15,7 +15,7 @@ use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::get_clustering_columns;
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::LazyCrc;
+use crate::crc::{Crc, CrcDelta, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
@@ -440,11 +440,23 @@ impl Snapshot {
     /// allows immediate use of the new and latest table state without re-reading metadata from
     /// storage.
     ///
-    /// TODO: Take in ICT.
+    /// CRC computation for the new snapshot:
+    /// - CREATE TABLE: builds CRC(0) from scratch using P&M + crc_delta
+    /// - CRC(N) loaded on readSnapshot at N: CRC(N) + crc_delta -> CRC(N+1)
+    /// - CRC stale or missing (e.g. CRC at N-5, not N): carried forward unchanged,
+    ///   no CRC at N+1 (future: forward replay will handle this)
+    ///
     /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
     /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
     #[allow(unused)]
-    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+    pub(crate) fn new_post_commit(
+        &self,
+        commit: ParsedLogPath,
+        crc_delta: CrcDelta,
+    ) -> DeltaResult<Self> {
+        let read_version = self.version();
+        let new_version = commit.version;
+
         require!(
             commit.is_commit(),
             Error::internal_error(format!(
@@ -454,24 +466,42 @@ impl Snapshot {
             ))
         );
         require!(
-            commit.version == self.version().wrapping_add(1),
+            new_version == read_version.wrapping_add(1),
             Error::internal_error(format!(
-                "Cannot create post-commit Snapshot. Log file version ({}) does not \
-                equal Snapshot version ({}) + 1.",
-                commit.version,
-                self.version()
+                "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
+                equal Snapshot version ({read_version}) + 1."
             ))
         );
 
         let new_table_configuration =
-            TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
+            TableConfiguration::new_post_commit(self.table_configuration(), new_version);
 
-        let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
+        let new_log_segment = self.log_segment.new_with_commit_appended(commit.clone())?;
+
+        // Try to compute CRC for the new version
+        let new_lazy_crc = if read_version == crate::PRE_COMMIT_VERSION {
+            // CREATE TABLE: build CRC(0) from scratch using P&M from the pre-commit snapshot
+            let crc = Crc::new_for_created_table(
+                self.table_configuration().protocol().clone(),
+                self.table_configuration().metadata().clone(),
+                &crc_delta,
+            );
+            Arc::new(LazyCrc::new_precomputed(crc, new_version))
+        } else if let Some(crc) = self.lazy_crc.get_if_loaded_at_version(read_version) {
+            // CRC(read_version) loaded -> apply delta to get CRC(new_version)
+            Arc::new(LazyCrc::new_precomputed(
+                crc.apply_delta(&crc_delta),
+                new_version,
+            ))
+        } else {
+            // No CRC available, carry forward existing lazy_crc
+            self.lazy_crc.clone()
+        };
 
         Ok(Snapshot::new(
             new_log_segment,
             new_table_configuration,
-            self.lazy_crc.clone(),
+            new_lazy_crc,
         ))
     }
 
@@ -2044,7 +2074,18 @@ mod tests {
 
         // WHEN
         let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+        let crc_delta = crate::crc::CrcDelta {
+            file_stats: crate::crc::FileStatsDelta {
+                num_adds: 0,
+                num_removes: 0,
+                size_bytes_adds: 0,
+                size_bytes_removes: 0,
+            },
+            in_commit_timestamp: None,
+        };
+        let post_commit_snapshot = base_snapshot
+            .new_post_commit(fake_new_commit, crc_delta)
+            .unwrap();
 
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
