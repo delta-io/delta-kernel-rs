@@ -2,9 +2,10 @@
 //!
 //! Each runner handles setup and execution of a specific operation (e.g., reading metadata)
 //! Results are discarded for benchmarking purposes
-//! Currently only supports reading metadata
 
-use crate::benchmarks::models::{ParallelScan, ReadConfig, ReadOperation, ReadSpec, TableInfo};
+use crate::benchmarks::models::{
+    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::AfterSequential;
 use crate::snapshot::Snapshot;
@@ -13,7 +14,10 @@ use crate::Engine;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
+use url::Url;
 
+/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
+/// so that `execute` measures only the operation itself
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
@@ -27,7 +31,6 @@ pub struct ReadMetadataRunner {
 }
 
 impl ReadMetadataRunner {
-    /// Sets up a benchmark runner for reading metadata.
     pub fn setup(
         table_info: &TableInfo,
         case_name: &str,
@@ -161,6 +164,55 @@ pub fn create_read_runner(
     }
 }
 
+pub struct SnapshotConstructionRunner {
+    url: Url,
+    version: Option<u64>,
+    engine: Arc<dyn Engine>,
+    name: String,
+}
+
+impl SnapshotConstructionRunner {
+    pub fn setup(
+        table_info: &TableInfo,
+        case_name: &str,
+        snapshot_spec: &SnapshotConstructionSpec,
+        engine: Arc<dyn Engine>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let table_root = table_info.resolved_table_root();
+        let url = crate::try_parse_uri(table_root)?;
+
+        let name = format!(
+            "{}/{}/{}",
+            table_info.name,
+            case_name,
+            snapshot_spec.as_str()
+        );
+
+        Ok(Self {
+            url,
+            version: snapshot_spec.version,
+            engine,
+            name,
+        })
+    }
+}
+
+impl WorkloadRunner for SnapshotConstructionRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut builder = Snapshot::builder_for(self.url.clone());
+        if let Some(version) = self.version {
+            builder = builder.at_version(version);
+        }
+        black_box(builder.build(self.engine.as_ref())?);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +285,48 @@ mod tests {
             runner.name(),
             "basic_partitioned/test_case/read_metadata/parallel"
         );
+        assert!(runner.execute().is_ok());
+    }
+
+    fn test_snapshot_spec() -> SnapshotConstructionSpec {
+        SnapshotConstructionSpec { version: None }
+    }
+
+    #[test]
+    fn test_snapshot_construction_runner_setup() {
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_snapshot_spec(),
+            test_engine(),
+        );
+        assert!(runner.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_construction_runner_name() {
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_snapshot_spec(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/test_case/snapshot_construction"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_construction_runner_execute() {
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &test_snapshot_spec(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
 

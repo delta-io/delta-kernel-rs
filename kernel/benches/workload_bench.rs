@@ -1,0 +1,92 @@
+use std::sync::Arc;
+
+use criterion::measurement::WallTime;
+use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
+
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
+
+mod utils;
+
+use delta_kernel::benchmarks::models::{
+    default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
+};
+use delta_kernel::benchmarks::runners::{
+    create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
+};
+use utils::load_all_workloads;
+
+fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
+    use object_store::local::LocalFileSystem;
+
+    let store = Arc::new(LocalFileSystem::new());
+    let engine = DefaultEngine::builder(store).build();
+
+    Arc::new(engine)
+}
+
+fn workload_benchmarks(c: &mut Criterion) {
+    let workloads = match load_all_workloads() {
+        Ok(workloads) if !workloads.is_empty() => workloads,
+        Ok(_) => panic!("No workloads found"),
+        Err(e) => panic!("Failed to load workloads: {}", e),
+    };
+
+    let engine = setup_engine();
+    let mut group = c.benchmark_group("workload_benchmarks");
+
+    for workload in &workloads {
+        match &workload.spec {
+            Spec::Read(read_spec) => {
+                for operation in [ReadOperation::ReadMetadata] {
+                    for config in build_read_configs(&workload.table_info.name) {
+                        let runner = create_read_runner(
+                            &workload.table_info,
+                            &workload.case_name,
+                            read_spec,
+                            operation,
+                            config,
+                            engine.clone(),
+                        )
+                        .expect("Failed to create read runner");
+                        run_benchmark(&mut group, runner.as_ref());
+                    }
+                }
+            }
+            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                let runner = SnapshotConstructionRunner::setup(
+                    &workload.table_info,
+                    &workload.case_name,
+                    snapshot_construction_spec,
+                    engine.clone(),
+                )
+                .expect("Failed to create snapshot construction runner");
+                run_benchmark(&mut group, &runner);
+            }
+        }
+    }
+
+    group.finish();
+}
+
+fn run_benchmark(group: &mut BenchmarkGroup<WallTime>, runner: &dyn WorkloadRunner) {
+    group.bench_function(runner.name(), |b| {
+        b.iter(|| runner.execute().expect("Benchmark execution failed"))
+    });
+}
+
+fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
+    // Choose which benchmark configurations to run for a given table
+    // TODO: This function will take in table info to choose the appropriate configs for a given table
+    let mut configs = default_read_configs();
+    if table_name.contains("v2_checkpoint") {
+        configs.push(ReadConfig {
+            name: "parallel_2".into(),
+            parallel_scan: ParallelScan::Enabled { num_threads: 2 },
+        });
+    }
+    configs
+}
+
+criterion_group!(benches, workload_benchmarks);
+criterion_main!(benches);
