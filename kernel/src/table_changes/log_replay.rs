@@ -72,9 +72,11 @@ pub(crate) fn table_changes_action_iter(
             DataSkippingFilter::new(
                 engine.as_ref(),
                 Some(predicate),
-                stats_schema,
-                get_log_add_schema().clone(),
+                Some(&stats_schema),
                 stats_expr,
+                None, // no partition columns for table changes
+                None,
+                get_log_add_schema().clone(),
             )
         })
         .map(Arc::new);

@@ -1,5 +1,5 @@
 use std::clone::Clone;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use super::data_skipping::DataSkippingFilter;
@@ -10,7 +10,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
 };
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
@@ -43,6 +42,10 @@ struct InternalScanState {
     logical_stats_schema: Option<SchemaRef>,
     #[serde(default)]
     skip_stats: bool,
+    /// Schema of typed partition columns referenced by the predicate (physical names).
+    /// Used to build the partition extraction expression for data skipping.
+    #[serde(default)]
+    partition_stats_schema: Option<SchemaRef>,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -84,9 +87,8 @@ pub struct SerializableScanState {
 /// and performs the following steps:
 ///
 /// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
-///   files that are irrelevant for the query.
-/// - Partition Pruning: Uses an optional partition filter (extracted from a physical predicate)
-///   to exclude actions whose partition values do not meet the required criteria.
+///   files that are irrelevant for the query. This includes both data column stats (min/max/nullCount)
+///   and partition value filtering in a single columnar pass.
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
 ///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
 /// - Transformation: Applies a built-in transformation (`add_transform`) to convert selected Add actions
@@ -102,7 +104,6 @@ pub struct SerializableScanState {
 /// to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
-    partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     /// Transform for log batches (commit files) - uses ParseJson for stats
     log_transform: Arc<dyn ExpressionEvaluator>,
@@ -166,10 +167,9 @@ impl ScanLogReplayProcessor {
             checkpoint_read_schema,
         } = checkpoint_info;
 
-        // Extract the physical predicate for data skipping and partition filtering.
-        // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
+        // Extract the physical predicate for data skipping.
         let physical_predicate = match &state_info.physical_predicate {
-            PhysicalPredicate::Some(predicate, schema) => Some((predicate.clone(), schema.clone())),
+            PhysicalPredicate::Some(predicate, _schema) => Some(predicate.clone()),
             _ => None,
         };
 
@@ -185,27 +185,34 @@ impl ScanLogReplayProcessor {
         // Create data skipping filter that reads stats_parsed from the transformed batch.
         // This avoids double JSON parsing - the transform parses JSON once, then data skipping
         // reads the already-parsed stats_parsed column from the transform output.
-        // Disabled when skip_stats is enabled.
+        //
+        // When partition columns are referenced by the predicate, the filter also receives
+        // a partition schema + expression to extract typed partition values from the string map.
+        // This enables mixed predicates (e.g. `WHERE part_col = 'X' OR data_col > 100`)
+        // to be evaluated in a single columnar pass.
         let data_skipping_filter = if skip_stats {
             None
         } else {
-            state_info
-                .physical_stats_schema
-                .as_ref()
-                .and_then(|physical_stats_schema| {
-                    DataSkippingFilter::new(
-                        engine,
-                        // these are all cheap arc clones
-                        physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                        physical_stats_schema.clone(),
-                        output_schema.clone(),
-                        column_expr_ref!("stats_parsed"),
-                    )
-                })
+            let partition_schema = state_info.partition_stats_schema.as_ref();
+            let partition_expr = partition_schema
+                .filter(|s| s.num_fields() > 0)
+                .map(|pv_schema| {
+                    Arc::new(Expression::map_to_struct(
+                        Expression::column(["fileConstantValues", "partitionValues"]),
+                    )) as ExpressionRef
+                });
+            DataSkippingFilter::new(
+                engine,
+                physical_predicate.clone(),
+                state_info.physical_stats_schema.as_ref(),
+                column_expr_ref!("stats_parsed"),
+                partition_schema,
+                partition_expr,
+                output_schema.clone(),
+            )
         };
 
         Ok(Self {
-            partition_filter: physical_predicate.as_ref().map(|(p, _)| p.clone()),
             data_skipping_filter,
             // Log transform: always parse JSON (no stats_parsed in JSON commit files)
             log_transform: engine.evaluation_handler().new_expression_evaluator(
@@ -252,6 +259,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
+            partition_stats_schema,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -270,6 +278,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             logical_stats_schema,
             skip_stats: self.skip_stats,
+            partition_stats_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
@@ -284,8 +293,8 @@ impl ScanLogReplayProcessor {
 
     /// Reconstruct a processor from serialized state.
     ///
-    /// Creates a new processor with the provided state. All fields (partition_filter,
-    /// data_skipping_filter, add_transform, and seen_file_keys) are reconstructed from
+    /// Creates a new processor with the provided state. All fields (data_skipping_filter,
+    /// add_transform, and seen_file_keys) are reconstructed from
     /// the serialized state and engine.
     ///
     /// # Parameters
@@ -326,6 +335,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             logical_stats_schema: internal_state.logical_stats_schema,
+            partition_stats_schema: internal_state.partition_stats_schema,
         });
 
         let processor = Self::new_with_seen_files(
@@ -348,7 +358,6 @@ struct AddRemoveDedupVisitor<D: Deduplicator> {
     deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
-    partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
@@ -357,33 +366,13 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
-        partition_filter: Option<PredicateRef>,
     ) -> AddRemoveDedupVisitor<D> {
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
             state_info,
-            partition_filter,
             row_transform_exprs: Vec::new(),
         }
-    }
-
-    fn is_file_partition_pruned(
-        &self,
-        partition_values: &HashMap<usize, (String, Scalar)>,
-    ) -> bool {
-        if partition_values.is_empty() {
-            return false;
-        }
-        let Some(partition_filter) = &self.partition_filter else {
-            return false;
-        };
-        let partition_values: HashMap<_, _> = partition_values
-            .values()
-            .map(|(k, v)| (ColumnName::new([k]), v.clone()))
-            .collect();
-        let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
-        evaluator.eval_sql_where(partition_filter) == Some(false)
     }
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
@@ -404,26 +393,19 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             return Ok(false);
         };
 
-        // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
-        // tracking pruned files. Removes don't get pruned and we'll still have to track them.
-        //
-        // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
-        // removes), because they are needed to suppress earlier incompatible adds we might
-        // encounter if the table's schema was replaced after the most recent checkpoint.
+        // Parse partition values for building the per-row transform expression.
+        // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
+        // so we only need to parse values here for the transform.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
+                parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
                     &partition_values,
                     self.state_info.column_mapping_mode,
-                )?;
-                if self.is_file_partition_pruned(&partition_values) {
-                    return Ok(false);
-                }
-                partition_values
+                )?
             }
             _ => Default::default(),
         };
@@ -690,12 +672,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
-        let mut visitor = AddRemoveDedupVisitor::new(
-            deduplicator,
-            selection_vector,
-            self.state_info.clone(),
-            self.partition_filter.clone(),
-        );
+        let mut visitor =
+            AddRemoveDedupVisitor::new(deduplicator, selection_vector, self.state_info.clone());
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
@@ -763,12 +741,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
         );
-        let mut visitor = AddRemoveDedupVisitor::new(
-            deduplicator,
-            selection_vector,
-            self.state_info.clone(),
-            self.partition_filter.clone(),
-        );
+        let mut visitor =
+            AddRemoveDedupVisitor::new(deduplicator, selection_vector, self.state_info.clone());
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
@@ -944,6 +918,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            partition_stats_schema: None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -1272,6 +1247,7 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
                 logical_stats_schema: None,
+                partition_stats_schema: None,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor =
@@ -1304,6 +1280,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            partition_stats_schema: None,
         });
         let processor =
             ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
@@ -1349,6 +1326,7 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
             skip_stats: false,
+            partition_stats_schema: None,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1381,6 +1359,7 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
             skip_stats: false,
+            partition_stats_schema: None,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();

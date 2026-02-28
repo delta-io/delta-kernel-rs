@@ -290,7 +290,8 @@ fn test_sql_where() {
                 expect,
                 "{pred:#?} became {skipping_pred:#?} ({min}..{max}, {nulls} nulls)"
             );
-            let skipping_sql_pred = as_sql_data_skipping_predicate(pred).unwrap();
+            let skipping_sql_pred =
+                as_sql_data_skipping_predicate(pred, &Default::default()).unwrap();
             expect_eq!(
                 filter.eval(&skipping_sql_pred),
                 expect_sql,
@@ -345,7 +346,9 @@ fn test_sql_where() {
 // are truncated to milliseconds in add.stats.
 #[test]
 fn test_timestamp_skipping_disabled() {
-    let creator = DataSkippingPredicateCreator;
+    let creator = DataSkippingPredicateCreator {
+        partition_columns: Default::default(),
+    };
     let col = &column_name!("timestamp_col");
 
     assert!(
@@ -514,4 +517,148 @@ fn test_timestamp_predicates_dont_data_skip() {
             "OR(NOT(Column(minValues.ts_col) = 1000000), null)"
         );
     }
+}
+
+// Tests for partition-aware data skipping
+#[test]
+fn test_partition_column_rewrite() {
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+
+    // Partition column equality rewrites to partitionValues (not minValues/maxValues)
+    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("2025-01-01"));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("partitionValues.part_col")),
+        "Expected partitionValues.part_col, got {pred_str:?}"
+    );
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| !s.contains("minValues") && !s.contains("maxValues")),
+        "Should not contain minValues/maxValues for partition columns"
+    );
+
+    // Data column still rewrites to minValues/maxValues
+    let pred = Pred::gt(column_expr!("data_col"), Scalar::from(100));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("maxValues.data_col")),
+        "Expected maxValues.data_col for data column, got {pred_str:?}"
+    );
+}
+
+#[test]
+fn test_partition_column_is_null() {
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+
+    // IS NULL for partition column checks partitionValues directly
+    let pred = Pred::is_null(column_expr!("part_col"));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert_eq!(
+        pred_str.as_deref(),
+        Some("Column(partitionValues.part_col) IS NULL"),
+        "IS NULL should use partitionValues"
+    );
+
+    // IS NOT NULL for partition column
+    let pred = Pred::is_not_null(column_expr!("part_col"));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert_eq!(
+        pred_str.as_deref(),
+        Some("NOT(Column(partitionValues.part_col) IS NULL)"),
+        "IS NOT NULL should use partitionValues"
+    );
+}
+
+#[test]
+fn test_mixed_partition_and_data_or_predicate() {
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+
+    // Mixed OR: partition_col = 'X' OR data_col > 100
+    // This should produce a valid skipping predicate (not None) because both
+    // operands are now eligible for data skipping.
+    let pred = Pred::or(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    assert!(
+        skipping_pred.is_some(),
+        "Mixed partition+data OR should produce a valid skipping predicate"
+    );
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("partitionValues.part_col")),
+        "Should reference partitionValues for partition column"
+    );
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("maxValues.data_col")),
+        "Should reference maxValues for data column"
+    );
+}
+
+#[test]
+fn test_mixed_partition_and_data_or_evaluation() {
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+
+    // WHERE part_col = 'X' OR data_col > 100
+    let pred = Pred::or(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns).expect("should exist");
+
+    // File with part_col='Y' and max(data_col)=50: both branches false -> skip
+    let resolver = HashMap::from_iter([
+        (column_name!("partitionValues.part_col"), Scalar::from("Y")),
+        (column_name!("maxValues.data_col"), Scalar::from(50)),
+    ]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&skipping_pred),
+        FALSE,
+        "part_col='Y' and max(data_col)=50 → skip"
+    );
+
+    // File with part_col='X' and max(data_col)=50: partition matches -> keep
+    let resolver = HashMap::from_iter([
+        (column_name!("partitionValues.part_col"), Scalar::from("X")),
+        (column_name!("maxValues.data_col"), Scalar::from(50)),
+    ]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&skipping_pred),
+        TRUE,
+        "part_col='X' → keep regardless of data_col"
+    );
+
+    // File with part_col='Y' and max(data_col)=200: data col matches -> keep
+    let resolver = HashMap::from_iter([
+        (column_name!("partitionValues.part_col"), Scalar::from("Y")),
+        (column_name!("maxValues.data_col"), Scalar::from(200)),
+    ]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&skipping_pred),
+        TRUE,
+        "max(data_col)=200 → keep regardless of part_col"
+    );
 }

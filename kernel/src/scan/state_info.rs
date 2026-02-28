@@ -36,6 +36,10 @@ pub(crate) struct StateInfo {
     /// the engine receives stats with physical column names (for column mapping). This
     /// logical schema maps those stats back to the table's logical column names.
     pub(crate) logical_stats_schema: Option<SchemaRef>,
+    /// Schema of typed partition columns referenced by the predicate (physical names).
+    /// Used by `DataSkippingFilter` to build the partition extraction expression and to
+    /// derive which columns should be rewritten to `partitionValues.*`.
+    pub(crate) partition_stats_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -214,13 +218,22 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
+        // Identify partition columns referenced by the predicate (using physical names).
+        // These are used by data skipping to rewrite partition column references to
+        // `partitionValues.*` instead of `minValues.*`/`maxValues.*`.
+        let physical_partition_names: HashSet<String> = logical_schema
+            .fields()
+            .filter(|f| partition_columns.contains(f.name()))
+            .map(|f| f.physical_name(column_mapping_mode).to_string())
+            .collect();
+
         // Build stats schemas:
         // - From stats_columns if specified (for outputting stats to the engine)
         // - From predicate columns otherwise (for data skipping only, no logical schema needed)
         // When both stats_columns and a predicate are provided, we use expected_stats_schema
         // (which is a superset of the predicate-derived schema) so the engine receives all
         // stats AND the DataSkippingFilter can still perform data skipping.
-        let (physical_stats_schema, logical_stats_schema) =
+        let (physical_stats_schema, logical_stats_schema, partition_stats_schema) =
             match (&stats_columns, &physical_predicate) {
                 // stats_columns = Some([]) means output all stats from expected_stats_schema.
                 // This works both with and without a predicate — the DataSkippingFilter
@@ -231,6 +244,7 @@ impl StateInfo {
                     (
                         Some(expected_stats_schemas.physical),
                         Some(expected_stats_schemas.logical),
+                        None,
                     )
                 }
                 // Non-empty stats_columns list not supported yet
@@ -242,9 +256,38 @@ impl StateInfo {
                 }
                 // No stats_columns, but has predicate - use predicate columns for data skipping
                 // (no logical stats schema needed for internal data skipping)
-                (None, PhysicalPredicate::Some(_, schema)) => (build_stats_schema(schema), None),
+                (None, PhysicalPredicate::Some(_, schema)) => {
+                    // Split referenced columns into data columns and partition columns.
+                    // Data columns get min/max/nullCount stats; partition columns get exact values.
+                    let data_fields: Vec<StructField> = schema
+                        .fields()
+                        .filter(|f| !physical_partition_names.contains(f.name()))
+                        .cloned()
+                        .collect();
+                    // Partition values extracted from the string map via ELEMENT_AT
+                    // are always nullable (map lookup can return null), so we make
+                    // all partition fields nullable in the stats schema.
+                    let partition_fields: Vec<StructField> = schema
+                        .fields()
+                        .filter(|f| physical_partition_names.contains(f.name()))
+                        .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+                        .collect();
+
+                    let data_schema = StructType::new_unchecked(data_fields);
+                    let pv_schema = if partition_fields.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(StructType::new_unchecked(partition_fields)))
+                    };
+
+                    // physical_stats_schema is data-only (used for JSON parsing in the transform).
+                    // The unified schema (data stats + partition values) is built in
+                    // ScanLogReplayProcessor for the DataSkippingFilter.
+                    let data_stats = build_stats_schema(&data_schema);
+                    (data_stats, None, pv_schema)
+                }
                 // No stats_columns and no predicate
-                (None, _) => (None, None),
+                (None, _) => (None, None, None),
             };
 
         let transform_spec =
@@ -262,6 +305,7 @@ impl StateInfo {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
+            partition_stats_schema,
         })
     }
 }
