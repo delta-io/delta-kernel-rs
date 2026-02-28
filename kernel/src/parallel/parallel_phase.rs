@@ -195,6 +195,7 @@ mod tests {
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema: get_log_add_schema().clone(),
         };
 
@@ -415,6 +416,7 @@ mod tests {
                     // For now, use a default checkpoint_info for serialization tests
                     let checkpoint_info = CheckpointReadInfo {
                         has_stats_parsed: false,
+                        has_partition_values_parsed: false,
                         checkpoint_read_schema: get_log_add_schema().clone(),
                     };
                     let serialized_state = processor.into_serializable_state(checkpoint_info)?;

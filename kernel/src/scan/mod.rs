@@ -662,6 +662,7 @@ impl Scan {
                 actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
+                    has_partition_values_parsed: false,
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
@@ -714,6 +715,7 @@ impl Scan {
                 .physical_stats_schema
                 .as_ref()
                 .map(|s| s.as_ref()),
+            None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -772,6 +774,10 @@ impl Scan {
                 meta_predicate,
                 self.state_info
                     .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+                self.state_info
+                    .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
@@ -882,6 +888,7 @@ impl Scan {
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema,
         };
         let processor = ScanLogReplayProcessor::new(
