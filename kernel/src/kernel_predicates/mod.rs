@@ -183,6 +183,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Binary(_)
             | Expr::Variadic(_)
             | Expr::ParseJson(_)
+            | Expr::MapToStruct(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -211,6 +212,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Variadic(_)
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
+                | Expr::MapToStruct(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
@@ -641,7 +643,8 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
-            Expr::ParseJson(_) => None, // ParseJson is not expected to be a top-level predicate expression
+            // ParseJson and MapToStruct produce structured output, not scalar values
+            Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
         }
     }

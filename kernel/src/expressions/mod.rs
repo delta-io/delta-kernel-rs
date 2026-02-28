@@ -473,6 +473,9 @@ pub enum Expression {
     Unknown(String),
     /// Parse a JSON string expression into a struct with the given schema.
     ParseJson(ParseJsonExpression),
+    /// Extract keys from a `Map<String, String>` and parse values into a typed struct using
+    /// Delta's partition value serialization rules.
+    MapToStruct(MapToStructExpression),
 }
 
 /// A SQL predicate.
@@ -591,6 +594,31 @@ impl ParseJsonExpression {
         Self {
             json_expr: Box::new(json_expr.into()),
             output_schema,
+        }
+    }
+}
+
+/// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
+/// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
+/// the output struct column: a `key` -> `value` mapping in the map means the struct field named
+/// `key` receives `value`, parsed into the field's target type using Delta's partition value
+/// serialization rules ([`PrimitiveType::parse_scalar`]).
+///
+/// - Missing keys produce null values
+/// - Parse errors are propagated (indicating a broken table)
+/// - Duplicate map keys are resolved by taking the rightmost entry
+///
+/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+}
+
+impl MapToStructExpression {
+    fn new(map_expr: impl Into<Expression>) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
         }
     }
 }
@@ -737,6 +765,13 @@ impl Expression {
     /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
+    }
+
+    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct using
+    /// Delta's partition value serialization rules. The output struct schema is determined by the
+    /// evaluator's `result_type`.
+    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr))
     }
 }
 
@@ -1000,6 +1035,7 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
+            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
         }
     }
 }
@@ -1397,6 +1433,18 @@ mod tests {
         fn test_expression_unknown_roundtrip() {
             let expr = Expression::unknown("some_unknown_function()");
             assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_map_to_struct_expression_roundtrip() {
+            let cases: Vec<Expression> = vec![
+                Expression::map_to_struct(column_expr!("pv")),
+                Expression::map_to_struct(Expression::literal("ignored")),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
         }
 
         // ==================== Predicate Tests ====================
