@@ -1188,7 +1188,12 @@ mod tests {
         Ok(())
     }
 
-    // test new CRC in new log segment (old log segment has old CRC)
+    // Test that incremental snapshot updates correctly propagate CRC files:
+    // a) old snapshot has 0.crc, no new CRC => combined log segment keeps 0.crc
+    // b) old snapshot has 0.crc, new 1.crc appears => combined log segment picks up 1.crc
+    //
+    // NOTE: This test only verifies CRC file *tracking* (that the right .crc file is
+    // referenced in the log segment). It does not test CRC *parsing* or CRC-based P&M loading.
     #[tokio::test]
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
@@ -1245,13 +1250,23 @@ mod tests {
 
         // a) CRC: old one has 0.crc, no new one (expect 0.crc)
         // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
+        //
+        // NOTE: CRC uses camelCase field names and unwrapped metadata/protocol (no "metaData"
+        // or "protocol" wrapper keys). See the `Crc` struct and `CrcVisitor` for the schema.
         let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 1),
+            "tableSizeBytes": 100,
+            "numFiles": 1,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
         });
 
         // put the old crc
@@ -1285,12 +1300,19 @@ mod tests {
         // put the new crc
         let path = delta_path_for_version(1, "crc");
         let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 2),
+            "tableSizeBytes": 100,
+            "numFiles": 1,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
         });
         store.put(&path, crc.to_string().into()).await?;
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
