@@ -1966,6 +1966,49 @@ fn test_validate_listed_log_file_invalid_multipart_checkpoint() {
     .is_err());
 }
 
+#[test]
+fn test_validate_listed_log_file_out_of_order_commit_files() {
+    assert!(ListedLogFiles {
+        ascending_commit_files: vec![
+            create_log_path("file:///_delta_log/00000000000000000003.json"),
+            create_log_path("file:///_delta_log/00000000000000000001.json"),
+        ],
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
+fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
+    assert!(ListedLogFiles {
+        checkpoint_parts: vec![create_log_path(
+            "file:///_delta_log/00000000000000000010.json"
+        ),],
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
+fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
+    // Two parts that agree on version but claim num_parts=3 (count mismatch: 2 != 3)
+    assert!(ListedLogFiles {
+        checkpoint_parts: vec![
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000002.0000000003.parquet",
+            ),
+        ],
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+}
+
 #[tokio::test]
 async fn commits_since() {
     // simple
