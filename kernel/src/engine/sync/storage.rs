@@ -71,6 +71,10 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(iter))
     }
 
+    fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
+        unimplemented!("SyncStorageHandler does not implement put");
+    }
+
     fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
         unimplemented!("SyncStorageHandler does not implement copy");
     }
