@@ -240,6 +240,13 @@ uintptr_t convert_engine_to_kernel_expression_item(
       };
       return visit_expression_unknown(state, str_slice);
     }
+    case MapToStruct: {
+      struct MapToStructExpr* m2s = (struct MapToStructExpr*)item.ref;
+      assert(m2s->child_expr.len == 1);
+      uintptr_t child = convert_engine_to_kernel_expression_item(
+          state, m2s->child_expr.list[0]);
+      return visit_expression_map_to_struct(state, child);
+    }
     case Transform:
     case FieldTransform:
     case OpaqueExpression:
