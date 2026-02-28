@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ReadConfig represents a specific configuration for a read operation
 // A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
@@ -46,6 +46,16 @@ impl TableInfo {
                 .to_string()
         })
     }
+
+    pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
+        let mut table_info: TableInfo = serde_json::from_str(&content)?;
+        //Stores the parent directory of the table info JSON file
+        if let Some(parent) = path.as_ref().parent() {
+            table_info.table_info_dir = parent.to_path_buf();
+        }
+        Ok(table_info)
+    }
 }
 
 // Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
@@ -66,6 +76,12 @@ impl Spec {
         match self {
             Spec::Read(_) => "read",
         }
+    }
+
+    pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
+        let spec: Spec = serde_json::from_str(&content)?;
+        Ok(spec)
     }
 }
 
