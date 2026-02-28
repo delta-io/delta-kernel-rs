@@ -57,6 +57,23 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     Ok(url)
 }
 
+/// Normalize a table root URL to behave like a directory for `Url::join`.
+///
+/// Without a trailing slash, `Url::join` replaces the last segment instead of appending.
+pub(crate) fn normalize_table_root_url(mut table_root: Url) -> Url {
+    let path = table_root.path();
+    if !path.ends_with('/') {
+        if path.is_empty() {
+            table_root.set_path("/");
+        } else {
+            let mut new_path = path.to_string();
+            new_path.push('/');
+            table_root.set_path(&new_path);
+        }
+    }
+    table_root
+}
+
 #[allow(unused)]
 #[derive(Debug)]
 enum UriType {
@@ -826,5 +843,40 @@ mod tests {
             url.to_string(),
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
+    }
+
+    #[test]
+    fn normalize_table_root_url_adds_trailing_slash() {
+        let table_root = Url::parse("memory:///tables/demo").unwrap();
+
+        let normalized = normalize_table_root_url(table_root);
+
+        assert_eq!(normalized.path(), "/tables/demo/");
+        assert_eq!(
+            normalized
+                .join("_delta_log/00000000000000000000.json")
+                .unwrap()
+                .to_string(),
+            "memory:///tables/demo/_delta_log/00000000000000000000.json"
+        );
+    }
+
+    #[test]
+    fn normalize_table_root_url_keeps_existing_trailing_slash() {
+        let table_root = Url::parse("memory:///tables/demo/").unwrap();
+
+        let normalized = normalize_table_root_url(table_root);
+
+        assert_eq!(normalized.path(), "/tables/demo/");
+    }
+
+    #[test]
+    fn normalize_table_root_url_handles_empty_path() {
+        let table_root = Url::parse("memory:").unwrap();
+        assert!(table_root.path().is_empty());
+
+        let normalized = normalize_table_root_url(table_root);
+
+        assert_eq!(normalized.path(), "%2F");
     }
 }

@@ -203,6 +203,24 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+/// Get an ObjectStore path for a delta file under a specific table root.
+pub fn delta_path_for_version_with_table_root(
+    table_root: &Url,
+    version: u64,
+    suffix: &str,
+) -> Path {
+    let table_prefix = table_root
+        .path()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    let file_path = delta_path_for_version(version, suffix);
+    if table_prefix.is_empty() {
+        file_path
+    } else {
+        Path::from(format!("{table_prefix}/{}", file_path.as_ref()).as_str())
+    }
+}
+
 pub fn staged_commit_path_for_version(version: u64) -> Path {
     let uuid = uuid::Uuid::new_v4();
     let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");

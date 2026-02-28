@@ -3,6 +3,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
+use crate::utils::normalize_table_root_url;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use tracing::{info, instrument};
@@ -41,7 +42,7 @@ pub struct SnapshotBuilder {
 impl SnapshotBuilder {
     pub(crate) fn new_for(table_root: Url) -> Self {
         Self {
-            table_root: Some(table_root),
+            table_root: Some(normalize_table_root_url(table_root)),
             existing_snapshot: None,
             version: None,
             log_tail: Vec::new(),
@@ -167,6 +168,7 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
     use serde_json::json;
+    use test_utils::delta_path_for_version_with_table_root;
 
     use super::*;
 
@@ -181,7 +183,7 @@ mod tests {
         (engine, store, table_root)
     }
 
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &Url) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<dyn ObjectStore>, table_root: &Url) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -218,7 +220,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
+        let path = delta_path_for_version_with_table_root(table_root, 0, "json");
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -241,7 +243,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
+        let path = delta_path_for_version_with_table_root(table_root, 1, "json");
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())
