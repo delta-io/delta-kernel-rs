@@ -137,6 +137,8 @@ impl Phase2State {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+        // Disable logging on drop since we're serializing, not completing
+        self.inner.get_metrics().clear_log_on_drop();
         self.inner.into_serializable_state()
     }
 
@@ -154,6 +156,10 @@ impl Phase2State {
         scan_span: tracing::Span,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
+        // Enable logging on drop for the reconstructed state
+        inner
+            .get_metrics()
+            .set_log_on_drop("Completed Phase 2 scan metadata");
         Ok(Self {
             inner,
             scan_span,

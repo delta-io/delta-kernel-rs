@@ -735,6 +735,24 @@ mod tests {
             phase2_partition_pruning_filtered_per_run: Some(0),
         }
     )]
+    #[case::no_phase2_needed(
+        "table-without-dv-small",
+        None,
+        ExpectedMetrics {
+            // This table has single-part checkpoint, completes in Phase 1
+            phase1_adds: 1,
+            phase1_removes: 0,
+            phase1_non_file_actions: 3,
+            phase1_data_skipping_filtered: 0,
+            phase1_partition_pruning_filtered: 0,
+            // No Phase 2 needed
+            phase2_adds_per_run: None,
+            phase2_removes_per_run: None,
+            phase2_non_file_actions_per_run: None,
+            phase2_data_skipping_filtered_per_run: None,
+            phase2_partition_pruning_filtered_per_run: None,
+        }
+    )]
     fn test_parallel_workflow_with_metrics(
         #[case] table_name: &str,
         #[case] predicate: Option<PredicateRef>,
@@ -763,24 +781,6 @@ mod tests {
         verify_metrics_in_logs(&logs, table_name, &expected, 1);
 
         Ok(())
-    }
-
-    /// Tests parallel workflow with a table that doesn't need Phase 2.
-    ///
-    /// This test verifies that tables with single-part checkpoints complete
-    /// in Phase 1 without requiring distributed processing.
-    #[rstest::rstest]
-    fn test_no_parallel_phase_needed(
-        #[values(false, true)] with_serde: bool,
-        #[values(false, true)] one_file_per_worker: bool,
-    ) -> DeltaResult<()> {
-        verify_parallel_workflow(
-            "table-without-dv-small",
-            None,
-            with_serde,
-            one_file_per_worker,
-            None,
-        )
     }
 
     #[test]
