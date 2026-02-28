@@ -493,9 +493,8 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression
-        let mut schema_transform = LiteralExpressionTransform::new(values);
-        schema_transform.transform_struct(schema.as_ref());
-        let row_expr = schema_transform.try_into_expr()?;
+        let schema_transform = LiteralExpressionTransform::new(values);
+        let row_expr = schema_transform.transform(schema.as_ref())?;
 
         let eval =
             self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
