@@ -421,8 +421,9 @@ mod tests {
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
+                    let scan_span = state.scan_span.clone();
                     let serialized_bytes = state.into_bytes()?;
-                    Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?
+                    Phase2State::from_bytes(engine.as_ref(), &serialized_bytes, scan_span)?
                 } else {
                     // Non-serde: just use the state directly
                     state
