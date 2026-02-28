@@ -338,7 +338,7 @@ impl StructField {
     /// metadata if present, otherwise returns the logical name.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
@@ -354,6 +354,26 @@ impl StructField {
                 }
             }
         }
+    }
+
+    /// Returns true if this field has a physical name annotation
+    /// in its column mapping metadata.
+    pub(crate) fn has_physical_name_annotation(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()),
+            Some(MetadataValue::String(_))
+        )
+    }
+
+    /// Returns true if this field has a column mapping ID annotation
+    /// in its column mapping metadata.
+    pub(crate) fn has_id_annotation(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::ColumnMappingId.as_ref()),
+            Some(MetadataValue::Number(_))
+        )
     }
 
     /// Change the name of a field. The field will preserve its data type and nullability. Note that
@@ -415,7 +435,7 @@ impl StructField {
     /// removed.
     ///
     /// NOTE: The caller must ensure that the schema has been validated by
-    /// [`crate::table_features::validate_schema_column_mapping`] to ensure that annotations are
+    /// [`crate::table_configuration::TableConfiguration::try_new`] to ensure that annotations are
     /// present only when column mapping mode is enabled.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
@@ -482,7 +502,7 @@ impl StructField {
     /// based on the specified `column_mapping_mode`.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// [`crate::table_features::validate_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
@@ -496,7 +516,7 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `validate_schema_column_mapping` should have verified that this has a field Id
+                    // `validate_column_mapping` should have verified that this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -884,7 +904,7 @@ impl StructType {
     /// [`ColumnMetadataKey::ParquetFieldId`] metadata field.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[allow(unused)]
     #[internal_api]
@@ -1004,6 +1024,14 @@ impl StructType {
     pub fn with_field_removed(mut self, name: &str) -> Self {
         self.fields.shift_remove(name);
         self
+    }
+
+    /// Returns a new [`StructType`] containing only the fields for which `predicate` returns `true`.
+    pub fn with_fields_filtered(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Self> {
+        Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
     }
 
     /// Returns a StructType with the named field replaced.
