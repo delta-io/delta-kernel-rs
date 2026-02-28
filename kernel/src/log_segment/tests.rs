@@ -28,7 +28,7 @@ use crate::scan::test_utils::{
 use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, FilePredicate, RowVisitor,
     StorageHandler,
 };
 use test_utils::{
@@ -49,7 +49,7 @@ fn process_sidecars(
     log_root: Url,
     batch: &dyn EngineData,
     checkpoint_read_schema: SchemaRef,
-    meta_predicate: Option<PredicateRef>,
+    meta_predicate: FilePredicate,
 ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
     // Visit the rows of the checkpoint batch to extract sidecar file references
     let mut visitor = SidecarVisitor::default();
@@ -972,7 +972,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
         log_root,
         checkpoint_batch.as_ref(),
         get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
-        None,
+        FilePredicate::None,
     )?
     .into_iter()
     .flatten();
@@ -1012,7 +1012,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
-        None,
+        FilePredicate::None,
     )?
     .into_iter()
     .flatten();
@@ -1040,7 +1040,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         log_root,
         checkpoint_batch.as_ref(),
         get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
-        None,
+        FilePredicate::None,
     )?
     .into_iter()
     .flatten();
@@ -1070,8 +1070,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     .await?;
 
     // Filter out sidecar files that do not contain remove actions
-    let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(
+    let remove_predicate: LazyLock<FilePredicate> = LazyLock::new(|| {
+        FilePredicate::Data(Arc::new(
             Expression::column([REMOVE_NAME, "path"]).is_not_null(),
         ))
     });
@@ -1125,7 +1125,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None,
+        FilePredicate::None,
         None,
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1195,7 +1195,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None,
+        FilePredicate::None,
         None,
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1260,7 +1260,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None,
+        FilePredicate::None,
         None,
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1311,8 +1311,12 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let checkpoint_result =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None, None)?;
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema,
+        FilePredicate::None,
+        None,
+    )?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1403,7 +1407,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None,
+        FilePredicate::None,
         None,
     )?;
     let mut iter = checkpoint_result.actions;

@@ -1,14 +1,17 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
 use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
-use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
+use crate::kernel_predicates::parquet_stats_skipping::{
+    MetadataSkippingFilter, ParquetStatsProvider,
+};
+use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
-use crate::parquet::schema::types::ColumnDescPtr;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
+use crate::{FilePredicate, MetadataStatResolver};
 use chrono::{DateTime, Days};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
 #[cfg(test)]
@@ -26,6 +29,24 @@ pub(crate) trait ParquetRowGroupSkipping {
         predicate: &Predicate,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
+
+    /// Instructs the parquet reader to perform metadata-aware row group skipping. The provided
+    /// [`MetadataStatResolver`] maps predicate columns to their physical stat locations in the
+    /// metadata file.
+    fn with_metadata_row_group_filter(
+        self,
+        predicate: &Predicate,
+        resolver: &MetadataStatResolver,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self;
+
+    /// Applies row group filtering based on a [`FilePredicate`]. Dispatches to the appropriate
+    /// filter method depending on the variant.
+    fn with_file_predicate_filter(
+        self,
+        predicate: &FilePredicate,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self;
 }
 impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
     fn with_row_group_filter(
@@ -39,7 +60,6 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .iter()
             .enumerate()
             .filter_map(|(ordinal, row_group)| {
-                // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
                 RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
             })
             .collect();
@@ -49,29 +69,73 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
         }
         self.with_row_groups(ordinals)
     }
+
+    fn with_metadata_row_group_filter(
+        self,
+        predicate: &Predicate,
+        resolver: &MetadataStatResolver,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self {
+        let ordinals: Vec<_> = self
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, row_group)| {
+                let inner = RowGroupFilter::new(row_group);
+                MetadataSkippingFilter::apply(inner, predicate, resolver).then_some(ordinal)
+            })
+            .collect();
+        debug!("with_metadata_row_group_filter({predicate:#?}) = {ordinals:?})");
+        if let Some(row_indexes) = row_indexes {
+            row_indexes.select_row_groups(&ordinals);
+        }
+        self.with_row_groups(ordinals)
+    }
+
+    fn with_file_predicate_filter(
+        self,
+        predicate: &FilePredicate,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self {
+        match predicate {
+            FilePredicate::None => self,
+            FilePredicate::Data(pred) => self.with_row_group_filter(pred, row_indexes),
+            FilePredicate::Metadata {
+                predicate,
+                resolver,
+            } => self.with_metadata_row_group_filter(predicate, resolver, row_indexes),
+        }
+    }
 }
 
 /// A ParquetStatsSkippingFilter for row group skipping. It obtains stats from a parquet
 /// [`RowGroupMetaData`] and pre-computes the mapping of each referenced column path to its
 /// corresponding field index, for O(1) stats lookups.
-struct RowGroupFilter<'a> {
+pub(crate) struct RowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
     field_indices: HashMap<ColumnName, usize>,
 }
 
 impl<'a> RowGroupFilter<'a> {
-    /// Creates a new row group filter for the given row group and predicate.
-    fn new(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> Self {
+    /// Creates a new row group filter with an empty field-index mapping.
+    ///
+    /// Callers must invoke [`prepare_stats`](ParquetStatsProvider::prepare_stats) before
+    /// querying stats, otherwise all lookups will return `None` (safe but no pruning).
+    /// Prefer [`MetadataSkippingFilter::apply`] or [`RowGroupFilter::apply`] which
+    /// handle this automatically.
+    pub(crate) fn new(row_group: &'a RowGroupMetaData) -> Self {
         Self {
             row_group,
-            field_indices: compute_field_indices(row_group.schema_descr().columns(), predicate),
+            field_indices: HashMap::new(),
         }
     }
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
     fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
-        use crate::kernel_predicates::KernelPredicateEvaluator as _;
-        RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
+        let mut filter = RowGroupFilter::new(row_group);
+        filter.prepare_stats(predicate.references());
+        filter.eval_sql_where(predicate) != Some(false)
     }
 
     /// Returns `None` if the column doesn't exist and `Some(None)` if the column has no stats.
@@ -101,6 +165,27 @@ impl<'a> RowGroupFilter<'a> {
 }
 
 impl ParquetStatsProvider for RowGroupFilter<'_> {
+    /// Given a set of columns of interest, filter our parquet column descriptors to build a column
+    /// -> index mapping for O(1) lookup times. That way, the total cost of stats lookups is O(m+n)
+    /// where m is the number of referenced columns and n is the number of column references in the
+    /// predicate. Otherwise, we'd either have to pre-materialize the mapping for all columns
+    /// (expensive with a wide schema), or pay O(m*n) lookup cost in repeated descriptor searches.
+    ///
+    /// NOTE: If a requested column was not available, it is silently ignored. These missing columns
+    /// are implied all-null, so we infer their min/max stats as NULL and nullcount == rowcount.
+    fn prepare_stats<'a, I>(&mut self, cols: I)
+    where
+        I: IntoIterator<Item = &'a ColumnName>,
+    {
+        let mut requested_columns = HashSet::<_>::from_iter(cols);
+        let fields = self.row_group.schema_descr().columns();
+        let field_indices = fields.iter().enumerate().filter_map(|(i, f)| {
+            let path = requested_columns.take(f.path().parts())?;
+            Some((path.clone(), i))
+        });
+        self.field_indices.extend(field_indices);
+    }
+
     // Extracts a stat value, converting from its physical type to the requested logical type.
     //
     // NOTE: This code is highly redundant with [`get_max_stat_value`] below, but parquet
@@ -225,28 +310,4 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
     fn get_parquet_rowcount_stat(&self) -> i64 {
         self.row_group.num_rows()
     }
-}
-
-/// Given a predicate of interest and a set of parquet column descriptors, build a column ->
-/// index mapping for columns the predicate references. This ensures O(1) lookup times, for an
-/// overall O(n) cost to evaluate a predicate tree with n nodes.
-pub(crate) fn compute_field_indices(
-    fields: &[ColumnDescPtr],
-    predicate: &Predicate,
-) -> HashMap<ColumnName, usize> {
-    // Build up a set of requested column paths, then take each found path as the corresponding map
-    // key (avoids unnecessary cloning).
-    //
-    // NOTE: If a requested column was not available, it is silently ignored. These missing columns
-    // are implied all-null, so we will infer their min/max stats as NULL and nullcount == rowcount.
-    let mut requested_columns = predicate.references();
-    fields
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| {
-            requested_columns
-                .take(f.path().parts())
-                .map(|path| (path.clone(), i))
-        })
-        .collect()
 }

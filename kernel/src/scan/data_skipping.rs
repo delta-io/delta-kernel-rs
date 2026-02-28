@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use tracing::{debug, error, info};
@@ -193,26 +192,6 @@ impl DataSkippingFilter {
     }
 }
 
-/// Rewrites a predicate for parquet row group skipping in checkpoint/sidecar files.
-/// Returns `None` if the predicate is not eligible for data skipping.
-///
-/// Adds IS NULL guards on each stat column reference so the parquet RowGroupFilter
-/// conservatively keeps row groups containing files with missing stats (null stat values
-/// are invisible to footer min/max). For example, `col_a > 100` becomes:
-/// ```text
-/// OR(maxValues.col_a IS NULL, maxValues.col_a > 100)
-/// ```
-///
-/// Partition columns are excluded since their values live in `add.partitionValues_parsed`,
-/// not `add.stats_parsed`.
-pub(crate) fn as_checkpoint_skipping_predicate(
-    pred: &Pred,
-    partition_columns: &[String],
-) -> Option<Pred> {
-    let partition_columns: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
-    NullGuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
-}
-
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.
 fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) -> Pred {
     let pred_fn = match (ord, inverted) {
@@ -329,146 +308,6 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         op.as_data_skipping_predicate(self, exprs, inverted)
     }
 
-    fn finish_eval_pred_junction(
-        &self,
-        op: JunctionPredicateOp,
-        preds: &mut dyn Iterator<Item = Option<Pred>>,
-        inverted: bool,
-    ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
-    }
-}
-
-/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references
-/// for safe parquet row group filtering. Partition columns are excluded (no stats in
-/// `stats_parsed`).
-struct NullGuardedDataSkippingPredicateCreator<'a> {
-    partition_columns: HashSet<&'a str>,
-}
-
-impl NullGuardedDataSkippingPredicateCreator<'_> {
-    /// Returns true if the column is a partition column (no stats in `stats_parsed`).
-    fn is_partition_column(&self, col: &ColumnName) -> bool {
-        let path = col.path();
-        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
-    }
-}
-
-impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<'_> {
-    type Output = Pred;
-    type ColumnStat = Expr;
-
-    // The get_*_stat methods delegate to DataSkippingPredicateCreator but return None for
-    // partition columns, which don't have stats in stats_parsed.
-
-    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
-        if self.is_partition_column(col) {
-            return None;
-        }
-        DataSkippingPredicateCreator.get_min_stat(col, data_type)
-    }
-
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
-        if self.is_partition_column(col) {
-            return None;
-        }
-        DataSkippingPredicateCreator.get_max_stat(col, data_type)
-    }
-
-    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
-        if self.is_partition_column(col) {
-            return None;
-        }
-        DataSkippingPredicateCreator.get_nullcount_stat(col)
-    }
-
-    fn get_rowcount_stat(&self) -> Option<Expr> {
-        DataSkippingPredicateCreator.get_rowcount_stat()
-    }
-
-    /// Wraps a stat column comparison with an IS NULL guard.
-    ///
-    /// `col > 100` → `OR(maxValues.col IS NULL, maxValues.col > 100)`
-    ///
-    /// `col = 100` (calls this twice, once per stat):
-    /// ```text
-    /// AND(
-    ///   OR(minValues.col IS NULL, minValues.col <= 100),
-    ///   OR(maxValues.col IS NULL, maxValues.col >= 100)
-    /// )
-    /// ```
-    fn eval_partial_cmp(
-        &self,
-        ord: Ordering,
-        col: Expr,
-        val: &Scalar,
-        inverted: bool,
-    ) -> Option<Pred> {
-        let comparison = comparison_predicate(ord, col.clone(), val, inverted);
-        Some(Pred::or(Pred::is_null(col), comparison))
-    }
-
-    /// No guard needed — no stat column reference. `TRUE` → `Some(true)`.
-    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Pred::literal)
-    }
-
-    /// No guard needed — no stat column reference. `NULL IS NULL` → `Some(true)`.
-    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
-    }
-
-    /// IS NULL guard on nullCount stat.
-    ///
-    /// `IS NULL` → `OR(nullCount.col IS NULL, nullCount.col != 0)`:
-    /// column vs literal — RowGroupFilter can evaluate via footer stats.
-    ///
-    /// `IS NOT NULL` → returns `None`. The unguarded version produces
-    /// `nullCount.col != numRecords`, which is column vs column. The RowGroupFilter can
-    /// only resolve one column at a time, so it can never prune with this predicate.
-    // TODO(#1873): IS NOT NULL pruning requires cross-column range comparison in RowGroupFilter.
-    // Skippable when the nullCount and numRecords ranges don't overlap (e.g. nullCount in
-    // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
-    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
-        if inverted {
-            return None; // IS NOT NULL: column vs column, can't prune (#1873)
-        }
-        let nullcount = self.get_nullcount_stat(col)?;
-        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
-        Some(Pred::or(Pred::is_null(nullcount), comparison))
-    }
-
-    /// No guard needed — no stat column reference. `5 < 10` → `Some(true)`.
-    fn eval_pred_binary_scalars(
-        &self,
-        op: BinaryPredicateOp,
-        left: &Scalar,
-        right: &Scalar,
-        inverted: bool,
-    ) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
-            .map(Pred::literal)
-    }
-
-    /// Unsupported. Opaque predicates can construct stat column references directly,
-    /// bypassing IS NULL guards and risking false pruning. Returns `None` to conservatively
-    /// drop these from the skipping predicate.
-    fn eval_pred_opaque(
-        &self,
-        _op: &OpaquePredicateOpRef,
-        _exprs: &[Expr],
-        _inverted: bool,
-    ) -> Option<Pred> {
-        None
-    }
-
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` →
-    /// ```text
-    /// AND(
-    ///   OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-    ///   OR(minValues.col_b IS NULL, minValues.col_b < 50)
-    /// )
-    /// ```
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
