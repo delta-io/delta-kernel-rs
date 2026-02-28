@@ -12,7 +12,7 @@ use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
+use crate::{DeltaResult, Engine, Error, FileMeta, FilePredicate, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
@@ -58,7 +58,7 @@ impl CheckpointManifestReader {
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
                 MANIFEST_READ_SCHMEA.clone(),
-                None,
+                FilePredicate::None,
             )?,
             extension => {
                 return Err(Error::generic(format!(
