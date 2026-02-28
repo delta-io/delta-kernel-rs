@@ -228,10 +228,7 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 fn build_partition_values_parsed_expr(partition_schema: &SchemaRef) -> ExpressionRef {
     Arc::new(Expression::coalesce([
         Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
-        Expression::map_to_struct(
-            Expression::column([ADD_NAME, PARTITION_VALUES_FIELD]),
-            partition_schema.clone(),
-        ),
+        Expression::map_to_struct(Expression::column([ADD_NAME, PARTITION_VALUES_FIELD])),
     ]))
 }
 
