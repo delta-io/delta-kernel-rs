@@ -158,6 +158,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             vec![Expr::literal(42), Expr::literal(1.111)],
         ),
         Expr::unknown("mystery"),
+        Expr::map_to_struct(column_expr!("pv")),
     ];
     sub_exprs.extend(
         [
@@ -273,6 +274,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
             Expr::literal(2_i64),
             Expr::literal(3.0_f64),
         ]),
+        Expr::map_to_struct(column_expr!("partitionValues")),
     ];
     Arc::new(Expr::struct_from(sub_exprs)).into()
 }
