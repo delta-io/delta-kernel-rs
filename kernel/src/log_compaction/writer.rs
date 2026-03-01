@@ -97,11 +97,8 @@ impl LogCompactionWriter {
         )?;
 
         // Read actions from the version-filtered log segment
-        let actions_iter = compaction_log_segment.read_actions(
-            engine,
-            COMPACTION_ACTIONS_SCHEMA.clone(),
-            None, // No predicate - we want all actions in the version range
-        )?;
+        let actions_iter =
+            compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 

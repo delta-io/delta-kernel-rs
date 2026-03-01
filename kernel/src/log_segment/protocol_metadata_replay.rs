@@ -3,12 +3,10 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
-use std::sync::{Arc, LazyLock};
-
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
-use crate::{DeltaResult, Engine, Error, Expression, Predicate, PredicateRef};
+use crate::{DeltaResult, Engine, Error};
 
 use tracing::{info, instrument, warn};
 
@@ -141,15 +139,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-            )))
-        });
-        // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema, META_PREDICATE.clone())
+        self.read_actions(engine, schema)
     }
 }
 

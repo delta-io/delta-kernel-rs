@@ -6,8 +6,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
+use crate::actions::{
+    schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
+};
 use crate::committer::CatalogCommit;
+use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -16,8 +20,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, PredicateRef, RowVisitor, StorageHandler, Version,
-    PRE_COMMIT_VERSION,
+    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -105,6 +109,38 @@ pub(crate) struct LogSegment {
     /// [LogSegment::ascending_commit_files] if there is a catalog commit present for the same
     /// version that took priority over it.
     pub max_published_version: Option<Version>,
+}
+
+/// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
+/// predicates that enable row group skipping in checkpoint parquet files.
+///
+/// For `txn`, this is effective because all app ids end up in a single checkpoint part when
+/// partitioned by `add.path` as the Delta spec requires. Filtering by a specific app id is not
+/// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
+fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
+    match action_name {
+        METADATA_NAME => Some(ColumnName::new([METADATA_NAME, "id"])),
+        PROTOCOL_NAME => Some(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])),
+        SET_TRANSACTION_NAME => Some(ColumnName::new([SET_TRANSACTION_NAME, "appId"])),
+        DOMAIN_METADATA_NAME => Some(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])),
+        _ => None,
+    }
+}
+
+/// Builds an IS NOT NULL predicate for row group skipping based on the action types in `schema`.
+/// Returns `None` if any top-level field in the schema is not a recognized action type, since
+/// an unknown type could have non-null rows in the same row group, making skipping unsafe.
+fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> {
+    // Collect identifying columns for every field; short-circuit to None on any unknown field.
+    let columns: Vec<ColumnName> = schema
+        .fields()
+        .map(|f| action_identifying_column(f.name()))
+        .collect::<Option<_>>()?;
+    let mut predicates = columns
+        .into_iter()
+        .map(|col| Expression::column(col).is_not_null());
+    let first = predicates.next()?;
+    Some(Arc::new(predicates.fold(first, Predicate::or)))
 }
 
 impl LogSegment {
@@ -477,13 +513,16 @@ impl LogSegment {
     ///  actions) that are not part of the schema but this is an implementation
     ///  detail that should not be relied on and will likely change.
     ///
-    /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
-    /// query's predicate, but rather a predicate for filtering log files themselves.
     /// Read a stream of actions from this log segment. This returns an iterator of
     /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
     /// the data was read from a commit file (true) or a checkpoint file (false).
     ///
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
+    ///
+    /// `meta_predicate` is an optional expression for row group skipping in checkpoint parquet
+    /// files. It is _NOT_ the query's data predicate, but a hint for skipping irrelevant data.
+    /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
+    /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -495,13 +534,22 @@ impl LogSegment {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
+        // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
+        // checkpoint parquet row groups without any relevant action type can be skipped.
+        // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
+        let is_not_null_pred = schema_to_is_not_null_predicate(&checkpoint_read_schema);
+        let effective_predicate = match (is_not_null_pred, meta_predicate) {
+            (None, x) | (x, None) => x,
+            (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
+        };
+
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            meta_predicate,
+            effective_predicate,
             stats_schema,
         )?;
 
@@ -511,19 +559,20 @@ impl LogSegment {
         })
     }
 
-    // Same as above, but uses the same schema for reading checkpoints and commits.
+    /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but uses the same schema
+    /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
+    /// the schema, so callers do not need to supply them.
     #[internal_api]
     pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
             action_schema.clone(),
             action_schema,
-            meta_predicate,
+            None,
             None,
         )?;
         Ok(result.actions)
