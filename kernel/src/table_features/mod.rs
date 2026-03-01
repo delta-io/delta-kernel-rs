@@ -23,6 +23,8 @@ pub(crate) use column_mapping::{
 };
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
+#[cfg(test)]
+mod feature_tests;
 mod timestamp_ntz;
 
 /// Maximum reader protocol version that the kernel can handle.
@@ -197,7 +199,7 @@ pub(crate) enum EnablementCheck {
 
 /// Represents the type of operation being performed on a table
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 pub(crate) enum Operation {
     /// Read operations on regular table data
     Scan,

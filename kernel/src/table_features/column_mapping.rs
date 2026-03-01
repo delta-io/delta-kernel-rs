@@ -351,6 +351,7 @@ mod tests {
     use crate::schema::{DataType, StructType};
     use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     #[test]
     fn test_column_mapping_mode() {
@@ -522,6 +523,101 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field id");
         let schema = create_schema(None, None, None, "\"col-5f422f40\"");
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
+    }
+
+    // =========================================================================
+    // End-to-end TC-level tests for column mapping mode vs protocol vs schema.
+    //
+    // Column mapping is the only feature with BOTH a multi-valued toggle property
+    // (delta.columnMapping.mode) AND schema-level presence (annotations). This
+    // combination is not expressible in the generic test battery, so these tests
+    // cover the {support mechanism} × {mode} × {annotations} matrix directly.
+    // =========================================================================
+
+    /// Helper: build a TC from a schema, protocol, and optional mode property.
+    fn make_cm_tc(
+        schema: Arc<StructType>,
+        protocol: Protocol,
+        mode: Option<&str>,
+    ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
+        use crate::actions::Metadata;
+        let props: HashMap<String, String> = mode
+            .map(|m| {
+                HashMap::from([("delta.columnMapping.mode".to_string(), m.to_string())])
+            })
+            .unwrap_or_default();
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+        let table_root = url::Url::parse("file:///").unwrap();
+        crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    }
+
+    fn plain_schema() -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]))
+    }
+
+    fn annotated_schema() -> Arc<StructType> {
+        Arc::new(create_schema(
+            "5",
+            "\"col-a7f4159c\"",
+            "4",
+            "\"col-5f422f40\"",
+        ))
+    }
+
+    /// v3 + CM feature: mode=id/name without annotations → rejected (missing annotations).
+    #[test]
+    fn test_cm_v3_supported_mode_set_but_no_annotations() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([TableFeature::ColumnMapping]),
+            Some([TableFeature::ColumnMapping]),
+        )
+        .unwrap();
+        for mode in ["id", "name"] {
+            assert!(
+                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
+                "v3+feat, mode={mode}, no annotations: should fail"
+            );
+        }
+    }
+
+    /// v3 + CM feature: mode=none with annotations → rejected (orphaned annotations).
+    #[test]
+    fn test_cm_v3_supported_mode_none_with_annotations() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([TableFeature::ColumnMapping]),
+            Some([TableFeature::ColumnMapping]),
+        )
+        .unwrap();
+        assert!(
+            make_cm_tc(annotated_schema(), protocol, Some("none")).is_err(),
+            "v3+feat, mode=none, annotations present: should fail"
+        );
+    }
+
+    /// v3 + no CM feature: mode=id/name without annotations → silently downgrades to None.
+    /// The mode property is ignored per spec when the feature is not supported.
+    #[test]
+    fn test_cm_v3_not_supported_mode_set_no_annotations() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<[String; 0]>([]),
+            Some::<[String; 0]>([]),
+        )
+        .unwrap();
+        for mode in ["id", "name"] {
+            let tc = make_cm_tc(plain_schema(), protocol.clone(), Some(mode))
+                .unwrap_or_else(|e| panic!("v3-feat, mode={mode}, no annotations: {e}"));
+            assert!(!tc.is_feature_supported(&TableFeature::ColumnMapping));
+            assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        }
     }
 
     // =========================================================================
