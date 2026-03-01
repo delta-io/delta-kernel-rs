@@ -665,31 +665,20 @@ impl<S> Transaction<S> {
             .read_snapshot
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-<<<<<<< HEAD
-        // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
+        // Build a Transform expression that drops partition columns (unless
+        // materializePartitionColumns is enabled) and void columns (never written to Parquet).
         let mut transform = Transform::new_top_level();
         if !materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
             }
         }
+        for field in self.read_snapshot.schema().fields() {
+            if *field.data_type() == DataType::VOID {
+                transform = transform.with_dropped_field_if_exists(field.name());
+            }
+        }
         Expression::transform(transform)
-=======
-        let schema = self.read_snapshot.schema();
-
-        // If the materialize partition columns feature is enabled, pass through all columns in the
-        // schema. Otherwise, exclude partition columns. Void columns are always excluded because
-        // they are never written to Parquet files.
-        let fields = schema
-            .fields()
-            .filter(|f| {
-                (materialize_partition_columns || !partition_cols.contains(&f.name().to_string()))
-                    && *f.data_type() != DataType::VOID
-            })
-            .map(|f| Expression::column([f.name()]));
-        Expression::struct_from(fields)
->>>>>>> fbdfb50 (refactor: keep void columns visible on reads, validate only at write time)
     }
 
     /// Get the write context for this transaction. At the moment, this is constant for the whole

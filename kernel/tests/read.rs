@@ -2,16 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-<<<<<<< HEAD
-use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
+use delta_kernel::arrow::array::{ArrayRef, AsArray as _, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{Field as ArrowField, Int64Type, Schema as ArrowSchema};
-=======
-use delta_kernel::arrow::array::{ArrayRef, AsArray as _};
-use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Int64Type, Schema as ArrowSchema};
-use delta_kernel::arrow::record_batch::RecordBatch;
->>>>>>> fbdfb50 (refactor: keep void columns visible on reads, validate only at write time)
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -1950,7 +1945,8 @@ fn read_spark_table_with_void_column() -> Result<(), Box<dyn std::error::Error>>
 
 // Verify that a table with void nested inside an Array can be read at runtime.
 // Write-time validation rejects void-in-array, but reads and metadata ops always work.
-// The arr column is missing from Parquet and materializes as null.
+// The arr column is absent from the Parquet schema; kernel synthesizes a null column at read
+// time (the entire column is NULL, not an array of null elements).
 #[tokio::test]
 async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("id", vec![1, 2].into_array())])?;
@@ -1979,8 +1975,15 @@ async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> 
     let batches = read_scan(&scan, engine)?;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
-    // arr column should be present (missing from Parquet → materialized as null)
-    let arr_col = batches[0].column_by_name("arr").expect("arr column");
+    // The arr column is absent from Parquet; kernel synthesizes a null column (all values NULL).
+    let arr_col = batches[0]
+        .column_by_name("arr")
+        .expect("arr column must be in RecordBatch");
+    assert_eq!(
+        arr_col.null_count(),
+        arr_col.len(),
+        "entire column should be null"
+    );
     assert!(arr_col.is_nullable());
 
     Ok(())
@@ -1988,7 +1991,8 @@ async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> 
 
 // Verify that a table with void nested inside a Map value can be read at runtime.
 // Write-time validation rejects void-in-map, but reads and metadata ops always work.
-// The m column is missing from Parquet and materializes as null.
+// The m column is absent from the Parquet schema; kernel synthesizes a null column at read
+// time (the entire column is NULL, not a map with null entries).
 #[tokio::test]
 async fn read_void_in_map_type_ok() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("id", vec![1, 2].into_array())])?;
@@ -2017,8 +2021,15 @@ async fn read_void_in_map_type_ok() -> Result<(), Box<dyn std::error::Error>> {
     let batches = read_scan(&scan, engine)?;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
-    // m column should be present (missing from Parquet → materialized as null)
-    let m_col = batches[0].column_by_name("m").expect("m column");
+    // The m column is absent from Parquet; kernel synthesizes a null column (all values NULL).
+    let m_col = batches[0]
+        .column_by_name("m")
+        .expect("m column must be in RecordBatch");
+    assert_eq!(
+        m_col.null_count(),
+        m_col.len(),
+        "entire column should be null"
+    );
     assert!(m_col.is_nullable());
 
     Ok(())

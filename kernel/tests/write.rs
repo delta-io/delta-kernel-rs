@@ -37,17 +37,14 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-<<<<<<< HEAD
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
+    StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
-=======
-use delta_kernel::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
->>>>>>> fbdfb50 (refactor: keep void columns visible on reads, validate only at write time)
 
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
@@ -3104,7 +3101,6 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     Ok(())
 }
 
-<<<<<<< HEAD
 #[tokio::test]
 async fn test_write_parquet_succeed_with_logical_partition_names(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3602,7 +3598,8 @@ async fn test_checkpoint_non_kernel_written_table() {
                 .is_some_and(|n| n.contains(".checkpoint.parquet"))
         });
     assert!(has_checkpoint, "Expected at least one checkpoint file");
-=======
+}
+
 // ---- Void type write-time validation tests ----
 
 /// Helper to create a table with a given schema and attempt a commit with dummy add_files.
@@ -3813,7 +3810,6 @@ async fn write_context_excludes_nested_void_from_physical_schema(
     }
 
     Ok(())
->>>>>>> fbdfb50 (refactor: keep void columns visible on reads, validate only at write time)
 }
 
 struct ClusteredTableSetup {
