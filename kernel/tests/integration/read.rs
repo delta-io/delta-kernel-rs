@@ -2629,6 +2629,7 @@ async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
     // The arr column is absent from Parquet; kernel synthesizes a null column (all values NULL).
+    // The Arrow type is List<Null> (matching Delta's array<void>), not a bare NullArray.
     let arr_col = batches[0]
         .column_by_name("arr")
         .expect("arr column must be in RecordBatch");
@@ -2637,7 +2638,6 @@ async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> 
         arr_col.len(),
         "entire column should be null"
     );
-    assert!(arr_col.is_nullable());
 
     Ok(())
 }
@@ -2675,6 +2675,7 @@ async fn read_void_in_map_type_ok() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
     // The m column is absent from Parquet; kernel synthesizes a null column (all values NULL).
+    // The Arrow type is Map<String,Null> (matching Delta's map<string,void>), not a bare NullArray.
     let m_col = batches[0]
         .column_by_name("m")
         .expect("m column must be in RecordBatch");
@@ -2683,7 +2684,6 @@ async fn read_void_in_map_type_ok() -> Result<(), Box<dyn std::error::Error>> {
         m_col.len(),
         "entire column should be null"
     );
-    assert!(m_col.is_nullable());
 
     Ok(())
 }

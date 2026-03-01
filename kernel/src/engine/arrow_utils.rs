@@ -4511,6 +4511,9 @@ mod tests {
         let void_col = inner.column(1);
         assert_eq!(*void_col.data_type(), DataType::Null);
         assert_eq!(void_col.len(), 4);
+        // NullArray has no null bitmap, so null_count() returns 0 in Arrow even though
+        // all values are conceptually null. Verify the quirk explicitly.
+        assert_eq!(void_col.null_count(), 0);
 
         // Verify the int column got the parent null propagated (row 0 is now null)
         let val_col = inner.column(0);
