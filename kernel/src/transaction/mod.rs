@@ -321,15 +321,19 @@ where
     })
 }
 
+/// Returns true if the struct (or any nested struct) contains void fields.
+fn contains_void(st: &StructType) -> bool {
+    st.fields().any(|f| {
+        *f.data_type() == DataType::VOID
+            || matches!(f.data_type(), DataType::Struct(inner) if contains_void(inner))
+    })
+}
+
 /// Recursively builds a nested StructPatch that drops void fields from a struct type.
 /// Returns `None` if the struct contains no void fields (no patch needed).
 /// The `path` parameter specifies the column path to the struct being transformed.
 fn build_void_stripping_transform(st: &StructType, path: &[&str]) -> Option<ExpressionStructPatch> {
-    let has_void = st.fields().any(|f| {
-        *f.data_type() == DataType::VOID
-            || matches!(f.data_type(), DataType::Struct(inner) if build_void_stripping_transform(inner, &[]).is_some())
-    });
-    if !has_void {
+    if !contains_void(st) {
         return None;
     }
 
