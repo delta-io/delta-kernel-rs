@@ -19,7 +19,10 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{
+    ColumnMetadataKey, DataType, PrimitiveType, StructField, StructType, TableSchema,
+};
+use crate::table_features::ColumnMappingMode;
 use crate::{EngineData, Snapshot};
 
 use super::*;
@@ -201,9 +204,9 @@ fn test_physical_predicate() {
         ),
     ];
 
+    let table_schema = TableSchema::new_for_test(Arc::new(logical_schema), ColumnMappingMode::Name);
     for (predicate, expected) in test_cases {
-        let result =
-            PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name).ok();
+        let result = PhysicalPredicate::try_new(&predicate, &table_schema).ok();
         assert_eq!(
             result, expected,
             "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"

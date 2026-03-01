@@ -1,6 +1,6 @@
 use crate::arrow::array::StringArray;
 use crate::scan::state_info::StateInfo;
-use crate::schema::StructType;
+use crate::schema::{StructType, TableSchema};
 use crate::utils::test_utils::string_array_to_engine_data;
 use itertools::Itertools;
 use std::sync::Arc;
@@ -143,11 +143,10 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
     let logical_schema =
         logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
     let state_info = Arc::new(StateInfo {
-        logical_schema: logical_schema.clone(),
+        schema: TableSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None),
         physical_schema: logical_schema,
         physical_predicate: PhysicalPredicate::None,
         transform_spec,
-        column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
         logical_stats_schema: None,
     });

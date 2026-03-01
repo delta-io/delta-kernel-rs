@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, TableSchema};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -14,9 +14,10 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 /// This function directly looks up CDF columns in the schema and generates their values
 /// based on the scan file metadata, returning an iterator over the metadata.
 fn get_cdf_columns(
-    logical_schema: &SchemaRef,
+    schema: &TableSchema,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
+    let logical_schema = schema.logical_schema();
     // Handle _change_type
     let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_field, &scan_file.scan_type) {
@@ -104,15 +105,14 @@ pub(crate) fn get_cdf_transform_expr(
 
     // Handle regular partition values using parse_partition_values
     let parsed_values = parse_partition_values(
-        &state_info.logical_schema,
+        &state_info.schema,
         transform_spec,
         &scan_file.partition_values,
-        state_info.column_mapping_mode,
     )?;
     partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
-    let cdf_values = get_cdf_columns(&state_info.logical_schema, scan_file)?;
+    let cdf_values = get_cdf_columns(&state_info.schema, scan_file)?;
     partition_values.extend(cdf_values);
 
     get_transform_expr(
@@ -131,7 +131,7 @@ mod tests {
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, StructField, StructType, TableSchema};
     use crate::table_features::ColumnMappingMode;
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
@@ -177,13 +177,12 @@ mod tests {
         logical_schema: SchemaRef,
         transform_spec: Vec<FieldTransformSpec>,
     ) -> StateInfo {
-        let physical_schema = create_test_physical_schema();
+        let physical_schema: SchemaRef = create_test_physical_schema().into();
         StateInfo {
-            logical_schema,
-            physical_schema: physical_schema.into(),
+            schema: TableSchema::new_for_test(logical_schema, ColumnMappingMode::None),
+            physical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
         }
@@ -400,11 +399,10 @@ mod tests {
         let transform_spec = vec![];
 
         let state_info = StateInfo {
-            logical_schema,
+            schema: TableSchema::new_for_test(logical_schema, ColumnMappingMode::None),
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
         };

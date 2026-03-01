@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -27,9 +27,11 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{
+    ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, TableSchema,
+};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -887,40 +889,23 @@ impl<S> Transaction<S> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-        let column_mapping_mode = self
-            .read_snapshot
-            .table_configuration()
-            .column_mapping_mode();
 
-        // Compute physical schema: exclude partition columns since they're stored in the path
-        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
-        // logical field names to physical names.
-        let partition_columns: Vec<String> = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
         let materialize_partition_columns = self
             .read_snapshot
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        let physical_fields = snapshot_schema
-            .fields()
-            .filter(|f| {
-                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
-            })
-            .map(|f| f.make_physical(column_mapping_mode));
-        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
+
+        let schema = TableSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
+        let physical_schema = schema.compute_write_schema(materialize_partition_columns);
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
 
         WriteContext::new(
             target_dir.clone(),
-            snapshot_schema,
+            schema,
             physical_schema,
             Arc::new(logical_to_physical),
-            column_mapping_mode,
             stats_columns,
         )
     }
@@ -1209,10 +1194,9 @@ impl<S> Transaction<S> {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    logical_schema: SchemaRef,
+    schema: TableSchema,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
-    column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
 }
@@ -1220,18 +1204,16 @@ pub struct WriteContext {
 impl WriteContext {
     fn new(
         target_dir: Url,
-        logical_schema: SchemaRef,
+        schema: TableSchema,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
-        column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
             target_dir,
-            logical_schema,
+            schema,
             physical_schema,
             logical_to_physical,
-            column_mapping_mode,
             stats_columns,
         }
     }
@@ -1241,7 +1223,7 @@ impl WriteContext {
     }
 
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
+        self.schema.logical_schema()
     }
 
     pub fn physical_schema(&self) -> &SchemaRef {
@@ -1252,9 +1234,29 @@ impl WriteContext {
         self.logical_to_physical.clone()
     }
 
-    /// The [`ColumnMappingMode`] for this table.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+    /// Translate logical partition column names to physical names.
+    ///
+    /// Validates that each logical name exists in the table schema and returns the
+    /// corresponding physical name (accounting for column mapping).
+    pub fn physical_partition_values(
+        &self,
+        partition_values: HashMap<String, String>,
+    ) -> DeltaResult<HashMap<String, String>> {
+        partition_values
+            .into_iter()
+            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
+                let physical_name = self
+                    .schema
+                    .logical_to_physical_name(&logical_name)
+                    .ok_or_else(|| {
+                        Error::generic(format!(
+                            "Partition column '{logical_name}' not found in table schema"
+                        ))
+                    })?
+                    .to_string();
+                Ok((physical_name, value))
+            })
+            .collect()
     }
 
     /// Returns the column names that should have statistics collected during writes.

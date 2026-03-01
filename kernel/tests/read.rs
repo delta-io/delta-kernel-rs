@@ -1552,7 +1552,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         (
             "row_id",
             MetadataColumnSpec::RowId,
-            "Row ids are not enabled on this table",
+            "Row IDs require row tracking to be enabled with a configured materialized column name",
         ),
         (
             "row_commit_version",
