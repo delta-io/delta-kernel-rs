@@ -690,6 +690,35 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// Creates a [`DefaultJsonHandler`] backed by a [`LocalFileSystem`] store.
+    fn make_local_handler() -> DefaultJsonHandler<TokioBackgroundExecutor> {
+        DefaultJsonHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+    }
+
+    /// Writes `lines` as newline-delimited JSON to a [`NamedTempFile`] and returns the file
+    /// together with a [`FileMeta`] pointing at it. The temp file must be kept alive for as long
+    /// as the `FileMeta` is used.
+    fn make_temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        for line in lines {
+            writeln!(temp_file, "{line}").expect("Failed to write to temp file");
+        }
+        let path = temp_file.path();
+        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
+        let size = std::fs::metadata(path)
+            .expect("Failed to stat temp file")
+            .len();
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size,
+        };
+        (temp_file, file_meta)
+    }
+
     fn make_invalid_named_temp() -> (NamedTempFile, Url) {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
         write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
@@ -892,22 +921,9 @@ mod tests {
     async fn test_read_json_files_injects_file_path_column() {
         use crate::schema::MetadataColumnSpec;
 
-        // Write a temp JSON file with two simple rows.
-        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        writeln!(temp_file, r#"{{"x": 1}}"#).unwrap();
-        writeln!(temp_file, r#"{{"x": 2}}"#).unwrap();
-        let file_url = Url::from_file_path(temp_file.path()).expect("Failed to create file URL");
+        let (_temp, file_meta) = make_temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
+        let file_url = file_meta.location.clone();
 
-        let store = Arc::new(LocalFileSystem::new());
-        let location = Path::from_url_path(file_url.path()).unwrap();
-        let meta = store.head(&location).await.unwrap();
-        let files = [FileMeta {
-            location: file_url.clone(),
-            last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
-        }];
-
-        // Schema: one regular field + a FilePath metadata column after it.
         let schema = Arc::new(
             StructType::try_new([
                 StructField::not_null("x", DeltaDataType::INTEGER),
@@ -916,9 +932,8 @@ mod tests {
             .unwrap(),
         );
 
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let data: Vec<RecordBatch> = handler
-            .read_json_files(&files, schema, None)
+        let data: Vec<RecordBatch> = make_local_handler()
+            .read_json_files(&[file_meta], schema, None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
