@@ -1002,8 +1002,13 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
     )
     .await?;
 
-    let checkpoint_batch = sidecar_batch_with_given_paths(
-        vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+    let sidecar1_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
+    let sidecar2_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile2.parquet").await;
+    let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
+        vec![
+            ("sidecarfile1.parquet", sidecar1_size),
+            ("sidecarfile2.parquet", sidecar2_size),
+        ],
         read_schema.clone(),
     );
 
@@ -1058,9 +1063,6 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
-    let checkpoint_batch =
-        sidecar_batch_with_given_paths(vec!["sidecarfile1.parquet"], read_schema.clone());
-
     // Add a sidecar file with only add actions
     add_sidecar_to_store(
         &store,
@@ -1068,6 +1070,12 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         "sidecarfile1.parquet",
     )
     .await?;
+
+    let sidecar_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
+    let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
+        vec![("sidecarfile1.parquet", sidecar_size)],
+        read_schema.clone(),
+    );
 
     // Filter out sidecar files that do not contain remove actions
     let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {

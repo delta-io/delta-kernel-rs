@@ -408,7 +408,9 @@ async fn open_parquet_file(
         // TODO(#1010): Note that we don't need this at all and can actually just _always_
         // do the `with_file_size` but need to (1) update our unit tests which often
         // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
-        if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
+        if file_meta.size != 0 {
+            ParquetObjectReader::new(store, path).with_file_size(file_meta.size)
+        } else if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
             ObjectStoreScheme::parse(&file_meta.location)
         {
             // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
@@ -564,6 +566,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::DEFAULT_BATCH_SIZE;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
@@ -583,6 +586,65 @@ mod tests {
         engine_data
             .and_then(ArrowEngineData::try_from_engine_data)
             .map(Into::into)
+    }
+
+    async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
+        let store = Arc::new(LocalFileSystem::new());
+        let path = Path::from_url_path(file_meta.location.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+        let stream = open_parquet_file(
+            store,
+            Arc::new(physical_schema.try_into_kernel().unwrap()),
+            None,
+            None,
+            DEFAULT_BATCH_SIZE,
+            file_meta,
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        Ok(batches)
+    }
+
+    #[tokio::test]
+    async fn test_open_parquet_file_with_size() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+        let data = read_all_rows_helper(file_meta).await.unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_open_parquet_file_without_size() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let url = Url::from_file_path(path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+        let data = read_all_rows_helper(file_meta).await.unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 10);
     }
 
     #[tokio::test]
