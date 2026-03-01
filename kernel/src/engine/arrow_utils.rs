@@ -1329,6 +1329,11 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
         .map(|column| match column.as_struct_opt() {
             Some(sa) => Arc::new(compute_nested_null_masks(sa.clone(), nulls.as_ref())) as _,
             None => {
+                // NullArray (void columns) does not accept a null buffer — all values are
+                // already null by definition, so propagating the parent null mask is a no-op.
+                if *column.data_type() == ArrowDataType::Null {
+                    return column;
+                }
                 let data = column.to_data();
                 let nulls = NullBuffer::union(nulls.as_ref(), data.nulls());
                 let builder = data.into_builder().nulls(nulls);
