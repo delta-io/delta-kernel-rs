@@ -225,6 +225,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    PrimitiveType::Void => Ok(ArrowDataType::Null),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -320,6 +321,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             ArrowDataType::UInt32 => Ok(DataType::INTEGER),
             ArrowDataType::UInt16 => Ok(DataType::SHORT),
             ArrowDataType::UInt8 => Ok(DataType::BYTE),
+            ArrowDataType::Null => Ok(DataType::VOID),
             ArrowDataType::Float32 => Ok(DataType::FLOAT),
             ArrowDataType::Float64 => Ok(DataType::DOUBLE),
             ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
@@ -427,6 +429,82 @@ mod tests {
             new_metadata.get("description").unwrap(),
             &"hello world".to_owned()
         );
+        Ok(())
+    }
+
+    // Regression test for https://github.com/delta-io/delta-kernel-rs/issues/739
+    // Delta tables can have void columns. The kernel should parse them and convert
+    // to Arrow's Null type (and back).
+    #[test]
+    fn test_void_type_roundtrip() -> DeltaResult<()> {
+        let json = r#"
+        {
+            "name": "void_col",
+            "type": "void",
+            "nullable": true,
+            "metadata": {} 
+        }
+        "#;
+
+        let field: crate::schema::StructField = serde_json::from_str(json).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(PrimitiveType::Void));
+
+        let arrow_type = ArrowDataType::try_from_kernel(&field.data_type)?;
+        assert_eq!(arrow_type, ArrowDataType::Null);
+
+        let kernel_type = DataType::try_from_arrow(&ArrowDataType::Null)?;
+        assert_eq!(kernel_type, DataType::Primitive(PrimitiveType::Void));
+
+        Ok(())
+    }
+
+    // Fokko review: void is inherently always-null, so nullable=false is semantically
+    // contradictory. We tolerate it on reads (be permissive), and the Arrow conversion still
+    // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
+    #[test]
+    fn test_void_type_not_nullable() -> DeltaResult<()> {
+        let json = r#"
+        {
+            "name": "void_col",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+
+        let field: crate::schema::StructField = serde_json::from_str(json).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(PrimitiveType::Void));
+        assert!(!field.is_nullable());
+
+        // Arrow conversion still works — produces Null type
+        let arrow_field = ArrowField::try_from_kernel(&field)?;
+        assert_eq!(arrow_field.data_type(), &ArrowDataType::Null);
+        assert!(!arrow_field.is_nullable());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_void_field_in_struct() -> DeltaResult<()> {
+        // A struct schema with a void column should convert to Arrow with a Null field
+        let schema = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("void_col", DataType::VOID),
+        ])?;
+
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        assert_eq!(arrow_schema.fields().len(), 2);
+        assert_eq!(arrow_schema.field(0).data_type(), &ArrowDataType::Int32);
+        assert_eq!(arrow_schema.field(1).data_type(), &ArrowDataType::Null);
+        assert_eq!(arrow_schema.field(1).name(), "void_col");
+
+        // And back to kernel
+        let kernel_schema = StructType::try_from_arrow(&arrow_schema)?;
+        assert_eq!(
+            kernel_schema.field("void_col").unwrap().data_type,
+            DataType::VOID
+        );
+
         Ok(())
     }
 

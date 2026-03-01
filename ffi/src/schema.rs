@@ -192,6 +192,15 @@ pub struct EngineSchemaVisitor {
         metadata: &CStringMap,
     ),
 
+    /// Visit a `void` belonging to the list identified by `sibling_list_id`.
+    pub visit_void: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CStringMap,
+    ),
+
     /// Visit a `variant` belonging to the list identified by `sibling_list_id`.
     pub visit_variant: extern "C" fn(
         data: *mut c_void,
@@ -328,6 +337,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            &DataType::VOID => call!(visit_void),
         }
     }
 

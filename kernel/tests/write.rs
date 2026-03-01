@@ -40,7 +40,8 @@ use tempfile::tempdir;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
+    StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
@@ -3579,4 +3580,283 @@ async fn test_checkpoint_non_kernel_written_table() {
                 .is_some_and(|n| n.contains(".checkpoint.parquet"))
         });
     assert!(has_checkpoint, "Expected at least one checkpoint file");
+}
+
+// ---- Void type write-time validation tests ----
+
+/// Helper to create a table with a given schema and attempt a commit with dummy add_files.
+/// Returns the commit error (panics if commit succeeds).
+async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
+    let (store, engine, table_location) = engine_store_setup("void_write_test", None);
+    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![])
+        .await
+        .expect("table creation should succeed");
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url)
+        .build(engine.as_ref())
+        .expect("snapshot should build");
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .expect("transaction should create");
+
+    // Add dummy file metadata to trigger write validation
+    let add_schema = txn.add_files_schema().clone();
+    let metadata = create_add_files_metadata(&add_schema, vec![("file.parquet", 100, 1000, 1)])
+        .expect("metadata creation should succeed");
+    txn.add_files(metadata);
+    txn.commit(engine.as_ref())
+        .expect_err("commit should fail for invalid void schema")
+}
+
+#[tokio::test]
+async fn write_rejects_void_in_array() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
+        ),
+    ]));
+    let err = try_write_with_void_schema(schema).await;
+    assert!(
+        err.to_string().contains("array element type"),
+        "Expected error about void in array, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn write_rejects_void_in_map() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::VOID,
+                true,
+            ))),
+        ),
+    ]));
+    let err = try_write_with_void_schema(schema).await;
+    assert!(
+        err.to_string().contains("map value type"),
+        "Expected error about void in map, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn write_rejects_void_in_map_key() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::VOID,
+                DataType::STRING,
+                true,
+            ))),
+        ),
+    ]));
+    let err = try_write_with_void_schema(schema).await;
+    assert!(
+        err.to_string().contains("map key type"),
+        "Expected error about void in map key, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn write_rejects_all_void_table() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", DataType::VOID),
+        StructField::nullable("b", DataType::VOID),
+    ]));
+    let err = try_write_with_void_schema(schema).await;
+    assert!(
+        err.to_string().contains("all columns are void"),
+        "Expected error about all-void table, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn write_rejects_all_void_struct() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("x", DataType::VOID),
+                StructField::nullable("y", DataType::VOID),
+            ]))),
+        ),
+    ]));
+    let err = try_write_with_void_schema(schema).await;
+    assert!(
+        err.to_string().contains("all fields are void"),
+        "Expected error about all-void struct, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("v", DataType::VOID),
+        StructField::nullable("name", DataType::STRING),
+    ]));
+    let (store, engine, table_location) = engine_store_setup("void_physical_test", None);
+    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    // Logical schema should contain void column
+    {
+        let logical = snapshot.schema();
+        assert_eq!(logical.fields().count(), 3);
+        assert!(logical.field("v").is_some());
+    }
+
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+
+    let wc = txn.get_write_context();
+    let physical = wc.physical_schema();
+
+    // Physical schema should NOT contain void column
+    assert_eq!(physical.fields().count(), 2);
+    assert!(physical.field("id").is_some());
+    assert!(physical.field("name").is_some());
+    assert!(physical.field("v").is_none());
+
+    Ok(())
+}
+
+// Per ZiyaZa: metadata-only operations should always succeed, even for schemas that are
+// invalid for data writes (void-in-array, void-in-map, all-void structs).
+#[tokio::test]
+async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
+        ),
+    ]));
+    let (store, engine, table_location) = engine_store_setup("void_metadata_test", None);
+    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+
+    // Commit with NO add_files — this is a metadata-only operation and should succeed
+    let result = txn.commit(engine.as_ref());
+    assert!(
+        result.is_ok(),
+        "Metadata-only commit on void-in-array schema should succeed, got: {:?}",
+        result.err()
+    );
+
+    Ok(())
+}
+
+// Verify that nested void fields inside structs are excluded from the physical schema.
+// Schema: {id: int, s: struct<a: int, b: void>}
+// Physical: {id: int, s: struct<a: int>}
+#[tokio::test]
+async fn write_context_excludes_nested_void_from_physical_schema(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::VOID),
+            ]))),
+        ),
+    ]));
+    let (store, engine, table_location) = engine_store_setup("void_nested_physical_test", None);
+    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    // Logical schema should contain the void field inside the struct
+    {
+        let logical = snapshot.schema();
+        let s_field = logical.field("s").expect("s should exist");
+        if let DataType::Struct(inner) = s_field.data_type() {
+            assert!(
+                inner.field("b").is_some(),
+                "logical should have void field b"
+            );
+            assert_eq!(inner.fields().count(), 2);
+        }
+    }
+
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let wc = txn.get_write_context();
+    let physical = wc.physical_schema();
+
+    // Physical schema struct should NOT contain the void field
+    let s_field = physical.field("s").expect("s should exist in physical");
+    if let DataType::Struct(inner) = s_field.data_type() {
+        assert_eq!(
+            inner.fields().count(),
+            1,
+            "physical struct should have 1 field (void dropped)"
+        );
+        assert!(inner.field("a").is_some(), "non-void field should remain");
+        assert!(inner.field("b").is_none(), "void field should be dropped");
+    } else {
+        panic!("s should be a struct type");
+    }
+
+    Ok(())
+}
+
+// Verify that the logical_to_physical transform drops nested void fields from structs.
+// The transform expression should contain a nested transform that drops the void sub-field,
+// matching the physical schema which has void stripped recursively.
+#[tokio::test]
+async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::VOID),
+            ]))),
+        ),
+    ]));
+    let (store, engine, table_location) = engine_store_setup("void_nested_transform_test", None);
+    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let wc = txn.get_write_context();
+
+    // The transform expression should mention dropping "b" inside the struct
+    let l2p = wc.logical_to_physical();
+    let expr_str = format!("{l2p}");
+    assert!(
+        expr_str.contains("drop b"),
+        "Transform should drop nested void field 'b'. Expression: {expr_str}"
+    );
+
+    // Physical schema should also not contain void
+    let physical = wc.physical_schema();
+    let s_field = physical.field("s").expect("s should exist in physical");
+    if let DataType::Struct(inner) = s_field.data_type() {
+        assert_eq!(inner.fields().count(), 1);
+        assert!(
+            inner.field("b").is_none(),
+            "void field b should be stripped"
+        );
+    } else {
+        panic!("s should be struct");
+    }
+
+    Ok(())
 }

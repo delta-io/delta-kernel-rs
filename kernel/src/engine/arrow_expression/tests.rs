@@ -1106,3 +1106,11 @@ fn test_to_json_with_nested_struct() {
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
 }
+
+#[test]
+fn test_void_scalar_to_array() {
+    let scalar = Scalar::Null(KernelDataType::VOID);
+    let array = scalar.to_array(5).unwrap();
+    assert_eq!(array.len(), 5);
+    assert_eq!(*array.data_type(), DataType::Null);
+}
