@@ -4466,4 +4466,57 @@ mod tests {
             ]
         );
     }
+
+    /// Verify that `fix_nested_null_masks` handles a struct with a NullArray child column
+    /// (void type) when the parent struct has non-trivial nulls. NullArray does not accept
+    /// a null buffer, so the propagation must skip it without panicking.
+    #[test]
+    fn test_nested_null_masks_with_null_array_child() {
+        use crate::arrow::array::NullArray;
+        use crate::arrow::datatypes::{DataType, Field};
+        use crate::engine::arrow_utils::fix_nested_null_masks;
+
+        // Build: struct<val: int32, void_col: null> with 4 rows, parent null at row 0
+        let int_field = Field::new("val", DataType::Int32, true);
+        let null_field = Field::new("void_col", DataType::Null, true);
+        let fields = ArrowFields::from(vec![int_field, null_field]);
+
+        let int_col: ArrowArrayRef = Arc::new(Int32Array::from(vec![
+            Some(10),
+            Some(20),
+            Some(30),
+            Some(40),
+        ]));
+        let null_col: ArrowArrayRef = Arc::new(NullArray::new(4));
+
+        // Parent struct has row 0 null
+        let parent_nulls = NullBuffer::from(&[false, true, true, true][..]);
+        let sa = StructArray::new(fields.clone(), vec![int_col, null_col], Some(parent_nulls));
+
+        // Wrap in an outer struct (as fix_nested_null_masks expects a top-level StructArray)
+        let outer_field = Field::new("outer", DataType::Struct(fields), true);
+        let outer = StructArray::new(
+            ArrowFields::from(vec![outer_field]),
+            vec![Arc::new(sa)],
+            None,
+        );
+
+        // This should NOT panic — previously it would crash because NullArray rejects null buffers
+        let result = fix_nested_null_masks(outer);
+
+        // Verify the NullArray child survived unchanged
+        let inner = result.column(0).as_struct();
+        assert_eq!(inner.len(), 4);
+
+        let void_col = inner.column(1);
+        assert_eq!(*void_col.data_type(), DataType::Null);
+        assert_eq!(void_col.len(), 4);
+
+        // Verify the int column got the parent null propagated (row 0 is now null)
+        let val_col = inner.column(0);
+        assert!(val_col.is_null(0), "row 0 should be null (parent null)");
+        assert!(!val_col.is_null(1));
+        assert!(!val_col.is_null(2));
+        assert!(!val_col.is_null(3));
+    }
 }
