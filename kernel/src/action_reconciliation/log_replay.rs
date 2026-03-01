@@ -316,31 +316,48 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     txn_expiration_timestamp: Option<i64>,
 }
 
+/// A projected column used by `ActionReconciliationVisitor`.
+///
+/// `index` is the position in the `getters: &[&dyn GetData]` slice.
+/// `name` is the fully-qualified field path used when calling `get_*` (and appears in errors).
+#[derive(Debug, Copy, Clone)]
+struct GetterColumn {
+    index: usize,
+    name: &'static str,
+}
+
+impl GetterColumn {
+    const fn new(index: usize, name: &'static str) -> Self {
+        GetterColumn { index, name }
+    }
+}
+
 #[allow(unused)]
 impl ActionReconciliationVisitor<'_> {
-    // TODO(#1717): Combine index and field name constants into a single struct
-    // These index positions correspond to the order of columns defined in
-    // `selected_column_names_and_types()`
-    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
-    const ADD_DV_START_INDEX: usize = 1; // Start position of add deletion vector columns
-    const REMOVE_PATH_INDEX: usize = 4; // Position of "remove.path" in getters
-    const REMOVE_DELETION_TIMESTAMP_INDEX: usize = 5; // Position of "remove.deletionTimestamp" in getters
-    const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
-    const METADATA_ID_INDEX: usize = 9;
-    const PROTOCOL_MIN_READER_VERSION_INDEX: usize = 10;
-    const TXN_APP_ID_INDEX: usize = 11;
-    const TXN_LAST_UPDATED_INDEX: usize = 12;
-    const DOMAIN_METADATA_DOMAIN_INDEX: usize = 13;
-    const DOMAIN_METADATA_REMOVED_INDEX: usize = 14;
-
-    // These are the column names used to access the data in the getters
-    const REMOVE_DELETION_TIMESTAMP: &'static str = "remove.deletionTimestamp";
-    const PROTOCOL_MIN_READER_VERSION: &'static str = "protocol.minReaderVersion";
-    const METADATA_ID: &'static str = "metaData.id";
-    const TXN_APP_ID: &'static str = "txn.appId";
-    const TXN_LAST_UPDATED: &'static str = "txn.lastUpdated";
-    const DOMAIN_METADATA_DOMAIN: &'static str = "domainMetadata.domain";
-    const DOMAIN_METADATA_REMOVED: &'static str = "domainMetadata.removed";
+    // Projected columns in the same order as `selected_column_names_and_types()`.
+    // Invariant: these indices must match the projection order exactly.
+    // DV columns are defined individually for completeness, even when accessed via a start index.
+    const ADD_PATH: GetterColumn = GetterColumn::new(0, "add.path");
+    const ADD_DV_STORAGE_TYPE: GetterColumn =
+        GetterColumn::new(1, "add.deletionVector.storageType");
+    const ADD_DV_PATH_OR_INLINE_DV: GetterColumn =
+        GetterColumn::new(2, "add.deletionVector.pathOrInlineDv");
+    const ADD_DV_OFFSET: GetterColumn = GetterColumn::new(3, "add.deletionVector.offset");
+    const REMOVE_PATH: GetterColumn = GetterColumn::new(4, "remove.path");
+    const REMOVE_DELETION_TIMESTAMP: GetterColumn =
+        GetterColumn::new(5, "remove.deletionTimestamp");
+    const REMOVE_DV_STORAGE_TYPE: GetterColumn =
+        GetterColumn::new(6, "remove.deletionVector.storageType");
+    const REMOVE_DV_PATH_OR_INLINE_DV: GetterColumn =
+        GetterColumn::new(7, "remove.deletionVector.pathOrInlineDv");
+    const REMOVE_DV_OFFSET: GetterColumn = GetterColumn::new(8, "remove.deletionVector.offset");
+    const METADATA_ID: GetterColumn = GetterColumn::new(9, "metaData.id");
+    const PROTOCOL_MIN_READER_VERSION: GetterColumn =
+        GetterColumn::new(10, "protocol.minReaderVersion");
+    const TXN_APP_ID: GetterColumn = GetterColumn::new(11, "txn.appId");
+    const TXN_LAST_UPDATED: GetterColumn = GetterColumn::new(12, "txn.lastUpdated");
+    const DOMAIN_METADATA_DOMAIN: GetterColumn = GetterColumn::new(13, "domainMetadata.domain");
+    const DOMAIN_METADATA_REMOVED: GetterColumn = GetterColumn::new(14, "domainMetadata.removed");
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
@@ -358,10 +375,10 @@ impl ActionReconciliationVisitor<'_> {
             deduplicator: FileActionDeduplicator::new(
                 seen_file_keys,
                 is_log_batch,
-                Self::ADD_PATH_INDEX,
-                Self::REMOVE_PATH_INDEX,
-                Self::ADD_DV_START_INDEX,
-                Self::REMOVE_DV_START_INDEX,
+                Self::ADD_PATH.index,
+                Self::REMOVE_PATH.index,
+                Self::ADD_DV_STORAGE_TYPE.index,
+                Self::REMOVE_DV_STORAGE_TYPE.index,
             ),
             selection_vector,
             actions_count: 0,
@@ -390,7 +407,7 @@ impl ActionReconciliationVisitor<'_> {
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
         // will be excluded as it will be treated as expired.
-        let deletion_timestamp = getter.get_opt(i, "remove.deletionTimestamp")?;
+        let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
         let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
         Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
@@ -424,7 +441,7 @@ impl ActionReconciliationVisitor<'_> {
             true
         } else {
             // Expired remove actions are not valid
-            !self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])?
+            !self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])?
         };
         Ok(Some(is_valid))
     }
@@ -443,7 +460,7 @@ impl ActionReconciliationVisitor<'_> {
         // minReaderVersion is a required field, so we check for its presence to determine if this is a protocol action.
         // Only return the first (newest) protocol action we see, ignoring other types
         let result = getter
-            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION)?
+            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_protocol, true));
         Ok(result)
@@ -463,7 +480,7 @@ impl ActionReconciliationVisitor<'_> {
         // id is a required field, so we check for its presence to determine if this is a metadata action.
         // Only return the first (newest) metadata action we see, ignoring other types
         let result = getter
-            .get_str(i, Self::METADATA_ID)?
+            .get_str(i, Self::METADATA_ID.name)?
             .is_some()
             .then(|| !std::mem::replace(&mut self.seen_metadata, true));
         Ok(result)
@@ -480,14 +497,15 @@ impl ActionReconciliationVisitor<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
-        let Some(app_id) = getters[Self::TXN_APP_ID_INDEX].get_str(i, Self::TXN_APP_ID)? else {
+        let Some(app_id) = getters[Self::TXN_APP_ID.index].get_str(i, Self::TXN_APP_ID.name)?
+        else {
             return Ok(None); // Not a txn action, continue checking other types
         };
 
         // Check retention if last_updated is present
         if let Some(retention_ts) = self.txn_expiration_timestamp {
             if let Some(last_updated) =
-                getters[Self::TXN_LAST_UPDATED_INDEX].get_opt(i, Self::TXN_LAST_UPDATED)?
+                getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
             {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
@@ -515,15 +533,15 @@ impl ActionReconciliationVisitor<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
-        let Some(domain) =
-            getters[Self::DOMAIN_METADATA_DOMAIN_INDEX].get_str(i, Self::DOMAIN_METADATA_DOMAIN)?
+        let Some(domain) = getters[Self::DOMAIN_METADATA_DOMAIN.index]
+            .get_str(i, Self::DOMAIN_METADATA_DOMAIN.name)?
         else {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
 
         // Exclude tombstones (removed=true) from checkpoint per protocol spec
-        let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED_INDEX]
-            .get_opt(i, Self::DOMAIN_METADATA_REMOVED)?
+        let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
+            .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
             .unwrap_or(false);
         if removed {
             return Ok(Some(false));
@@ -562,11 +580,11 @@ impl ActionReconciliationVisitor<'_> {
         } else if let Some(result) = self.check_domain_metadata_action(i, getters)? {
             result
         } else if let Some(result) =
-            self.check_protocol_action(i, getters[Self::PROTOCOL_MIN_READER_VERSION_INDEX])?
+            self.check_protocol_action(i, getters[Self::PROTOCOL_MIN_READER_VERSION.index])?
         {
             result
         } else {
-            self.check_metadata_action(i, getters[Self::METADATA_ID_INDEX])?
+            self.check_metadata_action(i, getters[Self::METADATA_ID.index])?
                 .unwrap_or_default()
         };
 
@@ -668,6 +686,58 @@ mod tests {
 
         Ok((filtered_data, total_count, add_count))
     }
+
+    #[test]
+    fn test_getter_columns_match_selected_columns() {
+        // Construct a visitor just to access selected_column_names_and_types().
+        let mut seen_file_keys: HashSet<FileActionKey> = HashSet::new();
+        let mut seen_txns: HashSet<String> = HashSet::new();
+        let mut seen_domains: HashSet<String> = HashSet::new();
+        let visitor = ActionReconciliationVisitor::new(
+            &mut seen_file_keys,
+            true,
+            vec![],
+            0,
+            false,
+            false,
+            &mut seen_txns,
+            &mut seen_domains,
+            None,
+        );
+        let (names, _types) = visitor.selected_column_names_and_types();
+
+        // Every GetterColumn constant, in index order.
+        let all_columns = [
+            ActionReconciliationVisitor::ADD_PATH,
+            ActionReconciliationVisitor::ADD_DV_STORAGE_TYPE,
+            ActionReconciliationVisitor::ADD_DV_PATH_OR_INLINE_DV,
+            ActionReconciliationVisitor::ADD_DV_OFFSET,
+            ActionReconciliationVisitor::REMOVE_PATH,
+            ActionReconciliationVisitor::REMOVE_DELETION_TIMESTAMP,
+            ActionReconciliationVisitor::REMOVE_DV_STORAGE_TYPE,
+            ActionReconciliationVisitor::REMOVE_DV_PATH_OR_INLINE_DV,
+            ActionReconciliationVisitor::REMOVE_DV_OFFSET,
+            ActionReconciliationVisitor::METADATA_ID,
+            ActionReconciliationVisitor::PROTOCOL_MIN_READER_VERSION,
+            ActionReconciliationVisitor::TXN_APP_ID,
+            ActionReconciliationVisitor::TXN_LAST_UPDATED,
+            ActionReconciliationVisitor::DOMAIN_METADATA_DOMAIN,
+            ActionReconciliationVisitor::DOMAIN_METADATA_REMOVED,
+        ];
+
+        assert_eq!(all_columns.len(), names.len());
+        for (expected_index, col) in all_columns.iter().enumerate() {
+            assert_eq!(col.index, expected_index);
+            assert_eq!(
+                names[col.index],
+                ColumnName::from_naive_str_split(col.name),
+                "GetterColumn '{}' at index {} doesn't match selected_column_names_and_types",
+                col.name,
+                col.index,
+            );
+        }
+    }
+
     #[test]
     fn test_action_reconciliation_visitor() -> DeltaResult<()> {
         let data = action_batch();
