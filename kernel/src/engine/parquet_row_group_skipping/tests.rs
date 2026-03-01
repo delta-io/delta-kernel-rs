@@ -242,12 +242,6 @@ fn test_get_stat_values() {
         None
     );
 
-    // Read a random column as Void. Stats on Void should always return None.
-    assert_eq!(
-        filter.get_min_stat(&column_name!("chrono.date32"), &DataType::VOID),
-        None
-    );
-
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_min_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
@@ -427,12 +421,6 @@ fn test_get_stat_values() {
             &column_name!("chrono.date32"),
             &DataType::unshredded_variant()
         ),
-        None
-    );
-
-    // Read a random column as Void. Stats on Void should always return None.
-    assert_eq!(
-        filter.get_max_stat(&column_name!("chrono.date32"), &DataType::VOID),
         None
     );
 

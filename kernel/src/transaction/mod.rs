@@ -365,6 +365,15 @@ impl<S> Transaction<S> {
 
         self.validate_blind_append_semantics()?;
 
+        // Validate that the schema supports data writes when files are being added.
+        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
+        // Reads and metadata-only commits are always allowed.
+        if !self.add_files_metadata.is_empty() {
+            crate::schema::void_utils::validate_schema_for_write(
+                &self.effective_table_config.logical_schema(),
+            )?;
+        }
+
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
         // This is because kernel does not yet have a way to discern DML operations. For DML
@@ -837,12 +846,17 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let materialize_partition_columns = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
+        // Build a Transform expression that drops partition columns (unless
+        // materializePartitionColumns is enabled) and void columns (never written to Parquet).
         let mut transform = Transform::new_top_level();
         if !materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
+            }
+        }
+        for field in self.effective_table_config.logical_schema().fields() {
+            if *field.data_type() == DataType::VOID {
+                transform = transform.with_dropped_field_if_exists(field.name());
             }
         }
         Expression::transform(transform)
@@ -857,10 +871,18 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let table_config = &self.effective_table_config;
+            // Strip void fields from the physical write schema: they are never written to Parquet.
+            let physical_write_schema = table_config.physical_write_schema();
+            let physical_schema = Arc::new(StructType::new_unchecked(
+                physical_write_schema
+                    .fields()
+                    .filter(|f| *f.data_type() != DataType::VOID)
+                    .map(crate::schema::void_utils::strip_void_from_field),
+            ));
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
-                physical_schema: table_config.physical_write_schema(),
+                physical_schema,
                 logical_to_physical: Arc::new(self.generate_logical_to_physical()),
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
