@@ -2876,11 +2876,30 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
 
     // Predicate: void_col IS NULL — always true for void, should return all rows
     let predicate = Arc::new(column_expr!("void_col").is_null());
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()?;
 
-    let batches = read_scan(&scan, engine)?;
+    let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3, "IS NULL on void should return all rows");
+
+    // Predicate: void_col IS NOT NULL — always false for void. Since kernel predicates are
+    // used for data skipping (row group level) not row filtering, all rows still appear.
+    // The void column has no Parquet stats, so the predicate cannot skip any row groups.
+    let predicate_not_null = Arc::new(column_expr!("void_col").is_not_null());
+    let scan_not_null = snapshot
+        .scan_builder()
+        .with_predicate(predicate_not_null)
+        .build()?;
+    let batches_not_null = read_scan(&scan_not_null, engine)?;
+    let total_rows_not_null: usize = batches_not_null.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows_not_null, 3,
+        "IS NOT NULL on void: no row-level filtering, all rows returned"
+    );
 
     Ok(())
 }

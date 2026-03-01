@@ -391,4 +391,109 @@ mod tests {
             .to_string()
             .contains("all fields are void"));
     }
+
+    // ---- strip_void_from_field tests ----
+
+    #[test]
+    fn test_strip_non_struct_is_passthrough() {
+        let field = StructField::nullable("x", DataType::INTEGER);
+        let stripped = strip_void_from_field(&field);
+        assert_eq!(stripped.name(), "x");
+        assert_eq!(*stripped.data_type(), DataType::INTEGER);
+    }
+
+    #[test]
+    fn test_strip_struct_with_mixed_void() {
+        let field = StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::VOID),
+                StructField::nullable("c", DataType::STRING),
+            ]))),
+        );
+        let stripped = strip_void_from_field(&field);
+        if let DataType::Struct(inner) = stripped.data_type() {
+            assert_eq!(inner.fields().count(), 2);
+            assert!(inner.field("a").is_some());
+            assert!(inner.field("b").is_none(), "void field should be removed");
+            assert!(inner.field("c").is_some());
+        } else {
+            panic!("expected struct");
+        }
+    }
+
+    #[test]
+    fn test_strip_deeply_nested_void() {
+        // struct<outer: struct<inner: struct<a: int, v: void>>>
+        let field = StructField::nullable(
+            "outer",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable(
+                    "inner",
+                    DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructField::nullable("a", DataType::INTEGER),
+                        StructField::nullable("v", DataType::VOID),
+                    ]))),
+                ),
+            ]))),
+        );
+        let stripped = strip_void_from_field(&field);
+        if let DataType::Struct(outer) = stripped.data_type() {
+            let inner_field = outer.field("inner").expect("inner should exist");
+            if let DataType::Struct(inner) = inner_field.data_type() {
+                assert_eq!(inner.fields().count(), 1);
+                assert!(inner.field("a").is_some());
+                assert!(
+                    inner.field("v").is_none(),
+                    "void should be stripped at depth 3"
+                );
+            } else {
+                panic!("expected struct");
+            }
+        } else {
+            panic!("expected struct");
+        }
+    }
+
+    #[test]
+    fn test_strip_preserves_metadata() {
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+        let mut field = StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::VOID),
+            ]))),
+        );
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
+            MetadataValue::String("phys_s".into()),
+        );
+        let stripped = strip_void_from_field(&field);
+        assert_eq!(
+            stripped
+                .metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()),
+            Some(&MetadataValue::String("phys_s".into())),
+            "metadata should be preserved after stripping"
+        );
+    }
+
+    #[test]
+    fn test_strip_no_void_is_noop() {
+        let field = StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::STRING),
+            ]))),
+        );
+        let stripped = strip_void_from_field(&field);
+        if let DataType::Struct(inner) = stripped.data_type() {
+            assert_eq!(inner.fields().count(), 2);
+        } else {
+            panic!("expected struct");
+        }
+    }
 }
