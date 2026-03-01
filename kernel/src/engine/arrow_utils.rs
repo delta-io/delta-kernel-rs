@@ -1293,34 +1293,57 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let json_strings = json_strings
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            Error::generic("Expected json_strings to be a StringArray, found something else")
-        })?;
     let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-    let result = parse_json_impl(json_strings, schema)?;
+    let result = parse_json_impl(json_strings.column(0).as_ref(), schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
-// Raw arrow implementation of the json parsing. Separate from the public function for testing.
-// Also used by ParseJson expression evaluation.
+/// Raw arrow implementation of the json parsing. Separate from the public function for testing.
+/// Also used by ParseJson expression evaluation.
+///
+/// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to avoid
+/// narrowing casts that could overflow (e.g. `LargeStringArray` → `StringArray`).
 pub(crate) fn parse_json_impl(
-    json_strings: &StringArray,
+    json_strings: &dyn ArrowArray,
     schema: ArrowSchemaRef,
 ) -> DeltaResult<RecordBatch> {
-    if json_strings.is_empty() {
+    match json_strings.data_type() {
+        ArrowDataType::Utf8 => parse_json_inner(
+            json_strings.as_string::<i32>().iter(),
+            json_strings.len(),
+            schema,
+        ),
+        ArrowDataType::LargeUtf8 => parse_json_inner(
+            json_strings.as_string::<i64>().iter(),
+            json_strings.len(),
+            schema,
+        ),
+        ArrowDataType::Utf8View => parse_json_inner(
+            json_strings.as_string_view().iter(),
+            json_strings.len(),
+            schema,
+        ),
+        dt => Err(Error::generic(format!(
+            "Expected string array for JSON parsing, got {dt}"
+        ))),
+    }
+}
+
+fn parse_json_inner<'a>(
+    json_strings: impl Iterator<Item = Option<&'a str>>,
+    num_rows: usize,
+    schema: ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
+    if num_rows == 0 {
         return Ok(RecordBatch::new_empty(schema));
     }
 
     let mut decoder = ReaderBuilder::new(schema.clone())
-        .with_batch_size(json_strings.len())
+        .with_batch_size(num_rows)
         .with_coerce_primitive(true)
         .build_decoder()?;
 
-    for (json, row_number) in json_strings.iter().zip(1..) {
+    for (json, row_number) in json_strings.zip(1..) {
         let line = json.unwrap_or("{}");
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
@@ -1338,11 +1361,11 @@ pub(crate) fn parse_json_impl(
     }
     // Get the final batch out
     if let Some(batch) = decoder.flush()? {
-        if batch.num_rows() != json_strings.len() {
+        if batch.num_rows() != num_rows {
             return Err(Error::Generic(format!(
                 "Unexpected number of rows decoded. Got {}, expected{}",
                 batch.num_rows(),
-                json_strings.len()
+                num_rows
             )));
         }
         return Ok(batch);
@@ -1567,7 +1590,7 @@ mod tests {
             schema: ArrowSchemaRef,
             expected_start: &str,
         ) {
-            let result = parse_json_impl(&input.into(), schema);
+            let result = parse_json_impl(&StringArray::from(input), schema);
             let err = result.expect_err("Expected an error");
             let msg = err.to_string();
             assert!(
@@ -1582,7 +1605,7 @@ mod tests {
             ArrowField::new("c", ArrowDataType::Int32, true),
         ]));
         let input: Vec<&str> = vec![];
-        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
         for input in [
@@ -1605,7 +1628,7 @@ mod tests {
         );
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
-        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        let result = parse_json_impl(&StringArray::from(input), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.column(0).null_count(), 2);
         assert_eq!(result.column(1).null_count(), 2);
@@ -1624,10 +1647,93 @@ mod tests {
         let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
 
-        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        let batch = parse_json_impl(&StringArray::from(input), schema.clone()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
+    }
+
+    #[test]
+    fn test_parse_json_large_string_array() {
+        // See issue#1923: parse_json should handle LargeStringArray (64-bit offsets)
+        use crate::arrow::array::LargeStringArray;
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let large_strings = LargeStringArray::from(vec![
+            Some(r#"{"a": 1, "b": "hello"}"#),
+            None,
+            Some(r#"{"a": 3, "b": "world"}"#),
+        ]);
+        let field = Arc::new(ArrowField::new("s", ArrowDataType::LargeUtf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(large_strings) as ArrowArrayRef]).unwrap();
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ]));
+        let result = parse_json(engine_data, output_schema).unwrap();
+        let result = ArrowEngineData::try_from_engine_data(result).unwrap();
+        let batch: RecordBatch = result.into();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 1);
+        assert_eq!(batch.column(1).null_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_json_string_view_array() {
+        use crate::arrow::array::StringViewArray;
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let view_strings = StringViewArray::from(vec![
+            Some(r#"{"a": 1, "b": "hello"}"#),
+            None,
+            Some(r#"{"a": 3, "b": "world"}"#),
+        ]);
+        let field = Arc::new(ArrowField::new("s", ArrowDataType::Utf8View, true));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(view_strings) as ArrowArrayRef]).unwrap();
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ]));
+        let result = parse_json(engine_data, output_schema).unwrap();
+        let result = ArrowEngineData::try_from_engine_data(result).unwrap();
+        let batch: RecordBatch = result.into();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 1);
+        assert_eq!(batch.column(1).null_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_json_rejects_non_string_array() {
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        let int_array = Int32Array::from(vec![1, 2, 3]);
+        let field = Arc::new(ArrowField::new("s", ArrowDataType::Int32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(int_array) as ArrowArrayRef]).unwrap();
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        let output_schema: crate::schema::SchemaRef =
+            Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+                "a",
+                DataType::INTEGER,
+            )]));
+        let err = match parse_json(engine_data, output_schema) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected error for non-string array input"),
+        };
+        assert!(
+            err.contains("Expected string array for JSON parsing"),
+            "Unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -328,17 +328,10 @@ pub fn evaluate_expression(
         (ParseJson(p), _) => {
             // Evaluate the JSON string expression
             let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
-            let json_strings =
-                json_arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        Error::generic("ParseJson input must evaluate to a STRING column")
-                    })?;
 
             // Convert kernel schema to Arrow schema and parse
             let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(p.output_schema.as_ref())?);
-            let result = parse_json_impl(json_strings, arrow_schema)?;
+            let result = parse_json_impl(json_arr.as_ref(), arrow_schema)?;
 
             // Return as StructArray
             Ok(Arc::new(StructArray::from(result)) as ArrayRef)
@@ -763,6 +756,7 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::array::LargeStringArray;
     use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -1567,6 +1561,50 @@ mod tests {
         assert_eq!(a_col.values(), &[1, 2, 3]);
 
         // Verify 'b' column (String values)
+        let b_col = struct_result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(b_col.value(0), "hello");
+        assert_eq!(b_col.value(1), "world");
+        assert_eq!(b_col.value(2), "test");
+    }
+
+    #[test]
+    fn test_parse_json_large_string_array() {
+        // See issue#1923: parse_json should handle LargeStringArray (64-bit offsets)
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "json_col",
+            ArrowDataType::LargeUtf8,
+            true,
+        )]);
+        let json_strings = LargeStringArray::from(vec![
+            Some(r#"{"a": 1, "b": "hello"}"#),
+            Some(r#"{"a": 2, "b": "world"}"#),
+            Some(r#"{"a": 3, "b": "test"}"#),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
+
+        let output_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("a", DataType::LONG, true),
+            StructField::new("b", DataType::STRING, true),
+        ]));
+
+        let expr = Expr::parse_json(column_expr!("json_col"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_result.num_columns(), 2);
+        assert_eq!(struct_result.len(), 3);
+
+        let a_col = struct_result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(a_col.values(), &[1, 2, 3]);
+
         let b_col = struct_result
             .column(1)
             .as_any()
