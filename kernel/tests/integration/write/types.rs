@@ -616,6 +616,26 @@ async fn write_rejects_void_in_map() {
 }
 
 #[tokio::test]
+async fn write_rejects_void_in_map_key() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::VOID,
+                DataType::STRING,
+                true,
+            ))),
+        ),
+    ]));
+    let err = try_write_with_void_schema(schema).await;
+    assert!(
+        err.to_string().contains("map key type"),
+        "Expected error about void in map key, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn write_rejects_all_void_table() {
     let schema = Arc::new(StructType::new_unchecked([
         StructField::nullable("a", DataType::VOID),
@@ -760,6 +780,53 @@ async fn write_context_excludes_nested_void_from_physical_schema(
         assert!(inner.field("b").is_none(), "void field should be dropped");
     } else {
         panic!("s should be a struct type");
+    }
+
+    Ok(())
+}
+
+// Verify that the logical_to_physical transform drops nested void fields from structs.
+// The transform expression should contain a nested transform that drops the void sub-field,
+// matching the physical schema which has void stripped recursively.
+#[tokio::test]
+async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::VOID),
+            ]))),
+        ),
+    ]));
+    let (store, engine, table_location) = engine_store_setup("void_nested_transform_test", None);
+    let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let wc = txn.unpartitioned_write_context()?;
+
+    // The transform expression should mention dropping "b" inside the struct
+    let l2p = wc.logical_to_physical();
+    let expr_str = format!("{l2p}");
+    assert!(
+        expr_str.contains("drop b"),
+        "Transform should drop nested void field 'b'. Expression: {expr_str}"
+    );
+
+    // Physical schema should also not contain void
+    let physical = wc.physical_schema();
+    let s_field = physical.field("s").expect("s should exist in physical");
+    if let DataType::Struct(inner) = s_field.data_type() {
+        assert_eq!(inner.fields().count(), 1);
+        assert!(
+            inner.field("b").is_none(),
+            "void field b should be stripped"
+        );
+    } else {
+        panic!("s should be struct");
     }
 
     Ok(())

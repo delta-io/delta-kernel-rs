@@ -321,6 +321,35 @@ where
     })
 }
 
+/// Recursively builds a nested StructPatch that drops void fields from a struct type.
+/// Returns `None` if the struct contains no void fields (no patch needed).
+/// The `path` parameter specifies the column path to the struct being transformed.
+fn build_void_stripping_transform(st: &StructType, path: &[&str]) -> Option<ExpressionStructPatch> {
+    let has_void = st.fields().any(|f| {
+        *f.data_type() == DataType::VOID
+            || matches!(f.data_type(), DataType::Struct(inner) if build_void_stripping_transform(inner, &[]).is_some())
+    });
+    if !has_void {
+        return None;
+    }
+
+    let mut patch = ExpressionStructPatch::new_nested(path.iter().copied());
+    for field in st.fields() {
+        if *field.data_type() == DataType::VOID {
+            patch = patch.with_dropped_field_if_exists(field.name());
+        } else if let DataType::Struct(inner) = field.data_type() {
+            // Build path for the nested struct: parent_path + field_name
+            let mut child_path: Vec<&str> = path.to_vec();
+            child_path.push(field.name());
+            if let Some(nested) = build_void_stripping_transform(inner, &child_path) {
+                patch =
+                    patch.with_replaced_field(field.name(), Arc::new(Expression::struct_patch(nested)));
+            }
+        }
+    }
+    Some(patch)
+}
+
 // =============================================================================
 // Shared methods available on ALL transaction types
 // =============================================================================
@@ -889,7 +918,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .effective_table_config
             .should_materialize_partition_columns();
         // Build a StructPatch expression that drops partition columns (unless they should be
-        // materialized) and void columns (never written to Parquet).
+        // materialized) and void columns (never written to Parquet). Void columns are dropped
+        // at all nesting levels: top-level void fields are dropped directly, and void sub-fields
+        // inside structs are dropped via nested patches.
         let mut patch = ExpressionStructPatch::new_top_level();
         if !should_materialize_partition_columns {
             for col in &partition_cols {
@@ -899,6 +930,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
         for field in self.effective_table_config.logical_schema().fields() {
             if *field.data_type() == DataType::VOID {
                 patch = patch.with_dropped_field_if_exists(field.name());
+            } else if let DataType::Struct(inner) = field.data_type() {
+                if let Some(nested) = build_void_stripping_transform(inner, &[field.name()]) {
+                    patch = patch
+                        .with_replaced_field(field.name(), Arc::new(Expression::struct_patch(nested)));
+                }
             }
         }
         Ok(Expression::struct_patch(patch))
