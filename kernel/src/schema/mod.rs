@@ -29,6 +29,7 @@ pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -1480,6 +1481,7 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
+    Void,
     #[serde(
         serialize_with = "serialize_decimal",
         deserialize_with = "deserialize_decimal",
@@ -1596,6 +1598,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Void => write!(f, "void"),
         }
     }
 }
@@ -1675,6 +1678,7 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
+    pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
 
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
@@ -2201,6 +2205,32 @@ mod tests {
             json_str,
             r#"{"name":"v","type":"variant","nullable":false,"metadata":{}}"#
         );
+    }
+
+    #[test]
+    fn test_roundtrip_void() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_void_display() {
+        assert_eq!(PrimitiveType::Void.to_string(), "void");
+        assert_eq!(DataType::VOID.to_string(), "void");
     }
 
     #[test]

@@ -253,6 +253,7 @@ DEFINE_VISIT_SIMPLE_TYPE(binary)
 DEFINE_VISIT_SIMPLE_TYPE(date)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
+DEFINE_VISIT_SIMPLE_TYPE(void)
 
 // free all the data in the builder and the builder itself
 void free_builder(SchemaBuilder* builder)
@@ -307,6 +308,7 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
     .visit_date = visit_date,
     .visit_timestamp = visit_timestamp,
     .visit_timestamp_ntz = visit_timestamp_ntz,
+    .visit_void = visit_void,
   };
   SharedSchema* schema = logical_schema(snapshot);
   uintptr_t schema_list_id = visit_schema(schema, &visitor);
