@@ -168,7 +168,7 @@ impl TableChangesScan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {
-        self.state_info.schema.user_schema()
+        self.state_info.logical_schema()
     }
 
     /// Get a shared reference to the physical [`Schema`] of the table changes scan.
@@ -253,7 +253,7 @@ fn read_scan_file(
             engine.evaluation_handler().new_expression_evaluator(
                 physical_schema.clone(),
                 expr,
-                state_info.schema.user_schema().clone().into(),
+                state_info.logical_schema().clone().into(),
             )
         })
         .transpose()?;

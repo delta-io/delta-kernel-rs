@@ -17,7 +17,7 @@ fn get_cdf_columns(
     schema: &TableSchema,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
-    let logical_schema = schema.user_schema();
+    let logical_schema = schema.logical_schema();
     // Handle _change_type
     let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_field, &scan_file.scan_type) {

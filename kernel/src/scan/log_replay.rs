@@ -1123,8 +1123,8 @@ mod tests {
 
         // Verify StateInfo fields preserved
         assert_eq!(
-            deserialized.state_info.schema.user_schema(),
-            state_info.schema.user_schema()
+            deserialized.state_info.logical_schema(),
+            state_info.logical_schema()
         );
         assert_eq!(
             deserialized.state_info.physical_schema,

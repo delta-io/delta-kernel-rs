@@ -1223,7 +1223,7 @@ impl WriteContext {
     }
 
     pub fn logical_schema(&self) -> &SchemaRef {
-        self.schema.user_schema()
+        self.schema.logical_schema()
     }
 
     pub fn physical_schema(&self) -> &SchemaRef {

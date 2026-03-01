@@ -425,7 +425,7 @@ pub struct Scan {
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", self.state_info.schema.user_schema())
+            .field("schema", self.state_info.logical_schema())
             .field("predicate", &self.state_info.physical_predicate)
             .field("skip_stats", &self.skip_stats)
             .finish()
@@ -456,7 +456,7 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {
-        self.state_info.schema.user_schema()
+        self.state_info.logical_schema()
     }
 
     /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
@@ -848,7 +848,7 @@ impl Scan {
 
         debug!(
             "Executing scan with logical schema {:#?} and physical schema {:#?}",
-            self.state_info.schema.user_schema(),
+            self.state_info.logical_schema(),
             self.state_info.physical_schema
         );
 

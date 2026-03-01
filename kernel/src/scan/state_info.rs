@@ -99,6 +99,10 @@ impl StateInfo {
             logical_stats_schema,
         })
     }
+
+    pub(crate) fn logical_schema(&self) -> &SchemaRef {
+        self.schema.logical_schema()
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +259,7 @@ pub(crate) mod tests {
         assert!(state_info.transform_spec.is_none());
 
         // Physical schema should match logical schema
-        assert_eq!(state_info.schema.user_schema(), &schema);
+        assert_eq!(state_info.logical_schema(), &schema);
         assert_eq!(state_info.physical_schema.fields().len(), 2);
 
         // No predicate
@@ -295,7 +299,7 @@ pub(crate) mod tests {
         }
 
         // Physical schema should not include partition column
-        assert_eq!(state_info.schema.user_schema(), &schema);
+        assert_eq!(state_info.logical_schema(), &schema);
         assert_eq!(state_info.physical_schema.fields().len(), 2); // Only id and value
     }
 
