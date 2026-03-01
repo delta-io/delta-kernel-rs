@@ -2638,6 +2638,10 @@ async fn read_void_in_array_type_ok() -> Result<(), Box<dyn std::error::Error>> 
         arr_col.len(),
         "entire column should be null"
     );
+    match arr_col.data_type() {
+        ArrowDataType::List(elem) => assert_eq!(*elem.data_type(), ArrowDataType::Null),
+        other => panic!("expected List<Null>, got {other:?}"),
+    }
 
     Ok(())
 }
@@ -2684,6 +2688,19 @@ async fn read_void_in_map_type_ok() -> Result<(), Box<dyn std::error::Error>> {
         m_col.len(),
         "entire column should be null"
     );
+    match m_col.data_type() {
+        ArrowDataType::Map(entries, _) => {
+            let entries = entries.data_type();
+            match entries {
+                ArrowDataType::Struct(fields) => {
+                    assert_eq!(*fields[0].data_type(), ArrowDataType::Utf8);
+                    assert_eq!(*fields[1].data_type(), ArrowDataType::Null);
+                }
+                other => panic!("expected Struct inside Map, got {other:?}"),
+            }
+        }
+        other => panic!("expected Map<String,Null>, got {other:?}"),
+    }
 
     Ok(())
 }
