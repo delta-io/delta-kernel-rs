@@ -1,42 +1,16 @@
-//! Validation and filtering for void type usage in schemas.
+//! Write-time validation for void type usage in schemas.
 //!
-//! The Delta protocol notes that void columns may exist in tables but behavior is undefined.
-//! Following the Spark connector behavior:
-//! - Void fields are recursively dropped from structs at any nesting level during reads.
-//! - Void nested inside Array or Map types is rejected with an error.
+//! The Delta protocol allows void columns in table metadata. Void columns are never written to
+//! Parquet files; reads generate null values on the fly for missing void columns. However, certain
+//! void placements make data writes impossible and must be rejected at write time:
+//! - Void nested inside Array or Map types (cannot represent in Parquet)
+//! - Structs where all fields are void (empty Parquet struct)
+//! - Tables where all columns are void (empty Parquet schema)
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use super::{DataType, Schema, SchemaTransform, StructField, StructType};
 use crate::{DeltaResult, Error};
-
-/// Schema transform that recursively removes void fields from structs at any nesting level.
-/// Mirrors Spark's `dropNullTypeColumns` behavior.
-struct DropVoidFields;
-
-impl<'a> SchemaTransform<'a> for DropVoidFields {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if matches!(
-            field.data_type(),
-            DataType::Primitive(super::PrimitiveType::Void)
-        ) {
-            return None; // Remove this field
-        }
-        self.recurse_into_struct_field(field)
-    }
-}
-
-/// Recursively removes void fields from a schema at any nesting level.
-/// Returns a new schema with all void fields stripped from structs.
-pub(crate) fn drop_void_fields(schema: &StructType) -> Arc<StructType> {
-    let mut dropper = DropVoidFields;
-    match dropper.transform_struct(schema) {
-        Some(Cow::Borrowed(_)) => Arc::new(schema.clone()),
-        Some(Cow::Owned(s)) => Arc::new(s),
-        None => Arc::new(StructType::new_unchecked(std::iter::empty::<StructField>())),
-    }
-}
 
 /// Schema visitor that detects void type nested inside Array or Map.
 #[derive(Debug, Default)]
@@ -76,8 +50,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
 }
 
 /// Validates that a schema does not contain void type nested inside Array or Map.
-/// Top-level void columns are allowed (they are dropped at scan time).
-pub(crate) fn validate_no_void_in_complex_types(schema: &Schema) -> DeltaResult<()> {
+fn validate_no_void_in_complex_types(schema: &Schema) -> DeltaResult<()> {
     let mut checker = CheckVoidInComplexTypes::default();
     let _ = checker.transform_struct(schema);
     if let Some(msg) = checker.0 {
@@ -86,10 +59,117 @@ pub(crate) fn validate_no_void_in_complex_types(schema: &Schema) -> DeltaResult<
     Ok(())
 }
 
+/// Returns true if a struct has fields and ALL of them are void (recursively treating
+/// all-void nested structs as void-equivalent).
+fn is_all_void_struct(st: &StructType) -> bool {
+    st.num_fields() > 0
+        && st.fields().all(|f| {
+            *f.data_type() == DataType::VOID
+                || matches!(f.data_type(), DataType::Struct(inner) if is_all_void_struct(inner))
+        })
+}
+
+/// Recursively strips void fields from a struct field. If the field's data type is a struct,
+/// void sub-fields are removed. Non-struct fields are returned as-is.
+pub(crate) fn strip_void_from_field(field: &StructField) -> StructField {
+    match field.data_type() {
+        DataType::Struct(inner) => {
+            let stripped_fields: Vec<StructField> = inner
+                .fields()
+                .filter(|f| *f.data_type() != DataType::VOID)
+                .map(strip_void_from_field)
+                .collect();
+            let mut result = field.clone();
+            result.data_type =
+                DataType::Struct(Box::new(StructType::new_unchecked(stripped_fields)));
+            result
+        }
+        _ => field.clone(),
+    }
+}
+
+/// Validates that a schema is suitable for writing data. Writes are rejected when:
+/// - Void is nested inside Array or Map (cannot represent in Parquet)
+/// - A struct has only void fields (would produce an empty Parquet struct)
+/// - All top-level columns are void (would produce an empty Parquet schema)
+///
+/// These checks are NOT applied at read time or for metadata-only operations.
+pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
+    validate_no_void_in_complex_types(schema)?;
+
+    // Check for all-void table
+    if is_all_void_struct(schema) {
+        return Err(Error::schema(
+            "Cannot write to a table where all columns are void",
+        ));
+    }
+
+    // Check for all-void structs at any nesting level
+    for field in schema.fields() {
+        check_all_void_structs(field.data_type())?;
+    }
+
+    Ok(())
+}
+
+/// Recursively checks for all-void structs inside the given data type.
+fn check_all_void_structs(dt: &DataType) -> DeltaResult<()> {
+    match dt {
+        DataType::Struct(inner) => {
+            if is_all_void_struct(inner) {
+                return Err(Error::schema(
+                    "Cannot write to a table with a struct where all fields are void",
+                ));
+            }
+            for field in inner.fields() {
+                check_all_void_structs(field.data_type())?;
+            }
+        }
+        DataType::Array(arr) => check_all_void_structs(&arr.element_type)?,
+        DataType::Map(map) => {
+            check_all_void_structs(map.key_type())?;
+            check_all_void_structs(map.value_type())?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+
+    // ---- validate_no_void_in_complex_types tests ----
+
+    /// Demonstrates that serde deserialization bypasses `MapType::new`, so adding
+    /// validation to the constructor would not catch void-in-map from Delta metadata.
+    #[test]
+    fn test_serde_bypasses_map_constructor() {
+        let json = r#"{
+            "name": "m",
+            "type": {
+                "type": "map",
+                "keyType": "string",
+                "valueType": "void",
+                "valueContainsNull": true
+            },
+            "nullable": true,
+            "metadata": {}
+        }"#;
+
+        // Deserialization succeeds — serde populates fields directly
+        let field: StructField = serde_json::from_str(json).unwrap();
+        if let DataType::Map(map_type) = field.data_type() {
+            assert_eq!(*map_type.value_type(), DataType::VOID);
+        } else {
+            panic!("expected map type");
+        }
+
+        // The dedicated validator is what actually catches this
+        let schema = StructType::new_unchecked([field]);
+        assert!(validate_no_void_in_complex_types(&schema).is_err());
+    }
 
     #[test]
     fn test_void_in_array_rejected() {
@@ -182,106 +262,133 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_void_top_level() {
-        let schema = StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("void_col", DataType::VOID),
-            StructField::nullable("name", DataType::STRING),
-        ]);
-        let result = drop_void_fields(&schema);
-        assert_eq!(result.fields().count(), 2);
-        assert!(result.field("id").is_some());
-        assert!(result.field("name").is_some());
-        assert!(result.field("void_col").is_none());
-    }
-
-    #[test]
-    fn test_drop_void_nested_in_struct() {
-        // struct<b: void, c: int> → struct<c: int>
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "outer",
-            DataType::Struct(Box::new(StructType::new_unchecked([
-                StructField::nullable("b", DataType::VOID),
-                StructField::nullable("c", DataType::INTEGER),
-            ]))),
-        )]);
-        let result = drop_void_fields(&schema);
-        assert_eq!(result.fields().count(), 1);
-        let outer = result.field("outer").expect("outer should exist");
-        if let DataType::Struct(inner) = outer.data_type() {
-            assert!(
-                inner.field("b").is_none(),
-                "void field 'b' should be dropped"
-            );
-            assert!(
-                inner.field("c").is_some(),
-                "non-void field 'c' should remain"
-            );
-            assert_eq!(inner.fields().count(), 1);
-        } else {
-            panic!("outer should be a struct");
-        }
-    }
-
-    #[test]
-    fn test_drop_void_deeply_nested() {
-        // a: struct<b: struct<c: void, d: int>> → a: struct<b: struct<d: int>>
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "a",
-            DataType::Struct(Box::new(StructType::new_unchecked([
-                StructField::nullable(
-                    "b",
-                    DataType::Struct(Box::new(StructType::new_unchecked([
-                        StructField::nullable("c", DataType::VOID),
-                        StructField::nullable("d", DataType::INTEGER),
-                    ]))),
-                ),
-            ]))),
-        )]);
-        let result = drop_void_fields(&schema);
-        let a = result.field("a").expect("a should exist");
-        if let DataType::Struct(b_struct) = a.data_type() {
-            let b = b_struct.field("b").expect("b should exist");
-            if let DataType::Struct(inner) = b.data_type() {
-                assert!(
-                    inner.field("c").is_none(),
-                    "void field 'c' should be dropped"
-                );
-                assert!(inner.field("d").is_some());
-            } else {
-                panic!("b should be a struct");
-            }
-        } else {
-            panic!("a should be a struct");
-        }
-    }
-
-    #[test]
-    fn test_drop_void_all_fields_void() {
-        let schema = StructType::new_unchecked([
-            StructField::nullable("a", DataType::VOID),
-            StructField::nullable("b", DataType::VOID),
-        ]);
-        let result = drop_void_fields(&schema);
-        assert_eq!(result.fields().count(), 0);
-    }
-
-    #[test]
-    fn test_drop_void_no_void_unchanged() {
-        let schema = StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ]);
-        let result = drop_void_fields(&schema);
-        assert_eq!(result.fields().count(), 2);
-    }
-
-    #[test]
     fn test_no_void_ok() {
         let schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("name", DataType::STRING),
         ]);
         validate_no_void_in_complex_types(&schema).expect("Schema without void should be fine");
+    }
+
+    // ---- validate_schema_for_write tests ----
+
+    #[test]
+    fn test_write_ok_with_void_column() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("void_col", DataType::VOID),
+        ]);
+        validate_schema_for_write(&schema)
+            .expect("Table with some void columns should be writable");
+    }
+
+    #[test]
+    fn test_write_rejects_all_void_table() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::VOID),
+            StructField::nullable("b", DataType::VOID),
+        ]);
+        let result = validate_schema_for_write(&schema);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("all columns are void"));
+    }
+
+    #[test]
+    fn test_write_rejects_all_void_struct() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable(
+                "s",
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("x", DataType::VOID),
+                    StructField::nullable("y", DataType::VOID),
+                ]))),
+            ),
+        ]);
+        let result = validate_schema_for_write(&schema);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("all fields are void"));
+    }
+
+    #[test]
+    fn test_write_rejects_void_in_array() {
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
+        )]);
+        let result = validate_schema_for_write(&schema);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("array element type"));
+    }
+
+    #[test]
+    fn test_write_rejects_void_in_map() {
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::VOID,
+                true,
+            ))),
+        )]);
+        let result = validate_schema_for_write(&schema);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("map value type"));
+    }
+
+    #[test]
+    fn test_write_ok_no_void() {
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+        validate_schema_for_write(&schema).expect("No void columns should be fine");
+    }
+
+    #[test]
+    fn test_write_ok_struct_with_mixed_void() {
+        // struct<a: int, b: void> is writable (not all-void)
+        let schema = StructType::new_unchecked([StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::VOID),
+            ]))),
+        )]);
+        validate_schema_for_write(&schema).expect("Struct with mixed fields should be writable");
+    }
+
+    #[test]
+    fn test_write_rejects_nested_all_void_struct() {
+        // {id: int, outer: struct<inner: struct<x: void>>} — inner is all-void
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable(
+                "outer",
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable(
+                        "inner",
+                        DataType::Struct(Box::new(StructType::new_unchecked([
+                            StructField::nullable("x", DataType::VOID),
+                        ]))),
+                    ),
+                ]))),
+            ),
+        ]);
+        let result = validate_schema_for_write(&schema);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("all fields are void"));
     }
 }

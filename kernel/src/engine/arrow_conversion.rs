@@ -458,6 +458,32 @@ mod tests {
         Ok(())
     }
 
+    // Fokko review: void is inherently always-null, so nullable=false is semantically
+    // contradictory. We tolerate it on reads (be permissive), and the Arrow conversion still
+    // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
+    #[test]
+    fn test_void_type_not_nullable() -> DeltaResult<()> {
+        let json = r#"
+        {
+            "name": "void_col",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+
+        let field: crate::schema::StructField = serde_json::from_str(json).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(PrimitiveType::Void));
+        assert!(!field.is_nullable());
+
+        // Arrow conversion still works — produces Null type
+        let arrow_field = ArrowField::try_from_kernel(&field)?;
+        assert_eq!(arrow_field.data_type(), &ArrowDataType::Null);
+        assert!(!arrow_field.is_nullable());
+
+        Ok(())
+    }
+
     #[test]
     fn test_void_field_in_struct() -> DeltaResult<()> {
         // A struct schema with a void column should convert to Arrow with a Null field

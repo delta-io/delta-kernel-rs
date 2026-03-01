@@ -289,6 +289,13 @@ impl<S> Transaction<S> {
 
         self.validate_blind_append_semantics()?;
 
+        // Validate that the schema supports data writes when files are being added.
+        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
+        // Reads and metadata-only commits are always allowed.
+        if !self.add_files_metadata.is_empty() {
+            crate::schema::void_utils::validate_schema_for_write(&self.read_snapshot.schema())?;
+        }
+
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
         // This is because kernel does not yet have a way to discern DML operations. For DML
@@ -658,6 +665,7 @@ impl<S> Transaction<S> {
             .read_snapshot
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+<<<<<<< HEAD
         // Build a Transform expression that drops partition columns from the input
         // (unless materializePartitionColumns is enabled).
         let mut transform = Transform::new_top_level();
@@ -667,6 +675,21 @@ impl<S> Transaction<S> {
             }
         }
         Expression::transform(transform)
+=======
+        let schema = self.read_snapshot.schema();
+
+        // If the materialize partition columns feature is enabled, pass through all columns in the
+        // schema. Otherwise, exclude partition columns. Void columns are always excluded because
+        // they are never written to Parquet files.
+        let fields = schema
+            .fields()
+            .filter(|f| {
+                (materialize_partition_columns || !partition_cols.contains(&f.name().to_string()))
+                    && *f.data_type() != DataType::VOID
+            })
+            .map(|f| Expression::column([f.name()]));
+        Expression::struct_from(fields)
+>>>>>>> fbdfb50 (refactor: keep void columns visible on reads, validate only at write time)
     }
 
     /// Get the write context for this transaction. At the moment, this is constant for the whole
@@ -686,8 +709,9 @@ impl<S> Transaction<S> {
             .column_mapping_mode();
 
         // Compute physical schema: exclude partition columns since they're stored in the path
-        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
-        // logical field names to physical names.
+        // (unless materializePartitionColumns is enabled), exclude void columns since they are
+        // never written to Parquet files, and apply column mapping to transform logical field
+        // names to physical names.
         let partition_columns: Vec<String> = self
             .read_snapshot
             .table_configuration()
@@ -700,9 +724,15 @@ impl<S> Transaction<S> {
         let physical_fields = snapshot_schema
             .fields()
             .filter(|f| {
-                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
+                (materialize_partition_columns
+                    || !partition_columns.contains(&f.name().to_string()))
+                    && *f.data_type() != DataType::VOID
             })
-            .map(|f| f.make_physical(column_mapping_mode));
+            .map(|f| {
+                // Recursively strip void fields from nested structs
+                let stripped = crate::schema::void_utils::strip_void_from_field(f);
+                stripped.make_physical(column_mapping_mode)
+            });
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
