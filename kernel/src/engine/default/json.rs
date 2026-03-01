@@ -698,27 +698,6 @@ mod tests {
         )
     }
 
-    /// Writes `lines` as newline-delimited JSON to a [`NamedTempFile`] and returns the file
-    /// together with a [`FileMeta`] pointing at it. The temp file must be kept alive for as long
-    /// as the `FileMeta` is used.
-    fn make_temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
-        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        for line in lines {
-            writeln!(temp_file, "{line}").expect("Failed to write to temp file");
-        }
-        let path = temp_file.path();
-        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
-        let size = std::fs::metadata(path)
-            .expect("Failed to stat temp file")
-            .len();
-        let file_meta = FileMeta {
-            location: file_url,
-            last_modified: 0,
-            size,
-        };
-        (temp_file, file_meta)
-    }
-
     fn make_invalid_named_temp() -> (NamedTempFile, Url) {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
         write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
@@ -919,41 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_json_files_injects_file_path_column() {
-        use crate::schema::MetadataColumnSpec;
-
-        let (_temp, file_meta) = make_temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
-        let file_url = file_meta.location.clone();
-
-        let schema = Arc::new(
-            StructType::try_new([
-                StructField::not_null("x", DeltaDataType::INTEGER),
-                StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            ])
-            .unwrap(),
-        );
-
-        let data: Vec<RecordBatch> = make_local_handler()
-            .read_json_files(&[file_meta], schema, None)
-            .unwrap()
-            .map_ok(into_record_batch)
-            .try_collect()
-            .unwrap();
-
-        assert_eq!(data.len(), 1);
-        let batch = &data[0];
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.schema().field(0).name(), "x");
-        assert_eq!(batch.schema().field(1).name(), "_file");
-
-        // _file should be a plain StringArray with the file URL repeated for each row.
-        let string_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray for _file column");
-        assert_eq!(string_array.len(), 2);
-        assert!(string_array.iter().all(|v| v == Some(file_url.as_str())));
+        crate::engine::tests::test_json_handler_file_path_contract(&make_local_handler());
     }
 
     async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {

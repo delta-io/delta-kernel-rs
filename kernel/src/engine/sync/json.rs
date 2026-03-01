@@ -147,53 +147,8 @@ mod tests {
     }
 
     #[test]
-    fn test_read_json_files_injects_file_path_column() -> DeltaResult<()> {
-        use crate::arrow::array::{Array as _, StringArray};
-        use crate::engine::arrow_data::EngineDataArrowExt as _;
-        use crate::schema::{
-            DataType as DeltaDataType, MetadataColumnSpec, StructField, StructType,
-        };
-
-        // Write a temp JSON file with two simple rows.
-        let test_dir = TempDir::new().unwrap();
-        let path = test_dir.path().join("test.json");
-        std::fs::write(&path, "{\"x\": 1}\n{\"x\": 2}\n").unwrap();
-        let file_url = Url::from_file_path(&path).expect("Failed to create file URL");
-
-        let files = [FileMeta::new(file_url.clone(), 0, 0)];
-
-        // Schema: one regular field + a FilePath metadata column after it.
-        let schema = Arc::new(
-            StructType::try_new([
-                StructField::not_null("x", DeltaDataType::INTEGER),
-                StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            ])
-            .unwrap(),
-        );
-
-        let handler = SyncJsonHandler;
-        let data: Vec<RecordBatch> = handler
-            .read_json_files(&files, schema, None)?
-            .map(|r| -> DeltaResult<RecordBatch> { r?.try_into_record_batch() })
-            .collect::<DeltaResult<_>>()?;
-
-        assert_eq!(data.len(), 1);
-        let batch = &data[0];
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.schema().field(0).name(), "x");
-        assert_eq!(batch.schema().field(1).name(), "_file");
-
-        // _file should be a plain StringArray with the file URL repeated for each row.
-        let string_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray for _file column");
-        assert_eq!(string_array.len(), 2);
-        assert!(string_array.iter().all(|v| v == Some(file_url.as_str())));
-
-        Ok(())
+    fn test_read_json_files_injects_file_path_column() {
+        crate::engine::tests::test_json_handler_file_path_contract(&SyncJsonHandler);
     }
 
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
