@@ -9,7 +9,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, TableSchema};
 use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
@@ -114,9 +114,11 @@ impl TableChangesScanBuilder {
 
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats_columns
+        let table_config = self.table_changes.end_snapshot.table_configuration();
+        let schema = TableSchema::new(logical_schema, table_config);
         let state_info = StateInfo::try_new(
-            logical_schema,
-            self.table_changes.end_snapshot.table_configuration(),
+            schema,
+            table_config,
             self.predicate,
             None, // stats_columns
             CdfTransformFieldClassifier,
@@ -166,7 +168,7 @@ impl TableChangesScan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.state_info.logical_schema
+        self.state_info.schema.user_schema()
     }
 
     /// Get a shared reference to the physical [`Schema`] of the table changes scan.
@@ -251,7 +253,7 @@ fn read_scan_file(
             engine.evaluation_handler().new_expression_evaluator(
                 physical_schema.clone(),
                 expr,
-                state_info.logical_schema.clone().into(),
+                state_info.schema.user_schema().clone().into(),
             )
         })
         .transpose()?;

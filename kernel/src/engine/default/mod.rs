@@ -11,7 +11,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
-use itertools::Itertools as _;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -26,8 +25,7 @@ use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
-    StorageHandler,
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 
 pub mod executor;
@@ -227,24 +225,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Validate partition columns exist in the schema and translate logical names to physical names.
-        let physical_partition_values: HashMap<String, String> = partition_values
-            .into_iter()
-            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
-                let field = write_context
-                    .logical_schema()
-                    .field(&logical_name)
-                    .ok_or_else(|| {
-                        Error::generic(format!(
-                            "Partition column '{logical_name}' not found in table schema"
-                        ))
-                    })?;
-                let physical_name = field
-                    .physical_name(write_context.column_mapping_mode())
-                    .to_string();
-                Ok((physical_name, value))
-            })
-            .try_collect()?;
+        let physical_partition_values =
+            write_context.physical_partition_values(partition_values)?;
 
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;

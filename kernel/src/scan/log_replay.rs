@@ -19,8 +19,9 @@ use crate::log_replay::{
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
-use crate::table_features::ColumnMappingMode;
+use crate::schema::{
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType, TableSchemaRef,
+};
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -32,11 +33,10 @@ use serde::{Deserialize, Serialize};
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct InternalScanState {
-    logical_schema: Arc<StructType>,
-    physical_schema: Arc<StructType>,
+    schema: TableSchemaRef,
+    physical_schema: SchemaRef,
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
-    column_mapping_mode: ColumnMappingMode,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
     /// Logical stats schema for the file statistics.
@@ -245,28 +245,26 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
     ) -> DeltaResult<SerializableScanState> {
         let StateInfo {
-            logical_schema,
+            schema,
             physical_schema,
             physical_predicate,
             transform_spec,
-            column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
         let (predicate, predicate_schema) = match physical_predicate {
-            PhysicalPredicate::Some(pred, schema) => (Some(pred), Some(schema)),
+            PhysicalPredicate::Some(pred, pred_schema) => (Some(pred), Some(pred_schema)),
             _ => (None, None),
         };
 
         // Serialize internal state to JSON blob (schemas, transform spec, and column mapping mode)
         let internal_state = InternalScanState {
-            logical_schema,
+            schema,
             physical_schema,
             transform_spec,
             predicate_schema,
-            column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
             skip_stats: self.skip_stats,
@@ -319,11 +317,10 @@ impl ScanLogReplayProcessor {
         };
 
         let state_info = Arc::new(StateInfo {
-            logical_schema: internal_state.logical_schema,
+            schema: internal_state.schema,
             physical_schema: internal_state.physical_schema,
             physical_predicate,
             transform_spec: internal_state.transform_spec,
-            column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
             logical_stats_schema: internal_state.logical_stats_schema,
         });
@@ -414,12 +411,8 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
-                    &self.state_info.logical_schema,
-                    transform,
-                    &partition_values,
-                    self.state_info.column_mapping_mode,
-                )?;
+                let partition_values =
+                    parse_partition_values(&self.state_info.schema, transform, &partition_values)?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -835,7 +828,7 @@ mod tests {
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType, TableSchema};
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::DeltaResult;
@@ -937,11 +930,10 @@ mod tests {
         let batch = vec![add_batch_simple(get_commit_schema().clone())];
         let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
         let state_info = Arc::new(StateInfo {
-            logical_schema: logical_schema.clone(),
-            physical_schema: logical_schema.clone(),
+            schema: TableSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None),
+            physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
         });
@@ -1131,16 +1123,16 @@ mod tests {
 
         // Verify StateInfo fields preserved
         assert_eq!(
-            deserialized.state_info.logical_schema,
-            state_info.logical_schema
+            deserialized.state_info.schema.user_schema(),
+            state_info.schema.user_schema()
         );
         assert_eq!(
             deserialized.state_info.physical_schema,
             state_info.physical_schema
         );
         assert_eq!(
-            deserialized.state_info.column_mapping_mode,
-            state_info.column_mapping_mode
+            deserialized.state_info.schema.column_mapping_mode(),
+            state_info.schema.column_mapping_mode()
         );
 
         // Verify all file keys are preserved with their DV info
@@ -1265,11 +1257,10 @@ mod tests {
                 true,
             )]));
             let state_info = Arc::new(StateInfo {
-                logical_schema: schema.clone(),
-                physical_schema: schema,
+                schema: TableSchema::new_for_test(schema.clone(), mode),
+                physical_schema: schema.clone(),
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
-                column_mapping_mode: mode,
                 physical_stats_schema: None,
                 logical_stats_schema: None,
             });
@@ -1282,7 +1273,7 @@ mod tests {
                 processor.into_serializable_state(checkpoint_info).unwrap(),
             )
             .unwrap();
-            assert_eq!(deserialized.state_info.column_mapping_mode, mode);
+            assert_eq!(deserialized.state_info.schema.column_mapping_mode(), mode);
         }
     }
 
@@ -1297,11 +1288,10 @@ mod tests {
             true,
         )]));
         let state_info = Arc::new(StateInfo {
-            logical_schema: schema.clone(),
+            schema: TableSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
         });
@@ -1341,11 +1331,10 @@ mod tests {
         )]));
         let checkpoint_info = test_checkpoint_info();
         let invalid_internal_state = InternalScanState {
-            logical_schema: schema.clone(),
+            schema: TableSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None, // Missing!
             transform_spec: None,
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
             skip_stats: false,
@@ -1373,11 +1362,10 @@ mod tests {
             true,
         )]));
         let invalid_internal_state = InternalScanState {
-            logical_schema: schema.clone(),
+            schema: TableSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None,
             transform_spec: None,
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
             skip_stats: false,
