@@ -36,6 +36,11 @@ pub(crate) struct StateInfo {
     /// the engine receives stats with physical column names (for column mapping). This
     /// logical schema maps those stats back to the table's logical column names.
     pub(crate) logical_stats_schema: Option<SchemaRef>,
+    /// Physical partition schema with native types for checkpoint optimization via
+    /// `partitionValues_parsed`. Fields use physical column names (for column mapping).
+    /// Present when the table has partition columns. Used for both row-group-level
+    /// partition pruning and reading pre-typed partition values from checkpoints.
+    pub(crate) physical_partition_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -214,6 +219,23 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
+        // Build partition schema with physical names for checkpoint optimization.
+        // Used for both row-group-level partition pruning and reading partitionValues_parsed.
+        let physical_partition_schema = if !partition_columns.is_empty() {
+            let partition_fields: Vec<StructField> = logical_schema
+                .fields()
+                .filter(|f| partition_columns.contains(f.name()))
+                .map(|f| f.make_physical(column_mapping_mode))
+                .collect();
+            if partition_fields.is_empty() {
+                None
+            } else {
+                Some(Arc::new(StructType::new_unchecked(partition_fields)))
+            }
+        } else {
+            None
+        };
+
         // Build stats schemas:
         // - From stats_columns if specified (for outputting stats to the engine)
         // - From predicate columns otherwise (for data skipping only, no logical schema needed)
@@ -241,7 +263,7 @@ impl StateInfo {
                     ));
                 }
                 // No stats_columns, but has predicate - use predicate columns for data skipping
-                // (no logical stats schema needed for internal data skipping)
+                // (no logical stats schema needed for internal data skipping).
                 (None, PhysicalPredicate::Some(_, schema)) => (build_stats_schema(schema), None),
                 // No stats_columns and no predicate
                 (None, _) => (None, None),
@@ -262,6 +284,7 @@ impl StateInfo {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
+            physical_partition_schema,
         })
     }
 }

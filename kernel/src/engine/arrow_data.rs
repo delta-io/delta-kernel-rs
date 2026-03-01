@@ -237,7 +237,7 @@ impl EngineData for ArrowEngineData {
         visitor: &mut dyn RowVisitor,
     ) -> DeltaResult<()> {
         // Make sure the caller passed the correct number of column names
-        let leaf_types = visitor.selected_column_names_and_types().1;
+        let leaf_types = visitor.column_types().to_vec();
         if leaf_types.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
                 "Visitor expected {} column names, but caller passed {}",

@@ -11,6 +11,7 @@ use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema a
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
@@ -19,8 +20,9 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
-use crate::{EngineData, Snapshot};
+use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType};
+use crate::utils::test_utils::string_array_to_engine_data;
+use crate::{EngineData, JsonHandler, Snapshot};
 
 use super::*;
 
@@ -1115,5 +1117,196 @@ fn test_skip_stats_and_include_stats_columns_errors() {
     assert!(
         err.contains("Cannot set both skip_stats and include_stats_columns"),
         "unexpected error: {err}"
+    );
+}
+
+/// Test that `partitionValues_parsed` in checkpoints enables partition pruning.
+///
+/// Creates a synthetic checkpoint where `partitionValues` (the string map) is empty `{}`
+/// but `partitionValues_parsed` contains typed partition values. A partition predicate
+/// should prune files using the typed values. If the string fallback were used instead,
+/// the empty map would produce null partition values and no files would be pruned.
+///
+/// | Scenario        | partitionValues | partitionValues_parsed.id | id > 1  | Files selected |
+/// |-----------------|-----------------|---------------------------|---------|----------------|
+/// | Typed path      | `{}` (ignored)  | 1, 2                      | prune 1 | **1**          |
+/// | String fallback | `{}` → null     | (not read)                | null    | **2**          |
+#[test]
+fn test_partition_values_parsed_data_skipping() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path();
+    let delta_log = table_path.join("_delta_log");
+    std::fs::create_dir_all(&delta_log).unwrap();
+
+    // Table schema: {id: integer (partition), val: string}
+    let schema_string = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"#;
+
+    // Version 0 JSON commit (needed so log listing finds version 0; the checkpoint covers it)
+    let metadata_json = format!(
+        r#"{{"metaData":{{"id":"test-pvp","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{}","partitionColumns":["id"],"configuration":{{}},"createdTime":1000}}}}"#,
+        schema_string
+    );
+    std::fs::write(
+        delta_log.join("00000000000000000000.json"),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            metadata_json,
+            r#"{"add":{"path":"id=1/file1.parquet","partitionValues":{"id":"1"},"size":100,"modificationTime":1000,"dataChange":true}}"#,
+            r#"{"add":{"path":"id=2/file2.parquet","partitionValues":{"id":"2"},"size":100,"modificationTime":1000,"dataChange":true}}"#,
+        ),
+    )
+    .unwrap();
+
+    // Build the checkpoint schema (Kernel types). The key field is `add.partitionValues_parsed`
+    // which has typed partition values, while `add.partitionValues` is an empty map.
+    let checkpoint_schema: Arc<StructType> = Arc::new(StructType::new_unchecked(vec![
+        StructField::nullable(
+            "protocol",
+            StructType::new_unchecked(vec![
+                StructField::nullable("minReaderVersion", DataType::INTEGER),
+                StructField::nullable("minWriterVersion", DataType::INTEGER),
+            ]),
+        ),
+        StructField::nullable(
+            "metaData",
+            StructType::new_unchecked(vec![
+                StructField::nullable("id", DataType::STRING),
+                StructField::nullable(
+                    "format",
+                    StructType::new_unchecked(vec![
+                        StructField::nullable("provider", DataType::STRING),
+                        StructField::nullable(
+                            "options",
+                            DataType::Map(Box::new(MapType::new(
+                                DataType::STRING,
+                                DataType::STRING,
+                                true,
+                            ))),
+                        ),
+                    ]),
+                ),
+                StructField::nullable("schemaString", DataType::STRING),
+                StructField::nullable(
+                    "partitionColumns",
+                    DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                ),
+                StructField::nullable(
+                    "configuration",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ))),
+                ),
+                StructField::nullable("createdTime", DataType::LONG),
+            ]),
+        ),
+        StructField::nullable(
+            "add",
+            StructType::new_unchecked(vec![
+                StructField::nullable("path", DataType::STRING),
+                StructField::nullable(
+                    "partitionValues",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ))),
+                ),
+                StructField::nullable("size", DataType::LONG),
+                StructField::nullable("modificationTime", DataType::LONG),
+                StructField::nullable("dataChange", DataType::BOOLEAN),
+                StructField::nullable("stats", DataType::STRING),
+                StructField::nullable(
+                    "partitionValues_parsed",
+                    StructType::new_unchecked(vec![StructField::nullable("id", DataType::INTEGER)]),
+                ),
+            ]),
+        ),
+    ]));
+
+    // Checkpoint rows: protocol, metaData, then two add actions.
+    // The add actions have empty `partitionValues` but typed `partitionValues_parsed`.
+    let json_strings: StringArray = vec![
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        &format!(
+            r#"{{"metaData":{{"id":"test-pvp","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{}","partitionColumns":["id"],"configuration":{{}},"createdTime":1000}}}}"#,
+            schema_string
+        ),
+        r#"{"add":{"path":"id=1/file1.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":true,"stats":"{\"numRecords\":3,\"minValues\":{\"val\":\"a\"},\"maxValues\":{\"val\":\"c\"},\"nullCount\":{\"val\":0}}","partitionValues_parsed":{"id":1}}}"#,
+        r#"{"add":{"path":"id=2/file2.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":true,"stats":"{\"numRecords\":3,\"minValues\":{\"val\":\"d\"},\"maxValues\":{\"val\":\"f\"},\"nullCount\":{\"val\":0}}","partitionValues_parsed":{"id":2}}}"#,
+    ]
+    .into();
+
+    let handler = SyncJsonHandler;
+    let parsed = handler
+        .parse_json(string_array_to_engine_data(json_strings), checkpoint_schema)
+        .unwrap();
+    let batch: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)
+        .unwrap()
+        .into();
+
+    // Write checkpoint parquet file
+    let checkpoint_path = delta_log.join("00000000000000000000.checkpoint.parquet");
+    let file = std::fs::File::create(&checkpoint_path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    // _last_checkpoint (no checkpointSchema → kernel reads parquet footer to discover schema)
+    std::fs::write(
+        delta_log.join("_last_checkpoint"),
+        r#"{"version":0,"size":4}"#,
+    )
+    .unwrap();
+
+    // Write data parquet files (partition column is not stored in the data files)
+    let data_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "val",
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    for (dir_name, file_name, vals) in [
+        ("id=1", "file1.parquet", vec!["a", "b", "c"]),
+        ("id=2", "file2.parquet", vec!["d", "e", "f"]),
+    ] {
+        let dir = table_path.join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let batch = RecordBatch::try_new(
+            data_schema.clone(),
+            vec![Arc::new(StringArray::from(vals)) as Arc<dyn Array>],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.join(file_name)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, data_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    // Scan with partition predicate: id > 1
+    let url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(1i32)));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    // If partitionValues_parsed works: id=1 (1>1=false) pruned, id=2 (2>1=true) kept → 1 file
+    // If fallback to empty partitionValues: null>1=null → not pruned → 2 files
+    let files = get_files_for_scan(scan, &engine).unwrap();
+    assert_eq!(
+        files.len(),
+        1,
+        "Partition pruning via partitionValues_parsed should keep only 1 file"
+    );
+    assert!(
+        files[0].contains("id=2"),
+        "Should keep the id=2 partition file, got: {}",
+        files[0]
     );
 }

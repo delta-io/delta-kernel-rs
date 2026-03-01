@@ -132,47 +132,39 @@ impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::sync::Arc;
 
+    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
 
+    use object_store::ObjectStore;
     use tracing::info;
 
     use super::*;
 
-    // We could just re-export UCClient's get_table to not require consumers to directly import
-    // uc_client themselves.
-    async fn get_table(
-        client: &UCClient,
-        table_name: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        let res = client.get_table(table_name).await?;
-        let table_id = res.table_id;
-        let table_uri = res.storage_location;
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-        info!(
-            "[GET TABLE] got table_id: {}, table_uri: {}\n",
-            table_id, table_uri
-        );
-
-        Ok((table_id, table_uri))
+    /// Configuration for connecting to a UC table
+    struct UCTableConfig {
+        table_id: String,
+        table_uri: String,
+        engine: DefaultEngine<TokioBackgroundExecutor>,
+        catalog: UCCatalog<'static, UCCommitsRestClient>,
+        _commits_client: Arc<UCCommitsRestClient>,
     }
 
-    // ignored test which you can run manually to play around with reading a UC table. run with:
-    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
-    #[ignore]
-    #[tokio::test]
-    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Load UC table configuration from environment variables and set up clients
+    async fn load_uc_table_config() -> Result<UCTableConfig, BoxError> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
-        // build shared config
         let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
 
-        // build clients
         let uc_client = UCClient::new(config.clone())?;
-        let uc_commits_client = UCCommitsRestClient::new(config)?;
+        let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
 
         let (table_id, table_uri) = get_table(&uc_client, &table_name).await?;
         let creds = uc_client
@@ -180,9 +172,6 @@ mod tests {
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
 
-        let catalog = UCCatalog::new(&uc_commits_client);
-
-        // TODO: support non-AWS
         let creds = creds
             .aws_temp_credentials
             .ok_or("No AWS temporary credentials found")?;
@@ -196,19 +185,90 @@ mod tests {
 
         let table_url = Url::parse(&table_uri)?;
         let (store, path) = object_store::parse_url_opts(&table_url, options)?;
-
         info!("created object store: {:?}\npath: {:?}\n", store, path);
 
-        let engine = DefaultEngineBuilder::new(store.into()).build();
+        let store: Arc<dyn ObjectStore> = store.into();
+        let engine = DefaultEngineBuilder::new(store).build();
 
-        // read table
-        let snapshot = catalog
-            .load_snapshot(&table_id, &table_uri, &engine)
+        let commits_client_ref: &'static UCCommitsRestClient = Box::leak(Box::new(
+            UCCommitsRestClient::new(uc_client::ClientConfig::build(&endpoint, &token).build()?)?,
+        ));
+        let catalog = UCCatalog::new(commits_client_ref);
+
+        Ok(UCTableConfig {
+            table_id,
+            table_uri,
+            engine,
+            catalog,
+            _commits_client: commits_client,
+        })
+    }
+
+    async fn get_table(client: &UCClient, table_name: &str) -> Result<(String, String), BoxError> {
+        let res = client.get_table(table_name).await?;
+        let table_id = res.table_id;
+        let table_uri = res.storage_location;
+        info!(
+            "[GET TABLE] got table_id: {}, table_uri: {}\n",
+            table_id, table_uri
+        );
+        Ok((table_id, table_uri))
+    }
+
+    // ignored test which you can run manually to play around with reading a UC table. run with:
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo nextest run -p uc-catalog read_uc_table --nocapture --run-ignored all`
+    #[ignore]
+    #[tokio::test]
+    async fn read_uc_table() -> Result<(), BoxError> {
+        let config = load_uc_table_config().await?;
+        let snapshot = config
+            .catalog
+            .load_snapshot(&config.table_id, &config.table_uri, &config.engine)
             .await?;
-        // or time travel
-        // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
+        println!("loaded snapshot: {snapshot:?}");
+        Ok(())
+    }
 
-        println!("🎉 loaded snapshot: {snapshot:?}");
+    // Run a scan to exercise the full scan setup path (partition detection, checkpoint info, etc).
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo nextest run -p uc-catalog read_uc_table_scan --nocapture --run-ignored all`
+    #[ignore]
+    #[tokio::test]
+    async fn read_uc_table_scan() -> Result<(), BoxError> {
+        let config = load_uc_table_config().await?;
+
+        let snapshot = config
+            .catalog
+            .load_snapshot(&config.table_id, &config.table_uri, &config.engine)
+            .await?;
+
+        println!("=== Snapshot version: {} ===", snapshot.version());
+        println!("=== Schema ===");
+        for field in snapshot.schema().fields() {
+            println!("  {}: {:?}", field.name(), field.data_type());
+        }
+
+        // Build scan with a partition predicate to activate partitionValues_parsed
+        // 2025-01-01 = 20089 days since epoch
+        use delta_kernel::expressions::{column_expr, Expression, Scalar};
+        let predicate =
+            Arc::new(column_expr!("part_date").eq(Expression::Literal(Scalar::Date(20089))));
+        let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+
+        println!("=== Running scan_metadata (first batch only) ===");
+        if let Some(result) = scan.scan_metadata(&config.engine)?.next() {
+            let scan_metadata = result?;
+            let selected = scan_metadata
+                .scan_files
+                .selection_vector()
+                .iter()
+                .filter(|&&s| s)
+                .count();
+            let total = scan_metadata.scan_files.selection_vector().len();
+            println!("  first batch: {selected}/{total} files selected");
+        } else {
+            println!("  no batches returned");
+        }
+        println!("=== Done ===");
 
         Ok(())
     }
