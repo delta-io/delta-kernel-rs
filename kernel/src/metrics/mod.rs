@@ -68,7 +68,39 @@
 //! correlating to specific Snapshot/Transaction operations.
 
 mod events;
-mod reporter;
+pub(crate) mod reporter;
+
+use std::sync::Arc;
 
 pub use events::{MetricEvent, MetricId};
-pub use reporter::MetricsReporter;
+pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+use tracing::Subscriber;
+use tracing_subscriber::{
+    layer::{Layered, SubscriberExt as _},
+    registry::LookupSpan,
+};
+
+/// An extension trait to add a convenience method for adding a layer that will send reports to a
+/// `MetricsReporter`
+pub trait WithMetricsReporterLayer: Subscriber {
+    /// Add a layer that will generate [`MetricEvent`]s. This is how you can register to get metric
+    /// reports if you prefer to consume things that way. For example, to write reports out as logs:
+    /// ```
+    /// tracing_subscriber::registry()
+    ///    .with_metrics_reporter_layer(
+    ///        Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
+    ///    )
+    /// ```
+    fn with_metrics_reporter_layer(
+        self,
+        reporter: Arc<dyn MetricsReporter>,
+    ) -> Layered<ReportGeneratorLayer, Self>
+    where
+        Self: Sized,
+        for<'lookup> Self: LookupSpan<'lookup>,
+    {
+        self.with(ReportGeneratorLayer::new(reporter))
+    }
+}
+
+impl<S> WithMetricsReporterLayer for S where S: Subscriber {}

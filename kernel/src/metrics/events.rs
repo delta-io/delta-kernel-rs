@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Each operation (Snapshot, Transaction, Scan) gets a unique MetricId that
 /// is used to correlate all events from that operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MetricId(Uuid);
+pub struct MetricId(pub(crate) Uuid);
 
 impl MetricId {
     /// Generate a new unique MetricId.

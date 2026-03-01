@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
+use crate::metrics::MetricId;
 use crate::{DeltaResult, Engine, Error, Expression, Predicate, PredicateRef};
 
 use tracing::{info, instrument, warn};
@@ -20,10 +21,12 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
     /// fresh snapshot creation where both Protocol and Metadata must exist.
+    #[instrument(name = "segment.read_metadata", fields(report, operation_id = %operation_id), skip(engine))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         lazy_crc: &LazyCrc,
+        operation_id: MetricId,
     ) -> DeltaResult<(Metadata, Protocol)> {
         match self.read_protocol_metadata_opt(engine, lazy_crc)? {
             (Some(m), Some(p)) => Ok((m, p)),
