@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
@@ -6,6 +7,7 @@ use tracing::{debug, error, info};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
+use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
     ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
@@ -211,6 +213,19 @@ pub(crate) fn as_checkpoint_skipping_predicate(
 ) -> Option<Pred> {
     let partition_columns: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
     NullGuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
+}
+
+/// Prefixes all column references in a predicate with a fixed path.
+/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
+/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+pub(crate) struct PrefixColumns {
+    pub(crate) prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixColumns {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Owned(self.prefix.join(name)))
+    }
 }
 
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.

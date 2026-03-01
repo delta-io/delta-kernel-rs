@@ -10,6 +10,8 @@ use crate::actions::{
     schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
+use crate::expressions::transforms::ExpressionTransform;
+use crate::scan::data_skipping::{as_checkpoint_skipping_predicate, PrefixColumns};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -69,6 +71,38 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<Actio
     /// Metadata about checkpoint reading, including the schema used.
     #[allow(unused)]
     pub checkpoint_info: CheckpointReadInfo,
+}
+
+/// The original data predicate from the user's query, after column mapping but before stats
+/// transformation. The transformation to checkpoint-file form (IS NULL guards,
+/// `add.stats_parsed` prefix) happens inside log_segment, not at the call site.
+pub(crate) struct UserPredicate {
+    pub(crate) predicate: PredicateRef,
+    pub(crate) partition_columns: Vec<String>,
+}
+
+/// Mutually exclusive predicate strategies for checkpoint parquet row group skipping.
+/// `Stats` is preferred when user predicate + stats_parsed + file-action schema are all available;
+/// `IsNotNull` is the fallback; `None` when even IS NOT NULL cannot be derived.
+enum CheckpointPredicate {
+    /// No predicate available (e.g., schema contains unrecognised action types that make
+    /// IS NOT NULL unsafe to generate).
+    None,
+    /// OR of IS NOT NULL for each action type in the schema. Allows skipping row groups
+    /// that contain none of the requested action types.
+    IsNotNull(PredicateRef),
+    /// Stats-based data skipping predicate derived from the user query.
+    /// References `add.stats_parsed.{minValues,maxValues,...}` columns with IS NULL guards.
+    Stats(PredicateRef),
+}
+
+impl CheckpointPredicate {
+    fn into_option(self) -> Option<PredicateRef> {
+        match self {
+            Self::None => Option::None,
+            Self::IsNotNull(p) | Self::Stats(p) => Some(p),
+        }
+    }
 }
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
@@ -519,28 +553,43 @@ impl LogSegment {
     ///
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
-    /// `meta_predicate` is an optional expression for row group skipping in checkpoint parquet
-    /// files. It is _NOT_ the query's data predicate, but a hint for skipping irrelevant data.
-    /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
-    /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
+    /// `user_predicate` carries the physical data predicate (after column mapping) and partition
+    /// columns. log_segment transforms it into a checkpoint-compatible skipping predicate
+    /// (IS NULL guards, `add.stats_parsed` prefix) when possible, falling back to IS NOT NULL
+    /// row-group skipping on action-type columns if stats are unavailable.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
+        user_predicate: Option<UserPredicate>,
         stats_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
-        // checkpoint parquet row groups without any relevant action type can be skipped.
-        // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
-        let is_not_null_pred = schema_to_is_not_null_predicate(&checkpoint_read_schema);
-        let effective_predicate = match (is_not_null_pred, meta_predicate) {
-            (None, x) | (x, None) => x,
-            (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
+        // Select CheckpointPredicate variant (mutually exclusive):
+        // Stats when: file-action schema + stats_parsed available + user predicate present + transforms OK
+        // IsNotNull otherwise (fallback for action-type row group skipping)
+        let effective_predicate = {
+            let stats_pred = if schema_contains_file_actions(&checkpoint_read_schema) {
+                stats_schema.zip(user_predicate).and_then(|(_, up)| {
+                    let skipping =
+                        as_checkpoint_skipping_predicate(&up.predicate, &up.partition_columns)?;
+                    let mut prefixer =
+                        PrefixColumns { prefix: ColumnName::new(["add", "stats_parsed"]) };
+                    Some(Arc::new(prefixer.transform_pred(&skipping)?.into_owned()))
+                })
+            } else {
+                None
+            };
+            let cp = match stats_pred {
+                Some(p) => CheckpointPredicate::Stats(p),
+                None => schema_to_is_not_null_predicate(&checkpoint_read_schema)
+                    .map(CheckpointPredicate::IsNotNull)
+                    .unwrap_or(CheckpointPredicate::None),
+            };
+            cp.into_option()
         };
 
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
