@@ -71,8 +71,18 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(iter))
     }
 
-    fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
-        unimplemented!("SyncStorageHandler does not implement put");
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+        if path.scheme() != "file" {
+            return Err(Error::generic("Can only write to local filesystem"));
+        }
+        let file_path = path
+            .to_file_path()
+            .map_err(|_| Error::generic(format!("Invalid path for put: {path:?}")))?;
+        if !overwrite && file_path.exists() {
+            return Err(Error::FileAlreadyExists(file_path.to_string_lossy().into()));
+        }
+        std::fs::write(&file_path, &data)
+            .map_err(|e| Error::generic(format!("Failed to write {}: {e}", file_path.display())))
     }
 
     fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
