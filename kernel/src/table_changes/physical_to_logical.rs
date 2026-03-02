@@ -18,12 +18,11 @@ fn get_cdf_columns(
     scan_file: &CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
     // Handle _change_type
-    let change_type_field = schema.field_with_index(CHANGE_TYPE_COL_NAME);
-    let change_type_metadata = match (change_type_field, &scan_file.scan_type) {
-        (Some((idx, field)), CdfScanFileType::Add | CdfScanFileType::Remove) => {
-            let name = field.name().to_string();
+    let change_type_idx = schema.top_level_field_index(CHANGE_TYPE_COL_NAME);
+    let change_type_metadata = match (change_type_idx, &scan_file.scan_type) {
+        (Some(idx), CdfScanFileType::Add | CdfScanFileType::Remove) => {
             let value = Scalar::String(scan_file.scan_type.get_cdf_string_value().to_string());
-            Some((idx, (name, value)))
+            Some((idx, (CHANGE_TYPE_COL_NAME.to_string(), value)))
         }
         (Some(_), CdfScanFileType::Cdc) | (None, _) => {
             // Cdc files contain the `change_type_` column physically, so we do not insert a metadata-derived value
@@ -32,23 +31,22 @@ fn get_cdf_columns(
     };
 
     // Handle _commit_timestamp
-    let timestamp_metadata = if let Some((idx, field)) =
-        schema.field_with_index(COMMIT_TIMESTAMP_COL_NAME)
+    let timestamp_metadata = if let Some(idx) =
+        schema.top_level_field_index(COMMIT_TIMESTAMP_COL_NAME)
     {
         let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp)
             .map_err(|e| Error::generic(format!("Failed to process {}: {e}", scan_file.path)))?;
-        Some((idx, (field.name().to_string(), value)))
+        Some((idx, (COMMIT_TIMESTAMP_COL_NAME.to_string(), value)))
     } else {
         None
     };
 
     // Handle _commit_version
     let version_metadata = schema
-        .field_with_index(COMMIT_VERSION_COL_NAME)
-        .map(|(idx, field)| {
-            let name = field.name().to_string();
+        .top_level_field_index(COMMIT_VERSION_COL_NAME)
+        .map(|idx| {
             let value = Scalar::Long(scan_file.commit_version);
-            (idx, (name, value))
+            (idx, (COMMIT_VERSION_COL_NAME.to_string(), value))
         });
 
     Ok(change_type_metadata

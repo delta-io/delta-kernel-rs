@@ -148,9 +148,9 @@ impl TableSchema {
         self.column_mapping_mode
     }
 
-    /// Returns the index and field for the given logical column name, or `None` if not found.
-    pub(crate) fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
-        self.schema.field_with_index(name)
+    /// Returns the index of the top-level logical column with the given name, or `None` if not found.
+    pub(crate) fn top_level_field_index(&self, name: impl AsRef<str>) -> Option<usize> {
+        self.schema.field_with_index(name).map(|(idx, _)| idx)
     }
 
     /// Returns the physical name for the given top-level logical column name, or `None` if not found.
