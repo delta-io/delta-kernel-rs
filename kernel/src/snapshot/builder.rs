@@ -138,8 +138,7 @@ impl SnapshotBuilder {
 
     fn table_path(&self) -> &str {
         self.table_root
-            .as_ref()
-            .map(|u| u.as_str())
+            .as_deref()
             .or_else(|| {
                 self.existing_snapshot
                     .as_ref()
@@ -175,7 +174,7 @@ mod tests {
         Arc<dyn ObjectStore>,
         String,
     ) {
-        let table_root = String::from("memory:///test_table");
+        let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
         let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
         (engine, store, table_root)
