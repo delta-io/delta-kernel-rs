@@ -1222,8 +1222,13 @@ impl WriteContext {
         &self.target_dir
     }
 
+    pub fn table_schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    #[cfg(test)]
     pub fn logical_schema(&self) -> &SchemaRef {
-        self.schema.logical_schema()
+        self.schema.logical_schema_for_ffi()
     }
 
     pub fn physical_schema(&self) -> &SchemaRef {

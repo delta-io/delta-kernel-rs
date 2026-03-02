@@ -100,8 +100,9 @@ impl StateInfo {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn logical_schema(&self) -> &SchemaRef {
-        self.schema.logical_schema()
+        self.schema.logical_schema_for_ffi()
     }
 }
 

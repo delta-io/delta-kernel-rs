@@ -426,7 +426,7 @@ pub struct Scan {
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", self.state_info.logical_schema())
+            .field("schema", &self.state_info.schema)
             .field("predicate", &self.state_info.physical_predicate)
             .field("skip_stats", &self.skip_stats)
             .finish()
@@ -456,10 +456,6 @@ impl Scan {
     /// partition columns which are present in the logical schema but not in the physical schema.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn logical_schema(&self) -> &SchemaRef {
-        self.state_info.logical_schema()
-    }
-
     /// Returns the [`TableSchema`] for this scan, which bundles the logical schema together with
     /// column mapping mode and partition columns.
     pub fn table_schema(&self) -> &TableSchemaRef {
@@ -854,8 +850,8 @@ impl Scan {
         }
 
         debug!(
-            "Executing scan with logical schema {:#?} and physical schema {:#?}",
-            self.state_info.logical_schema(),
+            "Executing scan with table schema {:#?} and physical schema {:#?}",
+            self.state_info.schema,
             self.state_info.physical_schema
         );
 

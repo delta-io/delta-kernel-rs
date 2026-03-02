@@ -108,8 +108,9 @@ impl TableSchema {
         })
     }
 
-    /// Returns the logical schema.
-    pub(crate) fn logical_schema(&self) -> &SchemaRef {
+    /// Returns the logical schema as a [`SchemaRef`] for use by FFI consumers.
+    // TODO: update FFI to expose TableSchema directly instead of extracting the underlying schema
+    pub fn logical_schema_for_ffi(&self) -> &SchemaRef {
         &self.schema
     }
 
@@ -128,6 +129,11 @@ impl TableSchema {
     #[cfg(test)]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
+    }
+
+    /// Returns the index and field for the given logical column name, or `None` if not found.
+    pub(crate) fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
+        self.schema.field_with_index(name)
     }
 
     /// Returns the physical name for the given top-level logical column name, or `None` if not found.
