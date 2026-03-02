@@ -11,7 +11,7 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, FilePredicate, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -197,7 +197,11 @@ fn do_work(
         // vector
         let read_results = engine
             .parquet_handler()
-            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
+            .read_parquet_files(
+                &[meta],
+                scan_state.physical_schema.clone(),
+                FilePredicate::None,
+            )
             .unwrap();
 
         for read_result in read_results {

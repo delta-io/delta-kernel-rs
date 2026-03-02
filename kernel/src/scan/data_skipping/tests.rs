@@ -2,7 +2,6 @@ use super::*;
 
 use crate::expressions::column_name;
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
-use rstest::rstest;
 use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
@@ -367,114 +366,6 @@ fn test_timestamp_skipping_disabled() {
         creator.get_max_stat(col, &DataType::TIMESTAMP_NTZ),
         None,
         "get_max_stat should return None: no data skipping on timestamp_ntz maxValues"
-    );
-}
-
-// Verifies the guarded checkpoint skipping predicate:
-// - Prunes when stats are present and below threshold
-// - Keeps when stats are present and above threshold
-// - Conservatively keeps when stats are null (IS NULL guard fires)
-#[rstest]
-#[case::stats_below_threshold(Scalar::from(50), FALSE, "max=50, col>100 should skip")]
-#[case::stats_above_threshold(Scalar::from(150), TRUE, "max=150, col>100 should keep")]
-#[case::stats_null(
-    Scalar::Null(DataType::INTEGER),
-    TRUE,
-    "null max should keep (IS NULL guard)"
-)]
-fn test_checkpoint_skipping_semantic(
-    #[case] max_val: Scalar,
-    #[case] expected: Option<bool>,
-    #[case] description: &str,
-) {
-    let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), max_val)]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
-}
-
-// Verifies that the IS NULL guard changes behavior compared to a regular data skipping predicate:
-// without the guard, null stats produce NULL (unknown); with the guard, they produce TRUE (keep).
-#[test]
-fn test_checkpoint_skipping_null_guard_vs_regular() {
-    let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let resolver =
-        HashMap::from_iter([(column_name!("maxValues.x"), Scalar::Null(DataType::INTEGER))]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-
-    let guarded = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    expect_eq!(
-        filter.eval(&guarded),
-        TRUE,
-        "guarded pred with null stats → TRUE (keep)"
-    );
-
-    let regular = as_data_skipping_predicate(&pred).unwrap();
-    expect_eq!(
-        filter.eval(&regular),
-        NULL,
-        "regular pred with null stats → NULL (unknown)"
-    );
-}
-
-// Verifies that a conjunction can still prune when one column has null stats but the other
-// column's stats are sufficient. For `col_a > 100 AND col_b < 50`, the guarded predicate is:
-//
-//   AND(
-//     OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-//     OR(minValues.col_b IS NULL, minValues.col_b < 50)
-//   )
-//
-// Even if col_a's stats are null, col_b's stats alone can prune the row group.
-#[test]
-fn test_checkpoint_skipping_conjunction_partial_null_stats() {
-    let pred = Pred::and(
-        Pred::gt(column_expr!("col_a"), Scalar::from(100)),
-        Pred::lt(column_expr!("col_b"), Scalar::from(50)),
-    );
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-
-    // Both stats present and both allow pruning → skip
-    let resolver = HashMap::from_iter([
-        (column_name!("maxValues.col_a"), Scalar::from(50)),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
-    ]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        FALSE,
-        "both cols prunable → skip"
-    );
-
-    // col_a stats null, but col_b stats alone are enough to prune → still skip
-    let resolver = HashMap::from_iter([
-        (
-            column_name!("maxValues.col_a"),
-            Scalar::Null(DataType::INTEGER),
-        ),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
-    ]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        FALSE,
-        "col_a null but col_b prunable → still skip"
-    );
-
-    // col_a stats null and col_b doesn't allow pruning → keep
-    let resolver = HashMap::from_iter([
-        (
-            column_name!("maxValues.col_a"),
-            Scalar::Null(DataType::INTEGER),
-        ),
-        (column_name!("minValues.col_b"), Scalar::from(30)),
-    ]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        TRUE,
-        "col_a null and col_b not prunable → keep"
     );
 }
 

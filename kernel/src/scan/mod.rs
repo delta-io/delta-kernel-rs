@@ -9,7 +9,6 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -31,7 +30,10 @@ use crate::schema::{
     StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, FileMeta, FilePredicate, MetadataStatResolver,
+    SnapshotRef, Version,
+};
 
 use self::log_replay::scan_action_iter;
 
@@ -369,19 +371,6 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
-struct PrefixColumns {
-    prefix: ColumnName,
-}
-
-impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
-    }
-}
-
 struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
@@ -698,7 +687,7 @@ impl Scan {
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate) = if self.skip_stats {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), FilePredicate::None)
         } else {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
@@ -756,7 +745,7 @@ impl Scan {
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
         let (checkpoint_schema, meta_predicate) = if self.skip_stats {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), FilePredicate::None)
         } else {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
@@ -777,36 +766,40 @@ impl Scan {
             )
     }
 
-    /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
+    /// Builds a metadata pruning predicate with a stat resolver for checkpoint/sidecar files.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
-    ///
-    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
-    /// values. Without them, row groups containing files with missing stats (null stat columns)
-    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
-    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
+    /// Returns `FilePredicate::Metadata` when there is a physical predicate and either a stats
+    /// schema (for data column skipping) or partition columns (for partition value skipping).
+    fn build_actions_meta_predicate(&self) -> FilePredicate {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
-            return None;
+            return FilePredicate::None;
         };
-        self.state_info.physical_stats_schema.as_ref()?;
 
-        let partition_columns = self
+        let partition_cols = self
             .snapshot
             .table_configuration()
             .metadata()
             .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+        let column_mapping_mode = self.state_info.column_mapping_mode;
+        let partition_columns: HashSet<ColumnName> = self
+            .state_info
+            .logical_schema
+            .fields()
+            .filter(|f| partition_cols.contains(f.name()))
+            .map(|f| ColumnName::new([f.physical_name(column_mapping_mode)]))
+            .collect();
 
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
-        Some(Arc::new(prefixed.into_owned()))
+        // Need either stats schema (for data column skipping) or partition columns
+        if self.state_info.physical_stats_schema.is_none() && partition_columns.is_empty() {
+            return FilePredicate::None;
+        }
+
+        let resolver = MetadataStatResolver::for_checkpoint(predicate, &partition_columns);
+
+        FilePredicate::Metadata {
+            predicate: predicate.clone(),
+            resolver,
+        }
     }
 
     /// Start a parallel scan metadata processing for the table.
@@ -950,7 +943,7 @@ impl Scan {
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     physical_schema.clone(),
-                    None,
+                    FilePredicate::None,
                 )?;
 
                 let engine = engine.clone(); // Arc clone
