@@ -9,7 +9,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::SchemaRef;
+use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
 use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
@@ -114,9 +114,11 @@ impl TableChangesScanBuilder {
 
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats_columns
+        let table_config = self.table_changes.end_snapshot.table_configuration();
+        let schema = LogicalSchema::new(logical_schema, table_config);
         let state_info = StateInfo::try_new(
-            logical_schema,
-            self.table_changes.end_snapshot.table_configuration(),
+            schema,
+            table_config,
             self.predicate,
             None, // stats_columns
             CdfTransformFieldClassifier,
@@ -165,8 +167,10 @@ impl TableChangesScan {
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.state_info.logical_schema
+    /// Returns the [`LogicalSchema`] for this scan, which bundles the logical schema together with
+    /// column mapping mode and partition columns.
+    pub fn logical_schema(&self) -> &LogicalSchemaRef {
+        &self.state_info.schema
     }
 
     /// Get a shared reference to the physical [`Schema`] of the table changes scan.
@@ -251,7 +255,7 @@ fn read_scan_file(
             engine.evaluation_handler().new_expression_evaluator(
                 physical_schema.clone(),
                 expr,
-                state_info.logical_schema.clone().into(),
+                state_info.schema.as_output_data_type(),
             )
         })
         .transpose()?;
@@ -413,12 +417,11 @@ mod tests {
 
         // Check logical schema matches projection
         assert_eq!(
-            *scan.logical_schema(),
-            StructType::new_unchecked([
+            scan.state_info.schema.raw_schema().as_ref(),
+            &StructType::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),
             ])
-            .into()
         );
 
         // Check physical schema only has the regular field 'id' (no CDF metadata columns)

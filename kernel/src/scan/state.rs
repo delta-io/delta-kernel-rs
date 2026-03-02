@@ -5,13 +5,12 @@ use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::scan::get_transform_for_row;
-use crate::schema::Schema;
 use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
-    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
+    schema::{ColumnName, ColumnNamesAndTypes, DataType, LogicalSchema, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
@@ -97,7 +96,7 @@ pub fn transform_to_logical(
     engine: &dyn Engine,
     physical_data: Box<dyn EngineData>,
     physical_schema: &SchemaRef,
-    logical_schema: &Schema,
+    table_schema: &LogicalSchema,
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
@@ -106,7 +105,7 @@ pub fn transform_to_logical(
             .new_expression_evaluator(
                 physical_schema.clone(),
                 transform,
-                logical_schema.clone().into(), // TODO: expensive deep clone!
+                table_schema.as_output_data_type(), // TODO: expensive deep clone per file
             )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),

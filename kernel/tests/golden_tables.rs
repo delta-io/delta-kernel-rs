@@ -9,14 +9,13 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Array, AsArray, StructArray};
 use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
-use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
+use delta_kernel::arrow::datatypes::{DataType, FieldRef};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 
-use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -178,8 +177,11 @@ async fn latest_snapshot_test(
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
-    let schema = Arc::new(Schema::try_from_kernel(scan.logical_schema().as_ref())?);
-    let result = concat_batches(&schema, &batches)?;
+    if batches.is_empty() {
+        assert_eq!(expected.num_rows(), 0, "Expected data but got no batches");
+        return Ok(());
+    }
+    let result = concat_batches(&batches[0].schema(), &batches)?;
     let result = sort_record_batch(result)?;
     let expected = sort_record_batch(expected)?;
     assert!(

@@ -28,6 +28,11 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod logical_schema;
+pub use logical_schema::LogicalSchema;
+/// A reference-counted [`LogicalSchema`]. Prefer this over a bare `LogicalSchema` in any struct
+/// that derives `Clone`, to avoid heap-allocating the partition-column list on each clone.
+pub type LogicalSchemaRef = Arc<LogicalSchema>;
 pub(crate) mod variant_utils;
 
 pub type Schema = StructType;

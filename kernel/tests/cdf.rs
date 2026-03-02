@@ -39,19 +39,18 @@ fn read_cdf_for_table(
         .filter(|name| *name != "_commit_timestamp")
         .collect_vec();
     let schema = table_changes.schema().project(&names)?;
+    let expected_arrow_schema = ArrowSchema::try_from_kernel(&schema).unwrap();
     let scan = table_changes
         .into_scan_builder()
         .with_schema(schema)
         .with_predicate(predicate)
         .build()?;
-    let scan_schema_as_arrow =
-        ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| -> DeltaResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
-            assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
+            assert!(record_batch.schema().as_ref() == &expected_arrow_schema);
             Ok(record_batch)
         })
         .try_collect()?;

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -27,9 +27,11 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{
+    ArrayType, LogicalSchema, MapType, SchemaRef, StructField, StructType, StructTypeBuilder,
+};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -887,40 +889,23 @@ impl<S> Transaction<S> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-        let column_mapping_mode = self
-            .read_snapshot
-            .table_configuration()
-            .column_mapping_mode();
 
-        // Compute physical schema: exclude partition columns since they're stored in the path
-        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
-        // logical field names to physical names.
-        let partition_columns: Vec<String> = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
         let materialize_partition_columns = self
             .read_snapshot
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        let physical_fields = snapshot_schema
-            .fields()
-            .filter(|f| {
-                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
-            })
-            .map(|f| f.make_physical(column_mapping_mode));
-        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
+
+        let schema = LogicalSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
+        let physical_schema = schema.compute_write_physical_schema(materialize_partition_columns);
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
 
         WriteContext::new(
             target_dir.clone(),
-            snapshot_schema,
+            schema,
             physical_schema,
             Arc::new(logical_to_physical),
-            column_mapping_mode,
             stats_columns,
         )
     }
@@ -1209,10 +1194,9 @@ impl<S> Transaction<S> {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    logical_schema: SchemaRef,
+    schema: LogicalSchema,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
-    column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
 }
@@ -1220,18 +1204,16 @@ pub struct WriteContext {
 impl WriteContext {
     fn new(
         target_dir: Url,
-        logical_schema: SchemaRef,
+        schema: LogicalSchema,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
-        column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
             target_dir,
-            logical_schema,
+            schema,
             physical_schema,
             logical_to_physical,
-            column_mapping_mode,
             stats_columns,
         }
     }
@@ -1240,8 +1222,8 @@ impl WriteContext {
         &self.target_dir
     }
 
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
+    pub fn logical_schema(&self) -> &LogicalSchema {
+        &self.schema
     }
 
     pub fn physical_schema(&self) -> &SchemaRef {
@@ -1252,9 +1234,29 @@ impl WriteContext {
         self.logical_to_physical.clone()
     }
 
-    /// The [`ColumnMappingMode`] for this table.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+    /// Translate logical partition column names to physical names.
+    ///
+    /// Validates that each logical name exists in the table schema and returns the
+    /// corresponding physical name (accounting for column mapping).
+    pub fn physical_partition_values(
+        &self,
+        partition_values: HashMap<String, String>,
+    ) -> DeltaResult<HashMap<String, String>> {
+        partition_values
+            .into_iter()
+            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
+                let physical_name = self
+                    .schema
+                    .top_level_logical_to_physical_name(&logical_name)
+                    .ok_or_else(|| {
+                        Error::generic(format!(
+                            "Partition column '{logical_name}' not found in table schema"
+                        ))
+                    })?
+                    .to_string();
+                Ok((physical_name, value))
+            })
+            .collect()
     }
 
     /// Returns the column names that should have statistics collected during writes.
@@ -1587,12 +1589,11 @@ mod tests {
             .with_engine_info("default engine");
 
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
         // Logical schema should include the partition column
         assert!(
-            logical_schema.contains("letter"),
+            write_context.logical_schema().contains("letter"),
             "Logical schema should contain partition column 'letter'"
         );
 
@@ -1604,7 +1605,7 @@ mod tests {
 
         // Both should contain the non-partition columns
         assert!(
-            logical_schema.contains("number"),
+            write_context.logical_schema().contains("number"),
             "Logical schema should contain data column 'number'"
         );
 
@@ -1636,13 +1637,12 @@ mod tests {
         wc: &WriteContext,
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-        let logical_schema = wc.logical_schema();
         let physical_schema = wc.physical_schema();
         let l2p = wc.logical_to_physical();
 
         let handler = ArrowEvaluationHandler;
         let evaluator = handler.new_expression_evaluator(
-            logical_schema.clone(),
+            wc.logical_schema().raw_schema().clone(),
             l2p,
             physical_schema.clone().into(),
         )?;
@@ -1973,6 +1973,50 @@ mod tests {
         Ok(())
     }
 
+    // ── WriteContext::physical_partition_values ──────────────────────────────
+
+    #[test]
+    fn physical_partition_values_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
+        assert!(wc.physical_partition_values(HashMap::new())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn physical_partition_values_none_mode_identity() -> Result<(), Box<dyn std::error::Error>> {
+        // In None mode logical name == physical name
+        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
+        let input = HashMap::from([("category".to_string(), "foo".to_string())]);
+        let result = wc.physical_partition_values(input)?;
+        assert_eq!(result.get("category").map(String::as_str), Some("foo"));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::name_mode("./tests/data/partition_cm/name")]
+    #[case::id_mode("./tests/data/partition_cm/id")]
+    fn physical_partition_values_column_mapping_translates_to_physical(
+        #[case] table_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_, wc) = snapshot_and_write_context(table_path)?;
+        let input = HashMap::from([("category".to_string(), "foo".to_string())]);
+        let result = wc.physical_partition_values(input)?;
+        // The physical name is the UUID-based name, not "category"
+        assert!(!result.contains_key("category"), "should use physical name");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.values().next().map(String::as_str), Some("foo"));
+        Ok(())
+    }
+
+    #[test]
+    fn physical_partition_values_unknown_column_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
+        let input = HashMap::from([("no_such_col".to_string(), "x".to_string())]);
+        let err = wc.physical_partition_values(input).unwrap_err();
+        assert!(err.to_string().contains("no_such_col"));
+        Ok(())
+    }
+
     // Input schemas have no CM metadata; create_table automatically assigns IDs and
     // physical names when mode is Name or Id.
     #[rstest]
@@ -1995,7 +2039,7 @@ mod tests {
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
         crate::utils::test_utils::validate_physical_schema_column_mapping(
-            write_context.logical_schema(),
+            write_context.logical_schema().raw_schema(),
             write_context.physical_schema(),
             mode,
         );
@@ -2080,7 +2124,7 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.logical_schema();
+        let logical_schema = write_context.logical_schema().raw_schema();
         let physical_schema = write_context.physical_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
 
@@ -2139,7 +2183,7 @@ mod tests {
         use crate::arrow::array::Float64Array;
         let (_snap, wc) = snapshot_and_write_context(table_path)?;
         let batch = RecordBatch::try_new(
-            Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
+            Arc::new(wc.logical_schema().raw_schema().as_ref().try_into_arrow()?),
             vec![
                 Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![42])),

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -14,16 +14,15 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 /// This function directly looks up CDF columns in the schema and generates their values
 /// based on the scan file metadata, returning an iterator over the metadata.
 fn get_cdf_columns(
-    logical_schema: &SchemaRef,
+    schema: &LogicalSchema,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
     // Handle _change_type
-    let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
-    let change_type_metadata = match (change_type_field, &scan_file.scan_type) {
-        (Some((idx, field)), CdfScanFileType::Add | CdfScanFileType::Remove) => {
-            let name = field.name().to_string();
+    let change_type_idx = schema.top_level_field_index(CHANGE_TYPE_COL_NAME);
+    let change_type_metadata = match (change_type_idx, &scan_file.scan_type) {
+        (Some(idx), CdfScanFileType::Add | CdfScanFileType::Remove) => {
             let value = Scalar::String(scan_file.scan_type.get_cdf_string_value().to_string());
-            Some((idx, (name, value)))
+            Some((idx, (CHANGE_TYPE_COL_NAME.to_string(), value)))
         }
         (Some(_), CdfScanFileType::Cdc) | (None, _) => {
             // Cdc files contain the `change_type_` column physically, so we do not insert a metadata-derived value
@@ -32,22 +31,23 @@ fn get_cdf_columns(
     };
 
     // Handle _commit_timestamp
-    let timestamp_field = logical_schema.field_with_index(COMMIT_TIMESTAMP_COL_NAME);
-    let timestamp_metadata = if let Some((idx, field)) = timestamp_field {
+    let timestamp_metadata = if let Some(idx) =
+        schema.top_level_field_index(COMMIT_TIMESTAMP_COL_NAME)
+    {
         let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp)
             .map_err(|e| Error::generic(format!("Failed to process {}: {e}", scan_file.path)))?;
-        Some((idx, (field.name().to_string(), value)))
+        Some((idx, (COMMIT_TIMESTAMP_COL_NAME.to_string(), value)))
     } else {
         None
     };
 
     // Handle _commit_version
-    let version_field = logical_schema.field_with_index(COMMIT_VERSION_COL_NAME);
-    let version_metadata = version_field.map(|(idx, field)| {
-        let name = field.name().to_string();
-        let value = Scalar::Long(scan_file.commit_version);
-        (idx, (name, value))
-    });
+    let version_metadata = schema
+        .top_level_field_index(COMMIT_VERSION_COL_NAME)
+        .map(|idx| {
+            let value = Scalar::Long(scan_file.commit_version);
+            (idx, (COMMIT_VERSION_COL_NAME.to_string(), value))
+        });
 
     Ok(change_type_metadata
         .into_iter()
@@ -104,15 +104,14 @@ pub(crate) fn get_cdf_transform_expr(
 
     // Handle regular partition values using parse_partition_values
     let parsed_values = parse_partition_values(
-        &state_info.logical_schema,
+        &state_info.schema,
         transform_spec,
         &scan_file.partition_values,
-        state_info.column_mapping_mode,
     )?;
     partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
-    let cdf_values = get_cdf_columns(&state_info.logical_schema, scan_file)?;
+    let cdf_values = get_cdf_columns(&state_info.schema, scan_file)?;
     partition_values.extend(cdf_values);
 
     get_transform_expr(
@@ -131,7 +130,7 @@ mod tests {
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, LogicalSchema, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
@@ -177,13 +176,12 @@ mod tests {
         logical_schema: SchemaRef,
         transform_spec: Vec<FieldTransformSpec>,
     ) -> StateInfo {
-        let physical_schema = create_test_physical_schema();
+        let physical_schema: SchemaRef = create_test_physical_schema().into();
         StateInfo {
-            logical_schema,
-            physical_schema: physical_schema.into(),
+            schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
+            physical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
         }
@@ -400,11 +398,10 @@ mod tests {
         let transform_spec = vec![];
 
         let state_info = StateInfo {
-            logical_schema,
+            schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
-            column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
         };

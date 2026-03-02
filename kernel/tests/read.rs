@@ -5,7 +5,6 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Field as ArrowField, Int64Type, Schema as ArrowSchema};
-use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
@@ -319,15 +318,12 @@ fn read_with_execute(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_schema = Arc::new(ArrowSchema::try_from_kernel(
-        scan.logical_schema().as_ref(),
-    )?);
     let batches = read_scan(scan, engine)?;
 
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);
     } else {
-        let batch = concat_batches(&result_schema, &batches)?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
         assert_batches_sorted_eq!(expected, &[batch]);
     }
     Ok(())
@@ -343,9 +339,6 @@ fn read_with_scan_metadata(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_schema = Arc::new(ArrowSchema::try_from_kernel(
-        scan.logical_schema().as_ref(),
-    )?);
     let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
     for res in scan_metadata {
@@ -402,7 +395,7 @@ fn read_with_scan_metadata(
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);
     } else {
-        let batch = concat_batches(&result_schema, &batches)?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
         assert_batches_sorted_eq!(expected, &[batch]);
     }
     Ok(())
@@ -922,10 +915,10 @@ fn not_and_or_predicates(
 }
 
 #[rstest::rstest]
-#[case::literal_false(Pred::literal(false), table_for_numbers(vec![]))]
+#[case::literal_false(Pred::literal(false), vec![])]
 #[case::and_with_literal_false(
     Pred::and(column_pred!("number"), Pred::literal(false)),
-    table_for_numbers(vec![])
+    vec![]
 )]
 #[case::literal_true(
     Pred::literal(true),
@@ -949,7 +942,7 @@ fn not_and_or_predicates(
 )]
 #[case::not_distinct_null(
     Pred::not(column_expr!("number").distinct(Expr::null_literal(DataType::LONG))),
-    table_for_numbers(vec![])
+    vec![]
 )]
 #[case::gt_empty_struct(
     column_expr!("number").gt(Expr::struct_from(Vec::<ExpressionRef>::new())),
@@ -1552,7 +1545,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         (
             "row_id",
             MetadataColumnSpec::RowId,
-            "Row ids are not enabled on this table",
+            "Row IDs require row tracking to be enabled with a configured materialized column name",
         ),
         (
             "row_commit_version",
