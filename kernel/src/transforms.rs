@@ -70,7 +70,16 @@ pub(crate) fn parse_partition_value(
     schema: &TableSchema,
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<(usize, (String, Scalar))> {
-    schema.parse_partition_value(field_idx, partition_values)
+    let (physical_name, data_type) = schema
+        .physical_name_and_type_at_index(field_idx)
+        .ok_or_else(|| {
+            Error::InternalError(format!(
+                "out of bounds partition column field index {field_idx}"
+            ))
+        })?;
+    let partition_value =
+        parse_partition_value_raw(partition_values.get(physical_name), data_type)?;
+    Ok((field_idx, (physical_name.to_string(), partition_value)))
 }
 
 /// Parse all partition values from a transform spec.
@@ -197,9 +206,12 @@ pub(crate) fn parse_partition_value_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::Scalar;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
+    };
     use std::collections::HashMap;
 
     // Tests for parse_partition_value function
@@ -216,6 +228,39 @@ mod tests {
 
         let result = parse_partition_value(5, &schema, &partition_values);
         assert_result_error_with_message(result, "out of bounds");
+    }
+
+    #[test]
+    fn parse_partition_value_none_mode() {
+        // field 1 is "name" (STRING)
+        let schema = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let map = [("name".to_string(), "alice".to_string())].into();
+        let (idx, (physical_name, scalar)) = parse_partition_value(1, &schema, &map).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(physical_name, "name");
+        assert_eq!(scalar, Scalar::String("alice".to_string()));
+    }
+
+    #[test]
+    fn parse_partition_value_name_mode_uses_physical_name() {
+        // field 0 is "id" → physical "phys_id"
+        let schema = TableSchema::new_for_test(
+            test_schema_flat_with_column_mapping(),
+            ColumnMappingMode::Name,
+        );
+        let map = [("phys_id".to_string(), "42".to_string())].into();
+        let (idx, (physical_name, scalar)) = parse_partition_value(0, &schema, &map).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(physical_name, "phys_id");
+        assert_eq!(scalar, Scalar::Long(42));
+    }
+
+    #[test]
+    fn parse_partition_value_null_when_absent() {
+        let schema = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let map = HashMap::new(); // value not present → null
+        let (_, (_, scalar)) = parse_partition_value(1, &schema, &map).unwrap();
+        assert!(scalar.is_null());
     }
 
     // Tests for parse_partition_values function

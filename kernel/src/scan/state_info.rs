@@ -50,7 +50,7 @@ impl StateInfo {
     ) -> DeltaResult<Self> {
         let schema = Arc::new(schema);
         let (physical_schema, transform_spec) =
-            schema.compute_read_schema_and_transform(&classifier)?;
+            schema.compute_physical_read_schema_and_transform(&classifier)?;
 
         let physical_predicate = match predicate {
             Some(pred) => PhysicalPredicate::try_new(&pred, &schema)?,

@@ -896,7 +896,7 @@ impl<S> Transaction<S> {
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
         let schema = TableSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
-        let physical_schema = schema.compute_write_schema(materialize_partition_columns);
+        let physical_schema = schema.compute_write_physical_schema(materialize_partition_columns);
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
@@ -1247,7 +1247,7 @@ impl WriteContext {
             .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
                 let physical_name = self
                     .schema
-                    .logical_to_physical_name(&logical_name)
+                    .top_level_logical_to_physical_name(&logical_name)
                     .ok_or_else(|| {
                         Error::generic(format!(
                             "Partition column '{logical_name}' not found in table schema"
@@ -2011,8 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_partition_values_unknown_column_errors() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn physical_partition_values_unknown_column_errors() -> Result<(), Box<dyn std::error::Error>> {
         let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
         let input = HashMap::from([("no_such_col".to_string(), "x".to_string())]);
         let err = wc.physical_partition_values(input).unwrap_err();

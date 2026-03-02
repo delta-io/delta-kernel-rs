@@ -12,11 +12,11 @@ use super::{
     ArrayType, DataType, MapType, MetadataColumnSpec, PrimitiveType, SchemaRef, SchemaTransform,
     StructField, StructType,
 };
-use crate::expressions::{ColumnName, Scalar};
+use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{parse_partition_value_raw, FieldTransformSpec, TransformSpec};
+use crate::transforms::{FieldTransformSpec, TransformSpec};
 use crate::{DeltaResult, Error};
 
 // Private helper for predicate-driven schema traversal.
@@ -116,16 +116,19 @@ impl TableSchema {
     /// Returns the column mapping mode. Exposed for tests only.
     ///
     /// Production code should never need the raw mode — all logical-to-physical name translation
-    /// should go through `TableSchema` methods (e.g. [`Self::logical_to_physical_name`],
-    /// [`Self::compute_read_schema_and_transform`]) so that callers remain insulated from
+    /// should go through `TableSchema` methods (e.g. [`Self::top_level_logical_to_physical_name`],
+    /// [`Self::compute_physical_read_schema_and_transform`]) so that callers remain insulated from
     /// the column-mapping details.
     #[cfg(test)]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
     }
 
-    /// Returns the physical name for the given logical column name, or `None` if not found.
-    pub(crate) fn logical_to_physical_name<'a>(&'a self, logical_name: &str) -> Option<&'a str> {
+    /// Returns the physical name for the given top-level logical column name, or `None` if not found.
+    pub(crate) fn top_level_logical_to_physical_name<'a>(
+        &'a self,
+        logical_name: &str,
+    ) -> Option<&'a str> {
         self.schema
             .field(logical_name)
             .map(|f| f.physical_name(self.column_mapping_mode))
@@ -134,7 +137,7 @@ impl TableSchema {
     /// Compute the physical read schema and transform spec for this table schema.
     ///
     /// The `classifier` allows different scan types (regular, CDF) to customize field handling.
-    pub(crate) fn compute_read_schema_and_transform<C: TransformFieldClassifier>(
+    pub(crate) fn compute_physical_read_schema_and_transform<C: TransformFieldClassifier>(
         &self,
         classifier: &C,
     ) -> DeltaResult<(SchemaRef, Option<Arc<TransformSpec>>)> {
@@ -243,6 +246,9 @@ impl TableSchema {
     ///
     /// Returns `None` if none of the referenced columns are eligible for data skipping.
     /// Returns `Err` if any referenced column is not present in the schema.
+    ///
+    /// The returned `HashMap` maps logical column paths (as used in predicates) to
+    /// their corresponding physical column paths (as found in Parquet files).
     pub(crate) fn get_referenced_physical_schema(
         &self,
         references: HashSet<&ColumnName>,
@@ -264,28 +270,18 @@ impl TableSchema {
         Ok(schema_opt.map(|s| (s.into_owned(), visitor.column_mappings)))
     }
 
-    /// Parse a single partition value for the field at `field_idx` from the raw string map.
-    pub(crate) fn parse_partition_value(
-        &self,
-        field_idx: usize,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<(usize, (String, Scalar))> {
-        let Some(field) = self.schema.field_at_index(field_idx) else {
-            return Err(Error::InternalError(format!(
-                "out of bounds partition column field index {field_idx}"
-            )));
-        };
-        let name = field.physical_name(self.column_mapping_mode);
-        let partition_value =
-            parse_partition_value_raw(partition_values.get(name), field.data_type())?;
-        Ok((field_idx, (name.to_string(), partition_value)))
+    /// Returns the physical name and data type of the field at `idx`, or `None` if out of bounds.
+    pub(crate) fn physical_name_and_type_at_index(&self, idx: usize) -> Option<(&str, &DataType)> {
+        self.schema
+            .field_at_index(idx)
+            .map(|f| (f.physical_name(self.column_mapping_mode), f.data_type()))
     }
 
     /// Compute the physical write schema for this table schema.
     ///
     /// `include_partition_cols`: if false, partition columns are excluded from the result
     /// (they are stored in the file path, not in the data).
-    pub(crate) fn compute_write_schema(&self, include_partition_cols: bool) -> SchemaRef {
+    pub(crate) fn compute_write_physical_schema(&self, include_partition_cols: bool) -> SchemaRef {
         let fields = self
             .schema
             .fields()
@@ -304,69 +300,38 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{column_name, Scalar};
+    use crate::expressions::column_name;
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::{
         test_schema_flat, test_schema_flat_with_column_mapping, test_schema_nested,
         test_schema_nested_with_column_mapping, test_schema_with_array, test_schema_with_map,
     };
 
-    // ── logical_to_physical_name ─────────────────────────────────────────────
+    // ── top_level_logical_to_physical_name ──────────────────────────────────
 
     #[rstest]
     #[case::none(test_schema_flat(), ColumnMappingMode::None, "id", Some("id"))]
-    #[case::name(test_schema_flat_with_column_mapping(), ColumnMappingMode::Name, "id", Some("phys_id"))]
-    #[case::id_mode(test_schema_flat_with_column_mapping(), ColumnMappingMode::Id, "name", Some("phys_name"))]
+    #[case::name(
+        test_schema_flat_with_column_mapping(),
+        ColumnMappingMode::Name,
+        "id",
+        Some("phys_id")
+    )]
+    #[case::id_mode(
+        test_schema_flat_with_column_mapping(),
+        ColumnMappingMode::Id,
+        "name",
+        Some("phys_name")
+    )]
     #[case::missing(test_schema_flat(), ColumnMappingMode::None, "no_such_col", None)]
-    fn logical_to_physical_name(
+    fn top_level_logical_to_physical_name(
         #[case] schema: SchemaRef,
         #[case] mode: ColumnMappingMode,
         #[case] logical: &str,
         #[case] expected: Option<&str>,
     ) {
         let ts = TableSchema::new_for_test(schema, mode);
-        assert_eq!(ts.logical_to_physical_name(logical), expected);
-    }
-
-    // ── parse_partition_value ────────────────────────────────────────────────
-
-    #[test]
-    fn parse_partition_value_none_mode() {
-        // field 1 is "name" (STRING)
-        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
-        let map = [("name".to_string(), "alice".to_string())].into();
-        let (idx, (physical_name, scalar)) = ts.parse_partition_value(1, &map).unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(physical_name, "name");
-        assert_eq!(scalar, Scalar::String("alice".to_string()));
-    }
-
-    #[test]
-    fn parse_partition_value_name_mode_uses_physical_name() {
-        // field 0 is "id" → physical "phys_id"
-        let ts = TableSchema::new_for_test(
-            test_schema_flat_with_column_mapping(),
-            ColumnMappingMode::Name,
-        );
-        let map = [("phys_id".to_string(), "42".to_string())].into();
-        let (idx, (physical_name, scalar)) = ts.parse_partition_value(0, &map).unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(physical_name, "phys_id");
-        assert_eq!(scalar, Scalar::Long(42));
-    }
-
-    #[test]
-    fn parse_partition_value_null_when_absent() {
-        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
-        let map = HashMap::new(); // value not present → null
-        let (_, (_, scalar)) = ts.parse_partition_value(1, &map).unwrap();
-        assert!(scalar.is_null());
-    }
-
-    #[test]
-    fn parse_partition_value_out_of_bounds_errors() {
-        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
-        assert!(ts.parse_partition_value(99, &HashMap::new()).is_err());
+        assert_eq!(ts.top_level_logical_to_physical_name(logical), expected);
     }
 
     // ── get_referenced_physical_schema ───────────────────────────────────────
@@ -374,7 +339,10 @@ mod tests {
     #[test]
     fn get_referenced_physical_schema_empty_refs_returns_none() {
         let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
-        assert!(ts.get_referenced_physical_schema(HashSet::new()).unwrap().is_none());
+        assert!(ts
+            .get_referenced_physical_schema(HashSet::new())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -399,7 +367,10 @@ mod tests {
             .get_referenced_physical_schema(HashSet::from([&id]))
             .unwrap()
             .unwrap();
-        assert_eq!(schema.field("phys_id").unwrap().data_type(), &DataType::LONG);
+        assert_eq!(
+            schema.field("phys_id").unwrap().data_type(),
+            &DataType::LONG
+        );
         assert_eq!(mappings[&id], column_name!("phys_id"));
     }
 
@@ -439,7 +410,9 @@ mod tests {
     fn get_referenced_physical_schema_unknown_column_errors() {
         let missing = column_name!("no_such_col");
         let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
-        assert!(ts.get_referenced_physical_schema(HashSet::from([&missing])).is_err());
+        assert!(ts
+            .get_referenced_physical_schema(HashSet::from([&missing]))
+            .is_err());
     }
 
     #[rstest]
@@ -450,10 +423,12 @@ mod tests {
         #[case] col: ColumnName,
     ) {
         let ts = TableSchema::new_for_test(schema, ColumnMappingMode::None);
-        assert!(ts.get_referenced_physical_schema(HashSet::from([&col])).is_err());
+        assert!(ts
+            .get_referenced_physical_schema(HashSet::from([&col]))
+            .is_err());
     }
 
-    // ── compute_write_schema ─────────────────────────────────────────────────
+    // ── compute_write_physical_schema ────────────────────────────────────────
 
     fn ts_with_partition(mode: ColumnMappingMode) -> Arc<TableSchema> {
         let schema = if mode == ColumnMappingMode::None {
@@ -470,25 +445,25 @@ mod tests {
     }
 
     #[test]
-    fn compute_write_schema_include_partitions() {
+    fn compute_write_physical_schema_include_partitions() {
         let ts = ts_with_partition(ColumnMappingMode::None);
-        let ws = ts.compute_write_schema(true);
+        let ws = ts.compute_write_physical_schema(true);
         assert_eq!(ws.fields().count(), 2); // id + name
     }
 
     #[test]
-    fn compute_write_schema_exclude_partitions() {
+    fn compute_write_physical_schema_exclude_partitions() {
         let ts = ts_with_partition(ColumnMappingMode::None);
-        let ws = ts.compute_write_schema(false);
+        let ws = ts.compute_write_physical_schema(false);
         assert_eq!(ws.fields().count(), 1);
         assert!(ws.field("id").is_some());
         assert!(ws.field("name").is_none());
     }
 
     #[test]
-    fn compute_write_schema_column_mapping_uses_physical_names() {
+    fn compute_write_physical_schema_column_mapping_uses_physical_names() {
         let ts = ts_with_partition(ColumnMappingMode::Name);
-        let ws = ts.compute_write_schema(false); // exclude partition "name"
+        let ws = ts.compute_write_physical_schema(false); // exclude partition "name"
         assert_eq!(ws.fields().count(), 1);
         assert!(ws.field("phys_id").is_some(), "expected physical name");
         assert!(ws.field("id").is_none(), "should not have logical name");
