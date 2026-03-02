@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -3245,16 +3244,19 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 #[test]
 fn test_rename_stat_columns() {
     let stats_path = ColumnName::new(["add", "stats_parsed"]);
+    let make_renamer = |partition_cols: &[&str]| RenameStatColumns {
+        stats_path: stats_path.clone(),
+        partition_columns: partition_cols.iter().map(|&s| s.to_owned()).collect(),
+    };
 
-    // Known stat column roots are renamed with the stats_path prefix.
+    // Known stat column roots for non-partition columns are renamed with the stats_path prefix.
     for root in ["minValues", "maxValues", "nullCount", "numRecords"] {
         let col_name = format!("{root}.x");
         let pred = Pred::gt(
             Expr::column(ColumnName::new([root, "x"])),
             Expr::literal(100i64),
         );
-        let mut renamer = RenameStatColumns { stats_path: stats_path.clone() };
-        let result = renamer.transform_pred(&pred).unwrap().into_owned();
+        let result = make_renamer(&[]).transform_pred(&pred).unwrap().into_owned();
         let refs: Vec<_> = result.references().into_iter().collect();
         assert_eq!(refs.len(), 1, "expected one ref for {col_name}");
         assert_eq!(
@@ -3266,17 +3268,34 @@ fn test_rename_stat_columns() {
 
     // Unknown column roots return None from transform_pred (conservative drop).
     let unknown_pred = Pred::gt(column_expr!("unknownRoot.x"), Expr::literal(100i64));
-    let mut renamer = RenameStatColumns { stats_path: stats_path.clone() };
     assert!(
-        renamer.transform_pred(&unknown_pred).is_none(),
+        make_renamer(&[]).transform_pred(&unknown_pred).is_none(),
         "unknown root should return None"
     );
 
     // Top-level numRecords (no sub-column) is also recognized.
     let pred = Pred::gt(column_expr!("numRecords"), Expr::literal(0i64));
-    let mut renamer = RenameStatColumns { stats_path: stats_path.clone() };
-    let result = renamer.transform_pred(&pred).unwrap().into_owned();
+    let result = make_renamer(&[]).transform_pred(&pred).unwrap().into_owned();
     let refs: Vec<_> = result.references().into_iter().collect();
     assert_eq!(refs.len(), 1);
     assert_eq!(*refs[0], column_name!("add.stats_parsed.numRecords"));
+
+    // Partition column: bare column name (path len 1) routes to add.partitionValues_parsed.<col>
+    let pred = Pred::gt(column_expr!("region"), Expr::literal("US"));
+    let result = make_renamer(&["region"])
+        .transform_pred(&pred)
+        .unwrap()
+        .into_owned();
+    let refs: Vec<_> = result.references().into_iter().collect();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(*refs[0], column_name!("add.partitionValues_parsed.region"));
+
+    // Non-partition columns with the same name are still routed to stats_parsed
+    let pred = Pred::gt(
+        Expr::column(ColumnName::new(["maxValues", "region"])),
+        Expr::literal("US"),
+    );
+    let result = make_renamer(&[]).transform_pred(&pred).unwrap().into_owned();
+    let refs: Vec<_> = result.references().into_iter().collect();
+    assert_eq!(*refs[0], column_name!("add.stats_parsed.maxValues.region"));
 }

@@ -515,3 +515,46 @@ fn test_timestamp_predicates_dont_data_skip() {
         );
     }
 }
+
+// Verifies that partition column predicates are kept as-is (bare column reference, no
+// minValues/maxValues prefix, no IS NULL guard), while data column comparisons retain the guard.
+#[test]
+fn test_checkpoint_skipping_partition_columns() {
+    let partition_cols = [String::from("region")];
+
+    // GT: partition col uses bare column reference (no IS NULL guard, no stat prefix)
+    let pred = Pred::gt(column_expr!("region"), Scalar::from("US"));
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &partition_cols).unwrap();
+    assert_eq!(skipping_pred.to_string(), "Column(region) > 'US'");
+
+    // EQ: bare column reference for both min and max paths
+    let pred = Pred::eq(column_expr!("region"), Scalar::from("US"));
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &partition_cols).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "AND(NOT(Column(region) > 'US'), NOT(Column(region) < 'US'))"
+    );
+
+    // IS NULL: bare column IS NULL (partition value is the exact value, not a null-count stat)
+    let pred = Pred::is_null(column_expr!("region"));
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &partition_cols).unwrap();
+    assert_eq!(skipping_pred.to_string(), "Column(region) IS NULL");
+
+    // IS NOT NULL: returns None (conservative)
+    let pred = Pred::is_not_null(column_expr!("region"));
+    assert!(
+        as_checkpoint_skipping_predicate(&pred, &partition_cols).is_none(),
+        "IS NOT NULL on partition column should return None"
+    );
+
+    // Mixed AND: partition col (bare ref) + data col (IS NULL guard) both contribute
+    let pred = Pred::and(
+        Pred::gt(column_expr!("region"), Scalar::from("US")),
+        Pred::gt(column_expr!("value"), Scalar::from(100i64)),
+    );
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &partition_cols).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "AND(Column(region) > 'US', OR(Column(maxValues.value) IS NULL, Column(maxValues.value) > 100))"
+    );
+}

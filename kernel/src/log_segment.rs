@@ -1,6 +1,7 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -146,21 +147,33 @@ pub(crate) struct LogSegment {
     pub max_published_version: Option<Version>,
 }
 
-/// Renames only the four known stat-column roots in a checkpoint skipping predicate by prepending
-/// `stats_path`. For example, `minValues.x > 100` becomes `add.stats_parsed.minValues.x > 100`.
-/// Returns `None` for any column whose root is not in `{minValues, maxValues, nullCount, numRecords}`,
-/// which causes `transform_pred` to conservatively drop that predicate.
+/// Resolves column references produced by [`as_checkpoint_skipping_predicate`] to their full
+/// checkpoint-file paths:
+///
+/// - `<partition_col>` (path len 1) → `add.partitionValues_parsed.<partition_col>`
+/// - `{minValues,maxValues,nullCount,numRecords}.*` → `add.stats_parsed.*`
+///
+/// Returns `None` for any unrecognised root, causing `transform_pred` to conservatively
+/// drop that sub-predicate.
 struct RenameStatColumns {
-    stats_path: ColumnName,
+    stats_path: ColumnName, // typically ColumnName::new(["add", "stats_parsed"])
+    partition_columns: HashSet<String>,
 }
 
 impl<'a> ExpressionTransform<'a> for RenameStatColumns {
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        matches!(
-            name.path().first().map(String::as_str),
-            Some("minValues" | "maxValues" | "nullCount" | "numRecords")
-        )
-        .then(|| Cow::Owned(self.stats_path.join(name)))
+        let path = name.path();
+        if path.len() == 1 && self.partition_columns.contains(path[0].as_str()) {
+            return Some(Cow::Owned(
+                ColumnName::new(["add", "partitionValues_parsed"]).join(name),
+            ));
+        }
+        match path.first().map(String::as_str) {
+            Some("minValues" | "maxValues" | "nullCount" | "numRecords") => {
+                Some(Cow::Owned(self.stats_path.join(name)))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -595,8 +608,10 @@ impl LogSegment {
                 stats_schema.zip(user_predicate).and_then(|(_, up)| {
                     let skipping =
                         as_checkpoint_skipping_predicate(&up.predicate, &up.partition_columns)?;
-                    let mut renamer =
-                        RenameStatColumns { stats_path: ColumnName::new(["add", "stats_parsed"]) };
+                    let mut renamer = RenameStatColumns {
+                        stats_path: ColumnName::new(["add", "stats_parsed"]),
+                        partition_columns: up.partition_columns.iter().cloned().collect(),
+                    };
                     Some(Arc::new(renamer.transform_pred(&skipping)?.into_owned()))
                 })
             } else {
