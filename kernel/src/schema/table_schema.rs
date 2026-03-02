@@ -64,7 +64,7 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
 /// Bundles a logical schema, column mapping mode, partition columns,
 /// and materialized row ID column for read and write schema computation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TableSchema {
+pub struct TableSchema {
     schema: SchemaRef,
     column_mapping_mode: ColumnMappingMode,
     partition_columns: Vec<String>,
@@ -111,6 +111,12 @@ impl TableSchema {
     /// Returns the logical schema.
     pub(crate) fn logical_schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    /// Returns the logical schema as an owned [`DataType`] for use as an expression output type.
+    // TODO: expensive deep clone of the schema
+    pub fn as_output_data_type(&self) -> DataType {
+        DataType::Struct(Box::new(self.schema.as_ref().clone()))
     }
 
     /// Returns the column mapping mode. Exposed for tests only.

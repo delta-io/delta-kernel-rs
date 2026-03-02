@@ -27,7 +27,8 @@ use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    DataType, MapType, SchemaRef, StructField, StructType, TableSchema, ToSchema as _,
+    DataType, MapType, SchemaRef, StructField, StructType, TableSchema, TableSchemaRef,
+    ToSchema as _,
 };
 use crate::table_features::Operation;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -459,6 +460,12 @@ impl Scan {
         self.state_info.logical_schema()
     }
 
+    /// Returns the [`TableSchema`] for this scan, which bundles the logical schema together with
+    /// column mapping mode and partition columns.
+    pub fn table_schema(&self) -> &TableSchemaRef {
+        &self.state_info.schema
+    }
+
     /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
     /// of the underlying data files which must be read from storage.
     ///
@@ -865,7 +872,7 @@ impl Scan {
             .flatten_ok();
 
         let physical_schema = self.physical_schema().clone();
-        let logical_schema = self.logical_schema().clone();
+        let table_schema = self.state_info.schema.clone();
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
@@ -895,7 +902,7 @@ impl Scan {
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
-                let logical_schema_inner = logical_schema.clone();
+                let table_schema_inner = table_schema.clone(); // Arc clone
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
@@ -903,7 +910,7 @@ impl Scan {
                         engine.as_ref(),
                         read_result,
                         &physical_schema_inner,
-                        &logical_schema_inner,
+                        &table_schema_inner,
                         scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
