@@ -223,7 +223,7 @@ pub unsafe extern "C" fn table_changes_scan_logical_schema(
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     table_changes_scan
         .logical_schema()
-        .raw_schema_for_ffi()
+        .raw_schema()
         .clone()
         .into()
 }

@@ -45,7 +45,7 @@ pub unsafe extern "C" fn get_write_schema(
     let write_context = unsafe { write_context.as_ref() };
     write_context
         .logical_schema()
-        .raw_schema_for_ffi()
+        .raw_schema()
         .clone()
         .into()
 }

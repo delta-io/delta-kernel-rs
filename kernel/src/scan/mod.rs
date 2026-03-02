@@ -388,7 +388,7 @@ pub struct ScanMetadata {
     /// expected by the scan:
     ///
     /// - `Some(expr)`: Apply this expression to transform the data to match
-    ///   [`Scan::table_schema()`].
+    ///   [`Scan::logical_schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
@@ -451,13 +451,12 @@ impl Scan {
         &self.snapshot
     }
 
-    /// Get a shared reference to the logical [`Schema`] of the scan (i.e. the output schema of the
-    /// scan). Note that the logical schema can differ from the physical schema due to e.g.
-    /// partition columns which are present in the logical schema but not in the physical schema.
+    /// Returns the [`LogicalSchema`] for this scan, which bundles the logical schema together with
+    /// column mapping mode and partition columns. Note that the logical schema can differ from the
+    /// physical schema due to e.g. partition columns which are present in the logical schema but
+    /// not in the physical schema.
     ///
     /// [`Schema`]: crate::schema::Schema
-    /// Returns the [`LogicalSchema`] for this scan, which bundles the logical schema together with
-    /// column mapping mode and partition columns.
     pub fn logical_schema(&self) -> &LogicalSchemaRef {
         &self.state_info.schema
     }
@@ -510,7 +509,7 @@ impl Scan {
     ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
     ///   the associated expression _must_ be applied to the data read from the file specified by
     ///   the row. The resultant schema for this expression is guaranteed to be
-    ///   [`Self::table_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
+    ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
     ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
     ///   from disk is already in the correct logical state.
     pub fn scan_metadata(

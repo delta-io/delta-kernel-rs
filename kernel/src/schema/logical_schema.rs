@@ -108,12 +108,14 @@ impl LogicalSchema {
         })
     }
 
-    /// Returns the underlying logical schema.
+    /// Returns the underlying logical [`SchemaRef`].
     ///
-    /// Test-only: [`LogicalSchema`] is the intended abstraction for the logical schema; production
-    /// code should operate on [`LogicalSchema`] directly rather than extracting the raw schema.
-    #[cfg(test)]
-    pub(crate) fn raw_schema(&self) -> &SchemaRef {
+    /// **Kernel callers should prefer not to use this method.** Instead, add methods to
+    /// [`LogicalSchema`] that encapsulate the business logic, so that column-mapping and
+    /// partition-column details remain in one place.
+    ///
+    /// TODO: audit existing callers and push logic into [`LogicalSchema`] to reduce raw access.
+    pub fn raw_schema(&self) -> &SchemaRef {
         &self.schema
     }
 
@@ -121,14 +123,6 @@ impl LogicalSchema {
     #[cfg(test)]
     pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
         self.schema.contains(name)
-    }
-
-    /// Returns the logical schema as a [`SchemaRef`] for use by FFI consumers.
-    // TODO: update FFI to expose LogicalSchema directly instead of extracting the underlying schema
-    // Note: this is public only for the FFI crate; all other callers should use raw_schema()
-    #[doc(hidden)]
-    pub fn raw_schema_for_ffi(&self) -> &SchemaRef {
-        &self.schema
     }
 
     /// Returns the logical schema as an owned [`DataType`] for use as an expression output type.
