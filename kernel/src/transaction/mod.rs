@@ -34,7 +34,7 @@ use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
+    ParquetWriterConfig, RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -915,6 +915,15 @@ impl<S> Transaction<S> {
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
 
+        // Derive parquet writer config from table properties
+        let compression = self
+            .read_snapshot
+            .table_configuration()
+            .table_properties()
+            .parquet_compression_codec
+            .unwrap_or_default();
+        let parquet_writer_config = ParquetWriterConfig { compression };
+
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
@@ -922,6 +931,7 @@ impl<S> Transaction<S> {
             Arc::new(logical_to_physical),
             column_mapping_mode,
             stats_columns,
+            parquet_writer_config,
         )
     }
 
@@ -1215,6 +1225,8 @@ pub struct WriteContext {
     column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
+    /// Parquet writer configuration derived from table properties.
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 impl WriteContext {
@@ -1225,6 +1237,7 @@ impl WriteContext {
         logical_to_physical: ExpressionRef,
         column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
+        parquet_writer_config: ParquetWriterConfig,
     ) -> Self {
         WriteContext {
             target_dir,
@@ -1233,6 +1246,7 @@ impl WriteContext {
             logical_to_physical,
             column_mapping_mode,
             stats_columns,
+            parquet_writer_config,
         }
     }
 
@@ -1262,6 +1276,13 @@ impl WriteContext {
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
         &self.stats_columns
+    }
+
+    /// Returns the Parquet writer configuration derived from table properties.
+    ///
+    /// Based on `delta.parquet.compression.codec` table property.
+    pub fn parquet_writer_config(&self) -> &ParquetWriterConfig {
+        &self.parquet_writer_config
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.
@@ -1422,12 +1443,14 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
+    use crate::table_properties::PARQUET_COMPRESSION_CODEC;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
     use crate::EvaluationHandler;
+    use crate::ParquetCompression;
     use crate::Snapshot;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -2151,6 +2174,45 @@ mod tests {
         for col in expected_partition_cols {
             assert!(rb.schema().fields().iter().any(|f| f.name() == *col));
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(None, ParquetCompression::Snappy)]
+    #[case(Some("zstd"), ParquetCompression::Zstd)]
+    fn test_write_context_parquet_compression(
+        #[case] codec: Option<&str>,
+        #[case] expected: ParquetCompression,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempfile::tempdir()?;
+        let engine = SyncEngine::new();
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let mut builder = create_table(
+            tempdir.path().to_str().expect("valid path"),
+            schema,
+            "test_engine",
+        );
+        if let Some(codec) = codec {
+            builder = builder.with_table_properties([(PARQUET_COMPRESSION_CODEC, codec)]);
+        }
+        let commit_result = builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+        assert!(
+            commit_result.is_committed(),
+            "table creation commit failed: {commit_result:?}"
+        );
+
+        let url = url::Url::from_directory_path(tempdir.path()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        assert_eq!(
+            txn.get_write_context().parquet_writer_config().compression,
+            expected
+        );
         Ok(())
     }
 }

@@ -38,6 +38,7 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::parquet::basic::Compression;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
@@ -50,7 +51,7 @@ use test_utils::{
     copy_directory, create_add_files_metadata, create_default_engine, create_table,
     create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
     read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
-    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
+    setup_test_tables, test_read, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 mod common;
@@ -1191,6 +1192,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            write_context.parquet_writer_config(),
         )
         .await?;
 
@@ -1365,6 +1367,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            write_context.parquet_writer_config(),
         )
         .await?;
 
@@ -3579,4 +3582,54 @@ async fn test_checkpoint_non_kernel_written_table() {
                 .is_some_and(|n| n.contains(".checkpoint.parquet"))
         });
     assert!(has_checkpoint, "Expected at least one checkpoint file");
+}
+
+#[rstest::rstest]
+#[case(None, Compression::SNAPPY)]
+#[case(Some("zstd"), Compression::ZSTD(Default::default()))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_uses_configured_compression(
+    #[case] codec: Option<&str>,
+    #[case] expected_compression: Compression,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let mut builder = create_table_txn(&table_path, schema, "test_engine");
+    if let Some(codec) = codec {
+        builder = builder.with_table_properties([("delta.parquet.compression.codec", codec)]);
+    }
+    let commit_result = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    assert!(
+        commit_result.is_committed(),
+        "table creation commit failed: {commit_result:?}"
+    );
+
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Find the checkpoint parquet file and verify its compression codec
+    let delta_log_path = std::path::Path::new(&table_path).join("_delta_log");
+    let checkpoint_file = std::fs::read_dir(&delta_log_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".checkpoint.parquet"))
+        })
+        .expect("checkpoint file not found")
+        .path();
+
+    let file = std::fs::File::open(&checkpoint_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let actual_compression = reader.metadata().row_group(0).column(0).compression();
+    assert_eq!(actual_compression, expected_compression);
+
+    Ok(())
 }

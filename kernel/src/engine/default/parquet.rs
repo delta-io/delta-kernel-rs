@@ -34,11 +34,23 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
+use crate::parquet::basic::Compression;
+use crate::parquet::file::properties::WriterProperties;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetCompression,
+    ParquetFooter, ParquetHandler, ParquetWriterConfig, PredicateRef,
 };
+
+pub(crate) fn build_writer_properties(config: &ParquetWriterConfig) -> WriterProperties {
+    let compression = match config.compression {
+        ParquetCompression::Snappy => Compression::SNAPPY,
+        ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
+    };
+    WriterProperties::builder()
+        .set_compression(compression)
+        .build()
+}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -161,6 +173,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
@@ -169,7 +182,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
+        let props = build_writer_properties(write_config);
+        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), Some(props))?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -217,9 +231,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
         stats_columns: Option<&[ColumnName]>,
+        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self
-            .write_parquet(path, data, stats_columns.unwrap_or(&[]))
+            .write_parquet(path, data, stats_columns.unwrap_or(&[]), write_config)
             .await?;
         parquet_metadata.as_record_batch(&partition_values)
     }
@@ -320,8 +335,10 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         location: url::Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
+        let props = build_writer_properties(write_config);
 
         self.task_executor.block_on(async move {
             let path = Path::from_url_path(location.path())?;
@@ -335,7 +352,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
-            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
+            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, Some(props))?;
 
             // Write the first batch
             writer.write(&first_record_batch).await?;
@@ -708,6 +725,53 @@ mod tests {
         assert_eq!(actual.record_batch(), &expected);
     }
 
+    #[rstest::rstest]
+    #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
+    #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
+    #[tokio::test]
+    async fn test_write_parquet_compression(
+        #[case] kernel_compression: ParquetCompression,
+        #[case] expected: Compression,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(data)));
+
+        let file_url = Url::parse("memory:///test/compression.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(
+                file_url.clone(),
+                data_iter,
+                &ParquetWriterConfig {
+                    compression: kernel_compression,
+                },
+            )
+            .unwrap();
+
+        // Read back the parquet metadata and verify the compression codec was applied
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store, path);
+        let metadata = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .metadata()
+            .clone();
+        let actual = metadata.row_group(0).column(0).compression();
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test]
     async fn test_write_parquet() {
         let store = Arc::new(InMemory::new());
@@ -723,7 +787,12 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -803,7 +872,12 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    &Default::default(),
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -838,7 +912,7 @@ mod tests {
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
+            .write_parquet_file(file_url.clone(), data_iter, &Default::default())
             .unwrap();
 
         // Verify we can read the file back
@@ -1027,7 +1101,7 @@ mod tests {
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
+            .write_parquet_file(file_url.clone(), data_iter, &Default::default())
             .unwrap();
 
         // Read it back
@@ -1216,7 +1290,7 @@ mod tests {
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter1)
+            .write_parquet_file(file_url.clone(), data_iter1, &Default::default())
             .unwrap();
 
         // Create second data set with different data
@@ -1232,7 +1306,7 @@ mod tests {
 
         // Overwrite with second file (overwrite=true)
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter2)
+            .write_parquet_file(file_url.clone(), data_iter2, &Default::default())
             .unwrap();
 
         // Read back and verify it contains the second data set
@@ -1296,7 +1370,7 @@ mod tests {
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter1)
+            .write_parquet_file(file_url.clone(), data_iter1, &Default::default())
             .unwrap();
 
         // Create second data set
@@ -1312,7 +1386,7 @@ mod tests {
 
         // Write again - should overwrite successfully (new behavior always overwrites)
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter2)
+            .write_parquet_file(file_url.clone(), data_iter2, &Default::default())
             .unwrap();
 
         // Verify the file was overwritten with the new data

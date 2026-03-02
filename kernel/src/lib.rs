@@ -663,6 +663,26 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
+/// Compression codec to use when writing Parquet files.
+///
+/// String parsing is case-insensitive.
+#[derive(Debug, strum::EnumString, Clone, Copy, PartialEq, Eq, Default)]
+#[strum(ascii_case_insensitive)]
+pub enum ParquetCompression {
+    /// Snappy compression (default).
+    #[default]
+    Snappy,
+    /// Zstandard compression.
+    Zstd,
+}
+
+/// Configuration for writing Parquet files.
+#[derive(Debug, Clone, Default)]
+pub struct ParquetWriterConfig {
+    /// Compression codec to use. Defaults to [`ParquetCompression::Snappy`].
+    pub compression: ParquetCompression,
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -801,17 +821,17 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Write data to a Parquet file at the specified URL.
-    ///
-    /// This method writes the provided `data` to a Parquet file at the given `url`.
+    /// Write data to a Parquet file at the specified location.
     ///
     /// This will overwrite the file if it already exists.
     ///
     /// # Parameters
     ///
-    /// - `url` - The full URL path where the Parquet file should be written
+    /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
+    /// - `write_config` - Configuration controlling how the Parquet file is written (e.g.
+    ///   compression codec).
     ///
     /// # Returns
     ///
@@ -820,6 +840,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
