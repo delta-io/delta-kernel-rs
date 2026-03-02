@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,12 +18,26 @@ use crate::expressions::{
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::expressions::transforms::ExpressionTransform;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, Snapshot};
 
 use super::*;
+
+/// Blindly prefixes all column references with a fixed path.
+/// Safe to use in tests where all column refs come from [`as_checkpoint_skipping_predicate`],
+/// which only ever produces stat column references.
+struct PrefixAll {
+    prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixAll {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Owned(self.prefix.join(name)))
+    }
+}
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
 macro_rules! get_column {
@@ -760,22 +775,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 }
 
 #[test]
-fn test_prefix_columns_simple() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A simple binary predicate: x > 100
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
-
-    // The column reference should now be add.stats_parsed.x
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
-}
-
-#[test]
-fn test_build_actions_meta_predicate_with_predicate() {
+fn test_build_user_predicate_with_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
@@ -789,29 +789,30 @@ fn test_build_actions_meta_predicate_with_predicate() {
         .build()
         .unwrap();
 
-    let meta_pred = scan.build_actions_meta_predicate();
+    let user_pred = scan.build_user_predicate();
     assert!(
-        meta_pred.is_some(),
-        "Should produce an actions meta predicate for a data-skipping-eligible predicate"
+        user_pred.is_some(),
+        "Should produce a user predicate for a data-skipping-eligible predicate"
     );
 
-    // Verify all column references are prefixed with add.stats_parsed
-    let pred = meta_pred.unwrap();
-    for col_ref in pred.references() {
-        let path: Vec<_> = col_ref.iter().collect();
-        assert_eq!(
-            path[0], "add",
-            "Column reference should start with 'add': {col_ref}"
-        );
-        assert_eq!(
-            path[1], "stats_parsed",
-            "Column reference should have 'stats_parsed' as second element: {col_ref}"
-        );
-    }
+    // Verify the predicate references the physical data column (id), not prefixed stats columns
+    let up = user_pred.unwrap();
+    let refs: Vec<_> = up.predicate.references().into_iter().collect();
+    assert_eq!(refs.len(), 1, "Predicate should reference exactly one column");
+    assert_eq!(
+        refs[0].to_string(),
+        "id",
+        "Predicate should reference the physical data column 'id'"
+    );
+    // Partition columns for the parsed-stats table should be empty
+    assert!(
+        up.partition_columns.is_empty(),
+        "parsed-stats table has no partition columns"
+    );
 }
 
 #[test]
-fn test_build_actions_meta_predicate_no_predicate() {
+fn test_build_user_predicate_no_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
@@ -821,20 +822,20 @@ fn test_build_actions_meta_predicate_no_predicate() {
     let scan = snapshot.scan_builder().build().unwrap();
 
     assert!(
-        scan.build_actions_meta_predicate().is_none(),
+        scan.build_user_predicate().is_none(),
         "Should return None when there is no predicate"
     );
 }
 
 #[test]
-fn test_build_actions_meta_predicate_static_skip_all() {
+fn test_build_user_predicate_static_skip_all() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
     // A predicate that statically evaluates to false should produce StaticSkipAll,
-    // which means build_actions_meta_predicate returns None.
+    // which means build_user_predicate returns None.
     let predicate = Arc::new(Pred::literal(false));
     let scan = snapshot
         .scan_builder()
@@ -843,7 +844,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         .unwrap();
 
     assert!(
-        scan.build_actions_meta_predicate().is_none(),
+        scan.build_user_predicate().is_none(),
         "StaticSkipAll predicate should return None"
     );
 }
@@ -961,7 +962,7 @@ impl CheckpointParquetBuilder {
 /// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
-    let mut prefixer = PrefixColumns {
+    let mut prefixer = PrefixAll {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
     Some(

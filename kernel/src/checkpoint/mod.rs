@@ -303,10 +303,10 @@ impl CheckpointWriter {
         let read_schema = build_checkpoint_read_schema_with_stats(base_schema, &stats_schema)?;
 
         // Read actions from log segment
-        let actions =
-            self.snapshot
-                .log_segment()
-                .read_actions(engine, read_schema.clone(), None)?;
+        let actions = self
+            .snapshot
+            .log_segment()
+            .read_actions(engine, read_schema.clone())?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
