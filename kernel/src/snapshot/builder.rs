@@ -3,7 +3,8 @@ use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
-use crate::{try_parse_uri, DeltaResult, Engine, Error, Snapshot, Version};
+use crate::utils::try_parse_uri;
+use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use tracing::{info, instrument};
 
