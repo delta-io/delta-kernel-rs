@@ -417,7 +417,7 @@ mod tests {
 
         // Check logical schema matches projection
         assert_eq!(
-            scan.state_info.schema.logical_schema_for_ffi().as_ref(),
+            scan.state_info.schema.logical_schema().as_ref(),
             &StructType::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),
