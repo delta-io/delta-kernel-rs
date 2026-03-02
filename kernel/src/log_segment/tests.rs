@@ -159,7 +159,7 @@ pub(crate) async fn add_checkpoint_to_store(
     write_parquet_to_store(store, path, data).await
 }
 
-/// Writes all actions to a _delta_log/_sidecars file in the store and return the FileMeta
+/// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
 /// This function formats the provided filename into the _sidecars subdirectory.
 async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
