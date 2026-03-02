@@ -18,6 +18,7 @@
 10. Distributed Log Replay serialization/deserialization ([#1503])
 11. Introduce Deduplicator trait to unify mutable and immutable deduplication ([#1537])
 12. Add ffi api to perform a checkpoint ([#1619])
+   - No migration needed. This adds a new api in ffi supporting all-in-one checkpointing.
 13. Add stats_columns to ParquetHandler ([#1668])
 14. Add StatisticsCollector core with numRecords ([#1662])
 15. Return updated Snapshot from `Snapshot::publish` ([#1694])
@@ -29,7 +30,9 @@
 21. Add tracing instrumentation to transaction and snapshot operations ([#1772])
 22. Checkpoint and sidecar row group skipping via stats_parsed ([#1853])
 23. Use physical stats column names in `WriteContext` ([#1836])
+   - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
 24. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
+   - `WriteContext.physical_schema` now respects column mapping, and retains partition columns when `materializePartitionColumns` is enabled. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
 25. Use CRC for In-Commit-Timestamp reading ([#1806])
 26. Implement the read metadata workload runner ([#1919])
    - No migration needed; this introduces new benchmarking infrastructure not yet used anywhere
