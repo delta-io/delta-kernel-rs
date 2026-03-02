@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::borrow::Cow;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -11,7 +12,7 @@ use crate::actions::{
     SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::expressions::transforms::ExpressionTransform;
-use crate::scan::data_skipping::{as_checkpoint_skipping_predicate, PrefixColumns};
+use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -143,6 +144,24 @@ pub(crate) struct LogSegment {
     /// [LogSegment::ascending_commit_files] if there is a catalog commit present for the same
     /// version that took priority over it.
     pub max_published_version: Option<Version>,
+}
+
+/// Renames only the four known stat-column roots in a checkpoint skipping predicate by prepending
+/// `stats_path`. For example, `minValues.x > 100` becomes `add.stats_parsed.minValues.x > 100`.
+/// Returns `None` for any column whose root is not in `{minValues, maxValues, nullCount, numRecords}`,
+/// which causes `transform_pred` to conservatively drop that predicate.
+struct RenameStatColumns {
+    stats_path: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for RenameStatColumns {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        matches!(
+            name.path().first().map(String::as_str),
+            Some("minValues" | "maxValues" | "nullCount" | "numRecords")
+        )
+        .then(|| Cow::Owned(self.stats_path.join(name)))
+    }
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
@@ -576,9 +595,9 @@ impl LogSegment {
                 stats_schema.zip(user_predicate).and_then(|(_, up)| {
                     let skipping =
                         as_checkpoint_skipping_predicate(&up.predicate, &up.partition_columns)?;
-                    let mut prefixer =
-                        PrefixColumns { prefix: ColumnName::new(["add", "stats_parsed"]) };
-                    Some(Arc::new(prefixer.transform_pred(&skipping)?.into_owned()))
+                    let mut renamer =
+                        RenameStatColumns { stats_path: ColumnName::new(["add", "stats_parsed"]) };
+                    Some(Arc::new(renamer.transform_pred(&skipping)?.into_owned()))
                 })
             } else {
                 None

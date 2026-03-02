@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,12 +18,26 @@ use crate::expressions::{
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::{as_checkpoint_skipping_predicate, PrefixColumns};
+use crate::expressions::transforms::ExpressionTransform;
+use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, Snapshot};
 
 use super::*;
+
+/// Blindly prefixes all column references with a fixed path.
+/// Safe to use in tests where all column refs come from [`as_checkpoint_skipping_predicate`],
+/// which only ever produces stat column references.
+struct PrefixAll {
+    prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixAll {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Owned(self.prefix.join(name)))
+    }
+}
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
 macro_rules! get_column {
@@ -760,21 +775,6 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 }
 
 #[test]
-fn test_prefix_columns_simple() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A simple binary predicate: x > 100
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
-
-    // The column reference should now be add.stats_parsed.x
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
-}
-
-#[test]
 fn test_build_user_predicate_with_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
@@ -962,7 +962,7 @@ impl CheckpointParquetBuilder {
 /// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
-    let mut prefixer = PrefixColumns {
+    let mut prefixer = PrefixAll {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
     Some(

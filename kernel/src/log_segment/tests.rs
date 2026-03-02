@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -25,6 +26,8 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
     sidecar_batch_with_given_paths_and_sizes,
 };
+use crate::expressions::{column_expr, column_name, ColumnName, Expression as Expr, Predicate as Pred};
+use crate::expressions::transforms::ExpressionTransform;
 use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
@@ -36,6 +39,7 @@ use test_utils::{
 };
 
 use super::*;
+use super::RenameStatColumns;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::ParquetHandler;
@@ -3236,4 +3240,43 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         case.through_compactions
     );
     assert_eq!(through.checkpoint_version, case.checkpoint);
+}
+
+#[test]
+fn test_rename_stat_columns() {
+    let stats_path = ColumnName::new(["add", "stats_parsed"]);
+
+    // Known stat column roots are renamed with the stats_path prefix.
+    for root in ["minValues", "maxValues", "nullCount", "numRecords"] {
+        let col_name = format!("{root}.x");
+        let pred = Pred::gt(
+            Expr::column(ColumnName::new([root, "x"])),
+            Expr::literal(100i64),
+        );
+        let mut renamer = RenameStatColumns { stats_path: stats_path.clone() };
+        let result = renamer.transform_pred(&pred).unwrap().into_owned();
+        let refs: Vec<_> = result.references().into_iter().collect();
+        assert_eq!(refs.len(), 1, "expected one ref for {col_name}");
+        assert_eq!(
+            *refs[0],
+            ColumnName::new(["add", "stats_parsed", root, "x"]),
+            "wrong rename for {col_name}"
+        );
+    }
+
+    // Unknown column roots return None from transform_pred (conservative drop).
+    let unknown_pred = Pred::gt(column_expr!("unknownRoot.x"), Expr::literal(100i64));
+    let mut renamer = RenameStatColumns { stats_path: stats_path.clone() };
+    assert!(
+        renamer.transform_pred(&unknown_pred).is_none(),
+        "unknown root should return None"
+    );
+
+    // Top-level numRecords (no sub-column) is also recognized.
+    let pred = Pred::gt(column_expr!("numRecords"), Expr::literal(0i64));
+    let mut renamer = RenameStatColumns { stats_path: stats_path.clone() };
+    let result = renamer.transform_pred(&pred).unwrap().into_owned();
+    let refs: Vec<_> = result.references().into_iter().collect();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(*refs[0], column_name!("add.stats_parsed.numRecords"));
 }
