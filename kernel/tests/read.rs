@@ -320,7 +320,7 @@ fn read_with_execute(
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result_schema = Arc::new(ArrowSchema::try_from_kernel(
-        scan.logical_schema().as_ref(),
+        scan.table_schema().logical_schema_for_ffi().as_ref(),
     )?);
     let batches = read_scan(scan, engine)?;
 
@@ -344,7 +344,7 @@ fn read_with_scan_metadata(
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result_schema = Arc::new(ArrowSchema::try_from_kernel(
-        scan.logical_schema().as_ref(),
+        scan.table_schema().logical_schema_for_ffi().as_ref(),
     )?);
     let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];

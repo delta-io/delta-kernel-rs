@@ -1226,11 +1226,6 @@ impl WriteContext {
         &self.schema
     }
 
-    #[cfg(test)]
-    pub fn logical_schema(&self) -> &SchemaRef {
-        self.schema.logical_schema_for_ffi()
-    }
-
     pub fn physical_schema(&self) -> &SchemaRef {
         &self.physical_schema
     }
@@ -1594,12 +1589,11 @@ mod tests {
             .with_engine_info("default engine");
 
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
         // Logical schema should include the partition column
         assert!(
-            logical_schema.contains("letter"),
+            write_context.table_schema().contains("letter"),
             "Logical schema should contain partition column 'letter'"
         );
 
@@ -1611,7 +1605,7 @@ mod tests {
 
         // Both should contain the non-partition columns
         assert!(
-            logical_schema.contains("number"),
+            write_context.table_schema().contains("number"),
             "Logical schema should contain data column 'number'"
         );
 
@@ -1643,13 +1637,12 @@ mod tests {
         wc: &WriteContext,
         batch: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-        let logical_schema = wc.logical_schema();
         let physical_schema = wc.physical_schema();
         let l2p = wc.logical_to_physical();
 
         let handler = ArrowEvaluationHandler;
         let evaluator = handler.new_expression_evaluator(
-            logical_schema.clone(),
+            wc.table_schema().logical_schema().clone(),
             l2p,
             physical_schema.clone().into(),
         )?;
@@ -2046,7 +2039,7 @@ mod tests {
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
         crate::utils::test_utils::validate_physical_schema_column_mapping(
-            write_context.logical_schema(),
+            write_context.table_schema().logical_schema(),
             write_context.physical_schema(),
             mode,
         );
@@ -2131,7 +2124,7 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.logical_schema();
+        let logical_schema = write_context.table_schema().logical_schema();
         let physical_schema = write_context.physical_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
 
@@ -2190,7 +2183,12 @@ mod tests {
         use crate::arrow::array::Float64Array;
         let (_snap, wc) = snapshot_and_write_context(table_path)?;
         let batch = RecordBatch::try_new(
-            Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
+            Arc::new(
+                wc.table_schema()
+                    .logical_schema()
+                    .as_ref()
+                    .try_into_arrow()?,
+            ),
             vec![
                 Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![42])),

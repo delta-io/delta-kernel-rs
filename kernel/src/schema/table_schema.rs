@@ -108,8 +108,22 @@ impl TableSchema {
         })
     }
 
+    /// Returns the logical schema.
+    #[cfg(test)]
+    pub(crate) fn logical_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Returns `true` if the logical schema contains a top-level field with the given name.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
+        self.schema.contains(name)
+    }
+
     /// Returns the logical schema as a [`SchemaRef`] for use by FFI consumers.
     // TODO: update FFI to expose TableSchema directly instead of extracting the underlying schema
+    // Note: this is public only for the FFI crate; all other callers should use logical_schema()
+    #[doc(hidden)]
     pub fn logical_schema_for_ffi(&self) -> &SchemaRef {
         &self.schema
     }

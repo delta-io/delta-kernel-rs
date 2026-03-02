@@ -178,7 +178,9 @@ async fn latest_snapshot_test(
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
-    let schema = Arc::new(Schema::try_from_kernel(scan.logical_schema().as_ref())?);
+    let schema = Arc::new(Schema::try_from_kernel(
+        scan.table_schema().logical_schema_for_ffi().as_ref(),
+    )?);
     let result = concat_batches(&schema, &batches)?;
     let result = sort_record_batch(result)?;
     let expected = sort_record_batch(expected)?;

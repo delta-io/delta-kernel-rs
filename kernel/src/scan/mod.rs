@@ -851,8 +851,7 @@ impl Scan {
 
         debug!(
             "Executing scan with table schema {:#?} and physical schema {:#?}",
-            self.state_info.schema,
-            self.state_info.physical_schema
+            self.state_info.schema, self.state_info.physical_schema
         );
 
         let table_root = self.snapshot.table_root().clone();
