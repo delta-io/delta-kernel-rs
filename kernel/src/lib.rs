@@ -663,6 +663,27 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
+/// Data-skipping and filtering semantics can change depending on whether a file contains data
+/// or metadata about a table. This enum conveys to the engine how the predicate should apply.
+#[derive(Clone, Debug, Default)]
+pub enum FilePredicate {
+    /// No row group filtering.
+    #[default]
+    None,
+    /// Predicate for data files. Row-group pruning maps directly to the parquet columns
+    /// referenced. Example: the predicate `x > 10` keeps a row-group if `rowgroup.x.max > 10`
+    /// is true or null.
+    Data(PredicateRef),
+}
+
+impl FilePredicate {
+    /// Creates a `FilePredicate` from an optional predicate. Returns `Data(pred)` if `Some`,
+    /// or `None` if the predicate is absent.
+    pub fn data(predicate: Option<PredicateRef>) -> Self {
+        predicate.map_or(Self::None, Self::Data)
+    }
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -770,7 +791,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Specifies how row group filtering should be applied.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
@@ -798,7 +819,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
+        predicate: FilePredicate,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
     /// Write data to a Parquet file at the specified URL.

@@ -16,8 +16,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, Error, FileMeta, PredicateRef, RowVisitor, StorageHandler, Version,
-    PRE_COMMIT_VERSION,
+    DeltaResult, Engine, Error, FileMeta, FilePredicate, PredicateRef, RowVisitor, StorageHandler,
+    Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -490,7 +490,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
+        meta_predicate: FilePredicate,
         stats_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
@@ -511,7 +511,7 @@ impl LogSegment {
         })
     }
 
-    // Same as above, but uses the same schema for reading checkpoints and commits.
+    /// The `meta_predicate` is treated as a standard row group filter (not checkpoint-aware).
     #[internal_api]
     pub(crate) fn read_actions(
         &self,
@@ -523,7 +523,7 @@ impl LogSegment {
             engine,
             action_schema.clone(),
             action_schema,
-            meta_predicate,
+            FilePredicate::data(meta_predicate),
             None,
         )?;
         Ok(result.actions)
@@ -680,7 +680,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
+        meta_predicate: FilePredicate,
         stats_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
@@ -769,10 +769,11 @@ impl LogSegment {
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
+                // The default JSON handler doesn't support predicate pushdown, so pass None.
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    None,
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
@@ -839,7 +840,7 @@ impl LogSegment {
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&checkpoint.location),
                 Self::sidecar_read_schema(),
-                None,
+                FilePredicate::None,
             )?,
             _ => return Ok(vec![]),
         };

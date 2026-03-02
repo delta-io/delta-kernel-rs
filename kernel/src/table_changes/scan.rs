@@ -10,7 +10,7 @@ use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, FilePredicate, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
@@ -265,10 +265,11 @@ fn read_scan_file(
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
-    let read_result_iter =
-        engine
-            .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+    let read_result_iter = engine.parquet_handler().read_parquet_files(
+        &[file],
+        physical_schema,
+        FilePredicate::None,
+    )?;
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
