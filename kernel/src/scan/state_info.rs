@@ -7,7 +7,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{SchemaRef, TableSchema, TableSchemaRef};
+use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::TransformSpec;
 use crate::{DeltaResult, Error, PredicateRef};
@@ -16,7 +16,7 @@ use crate::{DeltaResult, Error, PredicateRef};
 #[derive(Debug, Clone)]
 pub(crate) struct StateInfo {
     /// The logical schema, column mapping mode, and partition columns for this scan
-    pub(crate) schema: TableSchemaRef,
+    pub(crate) schema: LogicalSchemaRef,
     /// The physical read schema computed from the logical schema
     pub(crate) physical_schema: SchemaRef,
     /// The physical predicate for data skipping
@@ -42,7 +42,7 @@ impl StateInfo {
     /// `stats_columns` - Optional list of columns to include in parsed stats output
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        schema: TableSchema,
+        schema: LogicalSchema,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         stats_columns: Option<Vec<ColumnName>>,
@@ -193,7 +193,7 @@ pub(crate) mod tests {
             );
         }
 
-        let logical_schema = TableSchema::new(schema, &table_configuration);
+        let logical_schema = LogicalSchema::new(schema, &table_configuration);
         StateInfo::try_new(
             logical_schema,
             &table_configuration,
@@ -255,7 +255,7 @@ pub(crate) mod tests {
         assert!(state_info.transform_spec.is_none());
 
         // Physical schema should match logical schema
-        assert_eq!(state_info.schema.logical_schema(), &schema);
+        assert_eq!(state_info.schema.raw_schema(), &schema);
         assert_eq!(state_info.physical_schema.fields().len(), 2);
 
         // No predicate
@@ -295,7 +295,7 @@ pub(crate) mod tests {
         }
 
         // Physical schema should not include partition column
-        assert_eq!(state_info.schema.logical_schema(), &schema);
+        assert_eq!(state_info.schema.raw_schema(), &schema);
         assert_eq!(state_info.physical_schema.fields().len(), 2); // Only id and value
     }
 

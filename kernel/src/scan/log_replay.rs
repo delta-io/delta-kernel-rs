@@ -20,7 +20,7 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{
-    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType, TableSchemaRef,
+    ColumnNamesAndTypes, DataType, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType,
 };
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct InternalScanState {
-    schema: TableSchemaRef,
+    schema: LogicalSchemaRef,
     physical_schema: SchemaRef,
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
@@ -828,7 +828,7 @@ mod tests {
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType, TableSchema};
+    use crate::schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::DeltaResult;
@@ -930,7 +930,7 @@ mod tests {
         let batch = vec![add_batch_simple(get_commit_schema().clone())];
         let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
         let state_info = Arc::new(StateInfo {
-            schema: TableSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None),
+            schema: LogicalSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None),
             physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
@@ -1123,8 +1123,8 @@ mod tests {
 
         // Verify StateInfo fields preserved
         assert_eq!(
-            deserialized.state_info.schema.logical_schema(),
-            state_info.schema.logical_schema()
+            deserialized.state_info.schema.raw_schema(),
+            state_info.schema.raw_schema()
         );
         assert_eq!(
             deserialized.state_info.physical_schema,
@@ -1257,7 +1257,7 @@ mod tests {
                 true,
             )]));
             let state_info = Arc::new(StateInfo {
-                schema: TableSchema::new_for_test(schema.clone(), mode),
+                schema: LogicalSchema::new_for_test(schema.clone(), mode),
                 physical_schema: schema.clone(),
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
@@ -1288,7 +1288,7 @@ mod tests {
             true,
         )]));
         let state_info = Arc::new(StateInfo {
-            schema: TableSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
@@ -1331,7 +1331,7 @@ mod tests {
         )]));
         let checkpoint_info = test_checkpoint_info();
         let invalid_internal_state = InternalScanState {
-            schema: TableSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None, // Missing!
             transform_spec: None,
@@ -1362,7 +1362,7 @@ mod tests {
             true,
         )]));
         let invalid_internal_state = InternalScanState {
-            schema: TableSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None,
             transform_spec: None,

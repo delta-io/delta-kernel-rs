@@ -375,7 +375,7 @@ fn read_with_scan_metadata(
                 engine,
                 read_result,
                 scan.physical_schema(),
-                scan.table_schema(),
+                scan.logical_schema(),
                 scan_file.transform.clone(),
             )
             .unwrap();

@@ -10,7 +10,7 @@ use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
-use delta_kernel::schema::{SchemaRef, TableSchemaRef};
+use delta_kernel::schema::{LogicalSchemaRef, SchemaRef};
 use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
@@ -72,7 +72,7 @@ fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
 struct ScanState {
     table_root: Url,
     physical_schema: SchemaRef,
-    table_schema: TableSchemaRef,
+    logical_schema: LogicalSchemaRef,
 }
 
 fn try_main() -> DeltaResult<()> {
@@ -114,7 +114,7 @@ fn try_main() -> DeltaResult<()> {
             let scan_state = Arc::new(ScanState {
                 table_root: scan.table_root().clone(),
                 physical_schema: scan.physical_schema().clone(),
-                table_schema: scan.table_schema().clone(),
+                logical_schema: scan.logical_schema().clone(),
             });
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
@@ -208,7 +208,7 @@ fn do_work(
                 engine,
                 read_result,
                 &scan_state.physical_schema,
-                &scan_state.table_schema,
+                &scan_state.logical_schema,
                 scan_file.transform.clone(),
             )
             .unwrap();

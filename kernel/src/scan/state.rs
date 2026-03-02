@@ -10,7 +10,7 @@ use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
-    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, TableSchema},
+    schema::{ColumnName, ColumnNamesAndTypes, DataType, LogicalSchema, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
@@ -96,7 +96,7 @@ pub fn transform_to_logical(
     engine: &dyn Engine,
     physical_data: Box<dyn EngineData>,
     physical_schema: &SchemaRef,
-    table_schema: &TableSchema,
+    table_schema: &LogicalSchema,
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {

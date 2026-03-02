@@ -185,7 +185,7 @@ pub unsafe extern "C" fn scan_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
-    scan.table_schema().logical_schema_for_ffi().clone().into()
+    scan.logical_schema().raw_schema_for_ffi().clone().into()
 }
 
 /// Get the kernel view of the physical read schema that an engine should read from parquet file in

@@ -9,7 +9,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{SchemaRef, TableSchema, TableSchemaRef};
+use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
 use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
@@ -115,7 +115,7 @@ impl TableChangesScanBuilder {
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats_columns
         let table_config = self.table_changes.end_snapshot.table_configuration();
-        let schema = TableSchema::new(logical_schema, table_config);
+        let schema = LogicalSchema::new(logical_schema, table_config);
         let state_info = StateInfo::try_new(
             schema,
             table_config,
@@ -167,9 +167,9 @@ impl TableChangesScan {
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
     ///
     /// [`Schema`]: crate::schema::Schema
-    /// Returns the [`TableSchema`] for this scan, which bundles the logical schema together with
+    /// Returns the [`LogicalSchema`] for this scan, which bundles the logical schema together with
     /// column mapping mode and partition columns.
-    pub fn table_schema(&self) -> &TableSchemaRef {
+    pub fn logical_schema(&self) -> &LogicalSchemaRef {
         &self.state_info.schema
     }
 
@@ -417,7 +417,7 @@ mod tests {
 
         // Check logical schema matches projection
         assert_eq!(
-            scan.state_info.schema.logical_schema().as_ref(),
+            scan.state_info.schema.raw_schema().as_ref(),
             &StructType::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),

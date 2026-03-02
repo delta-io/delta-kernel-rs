@@ -28,7 +28,7 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::{
-    ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, TableSchema,
+    ArrayType, LogicalSchema, MapType, SchemaRef, StructField, StructType, StructTypeBuilder,
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
@@ -895,7 +895,7 @@ impl<S> Transaction<S> {
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
-        let schema = TableSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
+        let schema = LogicalSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
         let physical_schema = schema.compute_write_physical_schema(materialize_partition_columns);
 
         // Get stats columns from table configuration
@@ -1194,7 +1194,7 @@ impl<S> Transaction<S> {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    schema: TableSchema,
+    schema: LogicalSchema,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
     /// Column names that should have statistics collected during writes.
@@ -1204,7 +1204,7 @@ pub struct WriteContext {
 impl WriteContext {
     fn new(
         target_dir: Url,
-        schema: TableSchema,
+        schema: LogicalSchema,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
         stats_columns: Vec<ColumnName>,
@@ -1222,7 +1222,7 @@ impl WriteContext {
         &self.target_dir
     }
 
-    pub fn table_schema(&self) -> &TableSchema {
+    pub fn logical_schema(&self) -> &LogicalSchema {
         &self.schema
     }
 
@@ -1593,7 +1593,7 @@ mod tests {
 
         // Logical schema should include the partition column
         assert!(
-            write_context.table_schema().contains("letter"),
+            write_context.logical_schema().contains("letter"),
             "Logical schema should contain partition column 'letter'"
         );
 
@@ -1605,7 +1605,7 @@ mod tests {
 
         // Both should contain the non-partition columns
         assert!(
-            write_context.table_schema().contains("number"),
+            write_context.logical_schema().contains("number"),
             "Logical schema should contain data column 'number'"
         );
 
@@ -1642,7 +1642,7 @@ mod tests {
 
         let handler = ArrowEvaluationHandler;
         let evaluator = handler.new_expression_evaluator(
-            wc.table_schema().logical_schema().clone(),
+            wc.logical_schema().raw_schema().clone(),
             l2p,
             physical_schema.clone().into(),
         )?;
@@ -2039,7 +2039,7 @@ mod tests {
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
         crate::utils::test_utils::validate_physical_schema_column_mapping(
-            write_context.table_schema().logical_schema(),
+            write_context.logical_schema().raw_schema(),
             write_context.physical_schema(),
             mode,
         );
@@ -2124,7 +2124,7 @@ mod tests {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.table_schema().logical_schema();
+        let logical_schema = write_context.logical_schema().raw_schema();
         let physical_schema = write_context.physical_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
 
@@ -2183,12 +2183,7 @@ mod tests {
         use crate::arrow::array::Float64Array;
         let (_snap, wc) = snapshot_and_write_context(table_path)?;
         let batch = RecordBatch::try_new(
-            Arc::new(
-                wc.table_schema()
-                    .logical_schema()
-                    .as_ref()
-                    .try_into_arrow()?,
-            ),
+            Arc::new(wc.logical_schema().raw_schema().as_ref().try_into_arrow()?),
             vec![
                 Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![42])),

@@ -11,7 +11,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform};
-use crate::schema::{DataType, StructType, TableSchema};
+use crate::schema::{DataType, LogicalSchema, StructType};
 use crate::{DeltaResult, Error};
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
@@ -67,7 +67,7 @@ pub(crate) enum FieldTransformSpec {
 /// Parse a single partition value from the raw string representation
 pub(crate) fn parse_partition_value(
     field_idx: usize,
-    schema: &TableSchema,
+    schema: &LogicalSchema,
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<(usize, (String, Scalar))> {
     let (physical_name, data_type) = schema
@@ -84,7 +84,7 @@ pub(crate) fn parse_partition_value(
 
 /// Parse all partition values from a transform spec.
 pub(crate) fn parse_partition_values(
-    schema: &TableSchema,
+    schema: &LogicalSchema,
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
@@ -217,7 +217,7 @@ mod tests {
     // Tests for parse_partition_value function
     #[test]
     fn test_parse_partition_value_invalid_index() {
-        let schema = TableSchema::new_for_test(
+        let schema = LogicalSchema::new_for_test(
             Arc::new(StructType::new_unchecked(vec![StructField::nullable(
                 "col1",
                 DataType::STRING,
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn parse_partition_value_none_mode() {
         // field 1 is "name" (STRING)
-        let schema = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let schema = LogicalSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
         let map = [("name".to_string(), "alice".to_string())].into();
         let (idx, (physical_name, scalar)) = parse_partition_value(1, &schema, &map).unwrap();
         assert_eq!(idx, 1);
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn parse_partition_value_name_mode_uses_physical_name() {
         // field 0 is "id" → physical "phys_id"
-        let schema = TableSchema::new_for_test(
+        let schema = LogicalSchema::new_for_test(
             test_schema_flat_with_column_mapping(),
             ColumnMappingMode::Name,
         );
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn parse_partition_value_null_when_absent() {
-        let schema = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let schema = LogicalSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
         let map = HashMap::new(); // value not present → null
         let (_, (_, scalar)) = parse_partition_value(1, &schema, &map).unwrap();
         assert!(scalar.is_null());
@@ -266,7 +266,7 @@ mod tests {
     // Tests for parse_partition_values function
     #[test]
     fn test_parse_partition_values_mixed_transforms() {
-        let schema = TableSchema::new_for_test(
+        let schema = LogicalSchema::new_for_test(
             Arc::new(StructType::new_unchecked(vec![
                 StructField::nullable("id", DataType::STRING),
                 StructField::nullable("age", DataType::LONG),
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_parse_partition_values_empty_spec() {
-        let schema = TableSchema::new_for_test(
+        let schema = LogicalSchema::new_for_test(
             Arc::new(StructType::new_unchecked(vec![])),
             ColumnMappingMode::None,
         );

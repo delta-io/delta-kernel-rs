@@ -222,8 +222,8 @@ pub unsafe extern "C" fn table_changes_scan_logical_schema(
 ) -> Handle<SharedSchema> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     table_changes_scan
-        .table_schema()
-        .logical_schema_for_ffi()
+        .logical_schema()
+        .raw_schema_for_ffi()
         .clone()
         .into()
 }

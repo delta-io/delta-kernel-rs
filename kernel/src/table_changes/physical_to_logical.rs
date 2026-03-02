@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::schema::{DataType, SchemaRef, StructField, StructType, TableSchema};
+use crate::schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -14,7 +14,7 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 /// This function directly looks up CDF columns in the schema and generates their values
 /// based on the scan file metadata, returning an iterator over the metadata.
 fn get_cdf_columns(
-    schema: &TableSchema,
+    schema: &LogicalSchema,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
     // Handle _change_type
@@ -130,7 +130,7 @@ mod tests {
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType, TableSchema};
+    use crate::schema::{DataType, LogicalSchema, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
@@ -178,7 +178,7 @@ mod tests {
     ) -> StateInfo {
         let physical_schema: SchemaRef = create_test_physical_schema().into();
         StateInfo {
-            schema: TableSchema::new_for_test(logical_schema, ColumnMappingMode::None),
+            schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
             physical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
@@ -398,7 +398,7 @@ mod tests {
         let transform_spec = vec![];
 
         let state_info = StateInfo {
-            schema: TableSchema::new_for_test(logical_schema, ColumnMappingMode::None),
+            schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),

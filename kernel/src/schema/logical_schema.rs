@@ -1,4 +1,4 @@
-//! [`TableSchema`] bundles a logical schema, column mapping mode, partition columns,
+//! [`LogicalSchema`] bundles a logical schema, column mapping mode, partition columns,
 //! and materialized row ID column together under a single named type.
 
 use std::borrow::Cow;
@@ -64,15 +64,15 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
 /// Bundles a logical schema, column mapping mode, partition columns,
 /// and materialized row ID column for read and write schema computation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TableSchema {
+pub struct LogicalSchema {
     schema: SchemaRef,
     column_mapping_mode: ColumnMappingMode,
     partition_columns: Vec<String>,
     materialized_row_id_col: Option<String>,
 }
 
-impl TableSchema {
-    /// Create a new [`TableSchema`] from a logical schema and table configuration.
+impl LogicalSchema {
+    /// Create a new [`LogicalSchema`] from a logical schema and table configuration.
     pub(crate) fn new(schema: SchemaRef, table_config: &TableConfiguration) -> Self {
         let column_mapping_mode = table_config.column_mapping_mode();
         let partition_columns = table_config.partition_columns().to_vec();
@@ -94,7 +94,7 @@ impl TableSchema {
         }
     }
 
-    /// Create a new [`TableSchemaRef`] for testing, without table configuration.
+    /// Create a new [`LogicalSchemaRef`] for testing, without table configuration.
     #[cfg(test)]
     pub(crate) fn new_for_test(
         schema: SchemaRef,
@@ -110,10 +110,10 @@ impl TableSchema {
 
     /// Returns the underlying logical schema.
     ///
-    /// Test-only: [`TableSchema`] is the intended abstraction for the logical schema; production
-    /// code should operate on [`TableSchema`] directly rather than extracting the raw schema.
+    /// Test-only: [`LogicalSchema`] is the intended abstraction for the logical schema; production
+    /// code should operate on [`LogicalSchema`] directly rather than extracting the raw schema.
     #[cfg(test)]
-    pub(crate) fn logical_schema(&self) -> &SchemaRef {
+    pub(crate) fn raw_schema(&self) -> &SchemaRef {
         &self.schema
     }
 
@@ -124,10 +124,10 @@ impl TableSchema {
     }
 
     /// Returns the logical schema as a [`SchemaRef`] for use by FFI consumers.
-    // TODO: update FFI to expose TableSchema directly instead of extracting the underlying schema
-    // Note: this is public only for the FFI crate; all other callers should use logical_schema()
+    // TODO: update FFI to expose LogicalSchema directly instead of extracting the underlying schema
+    // Note: this is public only for the FFI crate; all other callers should use raw_schema()
     #[doc(hidden)]
-    pub fn logical_schema_for_ffi(&self) -> &SchemaRef {
+    pub fn raw_schema_for_ffi(&self) -> &SchemaRef {
         &self.schema
     }
 
@@ -140,7 +140,7 @@ impl TableSchema {
     /// Returns the column mapping mode. Exposed for tests only.
     ///
     /// Production code should never need the raw mode — all logical-to-physical name translation
-    /// should go through `TableSchema` methods (e.g. [`Self::top_level_logical_to_physical_name`],
+    /// should go through `LogicalSchema` methods (e.g. [`Self::top_level_logical_to_physical_name`],
     /// [`Self::compute_physical_read_schema_and_transform`]) so that callers remain insulated from
     /// the column-mapping details.
     #[cfg(test)]
@@ -359,7 +359,7 @@ mod tests {
         #[case] logical: &str,
         #[case] expected: Option<&str>,
     ) {
-        let ts = TableSchema::new_for_test(schema, mode);
+        let ts = LogicalSchema::new_for_test(schema, mode);
         assert_eq!(ts.top_level_logical_to_physical_name(logical), expected);
     }
 
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn get_referenced_physical_schema_empty_refs_returns_none() {
-        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let ts = LogicalSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
         assert!(ts
             .get_referenced_physical_schema(HashSet::new())
             .unwrap()
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn get_referenced_physical_schema_known_column() {
         let id = column_name!("id");
-        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let ts = LogicalSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
         let refs = HashSet::from([&id]);
         let (schema, mappings) = ts.get_referenced_physical_schema(refs).unwrap().unwrap();
         assert_eq!(schema.fields().count(), 1);
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn get_referenced_physical_schema_name_mode_maps_to_physical() {
         let id = column_name!("id");
-        let ts = TableSchema::new_for_test(
+        let ts = LogicalSchema::new_for_test(
             test_schema_flat_with_column_mapping(),
             ColumnMappingMode::Name,
         );
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn get_referenced_physical_schema_nested_leaf() {
         let leaf = ColumnName::new(["info", "age"]);
-        let ts = TableSchema::new_for_test(test_schema_nested(), ColumnMappingMode::None);
+        let ts = LogicalSchema::new_for_test(test_schema_nested(), ColumnMappingMode::None);
         let (schema, mappings) = ts
             .get_referenced_physical_schema(HashSet::from([&leaf]))
             .unwrap()
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn get_referenced_physical_schema_nested_with_column_mapping() {
         let leaf = ColumnName::new(["info", "age"]);
-        let ts = TableSchema::new_for_test(
+        let ts = LogicalSchema::new_for_test(
             test_schema_nested_with_column_mapping(),
             ColumnMappingMode::Name,
         );
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn get_referenced_physical_schema_unknown_column_errors() {
         let missing = column_name!("no_such_col");
-        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let ts = LogicalSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
         assert!(ts
             .get_referenced_physical_schema(HashSet::from([&missing]))
             .is_err());
@@ -451,7 +451,7 @@ mod tests {
         #[case] schema: SchemaRef,
         #[case] col: ColumnName,
     ) {
-        let ts = TableSchema::new_for_test(schema, ColumnMappingMode::None);
+        let ts = LogicalSchema::new_for_test(schema, ColumnMappingMode::None);
         assert!(ts
             .get_referenced_physical_schema(HashSet::from([&col]))
             .is_err());
@@ -459,13 +459,13 @@ mod tests {
 
     // ── compute_write_physical_schema ────────────────────────────────────────
 
-    fn ts_with_partition(mode: ColumnMappingMode) -> Arc<TableSchema> {
+    fn ts_with_partition(mode: ColumnMappingMode) -> Arc<LogicalSchema> {
         let schema = if mode == ColumnMappingMode::None {
             test_schema_flat()
         } else {
             test_schema_flat_with_column_mapping()
         };
-        Arc::new(TableSchema {
+        Arc::new(LogicalSchema {
             schema,
             column_mapping_mode: mode,
             partition_columns: vec!["name".to_string()],
