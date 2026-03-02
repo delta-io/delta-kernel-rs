@@ -388,7 +388,7 @@ pub struct ScanMetadata {
     /// expected by the scan:
     ///
     /// - `Some(expr)`: Apply this expression to transform the data to match
-    ///   [`Scan::logical_schema()`].
+    ///   [`Scan::table_schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
@@ -510,7 +510,7 @@ impl Scan {
     ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
     ///   the associated expression _must_ be applied to the data read from the file specified by
     ///   the row. The resultant schema for this expression is guaranteed to be
-    ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
+    ///   [`Self::table_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
     ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
     ///   from disk is already in the correct logical state.
     pub fn scan_metadata(
