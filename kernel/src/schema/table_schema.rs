@@ -108,7 +108,10 @@ impl TableSchema {
         })
     }
 
-    /// Returns the logical schema.
+    /// Returns the underlying logical schema.
+    ///
+    /// Test-only: [`TableSchema`] is the intended abstraction for the logical schema; production
+    /// code should operate on [`TableSchema`] directly rather than extracting the raw schema.
     #[cfg(test)]
     pub(crate) fn logical_schema(&self) -> &SchemaRef {
         &self.schema
