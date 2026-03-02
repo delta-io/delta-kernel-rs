@@ -16,12 +16,12 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use test_utils::test_table_setup;
+use test_utils::{create_table_and_load_snapshot, test_table_setup};
 
 use super::simple_schema;
 
 /// Helper to strip column mapping metadata (IDs and physical names) from all StructFields recursively.
-fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
+pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
     let cm_id = ColumnMetadataKey::ColumnMappingId.as_ref();
     let cm_name = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
 
@@ -58,22 +58,6 @@ fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
         .map(|f| strip_field(f, cm_id, cm_name))
         .collect();
     StructType::new_unchecked(fields)
-}
-
-/// Helper to create a table, load its snapshot, and return it for verification.
-fn create_table_and_load_snapshot(
-    table_path: &str,
-    schema: Arc<StructType>,
-    engine: &dyn delta_kernel::Engine,
-    properties: &[(&str, &str)],
-) -> DeltaResult<Arc<Snapshot>> {
-    let _ = create_table(table_path, schema, "Test/1.0")
-        .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?;
-
-    let table_url = delta_kernel::try_parse_uri(table_path)?;
-    Snapshot::builder_for(table_url).build(engine)
 }
 
 /// Assert column mapping configuration on a snapshot.
@@ -467,6 +451,115 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
     // Then strip column mapping metadata and verify the schema structure matches the input.
     let read_schema = strip_column_mapping_metadata(&snapshot.schema());
     assert_eq!(&read_schema, schema.as_ref(), "Schema roundtrip mismatch");
+
+    Ok(())
+}
+
+/// Builds a schema that supports clustering at depths 1, 2, and 5:
+///   { id: int, name: string, address: { city: string, zip: string },
+///     l1: { l2: { l3: { l4: { value: double } } } } }
+fn clustering_cm_test_schema() -> DeltaResult<Arc<StructType>> {
+    let address = StructType::try_new(vec![
+        StructField::new("city", DataType::STRING, true),
+        StructField::new("zip", DataType::STRING, true),
+    ])?;
+    let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
+    let l3 = StructType::try_new(vec![StructField::new(
+        "l4",
+        DataType::Struct(Box::new(l4)),
+        true,
+    )])?;
+    let l2 = StructType::try_new(vec![StructField::new(
+        "l3",
+        DataType::Struct(Box::new(l3)),
+        true,
+    )])?;
+    let l1 = StructType::try_new(vec![StructField::new(
+        "l2",
+        DataType::Struct(Box::new(l2)),
+        true,
+    )])?;
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("name", DataType::STRING, true),
+        StructField::new("address", DataType::Struct(Box::new(address)), true),
+        StructField::new("l1", DataType::Struct(Box::new(l1)), true),
+    ])?))
+}
+
+#[rstest::rstest]
+#[case::top_level_cm_none(vec![vec!["id"]], "none")]
+#[case::top_level_cm_name(vec![vec!["id"]], "name")]
+#[case::top_level_cm_id(vec![vec!["id"]], "id")]
+#[case::nested_2_cm_none(vec![vec!["address", "city"]], "none")]
+#[case::nested_2_cm_name(vec![vec!["address", "city"]], "name")]
+#[case::nested_2_cm_id(vec![vec!["address", "city"]], "id")]
+#[case::mixed_cm_none(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]], "none")]
+#[case::mixed_cm_name(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]], "name")]
+#[case::mixed_cm_id(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]], "id")]
+#[test]
+fn test_create_clustered_table_nested_with_column_mapping(
+    #[case] col_paths: Vec<Vec<&str>>,
+    #[case] cm_mode: &str,
+) -> DeltaResult<()> {
+    use delta_kernel::expressions::ColumnName;
+
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = clustering_cm_test_schema()?;
+    let expected_cols: Vec<ColumnName> = col_paths
+        .iter()
+        .map(|p| ColumnName::new(p.iter().copied()))
+        .collect();
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
+        .with_data_layout(DataLayout::Clustered {
+            columns: expected_cols.clone(),
+        })
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    let table_configuration = snapshot.table_configuration();
+    assert!(
+        table_configuration.is_feature_supported(&TableFeature::DomainMetadata),
+        "Protocol should support domainMetadata feature"
+    );
+    assert!(
+        table_configuration.is_feature_supported(&TableFeature::ClusteredTable),
+        "Protocol should support clustering feature"
+    );
+
+    let expected_cm_mode = match cm_mode {
+        "name" => ColumnMappingMode::Name,
+        "id" => ColumnMappingMode::Id,
+        _ => ColumnMappingMode::None,
+    };
+    assert_column_mapping_config(&snapshot, expected_cm_mode);
+
+    let clustering_columns = snapshot.get_clustering_columns(engine.as_ref())?;
+    let columns = clustering_columns.expect("Clustering columns should be present");
+    assert_eq!(columns.len(), expected_cols.len());
+
+    for (col, expected_path) in columns.iter().zip(col_paths.iter()) {
+        assert_eq!(col.path().len(), expected_path.len());
+        match expected_cm_mode {
+            ColumnMappingMode::Name | ColumnMappingMode::Id => {
+                for field_name in col.path() {
+                    assert!(
+                        field_name.starts_with("col-"),
+                        "Clustering path field '{field_name}' should use physical name"
+                    );
+                }
+            }
+            ColumnMappingMode::None => {
+                let expected_col = ColumnName::new(expected_path.iter().copied());
+                assert_eq!(*col, expected_col);
+            }
+        }
+    }
 
     Ok(())
 }

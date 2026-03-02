@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::AsArray as _;
+use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{Field as ArrowField, Int64Type, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -33,6 +33,20 @@ mod common;
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
+
+/// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
+/// conventions where the table metadata declares columns as nullable.
+fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| ArrowField::new(f.name(), f.data_type().clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap()
+}
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +78,8 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
-    let expected_data = vec![batch.clone(), batch];
+    let expected = make_top_level_fields_nullable(&batch);
+    let expected_data = vec![expected.clone(), expected];
 
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
@@ -115,7 +130,8 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
-    let expected_data = vec![batch.clone(), batch];
+    let expected = make_top_level_fields_nullable(&batch);
+    let expected_data = vec![expected.clone(), expected];
 
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
@@ -167,7 +183,8 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
-    let expected_data = vec![batch];
+    let expected = make_top_level_fields_nullable(&batch);
+    let expected_data = vec![expected];
 
     let snapshot = Snapshot::builder_for(location).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
@@ -196,11 +213,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .fold(String::new(), |a, b| a + &b + "\n")
     }
 
-    let batch1 = generate_simple_batch()?;
-    let batch2 = generate_batch(vec![
+    let batch1 = make_top_level_fields_nullable(&generate_simple_batch()?);
+    let batch2 = make_top_level_fields_nullable(&generate_batch(vec![
         ("id", vec![5, 7].into_array()),
         ("val", vec!["e", "g"].into_array()),
-    ])?;
+    ])?);
     let storage = Arc::new(InMemory::new());
     // valid commit with min/max (0, 2)
     add_commit(
@@ -1401,7 +1418,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::test]
 async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
-    use delta_kernel::arrow::array::{Array, AsArray, RunArray};
+    use delta_kernel::arrow::array::{Array, StringArray};
 
     // Set up an in-memory table with multiple data files
     let batch1 = generate_batch(vec![
@@ -1478,41 +1495,24 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         let expected_file_name = expected_files[file_count];
         let expected_path = format!("{}{}", location, expected_file_name);
 
-        // The file path array should be run-end encoded
-        let run_array = file_path_array
+        // The file path array should be a plain StringArray with the path repeated for each row.
+        let string_array = file_path_array
             .as_any()
-            .downcast_ref::<RunArray<Int64Type>>()
-            .expect("File path column should be run-end encoded");
+            .downcast_ref::<StringArray>()
+            .expect("File path column should be a StringArray");
 
-        // Verify each logical row has the correct file path
         assert_eq!(
-            run_array.len(),
+            string_array.len(),
             expected_row_counts[file_count],
             "File {} should have {} rows",
             expected_file_name,
             expected_row_counts[file_count]
         );
-
-        // Verify the physical representation is efficient (single run)
-        let run_ends = run_array.run_ends().values();
-        assert_eq!(
-            run_ends.len(),
-            1,
-            "File path should be encoded as a single run"
-        );
-        assert_eq!(
-            run_ends[0], expected_row_counts[file_count] as i64,
-            "Run should end at position {}",
-            expected_row_counts[file_count]
-        );
-
-        // Verify the value is the expected file path
-        let values = run_array.values().as_string::<i32>();
-        assert_eq!(values.len(), 1, "Should have only 1 unique file path value");
-        assert_eq!(
-            values.value(0),
-            expected_path,
-            "File path should be '{}'",
+        assert!(
+            string_array
+                .iter()
+                .all(|v| v == Some(expected_path.as_str())),
+            "All rows should contain file path '{}'",
             expected_path
         );
 

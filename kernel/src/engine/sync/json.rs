@@ -1,14 +1,16 @@
+use std::sync::Arc;
 use std::{fs::File, io::BufReader, io::Write};
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use tempfile::NamedTempFile;
 use url::Url;
 
 use super::read_files;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine::arrow_utils::{
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    to_json_bytes,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
@@ -17,20 +19,22 @@ use crate::{
 
 pub(crate) struct SyncJsonHandler;
 
-/// Note: This function must match the signature expected by `read_files` helper function,
-/// which is also used by `try_create_from_parquet`. The `_file_location` parameter is unused
-/// here but required to satisfy the shared function signature.
 fn try_create_from_json(
     file: File,
-    _schema: SchemaRef,
-    arrow_schema: ArrowSchemaRef,
+    schema: SchemaRef,
     _predicate: Option<PredicateRef>,
-    _file_location: String,
+    file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let json = ReaderBuilder::new(arrow_schema)
+    // Build Arrow schema from only the real JSON columns, omitting any metadata columns
+    // (e.g. FilePath) that the JSON reader cannot populate from the file content.
+    let json_schema = Arc::new(json_arrow_schema(&schema)?);
+    // Build the reorder index vec once; apply it to every batch to re-insert synthesized metadata
+    // columns (e.g. file path) at their schema positions.
+    let reorder_indices = build_json_reorder_indices(&schema)?;
+    let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
         .build(BufReader::new(file))?
-        .map(|data| Ok(ArrowEngineData::new(data?)));
+        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
     Ok(json)
 }
 
@@ -140,6 +144,56 @@ mod tests {
     #[test]
     fn test_write_json_file_overwrite() -> DeltaResult<()> {
         do_test_write_json_file(true)
+    }
+
+    #[test]
+    fn test_read_json_files_injects_file_path_column() -> DeltaResult<()> {
+        use crate::arrow::array::{Array as _, StringArray};
+        use crate::engine::arrow_data::EngineDataArrowExt as _;
+        use crate::schema::{
+            DataType as DeltaDataType, MetadataColumnSpec, StructField, StructType,
+        };
+
+        // Write a temp JSON file with two simple rows.
+        let test_dir = TempDir::new().unwrap();
+        let path = test_dir.path().join("test.json");
+        std::fs::write(&path, "{\"x\": 1}\n{\"x\": 2}\n").unwrap();
+        let file_url = Url::from_file_path(&path).expect("Failed to create file URL");
+
+        let files = [FileMeta::new(file_url.clone(), 0, 0)];
+
+        // Schema: one regular field + a FilePath metadata column after it.
+        let schema = Arc::new(
+            StructType::try_new([
+                StructField::not_null("x", DeltaDataType::INTEGER),
+                StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            ])
+            .unwrap(),
+        );
+
+        let handler = SyncJsonHandler;
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, schema, None)?
+            .map(|r| -> DeltaResult<RecordBatch> { r?.try_into_record_batch() })
+            .collect::<DeltaResult<_>>()?;
+
+        assert_eq!(data.len(), 1);
+        let batch = &data[0];
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "x");
+        assert_eq!(batch.schema().field(1).name(), "_file");
+
+        // _file should be a plain StringArray with the file URL repeated for each row.
+        let string_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray for _file column");
+        assert_eq!(string_array.len(), 2);
+        assert!(string_array.iter().all(|v| v == Some(file_url.as_str())));
+
+        Ok(())
     }
 
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {

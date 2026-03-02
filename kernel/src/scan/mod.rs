@@ -183,7 +183,9 @@ impl ScanBuilder {
     /// that integrations can use for their own data skipping logic.
     ///
     /// The statistics schema is determined by the table's configuration
-    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`).
+    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`). In the future,
+    /// a requested columns filter may limit which columns appear in the output without
+    /// affecting the table-level column counting.
     ///
     /// This method can be combined with [`with_predicate`]. When both are used, the kernel
     /// performs data skipping internally using the predicate AND outputs parsed statistics to the
