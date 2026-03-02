@@ -177,6 +177,10 @@ async fn latest_snapshot_test(
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
+    if batches.is_empty() {
+        assert_eq!(expected.num_rows(), 0, "Expected data but got no batches");
+        return Ok(());
+    }
     let result = concat_batches(&batches[0].schema(), &batches)?;
     let result = sort_record_batch(result)?;
     let expected = sort_record_batch(expected)?;

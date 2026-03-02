@@ -915,10 +915,10 @@ fn not_and_or_predicates(
 }
 
 #[rstest::rstest]
-#[case::literal_false(Pred::literal(false), table_for_numbers(vec![]))]
+#[case::literal_false(Pred::literal(false), vec![])]
 #[case::and_with_literal_false(
     Pred::and(column_pred!("number"), Pred::literal(false)),
-    table_for_numbers(vec![])
+    vec![]
 )]
 #[case::literal_true(
     Pred::literal(true),
@@ -942,7 +942,7 @@ fn not_and_or_predicates(
 )]
 #[case::not_distinct_null(
     Pred::not(column_expr!("number").distinct(Expr::null_literal(DataType::LONG))),
-    table_for_numbers(vec![])
+    vec![]
 )]
 #[case::gt_empty_struct(
     column_expr!("number").gt(Expr::struct_from(Vec::<ExpressionRef>::new())),
