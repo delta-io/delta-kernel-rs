@@ -159,15 +159,22 @@ pub(crate) async fn add_checkpoint_to_store(
     write_parquet_to_store(store, path, data).await
 }
 
-/// Writes all actions to a _delta_log/_sidecars file in the store.
+/// Writes all actions to a _delta_log/_sidecars file in the store and return the FileMeta
 /// This function formats the provided filename into the _sidecars subdirectory.
 async fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> DeltaResult<FileMeta> {
     let path = format!("_delta_log/_sidecars/{filename}");
-    write_parquet_to_store(store, path, data).await
+    write_parquet_to_store(store, path.clone(), data).await?;
+    let size = get_file_size(store, &path).await;
+    let location = Url::parse(&format!("memory:///{path}")).expect("valid url");
+    Ok(FileMeta {
+        location,
+        last_modified: 0,
+        size,
+    })
 }
 
 /// Writes all actions to a _delta_log json checkpoint file in the store.
@@ -989,21 +996,26 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
     let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
-    add_sidecar_to_store(
+    let FileMeta {
+        size: sidecar1_size,
+        ..
+    } = add_sidecar_to_store(
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
     .await?;
-    add_sidecar_to_store(
+
+    let FileMeta {
+        size: sidecar2_size,
+        ..
+    } = add_sidecar_to_store(
         &store,
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )
     .await?;
 
-    let sidecar1_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
-    let sidecar2_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile2.parquet").await;
     let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
         vec![
             ("sidecarfile1.parquet", sidecar1_size),
@@ -1064,14 +1076,15 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     // Add a sidecar file with only add actions
-    add_sidecar_to_store(
+    let FileMeta {
+        size: sidecar_size, ..
+    } = add_sidecar_to_store(
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
     .await?;
 
-    let sidecar_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
     let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
         vec![("sidecarfile1.parquet", sidecar_size)],
         read_schema.clone(),
@@ -1352,22 +1365,25 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
-    add_sidecar_to_store(
+    let FileMeta {
+        size: sidecar1_size,
+        ..
+    } = add_sidecar_to_store(
         &store,
         add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )
     .await?;
-    add_sidecar_to_store(
+
+    let FileMeta {
+        size: sidecar2_size,
+        ..
+    } = add_sidecar_to_store(
         &store,
         add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )
     .await?;
-
-    // Get actual sidecar sizes for correct FileMeta creation
-    let sidecar1_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
-    let sidecar2_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile2.parquet").await;
 
     // Now create checkpoint with correct sidecar sizes
     add_checkpoint_to_store(
