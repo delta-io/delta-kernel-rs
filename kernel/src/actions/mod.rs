@@ -8,8 +8,7 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -420,17 +419,17 @@ pub(crate) struct Protocol {
 /// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
 /// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
 fn parse_features(
-    features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+    features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
 ) -> Option<Vec<TableFeature>> {
-    let features = features?.into_iter().map(|f| f.into_table_feature());
+    let features = features?.into_iter().map(Into::into);
     Some(features.collect())
 }
 
 impl Protocol {
     /// Try to create a new modern Protocol instance with the given table feature lists
     pub(crate) fn try_new_modern(
-        reader_features: impl IntoIterator<Item = impl IntoTableFeature>,
-        writer_features: impl IntoIterator<Item = impl IntoTableFeature>,
+        reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
+        writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
     ) -> DeltaResult<Self> {
         Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
@@ -458,8 +457,8 @@ impl Protocol {
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
-        writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+        reader_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
+        writer_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
     ) -> DeltaResult<Self> {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
