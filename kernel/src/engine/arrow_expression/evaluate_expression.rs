@@ -136,19 +136,12 @@ fn evaluate_struct_expression(
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| Error::generic("Nullability predicate must evaluate to boolean"))?;
-        if bool_array.null_count() == 0 {
-            // Fast path: no nulls in predicate, use values directly
-            Some(crate::arrow::buffer::NullBuffer::new(
-                bool_array.values().clone(),
-            ))
-        } else {
-            // Slow path: predicate has nulls — null treated as false (Kleene AND)
-            let validity_array = is_not_null(&predicate_array)?;
-            let combined = and_kleene(&validity_array, bool_array)?;
-            Some(crate::arrow::buffer::NullBuffer::new(
-                combined.values().clone(),
-            ))
-        }
+        let values = bool_array.values();
+        let combined = match bool_array.nulls() {
+            Some(nulls) => values & nulls.inner(),
+            None => values.clone(),
+        };
+        Some(crate::arrow::buffer::NullBuffer::new(combined))
     } else {
         None
     };
