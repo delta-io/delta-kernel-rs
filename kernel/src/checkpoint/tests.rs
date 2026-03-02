@@ -527,10 +527,13 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    // normal commit
+    // normal commit with catalog-managed protocol
+    let catalog_managed_protocol = Action::Protocol(
+        Protocol::try_new_modern(vec!["catalogManaged"], vec!["catalogManaged"]).unwrap(),
+    );
     write_commit_to_store(
         &store,
-        vec![create_metadata_action(), create_basic_protocol_action()],
+        vec![create_metadata_action(), catalog_managed_protocol],
         0,
     )
     .await?;
@@ -556,6 +559,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     };
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .with_max_catalog_version(1)
         .build(&engine)?;
 
     assert!(matches!(

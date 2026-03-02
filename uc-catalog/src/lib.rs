@@ -123,6 +123,7 @@ impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
 
         Snapshot::builder_for(table_url)
             .at_version(version)
+            .with_max_catalog_version(version)
             .with_log_tail(commits)
             .build(engine)
             .map_err(|e| e.into())
