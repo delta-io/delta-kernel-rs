@@ -26,6 +26,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
+use crate::transaction::txn_changes::TxnChangesContext;
 use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::LogCompactionWriter;
@@ -64,6 +65,9 @@ pub struct Snapshot {
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
     lazy_crc: Arc<LazyCrc>,
+    /// Pre-computed transaction changes from the commit that created this snapshot.
+    /// `None` for snapshots loaded from storage; `Some` for post-commit snapshots.
+    txn_changes: Option<TxnChangesContext>,
 }
 
 impl PartialEq for Snapshot {
@@ -141,6 +145,7 @@ impl Snapshot {
             log_segment,
             table_configuration,
             lazy_crc,
+            txn_changes: None,
         }
     }
 
@@ -440,11 +445,11 @@ impl Snapshot {
     /// allows immediate use of the new and latest table state without re-reading metadata from
     /// storage.
     ///
-    /// TODO: Take in ICT.
     /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
     /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
     #[allow(unused)]
-    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+    pub(crate) fn new_post_commit(&self, txn_changes: TxnChangesContext) -> DeltaResult<Self> {
+        let commit = &txn_changes.parsed_commit;
         require!(
             commit.is_commit(),
             Error::internal_error(format!(
@@ -466,13 +471,17 @@ impl Snapshot {
         let new_table_configuration =
             TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
 
-        let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
+        let new_log_segment = self
+            .log_segment
+            .new_with_commit_appended(txn_changes.parsed_commit.clone())?;
 
-        Ok(Snapshot::new(
+        let mut snapshot = Snapshot::new(
             new_log_segment,
             new_table_configuration,
             self.lazy_crc.clone(),
-        ))
+        );
+        snapshot.txn_changes = Some(txn_changes);
+        Ok(snapshot)
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -782,6 +791,21 @@ impl Snapshot {
                     self.version(),
                     enablement_version
                 )));
+            }
+        }
+
+        // Fast path: use pre-computed ICT from the transaction that created this snapshot.
+        // If txn_changes exists, we have definitive knowledge. If ICT is enabled (checked above)
+        // it must be present.
+        if let Some(ref txn) = self.txn_changes {
+            match txn.in_commit_timestamp {
+                Some(ict) => return Ok(Some(ict)),
+                None => {
+                    return Err(Error::generic(format!(
+                        "In-Commit Timestamp not found in transaction changes at version {}",
+                        self.version()
+                    )));
+                }
             }
         }
 
@@ -2044,11 +2068,44 @@ mod tests {
 
         // WHEN
         let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+        let txn_changes = TxnChangesContext {
+            parsed_commit: fake_new_commit,
+            in_commit_timestamp: None,
+        };
+        let post_commit_snapshot = base_snapshot.new_post_commit(txn_changes).unwrap();
 
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
+    }
+
+    #[test]
+    fn test_new_post_commit_preserves_ict() {
+        // GIVEN: a base snapshot and a post-commit snapshot with a pre-computed ICT
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let base_snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
+        let next_version = base_snapshot.version() + 1;
+
+        // WHEN: post-commit snapshot is created with a pre-computed ICT
+        let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
+        let txn_changes = TxnChangesContext {
+            parsed_commit: fake_new_commit,
+            in_commit_timestamp: Some(12345),
+        };
+        let post_commit_snapshot = base_snapshot.new_post_commit(txn_changes).unwrap();
+
+        // THEN: txn_changes is stored on the snapshot
+        assert!(post_commit_snapshot.txn_changes.is_some());
+        assert_eq!(
+            post_commit_snapshot
+                .txn_changes
+                .as_ref()
+                .unwrap()
+                .in_commit_timestamp,
+            Some(12345)
+        );
     }
 
     // Helper: create a minimal test table with commits 0-N
