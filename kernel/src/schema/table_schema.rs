@@ -296,3 +296,201 @@ impl TableSchema {
         Arc::new(StructType::new_unchecked(fields))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::expressions::{column_name, Scalar};
+    use crate::table_features::ColumnMappingMode;
+    use crate::utils::test_utils::{
+        test_schema_flat, test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array, test_schema_with_map,
+    };
+
+    // ── logical_to_physical_name ─────────────────────────────────────────────
+
+    #[rstest]
+    #[case::none(test_schema_flat(), ColumnMappingMode::None, "id", Some("id"))]
+    #[case::name(test_schema_flat_with_column_mapping(), ColumnMappingMode::Name, "id", Some("phys_id"))]
+    #[case::id_mode(test_schema_flat_with_column_mapping(), ColumnMappingMode::Id, "name", Some("phys_name"))]
+    #[case::missing(test_schema_flat(), ColumnMappingMode::None, "no_such_col", None)]
+    fn logical_to_physical_name(
+        #[case] schema: SchemaRef,
+        #[case] mode: ColumnMappingMode,
+        #[case] logical: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let ts = TableSchema::new_for_test(schema, mode);
+        assert_eq!(ts.logical_to_physical_name(logical), expected);
+    }
+
+    // ── parse_partition_value ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_partition_value_none_mode() {
+        // field 1 is "name" (STRING)
+        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let map = [("name".to_string(), "alice".to_string())].into();
+        let (idx, (physical_name, scalar)) = ts.parse_partition_value(1, &map).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(physical_name, "name");
+        assert_eq!(scalar, Scalar::String("alice".to_string()));
+    }
+
+    #[test]
+    fn parse_partition_value_name_mode_uses_physical_name() {
+        // field 0 is "id" → physical "phys_id"
+        let ts = TableSchema::new_for_test(
+            test_schema_flat_with_column_mapping(),
+            ColumnMappingMode::Name,
+        );
+        let map = [("phys_id".to_string(), "42".to_string())].into();
+        let (idx, (physical_name, scalar)) = ts.parse_partition_value(0, &map).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(physical_name, "phys_id");
+        assert_eq!(scalar, Scalar::Long(42));
+    }
+
+    #[test]
+    fn parse_partition_value_null_when_absent() {
+        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let map = HashMap::new(); // value not present → null
+        let (_, (_, scalar)) = ts.parse_partition_value(1, &map).unwrap();
+        assert!(scalar.is_null());
+    }
+
+    #[test]
+    fn parse_partition_value_out_of_bounds_errors() {
+        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        assert!(ts.parse_partition_value(99, &HashMap::new()).is_err());
+    }
+
+    // ── get_referenced_physical_schema ───────────────────────────────────────
+
+    #[test]
+    fn get_referenced_physical_schema_empty_refs_returns_none() {
+        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        assert!(ts.get_referenced_physical_schema(HashSet::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_referenced_physical_schema_known_column() {
+        let id = column_name!("id");
+        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        let refs = HashSet::from([&id]);
+        let (schema, mappings) = ts.get_referenced_physical_schema(refs).unwrap().unwrap();
+        assert_eq!(schema.fields().count(), 1);
+        assert_eq!(schema.field("id").unwrap().data_type(), &DataType::LONG);
+        assert_eq!(mappings[&id], id); // identity mapping in None mode
+    }
+
+    #[test]
+    fn get_referenced_physical_schema_name_mode_maps_to_physical() {
+        let id = column_name!("id");
+        let ts = TableSchema::new_for_test(
+            test_schema_flat_with_column_mapping(),
+            ColumnMappingMode::Name,
+        );
+        let (schema, mappings) = ts
+            .get_referenced_physical_schema(HashSet::from([&id]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema.field("phys_id").unwrap().data_type(), &DataType::LONG);
+        assert_eq!(mappings[&id], column_name!("phys_id"));
+    }
+
+    #[test]
+    fn get_referenced_physical_schema_nested_leaf() {
+        let leaf = ColumnName::new(["info", "age"]);
+        let ts = TableSchema::new_for_test(test_schema_nested(), ColumnMappingMode::None);
+        let (schema, mappings) = ts
+            .get_referenced_physical_schema(HashSet::from([&leaf]))
+            .unwrap()
+            .unwrap();
+        // schema should have info.age, not info.name
+        let info = schema.field("info").unwrap();
+        let DataType::Struct(inner) = info.data_type() else {
+            panic!("expected struct");
+        };
+        assert!(inner.field("age").is_some());
+        assert!(inner.field("name").is_none());
+        assert_eq!(mappings[&leaf], leaf); // identity in None mode
+    }
+
+    #[test]
+    fn get_referenced_physical_schema_nested_with_column_mapping() {
+        let leaf = ColumnName::new(["info", "age"]);
+        let ts = TableSchema::new_for_test(
+            test_schema_nested_with_column_mapping(),
+            ColumnMappingMode::Name,
+        );
+        let (_, mappings) = ts
+            .get_referenced_physical_schema(HashSet::from([&leaf]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mappings[&leaf], ColumnName::new(["phys_info", "phys_age"]));
+    }
+
+    #[test]
+    fn get_referenced_physical_schema_unknown_column_errors() {
+        let missing = column_name!("no_such_col");
+        let ts = TableSchema::new_for_test(test_schema_flat(), ColumnMappingMode::None);
+        assert!(ts.get_referenced_physical_schema(HashSet::from([&missing])).is_err());
+    }
+
+    #[rstest]
+    #[case::array(test_schema_with_array(), column_name!("scores"))]
+    #[case::map(test_schema_with_map(), column_name!("entries"))]
+    fn get_referenced_physical_schema_non_primitive_column_errors(
+        #[case] schema: SchemaRef,
+        #[case] col: ColumnName,
+    ) {
+        let ts = TableSchema::new_for_test(schema, ColumnMappingMode::None);
+        assert!(ts.get_referenced_physical_schema(HashSet::from([&col])).is_err());
+    }
+
+    // ── compute_write_schema ─────────────────────────────────────────────────
+
+    fn ts_with_partition(mode: ColumnMappingMode) -> Arc<TableSchema> {
+        let schema = if mode == ColumnMappingMode::None {
+            test_schema_flat()
+        } else {
+            test_schema_flat_with_column_mapping()
+        };
+        Arc::new(TableSchema {
+            schema,
+            column_mapping_mode: mode,
+            partition_columns: vec!["name".to_string()],
+            materialized_row_id_col: None,
+        })
+    }
+
+    #[test]
+    fn compute_write_schema_include_partitions() {
+        let ts = ts_with_partition(ColumnMappingMode::None);
+        let ws = ts.compute_write_schema(true);
+        assert_eq!(ws.fields().count(), 2); // id + name
+    }
+
+    #[test]
+    fn compute_write_schema_exclude_partitions() {
+        let ts = ts_with_partition(ColumnMappingMode::None);
+        let ws = ts.compute_write_schema(false);
+        assert_eq!(ws.fields().count(), 1);
+        assert!(ws.field("id").is_some());
+        assert!(ws.field("name").is_none());
+    }
+
+    #[test]
+    fn compute_write_schema_column_mapping_uses_physical_names() {
+        let ts = ts_with_partition(ColumnMappingMode::Name);
+        let ws = ts.compute_write_schema(false); // exclude partition "name"
+        assert_eq!(ws.fields().count(), 1);
+        assert!(ws.field("phys_id").is_some(), "expected physical name");
+        assert!(ws.field("id").is_none(), "should not have logical name");
+    }
+}

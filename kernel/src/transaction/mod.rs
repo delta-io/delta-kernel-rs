@@ -1975,6 +1975,51 @@ mod tests {
         Ok(())
     }
 
+    // ── WriteContext::physical_partition_values ──────────────────────────────
+
+    #[test]
+    fn physical_partition_values_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
+        assert!(wc.physical_partition_values(HashMap::new())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn physical_partition_values_none_mode_identity() -> Result<(), Box<dyn std::error::Error>> {
+        // In None mode logical name == physical name
+        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
+        let input = HashMap::from([("category".to_string(), "foo".to_string())]);
+        let result = wc.physical_partition_values(input)?;
+        assert_eq!(result.get("category").map(String::as_str), Some("foo"));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::name_mode("./tests/data/partition_cm/name")]
+    #[case::id_mode("./tests/data/partition_cm/id")]
+    fn physical_partition_values_column_mapping_translates_to_physical(
+        #[case] table_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_, wc) = snapshot_and_write_context(table_path)?;
+        let input = HashMap::from([("category".to_string(), "foo".to_string())]);
+        let result = wc.physical_partition_values(input)?;
+        // The physical name is the UUID-based name, not "category"
+        assert!(!result.contains_key("category"), "should use physical name");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.values().next().map(String::as_str), Some("foo"));
+        Ok(())
+    }
+
+    #[test]
+    fn physical_partition_values_unknown_column_errors() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
+        let input = HashMap::from([("no_such_col".to_string(), "x".to_string())]);
+        let err = wc.physical_partition_values(input).unwrap_err();
+        assert!(err.to_string().contains("no_such_col"));
+        Ok(())
+    }
+
     // Input schemas have no CM metadata; create_table automatically assigns IDs and
     // physical names when mode is Name or Id.
     #[rstest]
