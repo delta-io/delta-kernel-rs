@@ -9,7 +9,7 @@ use crate::arrow::array::{
     make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
     NullBufferBuilder, RecordBatch, StringArray, StructArray,
 };
-use crate::arrow::buffer::OffsetBuffer;
+use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -141,7 +141,7 @@ fn evaluate_struct_expression(
             Some(nulls) => values & nulls.inner(),
             None => values.clone(),
         };
-        Some(crate::arrow::buffer::NullBuffer::new(combined))
+        Some(NullBuffer::new(combined))
     } else {
         None
     };
@@ -665,7 +665,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::column_expr;
-    use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
+    use crate::expressions::{column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
     use rstest::rstest;
@@ -1415,7 +1415,7 @@ mod tests {
     fn test_binary_type_validation() {
         let batch = create_test_batch();
         let add_expr = Expr::binary(
-            crate::expressions::BinaryExpressionOp::Plus,
+            BinaryExpressionOp::Plus,
             Expr::column(["a"]),
             Expr::column(["b"]),
         );
@@ -1692,8 +1692,8 @@ mod tests {
             ArrowField::new("is_valid", ArrowDataType::Boolean, true),
         ]);
         let a_array: ArrayRef = Arc::new(Int32Array::from(a_vals));
-        let bool_array: ArrayRef = Arc::new(BooleanArray::from(is_valid_vals));
-        RecordBatch::try_new(Arc::new(schema), vec![a_array, bool_array]).unwrap()
+        let is_valid_array: ArrayRef = Arc::new(BooleanArray::from(is_valid_vals));
+        RecordBatch::try_new(Arc::new(schema), vec![a_array, is_valid_array]).unwrap()
     }
 
     #[rstest]
