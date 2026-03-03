@@ -64,6 +64,7 @@ impl TableInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
     Read(ReadSpec),
+    SnapshotConstruction(SnapshotConstructionSpec),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,10 +72,30 @@ pub struct ReadSpec {
     pub version: Option<u64>, // If version is None, read at latest version
 }
 
+impl ReadSpec {
+    pub fn as_str(&self) -> &str {
+        "read"
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SnapshotConstructionSpec {
+    pub version: Option<u64>, // If version is None, read at latest version
+}
+
+impl SnapshotConstructionSpec {
+    pub fn as_str(&self) -> &str {
+        "snapshot_construction"
+    }
+}
+
 impl Spec {
     pub fn as_str(&self) -> &str {
         match self {
-            Spec::Read(_) => "read",
+            Spec::Read(read_spec) => read_spec.as_str(),
+            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                snapshot_construction_spec.as_str()
+            }
         }
     }
 
@@ -153,17 +174,39 @@ mod tests {
     }
 
     #[rstest]
-    #[case(r#"{"type": "read", "version": 5}"#, Some(5))]
-    #[case(r#"{"type": "read"}"#, None)]
+    #[case(r#"{"type": "read", "version": 5}"#, "read", Some(5))]
+    #[case(r#"{"type": "read"}"#, "read", None)]
     #[case(
         r#"{"type": "read", "version": 7, "extra_field": "should be ignored"}"#,
+        "read",
         Some(7)
     )]
-    fn test_deserialize_spec_read(#[case] json: &str, #[case] expected_version: Option<u64>) {
-        let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize read spec");
+    #[case(
+        r#"{"type": "snapshot_construction", "version": 5}"#,
+        "snapshot_construction",
+        Some(5)
+    )]
+    #[case(r#"{"type": "snapshot_construction"}"#, "snapshot_construction", None)]
+    #[case(
+        r#"{"type": "snapshot_construction", "version": 7, "extra_field": "should be ignored"}"#,
+        "snapshot_construction",
+        Some(7)
+    )]
+    fn test_deserialize_spec(
+        #[case] json: &str,
+        #[case] expected_type: &str,
+        #[case] expected_version: Option<u64>,
+    ) {
+        let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
+        assert_eq!(spec.as_str(), expected_type);
+        let version = match &spec {
+            Spec::Read(read_spec) => read_spec.version,
+            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                snapshot_construction_spec.version
+            }
+        };
 
-        let Spec::Read(read_spec) = spec;
-        assert_eq!(read_spec.version, expected_version);
+        assert_eq!(version, expected_version);
     }
 
     #[rstest]
