@@ -14,7 +14,11 @@ Compute Engine (Spark, Flink, DuckDB, Polars, ...)
 ```
 
 Kernel handles the Delta protocol; connectors handle execution, distribution, and data flow.
-Kernel never does I/O directly -- it delegates all I/O to the Engine trait.
+Kernel never does I/O directly -- it delegates all I/O to the Engine trait. Kernel also avoids
+making memory allocation and scheduling decisions, leaving those to the connector and engine.
+For example, during log replay or checkpoint writes, kernel receives opaque `EngineData` batches,
+inspects them via the visitor pattern, updates a selection vector, and hands them back to the
+engine -- it never deserializes the full batch into in-memory structs.
 
 ## Snapshot
 
@@ -97,13 +101,17 @@ engines only need to replace specific handlers -- they can reuse defaults for th
 Kernel never assumes data is Arrow. It uses the `EngineData` trait -- an opaque columnar data
 interface. The kernel extracts data via a visitor pattern (`visit_rows` with typed `GetData`
 accessors), not by inspecting columns directly. Never downcast `EngineData` to a concrete type
-(e.g. `ArrowEngineData`) in kernel code -- only engine *implementations* know the concrete type.
+(e.g. `ArrowEngineData`) in prod kernel code -- only engine *implementations* know the concrete
+type. (Unit tests using the default engine may legitimately downcast.)
 
 `DefaultEngine` uses `ArrowEngineData` (wrapping Arrow `RecordBatch`). Custom engines implement
 `EngineData` for their own columnar format.
 
 Key methods: `visit_rows`, `len`, `append_columns` (for partition value injection/column mapping),
 `apply_selection_vector` (for deletion vectors).
+
+**IMPORTANT:** Never assume that reading one file produces exactly one batch. Always iterate over
+all returned batches -- the engine may split a single file across multiple batches.
 
 ## Key Modules
 

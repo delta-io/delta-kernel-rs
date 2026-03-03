@@ -5,10 +5,15 @@ cbindgen-generated headers (`.h` and `.hpp`).
 
 ## Handle System
 
-Objects crossing the FFI boundary are wrapped in **handles** -- opaque pointers with
+Objects crossing the FFI boundary may be wrapped in **handles** -- opaque pointers with
 ownership semantics:
 - **Mutable handles** (`Box`-like) -- exclusive ownership, neither `Copy` nor `Clone`
 - **Shared handles** (`Arc`-like) -- shared ownership via reference counting
+
+A handle is needed when a value might outlive the function call that passes it across the
+FFI boundary, or when the type is not representable in C/C++ (dyn trait references, slices,
+options, etc.). Short-lived "plain old data" types like `ExternResult`, `KernelError`,
+`KernelStringSlice`, and `EngineIterator` do not need handles.
 
 Every handle has a corresponding `free_*` function (e.g. `free_engine`, `free_snapshot`).
 

@@ -30,11 +30,11 @@ cargo nextest run -p delta_kernel --lib --all-features test_name_here
 cargo nextest run --workspace --all-features test_name_here
 
 # Format and lint (always run after code changes)
-cargo fmt && cargo clippy --benches --tests --all-features -- -D warnings
+cargo fmt && cargo clippy --workspace --benches --tests --all-features -- -D warnings
 
 # Quick pre-push check (mimics CI)
 cargo fmt \
-  && cargo clippy --benches --tests --all-features -- -D warnings \
+  && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo nextest run --workspace --all-features
 ```
 
@@ -55,11 +55,14 @@ cargo fmt \
 
 - `default-engine` / `default-engine-rustls` / `default-engine-native-tls` -- async
   Arrow/Tokio engine (pick one TLS backend)
-- `arrow`, `arrow-56`, `arrow-57` -- Arrow version selection
+- `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
+  major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
+  but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
-- `internal-api` -- unstable APIs like `parallel_scan_metadata`
+- `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
+  `#[internal_api]` proc macro attribute.
 - `test-utils`, `integration-test` -- development only
 
 ## Architecture at a Glance
@@ -96,8 +99,8 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 
 ## Protocol TLDR
 
-The [Delta protocol spec](https://github.com/delta-io/delta/blob/master/PROTOCOL.md) is
-the source of truth. Key concepts:
+The [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
+is the source of truth. Key concepts:
 
 - **Actions** -- atomic units of a transaction: Metadata, Add File, Remove File, Add CDC
   File, Protocol, CommitInfo, Domain Metadata, Sidecar, Checkpoint Metadata
@@ -109,6 +112,10 @@ the source of truth. Key concepts:
 - **Data skipping** -- per-file column statistics (min, max, null count, row count) with
   tight/wide bounds
 - **Schemas** -- JSON serialization format for StructType/StructField/DataType
+- **Stats and partition values** -- per-file column statistics (min, max, nullCount) and
+  partition values are stored as JSON strings in Add file actions. The stats JSON structure
+  mirrors the table schema. See the protocol spec sections on "Per-file Statistics" and
+  "Partition Value Serialization" for the exact formats.
 
 **Table features**:
 
@@ -120,13 +127,15 @@ the source of truth. Key concepts:
   `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`, `variantType-preview`,
   `typeWidening`
 
+Keep this list updated when new protocol features are added to kernel.
+
 ## Common Gotchas
 
-- **EngineData is opaque:** Never downcast to `ArrowEngineData` or any concrete type.
-  Never assume one batch per file -- always iterate. See `CLAUDE/architecture.md`
-  "EngineData Data Flow" for details.
+- **EngineData is opaque:** Never downcast to `ArrowEngineData` or any concrete type
+  in production code (ok in tests). Never assume one batch per file -- always iterate.
 - **Column mapping:** Physical column names can differ from logical names. Always use
-  the schema from `Snapshot::schema()`, never hardcode column names.
+  the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
+  column names (defined by the protocol) are not subject to column mapping.
 
 ## Code Style / Documentation
 
@@ -136,6 +145,12 @@ the source of truth. Key concepts:
 - Include examples in doc comments for complex functions only.
 - NEVER use emoji or unicode in comments that emulates emoji (e.g. special arrows,
   checkmarks). Use ASCII equivalents (`->`, `=>`, etc.) instead.
+- Comments should be concise and non-repetitive -- find the right place to say it once.
+- Comments should never include temporal references -- only refer to current code and
+  design, not past iterations.
+- Doc comments focus on "what" (contract with caller) more than "how" (implementation),
+  unless the "how" meaningfully impacts the "what".
+- Code comments state intent and explain "why" -- don't restate what the code self-documents.
 
 ## Pull Requests
 
@@ -153,7 +168,7 @@ Read these when relevant to the task at hand:
 - `CLAUDE/architecture.md` -- kernel architecture: snapshot loading, read/write paths,
   engine trait system, EngineData, key modules, catalog-managed tables
 - Always cross-check protocol behavior against the
-  [Delta protocol spec](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
+  [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
 
 **Keeping docs current:** If you notice anything inaccurate in these docs -- renamed
 structs, traits, functions, modules, crates, APIs, stale data flows, wrong file paths --
