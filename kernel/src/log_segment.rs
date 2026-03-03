@@ -129,62 +129,9 @@ impl LogSegment {
         end_version: Option<Version>,
         checkpoint_schema: Option<SchemaRef>,
     ) -> DeltaResult<Self> {
-        // Validate compaction files are sorted by (version, hi) in a single pass.
-        for pair in listed_files.ascending_compaction_files.windows(2) {
-            match pair {
-                [ParsedLogPath {
-                    version: version0,
-                    file_type: LogPathFileType::CompactedCommit { hi: hi0 },
-                    ..
-                }, ParsedLogPath {
-                    version: version1,
-                    file_type: LogPathFileType::CompactedCommit { hi: hi1 },
-                    ..
-                }] if version0 < version1 || (version0 == version1 && hi0 <= hi1) => {}
-                _ => return Err(Error::generic("ascending_compaction_files is not sorted")),
-            }
-        }
-
-        // Validate all checkpoint invariants in a single pass: every part must be a
-        // checkpoint, all parts must share the same version, and multi-part checkpoints
-        // must have the correct part count.
-        let n = listed_files.checkpoint_parts.len();
-        if n > 0 {
-            let first_version = listed_files.checkpoint_parts[0].version;
-            for p in &listed_files.checkpoint_parts {
-                if !p.is_checkpoint() {
-                    return Err(Error::generic(
-                        "checkpoint_parts contains non-checkpoint file",
-                    ));
-                }
-                if p.version != first_version {
-                    return Err(Error::generic(
-                        "multi-part checkpoint parts have different versions",
-                    ));
-                }
-                if n > 1
-                    && !matches!(
-                        p.file_type,
-                        LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                            if n == num_parts as usize
-                    )
-                {
-                    return Err(Error::generic("multi-part checkpoint part count mismatch"));
-                }
-            }
-        }
-
-        // Ensure commit file versions are contiguous
-        require!(
-            listed_files
-                .ascending_commit_files
-                .windows(2)
-                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
-            Error::generic(format!(
-                "Expected ordered contiguous commit files {:?}",
-                listed_files.ascending_commit_files
-            ))
-        );
+        validate_compaction_files(&listed_files.ascending_compaction_files)?;
+        validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -1173,4 +1120,64 @@ impl LogSegment {
         }
         true
     }
+}
+
+fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
+    for pair in compactions.windows(2) {
+        match pair {
+            [ParsedLogPath {
+                version: version0,
+                file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                ..
+            }, ParsedLogPath {
+                version: version1,
+                file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                ..
+            }] if version0 < version1 || (version0 == version1 && hi0 <= hi1) => {}
+            _ => return Err(Error::generic("ascending_compaction_files is not sorted")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
+    let n = parts.len();
+    if n > 0 {
+        let first_version = parts[0].version;
+        for p in parts {
+            if !p.is_checkpoint() {
+                return Err(Error::generic(
+                    "checkpoint_parts contains non-checkpoint file",
+                ));
+            }
+            if p.version != first_version {
+                return Err(Error::generic(
+                    "multi-part checkpoint parts have different versions",
+                ));
+            }
+            if n > 1
+                && !matches!(
+                    p.file_type,
+                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                        if n == num_parts as usize
+                )
+            {
+                return Err(Error::generic("multi-part checkpoint part count mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    require!(
+        commits
+            .windows(2)
+            .all(|cfs| cfs[0].version + 1 == cfs[1].version),
+        Error::generic(format!(
+            "Expected ordered contiguous commit files {:?}",
+            commits
+        ))
+    );
+    Ok(())
 }
