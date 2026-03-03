@@ -156,6 +156,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 rstest = "0.23"
+tar = "0.4"
+flate2 = "1"
 
 [[bench]]
 name = "metadata_bench"
@@ -163,4 +165,8 @@ harness = false
 
 [[bench]]
 name = "expression_bench"
+harness = false
+
+[[bench]]
+name = "workload_bench"
 harness = false
