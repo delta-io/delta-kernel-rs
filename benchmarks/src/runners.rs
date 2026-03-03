@@ -94,13 +94,13 @@ impl ReadMetadataRunner {
                     .map(|chunk| chunk.to_vec())
                     .collect();
 
-                let state = Arc::from(state);
+                let state = Arc::new(*state);
 
                 let handles: Vec<_> = partitions
                     .into_iter()
                     .map(|partition_files| {
                         let engine = self.engine.clone();
-                        let state = Arc::clone(&state);
+                        let state = state.clone();
 
                         thread::spawn(move || -> Result<(), Error> {
                             if partition_files.is_empty() {
