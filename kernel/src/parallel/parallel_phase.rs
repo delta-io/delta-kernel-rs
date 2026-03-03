@@ -130,8 +130,8 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
-    use crate::parallel::parallel_scan_metadata::AfterPhase1ScanMetadata;
-    use crate::parallel::parallel_scan_metadata::{Phase2ScanMetadata, Phase2State};
+    use crate::parallel::parallel_scan_metadata::AfterSequentialScanMetadata;
+    use crate::parallel::parallel_scan_metadata::{ParallelScanMetadata, ParallelState};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -417,12 +417,12 @@ mod tests {
         })?;
 
         match phase1.finish()? {
-            AfterPhase1ScanMetadata::Done => {}
-            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+            AfterSequentialScanMetadata::Done => {}
+            AfterSequentialScanMetadata::Parallel { state, files } => {
                 let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
                     let serialized_bytes = state.into_bytes()?;
-                    Arc::new(Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?)
+                    Arc::new(ParallelState::from_bytes(engine.as_ref(), &serialized_bytes)?)
                 } else {
                     // Non-serde: just use the state directly
                     Arc::new(*state)
@@ -443,7 +443,7 @@ mod tests {
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
 
-                            let mut phase2 = Phase2ScanMetadata::try_new(
+                            let mut phase2 = ParallelScanMetadata::try_new(
                                 engine.clone(),
                                 state,
                                 partition_files,
@@ -579,11 +579,11 @@ mod tests {
         })?;
 
         match phase1.finish()? {
-            AfterPhase1ScanMetadata::Done => {}
-            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+            AfterSequentialScanMetadata::Done => {}
+            AfterSequentialScanMetadata::Parallel { state, files } => {
                 // Verify stats is None in phase2 results and collect paths
                 let mut phase2 =
-                    Phase2ScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
+                    ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
 
                 let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {

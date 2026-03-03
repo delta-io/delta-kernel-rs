@@ -10,45 +10,45 @@ use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
 
-/// Result of Phase 1 scan metadata processing.
+/// Result of sequential scan metadata processing.
 ///
 /// This enum indicates whether distributed processing is needed:
 /// - `Done`: All processing completed sequentially - no distributed phase needed.
-/// - `Phase2`: Contains state and files for parallel processing.
-pub enum AfterPhase1ScanMetadata {
+/// - `Parallel`: Contains state and files for parallel processing.
+pub enum AfterSequentialScanMetadata {
     Done,
-    Phase2 {
-        state: Box<Phase2State>,
+    Parallel {
+        state: Box<ParallelState>,
         files: Vec<FileMeta>,
     },
 }
 
-/// Sequential (Phase 1) scan metadata processing.
+/// Sequential scan metadata processing.
 ///
 /// This phase processes commits and single-part checkpoint manifests sequentially.
 /// After exhaustion, call `finish()` to get the result which indicates whether
 /// a distributed phase is needed.
-pub struct Phase1ScanMetadata {
+pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
 }
 
-impl Phase1ScanMetadata {
+impl SequentialScanMetadata {
     pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
         Self { sequential }
     }
 
-    pub fn finish(self) -> DeltaResult<AfterPhase1ScanMetadata> {
+    pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterPhase1ScanMetadata::Done),
-            AfterSequential::Parallel { processor, files } => Ok(AfterPhase1ScanMetadata::Phase2 {
-                state: Box::new(Phase2State { inner: processor }),
+            AfterSequential::Done(_) => Ok(AfterSequentialScanMetadata::Done),
+            AfterSequential::Parallel { processor, files } => Ok(AfterSequentialScanMetadata::Parallel {
+                state: Box::new(ParallelState { inner: processor }),
                 files,
             }),
         }
     }
 }
 
-impl Iterator for Phase1ScanMetadata {
+impl Iterator for SequentialScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -56,15 +56,15 @@ impl Iterator for Phase1ScanMetadata {
     }
 }
 
-/// State for Phase 2 parallel scan metadata processing.
+/// State for parallel scan metadata processing.
 ///
 /// This state can be serialized and distributed to remote workers, or wrapped
 /// in Arc and shared across threads for local parallel processing.
-pub struct Phase2State {
+pub struct ParallelState {
     inner: ScanLogReplayProcessor,
 }
 
-impl ParallelLogReplayProcessor for Arc<Phase2State> {
+impl ParallelLogReplayProcessor for Arc<ParallelState> {
     type Output = ScanMetadata;
 
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
@@ -72,7 +72,7 @@ impl ParallelLogReplayProcessor for Arc<Phase2State> {
     }
 }
 
-impl Phase2State {
+impl ParallelState {
     /// Get the schema to use for reading checkpoint files.
     ///
     /// Returns the checkpoint read schema which may have stats excluded
@@ -94,7 +94,7 @@ impl Phase2State {
         self.inner.into_serializable_state()
     }
 
-    /// Reconstruct a Phase2State from serialized state.
+    /// Reconstruct a ParallelState from serialized state.
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
@@ -122,10 +122,10 @@ impl Phase2State {
     pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
         serde_json::to_vec(&state)
-            .map_err(|e| Error::generic(format!("Failed to serialize Phase2State to bytes: {}", e)))
+            .map_err(|e| Error::generic(format!("Failed to serialize ParallelState to bytes: {}", e)))
     }
 
-    /// Reconstruct a Phase2State from bytes.
+    /// Reconstruct a ParallelState from bytes.
     ///
     /// This is a convenience method that combines JSON deserialization with
     /// `from_serializable_state()`. The bytes must have been produced by `into_bytes()`.
@@ -142,14 +142,14 @@ impl Phase2State {
     }
 }
 
-pub struct Phase2ScanMetadata {
-    pub(crate) processor: ParallelPhase<Arc<Phase2State>>,
+pub struct ParallelScanMetadata {
+    pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
 }
 
-impl Phase2ScanMetadata {
+impl ParallelScanMetadata {
     pub fn try_new(
         engine: Arc<dyn Engine>,
-        state: Arc<Phase2State>,
+        state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
         let read_schema = state.file_read_schema();
@@ -159,7 +159,7 @@ impl Phase2ScanMetadata {
     }
 
     pub fn new_from_iter(
-        state: Arc<Phase2State>,
+        state: Arc<ParallelState>,
         iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
         Self {
@@ -168,7 +168,7 @@ impl Phase2ScanMetadata {
     }
 }
 
-impl Iterator for Phase2ScanMetadata {
+impl Iterator for ParallelScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {

@@ -7,7 +7,7 @@
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
-use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
 use delta_kernel::{try_parse_uri, Engine, Error};
 
@@ -82,8 +82,8 @@ impl ReadMetadataRunner {
         }
 
         match phase1.finish()? {
-            AfterPhase1ScanMetadata::Done => {}
-            AfterPhase1ScanMetadata::Phase2 { state, files } => {
+            AfterSequentialScanMetadata::Done => {}
+            AfterSequentialScanMetadata::Parallel { state, files } => {
                 if num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
@@ -108,7 +108,7 @@ impl ReadMetadataRunner {
                             }
 
                             let parallel =
-                                Phase2ScanMetadata::try_new(engine, state, partition_files)?;
+                                ParallelScanMetadata::try_new(engine, state, partition_files)?;
                             for result in parallel {
                                 black_box(result?);
                             }

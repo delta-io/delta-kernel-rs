@@ -77,7 +77,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLoc
 
 #[allow(unused)]
 pub use crate::parallel::parallel_scan_metadata::{
-    AfterPhase1ScanMetadata, Phase1ScanMetadata, Phase2ScanMetadata, Phase2State,
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
 };
 
 /// Controls how file statistics are handled during a scan.
@@ -815,7 +815,7 @@ impl Scan {
 
     /// Start a parallel scan metadata processing for the table.
     ///
-    /// This method returns a [`Phase1ScanMetadata`] iterator that processes commits and
+    /// This method returns a [`SequentialScanMetadata`] iterator that processes commits and
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
     ///
@@ -824,7 +824,7 @@ impl Scan {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use delta_kernel::{Engine, DeltaResult};
-    /// # use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+    /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -838,29 +838,29 @@ impl Scan {
     ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
     ///     .build(engine.as_ref())?;
     /// let scan = snapshot.scan_builder().build()?;
-    /// let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+    /// let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
     ///
     /// // Process sequential phase
-    /// for result in phase1.by_ref() {
+    /// for result in sequential.by_ref() {
     ///     let scan_metadata = result?;
     ///     // Process scan metadata...
     /// }
     ///
     /// // Check if distributed phase is needed
-    /// match phase1.finish()? {
-    ///     AfterPhase1ScanMetadata::Done => {
+    /// match sequential.finish()? {
+    ///     AfterSequentialScanMetadata::Done => {
     ///         // All processing complete
     ///     }
-    ///     AfterPhase1ScanMetadata::Phase2 { state, files } => {
+    ///     AfterSequentialScanMetadata::Parallel { state, files } => {
     ///         // Distribute files for parallel processing (e.g., one file per worker)
     ///         let state = Arc::new(*state);
     ///         for file in files {
-    ///             let phase2 = Phase2ScanMetadata::try_new(
+    ///             let parallel = ParallelScanMetadata::try_new(
     ///                 engine.clone(),
     ///                 state.clone(),
     ///                 vec![file],
     ///             )?;
-    ///             for result in phase2 {
+    ///             for result in parallel {
     ///                 let scan_metadata = result?;
     ///                 // Process scan metadata...
     ///             }
@@ -872,7 +872,7 @@ impl Scan {
     pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<Phase1ScanMetadata> {
+    ) -> DeltaResult<SequentialScanMetadata> {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
@@ -893,7 +893,7 @@ impl Scan {
         )?;
         let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
 
-        Ok(Phase1ScanMetadata::new(sequential))
+        Ok(SequentialScanMetadata::new(sequential))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
