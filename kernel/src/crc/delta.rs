@@ -17,7 +17,7 @@ use super::Crc;
 
 /// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
 /// `.json` commit file during log replay, or from in-memory transaction state during writes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CrcDelta {
     /// Net file count and size changes.
     pub(crate) file_stats: FileStatsDelta,
@@ -31,6 +31,9 @@ pub(crate) struct CrcDelta {
     pub(crate) in_commit_timestamp: Option<i64>,
     /// The operation that produced this commit (e.g. "WRITE", "MERGE").
     pub(crate) operation: Option<String>,
+    /// A file action in this commit had a missing `size` field, making byte-level file stats
+    /// impossible to compute.
+    pub(crate) has_missing_file_size: bool,
 }
 
 /// Tracks whether file stats (`num_files`, `table_size_bytes`) are trustworthy.
@@ -41,7 +44,12 @@ pub(crate) enum FileStatsValidity {
     /// No CRC base: file stats are only deltas accumulated from zero.
     Incomplete,
     /// A non-incremental operation was seen: file stats cannot be determined incrementally.
+    /// A full log replay from scratch could recover correct file stats.
     Indeterminate,
+    /// A file action had a missing size field: correct file stats are impossible to compute.
+    /// Unlike [`Indeterminate`](Self::Indeterminate), no amount of replay can recover the
+    /// missing data.
+    Untrackable,
 }
 
 /// Wrapper around [`Crc`] that tracks file stats validity.
@@ -98,8 +106,11 @@ impl CrcContext {
 
     /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
     ///
-    /// Non-file-stats fields are always updated. File stats are only updated if validity is
-    /// not already [`FileStatsValidity::Indeterminate`] and the operation is incremental-safe.
+    /// Non-file-stats fields are always updated. File stats are only updated when:
+    /// - Validity is not already terminal ([`Untrackable`](FileStatsValidity::Untrackable) or
+    ///   [`Indeterminate`](FileStatsValidity::Indeterminate))
+    /// - The delta has no missing file sizes
+    /// - The operation is incremental-safe
     pub(crate) fn apply(&mut self, delta: &CrcDelta) {
         // Protocol and metadata: replace if present.
         if let Some(ref p) = delta.protocol {
@@ -126,7 +137,18 @@ impl CrcContext {
             self.crc.in_commit_timestamp_opt = Some(ict);
         }
 
-        // File stats: skip if already indeterminate.
+        // File stats: Untrackable is terminal -- nothing can recover missing data.
+        if matches!(self.validity, FileStatsValidity::Untrackable) {
+            return;
+        }
+
+        // Missing file size poisons stats permanently.
+        if delta.has_missing_file_size {
+            self.validity = FileStatsValidity::Untrackable;
+            return;
+        }
+
+        // Indeterminate is also terminal (though theoretically recoverable via full replay).
         if matches!(self.validity, FileStatsValidity::Indeterminate) {
             return;
         }
@@ -164,11 +186,8 @@ mod tests {
                 net_files,
                 net_bytes,
             },
-            protocol: None,
-            metadata: None,
-            domain_metadata_changes: vec![],
-            in_commit_timestamp: None,
             operation: Some("WRITE".to_string()),
+            ..Default::default()
         }
     }
 
@@ -309,6 +328,53 @@ mod tests {
         };
         ctx.apply(&unsafe_change);
         assert_eq!(ctx.validity, FileStatsValidity::Indeterminate);
+    }
+
+    // ===== apply: Untrackable (missing file size) tests =====
+
+    #[test]
+    fn test_missing_file_size_transitions_to_untrackable() {
+        let mut ctx = CrcContext::from_crc(base_crc());
+        let delta = CrcDelta {
+            has_missing_file_size: true,
+            ..write_delta(1, 100)
+        };
+        ctx.apply(&delta);
+        assert_eq!(ctx.validity, FileStatsValidity::Untrackable);
+    }
+
+    #[test]
+    fn test_untrackable_stays_untrackable() {
+        let mut ctx = CrcContext::from_crc(base_crc());
+        let delta = CrcDelta {
+            has_missing_file_size: true,
+            ..write_delta(1, 100)
+        };
+        ctx.apply(&delta);
+        assert_eq!(ctx.validity, FileStatsValidity::Untrackable);
+
+        // Neither safe ops nor unsafe ops recover from Untrackable.
+        ctx.apply(&write_delta(5, 500));
+        assert_eq!(ctx.validity, FileStatsValidity::Untrackable);
+    }
+
+    #[test]
+    fn test_indeterminate_transitions_to_untrackable_on_missing_size() {
+        let mut ctx = CrcContext::from_crc(base_crc());
+        let unsafe_change = CrcDelta {
+            operation: Some("ANALYZE STATS".to_string()),
+            ..write_delta(1, 100)
+        };
+        ctx.apply(&unsafe_change);
+        assert_eq!(ctx.validity, FileStatsValidity::Indeterminate);
+
+        // Missing size escalates Indeterminate to Untrackable.
+        let delta = CrcDelta {
+            has_missing_file_size: true,
+            ..write_delta(1, 100)
+        };
+        ctx.apply(&delta);
+        assert_eq!(ctx.validity, FileStatsValidity::Untrackable);
     }
 
     // ===== apply: non-file-stats field updates =====

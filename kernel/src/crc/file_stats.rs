@@ -15,7 +15,7 @@ use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, RowVisitor};
 
 /// Net file count and size changes from a single commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileStatsDelta {
     /// Net change in file count (files added minus files removed).
     pub(crate) net_files: i64,
