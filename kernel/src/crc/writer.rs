@@ -26,6 +26,8 @@ mod tests {
 
     use object_store::memory::InMemory;
 
+    use std::collections::HashMap;
+
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
     use crate::crc::reader::try_read_crc_file;
@@ -44,10 +46,17 @@ mod tests {
             ],
         )
         .unwrap();
-        let domain_metadata = vec![DomainMetadata::new(
+        // NOTE: Adding more entries here will break test_crc_serialized_json_content because
+        // domain_metadata is backed by an unsorted HashMap -- the serialized array order is
+        // non-deterministic. If you need multiple entries, either make the test order-independent
+        // (e.g. sort both sides by domain name) or switch to a BTreeMap.
+        let domain_metadata = HashMap::from([(
             "delta.rowTracking".to_string(),
-            r#"{"rowIdHighWaterMark":1048576}"#.to_string(),
-        )];
+            DomainMetadata::new(
+                "delta.rowTracking".to_string(),
+                r#"{"rowIdHighWaterMark":1048576}"#.to_string(),
+            ),
+        )]);
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
@@ -65,31 +74,6 @@ mod tests {
             num_deletion_vectors_opt: None,
             deleted_record_counts_histogram_opt: None,
         }
-    }
-
-    /// Strip common leading whitespace from a multi-line string, trim leading/trailing blank
-    /// lines, and return the dedented result.
-    fn dedent(s: &str) -> String {
-        let lines: Vec<&str> = s.lines().collect();
-        let min_indent = lines
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.len() - l.trim_start().len())
-            .min()
-            .unwrap_or(0);
-        lines
-            .iter()
-            .map(|l| {
-                if l.len() >= min_indent {
-                    &l[min_indent..]
-                } else {
-                    l.trim()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string()
     }
 
     #[test]
@@ -116,60 +100,50 @@ mod tests {
         assert_eq!(read_back, crc);
     }
 
-    /// Verify the exact JSON bytes produced by CRC serialization, including protocol table
-    /// features and row tracking domain metadata. The expected JSON is indented for readability;
-    /// we dedent it and compare directly against `serde_json::to_string_pretty` output.
+    /// Verify JSON content produced by CRC serialization via serde_json::Value comparison.
     #[test]
     fn test_crc_serialized_json_content() {
         let crc = test_crc();
-        let actual = serde_json::to_string_pretty(&crc).unwrap();
+        let actual: serde_json::Value = serde_json::to_value(&crc).unwrap();
 
-        // Expected output of serde_json::to_string_pretty (2-space indent, struct field order).
-        // dedent() strips the common leading whitespace so this stays readable in source.
-        let expected = dedent(
-            r#"
-            {
-              "tableSizeBytes": 1024,
-              "numFiles": 5,
-              "numMetadata": 1,
-              "numProtocol": 1,
-              "metadata": {
+        let expected = serde_json::json!({
+            "tableSizeBytes": 1024,
+            "numFiles": 5,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
                 "id": "",
                 "name": null,
                 "description": null,
                 "format": {
-                  "provider": "parquet",
-                  "options": {}
+                    "provider": "parquet",
+                    "options": {}
                 },
                 "schemaString": "",
                 "partitionColumns": [],
                 "createdTime": null,
                 "configuration": {}
-              },
-              "protocol": {
+            },
+            "protocol": {
                 "minReaderVersion": 3,
                 "minWriterVersion": 7,
-                "readerFeatures": [
-                  "columnMapping"
-                ],
+                "readerFeatures": ["columnMapping"],
                 "writerFeatures": [
-                  "columnMapping",
-                  "rowTracking",
-                  "domainMetadata",
-                  "inCommitTimestamp"
+                    "columnMapping",
+                    "rowTracking",
+                    "domainMetadata",
+                    "inCommitTimestamp"
                 ]
-              },
-              "inCommitTimestampOpt": 1234567890,
-              "domainMetadata": [
+            },
+            "inCommitTimestampOpt": 1234567890,
+            "domainMetadata": [
                 {
-                  "domain": "delta.rowTracking",
-                  "configuration": "{\"rowIdHighWaterMark\":1048576}",
-                  "removed": false
+                    "domain": "delta.rowTracking",
+                    "configuration": "{\"rowIdHighWaterMark\":1048576}",
+                    "removed": false
                 }
-              ]
-            }
-        "#,
-        );
+            ]
+        });
 
         assert_eq!(actual, expected);
     }
