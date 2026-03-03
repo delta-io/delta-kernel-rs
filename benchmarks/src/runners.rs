@@ -149,6 +149,7 @@ impl WorkloadRunner for ReadMetadataRunner {
     }
 }
 
+/// Factory function that creates the appropriate read runner for a given operation and config
 pub fn create_read_runner(
     table_info: &TableInfo,
     case_name: &str,

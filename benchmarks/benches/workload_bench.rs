@@ -23,6 +23,8 @@ fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
     Arc::new(engine)
 }
 
+// Loads all workloads and sets up a shared engine and benchmark group
+// For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.) and execution logic
 fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
@@ -67,6 +69,7 @@ fn workload_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+// Registers a workload with Criterion under the given group and benchmarks its `execute()` function
 fn run_benchmark(group: &mut BenchmarkGroup<WallTime>, runner: &dyn WorkloadRunner) {
     group.bench_function(runner.name(), |b| {
         b.iter(|| runner.execute().expect("Benchmark execution failed"))
