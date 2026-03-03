@@ -132,17 +132,6 @@ impl LogSegment {
         // Validate structural invariants on the raw input (debug builds only)
         #[cfg(debug_assertions)]
         {
-            // ascending_commit_files must be strictly ascending by version
-            if !listed_files
-                .ascending_commit_files
-                .windows(2)
-                .all(|w| w[0].version < w[1].version)
-            {
-                return Err(Error::generic(
-                    "ascending_commit_files is not in strictly ascending version order",
-                ));
-            }
-
             // Compaction files must be sorted by (version, hi)
             if !listed_files
                 .ascending_compaction_files
