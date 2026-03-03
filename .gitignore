@@ -3,6 +3,7 @@
 
 # IDE
 .claude/
+.cursor/
 .dir-locals.el
 .idea/
 .vscode/

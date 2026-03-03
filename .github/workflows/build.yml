@@ -67,8 +67,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: build docs
-        run: cargo doc --workspace --all-features
-
+        run: cargo doc --workspace --all-features --no-deps
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
   # ensure that we can build the kernel without any features enabled. Unfortunately, due to how
@@ -145,7 +144,7 @@ jobs:
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.30.x'
+          cmake-version: "3.30.x"
       - name: Install arrow-glib-linux
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
@@ -164,7 +163,7 @@ jobs:
         if: runner.os == 'macOS'
         uses: tecolicom/actions-use-homebrew-tools@v1
         with:
-          tools: 'apache-arrow apache-arrow-glib'
+          tools: "apache-arrow apache-arrow-glib"
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2

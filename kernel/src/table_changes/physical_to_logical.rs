@@ -168,6 +168,7 @@ mod tests {
             commit_timestamp: 1000000000000,
             dv_info: DvInfo::default(),
             remove_dv: None,
+            size: None,
         }
     }
 
@@ -381,6 +382,7 @@ mod tests {
             commit_timestamp: 1000000000000,
             dv_info: DvInfo::default(),
             remove_dv: None,
+            size: None,
         };
 
         // Create a simple schema without CDF metadata columns
