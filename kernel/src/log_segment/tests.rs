@@ -996,25 +996,21 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
     let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
-    let FileMeta {
-        size: sidecar1_size,
-        ..
-    } = add_sidecar_to_store(
+    let sidecar1_size = add_sidecar_to_store(
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
-    .await?;
+    .await?
+    .size;
 
-    let FileMeta {
-        size: sidecar2_size,
-        ..
-    } = add_sidecar_to_store(
+    let sidecar2_size = add_sidecar_to_store(
         &store,
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )
-    .await?;
+    .await?
+    .size;
 
     let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
         vec![
@@ -1076,14 +1072,13 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     // Add a sidecar file with only add actions
-    let FileMeta {
-        size: sidecar_size, ..
-    } = add_sidecar_to_store(
+    let sidecar_size = add_sidecar_to_store(
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )
-    .await?;
+    .await?
+    .size;
 
     let checkpoint_batch = sidecar_batch_with_given_paths_and_sizes(
         vec![("sidecarfile1.parquet", sidecar_size)],
@@ -1365,25 +1360,21 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
-    let FileMeta {
-        size: sidecar1_size,
-        ..
-    } = add_sidecar_to_store(
+    let sidecar1_size = add_sidecar_to_store(
         &store,
         add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )
-    .await?;
+    .await?
+    .size;
 
-    let FileMeta {
-        size: sidecar2_size,
-        ..
-    } = add_sidecar_to_store(
+    let sidecar2_size = add_sidecar_to_store(
         &store,
         add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )
-    .await?;
+    .await?
+    .size;
 
     // Now create checkpoint with correct sidecar sizes
     add_checkpoint_to_store(
