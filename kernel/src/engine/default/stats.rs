@@ -1600,12 +1600,9 @@ mod tests {
 
         // Build stats_columns from all leaf columns in the parquet schema
         let stats_columns = extract_leaf_columns(schema.fields(), &[]);
-        let stats_struct = collect_stats(
-            &record_batch,
-            &stats_columns,
-            DEFAULT_STRING_PREFIX_LENGTH,
-        )
-        .expect("collect stats");
+        let stats_struct =
+            collect_stats(&record_batch, &stats_columns, DEFAULT_STRING_PREFIX_LENGTH)
+                .expect("collect stats");
 
         // Convert kernel stats to JSON
         let json_array = to_json(&stats_struct).expect("convert stats to JSON");
