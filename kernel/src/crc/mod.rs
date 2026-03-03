@@ -5,11 +5,14 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
+mod delta;
 mod file_stats;
 mod lazy;
 mod reader;
 mod writer;
 
+#[allow(unused)]
+pub(crate) use delta::{CrcContext, CrcDelta, FileStatsValidity};
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]
@@ -30,7 +33,7 @@ use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
 /// 3. Contain exactly one JSON object with the schema of this struct.
 // Deserialized directly from JSON via serde. See `reader::try_read_crc_file`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Crc {
     // ===== Required fields =====
