@@ -60,22 +60,27 @@ Test tables organized by feature area. Tables live in two locations:
 
 ## V2 Checkpoints
 
-All in `data/` as `.tar.zst` archives. Tests V2 checkpoints across format, sidecar, and `_last_checkpoint` combinations.
+Tests V2 checkpoints across format, sidecar, and `_last_checkpoint` combinations.
 
-All V2 checkpoint tables share: schema=`id: long`, protocol v3/v7, r:`v2Checkpoint` w:`v2Checkpoint,appendOnly,invariants`, `checkpointPolicy=v2`
+All `data/` V2 checkpoint tables share: schema=`id: long`, protocol v3/v7, r:`v2Checkpoint` w:`v2Checkpoint,appendOnly,invariants`, `checkpointPolicy=v2`.
 
-| Table | Format | Sidecars | `_last_checkpoint` | Tests |
-|-------|--------|----------|--------------------|-------|
-| `v2-checkpoints-json-with-sidecars` | JSON | Yes | No | `v2_checkpoints.rs::v2_checkpoints_json_with_sidecars`, `checkpoint_manifest.rs` test, `sequential_phase.rs::test_sequential_v2_with_sidecars`, `parallel_phase.rs` tests |
-| `v2-checkpoints-json-without-sidecars` | JSON | No | No | `v2_checkpoints.rs::v2_checkpoints_json_without_sidecars`, `sequential_phase.rs::test_sequential_checkpoint_without_sidecars` |
-| `v2-checkpoints-json-with-last-checkpoint` | JSON | Yes | Yes | `v2_checkpoints.rs::v2_checkpoints_json_with_last_checkpoint` |
-| `v2-checkpoints-parquet-with-sidecars` | Parquet | Yes | No | `v2_checkpoints.rs::v2_checkpoints_parquet_with_sidecars`, `checkpoint_manifest.rs` test, `sequential_phase.rs::test_sequential_parquet_checkpoint_with_sidecars`, `parallel_phase.rs` test |
-| `v2-checkpoints-parquet-without-sidecars` | Parquet | No | No | `v2_checkpoints.rs::v2_checkpoints_parquet_without_sidecars` |
-| `v2-checkpoints-parquet-with-last-checkpoint` | Parquet | Yes | Yes | `v2_checkpoints.rs::v2_checkpoints_parquet_with_last_checkpoint` |
-| `v2-classic-checkpoint-json` | JSON | Classic compat | No | `v2_checkpoints.rs::v2_classic_checkpoint_json` |
-| `v2-classic-checkpoint-parquet` | Parquet | Classic compat | No | `v2_checkpoints.rs::v2_classic_checkpoint_parquet` |
-| `v2-checkpoint-json` | golden_data/ JSON | `id: long`, v1/v2, `checkpointInterval=2` | N/A | `golden_tables.rs::golden_test!` |
-| `v2-checkpoint-parquet` | golden_data/ Parquet | `id: long`, v1/v2, `checkpointInterval=2` | N/A | `golden_tables.rs::golden_test!` |
+| Table | Location | Format | Sidecars | `_last_checkpoint` | Tests |
+|-------|----------|--------|----------|--------------------|-------|
+| `v2-checkpoints-json-with-sidecars` | data/ .tar.zst | JSON | Yes | No | `v2_checkpoints.rs::v2_checkpoints_json_with_sidecars`, `checkpoint_manifest.rs` test, `sequential_phase.rs::test_sequential_v2_with_sidecars`, `parallel_phase.rs` tests |
+| `v2-checkpoints-json-without-sidecars` | data/ .tar.zst | JSON | No | No | `v2_checkpoints.rs::v2_checkpoints_json_without_sidecars`, `sequential_phase.rs::test_sequential_checkpoint_without_sidecars` |
+| `v2-checkpoints-json-with-last-checkpoint` | data/ .tar.zst | JSON | Yes | Yes | `v2_checkpoints.rs::v2_checkpoints_json_with_last_checkpoint` |
+| `v2-checkpoints-parquet-with-sidecars` | data/ .tar.zst | Parquet | Yes | No | `v2_checkpoints.rs::v2_checkpoints_parquet_with_sidecars`, `checkpoint_manifest.rs` test, `sequential_phase.rs::test_sequential_parquet_checkpoint_with_sidecars`, `parallel_phase.rs` test |
+| `v2-checkpoints-parquet-without-sidecars` | data/ .tar.zst | Parquet | No | No | `v2_checkpoints.rs::v2_checkpoints_parquet_without_sidecars` |
+| `v2-checkpoints-parquet-with-last-checkpoint` | data/ .tar.zst | Parquet | Yes | Yes | `v2_checkpoints.rs::v2_checkpoints_parquet_with_last_checkpoint` |
+| `v2-classic-checkpoint-json` | data/ .tar.zst | JSON | Classic compat | No | `v2_checkpoints.rs::v2_classic_checkpoint_json` |
+| `v2-classic-checkpoint-parquet` | data/ .tar.zst | Parquet | Classic compat | No | `v2_checkpoints.rs::v2_classic_checkpoint_parquet` |
+
+The golden V2 checkpoint tables have a different protocol (v1/v2, no table features):
+
+| Table | Location | Schema | Protocol | Features | Tests |
+|-------|----------|--------|----------|----------|-------|
+| `v2-checkpoint-json` | golden_data/ | `id: long` | v1/v2 | `checkpointInterval=2` | `golden_tables.rs::golden_test!` |
+| `v2-checkpoint-parquet` | golden_data/ | `id: long` | v1/v2 | `checkpointInterval=2` | `golden_tables.rs::golden_test!` |
 
 ## Data Skipping & Statistics
 
