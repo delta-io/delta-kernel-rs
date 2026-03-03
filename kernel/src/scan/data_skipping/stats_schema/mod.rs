@@ -102,6 +102,14 @@ use column_filter::StatsColumnFilter;
 ///
 /// To get the physical stats schema (with physical column names for column mapping),
 /// call `make_physical(column_mapping_mode)` on the result.
+///
+/// # Parameters
+///
+/// - `clustering_columns`: Columns that must always be included in statistics (write path).
+///   Per the Delta protocol, clustering columns must have statistics regardless of table
+///   property settings.
+/// - `requested_columns`: Filter output to only these columns (read path). If specified,
+///   only columns that also pass table property filtering will be included.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     logical_data_schema: &Schema,
@@ -167,11 +175,11 @@ pub(crate) fn stats_column_names(
     columns
 }
 
-/// Creates a stats schema from a referenced schema (columns from predicate).
+/// Creates a stats schema from a referenced schema (e.g. columns from a predicate).
 /// Returns schema: `{ numRecords, nullCount, minValues, maxValues }`
 ///
 /// This is used to build the schema for parsing JSON stats and for reading stats_parsed
-/// from checkpoints.
+/// from checkpoints when only a subset of columns is needed (e.g. predicate-referenced columns).
 pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
     let stats_schema = NullableStatsTransform
         .transform_struct(referenced_schema)?
@@ -274,13 +282,15 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
         }
 
         // We always traverse struct fields (they don't count against the column limit),
-        // but we only include leaf fields if they qualify based on column_trie config.
-        // When column_trie is None, all leaf fields are included (up to n_columns limit).
+        // but we only include leaf fields if they qualify based on table properties.
+        // The n_columns limit is based on schema order, so we count columns that pass
+        // the table filter regardless of requested_columns.
         if !matches!(data_type, DataType::Struct(_)) {
             if !self.filter.should_include_for_table() {
                 self.filter.exit_field();
                 return None;
             }
+            // Count this column toward the n_columns limit
             self.filter.record_included();
 
             // After recording the column for counting purposes, check if it passes the
@@ -446,19 +456,24 @@ mod tests {
 
     use super::*;
 
+    /// Builds an expected stats schema from the given null count and min/max nested schemas.
+    fn expected_stats(null_count: StructType, min_max: StructType) -> StructType {
+        StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", null_count),
+            StructField::nullable("minValues", min_max.clone()),
+            StructField::nullable("maxValues", min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ])
+    }
+
     #[test]
     fn test_stats_schema_simple() {
         let properties: TableProperties = [("key", "value")].into();
         let file_schema = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
         let stats_schema = expected_stats_schema(&file_schema, &properties, None, None).unwrap();
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", file_schema.clone()),
-            StructField::nullable("minValues", file_schema.clone()),
-            StructField::nullable("maxValues", file_schema),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(file_schema.clone(), file_schema);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -488,13 +503,7 @@ mod tests {
             .unwrap()
             .into_owned();
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(null_count, expected_min_max);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -546,13 +555,7 @@ mod tests {
             StructField::nullable("metadata", DataType::Struct(Box::new(expected_nested))),
         ]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null),
-            StructField::nullable("minValues", expected_fields.clone()),
-            StructField::nullable("maxValues", expected_fields.clone()),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_null, expected_fields);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -587,13 +590,7 @@ mod tests {
             .unwrap()
             .into_owned();
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", null_count),
-            StructField::nullable("minValues", expected_fields.clone()),
-            StructField::nullable("maxValues", expected_fields.clone()),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(null_count, expected_fields);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -620,13 +617,7 @@ mod tests {
             .unwrap()
             .into_owned();
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", null_count),
-            StructField::nullable("minValues", expected_fields.clone()),
-            StructField::nullable("maxValues", expected_fields.clone()),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(null_count, expected_fields);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -658,13 +649,7 @@ mod tests {
         let expected_min_max =
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_null_count, expected_min_max);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -712,13 +697,7 @@ mod tests {
             StructField::nullable("user", DataType::Struct(Box::new(expected_minmax_user))),
         ]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_null_count, expected_min_max);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -801,13 +780,7 @@ mod tests {
             StructField::nullable("col2", DataType::STRING),
         ]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_null_count, expected_min_max);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -954,13 +927,7 @@ mod tests {
             StructField::nullable("c", DataType::INTEGER),
         ]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null_count),
-            StructField::nullable("minValues", expected_min_max.clone()),
-            StructField::nullable("maxValues", expected_min_max),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_null_count, expected_min_max);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -1012,19 +979,7 @@ mod tests {
             field_with_physical_name("col_b", "phys_b", DataType::STRING),
         ]);
 
-        let stats_schema = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable(
-                "nullCount",
-                DataType::Struct(Box::new(inner_schema.clone())),
-            ),
-            StructField::nullable(
-                "minValues",
-                DataType::Struct(Box::new(inner_schema.clone())),
-            ),
-            StructField::nullable("maxValues", DataType::Struct(Box::new(inner_schema))),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let stats_schema = expected_stats(inner_schema.clone(), inner_schema);
 
         let result = PhysicalStatsSchemaTransform {
             column_mapping_mode: ColumnMappingMode::Name,
@@ -1168,13 +1123,7 @@ mod tests {
         let expected_nested =
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_nested.clone()),
-            StructField::nullable("minValues", expected_nested.clone()),
-            StructField::nullable("maxValues", expected_nested),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_nested.clone(), expected_nested);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -1243,13 +1192,7 @@ mod tests {
         let expected_null =
             StructType::new_unchecked([StructField::nullable("name", DataType::LONG)]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null),
-            StructField::nullable("minValues", expected_nested.clone()),
-            StructField::nullable("maxValues", expected_nested),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ]);
+        let expected = expected_stats(expected_null, expected_nested);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -1276,13 +1219,126 @@ mod tests {
         let expected_null =
             StructType::new_unchecked([StructField::nullable("name", DataType::LONG)]);
 
-        let expected = StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", expected_null),
-            StructField::nullable("minValues", expected_nested.clone()),
-            StructField::nullable("maxValues", expected_nested),
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        let expected = expected_stats(expected_null, expected_nested);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_multiple_requested_columns() {
+        let properties: TableProperties = [("key", "value")].into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("value", DataType::INTEGER),
         ]);
+
+        let columns = [ColumnName::new(["id"]), ColumnName::new(["name"])];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, None, Some(&columns)).unwrap();
+
+        let expected_nested = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+        let expected_null = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::LONG),
+        ]);
+
+        let expected = expected_stats(expected_null, expected_nested);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_nested_requested_column() {
+        let properties: TableProperties = [("key", "value")].into();
+        let user_struct = StructType::new_unchecked([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+        ]);
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+        ]);
+
+        let columns = [ColumnName::new(["user", "name"])];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, None, Some(&columns)).unwrap();
+
+        let expected_user_nested =
+            StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
+        let expected_nested = StructType::new_unchecked([StructField::nullable(
+            "user",
+            DataType::Struct(Box::new(expected_user_nested)),
+        )]);
+
+        let expected_user_null =
+            StructType::new_unchecked([StructField::nullable("name", DataType::LONG)]);
+        let expected_null = StructType::new_unchecked([StructField::nullable(
+            "user",
+            DataType::Struct(Box::new(expected_user_null)),
+        )]);
+
+        let expected = expected_stats(expected_null, expected_nested);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_empty_requested_columns() {
+        let properties: TableProperties = [("key", "value")].into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        // Empty columns list should return the full schema (same as None)
+        let columns: [ColumnName; 0] = [];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, None, Some(&columns)).unwrap();
+        let full_stats_schema =
+            expected_stats_schema(&file_schema, &properties, None, None).unwrap();
+
+        assert_eq!(&full_stats_schema, &stats_schema);
+    }
+
+    #[test]
+    fn test_mixed_nested_and_top_requested() {
+        let properties: TableProperties = [("key", "value")].into();
+        let user_struct = StructType::new_unchecked([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+        ]);
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
+            StructField::nullable("value", DataType::DOUBLE),
+        ]);
+
+        let columns = [ColumnName::new(["id"]), ColumnName::new(["user", "age"])];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, None, Some(&columns)).unwrap();
+
+        let expected_user_nested =
+            StructType::new_unchecked([StructField::nullable("age", DataType::INTEGER)]);
+        let expected_nested = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable(
+                "user",
+                DataType::Struct(Box::new(expected_user_nested.clone())),
+            ),
+        ]);
+
+        let expected_user_null =
+            StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]);
+        let expected_null = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(expected_user_null))),
+        ]);
+
+        let expected = expected_stats(expected_null, expected_nested);
 
         assert_eq!(&expected, &stats_schema);
     }
