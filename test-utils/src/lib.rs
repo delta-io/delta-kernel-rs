@@ -215,6 +215,7 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
+// TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
 /// put a commit file into the specified object store.
 pub async fn add_commit(
     store: &dyn ObjectStore,
