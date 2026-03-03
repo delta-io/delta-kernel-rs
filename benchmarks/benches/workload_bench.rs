@@ -6,15 +6,13 @@ use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
-mod utils;
-
-use delta_kernel::benchmarks::models::{
+use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
 };
-use delta_kernel::benchmarks::runners::{
+use delta_kernel_benchmarks::runners::{
     create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
 };
-use utils::load_all_workloads;
+use delta_kernel_benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
     use object_store::local::LocalFileSystem;
@@ -25,6 +23,8 @@ fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
     Arc::new(engine)
 }
 
+// Loads all workloads and sets up a shared engine and benchmark group
+// For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.) and execution logic
 fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
@@ -69,6 +69,7 @@ fn workload_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+// Registers a workload with Criterion under the given group and benchmarks its `execute()` function
 fn run_benchmark(group: &mut BenchmarkGroup<WallTime>, runner: &dyn WorkloadRunner) {
     group.bench_function(runner.name(), |b| {
         b.iter(|| runner.execute().expect("Benchmark execution failed"))

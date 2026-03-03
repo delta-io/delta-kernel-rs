@@ -1,17 +1,19 @@
 //! Utility functions for loading workload specifications
 
-use delta_kernel::benchmarks::models::{Spec, TableInfo, Workload};
+use crate::models::{Spec, TableInfo, Workload};
 use flate2::read::GzDecoder;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use tar::Archive;
 
 // Workload extraction configuration
-const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads.tar.gz");
-const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads");
-const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/workloads/.done");
+const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads.tar.gz");
+const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads");
+const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads/.done");
 const TABLE_INFO_FILE_NAME: &str = "table_info.json";
 const SPECS_DIR_NAME: &str = "specs";
+const BENCHMARKS_DIR_NAME: &str = "benchmarks";
+const DELTA_DIR_NAME: &str = "delta";
 
 /// Loads all workload specifications from OUTPUT_FOLDER
 /// On first run, extracts from WORKLOAD_TAR if it exists.
@@ -22,7 +24,7 @@ pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>>
     }
 
     let spec_dir = PathBuf::from(OUTPUT_FOLDER);
-    let benchmarks_dir = spec_dir.join("benchmarks");
+    let benchmarks_dir = spec_dir.join(BENCHMARKS_DIR_NAME);
     let table_directories = find_table_directories(&benchmarks_dir)?;
 
     let mut all_workloads = Vec::new();
@@ -34,10 +36,16 @@ pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>>
     Ok(all_workloads)
 }
 
+/// Checks if workload specs have already been extracted by looking for the .done file
+/// If the .done file exists, we don't need to extract the workload specs again
+///
+/// TODO(#1939): the usage of this function is a naive check;
+/// currently, the .done file must be manually deleted to force re-extraction of workload specs
 fn workload_specs_exist() -> bool {
     Path::new(DONE_FILE).exists()
 }
 
+/// Extracts workload specs from WORKLOAD_TAR into OUTPUT_FOLDER and writes a .done file on success
 fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
     let tar_path = Path::new(WORKLOAD_TAR);
 
@@ -51,6 +59,8 @@ fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Extracts a tarball at `path` into OUTPUT_FOLDER
+/// This is used to extract WORKLOAD_TAR into OUTPUT_FOLDER
 fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let tarball = GzDecoder::new(BufReader::new(file));
@@ -66,6 +76,8 @@ fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Writes DONE_FILE to mark that workload specs have been successfully extracted
+/// See TODO(#1939) for `workload_specs_exist` above; this file must be manually deleted to force re-extraction
 fn write_done_file() -> Result<(), Box<dyn std::error::Error>> {
     let mut done_file = std::fs::File::create(DONE_FILE)
         .map_err(|e| format!("Failed to create .done file: {}", e))?;
@@ -75,6 +87,8 @@ fn write_done_file() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Returns all subdirectories of `base_dir`. In practice this is called with base_dir = OUTPUT_FOLDER/BENCHMARKS_DIR_NAME,
+/// Each subdirectory returned represents a table to be benchmarked and contains the table itself, specs, and table info
 fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let entries = std::fs::read_dir(base_dir)
         .map_err(|e| format!("Cannot read directory {}: {}", base_dir.display(), e))?;
@@ -92,6 +106,9 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
     Ok(table_dirs)
 }
 
+/// Loads all workload specs for a single table
+/// Reads table info from TABLE_INFO_FILE_NAME at the root of `table_dir`,
+/// then loads each JSON spec from `table_dir/SPECS_DIR_NAME`
 fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR_NAME);
 
@@ -108,8 +125,9 @@ fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std:
         )
     })?;
 
+    // If the table path is not provided, assume that the Delta table is in a DELTA_DIR_NAME/ subdirectory at the same level as table_info.json
     if table_info.table_path.is_none() {
-        let delta_dir = table_dir.join("delta");
+        let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
             return Err(format!(
                 "Table data not found for '{}'. Expected a 'delta' directory in {}",
@@ -130,6 +148,7 @@ fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std:
     Ok(workloads)
 }
 
+/// Returns all JSON files in `specs_dir`, where each file is a benchmark spec for the table
 fn find_spec_files(specs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let entries = std::fs::read_dir(specs_dir)
         .map_err(|e| format!("Cannot read directory {}: {}", specs_dir.display(), e))?;
@@ -147,6 +166,8 @@ fn find_spec_files(specs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error:
     Ok(spec_files)
 }
 
+/// Parses a single spec JSON file and builds a Workload from it, combining the spec with the
+/// provided table info and using the spec file's name (without extension) as the case name
 fn load_single_spec(
     spec_file: &Path,
     table_info: TableInfo,

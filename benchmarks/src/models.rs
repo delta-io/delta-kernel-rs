@@ -4,15 +4,15 @@ use serde::Deserialize;
 
 use std::path::{Path, PathBuf};
 
-// ReadConfig represents a specific configuration for a read operation
-// A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
+/// ReadConfig represents a specific configuration for a read operation
+/// A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
 #[derive(Clone, Debug)]
 pub struct ReadConfig {
     pub name: String,
     pub parallel_scan: ParallelScan,
 }
 
-// Provides a default set of read configs for a given table, read spec, and operation
+/// Provides a default set of read configs for a given table, read spec, and operation
 pub fn default_read_configs() -> Vec<ReadConfig> {
     vec![ReadConfig {
         name: "serial".into(),
@@ -26,7 +26,7 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
-// Table info JSON files are located at the root of each table directory
+/// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 pub struct TableInfo {
     pub name: String,                // Table name used for identifying the table
@@ -58,8 +58,8 @@ impl TableInfo {
     }
 }
 
-// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
-// There will be multiple specs for a given table
+/// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
+/// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
@@ -106,7 +106,7 @@ impl Spec {
     }
 }
 
-// For Read specs, we will either run a read data operation or a read metadata operation
+/// For Read specs, we will either run a read data operation or a read metadata operation
 #[derive(Clone, Copy, Debug)]
 pub enum ReadOperation {
     ReadData,
@@ -122,7 +122,7 @@ impl ReadOperation {
     }
 }
 
-// Partial workload specification loaded from JSON - table, case name, and spec only
+/// Partial workload specification loaded from JSON - table, case name, and spec only
 #[derive(Clone, Debug)]
 pub struct Workload {
     pub table_info: TableInfo,
