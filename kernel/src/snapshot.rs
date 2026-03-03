@@ -17,8 +17,8 @@ use crate::clustering::get_clustering_columns_from_domain_metadata;
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
-use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
+use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
@@ -185,7 +185,7 @@ impl Snapshot {
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
-        let new_listed_files = ListedLogFiles::list(
+        let new_listed_files = LogSegmentFiles::list(
             storage.as_ref(),
             &log_root,
             log_tail,
@@ -307,7 +307,7 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFiles {
+            LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.listed.checkpoint_parts.clone(),
@@ -857,8 +857,8 @@ mod tests {
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFiles;
     use crate::log_segment::LogSegment;
+    use crate::log_segment_files::LogSegmentFiles;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::table_features::{
@@ -1807,7 +1807,7 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFiles {
+        let listed_files = LogSegmentFiles {
             checkpoint_parts,
             ..Default::default()
         }
@@ -2130,7 +2130,7 @@ mod tests {
 
     /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
     /// version onwards. We must ensure that it deduplicates compaction files, since producing
-    /// duplicates violated the sort invariant in ListedLogFilesBuilder::build().
+    /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
     #[tokio::test]
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());

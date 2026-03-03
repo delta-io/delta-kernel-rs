@@ -22,9 +22,9 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 #[cfg(feature = "internal-api")]
-pub use crate::listed_log_files::ListedLogFiles;
+pub use crate::log_segment_files::LogSegmentFiles;
 #[cfg(not(feature = "internal-api"))]
-use crate::listed_log_files::ListedLogFiles;
+use crate::log_segment_files::LogSegmentFiles;
 use crate::schema::compare::SchemaComparison;
 
 use itertools::Itertools;
@@ -102,7 +102,7 @@ pub(crate) struct LogSegment {
     /// Used to determine if `stats_parsed` is available for data skipping.
     pub checkpoint_schema: Option<SchemaRef>,
     /// The set of log files found during listing.
-    pub listed: ListedLogFiles,
+    pub listed: LogSegmentFiles,
 }
 
 impl LogSegment {
@@ -118,13 +118,13 @@ impl LogSegment {
             checkpoint_version: None,
             log_root,
             checkpoint_schema: None,
-            listed: ListedLogFiles::default(),
+            listed: LogSegmentFiles::default(),
         }
     }
 
     #[internal_api]
     pub(crate) fn try_new(
-        mut listed_files: ListedLogFiles,
+        mut listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
         checkpoint_schema: Option<SchemaRef>,
@@ -286,10 +286,10 @@ impl LogSegment {
 
         let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
+                LogSegmentFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
             }
             (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                ListedLogFiles::list_with_checkpoint_hint(
+                LogSegmentFiles::list_with_checkpoint_hint(
                     &cp,
                     storage,
                     &log_root,
@@ -297,7 +297,7 @@ impl LogSegment {
                     Some(end_version),
                 )?
             }
-            _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
+            _ => LogSegmentFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
         };
 
         LogSegment::try_new(
@@ -330,10 +330,10 @@ impl LogSegment {
 
         // TODO: compactions?
         let listed_files =
-            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
+            LogSegmentFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
+        // - [`LogSegmentFiles::list_commits`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             listed_files
@@ -378,7 +378,7 @@ impl LogSegment {
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
         let mut listed_commits =
-            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
+            LogSegmentFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = listed_commits.ascending_commit_files_mut();
@@ -868,7 +868,7 @@ impl LogSegment {
             checkpoint_version: None,
             log_root: self.log_root.clone(),
             checkpoint_schema: None,
-            listed: ListedLogFiles {
+            listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
                 checkpoint_parts: vec![],
@@ -893,7 +893,7 @@ impl LogSegment {
             checkpoint_version: self.checkpoint_version,
             log_root: self.log_root.clone(),
             checkpoint_schema: self.checkpoint_schema.clone(),
-            listed: ListedLogFiles {
+            listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
                 checkpoint_parts: self.listed.checkpoint_parts.clone(),

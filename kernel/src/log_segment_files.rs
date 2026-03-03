@@ -1,11 +1,11 @@
-//! [`ListedLogFiles`] is a struct holding the result of listing the delta log. Currently, it
+//! [`LogSegmentFiles`] is a struct holding the result of listing the delta log. Currently, it
 //! exposes three APIs for listing:
 //! 1. [`list_commits`]: Lists all commit files between the provided start and end versions.
 //! 2. [`list`]: Lists all commit and checkpoint files between the provided start and end versions.
 //! 3. [`list_with_checkpoint_hint`]: Lists all commit and checkpoint files after the provided
 //!    checkpoint hint.
 //!
-//! After listing, one can leverage the [`ListedLogFiles`] to construct a [`LogSegment`].
+//! After listing, one can leverage the [`LogSegmentFiles`] to construct a [`LogSegment`].
 //!
 //! [`list_commits`]: Self::list_commits
 //! [`list`]: Self::list
@@ -34,7 +34,7 @@ use url::Url;
 /// - `max_published_version`: The highest published commit file version, or `None` if no published commits were found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[internal_api]
-pub(crate) struct ListedLogFiles {
+pub(crate) struct LogSegmentFiles {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     pub checkpoint_parts: Vec<ParsedLogPath>,
@@ -121,8 +121,8 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
     checkpoints
 }
 
-impl ListedLogFiles {
-    /// Validates the structural invariants of a [`ListedLogFiles`] and returns it if valid.
+impl LogSegmentFiles {
+    /// Validates the structural invariants of a [`LogSegmentFiles`] and returns it if valid.
     ///
     /// Validation only runs under `#[cfg(debug_assertions)]` to avoid overhead in production
     /// builds. In release builds this is a no-op that returns `Ok(self)`.
@@ -236,7 +236,7 @@ impl ListedLogFiles {
         }
 
         let latest_commit_file = listed_commits.last().cloned();
-        ListedLogFiles {
+        LogSegmentFiles {
             ascending_commit_files: listed_commits,
             latest_commit_file,
             max_published_version,
@@ -246,7 +246,7 @@ impl ListedLogFiles {
     }
 
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
-    /// If successful, this returns a `ListedLogFiles`.
+    /// If successful, this returns a `LogSegmentFiles`.
     ///
     /// The `log_tail` is an optional sequence of commits provided by the caller, e.g. via
     /// [`SnapshotBuilder::with_log_tail`]. It may contain either published or staged commits. The
@@ -289,7 +289,7 @@ impl ListedLogFiles {
         #[derive(Default)]
         struct ListingAccumulator {
             /// The result being built up
-            output: ListedLogFiles,
+            output: LogSegmentFiles,
             /// Staging area for checkpoint parts at the current version group; always empty when iteration ends
             new_checkpoint_parts: Vec<ParsedLogPath>,
             /// End-version bound used in process_file() to filter CompactedCommit files
@@ -450,7 +450,7 @@ impl ListedLogFiles {
             builder.output.latest_commit_file = Some(commit_file.clone());
         }
 
-        ListedLogFiles { ..builder.output }.validate()
+        LogSegmentFiles { ..builder.output }.validate()
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
@@ -612,7 +612,7 @@ mod list_log_files_with_log_tail_tests {
         );
     }
 
-    /// Helper to call `ListedLogFiles::list()` and destructure the result for assertions.
+    /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
     /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
     ///          latest_crc_file, latest_commit_file, max_published_version).
     #[allow(clippy::type_complexity)]
@@ -631,7 +631,7 @@ mod list_log_files_with_log_tail_tests {
         Option<Version>,
     ) {
         let r =
-            ListedLogFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+            LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
         (
             r.ascending_commit_files,
             r.ascending_compaction_files,
