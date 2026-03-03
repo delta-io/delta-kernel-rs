@@ -22,6 +22,7 @@
 13. Add stats_columns to ParquetHandler ([#1668])
 14. Add StatisticsCollector core with numRecords ([#1662])
 15. Return updated Snapshot from `Snapshot::publish` ([#1694])
+- Snapshot::publish now takes self: Arc<Self> and returns DeltaResult<SnapshotRef> instead of ()
 16. Pass engine to Snapshot::transaction() for domain metadata access ([#1707])
 17. Read parsed-stats from checkpoint ([#1638])
 18.  feat: add get clustering columns in transactions ([#1693])
@@ -38,7 +39,7 @@
    - No migration needed; this introduces new benchmarking infrastructure not yet used anywhere
 27. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
 28. Fix get_app_id_version to take &self ([#1770])
-63. Add ability to  'enter' the runtime to the default engine ([#1847])
+29. Add ability to  'enter' the runtime to the default engine ([#1847])
     - Implementors of the `TaskExecutor` trait now need to support this
 
 #### In uc-catalog crate
@@ -51,6 +52,7 @@
 3. Implement `Scalar::From<HashMap<K, V>>` ([#1541])
 4. Add `logSegment.new_with_commit_appended` API ([#1602])
 5. `snapshot.new_post_commit` ([#1604])
+- Creates a new Snapshot reflecting a just-committed transaction without re-reading the log
 6. Enable Arrow to convert nullable StructArray to RecordBatch ([#1635])
 7. Add `snapshot.checkpoint()` for all-in-one checkpointing ([#1600])
 8. Add a tracing statement to print table configuration for each version ([#1634])
@@ -126,6 +128,7 @@
 4. Enable arrow conversion from Int96 ([#1653])
 5. Preserve null bitmap in nested transform expressions ([#1645])
 6. Include domain metadata in checkpoints ([#1718])
+- Domain metadata was not being written to checkpoint files, causing it to be lost after checkpoints
 7. Propagate struct-level nulls when computing nested column stats ([#1745])
 8. Express One Zone URLs do not support lexicographical ordering ([#1753])
 9. Preserve non-commit files (CRC, checkpoints, compactions) at log tail versions ([#1817])
@@ -193,6 +196,7 @@
 3. Stats-schema improvements ([#1642])
 4. Add Rust caching to build and test jobs ([#1672])
 5. Use cargo-nextest for parallel test execution ([#1673])
+- ~19x faster locally via per-test process isolation
 6. Fix ffi_test cache miss by using consistent toolchain action ([#1702])
 7. Add caching and optimize tool installation across all jobs ([#1674])
 8. Remove unused remove metadata ([#1732])
