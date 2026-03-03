@@ -14,7 +14,6 @@
    - Committer implementations must now return a FileMeta of the written file after each commit, instead of only returning the committed version
 6. Add function to check if schema supports parsed stats ([#1573])
 7. Add serialization/deserialization support for Predicates and Expressions ([#1543])
-8. Provide expected stats schema ([#1592])
 9. Distributed Log Replay serialization/deserialization ([#1503])
 10. Introduce Deduplicator trait to unify mutable and immutable deduplication ([#1537])
 11. Add ffi api to perform a checkpoint ([#1619])
@@ -34,12 +33,11 @@
 22. Use physical stats column names in `WriteContext` ([#1836])
     - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
 23. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
-   - `WriteContext.physical_schema` now respects column mapping, and retains partition columns when `materializePartitionColumns` is enabled. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
-26. Implement the read metadata workload runner ([#1919])
-   - No migration needed; this introduces new benchmarking infrastructure not yet used anywhere
+    - `WriteContext.physical_schema` now respects column mapping, and retains partition columns when `materializePartitionColumns` is enabled. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
 26. Fix get_app_id_version to take &self ([#1770])
+    - If you are calling `get_app_id` pass a reference to the `Snapshot` not `Arc<Snapshot>`
 27. Add ability to  'enter' the runtime to the default engine ([#1847])
-   - Implementors of the `TaskExecutor` trait now need to support this
+    - Implementors of the `TaskExecutor` trait now need to support this
 
 ### 🚀 Features / new APIs
 1. Add doctests for `IntoEngineData` derive macro ([#1580])
@@ -111,6 +109,8 @@
 65. Include max known published commit version inside of `LogSegment` ([#1587])
 66. Use CRC for In-Commit-Timestamp reading ([#1806])
 67. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
+68. Implement the read metadata workload runner ([#1919])
+69. Provide expected stats schema ([#1592])
 
 ### 🐛 Bug Fixes
 
