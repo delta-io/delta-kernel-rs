@@ -107,14 +107,13 @@ mod tests {
         let dms = crc.domain_metadata.unwrap();
         assert_eq!(dms.len(), 3);
 
-        assert_eq!(dms[0].domain(), "delta.clustering");
-        assert!(dms[0].configuration().contains("clusteringColumns"));
-
-        assert_eq!(dms[1].domain(), "delta.rowTracking");
-        assert!(dms[1].configuration().contains("rowIdHighWaterMark"));
-
-        assert_eq!(dms[2].domain(), "myApp.metadata");
-        assert!(dms[2].configuration().contains("key"));
+        assert!(dms["delta.clustering"]
+            .configuration()
+            .contains("clusteringColumns"));
+        assert!(dms["delta.rowTracking"]
+            .configuration()
+            .contains("rowIdHighWaterMark"));
+        assert!(dms["myApp.metadata"].configuration().contains("key"));
 
         // Skipped fields are always None (pending serde support on their types)
         assert!(crc.txn_id.is_none());
