@@ -130,8 +130,6 @@ impl LogSegment {
         checkpoint_schema: Option<SchemaRef>,
     ) -> DeltaResult<Self> {
         // Validate compaction files are sorted by (version, hi) in a single pass.
-        // Note: the ascending_commit_files ordering check is omitted because the contiguity
-        // check below (version + 1 == next_version) is strictly stronger.
         for pair in listed_files.ascending_compaction_files.windows(2) {
             match pair {
                 [ParsedLogPath {
