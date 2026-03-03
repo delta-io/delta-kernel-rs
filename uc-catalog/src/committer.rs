@@ -56,7 +56,8 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
 
         let committed = engine.storage_handler().head(&staged_commit_path)?;
         info!(
-            staged_file = ?committed,
+            staged_file_size = committed.size,
+            staged_file_last_modified = ?committed.last_modified,
             "Wrote staged commit file"
         );
         let max_published_version =
