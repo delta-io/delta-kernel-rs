@@ -181,7 +181,7 @@ mod tests {
         (engine, store, table_root)
     }
 
-    // TODO: update this function to properly store the table at table_root
+    // TODO (#1990): update this function to properly store the table at table_root
     async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: String) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
