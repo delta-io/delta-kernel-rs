@@ -11,7 +11,11 @@ cargo bench -p delta_kernel_benchmarks
 cargo bench -p delta_kernel_benchmarks --bench workload_bench
 
 # filter to benchmarks whose name contains a substring (Criterion substring matching)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_table_name"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
+
+# profile a benchmark and generate a flamegraph 
+cargo install samply
+samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
 ```
 
 ## Workload data layout
