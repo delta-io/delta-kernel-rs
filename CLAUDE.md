@@ -96,6 +96,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   version (time travel), and updating from an existing snapshot.
 - Consider table state: only deltas (`00.json` to `0N.json`), after a checkpoint, after
   a CRC (`0N.crc`) file, after log compaction, etc.
+- Prefer descriptive test names over doc comments. Encode the scenario and expected
+  behavior in the test name. Only add a test doc comment when the intent is too
+  verbose or complex to express succinctly in the name.
 
 ## Protocol TLDR
 
@@ -155,8 +158,12 @@ Keep this list updated when new protocol features are added to kernel.
 ## Pull Requests
 
 **Title:** use conventional commit format, lowercase after prefix, no period at the end.
+Allowed types: `feat`, `fix`, `refactor`, `chore`, `docs`, `perf`, `test`, `ci`.
+If the pull request contains a breaking change, the type must have a `!` suffix.
 Examples: `feat: add checkpoint stream support`, `fix: handle empty log segment`,
 `refactor: extract common log replay logic`
+Breaking change examples: `feat!: make_physical takes column mapping and sets parquet field ids`,
+`chore!: remove the arrow-55 feature`
 
 **Description:** follow the template in `.github/PULL_REQUEST_TEMPLATE.md`. Error on the
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
