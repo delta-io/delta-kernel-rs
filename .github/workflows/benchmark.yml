@@ -1,20 +1,33 @@
-name: benchmark pull requests
+name: run benchmarks
 
-on: [pull_request_target]
+on: [pull_request]
 
 jobs:
-  runBenchmark:
+  benchmark:
     name: run benchmark
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
-      - uses: boa-dev/criterion-compare-action@v3
+      - name: Benchmark base branch
+        run: |
+          git checkout ${{ github.base_ref }}
+          cargo bench --bench workload_bench -- --save-baseline base --noplot
+        working-directory: benchmarks
+      - name: Benchmark PR branch
+        run: |
+          git checkout ${{ github.sha }}
+          cargo bench --bench workload_bench -- --baseline base --noplot 2>&1 | tee criterion-output.txt
+        working-directory: benchmarks
+      - name: Save PR number
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+      - uses: actions/upload-artifact@v4
         with:
-          cwd: benchmarks
-          benchName: workload_bench
-          branchName: ${{ github.base_ref }}
+          name: benchmark-results
+          path: |
+            criterion-output.txt
+            pr-number.txt

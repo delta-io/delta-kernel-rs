@@ -1,0 +1,33 @@
+name: post benchmark results
+
+on:
+  workflow_run:
+    workflows: ["run benchmarks"]
+    types: [completed]
+
+jobs:
+  comment:
+    name: post comment
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Post comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const prNumber = parseInt(fs.readFileSync('pr-number.txt', 'utf8').trim());
+            const output = fs.readFileSync('criterion-output.txt', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `## Benchmark Results\n\`\`\`\n${output}\n\`\`\``,
+            });
