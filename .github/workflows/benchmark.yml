@@ -16,6 +16,5 @@ jobs:
       - uses: boa-dev/criterion-compare-action@v3
         with:
           cwd: benchmarks
-          package: delta_kernel_benchmarks
           benchName: workload_bench
           branchName: ${{ github.base_ref }}
