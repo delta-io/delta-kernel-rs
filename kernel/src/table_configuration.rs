@@ -20,7 +20,7 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name, validate_schema_column_mapping,
+    column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
     FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
     LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
@@ -114,13 +114,6 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
-        validate_schema_column_mapping(&schema, column_mapping_mode)?;
-
-        validate_timestamp_ntz_feature_support(&schema, &protocol)?;
-
-        validate_variant_type_feature_support(&schema, &protocol)?;
-
         let table_config = Self {
             schema,
             metadata,
@@ -130,6 +123,11 @@ impl TableConfiguration {
             table_root,
             version,
         };
+
+        // Validate schema against protocol features now that we have a TC instance.
+        validate_column_mapping(&table_config)?;
+        validate_timestamp_ntz_feature_support(&table_config)?;
+        validate_variant_type_feature_support(&table_config)?;
 
         Ok(table_config)
     }
@@ -201,8 +199,10 @@ impl TableConfiguration {
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
-    /// - **Clustering columns**: Per the Delta protocol, clustering columns are always included
+    /// - **Required columns** (e.g. clustering columns): Per the Delta protocol, always included
     ///   in statistics, regardless of the above settings.
+    /// - **Requested columns**: Optional output filter that limits which columns appear in the
+    ///   schema without affecting column counting.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
@@ -210,13 +210,15 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn build_expected_stats_schemas(
         &self,
-        clustering_columns: Option<&[ColumnName]>,
+        required_columns: Option<&[ColumnName]>,
+        requested_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<ExpectedStatsSchemas> {
         let logical_data_schema = self.logical_data_schema();
         let logical_stats_schema = Arc::new(expected_stats_schema(
             &logical_data_schema,
             self.table_properties(),
-            clustering_columns,
+            required_columns,
+            requested_columns,
         )?);
         let physical_stats_schema = match self.column_mapping_mode() {
             ColumnMappingMode::None => logical_stats_schema.clone(),
@@ -238,17 +240,17 @@ impl TableConfiguration {
     /// Returns leaf column paths as [`ColumnName`] objects, which store path components
     /// separately and handle escaping of special characters (dots, spaces) via backticks.
     ///
-    /// Per the Delta protocol, clustering columns are always included in statistics,
-    /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
-    /// settings.
+    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
+    /// in statistics, regardless of the `delta.dataSkippingStatsColumns` or
+    /// `delta.dataSkippingNumIndexedCols` settings.
     pub(crate) fn stats_column_names_logical(
         &self,
-        clustering_columns: Option<&[ColumnName]>,
+        required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
         stats_column_names(
             &self.logical_data_schema(),
             self.table_properties(),
-            clustering_columns,
+            required_columns,
         )
     }
 
@@ -257,9 +259,9 @@ impl TableConfiguration {
     /// Similar to [`stats_column_names_logical`], but returns physical column names.
     pub(crate) fn stats_column_names_physical(
         &self,
-        clustering_columns: Option<&[ColumnName]>,
+        required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let logical_names = self.stats_column_names_logical(clustering_columns);
+        let logical_names = self.stats_column_names_logical(required_columns);
         let column_mapping_mode = self.column_mapping_mode();
         logical_names
             .into_iter()
@@ -1590,7 +1592,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Both schemas should be identical (same Arc)
         assert!(Arc::ptr_eq(&stats_schemas.logical, &stats_schemas.physical));
@@ -1618,7 +1620,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Schemas should be different (not the same Arc)
         assert!(!Arc::ptr_eq(
@@ -1680,7 +1682,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
@@ -1731,7 +1733,7 @@ mod test {
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_logical(None /* clustering_columns */);
+        let column_names = config.stats_column_names_logical(None /* required_columns */);
 
         // Should return logical names, not physical names
         assert!(column_names.contains(&ColumnName::new(["col_a"])));
@@ -1746,7 +1748,7 @@ mod test {
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_physical(None /* clustering_columns */);
+        let column_names = config.stats_column_names_physical(None /* required_columns */);
 
         // Should return physical names, not logical names
         assert_eq!(

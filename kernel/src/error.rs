@@ -215,6 +215,10 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Validation error for file statistics (e.g., missing required clustering column stats)
+    #[error("Stats validation error: {0}")]
+    StatsValidation(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -302,6 +306,10 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn stats_validation(msg: impl ToString) -> Self {
+        Self::StatsValidation(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.
