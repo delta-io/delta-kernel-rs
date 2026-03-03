@@ -123,8 +123,18 @@ impl Snapshot {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
+    /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
     #[internal_api]
-    pub(crate) fn new(
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            Arc::new(LazyCrc::new(None)),
+        )
+    }
+
+    /// Internal constructor that accepts an explicit [`LazyCrc`].
+    pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         lazy_crc: Arc<LazyCrc>,
@@ -311,7 +321,7 @@ impl Snapshot {
         )?;
 
         let lazy_crc = Arc::new(LazyCrc::new(combined_log_segment.latest_crc_file.clone()));
-        Ok(Arc::new(Snapshot::new(
+        Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
             lazy_crc,
@@ -390,7 +400,11 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new(log_segment, table_configuration, lazy_crc))
+        Ok(Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            lazy_crc,
+        ))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -468,7 +482,7 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot::new(
+        Ok(Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
             self.lazy_crc.clone(),
@@ -717,7 +731,7 @@ impl Snapshot {
 
         committer.publish(engine, publish_metadata)?;
 
-        Ok(Arc::new(Snapshot::new(
+        Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
             self.lazy_crc.clone(),
@@ -1790,8 +1804,7 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit =
-            Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
+        let snapshot_no_commit = Snapshot::new(log_segment, table_config);
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);

@@ -15,7 +15,6 @@ use url::Url;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
-use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::variant_utils::UsesVariant;
@@ -568,11 +567,7 @@ impl CreateTableTransactionBuilder {
 
         // Create Transaction<CreateTable> with pre-commit snapshot
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(
-                log_segment,
-                table_configuration,
-                Arc::new(LazyCrc::new(None)),
-            )),
+            Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
             system_domain_metadata,
