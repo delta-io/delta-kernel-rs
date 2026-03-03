@@ -5,14 +5,12 @@
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.19.2...v0.20.0)
 
 ### 🏗️ Breaking changes
-1. Add checkpoint schema discovery for stats_parsed detection ([#1550])
 2. Remove `DefaultEngine::new` ([#1583])
    - Use `DefaultEngineBuilder` instead like: `DefaultEngineBuilder::new(store).build()`
 4. Add ParseJson expression  ([#1586])
    - Implementors of the ExpressionHandler trait now need to handle this expression
 5. Change CommitResponse::Committed to return a FileMeta ([#1599])
    - Committer implementations must now return a FileMeta of the written file after each commit, instead of only returning the committed version
-6. Add function to check if schema supports parsed stats ([#1573])
 7. Add serialization/deserialization support for Predicates and Expressions ([#1543])
 9. Distributed Log Replay serialization/deserialization ([#1503])
 10. Introduce Deduplicator trait to unify mutable and immutable deduplication ([#1537])
@@ -23,13 +21,8 @@
 14. Return updated Snapshot from `Snapshot::publish` ([#1694])
     - Snapshot::publish now takes self: Arc<Self> and returns DeltaResult<SnapshotRef> instead of ()
 15. Pass engine to Snapshot::transaction() for domain metadata access ([#1707])
-16. Read parsed-stats from checkpoint ([#1638])
-17.  feat: add get clustering columns in transactions ([#1693])
-18. Change expected_stats_schema to return logical schema + physical schema ([#1749])
-19. Add support for outputting parsed file statistics to scan batches ([#1720])
 20. Add tracing instrumentation to transaction and snapshot operations ([#1772])
     - snapshot and transaction have both stopped implementing auto traits UnwindSafe and RefUnwindSafe due to storing new instrumentation span fields
-21. Checkpoint and sidecar row group skipping via stats_parsed ([#1853])
 22. Use physical stats column names in `WriteContext` ([#1836])
     - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
 23. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
@@ -45,7 +38,7 @@
 3. Implement `Scalar::From<HashMap<K, V>>` ([#1541])
 4. Add `logSegment.new_with_commit_appended` API ([#1602])
 5. `snapshot.new_post_commit` ([#1604])
-- Creates a new Snapshot reflecting a just-committed transaction without re-reading the log
+   - Creates a new Snapshot reflecting a just-committed transaction without re-reading the log
 6. Enable Arrow to convert nullable StructArray to RecordBatch ([#1635])
 7. Add `snapshot.checkpoint()` for all-in-one checkpointing ([#1600])
 8. Add a tracing statement to print table configuration for each version ([#1634])
@@ -111,6 +104,13 @@
 67. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
 68. Implement the read metadata workload runner ([#1919])
 69. Provide expected stats schema ([#1592])
+70. Add checkpoint schema discovery for stats_parsed detection ([#1550])
+71. Add function to check if schema supports parsed stats ([#1573])
+72. Read parsed-stats from checkpoint ([#1638])
+73. feat: add get clustering columns in transactions ([#1693])
+74. Change expected_stats_schema to return logical schema + physical schema ([#1749])
+75. Add support for outputting parsed file statistics to scan batches ([#1720])
+76. Checkpoint and sidecar row group skipping via stats_parsed ([#1853])
 
 ### 🐛 Bug Fixes
 
