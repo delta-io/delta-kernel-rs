@@ -60,7 +60,9 @@ impl<'col> StatsColumnFilter<'col> {
         required_columns: Option<&'col [ColumnName]>,
         requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
-        let requested_trie = requested_columns.map(ColumnTrie::from_columns);
+        let requested_trie = requested_columns
+            .filter(|cols| !cols.is_empty())
+            .map(ColumnTrie::from_columns);
 
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
@@ -152,7 +154,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on table-level filtering config.
     /// Required columns (e.g. clustering columns) are always included, even past the column limit.
     pub(crate) fn should_include_for_table(&self) -> bool {
-        // When using dataSkippingStatsColumns, check the trie
+        // When using dataSkippingStatsColumns, check the trie (which includes required)
         if let Some(trie) = &self.data_skipping_stats_trie {
             return trie.contains_prefix_of(&self.path);
         }
@@ -168,10 +170,10 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on the requested columns
     /// filter. When no requested columns are set, all columns pass this check.
     pub(crate) fn should_include_for_requested(&self) -> bool {
-        match &self.requested_trie {
-            Some(trie) => trie.contains_prefix_of(&self.path),
-            None => true,
-        }
+        self.requested_trie
+            .as_ref()
+            .map(|trie| trie.contains_prefix_of(&self.path))
+            .unwrap_or(true)
     }
 
     /// Returns true if the current path is a required column (e.g. clustering column).
