@@ -5,34 +5,34 @@
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.19.2...v0.20.0)
 
 ### 🏗️ Breaking changes
-2. Remove `DefaultEngine::new` ([#1583])
+1. Remove `DefaultEngine::new` ([#1583])
    - Use `DefaultEngineBuilder` instead like: `DefaultEngineBuilder::new(store).build()`
-4. Add ParseJson expression  ([#1586])
+2. Add ParseJson expression  ([#1586])
    - Implementors of the ExpressionHandler trait now need to handle this expression
-5. Change CommitResponse::Committed to return a FileMeta ([#1599])
+3. Change CommitResponse::Committed to return a FileMeta ([#1599])
    - Committer implementations must now return a FileMeta of the written file after each commit, instead of only returning the committed version
-7. Add serialization/deserialization support for Predicates and Expressions ([#1543])
-9. Distributed Log Replay serialization/deserialization ([#1503])
-10. Introduce Deduplicator trait to unify mutable and immutable deduplication ([#1537])
-11. Add ffi api to perform a checkpoint ([#1619])
+4. Add serialization/deserialization support for Predicates and Expressions ([#1543])
+5. Distributed Log Replay serialization/deserialization ([#1503])
+6. Introduce Deduplicator trait to unify mutable and immutable deduplication ([#1537])
+7. Add ffi api to perform a checkpoint ([#1619])
     - No migration needed. This adds a new api in ffi supporting all-in-one checkpointing.
-12. Add stats_columns to ParquetHandler ([#1668])
+8. Add stats_columns to ParquetHandler ([#1668])
     - Add stat_columns to `write_parquet_file` engine implementation, which specifies the columns to collect Delta stats on
-13. Add StatisticsCollector core with numRecords ([#1662])
+9. Add StatisticsCollector core with numRecords ([#1662])
     - Renames `_stat_columns` above to `stat_columns`
-14. Return updated Snapshot from `Snapshot::publish` ([#1694])
+10. Return updated Snapshot from `Snapshot::publish` ([#1694])
     - Snapshot::publish now takes self: Arc<Self> and returns DeltaResult<SnapshotRef> instead of ()
-15. Pass engine to Snapshot::transaction() for domain metadata access ([#1707])
+11. Pass engine to Snapshot::transaction() for domain metadata access ([#1707])
     - Snapshot::transaction() now requires an engine: &dyn Engine parameter to read domain metadata
-20. Add tracing instrumentation to transaction and snapshot operations ([#1772])
+12. Add tracing instrumentation to transaction and snapshot operations ([#1772])
     - snapshot and transaction have both stopped implementing auto traits UnwindSafe and RefUnwindSafe due to storing new instrumentation span fields
-22. Use physical stats column names in `WriteContext` ([#1836])
+13. Use physical stats column names in `WriteContext` ([#1836])
     - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
-23. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
+14. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
     - `WriteContext.physical_schema` now respects column mapping, and retains partition columns when `materializePartitionColumns` is enabled. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
-26. Fix get_app_id_version to take &self ([#1770])
+15. Fix get_app_id_version to take &self ([#1770])
     - If you are calling `get_app_id` pass a reference to the `Snapshot` not `Arc<Snapshot>`
-27. Add ability to  'enter' the runtime to the default engine ([#1847])
+16. Add ability to  'enter' the runtime to the default engine ([#1847])
     - Implementors of the `TaskExecutor` trait now need to support this
 
 ### 🚀 Features / new APIs
