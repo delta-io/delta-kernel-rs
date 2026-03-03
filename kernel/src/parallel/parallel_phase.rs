@@ -408,21 +408,24 @@ mod tests {
             builder = builder.with_predicate(pred);
         }
         let scan = builder.build()?;
-        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
-        let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+        let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 ps.push(scan_file.path);
             })
         })?;
 
-        match phase1.finish()? {
+        match sequential.finish()? {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
                 let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
                     let serialized_bytes = state.into_bytes()?;
-                    Arc::new(ParallelState::from_bytes(engine.as_ref(), &serialized_bytes)?)
+                    Arc::new(ParallelState::from_bytes(
+                        engine.as_ref(),
+                        &serialized_bytes,
+                    )?)
                 } else {
                     // Non-serde: just use the state directly
                     Arc::new(*state)
@@ -443,13 +446,13 @@ mod tests {
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
                             assert!(!partition_files.is_empty());
 
-                            let mut phase2 = ParallelScanMetadata::try_new(
+                            let mut parallel = ParallelScanMetadata::try_new(
                                 engine.clone(),
                                 state,
                                 partition_files,
                             )?;
 
-                            phase2.try_fold(Vec::new(), |acc, metadata_res| {
+                            parallel.try_fold(Vec::new(), |acc, metadata_res| {
                                 metadata_res?.visit_scan_files(
                                     acc,
                                     |ps: &mut Vec<String>, scan_file| {
@@ -565,37 +568,37 @@ mod tests {
 
         // Run parallel workflow with skip_stats=true
         let scan = snapshot.scan_builder().with_skip_stats(true).build()?;
-        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
-        // Verify stats is None in phase1 results and collect paths
-        let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+        // Verify stats is None in sequential results and collect paths
+        let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "Phase1: scan_file.stats should be None when skip_stats=true"
+                    "sequential: scan_file.stats should be None when skip_stats=true"
                 );
                 ps.push(scan_file.path);
             })
         })?;
 
-        match phase1.finish()? {
+        match sequential.finish()? {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
-                // Verify stats is None in phase2 results and collect paths
-                let mut phase2 =
+                // Verify stats is None in parallel results and collect paths
+                let mut parallel =
                     ParallelScanMetadata::try_new(engine.clone(), Arc::from(state), files)?;
 
-                let phase2_paths = phase2.try_fold(Vec::new(), |acc, metadata_res| {
+                let parallel_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                         assert!(
                             scan_file.stats.is_none(),
-                            "Phase2: scan_file.stats should be None when skip_stats=true"
+                            "parallel: scan_file.stats should be None when skip_stats=true"
                         );
                         ps.push(scan_file.path);
                     })
                 })?;
 
-                all_paths.extend(phase2_paths);
+                all_paths.extend(parallel_paths);
             }
         }
 
