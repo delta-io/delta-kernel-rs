@@ -24,4 +24,4 @@ ffi/examples/read-table/build
 /kernel/target
 /target
 
-/kernel/tests/data/workloads/
+/benchmarks/data/workloads/
