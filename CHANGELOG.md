@@ -11,7 +11,7 @@
 4. Add ParseJson expression  ([#1586])
    - Implementors of the ExpressionHandler trait now need to handle this expression
 5. Change CommitResponse::Committed to return a FileMeta ([#1599])
-- Committer implementations must now return a FileMeta of the written file after each commit, instead of only returning the committed version
+   - Committer implementations must now return a FileMeta of the written file after each commit, instead of only returning the committed version
 6. Add function to check if schema supports parsed stats ([#1573])
 7. Add serialization/deserialization support for Predicates and Expressions ([#1543])
 8. Provide expected stats schema ([#1592])
@@ -29,7 +29,7 @@
 18. Change expected_stats_schema to return logical schema + physical schema ([#1749])
 19. Add support for outputting parsed file statistics to scan batches ([#1720])
 20. Add tracing instrumentation to transaction and snapshot operations ([#1772])
-- snapshot and transaction have both stopped implementing auto traits UnwindSafe and RefUnwindSafe due to storing new instrumentation span fields
+    - snapshot and transaction have both stopped implementing auto traits UnwindSafe and RefUnwindSafe due to storing new instrumentation span fields
 21. Checkpoint and sidecar row group skipping via stats_parsed ([#1853])
 22. Use physical stats column names in `WriteContext` ([#1836])
     - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
