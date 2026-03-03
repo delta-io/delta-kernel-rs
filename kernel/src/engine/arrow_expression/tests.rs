@@ -88,6 +88,42 @@ fn test_bad_right_type_array() {
     );
 }
 
+/// Verifies the known bug: IN predicate panics when the batch contains a `List<Utf8View>` column.
+///
+/// Root cause: `in_list_utf8` at `evaluate_expression.rs:405` does not handle `Utf8View` values
+/// inside the list. The correct behavior would be to return `Ok(BooleanArray::from(vec![true,
+/// false, true]))`.
+#[test]
+#[should_panic(expected = "string array")]
+fn test_in_predicate_fails_with_utf8view_list_column() {
+    use crate::arrow::array::StringViewArray;
+
+    // Build a List<Utf8View> column:
+    //   row 0: ["hello", "world"]  -> "hello" IN → true
+    //   row 1: ["foo"]             -> "hello" IN → false
+    //   row 2: ["bar", "hello", "baz"] -> "hello" IN → true
+    let values = StringViewArray::from(vec!["hello", "world", "foo", "bar", "hello", "baz"]);
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3, 6]));
+    let item_field = Arc::new(Field::new("item", DataType::Utf8View, true));
+    let list_field = Arc::new(Field::new(
+        "items",
+        DataType::List(item_field.clone()),
+        true,
+    ));
+    let schema = Schema::new([list_field]);
+    let list_array = ListArray::new(item_field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
+
+    let in_pred = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal("hello"), // left: Utf8 literal
+        column_expr!("items"),  // right: List<Utf8View> column
+    );
+
+    // BUG: panics; correct result would be Ok(BooleanArray::from(vec![true, false, true]))
+    let _ = evaluate_predicate(&in_pred, &batch, false);
+}
+
 #[test]
 fn test_literal_type_array() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
