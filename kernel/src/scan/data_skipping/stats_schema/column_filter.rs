@@ -135,6 +135,11 @@ impl<'col> StatsColumnFilter<'col> {
                         col
                     );
                     result.push(col.clone());
+                } else {
+                    tracing::warn!(
+                        "Required column '{}' not found in table schema; skipping",
+                        col
+                    );
                 }
             }
         }
