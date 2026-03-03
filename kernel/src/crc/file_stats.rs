@@ -4,7 +4,7 @@
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
-//! 1. In-memory transaction data via [`FileStatsDelta::try_new_from_transaction_data`]
+//! 1. In-memory transaction data via [`FileStatsDelta::try_compute_for_txn`]
 //! 2. A parsed .json commit file during forward log replay (future)
 
 use std::sync::LazyLock;
@@ -37,53 +37,61 @@ impl FileStatsDelta {
         remove_files_metadata: &[FilteredEngineData],
     ) -> DeltaResult<Self> {
         // Visit add files. Every row is a file being added (no selection vector).
-        let mut add_visitor = FileStatsVisitor::new();
+        let mut add_visitor = FileStatsVisitor::new(None);
         for batch in add_files_metadata {
             add_visitor.visit_rows_of(batch.as_ref())?;
         }
 
-        // Visit remove files. FilteredEngineData pairs rows with a selection vector -- only
-        // rows marked `true` are actually being removed.
-        let mut remove_visitor = FileStatsVisitor::new();
+        // Visit remove files. Each FilteredEngineData has its own selection vector, so we
+        // create a visitor per batch and accumulate counts.
+        let mut remove_count = 0i64;
+        let mut remove_size = 0i64;
         for filtered_batch in remove_files_metadata {
             let sv = filtered_batch.selection_vector();
-            if sv.is_empty() {
-                // All rows selected -- use simple visitor.
-                remove_visitor.visit_rows_of(filtered_batch.data())?;
-            } else {
-                // Some rows filtered -- use SV-aware visitor.
-                let data: &dyn EngineData = filtered_batch.data();
-                let (names, _types) = remove_visitor.selected_column_names_and_types();
-                let mut sv_visitor = SelectionVectorFileStatsVisitor::new(sv);
-                data.visit_rows(names, &mut sv_visitor)?;
-                remove_visitor.count += sv_visitor.count;
-                remove_visitor.total_size += sv_visitor.total_size;
-            }
+            let sv_opt = if sv.is_empty() { None } else { Some(sv) };
+            let mut visitor = FileStatsVisitor::new(sv_opt);
+            visitor.visit_rows_of(filtered_batch.data())?;
+            remove_count += visitor.count;
+            remove_size += visitor.total_size;
         }
 
         Ok(FileStatsDelta {
-            net_files: add_visitor.count - remove_visitor.count,
-            net_bytes: add_visitor.total_size - remove_visitor.total_size,
+            net_files: add_visitor.count - remove_count,
+            net_bytes: add_visitor.total_size - remove_size,
         })
     }
 }
 
 /// Visitor that extracts the `size` column from file metadata and accumulates counts and totals.
-struct FileStatsVisitor {
+///
+/// Accepts an optional selection vector to filter which rows are visited. AddFiles pass `None`
+/// (count every row); RemoveFiles may pass `Some(sv)` from [`FilteredEngineData`] to skip rows
+/// that are not actually being removed.
+///
+/// Tracks an `offset` across multiple `visit()` calls to correctly index into the selection
+/// vector when the engine delivers data in multiple batches.
+struct FileStatsVisitor<'sv> {
+    /// Optional selection vector. When `Some`, only rows marked `true` are counted. Rows beyond
+    /// the SV length are implicitly selected.
+    selection_vector: Option<&'sv [bool]>,
+    /// Offset into the selection vector, tracking position across multiple visit calls.
+    offset: usize,
     count: i64,
     total_size: i64,
 }
 
-impl FileStatsVisitor {
-    fn new() -> Self {
+impl<'sv> FileStatsVisitor<'sv> {
+    fn new(selection_vector: Option<&'sv [bool]>) -> Self {
         Self {
+            selection_vector,
+            offset: 0,
             count: 0,
             total_size: 0,
         }
     }
 }
 
-impl RowVisitor for FileStatsVisitor {
+impl RowVisitor for FileStatsVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| (vec![ColumnName::new(["size"])], vec![DataType::LONG]).into());
@@ -99,65 +107,10 @@ impl RowVisitor for FileStatsVisitor {
             ))
         );
         for i in 0..row_count {
-            let size: i64 = getters[0].get(i, "size")?;
-            self.count += 1;
-            self.total_size += size;
-        }
-        Ok(())
-    }
-}
-
-/// Visitor that extracts file sizes while respecting a selection vector.
-///
-/// Remove file batches come as [`FilteredEngineData`], which pairs rows with a selection vector.
-/// Only rows marked `true` are actually being removed; `false` rows are untouched files that
-/// happen to be in the same batch.
-///
-/// Maintains an `offset` counter across multiple `visit()` calls to correctly index into the
-/// selection vector when processing multi-batch data.
-struct SelectionVectorFileStatsVisitor<'sv> {
-    /// Guaranteed non-empty; the caller uses [`FileStatsVisitor`] directly when the SV is empty.
-    selection_vector: &'sv [bool],
-    /// Offset into the selection vector, tracking position across multiple visit calls.
-    offset: usize,
-    count: i64,
-    total_size: i64,
-}
-
-impl<'sv> SelectionVectorFileStatsVisitor<'sv> {
-    fn new(selection_vector: &'sv [bool]) -> Self {
-        Self {
-            selection_vector,
-            offset: 0,
-            count: 0,
-            total_size: 0,
-        }
-    }
-}
-
-impl RowVisitor for SelectionVectorFileStatsVisitor<'_> {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| (vec![ColumnName::new(["size"])], vec![DataType::LONG]).into());
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        require!(
-            getters.len() == 1,
-            Error::InternalError(format!(
-                "Wrong number of SelectionVectorFileStatsVisitor getters: {}",
-                getters.len()
-            ))
-        );
-        for i in 0..row_count {
-            let global_idx = self.offset + i;
-            // Rows beyond the SV length are implicitly selected.
-            let selected = self
-                .selection_vector
-                .get(global_idx)
-                .copied()
-                .unwrap_or(true);
+            let selected = match self.selection_vector {
+                Some(sv) => sv.get(self.offset + i).copied().unwrap_or(true),
+                None => true,
+            };
             if selected {
                 let size: i64 = getters[0].get(i, "size")?;
                 self.count += 1;
