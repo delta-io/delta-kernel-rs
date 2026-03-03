@@ -244,8 +244,8 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 5);
@@ -281,8 +281,8 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 5);
@@ -331,8 +331,8 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(commit_files.len(), 2);
@@ -376,8 +376,8 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 4);
     assert_eq!(checkpoint_parts[0].version, 3);
@@ -423,8 +423,8 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(commit_files.len(), 2);
@@ -474,8 +474,8 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 3);
     assert_eq!(commit_files.len(), 2);
@@ -609,8 +609,8 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
     )
     .unwrap();
 
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 3);
@@ -662,8 +662,8 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 3);
@@ -702,8 +702,8 @@ async fn build_snapshot_without_checkpoints() {
         None,
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 5);
@@ -722,8 +722,8 @@ async fn build_snapshot_without_checkpoints() {
         Some(2),
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 1);
@@ -772,8 +772,8 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         Some(4),
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 3);
@@ -819,9 +819,9 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     )
     .unwrap();
 
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    assert_eq!(log_segment.ascending_commit_files.len(), 1);
-    assert_eq!(log_segment.ascending_commit_files[0].version, 4);
+    assert_eq!(log_segment.listed.checkpoint_parts[0].version, 3);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 1);
+    assert_eq!(log_segment.listed.ascending_commit_files[0].version, 4);
 }
 
 #[tokio::test]
@@ -848,8 +848,8 @@ async fn build_table_changes_with_commit_versions() {
 
     let log_segment =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 2, 5).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     // Checkpoints should be omitted
     assert_eq!(checkpoint_parts.len(), 0);
@@ -863,8 +863,8 @@ async fn build_table_changes_with_commit_versions() {
     let log_segment =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, Some(0)).unwrap();
 
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
     // Checkpoints should be omitted
     assert_eq!(checkpoint_parts.len(), 0);
 
@@ -874,8 +874,8 @@ async fn build_table_changes_with_commit_versions() {
 
     ///////// Specify no start or end version /////////
     let log_segment = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, None).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     // Checkpoints should be omitted
     assert_eq!(checkpoint_parts.len(), 0);
@@ -1541,7 +1541,7 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
         Some(0),
         None,
     )?;
-    let latest_crc = result.into_parts().3.unwrap();
+    let latest_crc = result.latest_crc_file.unwrap();
     assert_eq!(
         latest_crc.location.location.path(),
         "/_delta_log/00000000000000000001.crc".to_string()
@@ -1579,15 +1579,16 @@ async fn test_compaction_listing(
         .collect();
 
     assert_eq!(
-        log_segment.ascending_commit_files.len(),
+        log_segment.listed.ascending_commit_files.len(),
         expected_commit_versions.len()
     );
     assert_eq!(
-        log_segment.ascending_compaction_files.len(),
+        log_segment.listed.ascending_compaction_files.len(),
         expected_compaction_versions.len()
     );
 
     for (commit_file, expected_version) in log_segment
+        .listed
         .ascending_commit_files
         .iter()
         .zip(expected_commit_versions.iter())
@@ -1597,6 +1598,7 @@ async fn test_compaction_listing(
     }
 
     for (compaction_file, (expected_start, expected_end)) in log_segment
+        .listed
         .ascending_compaction_files
         .iter()
         .zip(expected_compaction_versions.iter())
@@ -2120,8 +2122,8 @@ async fn for_timestamp_conversion_gets_commit_range() {
 
     let log_segment =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert!(checkpoint_parts.is_empty());
 
@@ -2151,8 +2153,8 @@ async fn for_timestamp_conversion_with_old_end_version() {
 
     let log_segment =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 5, None).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert!(checkpoint_parts.is_empty());
 
@@ -2182,8 +2184,8 @@ async fn for_timestamp_conversion_only_contiguous_ranges() {
 
     let log_segment =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert!(checkpoint_parts.is_empty());
 
@@ -2218,8 +2220,8 @@ async fn for_timestamp_conversion_with_limit() {
         Some(NonZero::new(3).unwrap()),
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert!(checkpoint_parts.is_empty());
 
@@ -2254,8 +2256,8 @@ async fn for_timestamp_conversion_with_large_limit() {
         Some(NonZero::new(20).unwrap()),
     )
     .unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
     assert!(checkpoint_parts.is_empty());
 
@@ -2297,12 +2299,12 @@ async fn test_latest_commit_file_field_is_captured() {
             .unwrap();
 
     // The latest commit should be version 5
-    assert_eq!(log_segment.latest_commit_file.unwrap().version, 5);
+    assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 5);
 
     // The log segment should only contain commits 3, 4, 5 (after checkpoint 2)
-    assert_eq!(log_segment.ascending_commit_files.len(), 3);
-    assert_eq!(log_segment.ascending_commit_files[0].version, 3);
-    assert_eq!(log_segment.ascending_commit_files[2].version, 5);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 3);
+    assert_eq!(log_segment.listed.ascending_commit_files[0].version, 3);
+    assert_eq!(log_segment.listed.ascending_commit_files[2].version, 5);
 }
 
 #[tokio::test]
@@ -2325,11 +2327,11 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
             .unwrap();
 
     // The latest commit should be version 4
-    assert_eq!(log_segment.latest_commit_file.unwrap().version, 4);
+    assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 4);
 
     // The log segment should have only commit 4 (after checkpoint 3)
-    assert_eq!(log_segment.ascending_commit_files.len(), 1);
-    assert_eq!(log_segment.ascending_commit_files[0].version, 4);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 1);
+    assert_eq!(log_segment.listed.ascending_commit_files[0].version, 4);
 }
 
 #[tokio::test]
@@ -2347,7 +2349,7 @@ async fn test_latest_commit_file_with_no_commits() {
             .unwrap();
 
     // latest_commit_file should be None when there are no commits
-    assert!(log_segment.latest_commit_file.is_none());
+    assert!(log_segment.listed.latest_commit_file.is_none());
 
     // The checkpoint should be at version 2
     assert_eq!(log_segment.checkpoint_version, Some(2));
@@ -2372,10 +2374,10 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
             .unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
-    assert_eq!(log_segment.latest_commit_file.unwrap().version, 1);
+    assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 1);
 
     // The log segment should have no commit files (all filtered by checkpoint at version 1)
-    assert_eq!(log_segment.ascending_commit_files.len(), 0);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 0);
 
     // The checkpoint should be at version 1
     assert_eq!(log_segment.checkpoint_version, Some(1));
@@ -2399,13 +2401,13 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
             .unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
-    assert!(log_segment.latest_commit_file.is_none());
+    assert!(log_segment.listed.latest_commit_file.is_none());
 
     // The checkpoint should be at version 1
     assert_eq!(log_segment.checkpoint_version, Some(1));
 
     // There should be no commits in the log segment (all filtered by checkpoint)
-    assert_eq!(log_segment.ascending_commit_files.len(), 0);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 0);
 }
 
 #[test]
@@ -2566,7 +2568,7 @@ async fn test_max_published_version_only_published_commits() {
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version.unwrap(), 4);
+    assert_eq!(log_segment.listed.max_published_version.unwrap(), 4);
 }
 
 #[tokio::test]
@@ -2577,7 +2579,7 @@ async fn test_max_published_version_checkpoint_followed_by_published_commits() {
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version.unwrap(), 8);
+    assert_eq!(log_segment.listed.max_published_version.unwrap(), 8);
 }
 
 #[tokio::test]
@@ -2587,7 +2589,7 @@ async fn test_max_published_version_only_staged_commits() {
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version, None);
+    assert_eq!(log_segment.listed.max_published_version, None);
 }
 
 #[tokio::test]
@@ -2598,7 +2600,7 @@ async fn test_max_published_version_checkpoint_followed_by_staged_commits() {
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version, None);
+    assert_eq!(log_segment.listed.max_published_version, None);
 }
 
 #[tokio::test]
@@ -2609,7 +2611,7 @@ async fn test_max_published_version_published_and_staged_commits_no_overlap() {
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+    assert_eq!(log_segment.listed.max_published_version.unwrap(), 2);
 }
 
 #[tokio::test]
@@ -2622,7 +2624,7 @@ async fn test_max_published_version_checkpoint_followed_by_published_and_staged_
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version.unwrap(), 7);
+    assert_eq!(log_segment.listed.max_published_version.unwrap(), 7);
 }
 
 #[tokio::test]
@@ -2633,7 +2635,7 @@ async fn test_max_published_version_published_and_staged_commits_with_overlap() 
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+    assert_eq!(log_segment.listed.max_published_version.unwrap(), 2);
 }
 
 #[tokio::test]
@@ -2646,7 +2648,7 @@ async fn test_max_published_version_checkpoint_followed_by_published_and_staged_
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version.unwrap(), 9);
+    assert_eq!(log_segment.listed.max_published_version.unwrap(), 9);
 }
 
 #[tokio::test]
@@ -2656,7 +2658,7 @@ async fn test_max_published_version_checkpoint_only() {
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_published_version, None);
+    assert_eq!(log_segment.listed.max_published_version, None);
 }
 
 // ============================================================================
@@ -3039,21 +3041,25 @@ fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
     // Check: What should have changed
     assert_eq!(orig.end_version + 1, new.end_version);
     assert_eq!(
-        orig.ascending_commit_files.len() + 1,
-        new.ascending_commit_files.len()
+        orig.listed.ascending_commit_files.len() + 1,
+        new.listed.ascending_commit_files.len()
     );
     assert_eq!(
-        orig.latest_commit_file.as_ref().unwrap().version + 1,
-        new.latest_commit_file.as_ref().unwrap().version
+        orig.listed.latest_commit_file.as_ref().unwrap().version + 1,
+        new.listed.latest_commit_file.as_ref().unwrap().version
     );
 
     // Check: What should be the same
     fn normalize(log_segment: LogSegment) -> LogSegment {
+        use crate::listed_log_files::ListedLogFiles;
         LogSegment {
             end_version: 0,
-            max_published_version: None,
-            ascending_commit_files: vec![],
-            latest_commit_file: None,
+            listed: ListedLogFiles {
+                max_published_version: None,
+                ascending_commit_files: vec![],
+                latest_commit_file: None,
+                ..log_segment.listed
+            },
             ..log_segment
         }
     }
@@ -3076,7 +3082,7 @@ async fn test_new_with_commit_published_commit() {
         .new_with_commit_appended(new_commit)
         .unwrap();
 
-    assert_eq!(new_log_segment.max_published_version, Some(5));
+    assert_eq!(new_log_segment.listed.max_published_version, Some(5));
     assert_log_segment_extended(log_segment, new_log_segment);
 }
 
@@ -3095,7 +3101,7 @@ async fn test_new_with_commit_staged_commit() {
         .new_with_commit_appended(new_commit)
         .unwrap();
 
-    assert_eq!(new_log_segment.max_published_version, Some(4));
+    assert_eq!(new_log_segment.listed.max_published_version, Some(4));
     assert_log_segment_extended(log_segment, new_log_segment);
 }
 
@@ -3147,7 +3153,7 @@ async fn test_get_unpublished_catalog_commits() {
     })
     .await;
 
-    assert_eq!(log_segment.max_published_version, Some(2));
+    assert_eq!(log_segment.listed.max_published_version, Some(2));
     let unpublished = log_segment.get_unpublished_catalog_commits().unwrap();
     let versions: Vec<_> = unpublished.iter().map(|c| c.version()).collect();
     assert_eq!(versions, vec![3, 4]);
@@ -3158,14 +3164,16 @@ async fn test_get_unpublished_catalog_commits() {
 // ============================================================================
 
 fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
-    seg.ascending_commit_files
+    seg.listed
+        .ascending_commit_files
         .iter()
         .map(|c| c.version)
         .collect()
 }
 
 fn extract_compaction_ranges(seg: &LogSegment) -> Vec<(u64, u64)> {
-    seg.ascending_compaction_files
+    seg.listed
+        .ascending_compaction_files
         .iter()
         .map(|c| match c.file_type {
             LogPathFileType::CompactedCommit { hi } => (c.version, hi),
@@ -3282,7 +3290,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     assert_eq!(extract_commit_versions(&after), case.after_commits);
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());
-    assert!(after.checkpoint_parts.is_empty());
+    assert!(after.listed.checkpoint_parts.is_empty());
 
     let through = seg.segment_through_crc(case.crc_version);
     assert_eq!(extract_commit_versions(&through), case.through_commits);

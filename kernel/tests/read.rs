@@ -1664,33 +1664,33 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
 
     fn ensure_segment_does_not_contain(invalid_files: &[&str], segment: &LogSegment) {
         assert!(
-            !segment.ascending_commit_files.iter().any(|p| {
+            !segment.listed.ascending_commit_files.iter().any(|p| {
                 let test_path = get_file_path_for_test(p);
                 invalid_files.contains(&test_path)
             }),
             "ascending_commit_files contained invalid file"
         );
         assert!(
-            !segment.ascending_compaction_files.iter().any(|p| {
+            !segment.listed.ascending_compaction_files.iter().any(|p| {
                 let test_path = get_file_path_for_test(p);
                 invalid_files.contains(&test_path)
             }),
             "ascending_compaction_files contained invalid file"
         );
         assert!(
-            !segment.checkpoint_parts.iter().any(|p| {
+            !segment.listed.checkpoint_parts.iter().any(|p| {
                 let test_path = get_file_path_for_test(p);
                 invalid_files.contains(&test_path)
             }),
             "checkpoint_parts contained invalid file"
         );
-        if let Some(ref crc) = segment.latest_crc_file {
+        if let Some(ref crc) = segment.listed.latest_crc_file {
             assert!(
                 !invalid_files.contains(&get_file_path_for_test(crc)),
                 "Latest crc contained invalid file"
             );
         }
-        if let Some(ref latest_commit) = segment.latest_commit_file {
+        if let Some(ref latest_commit) = segment.listed.latest_commit_file {
             assert!(
                 !invalid_files.contains(&get_file_path_for_test(latest_commit)),
                 "Latest commit contained invalid file"

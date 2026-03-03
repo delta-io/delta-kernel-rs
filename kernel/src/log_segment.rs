@@ -98,25 +98,11 @@ pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
     pub log_root: Url,
-    /// Sorted commit files in the log segment (ascending)
-    pub ascending_commit_files: Vec<ParsedLogPath>,
-    /// Sorted (by start version) compaction files in the log segment (ascending)
-    pub ascending_compaction_files: Vec<ParsedLogPath>,
-    /// Checkpoint files in the log segment.
-    pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file, only if version >= checkpoint version.
-    pub latest_crc_file: Option<ParsedLogPath>,
-    /// The latest commit file found during listing, which may not be part of the
-    /// contiguous segment but is needed for ICT timestamp reading
-    pub latest_commit_file: Option<ParsedLogPath>,
     /// Schema of the checkpoint file(s), if known from `_last_checkpoint` hint.
     /// Used to determine if `stats_parsed` is available for data skipping.
     pub checkpoint_schema: Option<SchemaRef>,
-    /// The maximum published commit version found during listing, if available.
-    /// Note that this published commit file maybe not be included in
-    /// [LogSegment::ascending_commit_files] if there is a catalog commit present for the same
-    /// version that took priority over it.
-    pub max_published_version: Option<Version>,
+    /// The set of log files found during listing.
+    pub listed: ListedLogFiles,
 }
 
 impl LogSegment {
@@ -131,53 +117,47 @@ impl LogSegment {
             end_version: PRE_COMMIT_VERSION,
             checkpoint_version: None,
             log_root,
-            ascending_commit_files: vec![],
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
-            latest_commit_file: None,
             checkpoint_schema: None,
-            max_published_version: None,
+            listed: ListedLogFiles::default(),
         }
     }
 
     #[internal_api]
     pub(crate) fn try_new(
-        listed_files: ListedLogFiles,
+        mut listed_files: ListedLogFiles,
         log_root: Url,
         end_version: Option<Version>,
         checkpoint_schema: Option<SchemaRef>,
     ) -> DeltaResult<Self> {
-        let (
-            mut ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-            latest_commit_file,
-            max_published_version,
-        ) = listed_files.into_parts();
-
         // Ensure commit file versions are contiguous
         require!(
-            ascending_commit_files
+            listed_files
+                .ascending_commit_files
                 .windows(2)
                 .all(|cfs| cfs[0].version + 1 == cfs[1].version),
             Error::generic(format!(
-                "Expected ordered contiguous commit files {ascending_commit_files:?}"
+                "Expected ordered contiguous commit files {:?}",
+                listed_files.ascending_commit_files
             ))
         );
 
-        // Commit file versions must be greater than the most recent checkpoint version if it exists
-        let checkpoint_version = checkpoint_parts.first().map(|checkpoint_file| {
-            ascending_commit_files.retain(|log_path| checkpoint_file.version < log_path.version);
-            checkpoint_file.version
-        });
+        // Filter commits before/at checkpoint version
+        let checkpoint_version =
+            if let Some(checkpoint_file) = listed_files.checkpoint_parts.first() {
+                let version = checkpoint_file.version;
+                listed_files
+                    .ascending_commit_files
+                    .retain(|log_path| version < log_path.version);
+                Some(version)
+            } else {
+                None
+            };
 
-        // There must be no gap between a checkpoint and the first commit version. Note that
-        // that all checkpoint parts share the same version.
-        if let (Some(checkpoint_version), Some(commit_file)) =
-            (checkpoint_version, ascending_commit_files.first())
-        {
+        // No gap between checkpoint and first commit
+        if let (Some(checkpoint_version), Some(commit_file)) = (
+            checkpoint_version,
+            listed_files.ascending_commit_files.first(),
+        ) {
             require!(
                 checkpoint_version + 1 == commit_file.version,
                 Error::InvalidCheckpoint(format!(
@@ -187,10 +167,11 @@ impl LogSegment {
             )
         }
 
-        // Get the effective version from chosen files
-        let effective_version = ascending_commit_files
+        // Get the effective version
+        let effective_version = listed_files
+            .ascending_commit_files
             .last()
-            .or(checkpoint_parts.first())
+            .or(listed_files.checkpoint_parts.first())
             .ok_or(Error::generic("No files in log segment"))?
             .version;
         if let Some(end_version) = end_version {
@@ -206,13 +187,8 @@ impl LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-            latest_commit_file,
             checkpoint_schema,
-            max_published_version,
+            listed: listed_files,
         };
 
         info!(segment = %log_segment.summary());
@@ -225,17 +201,17 @@ impl LogSegment {
         format!(
             "{{v={}, commits={}, checkpoint_v={}, checkpoint_parts={}, compactions={}, crc_v={}, max_pub_v={}}}",
             self.end_version,
-            self.ascending_commit_files.len(),
+            self.listed.ascending_commit_files.len(),
             self.checkpoint_version
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".into()),
-            self.checkpoint_parts.len(),
-            self.ascending_compaction_files.len(),
-            self.latest_crc_file
+            self.listed.checkpoint_parts.len(),
+            self.listed.ascending_compaction_files.len(),
+            self.listed.latest_crc_file
                 .as_ref()
                 .map(|f| f.version.to_string())
                 .unwrap_or_else(|| "none".into()),
-            self.max_published_version
+            self.listed.max_published_version
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".into()),
         )
@@ -283,9 +259,10 @@ impl LogSegment {
                     r.report(MetricEvent::LogSegmentLoaded {
                         operation_id,
                         duration: log_segment_loading_duration,
-                        num_commit_files: log_segment.ascending_commit_files.len() as u64,
-                        num_checkpoint_files: log_segment.checkpoint_parts.len() as u64,
-                        num_compaction_files: log_segment.ascending_compaction_files.len() as u64,
+                        num_commit_files: log_segment.listed.ascending_commit_files.len() as u64,
+                        num_checkpoint_files: log_segment.listed.checkpoint_parts.len() as u64,
+                        num_compaction_files: log_segment.listed.ascending_compaction_files.len()
+                            as u64,
                     });
                 });
                 Ok(log_segment)
@@ -445,12 +422,13 @@ impl LogSegment {
 
         new_log_segment.end_version = tail_commit_file.version;
         new_log_segment
+            .listed
             .ascending_commit_files
             .push(tail_commit_file.clone());
-        new_log_segment.latest_commit_file = Some(tail_commit_file.clone());
-        new_log_segment.max_published_version = match tail_commit_file.file_type {
+        new_log_segment.listed.latest_commit_file = Some(tail_commit_file.clone());
+        new_log_segment.listed.max_published_version = match tail_commit_file.file_type {
             LogPathFileType::Commit => Some(tail_commit_file.version),
-            _ => self.max_published_version,
+            _ => self.listed.max_published_version,
         };
 
         Ok(new_log_segment)
@@ -460,15 +438,20 @@ impl LogSegment {
         // In the future, we can additionally convert the staged commit files to published commit
         // files. That would reqire faking their FileMeta locations.
         let mut new_log_segment = self.clone();
-        new_log_segment.max_published_version = Some(self.end_version);
+        new_log_segment.listed.max_published_version = Some(self.end_version);
         Ok(new_log_segment)
     }
 
     pub(crate) fn get_unpublished_catalog_commits(&self) -> DeltaResult<Vec<CatalogCommit>> {
-        self.ascending_commit_files
+        self.listed
+            .ascending_commit_files
             .iter()
             .filter(|file| file.file_type == LogPathFileType::StagedCommit)
-            .filter(|file| self.max_published_version.is_none_or(|v| file.version > v))
+            .filter(|file| {
+                self.listed
+                    .max_published_version
+                    .is_none_or(|v| file.version > v)
+            })
             .map(|file| CatalogCommit::try_new(&self.log_root, file))
             .collect()
     }
@@ -551,8 +534,8 @@ impl LogSegment {
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
         let all_files = itertools::Itertools::merge_by(
-            self.ascending_commit_files.iter(),
-            self.ascending_compaction_files.iter(),
+            self.listed.ascending_commit_files.iter(),
+            self.listed.ascending_compaction_files.iter(),
             |path_a, path_b| path_a.version <= path_b.version,
         );
 
@@ -603,8 +586,8 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Only process single-part checkpoints (multi-part are always V1, no sidecars)
-        let checkpoint = match self.checkpoint_parts.first() {
-            Some(cp) if self.checkpoint_parts.len() == 1 => cp,
+        let checkpoint = match self.listed.checkpoint_parts.first() {
+            Some(cp) if self.listed.checkpoint_parts.len() == 1 => cp,
             _ => return Ok((None, vec![])),
         };
 
@@ -768,6 +751,7 @@ impl LogSegment {
         };
 
         let checkpoint_file_meta: Vec<_> = self
+            .listed
             .checkpoint_parts
             .iter()
             .map(|f| f.location.clone())
@@ -779,7 +763,7 @@ impl LogSegment {
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
-        let actions = match self.checkpoint_parts.first() {
+        let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
@@ -883,13 +867,15 @@ impl LogSegment {
             end_version: self.end_version,
             checkpoint_version: None,
             log_root: self.log_root.clone(),
-            ascending_commit_files: commits,
-            ascending_compaction_files: compactions,
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
-            latest_commit_file: None,
             checkpoint_schema: None,
-            max_published_version: None,
+            listed: ListedLogFiles {
+                ascending_commit_files: commits,
+                ascending_compaction_files: compactions,
+                checkpoint_parts: vec![],
+                latest_crc_file: None,
+                latest_commit_file: None,
+                max_published_version: None,
+            },
         }
     }
 
@@ -906,13 +892,15 @@ impl LogSegment {
             end_version: self.end_version,
             checkpoint_version: self.checkpoint_version,
             log_root: self.log_root.clone(),
-            ascending_commit_files: commits,
-            ascending_compaction_files: compactions,
-            checkpoint_parts: self.checkpoint_parts.clone(),
-            latest_crc_file: None,
-            latest_commit_file: None,
             checkpoint_schema: self.checkpoint_schema.clone(),
-            max_published_version: None,
+            listed: ListedLogFiles {
+                ascending_commit_files: commits,
+                ascending_compaction_files: compactions,
+                checkpoint_parts: self.listed.checkpoint_parts.clone(),
+                latest_crc_file: None,
+                latest_commit_file: None,
+                max_published_version: None,
+            },
         }
     }
 
@@ -925,12 +913,14 @@ impl LogSegment {
     ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
         let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
         let commits = self
+            .listed
             .ascending_commit_files
             .iter()
             .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
             .cloned()
             .collect();
         let compactions = self
+            .listed
             .ascending_compaction_files
             .iter()
             .filter(|c| {
@@ -968,18 +958,22 @@ impl LogSegment {
         // sort by start version, so technically the max end version could be anywhere in the vec.
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct
         // number of commits since compaction if there are no compactions
-        let max_compaction_end = self.ascending_compaction_files.iter().fold(0, |cur, f| {
-            if let &ParsedLogPath {
-                file_type: LogPathFileType::CompactedCommit { hi },
-                ..
-            } = f
-            {
-                Version::max(cur, hi)
-            } else {
-                warn!("Found invalid ParsedLogPath in ascending_compaction_files: {f:?}");
-                cur
-            }
-        });
+        let max_compaction_end = self
+            .listed
+            .ascending_compaction_files
+            .iter()
+            .fold(0, |cur, f| {
+                if let &ParsedLogPath {
+                    file_type: LogPathFileType::CompactedCommit { hi },
+                    ..
+                } = f
+                {
+                    Version::max(cur, hi)
+                } else {
+                    warn!("Found invalid ParsedLogPath in ascending_compaction_files: {f:?}");
+                    cur
+                }
+            });
         // we want to subtract off the max of the max compaction end or the checkpoint version
         let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
         debug_assert!(to_sub <= self.end_version);
@@ -988,7 +982,8 @@ impl LogSegment {
 
     pub(crate) fn validate_published(&self) -> DeltaResult<()> {
         require!(
-            self.max_published_version
+            self.listed
+                .max_published_version
                 .is_some_and(|v| v == self.end_version),
             Error::generic("Log segment is not published")
         );

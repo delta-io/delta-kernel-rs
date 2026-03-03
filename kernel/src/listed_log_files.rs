@@ -32,15 +32,15 @@ use url::Url;
 /// - `latest_crc_file`: The CRC file with the highest version, only if version >= checkpoint version.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
 /// - `max_published_version`: The highest published commit file version, or `None` if no published commits were found.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
-    pub(crate) ascending_commit_files: Vec<ParsedLogPath>,
-    pub(crate) ascending_compaction_files: Vec<ParsedLogPath>,
-    pub(crate) checkpoint_parts: Vec<ParsedLogPath>,
-    pub(crate) latest_crc_file: Option<ParsedLogPath>,
-    pub(crate) latest_commit_file: Option<ParsedLogPath>,
-    pub(crate) max_published_version: Option<Version>,
+    pub ascending_commit_files: Vec<ParsedLogPath>,
+    pub ascending_compaction_files: Vec<ParsedLogPath>,
+    pub checkpoint_parts: Vec<ParsedLogPath>,
+    pub latest_crc_file: Option<ParsedLogPath>,
+    pub latest_commit_file: Option<ParsedLogPath>,
+    pub max_published_version: Option<Version>,
 }
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
@@ -193,27 +193,6 @@ impl ListedLogFiles {
         }
 
         Ok(self)
-    }
-
-    #[allow(clippy::type_complexity)] // It's the most readable way to destructure
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<ParsedLogPath>,
-        Vec<ParsedLogPath>,
-        Vec<ParsedLogPath>,
-        Option<ParsedLogPath>,
-        Option<ParsedLogPath>,
-        Option<Version>,
-    ) {
-        (
-            self.ascending_commit_files,
-            self.ascending_compaction_files,
-            self.checkpoint_parts,
-            self.latest_crc_file,
-            self.latest_commit_file,
-            self.max_published_version,
-        )
     }
 
     pub(crate) fn ascending_commit_files(&self) -> &Vec<ParsedLogPath> {
@@ -651,9 +630,16 @@ mod list_log_files_with_log_tail_tests {
         Option<ParsedLogPath>,
         Option<Version>,
     ) {
-        ListedLogFiles::list(storage, log_root, log_tail, start_version, end_version)
-            .unwrap()
-            .into_parts()
+        let r =
+            ListedLogFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+        (
+            r.ascending_commit_files,
+            r.ascending_compaction_files,
+            r.checkpoint_parts,
+            r.latest_crc_file,
+            r.latest_commit_file,
+            r.max_published_version,
+        )
     }
 
     #[tokio::test]

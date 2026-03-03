@@ -684,11 +684,11 @@ impl Scan {
         }
 
         // create a new log segment containing only the commits added after the version hint.
-        let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
+        let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
         let listed_log_files = ListedLogFiles {
             ascending_commit_files,
-            latest_commit_file: log_segment.latest_commit_file.clone(),
+            latest_commit_file: log_segment.listed.latest_commit_file.clone(),
             ..Default::default()
         }
         .validate()?;
