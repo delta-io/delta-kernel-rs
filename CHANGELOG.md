@@ -42,10 +42,6 @@
 29. Add ability to  'enter' the runtime to the default engine ([#1847])
     - Implementors of the `TaskExecutor` trait now need to support this
 
-#### In uc-catalog crate
-1. `Committer::publish()` API and `PublishMetadata`/`CatalogCommit` types ([#1625])
-2. Extract UCCommitsClient trait from UCClient ([#1591])
-
 ### 🚀 Features / new APIs
 1. Add doctests for `IntoEngineData` derive macro ([#1580])
 2. Create `DefaultEngineBuilder` to build `DefaultEngine` ([#1582])
@@ -85,7 +81,6 @@
 34. Add stats transform module for checkpoint stats population ([#1646])
 35. Refactor data skipping to use stats_parsed directly ([#1715])
 36. Support using stats_columns and predicate together in scans ([#1691])
-37. Use CRC in Protocol + Metadata log replay ([#1790])
 38. Support creation of `DefaultEngine` with `TokioMultiThreadExecutor` in FFI ([#1755])
 39. Add column mapping support for CREATE TABLE ([#1764])
 40. Write parsed stats in checkpoints ([#1643])
@@ -115,11 +110,6 @@
 63. Add size metadata to the CdfScanFile ([#1935])
 64. Add deletion vector APIs to transaction ([#1430])
 
-
-#### In uc-catalog crate
-1. Add `max_published_version` to `CommitMetadata`; Implement in `UC-Committer` ([#1609]) UC
-2. Implement `UCCommitter::publish` ([#1626]) UC
-
 ### 🐛 Bug Fixes
 
 1. Make parquet read actually use the executor ([#1596])
@@ -146,6 +136,7 @@
 
 1. Pre-allocate Vecs and HashSets when size is known ([#1676])
 2. Add skip_stats option to skip reading file statistics ([#1738])
+3. Use CRC in Protocol + Metadata log replay ([#1790])
 
 ### 🚜 Refactor
 
