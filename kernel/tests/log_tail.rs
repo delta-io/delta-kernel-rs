@@ -9,7 +9,8 @@ use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::{FileMeta, LogPath, Snapshot};
 
 use test_utils::{
-    actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
+    actions_to_string, actions_to_string_with_metadata, add_commit, add_staged_commit,
+    delta_path_for_version, TestAction, CATALOG_MANAGED_METADATA,
 };
 
 /// Helper function to create a LogPath for a commit at the given version
@@ -43,12 +44,17 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     let (storage, engine, table_root) = setup_test();
 
     // with staged commits:
-    // _delta_log/0.json (PM in here)
+    // _delta_log/0.json (PM in here, catalog-managed)
     // _delta_log/_staged_commits/1.uuid.json
     // _delta_log/_staged_commits/1.uuid.json // add an unused staged commit at version 1
     // _delta_log/_staged_commits/2.uuid.json
     let actions = vec![TestAction::Metadata];
-    add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA),
+    )
+    .await?;
     let path1 = add_staged_commit(storage.as_ref(), 1, String::from("{}")).await?;
     let _ = add_staged_commit(storage.as_ref(), 1, String::from("{}")).await?;
     let path2 = add_staged_commit(storage.as_ref(), 2, String::from("{}")).await?;
@@ -60,6 +66,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     ];
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail.clone())
+        .with_max_catalog_version(2)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 2);
     let log_segment = snapshot.log_segment();
@@ -83,6 +90,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     // 2. Now check for time-travel to 1
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
+        .with_max_catalog_version(2)
         .at_version(1)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
@@ -103,6 +111,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     let log_tail = vec![create_log_path(&table_root, path1.clone())];
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
+        .with_max_catalog_version(1)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
@@ -119,7 +128,9 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     );
 
     // 4. Check if we don't pass log tail
-    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_max_catalog_version(0)
+        .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
     let log_segment = snapshot.log_segment();
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
@@ -136,6 +147,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     )];
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(log_tail)
+        .with_max_catalog_version(0)
         .build(engine.as_ref())?;
 
     assert_eq!(snapshot.version(), 0);
@@ -214,9 +226,14 @@ async fn log_tail_behind_filesystem() -> Result<(), Box<dyn std::error::Error>> 
 async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_root) = setup_test();
 
-    // commits 0, 1, 2 in storage
+    // commits 0, 1, 2 in storage (catalog-managed table)
     let actions = vec![TestAction::Metadata];
-    add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA),
+    )
+    .await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_2.parquet".to_string())];
@@ -225,6 +242,7 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     // initial snapshot at version 1
     let initial_snapshot = Snapshot::builder_for(table_root.clone())
         .at_version(1)
+        .with_max_catalog_version(1)
         .build(engine.as_ref())?;
     assert_eq!(initial_snapshot.version(), 1);
 
@@ -244,6 +262,7 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     // Build incremental snapshot with log_tail
     let new_snapshot = Snapshot::builder_from(initial_snapshot)
         .with_log_tail(log_tail)
+        .with_max_catalog_version(4)
         .build(engine.as_ref())?;
 
     // Verify we advanced to version 4
