@@ -96,7 +96,7 @@ impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
     /// using
-    pub fn builder_for(table_root: Url) -> SnapshotBuilder {
+    pub fn builder_for(table_root: impl AsRef<str>) -> SnapshotBuilder {
         SnapshotBuilder::new_for(table_root)
     }
 
@@ -966,7 +966,8 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    // TODO: unify this and lots of stuff in LogSegment tests and test_utils
+    // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
+    // Also make this function take in the path of the delta table (currently only can commit to tables at the root directory).
     async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
         let commit_data = commit
             .iter()
@@ -1666,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_enablement_version_in_future() -> DeltaResult<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
-        let url = Url::parse("memory:///table2")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1715,7 +1716,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_missing_ict_when_enabled() -> DeltaResult<()> {
         // Test missing ICT when it should be present - should error
-        let url = Url::parse("memory:///table3")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1747,7 +1748,7 @@ mod tests {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///missing_commit_test")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1802,7 +1803,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> DeltaResult<()> {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
-        let url = Url::parse("memory:///checkpoint_commit_test")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
