@@ -317,8 +317,7 @@ impl Snapshot {
                     .listed
                     .max_published_version
                     .max(old_log_segment.listed.max_published_version),
-            }
-            .validate()?,
+            },
             log_root,
             new_version,
             // Preserve checkpoint schema from old segment
@@ -1810,8 +1809,7 @@ mod tests {
         let listed_files = LogSegmentFiles {
             checkpoint_parts,
             ..Default::default()
-        }
-        .validate()?;
+        };
 
         let log_segment =
             LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;

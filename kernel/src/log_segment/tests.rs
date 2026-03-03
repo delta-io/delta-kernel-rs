@@ -1132,8 +1132,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .validate()?,
+        },
         log_root,
         None,
         None,
@@ -1202,8 +1201,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
             ],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .validate()?,
+        },
         log_root,
         None,
         None,
@@ -1267,8 +1265,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
             )],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .validate()?,
+        },
         log_root,
         None,
         None,
@@ -1321,8 +1318,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .validate()?,
+        },
         log_root,
         None,
         None,
@@ -1409,8 +1405,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
             )],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .validate()?,
+        },
         log_root,
         None,
         None,
@@ -1905,124 +1900,153 @@ async fn test_commit_cover_minimal_overlap() {
 
 #[test]
 fn test_validate_listed_log_file_in_order_compaction_files() {
-    assert!(LogSegmentFiles {
-        ascending_compaction_files: vec![
-            create_log_path(
-                "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
-            ),
-            create_log_path(
-                "file:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
-            ),
-        ],
-        latest_commit_file: Some(create_log_path(
-            "file:///_delta_log/00000000000000000001.json",
-        )),
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000001.json",
+            )],
+            ascending_compaction_files: vec![
+                create_log_path(
+                    "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
+                ),
+                create_log_path(
+                    "file:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
+                ),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_ok());
 }
 
 #[test]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
-    assert!(LogSegmentFiles {
-        ascending_compaction_files: vec![
-            create_log_path(
-                "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
-            ),
-            create_log_path(
-                "file:///_delta_log/00000000000000000000.00000000000000000003.compacted.json",
-            ),
-        ],
-        latest_commit_file: Some(create_log_path(
-            "file:///_delta_log/00000000000000000001.json",
-        )),
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000001.json",
+            )],
+            ascending_compaction_files: vec![
+                create_log_path(
+                    "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
+                ),
+                create_log_path(
+                    "file:///_delta_log/00000000000000000000.00000000000000000003.compacted.json",
+                ),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_err());
 }
 
 #[test]
 fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
-    assert!(LogSegmentFiles {
-        checkpoint_parts: vec![
-            create_log_path(
-                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
-            ),
-            create_log_path(
-                "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000002.parquet",
-            ),
-        ],
-        latest_commit_file: Some(create_log_path(
-            "file:///_delta_log/00000000000000000001.json",
-        )),
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![
+                create_log_path(
+                    "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
+                ),
+                create_log_path(
+                    "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000002.parquet",
+                ),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_err());
 }
 
 #[test]
 fn test_validate_listed_log_file_invalid_multipart_checkpoint() {
-    assert!(LogSegmentFiles {
-        checkpoint_parts: vec![
-            create_log_path(
-                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
-            ),
-            create_log_path(
-                "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000003.parquet",
-            ),
-        ],
-        latest_commit_file: Some(create_log_path(
-            "file:///_delta_log/00000000000000000001.json",
-        )),
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![
+                create_log_path(
+                    "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+                ),
+                create_log_path(
+                    "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000003.parquet",
+                ),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_err());
 }
 
 #[test]
 fn test_validate_listed_log_file_out_of_order_commit_files() {
-    assert!(LogSegmentFiles {
-        ascending_commit_files: vec![
-            create_log_path("file:///_delta_log/00000000000000000003.json"),
-            create_log_path("file:///_delta_log/00000000000000000001.json"),
-        ],
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000003.json"),
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_err());
 }
 
 #[test]
 fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
-    assert!(LogSegmentFiles {
-        checkpoint_parts: vec![create_log_path(
-            "file:///_delta_log/00000000000000000010.json"
-        ),],
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000010.json",
+            )],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_err());
 }
 
 #[test]
 fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
     // Two parts that agree on version but claim num_parts=3 (count mismatch: 2 != 3)
-    assert!(LogSegmentFiles {
-        checkpoint_parts: vec![
-            create_log_path(
-                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
-            ),
-            create_log_path(
-                "file:///_delta_log/00000000000000000010.checkpoint.0000000002.0000000003.parquet",
-            ),
-        ],
-        ..Default::default()
-    }
-    .validate()
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![
+                create_log_path(
+                    "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+                ),
+                create_log_path(
+                    "file:///_delta_log/00000000000000000010.checkpoint.0000000002.0000000003.parquet",
+                ),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
     .is_err());
 }
 
@@ -2412,36 +2436,37 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
 
 #[test]
 fn test_log_segment_contiguous_commit_files() {
-    let res = LogSegmentFiles {
-        ascending_commit_files: vec![
-            create_log_path("file:///_delta_log/00000000000000000001.json"),
-            create_log_path("file:///_delta_log/00000000000000000002.json"),
-            create_log_path("file:///_delta_log/00000000000000000003.json"),
-        ],
-        latest_commit_file: Some(create_log_path(
-            "file:///_delta_log/00000000000000000001.json",
-        )),
-        ..Default::default()
-    }
-    .validate();
-    assert!(res.is_ok());
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
 
-    // allow gaps in LogSegmentFiles
-    let listed = LogSegmentFiles {
-        ascending_commit_files: vec![
-            create_log_path("file:///_delta_log/00000000000000000001.json"),
-            create_log_path("file:///_delta_log/00000000000000000003.json"),
-        ],
-        latest_commit_file: Some(create_log_path(
-            "file:///_delta_log/00000000000000000001.json",
-        )),
-        ..Default::default()
-    }
-    .validate();
+    // contiguous commits are accepted
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+                create_log_path("file:///_delta_log/00000000000000000002.json"),
+                create_log_path("file:///_delta_log/00000000000000000003.json"),
+            ],
+            ..Default::default()
+        },
+        log_root.clone(),
+        None,
+        None,
+    )
+    .is_ok());
 
-    // disallow gaps in LogSegment
-    let log_segment =
-        LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None, None);
+    // gaps are disallowed by LogSegment::try_new
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![
+                create_log_path("file:///_delta_log/00000000000000000001.json"),
+                create_log_path("file:///_delta_log/00000000000000000003.json"),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    );
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2537,8 +2562,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
             checkpoint_parts: vec![create_log_path(&checkpoint_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
             ..Default::default()
-        }
-        .validate()?,
+        },
         log_root,
         None,
         Some(hint_schema.clone()), // V1 hint schema (no sidecar field)

@@ -690,8 +690,7 @@ impl Scan {
             ascending_commit_files,
             latest_commit_file: log_segment.listed.latest_commit_file.clone(),
             ..Default::default()
-        }
-        .validate()?;
+        };
         let new_log_segment = LogSegment::try_new(
             log_segment_files,
             log_segment.log_root.clone(),

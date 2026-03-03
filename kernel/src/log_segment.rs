@@ -129,6 +129,74 @@ impl LogSegment {
         end_version: Option<Version>,
         checkpoint_schema: Option<SchemaRef>,
     ) -> DeltaResult<Self> {
+        // Validate structural invariants on the raw input (debug builds only)
+        #[cfg(debug_assertions)]
+        {
+            // ascending_commit_files must be strictly ascending by version
+            if !listed_files
+                .ascending_commit_files
+                .windows(2)
+                .all(|w| w[0].version < w[1].version)
+            {
+                return Err(Error::generic(
+                    "ascending_commit_files is not in strictly ascending version order",
+                ));
+            }
+
+            // Compaction files must be sorted by (version, hi)
+            if !listed_files
+                .ascending_compaction_files
+                .windows(2)
+                .all(|pair| match pair {
+                    [ParsedLogPath {
+                        version: version0,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                        ..
+                    }, ParsedLogPath {
+                        version: version1,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                        ..
+                    }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
+                    _ => false,
+                })
+            {
+                return Err(Error::generic("ascending_compaction_files is not sorted"));
+            }
+
+            // All checkpoint_parts must be checkpoints
+            if !listed_files
+                .checkpoint_parts
+                .iter()
+                .all(|p| p.is_checkpoint())
+            {
+                return Err(Error::generic(
+                    "checkpoint_parts contains non-checkpoint file",
+                ));
+            }
+
+            // Multi-part checkpoints must share a version and have the right part count
+            if listed_files.checkpoint_parts.len() > 1 {
+                if !listed_files
+                    .checkpoint_parts
+                    .windows(2)
+                    .all(|pair| pair[0].version == pair[1].version)
+                {
+                    return Err(Error::generic(
+                        "multi-part checkpoint parts have different versions",
+                    ));
+                }
+                let n = listed_files.checkpoint_parts.len();
+                if !listed_files.checkpoint_parts.iter().all(|p| {
+                    matches!(
+                        p.file_type,
+                        LogPathFileType::MultiPartCheckpoint { num_parts, .. } if n == num_parts as usize
+                    )
+                }) {
+                    return Err(Error::generic("multi-part checkpoint part count mismatch"));
+                }
+            }
+        }
+
         // Ensure commit file versions are contiguous
         require!(
             listed_files
