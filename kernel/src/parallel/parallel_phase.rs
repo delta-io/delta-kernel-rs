@@ -421,16 +421,11 @@ mod tests {
             AfterPhase1ScanMetadata::Phase2 { state, files } => {
                 let final_state = if with_serde {
                     // Serialize and then deserialize to test the serde path
-                    let scan_span = state.scan_span.clone();
                     let serialized_bytes = state.into_bytes()?;
-                    Arc::new(Phase2State::from_bytes(
-                        engine.as_ref(),
-                        &serialized_bytes,
-                        scan_span,
-                    )?)
+                    Arc::new(Phase2State::from_bytes(engine.as_ref(), &serialized_bytes)?)
                 } else {
                     // Non-serde: just use the state directly
-                    Arc::new(state)
+                    Arc::new(*state)
                 };
 
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
