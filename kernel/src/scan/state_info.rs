@@ -10,6 +10,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
+use crate::scan::StatsOutputMode;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
@@ -109,13 +110,13 @@ impl StateInfo {
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
-    /// `stats_columns` - Optional list of columns to include in parsed stats output
+    /// `stats_output_mode` - Controls how file statistics are handled during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
-        stats_columns: Option<Vec<ColumnName>>,
+        stats_output_mode: StatsOutputMode,
         classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.partition_columns();
@@ -222,18 +223,16 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build stats schemas:
-        // - From stats_columns if specified (for outputting stats to the engine)
-        // - From predicate columns otherwise (for data skipping only, no logical schema needed)
-        // When both stats_columns and a predicate are provided, predicate-referenced columns
-        // are merged into the requested stats columns so the DataSkippingFilter has the stats
-        // it needs while also outputting the user-requested stats.
+        // Build stats schemas based on StatsOutputMode:
+        // - AllColumns: output all stats from expected_stats_schema
+        // - Columns(non-empty): merge requested + predicate columns for data skipping
+        // - Columns(empty): predicate-only internal data skipping (no stats output)
+        // - Skip: no stats at all (handled at the Scan level, no schemas needed here)
         let (physical_stats_schema, logical_stats_schema) =
-            match (&stats_columns, &physical_predicate) {
-                // stats_columns = Some([]) means output all stats from expected_stats_schema.
-                // This works both with and without a predicate — the DataSkippingFilter
+            match (&stats_output_mode, &physical_predicate) {
+                // Output all table stats columns in stats_parsed. The DataSkippingFilter
                 // reads stats_parsed from the transformed batch, which uses this schema.
-                (Some(columns), _) if columns.is_empty() => {
+                (StatsOutputMode::AllColumns, _) => {
                     let expected_stats_schemas =
                         table_configuration.build_expected_stats_schemas(None, None)?;
                     (
@@ -241,10 +240,12 @@ impl StateInfo {
                         Some(expected_stats_schemas.logical),
                     )
                 }
-                // Non-empty stats_columns list — include predicate-referenced columns
+                // Non-empty requested columns — include predicate-referenced columns
                 // alongside the user-requested stats columns so that the DataSkippingFilter
                 // has the stats it needs.
-                (Some(requested_columns), _) => {
+                (StatsOutputMode::Columns(requested_columns), _)
+                    if !requested_columns.is_empty() =>
+                {
                     let existing: HashSet<&ColumnName> = requested_columns.iter().collect();
                     let mut all_needed_stats_columns = requested_columns.clone();
                     for col in &predicate_column_names {
@@ -259,14 +260,14 @@ impl StateInfo {
                         Some(expected_stats_schemas.logical),
                     )
                 }
-                // No stats_columns, but has a physical predicate — build stats directly from
-                // the physical predicate's referenced schema (which already has physical
-                // column names and excludes partition columns).
-                (None, PhysicalPredicate::Some(_, ref_schema)) => {
+                // Columns(empty) or Skip with a physical predicate — build stats directly
+                // from the physical predicate's referenced schema for internal data skipping
+                // only (no logical schema needed for output).
+                (_, PhysicalPredicate::Some(_, ref_schema)) => {
                     (build_stats_schema(ref_schema), None)
                 }
-                // No stats_columns and no predicate
-                (None, _) => (None, None),
+                // No stats output and no predicate
+                (_, _) => (None, None),
             };
 
         let transform_spec =
@@ -295,7 +296,7 @@ pub(crate) mod tests {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::expressions::{column_expr, column_name, ColumnName, Expression as Expr};
+    use crate::expressions::{column_expr, column_name, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -327,7 +328,7 @@ pub(crate) mod tests {
             features,
             metadata_configuration,
             metadata_cols,
-            None,
+            StatsOutputMode::default(),
         )
     }
 
@@ -338,7 +339,7 @@ pub(crate) mod tests {
         features: &[TableFeature],
         metadata_configuration: HashMap<String, String>,
         metadata_cols: Vec<(&str, MetadataColumnSpec)>,
-        stats_columns: Option<Vec<ColumnName>>,
+        stats_output_mode: StatsOutputMode,
     ) -> DeltaResult<StateInfo> {
         let metadata = Metadata::try_new(
             None,
@@ -384,7 +385,7 @@ pub(crate) mod tests {
             schema.clone(),
             &table_configuration,
             predicate,
-            stats_columns,
+            stats_output_mode,
             (),
         )
     }
@@ -813,19 +814,19 @@ pub(crate) mod tests {
             &[], // no table features
             HashMap::new(),
             vec![],
-            Some(vec![]), // empty stats_columns = include all stats
+            StatsOutputMode::AllColumns,
         )
         .unwrap();
 
         // physical_stats_schema should be set (from expected_stats_schema)
         assert!(
             state_info.physical_stats_schema.is_some(),
-            "physical_stats_schema should be Some when stats_columns is set"
+            "physical_stats_schema should be Some when AllColumns is set"
         );
         // logical_stats_schema should be set for mapping physical->logical column names
         assert!(
             state_info.logical_stats_schema.is_some(),
-            "logical_stats_schema should be Some when stats_columns is set"
+            "logical_stats_schema should be Some when AllColumns is set"
         );
         // physical_predicate should still be active for data skipping
         assert!(
@@ -853,7 +854,7 @@ pub(crate) mod tests {
             &[],
             HashMap::new(),
             vec![],
-            Some(vec![column_name!("value")]), // request only 'value' stats
+            StatsOutputMode::Columns(vec![column_name!("value")]),
         )
         .unwrap();
 
@@ -896,7 +897,7 @@ pub(crate) mod tests {
             &[], // no table features
             HashMap::new(),
             vec![],
-            Some(vec![column_name!("value")]), // request only 'value' column stats
+            StatsOutputMode::Columns(vec![column_name!("value")]),
         )
         .unwrap();
 

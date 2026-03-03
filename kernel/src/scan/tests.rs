@@ -1102,24 +1102,79 @@ fn test_skip_stats_disables_data_skipping() {
 }
 
 #[test]
-fn test_skip_stats_and_include_stats_columns_errors() {
+fn test_skip_stats_after_include_stats_columns_wins() {
+    // With StatsOutputMode enum, last call wins. Calling with_skip_stats(true) after
+    // include_stats_columns() should result in stats being skipped.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let result = snapshot
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let scan = snapshot
         .scan_builder()
-        .with_skip_stats(true)
         .include_stats_columns()
-        .build();
+        .with_skip_stats(true)
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
 
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    // Stats are skipped, so all files should be returned (no data skipping)
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, 6);
+}
+
+#[test]
+fn test_with_stats_columns_empty_no_stats_output() {
+    // with_stats_columns(vec![]) should produce no stats output
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
     assert!(
-        err.contains("Cannot set both skip_stats and include_stats_columns"),
-        "unexpected error: {err}"
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
     );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, _selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+
+        // stats_parsed should not be present since empty Columns means no stats output
+        assert!(
+            batch.column_by_name("stats_parsed").is_none(),
+            "stats_parsed should not be present with empty stats columns"
+        );
+    }
 }
 
 /// Test that `with_stats_columns` with specific columns only returns stats for those columns.
