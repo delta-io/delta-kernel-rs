@@ -17,10 +17,13 @@
 11. Add ffi api to perform a checkpoint ([#1619])
     - No migration needed. This adds a new api in ffi supporting all-in-one checkpointing.
 12. Add stats_columns to ParquetHandler ([#1668])
+    - Add stat_columns to `write_parquet_file` engine implementation, which specifies the columns to collect Delta stats on
 13. Add StatisticsCollector core with numRecords ([#1662])
+    - Renames `_stat_columns` above to `stat_columns`
 14. Return updated Snapshot from `Snapshot::publish` ([#1694])
     - Snapshot::publish now takes self: Arc<Self> and returns DeltaResult<SnapshotRef> instead of ()
 15. Pass engine to Snapshot::transaction() for domain metadata access ([#1707])
+    - Snapshot::transaction() now requires an engine: &dyn Engine parameter to read domain metadata
 20. Add tracing instrumentation to transaction and snapshot operations ([#1772])
     - snapshot and transaction have both stopped implementing auto traits UnwindSafe and RefUnwindSafe due to storing new instrumentation span fields
 22. Use physical stats column names in `WriteContext` ([#1836])
