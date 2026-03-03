@@ -8,7 +8,6 @@
 1. Add checkpoint schema discovery for stats_parsed detection ([#1550])
 2. Remove `DefaultEngine::new` ([#1583])
    - Use `DefaultEngineBuilder` instead like: `DefaultEngineBuilder::new(store).build()`
-3. Include max known published commit version inside of `LogSegment` ([#1587])
 4. Add ParseJson expression  ([#1586])
    - Implementors of the ExpressionHandler trait now need to handle this expression
 5. Change CommitResponse::Committed to return a FileMeta ([#1599])
@@ -18,11 +17,11 @@
 9. Distributed Log Replay serialization/deserialization ([#1503])
 10. Introduce Deduplicator trait to unify mutable and immutable deduplication ([#1537])
 11. Add ffi api to perform a checkpoint ([#1619])
-   - No migration needed. This adds a new api in ffi supporting all-in-one checkpointing.
+    - No migration needed. This adds a new api in ffi supporting all-in-one checkpointing.
 12. Add stats_columns to ParquetHandler ([#1668])
 13. Add StatisticsCollector core with numRecords ([#1662])
 14. Return updated Snapshot from `Snapshot::publish` ([#1694])
-   - Snapshot::publish now takes self: Arc<Self> and returns DeltaResult<SnapshotRef> instead of ()
+    - Snapshot::publish now takes self: Arc<Self> and returns DeltaResult<SnapshotRef> instead of ()
 15. Pass engine to Snapshot::transaction() for domain metadata access ([#1707])
 16. Read parsed-stats from checkpoint ([#1638])
 17.  feat: add get clustering columns in transactions ([#1693])
@@ -31,13 +30,11 @@
 20. Add tracing instrumentation to transaction and snapshot operations ([#1772])
 21. Checkpoint and sidecar row group skipping via stats_parsed ([#1853])
 22. Use physical stats column names in `WriteContext` ([#1836])
-   - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
+    - `WriteContext.stats_columns` now uses _physical_ column names per column mapping. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
 23. Generate `physical_schema` in `WriteContext` w.r.t column mapping and `materializePartitionColumns` ([#1837])
    - `WriteContext.physical_schema` now respects column mapping, and retains partition columns when `materializePartitionColumns` is enabled. Ref: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
-24. Use CRC for In-Commit-Timestamp reading ([#1806])
 26. Implement the read metadata workload runner ([#1919])
    - No migration needed; this introduces new benchmarking infrastructure not yet used anywhere
-25. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
 26. Fix get_app_id_version to take &self ([#1770])
 27. Add ability to  'enter' the runtime to the default engine ([#1847])
    - Implementors of the `TaskExecutor` trait now need to support this
@@ -109,6 +106,9 @@
 62. Simplify checkpoint-table with Snapshot::checkpoint ([#1813])
 63. Add size metadata to the CdfScanFile ([#1935])
 64. Add deletion vector APIs to transaction ([#1430])
+65. Include max known published commit version inside of `LogSegment` ([#1587])
+66. Use CRC for In-Commit-Timestamp reading ([#1806])
+67. Refactor `ListedLogFiles::try_new` to be more extensible and with default values by using builder pattern ([#1585])
 
 ### 🐛 Bug Fixes
 
