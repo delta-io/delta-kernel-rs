@@ -9,8 +9,9 @@
 
 ## How to Contribute
 
-For trivial fixes, etc. please feel free to open a PR directly. For larger changes, we follow a
-structured contribution process to ensure high-quality code:
+For trivial fixes, etc. please feel free to open a PR directly (Please see [Getting you PR
+reviewed](#getting-your-pr-reviewed) below). For larger changes, we follow a structured contribution
+process to ensure high-quality code:
 
 1. **Start with an issue and/or design sketch**: Open an issue describing what you want to
    contribute and why. Continue to step 2 after reaching some consensus. This helps us avoid wasted
@@ -18,13 +19,32 @@ structured contribution process to ensure high-quality code:
    explored and rejected). Including a design sketch will help drive consensus (often a simple
    diagram or bullet points outlining high-level changes is sufficient).
 2. **Prototype/POC**: Create a PR marked as prototype/draft (not intended to merge) and gather
-   feedback to further derisk the design. This PR is not intended to be merged but will guide the
+   feedback to further de-risk the design. This PR is not intended to be merged but will guide the
    implementation and serve as a proving ground for the design. Then, pieces are torn out into
    smaller PRs that can be merged.
 3. **Implementation**: Finally, create PR(s) to implement the feature (production code, tests,
    thorough docs, etc.). Often the initial POC will be split into multiple smaller PRs (e.g.,
    refactors, then feature additions, then public APIs specifically). Care should be taken to ensure
-   each PR is easily reviewable and thoroughly tested.
+   each PR is easily review-able and thoroughly tested.
+
+## Getting your PR reviewed
+We invite everyone who would like their PRs reviewed to review _other_ open PRs as
+well. Like most open source projects, our review bandwidth is limited, and help from users is
+greatly appreciated. This helps increase the overall review rate, and allows contributors to build
+credibility within the project.
+
+PRs from contributors who do not review others' work will be lower priority, though we do try to
+review all PRs as promptly as possible.
+
+We also encourage contributors to optimize their PRs for review:
+- A crisp and complete PR description that explains clearly what the change is for cross-checking
+  against the code.
+- Tightly-scoped. That is, don't mix multiple changes in a single PR.
+- Code structure and doc comments optimized for understandability (e.g. avoid bloat, redundancy, and
+convoluted control flow).
+
+PRs that do not follow these principles are much more time consuming to review, and less likely to
+get prompt reviews.
 
 ## Forking and Setup
 
