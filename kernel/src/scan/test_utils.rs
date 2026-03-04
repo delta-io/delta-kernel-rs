@@ -143,7 +143,10 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
     let logical_schema =
         logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
     let state_info = Arc::new(StateInfo {
-        schema: LogicalSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None),
+        logical_schema: LogicalSchema::new_for_test(
+            logical_schema.clone(),
+            ColumnMappingMode::None,
+        ),
         physical_schema: logical_schema,
         physical_predicate: PhysicalPredicate::None,
         transform_spec,

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct InternalScanState {
-    schema: LogicalSchemaRef,
+    logical_schema: LogicalSchemaRef,
     physical_schema: SchemaRef,
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
@@ -245,7 +245,7 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
     ) -> DeltaResult<SerializableScanState> {
         let StateInfo {
-            schema,
+            logical_schema,
             physical_schema,
             physical_predicate,
             transform_spec,
@@ -261,7 +261,7 @@ impl ScanLogReplayProcessor {
 
         // Serialize internal state to JSON blob (schemas, transform spec, and column mapping mode)
         let internal_state = InternalScanState {
-            schema,
+            logical_schema,
             physical_schema,
             transform_spec,
             predicate_schema,
@@ -317,7 +317,7 @@ impl ScanLogReplayProcessor {
         };
 
         let state_info = Arc::new(StateInfo {
-            schema: internal_state.schema,
+            logical_schema: internal_state.logical_schema,
             physical_schema: internal_state.physical_schema,
             physical_predicate,
             transform_spec: internal_state.transform_spec,
@@ -411,8 +411,11 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
-                let partition_values =
-                    parse_partition_values(&self.state_info.schema, transform, &partition_values)?;
+                let partition_values = parse_partition_values(
+                    &self.state_info.logical_schema,
+                    transform,
+                    &partition_values,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -930,7 +933,10 @@ mod tests {
         let batch = vec![add_batch_simple(get_commit_schema().clone())];
         let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
         let state_info = Arc::new(StateInfo {
-            schema: LogicalSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None),
+            logical_schema: LogicalSchema::new_for_test(
+                logical_schema.clone(),
+                ColumnMappingMode::None,
+            ),
             physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
@@ -1123,16 +1129,16 @@ mod tests {
 
         // Verify StateInfo fields preserved
         assert_eq!(
-            deserialized.state_info.schema.raw_schema(),
-            state_info.schema.raw_schema()
+            deserialized.state_info.logical_schema.raw_schema(),
+            state_info.logical_schema.raw_schema()
         );
         assert_eq!(
             deserialized.state_info.physical_schema,
             state_info.physical_schema
         );
         assert_eq!(
-            deserialized.state_info.schema.column_mapping_mode(),
-            state_info.schema.column_mapping_mode()
+            deserialized.state_info.logical_schema.column_mapping_mode(),
+            state_info.logical_schema.column_mapping_mode()
         );
 
         // Verify all file keys are preserved with their DV info
@@ -1257,7 +1263,7 @@ mod tests {
                 true,
             )]));
             let state_info = Arc::new(StateInfo {
-                schema: LogicalSchema::new_for_test(schema.clone(), mode),
+                logical_schema: LogicalSchema::new_for_test(schema.clone(), mode),
                 physical_schema: schema.clone(),
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
@@ -1273,7 +1279,10 @@ mod tests {
                 processor.into_serializable_state(checkpoint_info).unwrap(),
             )
             .unwrap();
-            assert_eq!(deserialized.state_info.schema.column_mapping_mode(), mode);
+            assert_eq!(
+                deserialized.state_info.logical_schema.column_mapping_mode(),
+                mode
+            );
         }
     }
 
@@ -1288,7 +1297,7 @@ mod tests {
             true,
         )]));
         let state_info = Arc::new(StateInfo {
-            schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
@@ -1331,7 +1340,7 @@ mod tests {
         )]));
         let checkpoint_info = test_checkpoint_info();
         let invalid_internal_state = InternalScanState {
-            schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None, // Missing!
             transform_spec: None,
@@ -1362,7 +1371,7 @@ mod tests {
             true,
         )]));
         let invalid_internal_state = InternalScanState {
-            schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None,
             transform_spec: None,

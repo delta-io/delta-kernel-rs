@@ -104,14 +104,14 @@ pub(crate) fn get_cdf_transform_expr(
 
     // Handle regular partition values using parse_partition_values
     let parsed_values = parse_partition_values(
-        &state_info.schema,
+        &state_info.logical_schema,
         transform_spec,
         &scan_file.partition_values,
     )?;
     partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
-    let cdf_values = get_cdf_columns(&state_info.schema, scan_file)?;
+    let cdf_values = get_cdf_columns(&state_info.logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
     get_transform_expr(
@@ -178,7 +178,7 @@ mod tests {
     ) -> StateInfo {
         let physical_schema: SchemaRef = create_test_physical_schema().into();
         StateInfo {
-            schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
+            logical_schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
             physical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
@@ -398,7 +398,7 @@ mod tests {
         let transform_spec = vec![];
 
         let state_info = StateInfo {
-            schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
+            logical_schema: LogicalSchema::new_for_test(logical_schema, ColumnMappingMode::None),
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),

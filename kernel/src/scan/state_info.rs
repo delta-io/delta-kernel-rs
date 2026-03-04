@@ -16,7 +16,7 @@ use crate::{DeltaResult, Error, PredicateRef};
 #[derive(Debug, Clone)]
 pub(crate) struct StateInfo {
     /// The logical schema, column mapping mode, and partition columns for this scan
-    pub(crate) schema: LogicalSchemaRef,
+    pub(crate) logical_schema: LogicalSchemaRef,
     /// The physical read schema computed from the logical schema
     pub(crate) physical_schema: SchemaRef,
     /// The physical predicate for data skipping
@@ -36,24 +36,24 @@ impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
-    /// `schema` - The logical schema of the scan output, which includes partition columns
+    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
     /// `stats_columns` - Optional list of columns to include in parsed stats output
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
-        schema: LogicalSchema,
+        logical_schema: LogicalSchema,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
         stats_columns: Option<Vec<ColumnName>>,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let schema = Arc::new(schema);
+        let logical_schema = Arc::new(logical_schema);
         let (physical_schema, transform_spec) =
-            schema.compute_physical_read_schema_and_transform(&classifier)?;
+            logical_schema.compute_physical_read_schema_and_transform(&classifier)?;
 
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &schema)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
             None => PhysicalPredicate::None,
         };
 
@@ -91,7 +91,7 @@ impl StateInfo {
             };
 
         Ok(StateInfo {
-            schema,
+            logical_schema,
             physical_schema,
             physical_predicate,
             transform_spec,
@@ -255,7 +255,7 @@ pub(crate) mod tests {
         assert!(state_info.transform_spec.is_none());
 
         // Physical schema should match logical schema
-        assert_eq!(state_info.schema.raw_schema(), &schema);
+        assert_eq!(state_info.logical_schema.raw_schema(), &schema);
         assert_eq!(state_info.physical_schema.fields().len(), 2);
 
         // No predicate
@@ -295,7 +295,7 @@ pub(crate) mod tests {
         }
 
         // Physical schema should not include partition column
-        assert_eq!(state_info.schema.raw_schema(), &schema);
+        assert_eq!(state_info.logical_schema.raw_schema(), &schema);
         assert_eq!(state_info.physical_schema.fields().len(), 2); // Only id and value
     }
 

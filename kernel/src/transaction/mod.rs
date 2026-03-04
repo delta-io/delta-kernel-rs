@@ -1194,7 +1194,7 @@ impl<S> Transaction<S> {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    schema: LogicalSchema,
+    logical_schema: LogicalSchema,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
     /// Column names that should have statistics collected during writes.
@@ -1204,14 +1204,14 @@ pub struct WriteContext {
 impl WriteContext {
     fn new(
         target_dir: Url,
-        schema: LogicalSchema,
+        logical_schema: LogicalSchema,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
         stats_columns: Vec<ColumnName>,
     ) -> Self {
         WriteContext {
             target_dir,
-            schema,
+            logical_schema,
             physical_schema,
             logical_to_physical,
             stats_columns,
@@ -1223,7 +1223,7 @@ impl WriteContext {
     }
 
     pub fn logical_schema(&self) -> &LogicalSchema {
-        &self.schema
+        &self.logical_schema
     }
 
     pub fn physical_schema(&self) -> &SchemaRef {
@@ -1246,7 +1246,7 @@ impl WriteContext {
             .into_iter()
             .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
                 let physical_name = self
-                    .schema
+                    .logical_schema
                     .top_level_logical_to_physical_name(&logical_name)
                     .ok_or_else(|| {
                         Error::generic(format!(

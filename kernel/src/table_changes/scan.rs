@@ -170,7 +170,7 @@ impl TableChangesScan {
     /// Returns the [`LogicalSchema`] for this scan, which bundles the logical schema together with
     /// column mapping mode and partition columns.
     pub fn logical_schema(&self) -> &LogicalSchemaRef {
-        &self.state_info.schema
+        &self.state_info.logical_schema
     }
 
     /// Get a shared reference to the physical [`Schema`] of the table changes scan.
@@ -255,7 +255,7 @@ fn read_scan_file(
             engine.evaluation_handler().new_expression_evaluator(
                 physical_schema.clone(),
                 expr,
-                state_info.schema.as_output_data_type(),
+                state_info.logical_schema.as_output_data_type(),
             )
         })
         .transpose()?;
@@ -417,7 +417,7 @@ mod tests {
 
         // Check logical schema matches projection
         assert_eq!(
-            scan.state_info.schema.raw_schema().as_ref(),
+            scan.state_info.logical_schema.raw_schema().as_ref(),
             &StructType::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),

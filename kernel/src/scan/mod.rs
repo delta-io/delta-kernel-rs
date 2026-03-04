@@ -272,7 +272,7 @@ impl PhysicalPredicate {
     /// e.g. `col > 10 AND FALSE`. Such predicates can statically skip the whole query.
     pub(crate) fn try_new(
         predicate: &Predicate,
-        schema: &LogicalSchema,
+        logical_schema: &LogicalSchema,
     ) -> DeltaResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
@@ -282,7 +282,7 @@ impl PhysicalPredicate {
         // anyway needs to be evaluated against every row of data -- which is impossible if the
         // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
         let Some((physical_schema, column_mappings)) =
-            schema.get_referenced_physical_schema(predicate.references())?
+            logical_schema.get_referenced_physical_schema(predicate.references())?
         else {
             // The predicate doesn't statically skip all files, and it doesn't reference any columns
             // that could dynamically change its behavior, so it's useless for data skipping.
@@ -426,7 +426,7 @@ pub struct Scan {
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", &self.state_info.schema)
+            .field("logical_schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
             .field("skip_stats", &self.skip_stats)
             .finish()
@@ -458,7 +458,7 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &LogicalSchemaRef {
-        &self.state_info.schema
+        &self.state_info.logical_schema
     }
 
     /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
@@ -849,8 +849,8 @@ impl Scan {
         }
 
         debug!(
-            "Executing scan with table schema {:#?} and physical schema {:#?}",
-            self.state_info.schema, self.state_info.physical_schema
+            "Executing scan with logical schema {:#?} and physical schema {:#?}",
+            self.state_info.logical_schema, self.state_info.physical_schema
         );
 
         let table_root = self.snapshot.table_root().clone();
@@ -866,7 +866,7 @@ impl Scan {
             .flatten_ok();
 
         let physical_schema = self.physical_schema().clone();
-        let logical_schema = self.state_info.schema.clone();
+        let logical_schema = self.state_info.logical_schema.clone();
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
