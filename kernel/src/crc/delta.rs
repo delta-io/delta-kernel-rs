@@ -2,11 +2,17 @@
 #![allow(dead_code)]
 //! CRC commit delta types and replay context.
 //!
-//! [`CrcDelta`] captures all CRC-relevant changes from a single commit: protocol, metadata,
-//! domain metadata, in-commit timestamp, and file stats.
+//! A CRC tracks two categories of fields:
+//! - **Metadata fields**: protocol, metadata, domain metadata, in-commit timestamp (and
+//!   eventually set transactions). Always kept up-to-date during replay regardless of file
+//!   stats validity.
+//! - **File stats fields**: `num_files` and `table_size_bytes`. Only updated when the operation
+//!   is incremental-safe and current file stats validity permits it (e.g. an ANALYZE STATS
+//!   commit breaks validity because it re-adds files without removing them).
 //!
+//! [`CrcDelta`] captures changes from a single commit across both categories.
 //! [`CrcContext`] wraps a [`Crc`] with a [`FileStatsValidity`] tag to track whether
-//! incremental file stats are trustworthy during forward log replay.
+//! file stats are trustworthy during forward log replay.
 
 use std::collections::HashMap;
 
@@ -39,16 +45,24 @@ pub(crate) struct CrcDelta {
 /// Tracks whether file stats (`num_files`, `table_size_bytes`) are trustworthy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileStatsValidity {
-    /// CRC-rooted: file stats are correct totals from a valid CRC file.
+    /// File stats are known-correct absolute totals. This is the case when seeded from a CRC
+    /// file (which contains `num_files` and `table_size_bytes`) or when replay starts from
+    /// version zero (where the initial state is trivially zero).
     Valid,
-    /// No CRC base: file stats are only deltas accumulated from zero.
+    /// File stats are relative deltas, not absolute totals. This happens when seeding from a
+    /// checkpoint: we extract metadata fields but not file counts (reading all add actions from
+    /// a checkpoint just for counts is too expensive). The accumulated deltas are correct, but
+    /// without a baseline they cannot produce final totals.
     Incomplete,
     /// A non-incremental operation was seen: file stats cannot be determined incrementally.
+    /// For example, ANALYZE STATS re-adds existing files with updated statistics but no
+    /// corresponding removes, so naively counting adds would double-count.
     /// A full log replay from scratch could recover correct file stats.
     Indeterminate,
     /// A file action had a missing size field: correct file stats are impossible to compute.
-    /// Unlike [`Indeterminate`](Self::Indeterminate), no amount of replay can recover the
-    /// missing data.
+    /// For example, the Delta protocol allows `remove.size` to be null -- when encountered,
+    /// we can no longer track byte totals. Unlike [`Indeterminate`](Self::Indeterminate), no
+    /// amount of replay can recover the missing data.
     Untrackable,
 }
 
@@ -65,9 +79,8 @@ pub(crate) enum FileStatsValidity {
 /// - [`from_checkpoint`](Self::from_checkpoint): context is at the checkpoint version, replay
 ///   starts after.
 ///
-/// Non-file-stats fields (e.g. protocol, metadata, domain metadata, set transactions, ICT) are
-/// always kept up-to-date. File stats (`num_files`, `table_size_bytes`) are only updated when
-/// the operation is known to be incremental-safe.
+/// Metadata fields are always kept up-to-date. File stats are only updated when the operation
+/// is incremental-safe and current file stats validity permits it (see [`FileStatsValidity`]).
 #[derive(Debug, Clone)]
 pub(crate) struct CrcContext {
     /// The CRC state being built up during replay.
@@ -77,7 +90,7 @@ pub(crate) struct CrcContext {
 }
 
 impl CrcContext {
-    /// CRC-rooted: file stats are known-correct.
+    /// CRC-rooted: all fields including file stats are known-correct absolute totals.
     pub(crate) fn from_crc(crc: Crc) -> Self {
         Self {
             crc,
@@ -85,8 +98,8 @@ impl CrcContext {
         }
     }
 
-    /// No checkpoint, no CRC. Replay begins at 000.json, which will establish P/M and initial
-    /// file stats via the first [`apply`](Self::apply) call.
+    /// No checkpoint, no CRC. Replay begins at 000.json, which will establish metadata fields
+    /// and initial file stats via the first [`apply`](Self::apply) call.
     pub(crate) fn for_zero_rooted_table() -> Self {
         Self {
             crc: Crc::default(),
@@ -94,7 +107,21 @@ impl CrcContext {
         }
     }
 
-    /// Checkpoint-rooted: P/M/DM are seeded from the checkpoint, but file stats are unknown.
+    /// Checkpoint-rooted: metadata fields are seeded from the checkpoint, but file stats are
+    /// unknown.
+    ///
+    /// To avoid the performance cost of reading all add/remove file actions from the checkpoint,
+    /// we read only metadata fields (not file counts). Cost varies by checkpoint format:
+    /// - Classic (single parquet): must scan the full file (metadata fields are mixed in with
+    ///   add/remove actions)
+    /// - V2 single-file: same as classic
+    /// - V2 manifest + sidecars: only the manifest needs reading (sidecars contain only
+    ///   add/remove actions)
+    /// - Multi-part classic: must scan all parts, which can be expensive for large tables
+    ///
+    /// TODO(#2010): skip sidecar reads for V2 manifest checkpoints.
+    /// TODO(#2011): for single-file checkpoints, also extract file stats to produce Valid
+    ///              instead of Incomplete.
     pub(crate) fn from_checkpoint(mut seed: Crc) -> Self {
         seed.num_files = 0;
         seed.table_size_bytes = 0;
@@ -106,7 +133,7 @@ impl CrcContext {
 
     /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
     ///
-    /// Non-file-stats fields are always updated. File stats are only updated when:
+    /// Metadata fields are always updated. File stats are only updated when:
     /// - Validity is not already terminal ([`Untrackable`](FileStatsValidity::Untrackable) or
     ///   [`Indeterminate`](FileStatsValidity::Indeterminate))
     /// - The delta has no missing file sizes
