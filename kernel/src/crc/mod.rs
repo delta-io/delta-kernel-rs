@@ -5,13 +5,21 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
+mod file_stats;
 mod lazy;
 mod reader;
+mod writer;
 
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
+#[allow(unused)]
+pub(crate) use writer::try_write_crc_file;
 
-use serde::Deserialize;
+use std::collections::HashMap;
+
+use serde::de::Deserializer;
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 
@@ -22,7 +30,7 @@ use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
 /// 3. Contain exactly one JSON object with the schema of this struct.
 // Deserialized directly from JSON via serde. See `reader::try_read_crc_file`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Crc {
     // ===== Required fields =====
@@ -49,8 +57,17 @@ pub(crate) struct Crc {
     /// Live transaction identifier ([`SetTransaction`]) actions at this version.
     #[serde(skip)]
     pub(crate) set_transactions: Option<Vec<SetTransaction>>,
-    /// Live [`DomainMetadata`] actions at this version, excluding tombstones.
-    pub(crate) domain_metadata: Option<Vec<DomainMetadata>>,
+    /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
+    /// (`removed=true`) are never stored.
+    ///
+    /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
+    /// a Vec, which is converted via custom serde deserialization.
+    #[serde(
+        default,
+        deserialize_with = "de_opt_vec_to_opt_map",
+        serialize_with = "ser_opt_map_to_opt_vec"
+    )]
+    pub(crate) domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
     #[serde(skip)]
     pub(crate) file_size_histogram: Option<FileSizeHistogram>,
@@ -66,6 +83,36 @@ pub(crate) struct Crc {
     /// Distribution of deleted record counts across files. See this section for more details.
     #[serde(skip)]
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+}
+
+/// Deserialize `Option<Vec<DomainMetadata>>` from JSON into `Option<HashMap<String, DomainMetadata>>`.
+fn de_opt_vec_to_opt_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, DomainMetadata>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt_vec: Option<Vec<DomainMetadata>> = Option::deserialize(deserializer)?;
+    Ok(opt_vec.map(|vec| {
+        vec.into_iter()
+            .map(|dm| (dm.domain().to_string(), dm))
+            .collect()
+    }))
+}
+
+/// Serialize `Option<HashMap<String, DomainMetadata>>` back to `Option<Vec<DomainMetadata>>` so
+/// the CRC JSON format uses an array (matching the Delta protocol spec).
+fn ser_opt_map_to_opt_vec<S>(
+    map: &Option<HashMap<String, DomainMetadata>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match map {
+        None => serializer.serialize_none(),
+        Some(m) => m.values().collect::<Vec<_>>().serialize(serializer),
+    }
 }
 
 /// The [FileSizeHistogram] object represents a histogram tracking file counts and total bytes

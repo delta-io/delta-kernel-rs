@@ -9,6 +9,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
+use crate::scan::StatsOutputMode;
 use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
 use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
@@ -113,14 +114,14 @@ impl TableChangesScanBuilder {
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
 
         // Create StateInfo using CDF field classifier
-        // CDF doesn't support stats_columns
+        // CDF doesn't support stats output
         let table_config = self.table_changes.end_snapshot.table_configuration();
         let schema = LogicalSchema::new(logical_schema, table_config);
         let state_info = StateInfo::try_new(
             schema,
             table_config,
             self.predicate,
-            None, // stats_columns
+            StatsOutputMode::default(),
             CdfTransformFieldClassifier,
         )?;
 
