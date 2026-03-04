@@ -154,10 +154,6 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-// Benchmarking infrastructure (only public for benchmarks and tests)
-#[cfg(any(test, feature = "internal-api"))]
-pub mod benchmarks;
-
 #[cfg(feature = "internal-api")]
 pub mod parallel;
 #[cfg(not(feature = "internal-api"))]
