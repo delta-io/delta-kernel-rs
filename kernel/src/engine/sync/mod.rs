@@ -14,6 +14,7 @@ use tracing::debug;
 
 pub(crate) mod json;
 mod parquet;
+pub(crate) use parquet::SyncParquetHandler;
 mod storage;
 
 /// This is a simple (test-only) implementation of [`Engine`]. It only supports reading data from
