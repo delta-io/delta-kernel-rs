@@ -21,10 +21,10 @@ use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
-    FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
-    LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
-    MAX_VALID_WRITER_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
+    LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -603,12 +603,11 @@ impl TableConfiguration {
             .unwrap_or(false)
     }
 
-    /// Helper method to check if a feature is supported based on its FeatureInfo.
+    /// Helper method to check if a feature is supported.
     /// This checks protocol versions and feature lists but does NOT check enablement properties.
-    #[allow(dead_code)]
-    fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
-        // NOTE: This method uses the passed-in `info` (not feature.info()) because tests
-        // construct custom FeatureInfo instances with different version thresholds.
+    #[internal_api]
+    pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
+        let info = feature.info();
         let min_legacy_version = info.min_legacy_version.as_ref();
         let min_reader_version =
             min_legacy_version.map_or(TABLE_FEATURES_MIN_READER_VERSION, |v| v.0);
@@ -647,28 +646,6 @@ impl TableConfiguration {
         }
     }
 
-    /// Helper method to check if a feature is enabled based on its FeatureInfo.
-    /// This checks both protocol support and enablement via table properties.
-    #[allow(dead_code)]
-    fn is_feature_info_enabled(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
-        if !self.is_feature_info_supported(feature, info) {
-            return false;
-        }
-
-        match info.enablement_check {
-            EnablementCheck::AlwaysIfSupported => true,
-            EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
-        }
-    }
-
-    /// Generic method to check if a feature is supported in the protocol.
-    /// This does NOT check if the feature is enabled via table properties.
-    #[internal_api]
-    pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
-        let info = feature.info();
-        self.is_feature_info_supported(feature, info)
-    }
-
     /// Generic method to check if a feature is enabled.
     ///
     /// A feature is enabled if:
@@ -676,8 +653,14 @@ impl TableConfiguration {
     /// 2. The enablement check passes
     #[internal_api]
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
-        let info = feature.info();
-        self.is_feature_info_enabled(feature, info)
+        if !self.is_feature_supported(feature) {
+            return false;
+        }
+
+        match feature.info().enablement_check {
+            EnablementCheck::AlwaysIfSupported => true,
+            EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
+        }
     }
 }
 
@@ -1244,15 +1227,13 @@ mod test {
     }
 
     #[test]
-    fn test_is_feature_supported_returns_false_without_info() {
-        // is_feature_supported should return false for features without FeatureInfo
+    fn test_is_feature_supported_returns_false_for_unknown_feature() {
         let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
         assert!(!config.is_feature_supported(&TableFeature::unknown("futureFeature")));
     }
 
     #[test]
-    fn test_is_feature_enabled_returns_false_without_info() {
-        // is_feature_enabled should return false for features without FeatureInfo
+    fn test_is_feature_enabled_returns_false_for_unknown_feature() {
         let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
         assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
     }
