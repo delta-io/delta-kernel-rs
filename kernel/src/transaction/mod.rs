@@ -895,15 +895,15 @@ impl<S> Transaction<S> {
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
-        let schema = LogicalSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
-        let physical_schema = schema.compute_write_physical_schema(materialize_partition_columns);
+        let logical_schema = LogicalSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
+        let physical_schema = logical_schema.compute_write_physical_schema(materialize_partition_columns);
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
 
         WriteContext::new(
             target_dir.clone(),
-            schema,
+            logical_schema,
             physical_schema,
             Arc::new(logical_to_physical),
             stats_columns,

@@ -14,11 +14,11 @@ use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_
 /// This function directly looks up CDF columns in the schema and generates their values
 /// based on the scan file metadata, returning an iterator over the metadata.
 fn get_cdf_columns(
-    schema: &LogicalSchema,
+    logical_schema: &LogicalSchema,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
     // Handle _change_type
-    let change_type_idx = schema.top_level_field_index(CHANGE_TYPE_COL_NAME);
+    let change_type_idx = logical_schema.top_level_field_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_idx, &scan_file.scan_type) {
         (Some(idx), CdfScanFileType::Add | CdfScanFileType::Remove) => {
             let value = Scalar::String(scan_file.scan_type.get_cdf_string_value().to_string());
@@ -32,7 +32,7 @@ fn get_cdf_columns(
 
     // Handle _commit_timestamp
     let timestamp_metadata = if let Some(idx) =
-        schema.top_level_field_index(COMMIT_TIMESTAMP_COL_NAME)
+        logical_schema.top_level_field_index(COMMIT_TIMESTAMP_COL_NAME)
     {
         let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp)
             .map_err(|e| Error::generic(format!("Failed to process {}: {e}", scan_file.path)))?;
@@ -42,7 +42,7 @@ fn get_cdf_columns(
     };
 
     // Handle _commit_version
-    let version_metadata = schema
+    let version_metadata = logical_schema
         .top_level_field_index(COMMIT_VERSION_COL_NAME)
         .map(|idx| {
             let value = Scalar::Long(scan_file.commit_version);

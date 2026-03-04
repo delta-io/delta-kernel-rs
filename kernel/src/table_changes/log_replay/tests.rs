@@ -834,9 +834,8 @@ async fn data_skipping_filter() {
         column_expr!("id"),
         Scalar::from(4),
     );
-    let logical_schema = get_schema();
-    let table_schema = LogicalSchema::new_for_test(logical_schema.clone(), ColumnMappingMode::None);
-    let predicate = match PhysicalPredicate::try_new(&predicate, &table_schema) {
+    let logical_schema = LogicalSchema::new_for_test(get_schema(), ColumnMappingMode::None);
+    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
         Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
         other => panic!("Unexpected result: {other:?}"),
     };
@@ -846,7 +845,7 @@ async fn data_skipping_filter() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
+    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema.raw_schema().clone(), predicate)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
