@@ -25,6 +25,7 @@ use delta_kernel_derive::internal_api;
 pub use crate::listed_log_files::ListedLogFiles;
 #[cfg(not(feature = "internal-api"))]
 use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::find_last_checkpoint_before;
 use crate::schema::compare::SchemaComparison;
 
 use itertools::Itertools;
@@ -308,7 +309,31 @@ impl LogSegment {
                     Some(end_version),
                 )?
             }
-            _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
+            // Hint is stale (cp.version > end_version) or absent — scan backwards.
+            // Mirrors Java: findLastCompleteCheckpointBefore(engine, logPath, versionToLoad + 1)
+            (_, Some(end_version)) => {
+                match find_last_checkpoint_before(storage, &log_root, end_version.saturating_add(1))? {
+                    Some(cp_version) => {
+                        info!(
+                            "Backward listing found checkpoint at v{cp_version} for time-travel to v{end_version}"
+                        );
+                        ListedLogFiles::list(
+                            storage,
+                            &log_root,
+                            log_tail,
+                            Some(cp_version),
+                            Some(end_version),
+                        )?
+                    }
+                    None => {
+                        warn!("No checkpoint found via backward listing; listing from version 0");
+                        ListedLogFiles::list(storage, &log_root, log_tail, None, Some(end_version))?
+                    }
+                }
+            }
+            // No hint, no time-travel version: no upper bound to scan backwards from.
+            // List from 0, same as Java's "list from version 0" fallback.
+            _ => ListedLogFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
         LogSegment::try_new(

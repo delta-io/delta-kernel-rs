@@ -12,7 +12,7 @@
 //! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -187,6 +187,59 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
         }
     }
     checkpoints
+}
+
+/// Find the last complete checkpoint at or before `version - 1` (i.e., `version` is the exclusive
+/// upper bound), searching backwards in batches of 1000 versions.
+///
+/// Mirrors Java's `Checkpointer.findLastCompleteCheckpointBefore`.
+pub(crate) fn find_last_checkpoint_before(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    version: Version, // exclusive upper bound; caller passes target_version + 1
+) -> DeltaResult<Option<Version>> {
+    let mut upper = version; // exclusive upper bound for the current batch
+
+    loop {
+        if upper == 0 {
+            break;
+        }
+        let lower = upper.saturating_sub(1000);
+        let start_from = log_root.join(&format!("{lower:020}"))?;
+
+        // Collect only checkpoint files in [lower, upper)
+        let checkpoint_files: Vec<ParsedLogPath> = storage
+            .list_from(&start_from)?
+            .map(|meta| ParsedLogPath::try_from(meta?))
+            .filter_map_ok(|opt| opt) // skip non-delta-log paths
+            .take_while(|res| match res {
+                Ok(p) => p.version < upper, // stop at the batch upper bound
+                Err(_) => true,             // propagate errors
+            })
+            .filter_ok(|p| p.is_checkpoint())
+            .try_collect()?;
+
+        // Group by version, find latest complete checkpoint in this batch.
+        let mut by_version: BTreeMap<Version, Vec<ParsedLogPath>> = BTreeMap::new();
+        for cp in checkpoint_files {
+            by_version.entry(cp.version).or_default().push(cp);
+        }
+
+        // Walk highest version first — return as soon as we find a complete checkpoint.
+        for (cp_version, parts) in by_version.into_iter().rev() {
+            let grouped = group_checkpoint_parts(parts);
+            if grouped
+                .iter()
+                .any(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+            {
+                return Ok(Some(cp_version));
+            }
+        }
+
+        upper = lower; // move to previous 1000-version window
+    }
+
+    Ok(None)
 }
 
 impl ListedLogFiles {
