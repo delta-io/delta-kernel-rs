@@ -281,7 +281,7 @@ impl TableConfiguration {
     /// Returns the physical partition schema for `partitionValues_parsed`.
     ///
     /// Field names are physical column names (respecting column mapping mode),
-    /// and field types are the actual partition column data types (all nullable).
+    /// and field types are the actual partition column data types with their original nullability.
     /// Returns `None` if the table has no partition columns.
     pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
         let partition_columns = self.metadata().partition_columns();
@@ -298,9 +298,10 @@ impl TableConfiguration {
                 field
             })
             .map(|field| {
-                StructField::nullable(
+                StructField::new(
                     field.physical_name(self.column_mapping_mode).to_owned(),
                     field.data_type().clone(),
+                    field.is_nullable(),
                 )
             })
             .collect();
