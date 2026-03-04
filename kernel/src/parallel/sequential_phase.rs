@@ -205,7 +205,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::AfterPhase1ScanMetadata;
+    use crate::scan::AfterSequentialScanMetadata;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
@@ -239,14 +239,14 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = sequential.finish()?;
         match (expected_sidecars, result) {
-            (sidecars, AfterPhase1ScanMetadata::Done(_)) => {
+            (sidecars, AfterSequentialScanMetadata::Done) => {
                 assert!(
                     sidecars.is_empty(),
                     "Expected Done but got sidecars {:?}",
                     sidecars
                 );
             }
-            (expected_sidecars, AfterSequential::Parallel { files, .. }) => {
+            (expected_sidecars, AfterSequentialScanMetadata::Parallel { files, .. }) => {
                 assert_eq!(
                     files.len(),
                     expected_sidecars.len(),

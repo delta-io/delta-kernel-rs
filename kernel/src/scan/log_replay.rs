@@ -115,6 +115,8 @@ pub struct ScanLogReplayProcessor {
     seen_file_keys: HashSet<FileActionKey>,
     /// Skip reading file statistics.
     skip_stats: bool,
+    /// Information about checkpoint reading for stats optimization
+    checkpoint_info: CheckpointReadInfo,
 }
 
 impl ScanLogReplayProcessor {
@@ -164,7 +166,7 @@ impl ScanLogReplayProcessor {
         let CheckpointReadInfo {
             has_stats_parsed,
             checkpoint_read_schema,
-        } = checkpoint_info;
+        } = checkpoint_info.clone();
 
         // Extract the physical predicate for data skipping and partition filtering.
         // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
@@ -222,7 +224,13 @@ impl ScanLogReplayProcessor {
             seen_file_keys,
             state_info,
             skip_stats,
+            checkpoint_info,
         })
+    }
+
+    /// Get a reference to the checkpoint info.
+    pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
+        &self.checkpoint_info
     }
 
     /// Serialize the processor state for distributed processing.
@@ -240,10 +248,7 @@ impl ScanLogReplayProcessor {
     /// undefined behaviour!
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn into_serializable_state(
-        self,
-        checkpoint_info: CheckpointReadInfo,
-    ) -> DeltaResult<SerializableScanState> {
+    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
         let StateInfo {
             logical_schema,
             physical_schema,
@@ -278,7 +283,7 @@ impl ScanLogReplayProcessor {
             predicate,
             internal_state_blob,
             seen_file_keys: self.seen_file_keys,
-            checkpoint_info,
+            checkpoint_info: self.checkpoint_info,
         })
     }
 
@@ -300,7 +305,7 @@ impl ScanLogReplayProcessor {
     pub(crate) fn from_serializable_state(
         engine: &dyn Engine,
         state: SerializableScanState,
-    ) -> DeltaResult<Arc<Self>> {
+    ) -> DeltaResult<Self> {
         // Deserialize internal state from json
         let internal_state: InternalScanState =
             serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
@@ -328,15 +333,13 @@ impl ScanLogReplayProcessor {
             logical_stats_schema: internal_state.logical_stats_schema,
         });
 
-        let processor = Self::new_with_seen_files(
+        Self::new_with_seen_files(
             engine,
             state_info,
             state.checkpoint_info,
             state.seen_file_keys,
             internal_state.skip_stats,
-        )?;
-
-        Ok(Arc::new(processor))
+        )
     }
 }
 
@@ -813,7 +816,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use crate::actions::{get_commit_schema, get_log_add_schema};
+    use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
@@ -847,10 +850,7 @@ mod tests {
     };
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
-        CheckpointReadInfo {
-            has_stats_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
-        }
+        CheckpointReadInfo::without_stats_parsed()
     }
 
     /// A minimal opaque predicate op for testing serialization behavior
@@ -1125,7 +1125,7 @@ mod tests {
         let state_info = processor.state_info.clone();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
-            processor.into_serializable_state(checkpoint_info).unwrap(),
+            processor.into_serializable_state().unwrap(),
         )
         .unwrap();
 
@@ -1187,7 +1187,7 @@ mod tests {
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
-            processor.into_serializable_state(checkpoint_info).unwrap(),
+            processor.into_serializable_state().unwrap(),
         )
         .unwrap();
 
@@ -1244,7 +1244,7 @@ mod tests {
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
-            processor.into_serializable_state(checkpoint_info).unwrap(),
+            processor.into_serializable_state().unwrap(),
         )
         .unwrap();
         assert_eq!(deserialized.state_info.transform_spec, original_transform);
@@ -1279,7 +1279,7 @@ mod tests {
                     .unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
                 &engine,
-                processor.into_serializable_state(checkpoint_info).unwrap(),
+                processor.into_serializable_state().unwrap(),
             )
             .unwrap();
             assert_eq!(deserialized.state_info.column_mapping_mode, mode);
@@ -1308,7 +1308,7 @@ mod tests {
         let processor =
             ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
                 .unwrap();
-        let serialized = processor.into_serializable_state(checkpoint_info).unwrap();
+        let serialized = processor.into_serializable_state().unwrap();
         assert!(serialized.predicate.is_none());
         let deserialized =
             ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
