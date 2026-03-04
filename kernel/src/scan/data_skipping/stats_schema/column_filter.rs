@@ -6,8 +6,20 @@
 use crate::{
     column_trie::ColumnTrie,
     schema::{ColumnName, DataType, Schema, StructField},
-    table_properties::{DataSkippingNumIndexedCols, TableProperties},
+    table_properties::DataSkippingNumIndexedCols,
 };
+
+/// Configuration for statistics columns
+pub(crate) struct StatsConfig<'a> {
+    /// Explicit list of columns to collect statistics for. When `Some`, takes precedence over
+    /// `data_skipping_num_indexed_cols`.
+    /// See delta.dataSkippingStatsColumns in the Delta protocol for more details.
+    pub(crate) data_skipping_stats_columns: Option<&'a [ColumnName]>,
+    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is
+    /// set.
+    /// See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
+    pub(crate) data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
+}
 
 /// Handles column filtering logic for statistics based on table properties.
 ///
@@ -26,9 +38,9 @@ pub(crate) struct StatsColumnFilter<'col> {
     n_columns: Option<DataSkippingNumIndexedCols>,
     /// Counter for leaf columns included so far. Used to enforce the `n_columns` limit.
     added_columns: u64,
-    /// Trie built from columns specified in `delta.dataSkippingStatsColumns` for O(path_length)
-    /// prefix matching. `Some` when using explicit column list, `None` when using the
-    /// `delta.dataSkippingNumIndexedCols` count-based approach.
+    /// Trie built from `StatsConfig::data_skipping_stats_columns` for O(path_length) prefix
+    /// matching. `Some` when using explicit column list, `None` when using the
+    /// `StatsConfig::data_skipping_num_indexed_cols` count-based approach.
     data_skipping_stats_trie: Option<ColumnTrie<'col>>,
     /// Trie built from required columns (e.g. clustering columns) for O(path_length) lookup
     /// during traversal. Used by `should_include_for_table()` to allow required columns past
@@ -56,7 +68,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Requested columns optionally filter the output without affecting column counting. When
     /// `Some`, only columns matching the requested set are included in the final output.
     pub(crate) fn new(
-        props: &'col TableProperties,
+        config: StatsConfig<'col>,
         required_columns: Option<&'col [ColumnName]>,
         requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
@@ -66,7 +78,7 @@ impl<'col> StatsColumnFilter<'col> {
 
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
-        if let Some(column_names) = &props.data_skipping_stats_columns {
+        if let Some(column_names) = config.data_skipping_stats_columns {
             let mut combined_trie = ColumnTrie::from_columns(column_names);
 
             // Add required columns to the trie so they're included during traversal
@@ -93,7 +105,7 @@ impl<'col> StatsColumnFilter<'col> {
                 path: Vec::new(),
             }
         } else {
-            let n_cols = props.data_skipping_num_indexed_cols.unwrap_or_default();
+            let n_cols = config.data_skipping_num_indexed_cols.unwrap_or_default();
             let required_trie = required_columns.map(ColumnTrie::from_columns);
             Self {
                 n_columns: Some(n_cols),
@@ -238,7 +250,7 @@ impl<'col> StatsColumnFilter<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::StructType;
+    use crate::{schema::StructType, table_properties::TableProperties};
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
@@ -271,7 +283,11 @@ mod tests {
         required_cols: Option<&[ColumnName]>,
         schema: &Schema,
     ) -> Vec<ColumnName> {
-        let mut filter = StatsColumnFilter::new(props, required_cols, None);
+        let config = StatsConfig {
+            data_skipping_stats_columns: props.data_skipping_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
+        };
+        let mut filter = StatsColumnFilter::new(config, required_cols, None);
         let mut columns = Vec::new();
         filter.collect_columns(schema, &mut columns);
         columns

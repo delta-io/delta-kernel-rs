@@ -15,7 +15,7 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
+    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform, StatsConfig,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
@@ -76,7 +76,11 @@ pub(crate) enum InCommitTimestampEnablement {
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
-    schema: SchemaRef,
+    /// Logical schema: field names are the user-facing (logical) column names.
+    logical_schema: SchemaRef,
+    /// Physical schema: field names are the physical column names (same as logical when
+    /// `ColumnMappingMode::None`, otherwise derived from column mapping metadata).
+    physical_schema: SchemaRef,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -110,12 +114,18 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        let schema = Arc::new(metadata.parse_schema()?);
+        let logical_schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
+        let physical_schema = match column_mapping_mode {
+            ColumnMappingMode::None => logical_schema.clone(),
+            _ => Arc::new(logical_schema.make_physical(column_mapping_mode)),
+        };
+
         let table_config = Self {
-            schema,
+            logical_schema,
+            physical_schema,
             metadata,
             protocol,
             table_properties,
@@ -235,48 +245,40 @@ impl TableConfiguration {
         })
     }
 
-    /// Returns the list of logical column names that should have statistics collected.
-    ///
-    /// Returns leaf column paths as [`ColumnName`] objects, which store path components
-    /// separately and handle escaping of special characters (dots, spaces) via backticks.
-    ///
-    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
-    /// in statistics, regardless of the `delta.dataSkippingStatsColumns` or
-    /// `delta.dataSkippingNumIndexedCols` settings.
-    pub(crate) fn stats_column_names_logical(
-        &self,
-        required_columns: Option<&[ColumnName]>,
-    ) -> Vec<ColumnName> {
-        stats_column_names(
-            &self.logical_data_schema(),
-            self.table_properties(),
-            required_columns,
-        )
-    }
-
     /// Returns the list of physical column names that should have statistics collected.
     ///
-    /// Similar to [`stats_column_names_logical`], but returns physical column names.
+    /// Traverses the physical data schema. `delta.dataSkippingStatsColumns` (logical names) are
+    /// pre-translated to physical here before being passed to [`StatsColumnFilter`].
     pub(crate) fn stats_column_names_physical(
         &self,
         required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let logical_names = self.stats_column_names_logical(required_columns);
-        let column_mapping_mode = self.column_mapping_mode();
-        logical_names
-            .into_iter()
-            .filter_map(|col_name| {
-                get_any_level_column_physical_name(
-                    self.schema.as_ref(),
-                    &col_name,
-                    column_mapping_mode,
-                )
-                .inspect_err(|e| {
-                    warn!("Couldn't find physical name for {col_name}: {e}");
-                })
-                .ok()
-            })
-            .collect()
+        let props = self.table_properties();
+        let physical_stats_columns: Option<Vec<ColumnName>> =
+            props.data_skipping_stats_columns.as_ref().map(|cols| {
+                let logical_schema = self.logical_data_schema();
+                let mode = self.column_mapping_mode();
+                cols.iter()
+                    .filter_map(|col| {
+                        get_any_level_column_physical_name(&logical_schema, col, mode)
+                            .inspect_err(|e| {
+                                // Theoretically this should always resolve — if it doesn't,
+                                // the user specified a non-existent column in
+                                // delta.dataSkippingStatsColumns, which is safe to ignore.
+                                warn!(
+                                    "Couldn't translate dataSkippingStatsColumns entry '{col}' \
+                                     to physical name: {e}; skipping"
+                                );
+                            })
+                            .ok()
+                    })
+                    .collect()
+            });
+        let config = StatsConfig {
+            data_skipping_stats_columns: physical_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
+        };
+        stats_column_names(&self.physical_schema(), config, required_columns)
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
@@ -287,7 +289,7 @@ impl TableConfiguration {
     fn logical_data_schema(&self) -> SchemaRef {
         let partition_columns = self.partition_columns();
         Arc::new(StructType::new_unchecked(
-            self.schema()
+            self.logical_schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
@@ -309,8 +311,18 @@ impl TableConfiguration {
 
     /// The logical schema ([`SchemaRef`]) of this table at this version.
     #[internal_api]
-    pub(crate) fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    pub(crate) fn logical_schema(&self) -> SchemaRef {
+        self.logical_schema.clone()
+    }
+
+    /// The physical schema ([`SchemaRef`]) of this table at this version.
+    ///
+    /// When column mapping is disabled, this is identical to [`schema`](Self::schema).
+    /// Otherwise, field names are replaced with physical column names derived from column
+    /// mapping metadata.
+    #[internal_api]
+    pub(crate) fn physical_schema(&self) -> SchemaRef {
+        self.physical_schema.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -535,7 +547,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.schema.as_ref())
+            && InvariantChecker::has_invariants(self.logical_schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -1170,7 +1182,10 @@ mod test {
         assert_eq!(new_table_config.version(), new_version);
         assert_eq!(new_table_config.metadata(), &new_metadata);
         assert_eq!(new_table_config.protocol(), &new_protocol);
-        assert_eq!(new_table_config.schema(), table_config.schema());
+        assert_eq!(
+            new_table_config.logical_schema(),
+            table_config.logical_schema()
+        );
         assert_eq!(
             new_table_config.table_properties(),
             &TableProperties {
@@ -1725,21 +1740,6 @@ mod test {
             ),
             "make_physical should inject ParquetFieldId for data schemas in Id mode"
         );
-    }
-
-    #[test]
-    fn test_stats_column_names_logical_returns_logical_names() {
-        // stats_column_names_logical should return logical column names
-        let schema = schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "name");
-
-        let column_names = config.stats_column_names_logical(None /* required_columns */);
-
-        // Should return logical names, not physical names
-        assert!(column_names.contains(&ColumnName::new(["col_a"])));
-        assert!(column_names.contains(&ColumnName::new(["col_b"])));
-        assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
-        assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
     }
 
     #[test]

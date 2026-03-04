@@ -53,7 +53,7 @@ pub(crate) fn column_mapping_mode(
 
 /// Validates that the schema annotations are consistent with the column mapping mode.
 pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
-    validate_schema_column_mapping(&tc.schema(), tc.column_mapping_mode())
+    validate_schema_column_mapping(&tc.logical_schema(), tc.column_mapping_mode())
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
