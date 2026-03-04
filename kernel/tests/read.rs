@@ -656,18 +656,18 @@ fn predicate_on_letter(
 }
 
 #[rstest::rstest]
-#[case::or_no_pruning(
+#[case::or_with_pruning(
     Pred::or(
-        // No pruning power
         column_expr!("letter").gt(Expr::literal("a")),
         column_expr!("number").gt(Expr::literal(3i64)),
     ),
+    // Unified data skipping evaluates partition + data predicates in a single pass.
+    // File a/1 (letter='a', max(number)=1): OR('a'>'a', 1>3) = FALSE → pruned
     vec![
         "+--------+--------+",
         "| letter | number |",
         "+--------+--------+",
         "|        | 6      |",
-        "| a      | 1      |",
         "| a      | 4      |",
         "| b      | 2      |",
         "| c      | 3      |",
@@ -689,19 +689,22 @@ fn predicate_on_letter(
     Pred::and(
         column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
         Pred::or(
-            // No pruning power
             column_expr!("letter").eq(Expr::literal("c")),
             column_expr!("number").eq(Expr::literal(3i64)),
         ),
     ),
-    table_for_letters(&['b', 'c', 'e'])
+    // Unified data skipping evaluates the full expression:
+    // b/2: AND(TRUE, OR(FALSE, FALSE)) = FALSE → pruned
+    // c/3: AND(TRUE, OR(TRUE, TRUE)) = TRUE → kept
+    // e/5: AND(TRUE, OR(FALSE, FALSE)) = FALSE → pruned
+    table_for_letters(&['c'])
 )]
 fn predicate_on_letter_and_number(
     #[case] pred: Pred,
     #[case] expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Partition skipping and file skipping are currently implemented separately. Mixing them in an
-    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
+    // Unified data skipping evaluates partition + data predicates together in a single
+    // columnar pass, enabling pruning for mixed predicates including OR expressions.
     read_table_data(
         "./tests/data/basic_partitioned",
         Some(&["letter", "number"]),

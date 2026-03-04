@@ -213,6 +213,101 @@ mod tests {
         Ok(())
     }
 
+    // Validates partition-based data skipping works end-to-end against a real UC table.
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo nextest run -p uc-catalog read_uc_table_scan --nocapture --run-ignored all`
+    #[ignore]
+    #[tokio::test]
+    async fn read_uc_table_scan() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use delta_kernel::expressions::{column_expr, Expression, Predicate, Scalar};
+        use std::sync::Arc;
+
+        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
+        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
+        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+
+        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let uc_client = UCClient::new(config.clone())?;
+        let uc_commits_client = UCCommitsRestClient::new(config)?;
+
+        let (table_id, table_uri) = get_table(&uc_client, &table_name).await?;
+        let creds = uc_client
+            .get_credentials(&table_id, Operation::Read)
+            .await
+            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+        let catalog = UCCatalog::new(&uc_commits_client);
+        let creds = creds
+            .aws_temp_credentials
+            .ok_or("No AWS temporary credentials found")?;
+        let options = [
+            ("region", "us-west-2"),
+            ("access_key_id", &creds.access_key_id),
+            ("secret_access_key", &creds.secret_access_key),
+            ("session_token", &creds.session_token),
+        ];
+        let table_url = Url::parse(&table_uri)?;
+        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
+        let engine = DefaultEngineBuilder::new(store.into()).build();
+
+        let snapshot = catalog
+            .load_snapshot(&table_id, &table_uri, &engine)
+            .await?;
+        println!("Snapshot version: {}", snapshot.version());
+
+        // Baseline: count files without any predicate
+        let scan_all = snapshot.clone().scan_builder().build()?;
+        let (total_files, total_selected) = count_scan_files(scan_all.scan_metadata(&engine)?)?;
+        println!("Baseline: {total_selected}/{total_files} files selected");
+
+        // Partition predicate: part_date = '2025-01-01' (20089 days since epoch)
+        let predicate: Arc<Predicate> =
+            Arc::new(column_expr!("part_date").eq(Expression::Literal(Scalar::Date(20089))));
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()?;
+        let (pred_total, pred_selected) = count_scan_files(scan.scan_metadata(&engine)?)?;
+        println!("With part_date = '2025-01-01': {pred_selected}/{pred_total} files selected");
+
+        assert!(
+            pred_selected < total_selected,
+            "Expected partition predicate to skip files: \
+             {pred_selected} selected with predicate vs {total_selected} without"
+        );
+
+        // Mixed predicate: score > 50 OR part_region = 'eu-west'
+        let predicate: Arc<Predicate> = Arc::new(Predicate::or(
+            column_expr!("score").gt(Expression::literal(50i32)),
+            column_expr!("part_region").eq(Expression::literal("eu-west")),
+        ));
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()?;
+        let (or_total, or_selected) = count_scan_files(scan.scan_metadata(&engine)?)?;
+        println!(
+            "With score > 50 OR part_region = 'eu-west': {or_selected}/{or_total} files selected"
+        );
+
+        Ok(())
+    }
+
+    /// Iterates all scan_metadata batches and counts total vs selected files.
+    fn count_scan_files(
+        iter: impl Iterator<Item = delta_kernel::DeltaResult<delta_kernel::scan::ScanMetadata>>,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let mut total = 0;
+        let mut selected = 0;
+        for result in iter {
+            let scan_metadata = result?;
+            let sv = scan_metadata.scan_files.selection_vector();
+            total += sv.len();
+            selected += sv.iter().filter(|&&s| s).count();
+        }
+        Ok((total, selected))
+    }
+
     // ignored test which you can run manually to play around with writing to a UC table. run with:
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
     #[ignore]
