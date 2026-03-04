@@ -134,7 +134,7 @@ impl LogicalSchema {
     /// Returns the column mapping mode. Exposed for tests only.
     ///
     /// Production code should never need the raw mode — all logical-to-physical name translation
-    /// should go through `LogicalSchema` methods (e.g. [`Self::top_level_logical_to_physical_name_map`],
+    /// should go through `LogicalSchema` methods (e.g. [`Self::top_level_logical_to_physical_name`],
     /// [`Self::compute_physical_read_schema_and_transform`]) so that callers remain insulated from
     /// the column-mapping details.
     #[cfg(test)]
@@ -147,24 +147,14 @@ impl LogicalSchema {
         self.schema.field_with_index(name).map(|(idx, _)| idx)
     }
 
-    /// Returns a map of physical names for the given top-level logical column names.
-    /// Names not found in the schema are silently omitted from the result; callers that
-    /// require all names to be present must check for missing keys themselves.
-    pub(crate) fn top_level_logical_to_physical_name_map<'a>(
-        &self,
-        logical_names: impl IntoIterator<Item = &'a str>,
-    ) -> HashMap<String, String> {
-        let names: HashSet<&str> = logical_names.into_iter().collect();
+    /// Returns the physical name for the given top-level logical column name, or `None` if not found.
+    pub(crate) fn top_level_logical_to_physical_name<'a>(
+        &'a self,
+        logical_name: &str,
+    ) -> Option<&'a str> {
         self.schema
-            .fields()
-            .filter(|f| names.contains(f.name.as_str()))
-            .map(|f| {
-                (
-                    f.name.clone(),
-                    f.physical_name(self.column_mapping_mode).to_string(),
-                )
-            })
-            .collect()
+            .field(logical_name)
+            .map(|f| f.physical_name(self.column_mapping_mode))
     }
 
     /// Compute the physical read schema and transform spec for this table schema.
@@ -340,7 +330,7 @@ mod tests {
         test_schema_nested_with_column_mapping, test_schema_with_array, test_schema_with_map,
     };
 
-    // ── top_level_logical_to_physical_name_map ──────────────────────────────
+    // ── top_level_logical_to_physical_name ──────────────────────────────────
 
     #[rstest]
     #[case::none(test_schema_flat(), ColumnMappingMode::None, "id", Some("id"))]
@@ -357,15 +347,14 @@ mod tests {
         Some("phys_name")
     )]
     #[case::missing(test_schema_flat(), ColumnMappingMode::None, "no_such_col", None)]
-    fn top_level_logical_to_physical_name_map(
+    fn top_level_logical_to_physical_name(
         #[case] schema: SchemaRef,
         #[case] mode: ColumnMappingMode,
         #[case] logical: &str,
         #[case] expected: Option<&str>,
     ) {
         let ts = LogicalSchema::new_for_test(schema, mode);
-        let map = ts.top_level_logical_to_physical_name_map(std::iter::once(logical));
-        assert_eq!(map.get(logical).map(String::as_str), expected);
+        assert_eq!(ts.top_level_logical_to_physical_name(logical), expected);
     }
 
     // ── get_referenced_physical_schema ───────────────────────────────────────

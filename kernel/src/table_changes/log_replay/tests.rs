@@ -845,19 +845,13 @@ async fn data_skipping_filter() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(
-        engine,
-        &table_config,
-        commits,
-        logical_schema.raw_schema().clone(),
-        predicate,
-    )
-    .unwrap()
-    .flat_map(|scan_metadata| {
-        let scan_metadata = scan_metadata.unwrap();
-        scan_metadata.selection_vector
-    })
-    .collect_vec();
+    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema.raw_schema().clone(), predicate)
+        .unwrap()
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            scan_metadata.selection_vector
+        })
+        .collect_vec();
 
     // Note: since the first pair is a dv operation, remove action will always be filtered
     assert_eq!(sv, &[false, true, false, false, true]);
