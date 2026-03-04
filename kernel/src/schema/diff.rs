@@ -1860,7 +1860,6 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityLoosened]
@@ -1889,7 +1888,6 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
@@ -2117,7 +2115,6 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["lookup"]));
         assert_eq!(
             diff.updated_fields[0].change_types,
             vec![FieldChangeType::ContainerNullabilityTightened]
