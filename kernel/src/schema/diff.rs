@@ -1564,6 +1564,7 @@ mod tests {
         assert!(updated_paths.contains(&ColumnName::new(["identifier"])));
         assert!(updated_paths.contains(&ColumnName::new(["user", "full_name"])));
     }
+
     #[test]
     fn test_array_element_struct_field_changes() {
         let before = StructType::new_unchecked([create_field_with_id(
@@ -1656,6 +1657,36 @@ mod tests {
             vec![FieldChangeType::TypeChanged]
         );
 
+        assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
+    fn test_array_primitive_element_type_change() {
+        // Test direct primitive element type change: array<string> -> array<int>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
+        );
         assert!(diff.has_breaking_changes()); // Type change is breaking
     }
 
@@ -1861,5 +1892,135 @@ mod tests {
             vec![FieldChangeType::ContainerNullabilityTightened]
         );
         assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_array_struct_element_nullability_loosened() {
+        // Test: array<struct<name: string> not null> -> array<struct<name: string>>
+        // Struct element nullability loosened (safe change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false, // Struct elements non-nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                true, // Struct elements now nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_array_struct_element_nullability_tightened() {
+        // Test: array<struct<name: string>> -> array<struct<name: string> not null>
+        // Struct element nullability tightened (breaking change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                true, // Struct elements nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false, // Struct elements now non-nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_array_combined_nullability_and_type_change() {
+        // Test that both nullability and type change can be exercised at once in a single diff.
+        // Before: items: array<string> not null (elements non-nullable)
+        // After: items: array<int> (elements nullable, type changed)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable elements
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Nullable, type changed
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items"]));
+        // Should have both TypeChanged and ContainerNullabilityLoosened
+        let change_types = &diff.updated_fields[0].change_types;
+        assert!(change_types.contains(&FieldChangeType::TypeChanged));
+        assert!(change_types.contains(&FieldChangeType::ContainerNullabilityLoosened));
+        assert!(diff.has_breaking_changes()); // Type change is breaking
     }
 }
