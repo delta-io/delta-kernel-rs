@@ -55,23 +55,39 @@ impl SequentialScanMetadata {
         let elapsed = self.start_time.elapsed();
 
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => {
+            AfterSequential::Done(processor) => {
+                // Log counter metrics
+                processor
+                    .get_metrics()
+                    .log_with_message("Sequential scan metadata completed");
+
+                // Log timing
                 tracing::info!(
                     sequential_duration_ms = elapsed.as_millis(),
-                    "Sequential scan metadata completed"
+                    "Sequential scan metadata timing"
                 );
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
+                // Log counter metrics for sequential phase
                 processor
                     .get_metrics()
-                    .log_with_message("Completed sequential scan metadata");
-                processor.get_metrics().reset_counters();
+                    .log_with_message("Sequential scan metadata completed");
+
+                // Log timing
                 tracing::info!(
                     sequential_duration_ms = elapsed.as_millis(),
                     num_parallel_files = files.len(),
-                    "Sequential scan metadata completed, parallel phase needed"
+                    "Sequential scan metadata timing"
                 );
+
+                // Reset counters for parallel phase
+                processor.get_metrics().reset_counters();
+
+                // Enable logging on drop for parallel phase
+                processor
+                    .get_metrics()
+                    .set_log_on_drop("Completed parallel scan metadata");
 
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState {
@@ -89,6 +105,7 @@ impl Iterator for SequentialScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.sequential_span.enter();
         self.sequential.next()
     }
 }
@@ -156,6 +173,11 @@ impl ParallelState {
         scan_span: tracing::Span,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
+        // Enable logging on drop for the reconstructed state. This will include all the metrics
+        // across parallel workers.
+        inner
+            .get_metrics()
+            .set_log_on_drop("Completed parallel scan metadata");
         Ok(Self { inner, scan_span })
     }
 
@@ -234,6 +256,7 @@ impl Iterator for ParallelScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.parallel_span.enter();
         self.processor.next()
     }
 }

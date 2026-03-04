@@ -524,8 +524,8 @@ mod tests {
     ) {
         // Verify Sequentialmetrics were logged
         assert!(
-            logs.contains("Completed sequential scan metadata"),
-            "Expected Sequentialcompletion log for table '{}'",
+            logs.contains("Sequential scan metadata completed"),
+            "Expected Sequential completion log for table '{}'",
             table_name
         );
 
