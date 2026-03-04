@@ -205,6 +205,7 @@ fn set_table_properties(
 
 /// Assert that the snapshot's column mapping mode matches the given `cm_mode` string,
 /// and return the resolved mode.
+#[cfg(feature = "clustered-table")]
 fn assert_column_mapping_mode(snapshot: &Snapshot, cm_mode: &str) -> ColumnMappingMode {
     let expected = match cm_mode {
         "none" => ColumnMappingMode::None,
