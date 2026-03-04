@@ -5,9 +5,20 @@
 
 use crate::{
     column_trie::ColumnTrie,
-    schema::{ColumnName, DataType, Schema, StructField, StructType},
-    table_properties::{DataSkippingNumIndexedCols, TableProperties},
+    schema::{ColumnName, DataType, Schema, StructField},
+    table_properties::DataSkippingNumIndexedCols,
 };
+
+/// Configuration for statistics columns
+pub(crate) struct StatsConfig<'a> {
+    /// Explicit list of columns to collect statistics for. When `Some`, takes precedence over
+    /// `data_skipping_num_indexed_cols`.
+    /// See delta.dataSkippingStatsColumns in the Delta protocol for more details.
+    pub(crate) data_skipping_stats_columns: Option<&'a [ColumnName]>,
+    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is set.
+    /// See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
+    pub(crate) data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
+}
 
 /// Handles column filtering logic for statistics based on table properties.
 ///
@@ -26,9 +37,9 @@ pub(crate) struct StatsColumnFilter<'col> {
     n_columns: Option<DataSkippingNumIndexedCols>,
     /// Counter for leaf columns included so far. Used to enforce the `n_columns` limit.
     added_columns: u64,
-    /// Trie built from columns specified in `delta.dataSkippingStatsColumns` for O(path_length)
-    /// prefix matching. `Some` when using explicit column list, `None` when using the
-    /// `delta.dataSkippingNumIndexedCols` count-based approach.
+    /// Trie built from `StatsConfig::data_skipping_stats_columns` for O(path_length) prefix
+    /// matching. `Some` when using explicit column list, `None` when using the
+    /// `StatsConfig::data_skipping_num_indexed_cols` count-based approach.
     data_skipping_stats_trie: Option<ColumnTrie<'col>>,
     /// Trie built from required columns (e.g. clustering columns) for O(path_length) lookup
     /// during traversal. Used by `should_include_for_table()` to allow required columns past
@@ -56,15 +67,17 @@ impl<'col> StatsColumnFilter<'col> {
     /// Requested columns optionally filter the output without affecting column counting. When
     /// `Some`, only columns matching the requested set are included in the final output.
     pub(crate) fn new(
-        props: &'col TableProperties,
+        config: &StatsConfig<'col>,
         required_columns: Option<&'col [ColumnName]>,
         requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
-        let requested_trie = requested_columns.map(ColumnTrie::from_columns);
+        let requested_trie = requested_columns
+            .filter(|cols| !cols.is_empty())
+            .map(ColumnTrie::from_columns);
 
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
-        if let Some(column_names) = &props.data_skipping_stats_columns {
+        if let Some(column_names) = config.data_skipping_stats_columns {
             let mut combined_trie = ColumnTrie::from_columns(column_names);
 
             // Add required columns to the trie so they're included during traversal
@@ -91,7 +104,7 @@ impl<'col> StatsColumnFilter<'col> {
                 path: Vec::new(),
             }
         } else {
-            let n_cols = props.data_skipping_num_indexed_cols.unwrap_or_default();
+            let n_cols = config.data_skipping_num_indexed_cols.unwrap_or_default();
             let required_trie = required_columns.map(ColumnTrie::from_columns);
             Self {
                 n_columns: Some(n_cols),
@@ -126,13 +139,18 @@ impl<'col> StatsColumnFilter<'col> {
                     continue;
                 }
                 // Verify the required column exists in schema before adding
-                if lookup_column_type(schema, col).is_some() {
+                if schema.walk_column_fields(col).is_ok() {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
                         col
                     );
                     result.push(col.clone());
+                } else {
+                    tracing::warn!(
+                        "Required column '{}' not found in table schema; skipping",
+                        col
+                    );
                 }
             }
         }
@@ -152,7 +170,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on table-level filtering config.
     /// Required columns (e.g. clustering columns) are always included, even past the column limit.
     pub(crate) fn should_include_for_table(&self) -> bool {
-        // When using dataSkippingStatsColumns, check the trie
+        // When using dataSkippingStatsColumns, check the trie (which includes required)
         if let Some(trie) = &self.data_skipping_stats_trie {
             return trie.contains_prefix_of(&self.path);
         }
@@ -168,10 +186,10 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on the requested columns
     /// filter. When no requested columns are set, all columns pass this check.
     pub(crate) fn should_include_for_requested(&self) -> bool {
-        match &self.requested_trie {
-            Some(trie) => trie.contains_prefix_of(&self.path),
-            None => true,
-        }
+        self.requested_trie
+            .as_ref()
+            .map(|trie| trie.contains_prefix_of(&self.path))
+            .unwrap_or(true)
     }
 
     /// Returns true if the current path is a required column (e.g. clustering column).
@@ -228,37 +246,10 @@ impl<'col> StatsColumnFilter<'col> {
     }
 }
 
-/// Looks up a column by path in the schema, returning its data type if found.
-///
-/// Navigates through nested structs following the path components.
-/// For example, `lookup_column_type(schema, "user.address.city")` will:
-/// 1. Find field "user" in schema
-/// 2. Find field "address" in user's struct type
-/// 3. Find field "city" in address's struct type
-/// 4. Return city's data type
-fn lookup_column_type<'a>(schema: &'a StructType, column: &ColumnName) -> Option<&'a DataType> {
-    let mut parts = column.iter();
-
-    // Get the first part to start navigation
-    let first = parts.next()?;
-    let mut current_field = schema.field(first)?;
-
-    // Navigate through remaining parts
-    for part in parts {
-        match current_field.data_type() {
-            DataType::Struct(struct_type) => {
-                current_field = struct_type.field(part)?;
-            }
-            _ => return None, // Path continues but current field is not a struct
-        }
-    }
-
-    Some(current_field.data_type())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{schema::StructType, table_properties::TableProperties};
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
@@ -291,7 +282,11 @@ mod tests {
         required_cols: Option<&[ColumnName]>,
         schema: &Schema,
     ) -> Vec<ColumnName> {
-        let mut filter = StatsColumnFilter::new(props, required_cols, None);
+        let config = StatsConfig {
+            data_skipping_stats_columns: props.data_skipping_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
+        };
+        let mut filter = StatsColumnFilter::new(&config, required_cols, None);
         let mut columns = Vec::new();
         filter.collect_columns(schema, &mut columns);
         columns

@@ -15,7 +15,6 @@ use url::Url;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
-use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::variant_utils::UsesVariant;
@@ -201,7 +200,7 @@ fn apply_clustering_for_table_create(
 /// # Returns
 ///
 /// A tuple of (domain_metadata_list, clustering_columns_for_stats).
-/// The clustering columns returned are logical names (for stats_columns).
+/// The clustering columns returned are physical names.
 fn maybe_enable_clustering(
     data_layout: &DataLayout,
     effective_schema: &SchemaRef,
@@ -239,8 +238,7 @@ fn maybe_enable_clustering(
             // Create domain metadata with physical names
             let dm = create_clustering_domain_metadata(&physical_columns);
 
-            // Return logical names for stats_columns
-            Ok((vec![dm], Some(columns.clone())))
+            Ok((vec![dm], Some(physical_columns)))
         }
         DataLayout::None => Ok((vec![], None)),
     }
@@ -568,11 +566,7 @@ impl CreateTableTransactionBuilder {
 
         // Create Transaction<CreateTable> with pre-commit snapshot
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(
-                log_segment,
-                table_configuration,
-                Arc::new(LazyCrc::new(None)),
-            )),
+            Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
             system_domain_metadata,
