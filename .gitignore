@@ -23,3 +23,5 @@ ffi/examples/read-table/build
 /build
 /kernel/target
 /target
+
+/benchmarks/data/workloads/
