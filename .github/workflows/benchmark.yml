@@ -2,14 +2,12 @@ name: Benchmarks
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
-
-permissions:
-  pull-requests: write
 
 jobs:
   compare:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
