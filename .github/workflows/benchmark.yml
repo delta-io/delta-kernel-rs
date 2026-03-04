@@ -3,7 +3,8 @@ name: Benchmarking PR performance
 on: [pull_request_target]
 
 jobs:
-  compare:
+  runBenchmark:
+    name: Run benchmarks
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
