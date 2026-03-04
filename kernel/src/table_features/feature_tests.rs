@@ -378,6 +378,9 @@ fn run_battery(fixture: &FeatureFixture) {
     // ============================================================================================
     if let Some(MinReaderWriterVersion(legacy_reader, legacy_writer)) = fixture.spec_legacy_versions
     {
+        // NOTE: This section does not include any tests specific to legacy ReaderWriter features.
+        // ColumnMapping is the only one, and its own unit tests cover those cases already.
+
         // E1: Legacy version with no metadata presence -- version alone is sufficient to infer
         // support, but enablement is determined by presence or toggle properties.
         let tc = create_table_config(&[], &[], None, legacy_reader, legacy_writer);
@@ -436,17 +439,7 @@ fn run_battery(fixture: &FeatureFixture) {
             }
         }
 
-        // E3: ReaderWriter feature with writer sufficient but reader insufficient
-        if legacy_reader > 1 && fixture.spec_type == FeatureType::ReaderWriter {
-            let tc = create_table_config(&[], &[], None, legacy_reader - 1, legacy_writer);
-            assert!(
-                !tc.is_feature_supported(&feature),
-                "{name}: legacy asymmetric ({},{legacy_writer}): expected (reader insufficient)",
-                legacy_reader - 1
-            );
-        }
-
-        // E4/E5: Legacy enablement for toggle features.
+        // E3/E4: Legacy enablement for toggle features.
         //
         // Toggle features have both Enabled and Disabled prop_cases. We verify that legacy
         // version inference correctly distinguishes supported-but-not-enabled from
@@ -457,7 +450,7 @@ fn run_battery(fixture: &FeatureFixture) {
                 "{name}: has Disabled prop_case but no Enabled prop_case"
             );
 
-            // E4: Legacy version + each Enabled case + schema -> supported AND enabled.
+            // E3: Legacy version + each Enabled case + schema -> supported AND enabled.
             // Iterates all Enabled cases (e.g. CM mode=name and mode=id) rather than
             // just the first, so each mode gets legacy coverage.
             for (i, case) in fixture.prop_cases.iter().enumerate() {
@@ -480,7 +473,7 @@ fn run_battery(fixture: &FeatureFixture) {
                 }
             }
 
-            // E5: Legacy version + disabled props -> supported but NOT enabled
+            // E4: Legacy version + disabled props -> supported but NOT enabled
             let tc = create_table_config(
                 &[],
                 disabled_props,
@@ -994,9 +987,17 @@ fn test_iceberg_compat_v1() {
                 "delta.enableIcebergCompatV1=true",
                 "delta.columnMapping.mode=name",
             ]),
+            PropCase::Enabled(&[
+                "delta.enableIcebergCompatV1=true",
+                "delta.columnMapping.mode=id",
+            ]),
             PropCase::Disabled(&[
                 "delta.enableIcebergCompatV1=false",
                 "delta.columnMapping.mode=name",
+            ]),
+            PropCase::Disabled(&[
+                "delta.enableIcebergCompatV1=false",
+                "delta.columnMapping.mode=id",
             ]),
         ],
         // CM schema annotations without CM in protocol are rejected.
@@ -1024,9 +1025,17 @@ fn test_iceberg_compat_v2() {
                 "delta.enableIcebergCompatV2=true",
                 "delta.columnMapping.mode=name",
             ]),
+            PropCase::Enabled(&[
+                "delta.enableIcebergCompatV2=true",
+                "delta.columnMapping.mode=id",
+            ]),
             PropCase::Disabled(&[
                 "delta.enableIcebergCompatV2=false",
                 "delta.columnMapping.mode=name",
+            ]),
+            PropCase::Disabled(&[
+                "delta.enableIcebergCompatV2=false",
+                "delta.columnMapping.mode=id",
             ]),
         ],
         // CM schema annotations without CM in protocol are rejected.
