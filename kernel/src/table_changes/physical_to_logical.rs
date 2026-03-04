@@ -186,6 +186,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            physical_partition_schema: None,
         }
     }
 
@@ -407,6 +408,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
             logical_stats_schema: None,
+            physical_partition_schema: None,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
