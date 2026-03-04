@@ -410,7 +410,7 @@ mod tests {
         version: u64,
         file: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let metadata = storage.head(&Path::from(file.clone())).await?;
+        let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
             storage,
             version,
@@ -430,7 +430,7 @@ mod tests {
         version: u64,
         file: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let metadata = storage.head(&Path::from(file.clone())).await?;
+        let metadata = storage.head(&Path::from(file.as_ref())).await?;
         add_commit(
             storage,
             version,
