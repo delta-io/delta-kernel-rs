@@ -10,44 +10,78 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
+use rstest::rstest;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
 use super::simple_schema;
 
-#[tokio::test]
-async fn test_create_clustered_table() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // Create schema for a clustered table
-    let schema = Arc::new(StructType::try_new(vec![
+/// Builds a schema that supports clustering at depths 1, 2, and 5:
+///   { id: int, name: string, address: { city: string, zip: string },
+///     l1: { l2: { l3: { l4: { value: double } } } } }
+fn clustering_test_schema() -> DeltaResult<Arc<StructType>> {
+    let address = StructType::try_new(vec![
+        StructField::new("city", DataType::STRING, true),
+        StructField::new("zip", DataType::STRING, true),
+    ])?;
+    let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
+    let l3 = StructType::try_new(vec![StructField::new(
+        "l4",
+        DataType::Struct(Box::new(l4)),
+        true,
+    )])?;
+    let l2 = StructType::try_new(vec![StructField::new(
+        "l3",
+        DataType::Struct(Box::new(l3)),
+        true,
+    )])?;
+    let l1 = StructType::try_new(vec![StructField::new(
+        "l2",
+        DataType::Struct(Box::new(l2)),
+        true,
+    )])?;
+    Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, false),
         StructField::new("name", DataType::STRING, true),
-        StructField::new("timestamp", DataType::TIMESTAMP, false),
-    ])?);
+        StructField::new("address", DataType::Struct(Box::new(address)), true),
+        StructField::new("l1", DataType::Struct(Box::new(l1)), true),
+    ])?))
+}
 
-    // Create clustered table on "id" column
-    let txn = create_table(&table_path, schema.clone(), "DeltaKernel-RS/Test")
-        .with_data_layout(DataLayout::clustered(["id"]))
+#[rstest]
+#[case::top_level(vec![vec!["id"]])]
+#[case::nested_2(vec![vec!["address", "city"]])]
+#[case::mixed(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]])]
+#[tokio::test]
+async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = clustering_test_schema()?;
+    let expected_cols: Vec<ColumnName> = col_paths
+        .iter()
+        .map(|p| ColumnName::new(p.iter().copied()))
+        .collect();
+
+    let txn = create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::Clustered {
+            columns: expected_cols.clone(),
+        })
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    // Verify stats_columns includes the clustering column
     let stats_cols = txn.stats_columns();
-    assert!(
-        stats_cols.iter().any(|c| c.to_string() == "id"),
-        "Clustering column 'id' should be in stats columns"
-    );
+    for col in &expected_cols {
+        assert!(
+            stats_cols.contains(col),
+            "Clustering column '{col}' should be in stats columns"
+        );
+    }
 
-    // Commit the table
     let _ = txn.commit(engine.as_ref())?;
 
-    // Verify clustering columns via snapshot read path
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
     let clustering_columns = snapshot.get_clustering_columns(engine.as_ref())?;
-    assert_eq!(clustering_columns, Some(vec![ColumnName::new(["id"])]));
+    assert_eq!(clustering_columns, Some(expected_cols));
 
-    // Verify protocol has required features
     let table_configuration = snapshot.table_configuration();
     assert!(
         table_configuration.is_feature_supported(&TableFeature::DomainMetadata),
@@ -164,21 +198,25 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::not_in_schema(vec!["nonexistent"], "not found in schema")]
+#[case::nested_not_found(vec!["l1", "l2", "l3", "l4", "missing"], "not found in schema")]
+#[case::struct_as_leaf(vec!["address"], "unsupported type")]
 #[tokio::test]
-async fn test_clustering_column_not_in_schema() -> DeltaResult<()> {
+async fn test_clustering_column_error(
+    #[case] col_path: Vec<&str>,
+    #[case] expected_error: &str,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = clustering_test_schema()?;
 
-    let schema = simple_schema()?;
-
-    // Try to create clustered table on non-existent column
     let result = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::clustered(["nonexistent"]))
+        .with_data_layout(DataLayout::Clustered {
+            columns: vec![ColumnName::new(col_path.iter().copied())],
+        })
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(
-        result,
-        "Clustering column 'nonexistent' not found in schema",
-    );
+    assert_result_error_with_message(result, expected_error);
 
     Ok(())
 }
