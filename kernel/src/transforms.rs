@@ -84,7 +84,7 @@ pub(crate) fn parse_partition_value(
 
 /// Parse all partition values from a transform spec.
 pub(crate) fn parse_partition_values(
-    schema: &LogicalSchema,
+    logical_schema: &LogicalSchema,
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
@@ -92,7 +92,7 @@ pub(crate) fn parse_partition_values(
         .iter()
         .filter_map(|field_transform| match field_transform {
             FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => Some(
-                parse_partition_value(*field_index, schema, partition_values),
+                parse_partition_value(*field_index, logical_schema, partition_values),
             ),
             FieldTransformSpec::DynamicColumn { .. }
             | FieldTransformSpec::StaticInsert { .. }
