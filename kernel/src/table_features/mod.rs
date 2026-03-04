@@ -195,7 +195,7 @@ pub(crate) enum EnablementCheck {
 }
 
 /// Represents the type of operation being performed on a table
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
     /// Read operations on regular table data
     Scan,
@@ -552,8 +552,9 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-/// Unknown features are not supported by the kernel but are tolerated for forward compatibility.
-/// They cannot be inferred from legacy protocol versions.
+/// By definition, kernel cannot know how to handle unknown features and must assume they're always
+/// enabled if supported in protocol. However, the read path ignores all writer-only features,
+/// including unknown ones. Unknown features are never inferred from legacy protocol versions.
 static UNKNOWN_FEATURE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Unknown,
     min_legacy_version: None,
@@ -600,7 +601,7 @@ impl TableFeature {
     }
 
     /// Returns true if this feature can be inferred from a legacy reader protocol version.
-    /// Always returns false for non-legacy (feature-list-only) features.
+    /// Always returns false for modern features (use feature lists instead).
     pub(crate) fn is_valid_for_legacy_reader(&self, reader_version: i32) -> bool {
         matches!(
             self.info().min_legacy_version,
@@ -609,7 +610,7 @@ impl TableFeature {
     }
 
     /// Returns true if this feature can be inferred from a legacy writer protocol version.
-    /// Always returns false for non-legacy (feature-list-only) features.
+    /// Always returns false for modern features (use feature lists instead).
     pub(crate) fn is_valid_for_legacy_writer(&self, writer_version: i32) -> bool {
         matches!(
             self.info().min_legacy_version,
@@ -617,8 +618,8 @@ impl TableFeature {
         )
     }
 
-    /// Returns rich metadata about this table feature including version requirements,
-    /// dependencies, and support status. Unknown features return UNKNOWN_FEATURE_INFO.
+    /// Returns rich metadata about this table feature including protocol version requirements,
+    /// dependencies, and kernel support status.
     pub(crate) fn info(&self) -> &FeatureInfo {
         match self {
             // Writer-only features
