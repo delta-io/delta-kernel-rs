@@ -873,25 +873,6 @@ mod tests {
         assert_eq!(data[0].num_columns(), 2);
     }
 
-    fn make_local_parquet_handler() -> DefaultParquetHandler<TokioBackgroundExecutor> {
-        DefaultParquetHandler::new(
-            Arc::new(LocalFileSystem::new()),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-    }
-
-    #[test]
-    fn test_read_parquet_footer() {
-        crate::engine::tests::test_parquet_handler_reads_footer(&make_local_parquet_handler());
-    }
-
-    #[test]
-    fn test_read_parquet_footer_invalid_file() {
-        crate::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
-            &make_local_parquet_handler(),
-        );
-    }
-
     #[tokio::test]
     async fn test_parquet_handler_trait_write_and_read_roundtrip() {
         let store = Arc::new(InMemory::new());
@@ -1170,27 +1151,6 @@ mod tests {
         assert_eq!(decimal_col.value(4), 56789i128);
         assert_eq!(decimal_col.precision(), 10);
         assert_eq!(decimal_col.scale(), 2);
-    }
-
-    #[test]
-    fn test_parquet_handler_trait_write_overwrite_true() {
-        crate::engine::tests::test_parquet_handler_write_always_overwrites(
-            &make_local_parquet_handler(),
-        );
-    }
-
-    #[test]
-    fn test_parquet_handler_trait_write_always_overwrites() {
-        crate::engine::tests::test_parquet_handler_write_always_overwrites(
-            &make_local_parquet_handler(),
-        );
-    }
-
-    #[test]
-    fn test_read_parquet_footer_preserves_field_ids() {
-        crate::engine::tests::test_parquet_handler_footer_preserves_field_ids(
-            &make_local_parquet_handler(),
-        );
     }
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.

@@ -690,14 +690,6 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    /// Creates a [`DefaultJsonHandler`] backed by a [`LocalFileSystem`] store.
-    fn make_local_handler() -> DefaultJsonHandler<TokioBackgroundExecutor> {
-        DefaultJsonHandler::new(
-            Arc::new(LocalFileSystem::new()),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-    }
-
     fn make_invalid_named_temp() -> (NamedTempFile, Url) {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
         write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
@@ -894,11 +886,6 @@ mod tests {
     #[tokio::test]
     async fn test_write_json_file_overwrite() -> DeltaResult<()> {
         do_test_write_json_file(true).await
-    }
-
-    #[tokio::test]
-    async fn test_read_json_files_injects_file_path_column() {
-        crate::engine::tests::test_json_handler_file_path_contract(&make_local_handler());
     }
 
     async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {

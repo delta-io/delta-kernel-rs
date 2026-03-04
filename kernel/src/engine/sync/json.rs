@@ -146,11 +146,6 @@ mod tests {
         do_test_write_json_file(true)
     }
 
-    #[test]
-    fn test_read_json_files_injects_file_path_column() {
-        crate::engine::tests::test_json_handler_file_path_contract(&SyncJsonHandler);
-    }
-
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");

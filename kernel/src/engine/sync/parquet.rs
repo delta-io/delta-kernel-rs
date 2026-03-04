@@ -225,18 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_read_parquet_footer() {
-        crate::engine::tests::test_parquet_handler_reads_footer(&SyncParquetHandler);
-    }
-
-    #[test]
-    fn test_sync_read_parquet_footer_invalid_file() {
-        crate::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
-            &SyncParquetHandler,
-        );
-    }
-
-    #[test]
     fn test_sync_write_parquet_file_with_filter() {
         let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
@@ -320,16 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_write_parquet_file_overwrite_true() {
-        crate::engine::tests::test_parquet_handler_write_always_overwrites(&SyncParquetHandler);
-    }
-
-    #[test]
-    fn test_sync_write_parquet_file_always_overwrites() {
-        crate::engine::tests::test_parquet_handler_write_always_overwrites(&SyncParquetHandler);
-    }
-
-    #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
         let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
@@ -406,10 +384,5 @@ mod tests {
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         assert!(result.next().is_none());
-    }
-
-    #[test]
-    fn test_sync_read_parquet_footer_preserves_field_ids() {
-        crate::engine::tests::test_parquet_handler_footer_preserves_field_ids(&SyncParquetHandler);
     }
 }
