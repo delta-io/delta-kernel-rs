@@ -85,16 +85,12 @@ async fn test_clustered_table_write_and_checkpoint() -> Result<(), Box<dyn std::
         snapshot.get_clustering_columns(engine.as_ref())?,
         Some(expected_clustering.clone())
     );
-    assert!(
-        snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::ClusteredTable)
-    );
-    assert!(
-        snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::DomainMetadata)
-    );
+    assert!(snapshot
+        .table_configuration()
+        .is_feature_supported(&TableFeature::ClusteredTable));
+    assert!(snapshot
+        .table_configuration()
+        .is_feature_supported(&TableFeature::DomainMetadata));
 
     // First write: 3 rows
     let batch = make_batch(
@@ -163,8 +159,8 @@ async fn test_clustered_table_write_and_checkpoint() -> Result<(), Box<dyn std::
 /// that did not create the table). Verifies that clustering column metadata is picked up from
 /// the existing table and applied to new writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_clustered_table_write_from_fresh_snapshot(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_clustered_table_write_from_fresh_snapshot() -> Result<(), Box<dyn std::error::Error>>
+{
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = test_schema();
     let arrow_schema = test_arrow_schema(&schema);
@@ -191,18 +187,12 @@ async fn test_clustered_table_write_from_fresh_snapshot(
         .with_data_change(true);
     let write_context = txn.get_write_context();
     let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(batch),
-            &write_context,
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
         .await?;
     txn.add_files(add_meta);
     let result = txn.commit(engine.as_ref())?;
     let snapshot = match result {
-        CommitResult::CommittedTransaction(c) => {
-            c.post_commit_snapshot().unwrap().clone()
-        }
+        CommitResult::CommittedTransaction(c) => c.post_commit_snapshot().unwrap().clone(),
         other => panic!("Expected CommittedTransaction, got: {other:?}"),
     };
 
