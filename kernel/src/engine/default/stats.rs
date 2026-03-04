@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
     PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -480,6 +482,7 @@ impl StatsAccumulator {
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist).
 ///   Only these columns will appear in nullCount/minValues/maxValues.
+#[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
