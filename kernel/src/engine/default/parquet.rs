@@ -23,7 +23,7 @@ use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use super::stats::collect_stats;
+use super::stats::{collect_stats, DEFAULT_STRING_PREFIX_LENGTH};
 use super::UrlExt;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
@@ -161,12 +161,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        string_prefix_length: usize,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns)?;
+        let stats = collect_stats(record_batch, stats_columns, string_prefix_length)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
@@ -217,9 +218,16 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
         stats_columns: Option<&[ColumnName]>,
+        string_prefix_length: Option<usize>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        let string_prefix_length = string_prefix_length.unwrap_or(DEFAULT_STRING_PREFIX_LENGTH);
         let parquet_metadata = self
-            .write_parquet(path, data, stats_columns.unwrap_or(&[]))
+            .write_parquet(
+                path,
+                data,
+                stats_columns.unwrap_or(&[]),
+                string_prefix_length,
+            )
             .await?;
         parquet_metadata.as_record_batch(&partition_values)
     }
@@ -723,7 +731,12 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                DEFAULT_STRING_PREFIX_LENGTH,
+            )
             .await
             .unwrap();
 
@@ -803,7 +816,12 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    DEFAULT_STRING_PREFIX_LENGTH,
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
