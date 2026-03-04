@@ -171,10 +171,6 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
 
-## Git Safety
-
-- **NEVER use `git add -A` or `git add .`**. Always stage specific files by name.
-
 ## Deep Context
 
 Read these when relevant to the task at hand:
