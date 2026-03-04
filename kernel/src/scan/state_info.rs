@@ -233,12 +233,14 @@ impl StateInfo {
                 // Output all table stats columns in stats_parsed. The DataSkippingFilter
                 // reads stats_parsed from the transformed batch, which uses this schema.
                 (StatsOutputMode::AllColumns, _) => {
-                    let expected_stats_schemas =
-                        table_configuration.build_expected_stats_schemas(None, None)?;
-                    (
-                        Some(expected_stats_schemas.physical),
-                        Some(expected_stats_schemas.logical),
-                    )
+                    let physical_schema =
+                        table_configuration.build_expected_stats_schema(None, None)?;
+                    // When no column mapping, logical = physical
+                    // When column mapping enabled, logical schema is not stored in kernel
+                    // (per issue #2017). For now, use physical schema as a proxy.
+                    // TODO: Implement proper physical-to-logical name mapping when needed.
+                    let logical_schema = Some(physical_schema.clone());
+                    (Some(physical_schema), logical_schema)
                 }
                 // Non-empty requested columns — include predicate-referenced columns
                 // alongside the user-requested stats columns so that the DataSkippingFilter
@@ -253,12 +255,11 @@ impl StateInfo {
                             all_needed_stats_columns.push(col.clone());
                         }
                     }
-                    let expected_stats_schemas = table_configuration
-                        .build_expected_stats_schemas(None, Some(&all_needed_stats_columns))?;
-                    (
-                        Some(expected_stats_schemas.physical),
-                        Some(expected_stats_schemas.logical),
-                    )
+                    let physical_schema = table_configuration
+                        .build_expected_stats_schema(None, Some(&all_needed_stats_columns))?;
+                    // Use physical schema as proxy for logical schema
+                    let logical_schema = Some(physical_schema.clone());
+                    (Some(physical_schema), logical_schema)
                 }
                 // Columns(empty) or Skip with a physical predicate — build stats directly
                 // from the physical predicate's referenced schema for internal data skipping

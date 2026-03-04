@@ -32,21 +32,9 @@ use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
 use tracing::warn;
 
-/// Expected schemas for file statistics.
-///
-/// Contains both logical and physical versions of the stats schema:
-/// - **Logical schema**: Uses original column names (matching table schema)
-/// - **Physical schema**: Uses physical column names (for column mapping)
-///
-/// When column mapping is disabled (`ColumnMappingMode::None`), both schemas are identical.
-#[allow(unused)]
-#[derive(Debug, Clone)]
-pub(crate) struct ExpectedStatsSchemas {
-    /// Stats schema using logical (user-facing) column names.
-    pub logical: SchemaRef,
-    /// Stats schema using physical column names (for storage).
-    pub physical: SchemaRef,
-}
+// Removed ExpectedStatsSchemas - stats schemas are now represented directly as SchemaRef.
+// All clustering columns and stats columns are maintained as physical in kernel.
+// The logical form only exists as user input, not stored internally.
 
 /// Information about in-commit timestamp enablement state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,17 +171,15 @@ impl TableConfiguration {
         }
     }
 
-    /// Generates the expected schemas for file statistics (both logical and physical).
+    /// Generates the expected schema for file statistics using physical column names.
     ///
     /// Engines can provide statistics for files written to the delta table, enabling
-    /// data skipping and other optimizations. This method generates the expected schemas
+    /// data skipping and other optimizations. This method generates the expected schema
     /// for structured statistics based on the table configuration.
     ///
-    /// Returns a tuple of `(logical_stats_schema, physical_stats_schema)`:
-    /// - **Logical schema**: Uses original column names (matching table schema)
-    /// - **Physical schema**: Uses physical column names (respecting column mapping mode)
+    /// Returns a stats schema using physical column names (respecting column mapping mode).
     ///
-    /// Both schemas are structured as:
+    /// The schema is structured as:
     /// ```text
     /// {
     ///   numRecords: long,
@@ -203,46 +189,43 @@ impl TableConfiguration {
     /// }
     /// ```
     ///
-    /// The schemas are affected by:
-    /// - **Column mapping mode**: Physical schema field names use physical names from column
-    ///   mapping metadata.
+    /// The schema is affected by:
+    /// - **Column mapping mode**: Field names use physical names from column mapping metadata.
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
     /// - **Required columns** (e.g. clustering columns): Per the Delta protocol, always included
-    ///   in statistics, regardless of the above settings.
+    ///   in statistics, regardless of the above settings. These should be provided as physical
+    ///   column names.
     /// - **Requested columns**: Optional output filter that limits which columns appear in the
-    ///   schema without affecting column counting.
+    ///   schema without affecting column counting. These should also be physical column names.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn build_expected_stats_schemas(
+    pub(crate) fn build_expected_stats_schema(
         &self,
-        required_columns: Option<&[ColumnName]>,
-        requested_columns: Option<&[ColumnName]>,
-    ) -> DeltaResult<ExpectedStatsSchemas> {
+        required_columns_physical: Option<&[ColumnName]>,
+        requested_columns_physical: Option<&[ColumnName]>,
+    ) -> DeltaResult<SchemaRef> {
         let logical_data_schema = self.logical_data_schema();
         let logical_stats_schema = Arc::new(expected_stats_schema(
             &logical_data_schema,
             self.table_properties(),
-            required_columns,
-            requested_columns,
+            required_columns_physical,
+            requested_columns_physical,
         )?);
         let physical_stats_schema = match self.column_mapping_mode() {
-            ColumnMappingMode::None => logical_stats_schema.clone(),
+            ColumnMappingMode::None => logical_stats_schema,
             _ => PhysicalStatsSchemaTransform {
                 column_mapping_mode: self.column_mapping_mode(),
             }
             .transform_struct(&logical_stats_schema)
             .map(|s| Arc::new(s.into_owned()))
-            .unwrap_or_else(|| logical_stats_schema.clone()),
+            .unwrap_or(logical_stats_schema),
         };
-        Ok(ExpectedStatsSchemas {
-            logical: logical_stats_schema,
-            physical: physical_stats_schema,
-        })
+        Ok(physical_stats_schema)
     }
 
     /// Returns the list of physical column names that should have statistics collected.
@@ -1613,14 +1596,10 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.build_expected_stats_schema(None, None).unwrap();
 
-        // Both schemas should be identical (same Arc)
-        assert!(Arc::ptr_eq(&stats_schemas.logical, &stats_schemas.physical));
-
-        // Verify field names are logical names
-        let min_values = stats_schemas
-            .logical
+        // Without column mapping, physical schema uses logical column names
+        let min_values = stats_schema
             .field("minValues")
             .unwrap()
             .data_type();
@@ -1633,49 +1612,21 @@ mod test {
     }
 
     #[test]
-    fn test_build_expected_stats_schemas_with_column_mapping() {
-        // With column mapping, logical schema should have logical names,
-        // physical schema should have physical names
+    fn test_build_expected_stats_schema_with_column_mapping() {
+        // With column mapping, returned schema should have physical names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.build_expected_stats_schema(None, None).unwrap();
 
-        // Schemas should be different (not the same Arc)
-        assert!(!Arc::ptr_eq(
-            &stats_schemas.logical,
-            &stats_schemas.physical
-        ));
-
-        // Verify logical schema has logical names
-        let logical_min_values = stats_schemas
-            .logical
+        // Verify schema has physical names (not logical names)
+        let min_values = stats_schema
             .field("minValues")
             .unwrap()
             .data_type();
-        if let DataType::Struct(inner) = logical_min_values {
-            assert!(
-                inner.field("col_a").is_some(),
-                "Logical schema should have col_a"
-            );
-            assert!(
-                inner.field("col_b").is_some(),
-                "Logical schema should have col_b"
-            );
-            assert!(inner.field("phys_col_a").is_none());
-        } else {
-            panic!("Expected minValues to be a struct");
-        }
-
-        // Verify physical schema has physical names
-        let physical_min_values = stats_schemas
-            .physical
-            .field("minValues")
-            .unwrap()
-            .data_type();
-        if let DataType::Struct(inner) = physical_min_values {
+        if let DataType::Struct(inner) = min_values {
             assert!(
                 inner.field("phys_col_a").is_some(),
                 "Physical schema should have phys_col_a"
@@ -1684,14 +1635,14 @@ mod test {
                 inner.field("phys_col_b").is_some(),
                 "Physical schema should have phys_col_b"
             );
-            assert!(inner.field("col_a").is_none());
+            assert!(inner.field("col_a").is_none(), "Should not have logical name col_a");
         } else {
             panic!("Expected minValues to be a struct");
         }
     }
 
     #[test]
-    fn test_build_expected_stats_schemas_id_mode_has_no_parquet_field_ids() {
+    fn test_build_expected_stats_schema_id_mode_has_no_parquet_field_ids() {
         // With column mapping mode `id`, make_physical() injects ParquetFieldId metadata for
         // data file reading. But the physical stats schema must NOT contain these field IDs
         // because stats are read from JSON commit files or checkpoint Parquet files, neither of
@@ -1703,15 +1654,14 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
 
-        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+        let stats_schema = config.build_expected_stats_schema(None, None).unwrap();
 
-        // Verify physical schema has physical names
-        let physical_min_values = stats_schemas
-            .physical
+        // Verify schema has physical names
+        let min_values = stats_schema
             .field("minValues")
             .unwrap()
             .data_type();
-        let DataType::Struct(inner) = physical_min_values else {
+        let DataType::Struct(inner) = min_values else {
             panic!("Expected minValues to be a struct");
         };
         assert!(
