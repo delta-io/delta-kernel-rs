@@ -1,7 +1,5 @@
-name: Benchmarking PR performance
-
 on: [pull_request_target]
-
+name: Benchmarking PR performance
 jobs:
   runBenchmark:
     name: Run benchmarks
