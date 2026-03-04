@@ -5,6 +5,7 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
+mod file_stats;
 mod lazy;
 mod reader;
 mod writer;

@@ -184,11 +184,11 @@ impl ScanBuilder {
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
     ///
-    /// This method can be combined with [`include_stats_columns`]. When both are used, the kernel
+    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the kernel
     /// performs data skipping internally using the predicate AND outputs parsed statistics to the
     /// engine via the `stats_parsed` column in scan metadata.
     ///
-    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
+    /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
@@ -210,7 +210,7 @@ impl ScanBuilder {
     /// engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`with_predicate`]: ScanBuilder::with_predicate
-    pub fn include_stats_columns(mut self) -> Self {
+    pub fn include_all_stats_columns(mut self) -> Self {
         self.stats_output_mode = StatsOutputMode::AllColumns;
         self
     }
@@ -234,11 +234,11 @@ impl ScanBuilder {
     /// - The `stats` field in scan results will be `None`
     /// - Data skipping is disabled (predicates still filter partitions, but not files)
     ///
-    /// If called after [`include_stats_columns`] or [`with_stats_columns`], the last call wins.
+    /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
     ///
     /// Use this when data skipping is handled externally (e.g., by the query engine).
     ///
-    /// [`include_stats_columns`]: ScanBuilder::include_stats_columns
+    /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
     /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
     pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
         if skip_stats {

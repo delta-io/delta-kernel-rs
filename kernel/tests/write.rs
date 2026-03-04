@@ -3258,7 +3258,7 @@ async fn test_column_mapping_write(
     {
         let scan = ckpt_snapshot
             .scan_builder()
-            .include_stats_columns()
+            .include_all_stats_columns()
             .build()?;
         let scan_metadata_results: Vec<_> = scan
             .scan_metadata(engine.as_ref())?
