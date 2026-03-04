@@ -1,7 +1,6 @@
-name: Benchmarks
+name: Benchmarking PR performance
 
-on:
-  pull_request_target:
+on: [pull_request_target]
 
 jobs:
   compare:
