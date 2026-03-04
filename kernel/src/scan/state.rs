@@ -96,7 +96,7 @@ pub fn transform_to_logical(
     engine: &dyn Engine,
     physical_data: Box<dyn EngineData>,
     physical_schema: &SchemaRef,
-    table_schema: &LogicalSchema,
+    logical_schema: &LogicalSchema,
     transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
@@ -105,7 +105,7 @@ pub fn transform_to_logical(
             .new_expression_evaluator(
                 physical_schema.clone(),
                 transform,
-                table_schema.as_output_data_type(), // TODO: expensive deep clone per file
+                logical_schema.as_output_data_type(), // TODO: expensive deep clone per file
             )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),

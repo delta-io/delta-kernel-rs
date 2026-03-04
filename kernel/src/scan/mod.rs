@@ -232,15 +232,15 @@ impl ScanBuilder {
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        let raw_logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        let schema = LogicalSchema::new(logical_schema, self.snapshot.table_configuration());
+        let logical_schema = LogicalSchema::new(raw_logical_schema, self.snapshot.table_configuration());
         let state_info = StateInfo::try_new(
-            schema,
+            logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
             self.stats_columns,
