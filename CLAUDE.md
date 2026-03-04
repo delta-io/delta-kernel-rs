@@ -154,6 +154,8 @@ Keep this list updated when new protocol features are added to kernel.
 - Doc comments focus on "what" (contract with caller) more than "how" (implementation),
   unless the "how" meaningfully impacts the "what".
 - Code comments state intent and explain "why" -- don't restate what the code self-documents.
+- Place `use` imports at the top of the file (for non-test code) or at the top of the
+  `mod tests` block (for test code) -- never inside function bodies.
 
 ## Pull Requests
 
@@ -168,6 +170,10 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 **Description:** follow the template in `.github/PULL_REQUEST_TEMPLATE.md`. Error on the
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
+
+## Git Safety
+
+- **NEVER use `git add -A` or `git add .`**. Always stage specific files by name.
 
 ## Deep Context
 
