@@ -246,9 +246,6 @@ impl TableConfiguration {
     }
 
     /// Returns the list of physical column names that should have statistics collected.
-    ///
-    /// Traverses the physical data schema. `delta.dataSkippingStatsColumns` (logical names) are
-    /// pre-translated to physical here before being passed to [`StatsColumnFilter`].
     pub(crate) fn stats_column_names_physical(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -317,7 +314,7 @@ impl TableConfiguration {
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
-    /// When column mapping is disabled, this is identical to [`schema`](Self::schema).
+    /// When column mapping is disabled, this is identical to [`logical_schema`](Self::logical_schema).
     /// Otherwise, field names are replaced with physical column names derived from column
     /// mapping metadata.
     #[internal_api]

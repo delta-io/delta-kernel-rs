@@ -29,7 +29,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -833,10 +833,20 @@ impl<S> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schemas = self
-            .read_snapshot
-            .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns_physical.as_deref(), None)?;
+        let tc = self.read_snapshot.table_configuration();
+        let clustering_columns_logical = self
+            .clustering_columns_physical
+            .as_deref()
+            .map(|cols| {
+                get_any_level_columns_logical_names(
+                    &tc.logical_schema(),
+                    cols,
+                    tc.column_mapping_mode(),
+                )
+            })
+            .transpose()?;
+        let stats_schemas =
+            tc.build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
