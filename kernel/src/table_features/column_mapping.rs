@@ -542,9 +542,7 @@ mod tests {
     ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
         use crate::actions::Metadata;
         let props: HashMap<String, String> = mode
-            .map(|m| {
-                HashMap::from([("delta.columnMapping.mode".to_string(), m.to_string())])
-            })
+            .map(|m| HashMap::from([("delta.columnMapping.mode".to_string(), m.to_string())]))
             .unwrap_or_default();
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
         let table_root = url::Url::parse("file:///").unwrap();
@@ -570,13 +568,9 @@ mod tests {
     /// v3 + CM feature: mode=id/name without annotations → rejected (missing annotations).
     #[test]
     fn test_cm_v3_supported_mode_set_but_no_annotations() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::ColumnMapping]),
-            Some([TableFeature::ColumnMapping]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
         for mode in ["id", "name"] {
             assert!(
                 make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
@@ -588,13 +582,9 @@ mod tests {
     /// v3 + CM feature: mode=none with annotations → rejected (orphaned annotations).
     #[test]
     fn test_cm_v3_supported_mode_none_with_annotations() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::ColumnMapping]),
-            Some([TableFeature::ColumnMapping]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
         assert!(
             make_cm_tc(annotated_schema(), protocol, Some("none")).is_err(),
             "v3+feat, mode=none, annotations present: should fail"
@@ -605,13 +595,8 @@ mod tests {
     /// The mode property is ignored per spec when the feature is not supported.
     #[test]
     fn test_cm_v3_not_supported_mode_set_no_annotations() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<[String; 0]>([]),
-            Some::<[String; 0]>([]),
-        )
-        .unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
         for mode in ["id", "name"] {
             let tc = make_cm_tc(plain_schema(), protocol.clone(), Some(mode))
                 .unwrap_or_else(|e| panic!("v3-feat, mode={mode}, no annotations: {e}"));
