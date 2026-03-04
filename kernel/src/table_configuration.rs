@@ -723,7 +723,7 @@ mod test {
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
-    use crate::table_properties::TableProperties;
+    use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
@@ -1574,9 +1574,18 @@ mod test {
         schema: SchemaRef,
         column_mapping_mode: &str,
     ) -> TableConfiguration {
-        use crate::table_properties::COLUMN_MAPPING_MODE;
+        create_table_config_with_column_mapping_and_props(schema, column_mapping_mode, [])
+    }
 
-        let mut props = HashMap::new();
+    fn create_table_config_with_column_mapping_and_props(
+        schema: SchemaRef,
+        column_mapping_mode: &str,
+        extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> TableConfiguration {
+        let mut props: HashMap<String, String> = extra_props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         props.insert(
             COLUMN_MAPPING_MODE.to_string(),
             column_mapping_mode.to_string(),
@@ -1756,6 +1765,34 @@ mod test {
             ],
             "Expected physical column names, not logical names"
         );
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_with_data_skipping_stats_columns() {
+        let config = create_table_config_with_column_mapping_and_props(
+            test_schema_nested_with_column_mapping(),
+            "name",
+            [("delta.dataSkippingStatsColumns", "id,info.name")],
+        );
+        let column_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["phys_id"]),
+                ColumnName::new(["phys_info", "phys_name"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_skips_nonexistent_data_skipping_stats_column() {
+        let config = create_table_config_with_column_mapping_and_props(
+            test_schema_nested_with_column_mapping(),
+            "name",
+            [("delta.dataSkippingStatsColumns", "id,nonexistent")],
+        );
+        let column_names = config.stats_column_names_physical(None);
+        assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
     }
 
     #[rstest]
