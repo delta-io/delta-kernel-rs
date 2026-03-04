@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "acceptance",
+    "benchmarks",
     "derive-macros",
     "ffi",
     "kernel",

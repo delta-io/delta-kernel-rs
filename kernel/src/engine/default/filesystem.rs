@@ -286,6 +286,26 @@ async fn copy_atomic_impl(
     Ok(())
 }
 
+/// Native async implementation for put
+async fn put_impl(
+    store: Arc<DynObjectStore>,
+    path: Path,
+    data: Bytes,
+    overwrite: bool,
+) -> DeltaResult<()> {
+    let put_mode = if overwrite {
+        PutMode::Overwrite
+    } else {
+        PutMode::Create
+    };
+    let result = store.put_opts(&path, data.into(), put_mode.into()).await;
+    result.map_err(|e| match e {
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.into()),
+        e => e.into(),
+    })?;
+    Ok(())
+}
+
 /// Native async implementation for head
 async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
     let meta = store.head(&Path::from_url_path(url.path())?).await?;
@@ -324,6 +344,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         );
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
+    }
+
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+        let path = Path::from_url_path(path.path())?;
+        self.task_executor
+            .block_on(put_impl(self.inner.clone(), path, data, overwrite))
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
@@ -392,6 +418,18 @@ mod tests {
     use crate::Engine as _;
 
     use super::*;
+
+    fn setup_test() -> (
+        tempfile::TempDir,
+        Arc<LocalFileSystem>,
+        ObjectStoreStorageHandler<TokioBackgroundExecutor>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
+        (tmp, store, handler)
+    }
 
     #[test]
     fn test_ordered_listing_for_url() {
@@ -521,10 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
+        let (tmp, store, handler) = setup_test();
 
         // basic
         let data = Bytes::from("test-data");
@@ -553,10 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_head() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
+        let (tmp, store, handler) = setup_test();
 
         let data = Bytes::from("test-content");
         let file_path = Path::from_absolute_path(tmp.path().join("test.txt")).unwrap();
@@ -581,14 +613,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_head_non_existent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store, executor, None);
+        let (tmp, _store, handler) = setup_test();
 
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let result = handler.head(&missing_url);
 
         assert!(matches!(result, Err(Error::FileNotFound(_))));
+    }
+
+    #[test]
+    fn test_put() {
+        let (tmp, _store, handler) = setup_test();
+
+        let data = Bytes::from("put-test-data");
+        let file_url = Url::from_file_path(tmp.path().join("put.txt")).unwrap();
+        handler.put(&file_url, data.clone(), false).unwrap();
+
+        // Read back via read_files and verify content
+        let read_back: Vec<Bytes> = handler
+            .read_files(vec![(file_url, None)])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0], data);
+    }
+
+    #[test]
+    fn test_put_already_exists() {
+        let (tmp, _store, handler) = setup_test();
+
+        let data = Bytes::from("original");
+        let file_url = Url::from_file_path(tmp.path().join("put.txt")).unwrap();
+        handler.put(&file_url, data, false).unwrap();
+
+        // Second put with overwrite=false should fail
+        let new_data = Bytes::from("updated");
+        assert!(matches!(
+            handler.put(&file_url, new_data.clone(), false),
+            Err(Error::FileAlreadyExists(_))
+        ));
+
+        // Put with overwrite=true should succeed
+        handler.put(&file_url, new_data.clone(), true).unwrap();
+
+        // Verify the content was overwritten
+        let read_back: Vec<Bytes> = handler
+            .read_files(vec![(file_url, None)])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0], new_data);
     }
 }
