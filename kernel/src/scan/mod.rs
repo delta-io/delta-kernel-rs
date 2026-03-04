@@ -238,7 +238,8 @@ impl ScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        let logical_schema = LogicalSchema::new(raw_logical_schema, self.snapshot.table_configuration());
+        let logical_schema =
+            LogicalSchema::new(raw_logical_schema, self.snapshot.table_configuration());
         let state_info = StateInfo::try_new(
             logical_schema,
             self.snapshot.table_configuration(),

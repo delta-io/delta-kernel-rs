@@ -895,8 +895,10 @@ impl<S> Transaction<S> {
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
-        let logical_schema = LogicalSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
-        let physical_schema = logical_schema.compute_write_physical_schema(materialize_partition_columns);
+        let logical_schema =
+            LogicalSchema::new(snapshot_schema, self.read_snapshot.table_configuration());
+        let physical_schema =
+            logical_schema.compute_write_physical_schema(materialize_partition_columns);
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();
@@ -1242,18 +1244,20 @@ impl WriteContext {
         &self,
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<HashMap<String, String>> {
+        let name_map = self
+            .logical_schema
+            .top_level_logical_to_physical_name_map(partition_values.keys().map(String::as_str));
         partition_values
             .into_iter()
             .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
-                let physical_name = self
-                    .logical_schema
-                    .top_level_logical_to_physical_name(&logical_name)
+                let physical_name = name_map
+                    .get(&logical_name)
                     .ok_or_else(|| {
                         Error::generic(format!(
                             "Partition column '{logical_name}' not found in table schema"
                         ))
                     })?
-                    .to_string();
+                    .clone();
                 Ok((physical_name, value))
             })
             .collect()
