@@ -157,7 +157,7 @@ impl ParallelScanMetadata {
     ) -> DeltaResult<Self> {
         let read_schema = state.file_read_schema();
         Ok(Self {
-            processor: ParallelPhase::try_new(engine, state.clone(), leaf_files, read_schema)?,
+            processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
         })
     }
 
