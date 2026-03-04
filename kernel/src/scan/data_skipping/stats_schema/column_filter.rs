@@ -15,8 +15,7 @@ pub(crate) struct StatsConfig<'a> {
     /// `data_skipping_num_indexed_cols`.
     /// See delta.dataSkippingStatsColumns in the Delta protocol for more details.
     pub(crate) data_skipping_stats_columns: Option<&'a [ColumnName]>,
-    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is
-    /// set.
+    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is set.
     /// See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
     pub(crate) data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
 }
@@ -68,7 +67,7 @@ impl<'col> StatsColumnFilter<'col> {
     /// Requested columns optionally filter the output without affecting column counting. When
     /// `Some`, only columns matching the requested set are included in the final output.
     pub(crate) fn new(
-        config: StatsConfig<'col>,
+        config: &StatsConfig<'col>,
         required_columns: Option<&'col [ColumnName]>,
         requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
@@ -287,7 +286,7 @@ mod tests {
             data_skipping_stats_columns: props.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
         };
-        let mut filter = StatsColumnFilter::new(config, required_cols, None);
+        let mut filter = StatsColumnFilter::new(&config, required_cols, None);
         let mut columns = Vec::new();
         filter.collect_columns(schema, &mut columns);
         columns

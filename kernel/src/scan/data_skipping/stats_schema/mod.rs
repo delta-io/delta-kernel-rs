@@ -130,7 +130,7 @@ pub(crate) fn expected_stats_schema(
         data_skipping_stats_columns: table_properties.data_skipping_stats_columns.as_deref(),
         data_skipping_num_indexed_cols: table_properties.data_skipping_num_indexed_cols,
     };
-    let mut base_transform = BaseStatsTransform::new(config, required_columns, requested_columns);
+    let mut base_transform = BaseStatsTransform::new(&config, required_columns, requested_columns);
     if let Some(base_schema) = base_transform.transform_struct(logical_data_schema) {
         let base_schema = base_schema.into_owned();
 
@@ -168,10 +168,10 @@ pub(crate) fn expected_stats_schema(
 /// statistics, regardless of the `delta.dataSkippingStatsColumns` or
 /// `delta.dataSkippingNumIndexedCols` settings.
 #[allow(unused)]
-pub(crate) fn stats_column_names<'a>(
+pub(crate) fn stats_column_names(
     data_schema: &Schema,
-    config: StatsConfig<'a>,
-    required_columns: Option<&'a [ColumnName]>,
+    config: &StatsConfig<'_>,
+    required_columns: Option<&[ColumnName]>,
 ) -> Vec<ColumnName> {
     let mut filter = StatsColumnFilter::new(config, required_columns, None);
     let mut columns = Vec::new();
@@ -259,7 +259,7 @@ struct BaseStatsTransform<'col> {
 impl<'col> BaseStatsTransform<'col> {
     #[allow(unused)]
     fn new(
-        config: StatsConfig<'col>,
+        config: &StatsConfig<'col>,
         required_columns: Option<&'col [ColumnName]>,
         requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
@@ -808,7 +808,7 @@ mod tests {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
         };
-        let columns = stats_column_names(&file_schema, config, None);
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // With default settings, all leaf columns should be included
         assert_eq!(
@@ -840,7 +840,7 @@ mod tests {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
         };
-        let columns = stats_column_names(&file_schema, config, None);
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // Only first 2 columns should be included
         assert_eq!(
@@ -871,7 +871,7 @@ mod tests {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
         };
-        let columns = stats_column_names(&file_schema, config, None);
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // Only specified columns should be included (user.name and extra excluded)
         assert_eq!(
@@ -905,7 +905,7 @@ mod tests {
             data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
         };
-        let columns = stats_column_names(&file_schema, config, None);
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // Array and Map types should be excluded
         assert_eq!(

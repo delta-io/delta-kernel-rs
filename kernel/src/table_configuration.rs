@@ -278,7 +278,7 @@ impl TableConfiguration {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
         };
-        stats_column_names(&self.physical_schema(), config, required_columns)
+        stats_column_names(&self.physical_schema(), &config, required_columns)
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
