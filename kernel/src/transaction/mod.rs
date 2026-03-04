@@ -29,7 +29,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -225,8 +225,9 @@ pub struct Transaction<S = ExistingTable> {
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
-    // enabled. Used for determining which columns require statistics collection.
-    clustering_columns: Option<Vec<ColumnName>>,
+    // enabled. Used for determining which columns require statistics collection. Expected to be
+    // physical column names.
+    clustering_columns_physical: Option<Vec<ColumnName>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -832,10 +833,20 @@ impl<S> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schemas = self
-            .read_snapshot
-            .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns.as_deref(), None)?;
+        let tc = self.read_snapshot.table_configuration();
+        let clustering_columns_logical = self
+            .clustering_columns_physical
+            .as_deref()
+            .map(|cols| {
+                get_any_level_columns_logical_names(
+                    &tc.logical_schema(),
+                    cols,
+                    tc.column_mapping_mode(),
+                )
+            })
+            .transpose()?;
+        let stats_schemas =
+            tc.build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -854,7 +865,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names_physical(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -950,13 +961,13 @@ impl<S> Transaction<S> {
         if add_files.is_empty() {
             return Ok(());
         }
-        if let Some(ref clustering_cols) = self.clustering_columns {
+        if let Some(ref clustering_cols) = self.clustering_columns_physical {
             if !clustering_cols.is_empty() {
-                let schema = self.read_snapshot.schema();
+                let physical_schema = self.read_snapshot.table_configuration().physical_schema();
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
                     .iter()
                     .map(|col| {
-                        let data_type = schema
+                        let data_type = physical_schema
                             .walk_column_fields(col)?
                             .last()
                             .map(|field| field.data_type().clone())
@@ -1478,7 +1489,7 @@ mod tests {
         /// Set clustering columns for testing purposes without needing a table
         /// with the ClusteredTable feature enabled.
         fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-            self.clustering_columns = Some(columns);
+            self.clustering_columns_physical = Some(columns);
             self
         }
     }
