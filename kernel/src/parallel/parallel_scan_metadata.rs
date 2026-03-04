@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 
@@ -30,19 +31,35 @@ pub enum AfterSequentialScanMetadata {
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    pub(crate) sequential_span: tracing::Span,
+    pub(crate) scan_span: tracing::Span,
+    start_time: Instant,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
-        Self { sequential }
+    pub(crate) fn new(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        scan_span: tracing::Span,
+    ) -> Self {
+        let sequential_span = tracing::info_span!(parent: &scan_span, "scan_metadata_sequential");
+        Self {
+            sequential,
+            sequential_span,
+            scan_span,
+            start_time: Instant::now(),
+        }
     }
 
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
+        let _guard = self.sequential_span.enter();
+        let elapsed = self.start_time.elapsed();
+
         match self.sequential.finish()? {
-            AfterSequential::Done(processor) => {
-                processor
-                    .get_metrics()
-                    .log_with_message("Completed sequential scan metadata");
+            AfterSequential::Done(_) => {
+                tracing::info!(
+                    sequential_duration_ms = elapsed.as_millis(),
+                    "Sequential scan metadata completed"
+                );
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
@@ -50,9 +67,17 @@ impl SequentialScanMetadata {
                     .get_metrics()
                     .log_with_message("Completed sequential scan metadata");
                 processor.get_metrics().reset_counters();
+                tracing::info!(
+                    sequential_duration_ms = elapsed.as_millis(),
+                    num_parallel_files = files.len(),
+                    "Sequential scan metadata completed, parallel phase needed"
+                );
 
                 Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState { inner: processor }),
+                    state: Box::new(ParallelState {
+                        inner: processor,
+                        scan_span: self.scan_span,
+                    }),
                     files,
                 })
             }
@@ -74,6 +99,7 @@ impl Iterator for SequentialScanMetadata {
 /// in Arc and shared across threads for local parallel processing.
 pub struct ParallelState {
     inner: ScanLogReplayProcessor,
+    pub(crate) scan_span: tracing::Span,
 }
 
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
@@ -127,9 +153,10 @@ impl ParallelState {
     pub(crate) fn from_serializable_state(
         engine: &dyn Engine,
         state: SerializableScanState,
+        scan_span: tracing::Span,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        Ok(Self { inner })
+        Ok(Self { inner, scan_span })
     }
 
     /// Serialize the processor state directly to bytes.
@@ -158,15 +185,21 @@ impl ParallelState {
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
     /// - `scan_span`: The parent scan span for tracing
     #[allow(unused)]
-    pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> DeltaResult<Self> {
+    pub fn from_bytes(
+        engine: &dyn Engine,
+        bytes: &[u8],
+        scan_span: tracing::Span,
+    ) -> DeltaResult<Self> {
         let state: SerializableScanState =
             serde_json::from_slice(bytes).map_err(Error::MalformedJson)?;
-        Self::from_serializable_state(engine, state)
+        Self::from_serializable_state(engine, state, scan_span)
     }
 }
 
 pub struct ParallelScanMetadata {
     pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
+    parallel_span: tracing::Span,
+    start_time: Instant,
 }
 
 impl ParallelScanMetadata {
@@ -175,9 +208,12 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
+        let parallel_span = tracing::info_span!(parent: &state.scan_span, "scan_metadata_parallel");
         let read_schema = state.file_read_schema();
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            parallel_span,
+            start_time: Instant::now(),
         })
     }
 
@@ -185,8 +221,11 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
+        let parallel_span = tracing::info_span!(parent: &state.scan_span, "scan_metadata_parallel");
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
+            parallel_span,
+            start_time: Instant::now(),
         }
     }
 }
@@ -196,5 +235,19 @@ impl Iterator for ParallelScanMetadata {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.processor.next()
+    }
+}
+
+impl Drop for ParallelScanMetadata {
+    fn drop(&mut self) {
+        let _guard = self.parallel_span.enter();
+        let elapsed = self.start_time.elapsed();
+        let thread_id = std::thread::current().id();
+
+        tracing::info!(
+            parallel_duration_ms = elapsed.as_millis(),
+            thread_id = ?thread_id,
+            "Parallel scan metadata completed"
+        );
     }
 }

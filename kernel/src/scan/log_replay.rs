@@ -385,6 +385,7 @@ impl Default for ScanMetrics {
 }
 
 impl ScanMetrics {
+    #[allow(dead_code)]
     pub(crate) fn reset_counters(&self) {
         // NOTE: We do not reset hash set size because that never decreases. All subsequent uses of
         // the processor will reuse the same hashset.
