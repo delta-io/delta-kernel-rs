@@ -5,11 +5,14 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
+mod delta;
 mod file_stats;
 mod lazy;
 mod reader;
 mod writer;
 
+#[allow(unused)]
+pub(crate) use delta::CrcDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]
@@ -23,6 +26,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 
+/// Tracks whether file stats (`num_files`, `table_size_bytes`) are trustworthy.
+///
+/// Defaults to [`Valid`](Self::Valid), which is the correct state when deserializing a CRC file
+/// from disk (a CRC file's stats are correct by definition).
+#[allow(dead_code)] // Variants used in follow-up PRs (forward replay, transaction delta).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FileStatsValidity {
+    /// File stats are known-correct absolute totals. This is the case when seeded from a CRC
+    /// file (which contains `num_files` and `table_size_bytes`) or when replay starts from
+    /// version zero (where the initial state is trivially zero).
+    #[default]
+    Valid,
+    /// File stats are relative deltas, not absolute totals. This happens when seeding from a
+    /// checkpoint: we extract metadata fields but not file counts (reading all add actions from
+    /// a checkpoint just for counts is too expensive). The accumulated deltas are correct, but
+    /// without a baseline they cannot produce final totals.
+    RequiresCheckpointRead,
+    /// A non-incremental operation was seen: file stats cannot be determined incrementally.
+    /// For example, ANALYZE STATS re-adds existing files with updated statistics but no
+    /// corresponding removes, so naively counting adds would double-count.
+    /// A full log replay from scratch could recover correct file stats.
+    Indeterminate,
+    /// A file action had a missing size field: correct file stats are impossible to compute.
+    /// For example, the Delta protocol allows `remove.size` to be null -- when encountered,
+    /// we can no longer track byte totals. Unlike [`Indeterminate`](Self::Indeterminate), no
+    /// amount of replay can recover the missing data.
+    Untrackable,
+}
+
 /// Parsed content of a CRC (version checksum) file.
 ///
 /// A CRC file must:
@@ -30,7 +62,7 @@ use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
 /// 3. Contain exactly one JSON object with the schema of this struct.
 // Deserialized directly from JSON via serde. See `reader::try_read_crc_file`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Crc {
     // ===== Required fields =====
@@ -47,6 +79,12 @@ pub(crate) struct Crc {
     pub(crate) metadata: Metadata,
     /// The table [`Protocol`] at this version.
     pub(crate) protocol: Protocol,
+    /// Whether the file stats (`num_files`, `table_size_bytes`) in this CRC are trustworthy.
+    /// Not serialized -- this is an in-memory replay concern only. When deserialized from a CRC
+    /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
+    /// by definition).
+    #[serde(skip)]
+    pub(crate) validity: FileStatsValidity,
 
     // ===== Optional fields =====
     /// A unique identifier for the transaction that produced this commit.

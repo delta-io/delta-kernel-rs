@@ -112,7 +112,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol};
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use object_store::memory::InMemory;
@@ -134,17 +133,7 @@ mod tests {
             num_files: 10,
             num_metadata: 1,
             num_protocol: 1,
-            metadata: Metadata::default(),
-            protocol: Protocol::default(),
-            txn_id: None,
-            in_commit_timestamp_opt: None,
-            set_transactions: None,
-            domain_metadata: None,
-            file_size_histogram: None,
-            all_files: None,
-            num_deleted_records_opt: None,
-            num_deletion_vectors_opt: None,
-            deleted_record_counts_histogram_opt: None,
+            ..Default::default()
         };
         let loaded = CrcLoadResult::Loaded(Arc::new(crc));
         assert!(loaded.get().is_some());
