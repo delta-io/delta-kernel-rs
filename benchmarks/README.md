@@ -72,7 +72,7 @@ benchmarks/data/workloads/
 
 ## Loading workloads
 
-Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
+Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written (to `benchmarks/data/workloads/`) to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
 
 Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/data/workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
