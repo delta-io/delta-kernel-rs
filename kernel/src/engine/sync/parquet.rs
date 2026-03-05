@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::sync::Arc;
 
+use crate::engine::default::parquet::{reader_options, writer_options};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
@@ -29,9 +30,10 @@ fn try_create_from_parquet(
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
-    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let reader_options = reader_options();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
@@ -102,7 +104,11 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let mut writer = ArrowWriter::try_new(&mut file, first_record_batch.schema(), None)?;
+        let mut writer = ArrowWriter::try_new_with_options(
+            &mut file,
+            first_record_batch.schema(),
+            writer_options(),
+        )?;
         writer.write(&first_record_batch)?;
 
         // Write remaining batches
@@ -124,7 +130,7 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
         let file = File::open(path)?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let metadata = ArrowReaderMetadata::load(&file, reader_options())?;
         let schema = StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)?;
@@ -383,6 +389,88 @@ mod tests {
             .unwrap();
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
+        assert!(result.next().is_none());
+    }
+
+    fn assert_no_arrow_schema_in_file(file_path: &std::path::Path) {
+        use crate::parquet::arrow::ARROW_SCHEMA_META_KEY;
+        let file = File::open(file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let kv = builder.metadata().file_metadata().key_value_metadata();
+        let has = kv
+            .map(|kv| kv.iter().any(|e| e.key == ARROW_SCHEMA_META_KEY))
+            .unwrap_or(false);
+        assert!(
+            !has,
+            "Parquet file should not contain embedded Arrow schema metadata"
+        );
+    }
+
+    // Verifies that the writer does not embed the Arrow IPC schema in the Parquet file metadata,
+    // which wastes space and can cause interoperability issues with non-Arrow readers.
+    #[test]
+    fn write_parquet_file_omits_arrow_schema_metadata() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("no_arrow_schema.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "id",
+                Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<
+            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
+        > = Box::new(std::iter::once(Ok(engine_data)));
+        handler.write_parquet_file(url, data_iter).unwrap();
+
+        assert_no_arrow_schema_in_file(&file_path);
+    }
+
+    // Verifies that files written with Arrow schema metadata (e.g., by other tools) can still be
+    // read correctly when the reader is configured to skip arrow metadata.
+    #[test]
+    fn read_parquet_file_with_arrow_schema_metadata() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("with_arrow_schema.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        // Write a parquet file with arrow schema metadata using default ArrowWriter options
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let mut file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let file_meta = FileMeta {
+            location: url.clone(),
+            last_modified: 0,
+            size: file_size,
+        };
+        let schema = Arc::new(batch.schema().as_ref().try_into_kernel().unwrap());
+        let handler = SyncParquetHandler;
+        let mut result = handler
+            .read_parquet_files(&[file_meta], schema, None)
+            .unwrap();
+
+        let engine_data = result.next().unwrap().unwrap();
+        let arrow_data = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
+        let record_batch = arrow_data.record_batch();
+        assert_eq!(record_batch.num_rows(), 3);
+        let value_col = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.values(), &[10, 20, 30]);
         assert!(result.next().is_none());
     }
 }
