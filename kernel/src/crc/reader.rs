@@ -115,9 +115,18 @@ mod tests {
             .contains("rowIdHighWaterMark"));
         assert!(dms["myApp.metadata"].configuration().contains("key"));
 
+        // Verify set transactions
+        let txns = crc.set_transactions.unwrap();
+        assert_eq!(txns.len(), 2);
+        assert_eq!(txns[0].app_id, "spark-app-1");
+        assert_eq!(txns[0].version, 42);
+        assert_eq!(txns[0].last_updated, Some(1694758250000));
+        assert_eq!(txns[1].app_id, "streaming-job-abc");
+        assert_eq!(txns[1].version, 100);
+        assert_eq!(txns[1].last_updated, Some(1694758255000));
+
         // Skipped fields are always None (pending serde support on their types)
         assert!(crc.txn_id.is_none());
-        assert!(crc.set_transactions.is_none());
         assert!(crc.file_size_histogram.is_none());
         assert!(crc.all_files.is_none());
         assert!(crc.num_deleted_records_opt.is_none());
