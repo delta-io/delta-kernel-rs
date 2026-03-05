@@ -23,7 +23,7 @@ samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "som
 Benchmark names follow a hierarchical path structure assembled from the Criterion group name, the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
 
 ```
-workload_benchmarks/{table_name}/{spec_file_name}/{operation}[/{config_name}]
+workload_benchmarks/{table_name}/{spec_file_name}/{operation}/{config_name}
 ```
 
 - `workload_benchmarks` — the Criterion benchmark group (always this literal string)
