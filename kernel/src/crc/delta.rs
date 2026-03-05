@@ -74,10 +74,10 @@ impl Crc {
             }
         }
 
-        // In-commit timestamp: replace if present.
-        if let Some(ict) = delta.in_commit_timestamp {
-            self.in_commit_timestamp_opt = Some(ict);
-        }
+        // In-commit timestamp: unconditional replace (not guarded by `if let Some`).
+        // If ICT was disabled after being enabled, the delta carries None, which correctly
+        // clears the previous value.
+        self.in_commit_timestamp_opt = delta.in_commit_timestamp;
 
         // File stats: Untrackable is terminal -- nothing can recover missing data.
         if matches!(self.validity, FileStatsValidity::Untrackable) {
