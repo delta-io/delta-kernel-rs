@@ -121,17 +121,22 @@ impl From<Box<ArrowEngineData>> for RecordBatch {
     }
 }
 
+<<<<<<< HEAD
 /// Extract a string value from any Arrow string-typed array.
 ///
 /// Arrow has three string representations that all map to Delta's logical STRING type:
 /// - `Utf8` (i32 offsets, aka `StringArray`)
 /// - `LargeUtf8` (i64 offsets, aka `LargeStringArray`)
 /// - `Utf8View` (inline/buffer views, aka `StringViewArray`)
+=======
+/// Extract a string value from any Arrow string-typed array (Utf8, LargeUtf8, or Utf8View).
+>>>>>>> 6a48a190 (verify)
 ///
 /// The caller is responsible for ensuring `array` has a string data type. This is guaranteed
 /// by the type checks in `extract_leaf_column`, `col_as_list`, and `col_as_map`.
 fn get_string_value(array: &ArrayRef, index: usize) -> &str {
     if let Some(a) = array.as_string_opt::<i32>() {
+<<<<<<< HEAD
         // Utf8 / StringArray
         a.value(index)
     } else if let Some(a) = array.as_string_opt::<i64>() {
@@ -140,6 +145,14 @@ fn get_string_value(array: &ArrayRef, index: usize) -> &str {
     } else {
         // Utf8View / StringViewArray — the only remaining string variant after the
         // checks above, guaranteed by callers validating the array is a string type.
+=======
+        a.value(index)
+    } else if let Some(a) = array.as_string_opt::<i64>() {
+        a.value(index)
+    } else {
+        // Callers only invoke this after verifying the array is a string type, so this
+        // must be Utf8View (the only remaining string variant).
+>>>>>>> 6a48a190 (verify)
         array.as_string_view().value(index)
     }
 }
@@ -547,9 +560,15 @@ mod tests {
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
+<<<<<<< HEAD
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
         LargeBinaryArray, LargeStringArray, MapArray, RecordBatch, RunArray, StringArray,
         StringViewArray, StructArray,
+=======
+        Array, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, MapArray, RecordBatch, RunArray, StringArray, StringViewArray,
+        StructArray,
+>>>>>>> 6a48a190 (verify)
     };
     use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
@@ -1583,6 +1602,7 @@ mod tests {
         Ok(())
     }
 
+<<<<<<< HEAD
     /// visit_rows must accept all Arrow string representations (Utf8/StringArray,
     /// LargeUtf8/LargeStringArray, Utf8View/StringViewArray) when the visitor declares
     /// DataType::STRING.
@@ -1598,6 +1618,73 @@ mod tests {
                 true,
             )])),
             vec![values],
+=======
+    /// visit_rows must accept LargeUtf8 columns when the visitor declares DataType::STRING.
+    #[test]
+    fn test_visit_rows_large_string() -> DeltaResult<()> {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "name",
+                ArrowDataType::LargeUtf8,
+                true,
+            )])),
+            vec![Arc::new(LargeStringArray::from(vec![
+                Some("alice"),
+                None,
+                Some("charlie"),
+            ]))],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Option<String>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["name"])]);
+                static TYPES: &[DataType] = &[DataType::STRING];
+                (&NAMES, TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.values
+                        .push(getters[0].get_str(i, "name")?.map(|s| s.to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["name"])], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![Some("alice".into()), None, Some("charlie".into())]
+        );
+        Ok(())
+    }
+
+    /// visit_rows must accept Utf8View columns when the visitor declares DataType::STRING.
+    #[test]
+    fn test_visit_rows_string_view() -> DeltaResult<()> {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "name",
+                ArrowDataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec![
+                Some("alice"),
+                None,
+                Some("charlie"),
+            ]))],
+>>>>>>> 6a48a190 (verify)
         )?;
         let arrow_data = ArrowEngineData::new(batch);
 
