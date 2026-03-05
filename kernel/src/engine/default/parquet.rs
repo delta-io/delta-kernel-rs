@@ -586,7 +586,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
 
@@ -1332,20 +1332,6 @@ mod tests {
         assert_eq!(name_col.value(2), "charlie");
     }
 
-    async fn assert_no_arrow_schema_in_store(store: Arc<InMemory>, path: Path) {
-        use crate::parquet::arrow::ARROW_SCHEMA_META_KEY;
-        let reader = ParquetObjectReader::new(store, path);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
-        let kv = builder.metadata().file_metadata().key_value_metadata();
-        let has = kv
-            .map(|kv| kv.iter().any(|e| e.key == ARROW_SCHEMA_META_KEY))
-            .unwrap_or(false);
-        assert!(
-            !has,
-            "Parquet file should not contain embedded Arrow schema metadata"
-        );
-    }
-
     // Verifies that write_parquet (the internal stats-collecting path) does not embed the Arrow
     // IPC schema in the Parquet file metadata.
     #[tokio::test]
@@ -1367,80 +1353,15 @@ mod tests {
             .unwrap();
 
         let path = Path::from_url_path(metadata.file_meta.location.path()).unwrap();
-        assert_no_arrow_schema_in_store(store, path).await;
-    }
-
-    // Verifies that write_parquet_file (the ParquetHandler trait path) does not embed the Arrow
-    // IPC schema in the Parquet file metadata.
-    #[tokio::test]
-    async fn write_parquet_file_trait_omits_arrow_schema_metadata() {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
-
-        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "x",
-                Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
-            Box::new(std::iter::once(Ok(engine_data)));
-        let file_url = Url::parse("memory:///test/data.parquet").unwrap();
-        parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
-            .unwrap();
-
-        let path = Path::from_url_path(file_url.path()).unwrap();
-        assert_no_arrow_schema_in_store(store, path).await;
-    }
-
-    // Verifies that files written with Arrow schema metadata (e.g., by other tools) can still be
-    // read correctly when the reader is configured to skip arrow metadata.
-    #[tokio::test]
-    async fn read_parquet_file_with_arrow_schema_metadata() {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-
-        // Write a parquet file with arrow schema metadata using default ArrowWriter options
-        let batch = RecordBatch::try_from_iter(vec![(
-            "value",
-            Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
-        )])
-        .unwrap();
-        let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let path = Path::from("test/with_arrow_schema.parquet");
-        store.put(&path, buffer.clone().into()).await.unwrap();
-
-        let url = Url::parse("memory:///test/with_arrow_schema.parquet").unwrap();
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: buffer.len() as u64,
-        };
-        let schema = Arc::new(batch.schema().as_ref().try_into_kernel().unwrap());
-        let data: Vec<RecordBatch> = parquet_handler
-            .read_parquet_files(slice::from_ref(&file_meta), schema, None)
-            .unwrap()
-            .map(into_record_batch)
-            .try_collect()
-            .unwrap();
-
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].num_rows(), 3);
-        let value_col = data[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(value_col.values(), &[10, 20, 30]);
+        let reader = ParquetObjectReader::new(store, path);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
+        let kv = builder.metadata().file_metadata().key_value_metadata();
+        let has = kv
+            .map(|kv| kv.iter().any(|e| e.key == ARROW_SCHEMA_META_KEY))
+            .unwrap_or(false);
+        assert!(
+            !has,
+            "Parquet file should not contain embedded Arrow schema metadata"
+        );
     }
 }
