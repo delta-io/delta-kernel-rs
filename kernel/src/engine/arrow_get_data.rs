@@ -4,8 +4,8 @@ use crate::arrow::array::{
         Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
         Int32Type, Int64Type, TimestampMicrosecondType,
     },
-    Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
-    PrimitiveArray, RunArray,
+    Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, MapArray,
+    OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray,
 };
 
 use crate::{
@@ -69,7 +69,31 @@ impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i32>> {
     }
 }
 
+impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i64>> {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a str>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl<'a> GetData<'a> for StringViewArray {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a str>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
 impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i32>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i64>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl<'a> GetData<'a> for BinaryViewArray {
     fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
@@ -204,7 +228,8 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
 mod tests {
     use super::*;
     use crate::arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray,
+        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, PrimitiveArray,
     };
     use crate::engine_data::GetData;
 
@@ -310,6 +335,42 @@ mod tests {
         assert_eq!(array.get_decimal(0, "f").unwrap(), Some(12345));
         assert_eq!(array.get_decimal(1, "f").unwrap(), Some(-99999));
         assert_eq!(array.get_decimal(2, "f").unwrap(), None);
+    }
+
+    // =========================================================================
+    // LargeString/StringView/LargeBinary/BinaryView tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_str_large_string() {
+        let array = LargeStringArray::from(vec![Some("hello"), Some("world"), None]);
+        assert_eq!(array.get_str(0, "f").unwrap(), Some("hello"));
+        assert_eq!(array.get_str(1, "f").unwrap(), Some("world"));
+        assert_eq!(array.get_str(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_str_string_view() {
+        let array = StringViewArray::from(vec![Some("hello"), Some("world"), None]);
+        assert_eq!(array.get_str(0, "f").unwrap(), Some("hello"));
+        assert_eq!(array.get_str(1, "f").unwrap(), Some("world"));
+        assert_eq!(array.get_str(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_binary_large_binary() {
+        let array = LargeBinaryArray::from(vec![Some(b"abc" as &[u8]), Some(b"xyz"), None]);
+        assert_eq!(array.get_binary(0, "f").unwrap(), Some(b"abc" as &[u8]));
+        assert_eq!(array.get_binary(1, "f").unwrap(), Some(b"xyz" as &[u8]));
+        assert_eq!(array.get_binary(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_binary_binary_view() {
+        let array = BinaryViewArray::from(vec![Some(b"abc" as &[u8]), Some(b"xyz"), None]);
+        assert_eq!(array.get_binary(0, "f").unwrap(), Some(b"abc" as &[u8]));
+        assert_eq!(array.get_binary(1, "f").unwrap(), Some(b"xyz" as &[u8]));
+        assert_eq!(array.get_binary(2, "f").unwrap(), None);
     }
 
     // =========================================================================
