@@ -554,7 +554,7 @@ fn test_scan_metadata_with_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .include_stats_columns()
+        .include_all_stats_columns()
         .build()
         .unwrap();
 
@@ -688,7 +688,7 @@ fn test_data_skipping_with_parsed_stats() {
     );
 }
 
-/// Test that `include_stats_columns` and `with_predicate` can be used together.
+/// Test that `include_all_stats_columns` and `with_predicate` can be used together.
 /// The scan should output stats_parsed AND perform data skipping via the predicate.
 #[test]
 fn test_scan_metadata_stats_columns_with_predicate() {
@@ -705,7 +705,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .include_stats_columns()
+        .include_all_stats_columns()
         .build()
         .expect("Should succeed when using both predicate and stats_columns");
 
@@ -1102,9 +1102,9 @@ fn test_skip_stats_disables_data_skipping() {
 }
 
 #[test]
-fn test_skip_stats_after_include_stats_columns_wins() {
+fn test_skip_stats_after_include_all_stats_columns_wins() {
     // With StatsOutputMode enum, last call wins. Calling with_skip_stats(true) after
-    // include_stats_columns() should result in stats being skipped.
+    // include_all_stats_columns() should result in stats being skipped.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
@@ -1113,7 +1113,7 @@ fn test_skip_stats_after_include_stats_columns_wins() {
     let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
     let scan = snapshot
         .scan_builder()
-        .include_stats_columns()
+        .include_all_stats_columns()
         .with_skip_stats(true)
         .with_predicate(predicate)
         .build()

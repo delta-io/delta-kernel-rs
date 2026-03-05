@@ -200,7 +200,7 @@ fn apply_clustering_for_table_create(
 /// # Returns
 ///
 /// A tuple of (domain_metadata_list, clustering_columns_for_stats).
-/// The clustering columns returned are logical names (for stats_columns).
+/// The clustering columns returned are physical names.
 fn maybe_enable_clustering(
     data_layout: &DataLayout,
     effective_schema: &SchemaRef,
@@ -238,8 +238,7 @@ fn maybe_enable_clustering(
             // Create domain metadata with physical names
             let dm = create_clustering_domain_metadata(&physical_columns);
 
-            // Return logical names for stats_columns
-            Ok((vec![dm], Some(columns.clone())))
+            Ok((vec![dm], Some(physical_columns)))
         }
         DataLayout::None => Ok((vec![], None)),
     }
