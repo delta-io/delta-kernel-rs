@@ -118,12 +118,10 @@ mod tests {
         // Verify set transactions
         let txns = crc.set_transactions.unwrap();
         assert_eq!(txns.len(), 2);
-        assert_eq!(txns[0].app_id, "spark-app-1");
-        assert_eq!(txns[0].version, 42);
-        assert_eq!(txns[0].last_updated, Some(1694758250000));
-        assert_eq!(txns[1].app_id, "streaming-job-abc");
-        assert_eq!(txns[1].version, 100);
-        assert_eq!(txns[1].last_updated, Some(1694758255000));
+        assert_eq!(txns["spark-app-1"].version, 42);
+        assert_eq!(txns["spark-app-1"].last_updated, Some(1694758250000));
+        assert_eq!(txns["streaming-job-abc"].version, 100);
+        assert_eq!(txns["streaming-job-abc"].last_updated, Some(1694758255000));
 
         // Skipped fields are always None (pending serde support on their types)
         assert!(crc.txn_id.is_none());

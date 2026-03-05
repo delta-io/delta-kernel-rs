@@ -57,6 +57,10 @@ mod tests {
                 r#"{"rowIdHighWaterMark":1048576}"#.to_string(),
             ),
         )]);
+        let ict = 1234567890;
+        let app_id = "testAppId".to_string();
+        let set_transactions =
+            HashMap::from([(app_id.clone(), SetTransaction::new(app_id, 1, Some(ict)))]);
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
@@ -65,8 +69,8 @@ mod tests {
             metadata: Metadata::default(),
             protocol,
             txn_id: None,
-            in_commit_timestamp_opt: Some(1234567890),
-            set_transactions: None,
+            in_commit_timestamp_opt: Some(ict),
+            set_transactions: Some(set_transactions),
             domain_metadata: Some(domain_metadata),
             file_size_histogram: None,
             all_files: None,
@@ -143,7 +147,13 @@ mod tests {
                     "removed": false
                 }
             ],
-            "setTransactions": None as Option<SetTransaction>
+            "setTransactions": [
+                {
+                    "appId": "testAppId",
+                    "version": 1,
+                    "lastUpdated": 1234567890
+                }
+            ]
         });
 
         assert_eq!(actual, expected);
