@@ -399,20 +399,20 @@ async fn open_parquet_file(
 
     let mut reader = {
         use object_store::ObjectStoreScheme;
-        // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
-        // request which isn't supported by Azure. For now we just detect if the URL is
-        // pointing to azure and if so, do a HEAD request so we can pass in file size to the
-        // reader which will cause the reader to avoid a suffix range request.
-        // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
-        //
-        // TODO(#1010): Note that we don't need this at all and can actually just _always_
-        // do the `with_file_size` but need to (1) update our unit tests which often
-        // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
+        // Since the `Remove` action's size value is optional as specified in the delta protocol
+        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file,
+        // the extracted size will be zero in this case. Thus, this function
+        // need to handle the case of zero file_meta.size.
         if file_meta.size != 0 {
             ParquetObjectReader::new(store, path).with_file_size(file_meta.size)
         } else if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
             ObjectStoreScheme::parse(&file_meta.location)
         {
+            // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
+            // request which isn't supported by Azure. For now we just detect if the URL is
+            // pointing to azure and if so, do a HEAD request so we can pass in file size to the
+            // reader which will cause the reader to avoid a suffix range request.
+            // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
             // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
             // to file changing between the two calls.
             let meta = store.head(&path).await?;

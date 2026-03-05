@@ -262,11 +262,12 @@ fn read_scan_file(
     let location = table_root.join(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
-        size: scan_file
-            .size
-            .unwrap_or(0)
-            .try_into()
-            .map_err(|_| Error::generic("Unable to convert scan file size into FileSize"))?,
+        size: match scan_file.size {
+            Some(s) => s
+                .try_into()
+                .map_err(|_| Error::generic(format!("invalid file size: {s}")))?,
+            None => 0,
+        },
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
