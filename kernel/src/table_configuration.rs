@@ -288,18 +288,20 @@ impl TableConfiguration {
         if partition_columns.is_empty() {
             return None;
         }
+        let logical_schema = self.logical_schema();
+        let column_mapping_mode = self.column_mapping_mode();
         let partition_fields: Vec<StructField> = partition_columns
             .iter()
             .filter_map(|col_name| {
-                let field = self.schema.field(col_name);
+                let field = logical_schema.field(col_name);
                 if field.is_none() {
                     warn!("Partition column '{col_name}' not found in table schema");
                 }
                 field
             })
-            .map(|field| {
+            .map(|field: &StructField| {
                 StructField::new(
-                    field.physical_name(self.column_mapping_mode).to_owned(),
+                    field.physical_name(column_mapping_mode).to_owned(),
                     field.data_type().clone(),
                     field.is_nullable(),
                 )
