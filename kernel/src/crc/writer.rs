@@ -29,7 +29,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::actions::{DomainMetadata, Metadata, Protocol};
+    use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -142,7 +142,8 @@ mod tests {
                     "configuration": "{\"rowIdHighWaterMark\":1048576}",
                     "removed": false
                 }
-            ]
+            ],
+            "setTransactions": None as Option<SetTransaction>
         });
 
         assert_eq!(actual, expected);

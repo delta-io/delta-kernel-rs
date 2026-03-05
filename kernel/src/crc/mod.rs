@@ -55,7 +55,6 @@ pub(crate) struct Crc {
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub(crate) in_commit_timestamp_opt: Option<i64>,
     /// Live transaction identifier ([`SetTransaction`]) actions at this version.
-    #[serde(skip)]
     pub(crate) set_transactions: Option<Vec<SetTransaction>>,
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored.
