@@ -405,7 +405,10 @@ impl<S> Transaction<S> {
             log_root,
             commit_version,
             self.commit_timestamp,
-            self.read_snapshot.log_segment().max_published_version,
+            self.read_snapshot
+                .log_segment()
+                .listed
+                .max_published_version,
         );
         match self
             .committer
