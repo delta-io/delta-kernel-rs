@@ -91,7 +91,12 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            builder.values().append_value(v);
+            if v.is_empty() {
+                // convert empty string to null as per the Delta Spec
+                builder.values().append_null();
+            } else {
+                builder.values().append_value(v);
+            }
         }
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
