@@ -42,7 +42,7 @@ pub(crate) enum FileStatsValidity {
     /// checkpoint: we extract metadata fields but not file counts (reading all add actions from
     /// a checkpoint just for counts is too expensive). The accumulated deltas are correct, but
     /// without a baseline they cannot produce final totals.
-    Incomplete,
+    RequiresCheckpointRead,
     /// A non-incremental operation was seen: file stats cannot be determined incrementally.
     /// For example, ANALYZE STATS re-adds existing files with updated statistics but no
     /// corresponding removes, so naively counting adds would double-count.
