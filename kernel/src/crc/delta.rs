@@ -79,21 +79,23 @@ impl Crc {
         // clears the previous value.
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
 
-        // File stats: Untrackable is terminal -- nothing can recover missing data.
-        if matches!(self.validity, FileStatsValidity::Untrackable) {
+        // Bail if already Untrackable -- nothing can recover missing file stats.
+        if self.validity == FileStatsValidity::Untrackable {
             return;
         }
 
-        // Missing file size poisons stats permanently.
+        // Missing file size poisons stats permanently. Checked after the Untrackable bail-out
+        // so that Untrackable can never transition to Indeterminate below.
         if delta.has_missing_file_size {
             self.validity = FileStatsValidity::Untrackable;
             return;
         }
 
-        // Indeterminate is also terminal (though theoretically recoverable via full replay).
-        if matches!(self.validity, FileStatsValidity::Indeterminate) {
+        // Bail if already Indeterminate (theoretically recoverable via full replay).
+        if self.validity == FileStatsValidity::Indeterminate {
             return;
         }
+
         let is_safe = delta
             .operation
             .as_deref()
@@ -254,8 +256,15 @@ mod tests {
         crc.apply(delta);
         assert_eq!(crc.validity, FileStatsValidity::Untrackable);
 
-        // Neither safe ops nor unsafe ops recover from Untrackable.
+        // Applying a safe delta does not recover from Untrackable.
         crc.apply(write_delta(5, 500));
+        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+
+        // Applying an unsafe delta also stays Untrackable (does not downgrade to Indeterminate).
+        crc.apply(CrcDelta {
+            operation: None,
+            ..write_delta(1, 100)
+        });
         assert_eq!(crc.validity, FileStatsValidity::Untrackable);
     }
 
@@ -362,5 +371,19 @@ mod tests {
         };
         crc.apply(delta);
         assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
+    }
+
+    #[test]
+    fn test_apply_clears_in_commit_timestamp_when_ict_disabled() {
+        let mut crc = base_crc();
+        crc.in_commit_timestamp_opt = Some(1000);
+
+        // Delta without ICT (e.g. ICT was disabled) clears the previous value.
+        let delta = CrcDelta {
+            in_commit_timestamp: None,
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+        assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 }
