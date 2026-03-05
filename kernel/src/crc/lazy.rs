@@ -78,6 +78,18 @@ impl LazyCrc {
         })
     }
 
+    /// Returns the CRC only if the CRC file is at the given version, loading if necessary.
+    pub(crate) fn get_or_load_if_at_version(
+        &self,
+        engine: &dyn Engine,
+        version: Version,
+    ) -> Option<&Arc<Crc>> {
+        if self.crc_version() != Some(version) {
+            return None;
+        }
+        self.get_or_load(engine).get()
+    }
+
     /// Check if CRC has been loaded (without triggering loading).
     #[allow(dead_code)] // Used in future phases (domain metadata, ICT)
     pub(crate) fn is_loaded(&self) -> bool {

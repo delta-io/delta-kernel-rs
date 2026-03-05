@@ -62,6 +62,7 @@ pub(crate) fn table_changes_action_iter(
     let filter = physical_predicate
         .and_then(|(predicate, ref_schema)| {
             let stats_schema = build_stats_schema(&ref_schema)?;
+
             // Parse JSON stats from the raw action batch's `add.stats` column. Unlike the scan
             // path (which transforms first and reads pre-parsed stats), table_changes must
             // resolve deletion vector pairs before filtering, so it operates on raw batches.
@@ -251,7 +252,7 @@ impl LogReplayScanner {
                 info!(
                     version = commit_file.version,
                     id = table_configuration.metadata().id(),
-                    //Writer features is always a superset of reader features, so writer features is logged to trace the full set of table features
+                    // Writer features are always a superset of reader features, so we log writer features to trace the full set of table features.
                     writerFeatures = %writer_features_str,
                     minReaderVersion = table_configuration.protocol().min_reader_version(),
                     minWriterVersion = table_configuration.protocol().min_writer_version(),

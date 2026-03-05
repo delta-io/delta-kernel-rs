@@ -15,12 +15,12 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform,
+    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform, StatsConfig,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name, validate_schema_column_mapping,
+    column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
     FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
     LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
@@ -76,7 +76,11 @@ pub(crate) enum InCommitTimestampEnablement {
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
-    schema: SchemaRef,
+    /// Logical schema: field names are the user-facing (logical) column names.
+    logical_schema: SchemaRef,
+    /// Physical schema: field names are the physical column names (same as logical when
+    /// `ColumnMappingMode::None`, otherwise derived from column mapping metadata).
+    physical_schema: SchemaRef,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -110,19 +114,18 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        let schema = Arc::new(metadata.parse_schema()?);
+        let logical_schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
-        validate_schema_column_mapping(&schema, column_mapping_mode)?;
-
-        validate_timestamp_ntz_feature_support(&schema, &protocol)?;
-
-        validate_variant_type_feature_support(&schema, &protocol)?;
+        let physical_schema = match column_mapping_mode {
+            ColumnMappingMode::None => logical_schema.clone(),
+            _ => Arc::new(logical_schema.make_physical(column_mapping_mode)),
+        };
 
         let table_config = Self {
-            schema,
+            logical_schema,
+            physical_schema,
             metadata,
             protocol,
             table_properties,
@@ -130,6 +133,11 @@ impl TableConfiguration {
             table_root,
             version,
         };
+
+        // Validate schema against protocol features now that we have a TC instance.
+        validate_column_mapping(&table_config)?;
+        validate_timestamp_ntz_feature_support(&table_config)?;
+        validate_variant_type_feature_support(&table_config)?;
 
         Ok(table_config)
     }
@@ -201,8 +209,10 @@ impl TableConfiguration {
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
-    /// - **Clustering columns**: Per the Delta protocol, clustering columns are always included
+    /// - **Required columns** (e.g. clustering columns): Per the Delta protocol, always included
     ///   in statistics, regardless of the above settings.
+    /// - **Requested columns**: Optional output filter that limits which columns appear in the
+    ///   schema without affecting column counting.
     ///
     /// See the Delta protocol for more details on per-file statistics:
     /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics>
@@ -210,13 +220,15 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn build_expected_stats_schemas(
         &self,
-        clustering_columns: Option<&[ColumnName]>,
+        required_columns: Option<&[ColumnName]>,
+        requested_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<ExpectedStatsSchemas> {
         let logical_data_schema = self.logical_data_schema();
         let logical_stats_schema = Arc::new(expected_stats_schema(
             &logical_data_schema,
             self.table_properties(),
-            clustering_columns,
+            required_columns,
+            requested_columns,
         )?);
         let physical_stats_schema = match self.column_mapping_mode() {
             ColumnMappingMode::None => logical_stats_schema.clone(),
@@ -233,48 +245,69 @@ impl TableConfiguration {
         })
     }
 
-    /// Returns the list of logical column names that should have statistics collected.
-    ///
-    /// Returns leaf column paths as [`ColumnName`] objects, which store path components
-    /// separately and handle escaping of special characters (dots, spaces) via backticks.
-    ///
-    /// Per the Delta protocol, clustering columns are always included in statistics,
-    /// regardless of the `delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`
-    /// settings.
-    pub(crate) fn stats_column_names_logical(
-        &self,
-        clustering_columns: Option<&[ColumnName]>,
-    ) -> Vec<ColumnName> {
-        stats_column_names(
-            &self.logical_data_schema(),
-            self.table_properties(),
-            clustering_columns,
-        )
-    }
-
     /// Returns the list of physical column names that should have statistics collected.
-    ///
-    /// Similar to [`stats_column_names_logical`], but returns physical column names.
     pub(crate) fn stats_column_names_physical(
         &self,
-        clustering_columns: Option<&[ColumnName]>,
+        required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let logical_names = self.stats_column_names_logical(clustering_columns);
+        let props = self.table_properties();
+        let physical_stats_columns: Option<Vec<ColumnName>> =
+            props.data_skipping_stats_columns.as_ref().map(|cols| {
+                let logical_schema = self.logical_data_schema();
+                let mode = self.column_mapping_mode();
+                cols.iter()
+                    .filter_map(|col| {
+                        get_any_level_column_physical_name(&logical_schema, col, mode)
+                            .inspect_err(|e| {
+                                // Theoretically this should always resolve — if it doesn't,
+                                // the user specified a non-existent column in
+                                // delta.dataSkippingStatsColumns, which is safe to ignore.
+                                warn!(
+                                    "Couldn't translate dataSkippingStatsColumns entry '{col}' \
+                                     to physical name: {e}; skipping"
+                                );
+                            })
+                            .ok()
+                    })
+                    .collect()
+            });
+        let config = StatsConfig {
+            data_skipping_stats_columns: physical_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
+        };
+        stats_column_names(&self.physical_schema(), &config, required_columns)
+    }
+
+    /// Returns the physical partition schema for `partitionValues_parsed`.
+    ///
+    /// Field names are physical column names (respecting column mapping mode),
+    /// and field types are the actual partition column data types with their original nullability.
+    /// Returns `None` if the table has no partition columns.
+    pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
+        let partition_columns = self.metadata().partition_columns();
+        if partition_columns.is_empty() {
+            return None;
+        }
+        let logical_schema = self.logical_schema();
         let column_mapping_mode = self.column_mapping_mode();
-        logical_names
-            .into_iter()
+        let partition_fields: Vec<StructField> = partition_columns
+            .iter()
             .filter_map(|col_name| {
-                get_any_level_column_physical_name(
-                    self.schema.as_ref(),
-                    &col_name,
-                    column_mapping_mode,
-                )
-                .inspect_err(|e| {
-                    warn!("Couldn't find physical name for {col_name}: {e}");
-                })
-                .ok()
+                let field = logical_schema.field(col_name);
+                if field.is_none() {
+                    warn!("Partition column '{col_name}' not found in table schema");
+                }
+                field
             })
-            .collect()
+            .map(|field: &StructField| {
+                StructField::new(
+                    field.physical_name(column_mapping_mode).to_owned(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
+            .collect();
+        Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
@@ -285,7 +318,7 @@ impl TableConfiguration {
     fn logical_data_schema(&self) -> SchemaRef {
         let partition_columns = self.partition_columns();
         Arc::new(StructType::new_unchecked(
-            self.schema()
+            self.logical_schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
@@ -307,8 +340,18 @@ impl TableConfiguration {
 
     /// The logical schema ([`SchemaRef`]) of this table at this version.
     #[internal_api]
-    pub(crate) fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    pub(crate) fn logical_schema(&self) -> SchemaRef {
+        self.logical_schema.clone()
+    }
+
+    /// The physical schema ([`SchemaRef`]) of this table at this version.
+    ///
+    /// When column mapping is disabled, this is identical to [`logical_schema`](Self::logical_schema).
+    /// Otherwise, field names are replaced with physical column names derived from column
+    /// mapping metadata.
+    #[internal_api]
+    pub(crate) fn physical_schema(&self) -> SchemaRef {
+        self.physical_schema.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -533,7 +576,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.schema.as_ref())
+            && InvariantChecker::has_invariants(self.logical_schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -626,7 +669,7 @@ impl TableConfiguration {
     #[allow(dead_code)]
     fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
         match info.feature_type {
-            FeatureType::Writer => {
+            FeatureType::WriterOnly => {
                 if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
                     self.protocol.min_writer_version() >= info.min_writer_version
@@ -712,7 +755,7 @@ mod test {
         EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
-    use crate::table_properties::TableProperties;
+    use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
@@ -889,28 +932,22 @@ mod test {
                 ),
                 Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
-            // NOTE: The following cases should be updated if column mapping for writes is
-            // supported before cdc is.
+            // Column mapping is now supported for writes.
             (
-                // Should fail since change data feed and column mapping features cannot both be
-                // present.
+                // CDF + column mapping: both supported, should succeed
                 create_mock_table_config(
                     &[(ENABLE_CHANGE_DATA_FEED, "true"), (APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
-                // The table does not require writing CDC files, so it is safe to write to it.
+                // Column mapping + AppendOnly, no CDF enabled: should succeed
                 create_mock_table_config(
                     &[(APPEND_ONLY, "true")],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(
-                    "Feature 'columnMapping' is not supported for writes",
-                )),
+                Ok(()),
             ),
             (
                 // Should succeed since change data feed is not enabled
@@ -1174,7 +1211,10 @@ mod test {
         assert_eq!(new_table_config.version(), new_version);
         assert_eq!(new_table_config.metadata(), &new_metadata);
         assert_eq!(new_table_config.protocol(), &new_protocol);
-        assert_eq!(new_table_config.schema(), table_config.schema());
+        assert_eq!(
+            new_table_config.logical_schema(),
+            table_config.logical_schema()
+        );
         assert_eq!(
             new_table_config.table_properties(),
             &TableProperties {
@@ -1280,15 +1320,15 @@ mod test {
 
     #[test]
     fn test_is_feature_info_supported_writer() {
-        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as Writer type
+        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as WriterOnly type
         let feature = TableFeature::ColumnMapping;
 
-        // Custom FeatureInfo that treats ColumnMapping as Writer-only with min_writer_version = 2
+        // Custom FeatureInfo that treats ColumnMapping as WriterOnly with min_writer_version = 2
         let custom_feature_info = FeatureInfo {
             name: "columnMapping",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1303,14 +1343,14 @@ mod test {
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
 
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
-        // For this to work with a Writer-only FeatureInfo, we need a real Writer-only feature
+        // For this to work with a WriterOnly FeatureInfo, we need a real WriterOnly feature
         // Use AppendOnly instead of ColumnMapping for the 2,7 test cases
         let writer_only_feature = TableFeature::AppendOnly;
         let writer_only_info = FeatureInfo {
             name: "appendOnly",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1322,7 +1362,7 @@ mod test {
         assert!(config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
 
         // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
-        // Use ChangeDataFeed which is also a Writer-only feature
+        // Use ChangeDataFeed which is also a WriterOnly feature
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
         assert!(!config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
@@ -1369,7 +1409,7 @@ mod test {
         // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
         // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
         // But we still need to test that the code correctly identifies them as NOT supported
-        // Create a table with only Writer-only features (e.g., AppendOnly)
+        // Create a table with only WriterOnly features (e.g., AppendOnly)
         let config =
             create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
         // ColumnMapping (ReaderWriter) should NOT be supported because:
@@ -1396,7 +1436,7 @@ mod test {
             name: "customPropertyFeature",
             min_reader_version: 1,
             min_writer_version: 2,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
@@ -1422,7 +1462,7 @@ mod test {
             name: "alwaysEnabledFeature",
             min_reader_version: 1,
             min_writer_version: 3,
-            feature_type: FeatureType::Writer,
+            feature_type: FeatureType::WriterOnly,
             feature_requirements: &[],
             kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -1566,9 +1606,18 @@ mod test {
         schema: SchemaRef,
         column_mapping_mode: &str,
     ) -> TableConfiguration {
-        use crate::table_properties::COLUMN_MAPPING_MODE;
+        create_table_config_with_column_mapping_and_props(schema, column_mapping_mode, [])
+    }
 
-        let mut props = HashMap::new();
+    fn create_table_config_with_column_mapping_and_props(
+        schema: SchemaRef,
+        column_mapping_mode: &str,
+        extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> TableConfiguration {
+        let mut props: HashMap<String, String> = extra_props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         props.insert(
             COLUMN_MAPPING_MODE.to_string(),
             column_mapping_mode.to_string(),
@@ -1596,7 +1645,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::None);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Both schemas should be identical (same Arc)
         assert!(Arc::ptr_eq(&stats_schemas.logical, &stats_schemas.physical));
@@ -1624,7 +1673,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Schemas should be different (not the same Arc)
         assert!(!Arc::ptr_eq(
@@ -1686,7 +1735,7 @@ mod test {
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
 
-        let stats_schemas = config.build_expected_stats_schemas(None).unwrap();
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
@@ -1732,27 +1781,12 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_logical_returns_logical_names() {
-        // stats_column_names_logical should return logical column names
-        let schema = schema_with_column_mapping();
-        let config = create_table_config_with_column_mapping(schema, "name");
-
-        let column_names = config.stats_column_names_logical(None /* clustering_columns */);
-
-        // Should return logical names, not physical names
-        assert!(column_names.contains(&ColumnName::new(["col_a"])));
-        assert!(column_names.contains(&ColumnName::new(["col_b"])));
-        assert!(!column_names.contains(&ColumnName::new(["phys_col_a"])));
-        assert!(!column_names.contains(&ColumnName::new(["phys_col_b"])));
-    }
-
-    #[test]
     fn test_stats_column_names_physical_returns_physical_names() {
         // stats_column_names_physical should return physical column names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_physical(None /* clustering_columns */);
+        let column_names = config.stats_column_names_physical(None /* required_columns */);
 
         // Should return physical names, not logical names
         assert_eq!(
@@ -1763,6 +1797,34 @@ mod test {
             ],
             "Expected physical column names, not logical names"
         );
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_with_data_skipping_stats_columns() {
+        let config = create_table_config_with_column_mapping_and_props(
+            test_schema_nested_with_column_mapping(),
+            "name",
+            [("delta.dataSkippingStatsColumns", "id,info.name")],
+        );
+        let column_names = config.stats_column_names_physical(None);
+        assert_eq!(
+            column_names,
+            vec![
+                ColumnName::new(["phys_id"]),
+                ColumnName::new(["phys_info", "phys_name"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_stats_column_names_physical_skips_nonexistent_data_skipping_stats_column() {
+        let config = create_table_config_with_column_mapping_and_props(
+            test_schema_nested_with_column_mapping(),
+            "name",
+            [("delta.dataSkippingStatsColumns", "id,nonexistent")],
+        );
+        let column_names = config.stats_column_names_physical(None);
+        assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
     }
 
     #[rstest]

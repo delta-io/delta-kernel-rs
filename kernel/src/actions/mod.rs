@@ -179,12 +179,9 @@ pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
     )]))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
@@ -219,12 +216,9 @@ impl TryFrom<Format> for Scalar {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
@@ -527,7 +521,7 @@ impl Protocol {
                 let check_w = writer_features
                     .iter()
                     .all(|feature| match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => reader_features.contains(feature),
                     });
                 require!(
@@ -545,7 +539,7 @@ impl Protocol {
                 // Unknown features are treated as potentially Writer-only for forward compatibility.
                 let is_valid = writer_features.iter().all(|feature| {
                     match feature.feature_type() {
-                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => true,
                         FeatureType::ReaderWriter => {
                             // ColumnMapping is allowed when reader version is 2 (implied support)
                             min_reader_version == 2 && feature == &TableFeature::ColumnMapping
@@ -849,6 +843,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
+// TODO: Add serde Deserialize with rename_all = "camelCase" for CRC file reads.
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct SetTransaction {
@@ -942,7 +937,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
     domain: String,
@@ -1344,7 +1339,7 @@ mod tests {
                 ],
                 "Writer features must be Writer-only or also listed in reader features",
             ),
-            // Writer only feature present in reader features
+            // WriterOnly feature present in reader features
             (
                 vec![TableFeature::AppendOnly],
                 vec![TableFeature::AppendOnly],
@@ -1389,7 +1384,7 @@ mod tests {
         // (reader_feature, writer_feature)
         let valid_features = [
             // ReaderWriter feature present in both reader/writer features,
-            // Writer only feature present in writer feature
+            // WriterOnly feature present in writer feature
             (
                 vec![TableFeature::DeletionVectors],
                 vec![TableFeature::DeletionVectors],
@@ -1399,7 +1394,7 @@ mod tests {
                 vec![TableFeature::VariantType],
                 vec![TableFeature::VariantType, TableFeature::AppendOnly],
             ),
-            // Unknown feature may be ReaderWriter or Writer only (for forward compatibility)
+            // Unknown feature may be ReaderWriter or WriterOnly (for forward compatibility)
             (
                 vec![TableFeature::Unknown("rw".to_string())],
                 vec![
