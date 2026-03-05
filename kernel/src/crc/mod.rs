@@ -55,8 +55,15 @@ pub(crate) struct Crc {
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub(crate) in_commit_timestamp_opt: Option<i64>,
     /// Live transaction identifier ([`SetTransaction`]) actions at this version.
-    #[serde(skip)]
-    pub(crate) set_transactions: Option<Vec<SetTransaction>>,
+    ///
+    /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
+    /// a Vec, which is converted via custom serde deserialization.
+    #[serde(
+        default,
+        deserialize_with = "de_opt_vec_to_opt_map",
+        serialize_with = "ser_opt_map_to_opt_vec"
+    )]
+    pub(crate) set_transactions: Option<HashMap<String, SetTransaction>>,
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored.
     ///
@@ -85,29 +92,48 @@ pub(crate) struct Crc {
     pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
-/// Deserialize `Option<Vec<DomainMetadata>>` from JSON into `Option<HashMap<String, DomainMetadata>>`.
-fn de_opt_vec_to_opt_map<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashMap<String, DomainMetadata>>, D::Error>
+/// Trait for types that can be stored in a HashMap keyed by a string identifier.
+/// Used by CRC serde helpers to convert between Vec (JSON format) and HashMap (in-memory).
+trait MapKey {
+    fn map_key(&self) -> &str;
+}
+
+impl MapKey for DomainMetadata {
+    fn map_key(&self) -> &str {
+        self.domain()
+    }
+}
+
+impl MapKey for SetTransaction {
+    fn map_key(&self) -> &str {
+        &self.app_id
+    }
+}
+
+/// Deserialize an `Option<Vec<T>>` from JSON into `Option<HashMap<String, T>>`, using
+/// [`MapKey::map_key`] to derive the HashMap key for each element.
+fn de_opt_vec_to_opt_map<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
 where
     D: Deserializer<'de>,
+    T: Deserialize<'de> + MapKey,
 {
-    let opt_vec: Option<Vec<DomainMetadata>> = Option::deserialize(deserializer)?;
+    let opt_vec: Option<Vec<T>> = Option::deserialize(deserializer)?;
     Ok(opt_vec.map(|vec| {
         vec.into_iter()
-            .map(|dm| (dm.domain().to_string(), dm))
+            .map(|item| (item.map_key().to_string(), item))
             .collect()
     }))
 }
 
-/// Serialize `Option<HashMap<String, DomainMetadata>>` back to `Option<Vec<DomainMetadata>>` so
-/// the CRC JSON format uses an array (matching the Delta protocol spec).
-fn ser_opt_map_to_opt_vec<S>(
-    map: &Option<HashMap<String, DomainMetadata>>,
+/// Serialize `Option<HashMap<String, T>>` back to `Option<Vec<T>>` so the CRC JSON format
+/// uses an array (matching the Delta protocol spec).
+fn ser_opt_map_to_opt_vec<S, T>(
+    map: &Option<HashMap<String, T>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
+    T: Serialize,
 {
     match map {
         None => serializer.serialize_none(),
@@ -153,4 +179,139 @@ pub(crate) struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{de_opt_vec_to_opt_map, ser_opt_map_to_opt_vec};
+    use crate::actions::{DomainMetadata, SetTransaction};
+
+    /// Wrapper struct to exercise the serde helpers, since they require a Deserializer/Serializer.
+    #[derive(Deserialize, Serialize, PartialEq, Debug)]
+    struct MapKeyTestWrapper {
+        #[serde(
+            default,
+            deserialize_with = "de_opt_vec_to_opt_map",
+            serialize_with = "ser_opt_map_to_opt_vec"
+        )]
+        txns: Option<HashMap<String, SetTransaction>>,
+        #[serde(
+            default,
+            deserialize_with = "de_opt_vec_to_opt_map",
+            serialize_with = "ser_opt_map_to_opt_vec"
+        )]
+        domains: Option<HashMap<String, DomainMetadata>>,
+    }
+
+    #[test]
+    fn de_vec_to_map_produces_correct_keys_and_values() {
+        let json = r#"{
+            "txns": [
+                {"appId": "app-1", "version": 3, "lastUpdated": 1000},
+                {"appId": "app-2", "version": 7}
+            ],
+            "domains": [
+                {"domain": "delta.rowTracking", "configuration": "{\"rowIdHighWaterMark\":1}", "removed": false},
+                {"domain": "delta.clustering", "configuration": "{}", "removed": false}
+            ]
+        }"#;
+
+        let wrapper: MapKeyTestWrapper = serde_json::from_str(json).unwrap();
+
+        let txns = wrapper.txns.as_ref().unwrap();
+        assert_eq!(txns.len(), 2);
+
+        let txn1 = &txns["app-1"];
+        assert_eq!(txn1.app_id, "app-1");
+        assert_eq!(txn1.version, 3);
+        assert_eq!(txn1.last_updated, Some(1000));
+
+        let txn2 = &txns["app-2"];
+        assert_eq!(txn2.app_id, "app-2");
+        assert_eq!(txn2.version, 7);
+        assert_eq!(txn2.last_updated, None);
+
+        let domains = wrapper.domains.as_ref().unwrap();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains_key("delta.rowTracking"));
+        assert!(domains.contains_key("delta.clustering"));
+    }
+
+    #[test]
+    fn de_null_deserializes_to_none() {
+        let json = r#"{"txns": null, "domains": null}"#;
+        let wrapper: MapKeyTestWrapper = serde_json::from_str(json).unwrap();
+        assert!(wrapper.txns.is_none());
+        assert!(wrapper.domains.is_none());
+    }
+
+    #[test]
+    fn de_missing_field_deserializes_to_none() {
+        let json = r#"{}"#;
+        let wrapper: MapKeyTestWrapper = serde_json::from_str(json).unwrap();
+        assert!(wrapper.txns.is_none());
+        assert!(wrapper.domains.is_none());
+    }
+
+    #[test]
+    fn ser_none_serializes_to_null() {
+        let wrapper = MapKeyTestWrapper {
+            txns: None,
+            domains: None,
+        };
+        let json = serde_json::to_value(&wrapper).unwrap();
+        assert!(json["txns"].is_null());
+        assert!(json["domains"].is_null());
+    }
+
+    #[test]
+    fn ser_map_round_trips_through_vec() {
+        let mut txns = HashMap::new();
+        txns.insert(
+            "app-1".to_string(),
+            SetTransaction::new("app-1".to_string(), 5, Some(2000)),
+        );
+        txns.insert(
+            "app-2".to_string(),
+            SetTransaction::new("app-2".to_string(), 10, None),
+        );
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
+        );
+
+        let original = MapKeyTestWrapper {
+            txns: Some(txns),
+            domains: Some(domains),
+        };
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: MapKeyTestWrapper = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn round_trip_empty_maps() {
+        let original = MapKeyTestWrapper {
+            txns: Some(HashMap::new()),
+            domains: Some(HashMap::new()),
+        };
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: MapKeyTestWrapper = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(original, deserialized);
+
+        // Verify the JSON has empty arrays (not null)
+        let json_value = serde_json::to_value(&original).unwrap();
+        assert_eq!(json_value["txns"], serde_json::json!([]));
+        assert_eq!(json_value["domains"], serde_json::json!([]));
+    }
 }
