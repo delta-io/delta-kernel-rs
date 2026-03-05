@@ -41,6 +41,19 @@ use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
 
+/// File-level statistics for a table snapshot.
+///
+/// NOTE: This is an unstable API expected to change in future releases.
+#[allow(unused)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct FileStats {
+    /// Total size of the table in bytes (sum of all active AddFile sizes).
+    pub table_size_bytes: i64,
+    /// Number of active AddFile actions in this table version.
+    pub num_files: i64,
+}
+
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
@@ -83,7 +96,7 @@ impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
     /// using
-    pub fn builder_for(table_root: Url) -> SnapshotBuilder {
+    pub fn builder_for(table_root: impl AsRef<str>) -> SnapshotBuilder {
         SnapshotBuilder::new_for(table_root)
     }
 
@@ -110,8 +123,18 @@ impl Snapshot {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
+    /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
     #[internal_api]
-    pub(crate) fn new(
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            Arc::new(LazyCrc::new(None)),
+        )
+    }
+
+    /// Internal constructor that accepts an explicit [`LazyCrc`].
+    pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         lazy_crc: Arc<LazyCrc>,
@@ -298,7 +321,7 @@ impl Snapshot {
         )?;
 
         let lazy_crc = Arc::new(LazyCrc::new(combined_log_segment.latest_crc_file.clone()));
-        Ok(Arc::new(Snapshot::new(
+        Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
             lazy_crc,
@@ -377,7 +400,11 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new(log_segment, table_configuration, lazy_crc))
+        Ok(Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            lazy_crc,
+        ))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -455,7 +482,7 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot::new(
+        Ok(Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
             self.lazy_crc.clone(),
@@ -627,6 +654,22 @@ impl Snapshot {
         }
     }
 
+    /// Returns file-level statistics from the CRC file, or `None` if no CRC exists at this
+    /// snapshot's version.
+    ///
+    /// NOTE: This is an unstable API expected to change in future releases.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
+        let crc = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())?;
+        Some(FileStats {
+            table_size_bytes: crc.table_size_bytes,
+            num_files: crc.num_files,
+        })
+    }
+
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
     /// tables. This method is a no-op for filesystem-managed tables or if there are no catalog
     /// commits to publish.
@@ -688,7 +731,7 @@ impl Snapshot {
 
         committer.publish(engine, publish_metadata)?;
 
-        Ok(Arc::new(Snapshot::new(
+        Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
             self.lazy_crc.clone(),
@@ -937,7 +980,8 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    // TODO: unify this and lots of stuff in LogSegment tests and test_utils
+    // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
+    // Also make this function take in the path of the delta table (currently only can commit to tables at the root directory).
     async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
         let commit_data = commit
             .iter()
@@ -1637,7 +1681,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_enablement_version_in_future() -> DeltaResult<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
-        let url = Url::parse("memory:///table2")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1686,7 +1730,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_missing_ict_when_enabled() -> DeltaResult<()> {
         // Test missing ICT when it should be present - should error
-        let url = Url::parse("memory:///table3")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1718,7 +1762,7 @@ mod tests {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///missing_commit_test")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1760,8 +1804,7 @@ mod tests {
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
-        let snapshot_no_commit =
-            Snapshot::new(log_segment, table_config, Arc::new(LazyCrc::new(None)));
+        let snapshot_no_commit = Snapshot::new(log_segment, table_config);
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
@@ -1773,7 +1816,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> DeltaResult<()> {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
-        let url = Url::parse("memory:///checkpoint_commit_test")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 

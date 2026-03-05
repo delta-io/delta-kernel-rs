@@ -104,6 +104,10 @@ pub enum TestAction {
     Add(String),
     Remove(String),
     Metadata,
+    // TODO: This is a temporary fix to make the test compatible with the file size requirement.
+    // In the future, we can create an AddCommit/RemoveCommit struct type with DefaultAddCommit/DefaultRemoveCommit value to store the commit info in the enum for Add/Remove.
+    AddWithSize(String, u64),
+    RemoveWithSize(String, u64),
 }
 
 // TODO: We need a better way to mock tables :)
@@ -125,6 +129,8 @@ pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str)
             TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
             TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
             TestAction::Metadata => metadata.into(),
+            TestAction::AddWithSize(path, file_size) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
+            TestAction::RemoveWithSize(path, file_size) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true}}}}"#),
         })
         .join("\n")
 }
@@ -215,6 +221,7 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
+// TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
 /// put a commit file into the specified object store.
 pub async fn add_commit(
     store: &dyn ObjectStore,

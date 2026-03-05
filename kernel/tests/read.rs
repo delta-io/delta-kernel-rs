@@ -52,13 +52,15 @@ fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
     add_commit(
         storage.as_ref(),
         0,
         actions_to_string(vec![
             TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-            TestAction::Add(PARQUET_FILE2.to_string()),
+            TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
+            TestAction::AddWithSize(PARQUET_FILE2.to_string(), file_size),
         ]),
     )
     .await?;
@@ -99,19 +101,24 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
     add_commit(
         storage.as_ref(),
         0,
         actions_to_string(vec![
             TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
         ]),
     )
     .await?;
     add_commit(
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
+        actions_to_string(vec![TestAction::AddWithSize(
+            PARQUET_FILE2.to_string(),
+            file_size,
+        )]),
     )
     .await?;
     storage
@@ -152,25 +159,33 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
     add_commit(
         storage.as_ref(),
         0,
         actions_to_string(vec![
             TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
         ]),
     )
     .await?;
     add_commit(
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
+        actions_to_string(vec![TestAction::AddWithSize(
+            PARQUET_FILE2.to_string(),
+            file_size,
+        )]),
     )
     .await?;
     add_commit(
         storage.as_ref(),
         2,
-        actions_to_string(vec![TestAction::Remove(PARQUET_FILE2.to_string())]),
+        actions_to_string(vec![TestAction::RemoveWithSize(
+            PARQUET_FILE2.to_string(),
+            file_size,
+        )]),
     )
     .await?;
     storage
@@ -209,6 +224,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
                 TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 5}},\"maxValues\":{{\"id\":7}}}}"}}}}"#, action = "add", path = path),
                 TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
                 TestAction::Metadata => METADATA.into(),
+                TestAction::AddWithSize(path, size) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 5}},\"maxValues\":{{\"id\":7}}}}"}}}}"#, action = "add", path = path),
+                TestAction::RemoveWithSize(path, size) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
             })
             .fold(String::new(), |a, b| a + &b + "\n")
     }
@@ -218,6 +235,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         ("id", vec![5, 7].into_array()),
         ("val", vec!["e", "g"].into_array()),
     ])?);
+    let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
+    let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let storage = Arc::new(InMemory::new());
     // valid commit with min/max (0, 2)
     add_commit(
@@ -225,7 +244,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         0,
         actions_to_string(vec![
             TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size1),
         ]),
     )
     .await?;
@@ -233,7 +252,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     add_commit(
         storage.as_ref(),
         1,
-        generate_commit2(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
+        generate_commit2(vec![TestAction::AddWithSize(
+            PARQUET_FILE2.to_string(),
+            file_size2,
+        )]),
     )
     .await?;
 
@@ -1335,15 +1357,18 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         ("value", vec!["p", "q", "r", "s"].into_array()),
     ])?;
 
+    let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
+    let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
+    let file_size3 = record_batch_to_bytes(&batch3).len() as u64;
     let storage = Arc::new(InMemory::new());
     add_commit(
         storage.as_ref(),
         0,
         actions_to_string(vec![
             TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-            TestAction::Add(PARQUET_FILE2.to_string()),
-            TestAction::Add(PARQUET_FILE3.to_string()),
+            TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size1),
+            TestAction::AddWithSize(PARQUET_FILE2.to_string(), file_size2),
+            TestAction::AddWithSize(PARQUET_FILE3.to_string(), file_size3),
         ]),
     )
     .await?;
@@ -1418,7 +1443,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::test]
 async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
-    use delta_kernel::arrow::array::{Array, AsArray, RunArray};
+    use delta_kernel::arrow::array::{Array, StringArray};
 
     // Set up an in-memory table with multiple data files
     let batch1 = generate_batch(vec![
@@ -1430,14 +1455,16 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         ("value", vec!["x", "y"].into_array()),
     ])?;
 
+    let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
+    let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let storage = Arc::new(InMemory::new());
     add_commit(
         storage.as_ref(),
         0,
         actions_to_string(vec![
             TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-            TestAction::Add(PARQUET_FILE2.to_string()),
+            TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size1),
+            TestAction::AddWithSize(PARQUET_FILE2.to_string(), file_size2),
         ]),
     )
     .await?;
@@ -1495,41 +1522,24 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         let expected_file_name = expected_files[file_count];
         let expected_path = format!("{}{}", location, expected_file_name);
 
-        // The file path array should be run-end encoded
-        let run_array = file_path_array
+        // The file path array should be a plain StringArray with the path repeated for each row.
+        let string_array = file_path_array
             .as_any()
-            .downcast_ref::<RunArray<Int64Type>>()
-            .expect("File path column should be run-end encoded");
+            .downcast_ref::<StringArray>()
+            .expect("File path column should be a StringArray");
 
-        // Verify each logical row has the correct file path
         assert_eq!(
-            run_array.len(),
+            string_array.len(),
             expected_row_counts[file_count],
             "File {} should have {} rows",
             expected_file_name,
             expected_row_counts[file_count]
         );
-
-        // Verify the physical representation is efficient (single run)
-        let run_ends = run_array.run_ends().values();
-        assert_eq!(
-            run_ends.len(),
-            1,
-            "File path should be encoded as a single run"
-        );
-        assert_eq!(
-            run_ends[0], expected_row_counts[file_count] as i64,
-            "Run should end at position {}",
-            expected_row_counts[file_count]
-        );
-
-        // Verify the value is the expected file path
-        let values = run_array.values().as_string::<i32>();
-        assert_eq!(values.len(), 1, "Should have only 1 unique file path value");
-        assert_eq!(
-            values.value(0),
-            expected_path,
-            "File path should be '{}'",
+        assert!(
+            string_array
+                .iter()
+                .all(|v| v == Some(expected_path.as_str())),
+            "All rows should contain file path '{}'",
             expected_path
         );
 

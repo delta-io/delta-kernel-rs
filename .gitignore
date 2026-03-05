@@ -3,6 +3,7 @@
 
 # IDE
 .claude/
+.cursor/
 .dir-locals.el
 .idea/
 .vscode/
@@ -22,3 +23,5 @@ ffi/examples/read-table/build
 /build
 /kernel/target
 /target
+
+/benchmarks/data/workloads/
