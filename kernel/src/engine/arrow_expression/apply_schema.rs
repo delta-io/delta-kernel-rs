@@ -215,6 +215,8 @@ mod apply_schema_validation_tests {
     };
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     fn struct_output_schema(schema: &DataType) -> Arc<ArrowSchema> {
         let DataType::Struct(struct_type) = schema else {
@@ -222,8 +224,6 @@ mod apply_schema_validation_tests {
         };
         Arc::new(struct_type.as_ref().try_into_arrow().unwrap())
     }
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_apply_schema_basic_functionality() {
