@@ -3,6 +3,7 @@
 
 # IDE
 .claude/
+.cursor/
 .dir-locals.el
 .idea/
 .vscode/
@@ -10,8 +11,10 @@
 .zed
 .cache/
 .clangd
+*.*~
 
 # Rust
+.cargo-home
 target/
 /Cargo.lock
 integration-tests/Cargo.lock
@@ -19,6 +22,9 @@ integration-tests/Cargo.lock
 # Project
 acceptance/tests/dat/
 ffi/examples/read-table/build
+ffi/examples/visit-expression/build
 /build
 /kernel/target
 /target
+
+/benchmarks/data/workloads/

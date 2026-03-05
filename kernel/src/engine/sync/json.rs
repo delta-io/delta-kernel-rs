@@ -1,14 +1,16 @@
+use std::sync::Arc;
 use std::{fs::File, io::BufReader, io::Write};
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use tempfile::NamedTempFile;
 use url::Url;
 
 use super::read_files;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine::arrow_utils::{
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    to_json_bytes,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
@@ -17,20 +19,22 @@ use crate::{
 
 pub(crate) struct SyncJsonHandler;
 
-/// Note: This function must match the signature expected by `read_files` helper function,
-/// which is also used by `try_create_from_parquet`. The `_file_location` parameter is unused
-/// here but required to satisfy the shared function signature.
 fn try_create_from_json(
     file: File,
-    _schema: SchemaRef,
-    arrow_schema: ArrowSchemaRef,
+    schema: SchemaRef,
     _predicate: Option<PredicateRef>,
-    _file_location: String,
+    file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let json = ReaderBuilder::new(arrow_schema)
+    // Build Arrow schema from only the real JSON columns, omitting any metadata columns
+    // (e.g. FilePath) that the JSON reader cannot populate from the file content.
+    let json_schema = Arc::new(json_arrow_schema(&schema)?);
+    // Build the reorder index vec once; apply it to every batch to re-insert synthesized metadata
+    // columns (e.g. file path) at their schema positions.
+    let reorder_indices = build_json_reorder_indices(&schema)?;
+    let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
         .build(BufReader::new(file))?
-        .map(|data| Ok(ArrowEngineData::new(data?)));
+        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
     Ok(json)
 }
 

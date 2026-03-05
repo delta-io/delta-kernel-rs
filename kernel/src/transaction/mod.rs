@@ -29,7 +29,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -53,7 +53,9 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod stats_verifier;
 mod update;
+use stats_verifier::StatsVerifier;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -223,8 +225,9 @@ pub struct Transaction<S = ExistingTable> {
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
-    // enabled. Used for determining which columns require statistics collection.
-    clustering_columns: Option<Vec<ColumnName>>,
+    // enabled. Used for determining which columns require statistics collection. Expected to be
+    // physical column names.
+    clustering_columns_physical: Option<Vec<ColumnName>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -314,6 +317,9 @@ impl<S> Transaction<S> {
             );
         }
 
+        // Validate clustering column stats if ClusteredTable feature is enabled
+        self.validate_add_files_stats(&self.add_files_metadata)?;
+
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
@@ -399,7 +405,10 @@ impl<S> Transaction<S> {
             log_root,
             commit_version,
             self.commit_timestamp,
-            self.read_snapshot.log_segment().max_published_version,
+            self.read_snapshot
+                .log_segment()
+                .listed
+                .max_published_version,
         );
         match self
             .committer
@@ -822,14 +831,25 @@ impl<S> Transaction<S> {
     ///
     /// Engines should collect statistics matching this schema structure when writing files.
     ///
-    /// Per the Delta protocol, clustering columns are always included in statistics,
-    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
+    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
+    /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
+    /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schemas = self
-            .read_snapshot
-            .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns.as_deref())?;
+        let tc = self.read_snapshot.table_configuration();
+        let clustering_columns_logical = self
+            .clustering_columns_physical
+            .as_deref()
+            .map(|cols| {
+                get_any_level_columns_logical_names(
+                    &tc.logical_schema(),
+                    cols,
+                    tc.column_mapping_mode(),
+                )
+            })
+            .transpose()?;
+        let stats_schemas =
+            tc.build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -848,7 +868,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names_physical(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -931,6 +951,42 @@ impl<S> Transaction<S> {
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
+    }
+
+    /// Validate that add files have required statistics for clustering columns.
+    ///
+    /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
+    /// when the `ClusteredTable` feature is enabled. Other stat columns (e.g. the conventional
+    /// "first 32 columns") are not validated here because they are not protocol-required.
+    ///
+    /// Only add files are validated — remove files do not carry statistics.
+    fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
+        if add_files.is_empty() {
+            return Ok(());
+        }
+        if let Some(ref clustering_cols) = self.clustering_columns_physical {
+            if !clustering_cols.is_empty() {
+                let physical_schema = self.read_snapshot.table_configuration().physical_schema();
+                let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
+                    .iter()
+                    .map(|col| {
+                        let data_type = physical_schema
+                            .walk_column_fields(col)?
+                            .last()
+                            .map(|field| field.data_type().clone())
+                            .ok_or_else(|| {
+                                Error::internal_error(format!(
+                                    "Required column '{col}' not found in table schema"
+                                ))
+                            })?;
+                        Ok((col.clone(), data_type))
+                    })
+                    .collect::<DeltaResult<_>>()?;
+                let verifier = StatsVerifier::new(columns_with_types);
+                verifier.verify(add_files)?;
+            }
+        }
+        Ok(())
     }
 
     /// Generate add actions, handling row tracking internally if needed
@@ -1410,8 +1466,9 @@ mod tests {
     use crate::arrow::array::{
         ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
     };
+    use crate::arrow::buffer::OffsetBuffer;
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
@@ -1430,6 +1487,15 @@ mod tests {
     use crate::Snapshot;
     use rstest::rstest;
     use std::path::PathBuf;
+
+    impl Transaction {
+        /// Set clustering columns for testing purposes without needing a table
+        /// with the ClusteredTable feature enabled.
+        fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
+            self.clustering_columns_physical = Some(columns);
+            self
+        }
+    }
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
     struct IoErrorCommitter;
@@ -2151,5 +2217,230 @@ mod tests {
             assert!(rb.schema().fields().iter().any(|f| f.name() == *col));
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Stats validation tests for clustering columns
+    // =========================================================================
+
+    /// Creates test add file metadata with configurable stats.
+    /// If `has_stats` is false, the stats struct will be null (indicating no stats).
+    /// If `has_stats` is true, creates full stats with nullCount, minValues, maxValues for "value" column.
+    fn create_test_add_files(paths: Vec<&str>, has_stats: Vec<bool>) -> Box<dyn EngineData> {
+        let path_array = StringArray::from(paths.to_vec());
+        let size_array = Int64Array::from(vec![1024i64; paths.len()]);
+        let mod_time_array = Int64Array::from(vec![1000000i64; paths.len()]);
+
+        // Create stats struct with full structure for "value" column (matches test table schema)
+        let value_field = Arc::new(ArrowField::new("value", ArrowDataType::Int64, true));
+
+        // nullCount.value
+        let null_count_values: Vec<Option<i64>> = has_stats
+            .iter()
+            .map(|&h| if h { Some(0) } else { None })
+            .collect();
+        let null_count_array = Int64Array::from(null_count_values);
+        let null_count_struct = StructArray::new(
+            Fields::from(vec![value_field.clone()]),
+            vec![Arc::new(null_count_array) as ArrayRef],
+            None,
+        );
+
+        // minValues.value
+        let min_values: Vec<Option<i64>> = has_stats
+            .iter()
+            .map(|&h| if h { Some(1) } else { None })
+            .collect();
+        let min_values_array = Int64Array::from(min_values);
+        let min_values_struct = StructArray::new(
+            Fields::from(vec![value_field.clone()]),
+            vec![Arc::new(min_values_array) as ArrayRef],
+            None,
+        );
+
+        // maxValues.value
+        let max_values: Vec<Option<i64>> = has_stats
+            .iter()
+            .map(|&h| if h { Some(100) } else { None })
+            .collect();
+        let max_values_array = Int64Array::from(max_values);
+        let max_values_struct = StructArray::new(
+            Fields::from(vec![value_field]),
+            vec![Arc::new(max_values_array) as ArrayRef],
+            None,
+        );
+
+        // numRecords
+        let num_records: Vec<Option<i64>> = has_stats
+            .iter()
+            .map(|&h| if h { Some(100) } else { None })
+            .collect();
+        let num_records_array = Int64Array::from(num_records);
+
+        // Build stats struct fields
+        let value_struct_type = ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let stats_fields = Fields::from(vec![
+            ArrowField::new("numRecords", ArrowDataType::Int64, true),
+            ArrowField::new("nullCount", value_struct_type.clone(), true),
+            ArrowField::new("minValues", value_struct_type.clone(), true),
+            ArrowField::new("maxValues", value_struct_type, true),
+        ]);
+
+        // Create validity bitmap - stats struct is null when has_stats is false
+        let stats_validity: Vec<bool> = has_stats.clone();
+        let stats_struct = StructArray::new(
+            stats_fields.clone(),
+            vec![
+                Arc::new(num_records_array) as ArrayRef,
+                Arc::new(null_count_struct) as ArrayRef,
+                Arc::new(min_values_struct) as ArrayRef,
+                Arc::new(max_values_struct) as ArrayRef,
+            ],
+            Some(stats_validity.into()),
+        );
+
+        // Create empty partition values map
+        let entries_field = Arc::new(ArrowField::new(
+            "key_value",
+            ArrowDataType::Struct(
+                vec![
+                    Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
+                    Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let empty_keys = StringArray::from(Vec::<&str>::new());
+        let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+        let empty_entries = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(empty_keys) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
+                Arc::new(empty_values) as ArrayRef,
+            ),
+        ]);
+        let offsets = OffsetBuffer::from_lengths(vec![0; paths.len()]);
+        let partition_values = MapArray::new(entries_field, offsets, empty_entries, None, false);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("path", ArrowDataType::Utf8, false),
+            ArrowField::new(
+                "partitionValues",
+                ArrowDataType::Map(
+                    Arc::new(ArrowField::new(
+                        "key_value",
+                        ArrowDataType::Struct(
+                            vec![
+                                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
+                                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            ArrowField::new("size", ArrowDataType::Int64, false),
+            ArrowField::new("modificationTime", ArrowDataType::Int64, false),
+            ArrowField::new("stats", ArrowDataType::Struct(stats_fields), true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(path_array),
+                Arc::new(partition_values),
+                Arc::new(size_array),
+                Arc::new(mod_time_array),
+                Arc::new(stats_struct),
+            ],
+        )
+        .unwrap();
+
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[test]
+    fn test_stats_validation_when_clustering_cols_missing_stats() {
+        let (engine, snapshot) = setup_non_dv_table();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap()
+            .with_operation("WRITE".to_string())
+            // Enable clustering columns for this test
+            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+
+        // Add files WITHOUT stats
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![false]);
+
+        // Directly test the validation method instead of committing
+        let result = txn.validate_add_files_stats(&[add_files]);
+
+        assert!(
+            result.is_err(),
+            "Expected validation to fail when stats are missing for clustering columns"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Stats validation error") || err_msg.contains("no stats"),
+            "Expected stats validation error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_stats_validation_when_clustering_stats_present() {
+        let (engine, snapshot) = setup_non_dv_table();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap()
+            .with_operation("WRITE".to_string())
+            // Enable clustering columns for this test
+            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+
+        // Add files WITH stats
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![true]);
+
+        // Directly test the validation method
+        let result = txn.validate_add_files_stats(&[add_files]);
+
+        assert!(
+            result.is_ok(),
+            "Stats validation should pass when stats are present, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_stats_validation_skipped_without_clustering() {
+        let (engine, snapshot) = setup_non_dv_table();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap()
+            .with_operation("WRITE".to_string());
+        // No clustering columns set (default)
+
+        // Add files WITHOUT stats
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![false]);
+
+        // Directly test the validation method - should pass because no clustering
+        let result = txn.validate_add_files_stats(&[add_files]);
+
+        assert!(
+            result.is_ok(),
+            "Stats validation should be skipped without clustering, got: {:?}",
+            result
+        );
     }
 }
