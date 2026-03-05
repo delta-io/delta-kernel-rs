@@ -1,6 +1,6 @@
 name: Run tests to ensure we can compile across arrow versions
 
-on: [workflow_dispatch, push, pull_request]
+on: [workflow_dispatch, push, pull_request, merge_group]
 
 jobs:
   arrow_integration_test:

@@ -385,7 +385,7 @@ mod tests {
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
             &table_config,
-            log_segment.ascending_commit_files.clone(),
+            log_segment.listed.ascending_commit_files.clone(),
             table_schema,
             None,
         )
@@ -396,6 +396,7 @@ mod tests {
 
         // Generate the expected [`CdfScanFile`]
         let timestamps = log_segment
+            .listed
             .ascending_commit_files
             .iter()
             .map(|commit| commit.location.last_modified)

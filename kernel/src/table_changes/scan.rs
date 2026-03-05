@@ -144,6 +144,7 @@ impl TableChangesScan {
         let commits = self
             .table_changes
             .log_segment
+            .listed
             .ascending_commit_files
             .clone();
         // NOTE: This is a cheap arc clone
