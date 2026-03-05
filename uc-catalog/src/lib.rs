@@ -132,20 +132,102 @@ impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::sync::Arc;
 
+    use delta_kernel::arrow::array::RecordBatch;
+    use delta_kernel::arrow::util::pretty::print_batches;
+    use delta_kernel::engine::arrow_data::EngineDataArrowExt;
+    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
 
+    use itertools::Itertools;
+    use object_store::ObjectStore;
     use tracing::info;
 
     use super::*;
 
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// Configuration for connecting to a UC table
+    struct UCTableConfig {
+        table_id: String,
+        table_uri: String,
+        engine: DefaultEngine<TokioBackgroundExecutor>,
+        catalog: UCCatalog<'static, UCCommitsRestClient>,
+        // Keep the commits client alive since catalog borrows from it
+        _commits_client: Arc<UCCommitsRestClient>,
+    }
+
+    /// Load UC table configuration from environment variables and set up clients
+    async fn load_uc_table_config() -> Result<UCTableConfig, BoxError> {
+        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
+        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
+        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+
+        // build shared config
+        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+
+        // build clients
+        let uc_client = UCClient::new(config.clone())?;
+        let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+
+        let (table_id, table_uri) = get_table(&uc_client, &table_name).await?;
+        let creds = uc_client
+            .get_credentials(&table_id, Operation::Read)
+            .await
+            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+
+        // TODO: support non-AWS
+        let creds = creds
+            .aws_temp_credentials
+            .ok_or("No AWS temporary credentials found")?;
+
+        let options = [
+            ("region", "us-west-2"),
+            ("access_key_id", &creds.access_key_id),
+            ("secret_access_key", &creds.secret_access_key),
+            ("session_token", &creds.session_token),
+        ];
+
+        let table_url = Url::parse(&table_uri)?;
+        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
+        info!("created object store: {:?}\npath: {:?}\n", store, path);
+
+        let store: Arc<dyn ObjectStore> = store.into();
+        let engine = DefaultEngineBuilder::new(store).build();
+
+        // Use a leaked reference for the catalog to satisfy lifetime requirements in tests
+        let commits_client_ref: &'static UCCommitsRestClient = Box::leak(Box::new(
+            UCCommitsRestClient::new(uc_client::ClientConfig::build(&endpoint, &token).build()?)?,
+        ));
+        let catalog = UCCatalog::new(commits_client_ref);
+
+        Ok(UCTableConfig {
+            table_id,
+            table_uri,
+            engine,
+            catalog,
+            _commits_client: commits_client,
+        })
+    }
+
+    /// Execute a scan and collect results as RecordBatches
+    fn execute_scan_to_batches(
+        scan: &delta_kernel::scan::Scan,
+        engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    ) -> Result<Vec<RecordBatch>, BoxError> {
+        let batches: Vec<RecordBatch> = scan
+            .execute(engine)?
+            .map(EngineDataArrowExt::try_into_record_batch)
+            .try_collect()?;
+        Ok(batches)
+    }
+
     // We could just re-export UCClient's get_table to not require consumers to directly import
     // uc_client themselves.
-    async fn get_table(
-        client: &UCClient,
-        table_name: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_table(client: &UCClient, table_name: &str) -> Result<(String, String), BoxError> {
         let res = client.get_table(table_name).await?;
         let table_id = res.table_id;
         let table_uri = res.storage_location;
@@ -162,53 +244,129 @@ mod tests {
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test]
-    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
-        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
-        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
-
-        // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
-
-        // build clients
-        let uc_client = UCClient::new(config.clone())?;
-        let uc_commits_client = UCCommitsRestClient::new(config)?;
-
-        let (table_id, table_uri) = get_table(&uc_client, &table_name).await?;
-        let creds = uc_client
-            .get_credentials(&table_id, Operation::Read)
-            .await
-            .map_err(|e| format!("Failed to get credentials: {}", e))?;
-
-        let catalog = UCCatalog::new(&uc_commits_client);
-
-        // TODO: support non-AWS
-        let creds = creds
-            .aws_temp_credentials
-            .ok_or("No AWS temporary credentials found")?;
-
-        let options = [
-            ("region", "us-west-2"),
-            ("access_key_id", &creds.access_key_id),
-            ("secret_access_key", &creds.secret_access_key),
-            ("session_token", &creds.session_token),
-        ];
-
-        let table_url = Url::parse(&table_uri)?;
-        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
-
-        info!("created object store: {:?}\npath: {:?}\n", store, path);
-
-        let engine = DefaultEngineBuilder::new(store.into()).build();
+    async fn read_uc_table() -> Result<(), BoxError> {
+        let config = load_uc_table_config().await?;
 
         // read table
-        let snapshot = catalog
-            .load_snapshot(&table_id, &table_uri, &engine)
+        let snapshot = config
+            .catalog
+            .load_snapshot(&config.table_id, &config.table_uri, &config.engine)
             .await?;
         // or time travel
         // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
 
         println!("🎉 loaded snapshot: {snapshot:?}");
+
+        Ok(())
+    }
+
+    // ignored test which you can run manually to read all data from a UC table. run with:
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo nextest run read_uc_table_data --nocapture -- --ignored`
+    //
+    // You can experiment with the scan builder by adding:
+    //   - `.with_predicate(predicate)` - filter rows (enables data skipping)
+    //   - `.with_schema(schema)` - select specific columns
+    //   - `.include_stats_columns()` - include parsed file statistics in scan metadata
+    //
+    // Example predicate:
+    //   use delta_kernel::expressions::{column_expr, Expression};
+    //   let predicate = Arc::new(column_expr!("id").gt(Expression::literal(100i64)));
+    //   let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    //
+    // Example schema selection (read only "id" and "name" columns):
+    //   use delta_kernel::schema::{StructType, StructField, DataType};
+    //   let schema = Arc::new(StructType::try_new(vec![
+    //       StructField::nullable("id", DataType::LONG),
+    //       StructField::nullable("name", DataType::STRING),
+    //   ])?);
+    //   let scan = snapshot.scan_builder().with_schema(schema).build()?;
+    #[ignore]
+    #[tokio::test]
+    async fn read_uc_table_data() -> Result<(), BoxError> {
+        let config = load_uc_table_config().await?;
+
+        // Load snapshot
+        let snapshot = config
+            .catalog
+            .load_snapshot(&config.table_id, &config.table_uri, &config.engine)
+            .await?;
+        let version = snapshot.version();
+        println!("📋 Table schema (version {version}):");
+        for field in snapshot.schema().fields() {
+            println!("  - {}: {:?}", field.name(), field.data_type());
+        }
+
+        // Build scan to read all data
+        let scan = snapshot.scan_builder().build()?;
+
+        println!("\n📊 Scanning table...");
+
+        // Execute scan and collect results
+        let batches = execute_scan_to_batches(&scan, Arc::new(config.engine))?;
+
+        if batches.is_empty() {
+            println!("⚠️  No data found");
+        } else {
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            println!(
+                "✅ Found {} rows across {} batches:",
+                total_rows,
+                batches.len()
+            );
+            print_batches(&batches)?;
+
+            // ───────────────────────────────────────────────────────────────
+            // Examples of extracting data from RecordBatches:
+            // ───────────────────────────────────────────────────────────────
+            //
+            // use delta_kernel::arrow::array::AsArray;
+            //
+            // 1. Access a column by name:
+            //    let batch = &batches[0];
+            //    let col_idx = batch.schema().index_of("column_name").unwrap();
+            //    let column = batch.column(col_idx);
+            //
+            // 2. Downcast to specific Arrow array types using AsArray trait:
+            //
+            //    // For string columns (StringArray):
+            //    let string_col = column.as_string::<i32>();
+            //    for i in 0..string_col.len() {
+            //        if let Some(val) = string_col.value(i) {
+            //            println!("row {i}: {val}");
+            //        }
+            //    }
+            //
+            //    // For integer columns (Int64Array, Int32Array, etc.):
+            //    use delta_kernel::arrow::datatypes::Int64Type;
+            //    let int_col = column.as_primitive::<Int64Type>();
+            //    for i in 0..int_col.len() {
+            //        println!("row {i}: {}", int_col.value(i));
+            //    }
+            //
+            //    // For boolean columns:
+            //    let bool_col = column.as_boolean();
+            //
+            //    // For struct columns (nested data):
+            //    let struct_col = column.as_struct();
+            //    let nested_field = struct_col.column_by_name("field_name");
+            //
+            // 3. Get raw values as a slice (for primitive types):
+            //    let values: &[i64] = int_col.values();
+            //
+            // 4. Check for nulls:
+            //    if column.is_null(row_idx) { /* handle null */ }
+            //
+            // 5. Get batch dimensions:
+            //    batch.num_rows()    // number of rows
+            //    batch.num_columns() // number of columns
+            //
+            // 6. Iterate over all rows with column access:
+            //    for row in 0..batch.num_rows() {
+            //        let id = int_col.value(row);
+            //        let name = string_col.value(row);
+            //        println!("row {row}: id={id}, name={name}");
+            //    }
+        }
 
         Ok(())
     }
