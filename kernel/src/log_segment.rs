@@ -131,6 +131,7 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
+        validate_commit_file_types(&listed_files.ascending_commit_files)?;
         validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
 
         // Filter commits before/at checkpoint version
@@ -1123,6 +1124,19 @@ impl LogSegment {
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
+    for f in compactions {
+        let LogPathFileType::CompactedCommit { hi } = f.file_type else {
+            return Err(Error::generic(
+                "ascending_compaction_files contains non-compaction file",
+            ));
+        };
+        if f.version > hi {
+            return Err(Error::generic(format!(
+                "compaction file has start version {} > end version {}",
+                f.version, hi
+            )));
+        }
+    }
     for pair in compactions.windows(2) {
         match pair {
             [ParsedLogPath {
@@ -1134,7 +1148,12 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
                 file_type: LogPathFileType::CompactedCommit { hi: hi1 },
                 ..
             }] if version0 < version1 || (version0 == version1 && hi0 <= hi1) => {}
-            _ => return Err(Error::generic("ascending_compaction_files is not sorted")),
+            _ => {
+                return Err(Error::generic(format!(
+                    "ascending_compaction_files is not sorted: {:?} -> {:?}",
+                    pair[0], pair[1]
+                )))
+            }
         }
     }
     Ok(())
@@ -1163,6 +1182,17 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
                 if n != num_parts as usize
         ) {
             return Err(Error::generic("multi-part checkpoint part count mismatch"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    for f in commits {
+        if !f.is_commit() {
+            return Err(Error::generic(
+                "ascending_commit_files contains non-commit file",
+            ));
         }
     }
     Ok(())

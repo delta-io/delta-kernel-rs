@@ -2046,6 +2046,64 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
     .is_err());
 }
 
+#[test]
+fn test_validate_listed_log_file_commit_files_contains_non_commit() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.parquet",
+            )],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )],
+            ascending_compaction_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000001.json",
+            )],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn test_validate_listed_log_file_compaction_start_exceeds_end() {
+    // A compaction file where the start version is greater than the end version
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000005.json",
+            )],
+            ascending_compaction_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000005.00000000000000000002.compacted.json",
+            )],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
 #[tokio::test]
 async fn commits_since() {
     // simple
