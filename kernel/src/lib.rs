@@ -147,16 +147,12 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
-pub(crate) mod listed_log_files;
+pub(crate) mod log_segment_files;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
-
-// Benchmarking infrastructure (only public for benchmarks and tests)
-#[cfg(any(test, feature = "internal-api"))]
-pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -563,6 +559,12 @@ pub trait StorageHandler: AsAny {
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+
+    /// Write data to the specified path.
+    ///
+    /// If `overwrite` is false and the file already exists, this must return
+    /// `Err(Error::FileAlreadyExists)`.
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
 
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
