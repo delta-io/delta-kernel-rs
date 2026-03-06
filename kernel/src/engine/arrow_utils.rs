@@ -714,9 +714,11 @@ fn get_indices(
                             reorder_indices.push(ReorderIndex::nested(index, children));
                         }
                         // If no leaves were selected, the parquet reader won't materialize
-                        // this struct at all. We intentionally skip adding it to
-                        // found_fields so the missing-field loop below emits a Missing
-                        // entry (filled with nulls) at the correct position.
+                        // this struct at all. We skip adding it to found_fields so the
+                        // missing-field loop below emits a Missing entry (filled with
+                        // nulls) at the correct position. This requires the struct field
+                        // to be nullable; a non-nullable struct with zero matching
+                        // children will error in the missing-field loop.
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
                     }

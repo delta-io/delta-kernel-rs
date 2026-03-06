@@ -776,8 +776,10 @@ impl LogSegment {
         // (stats_parsed, partitionValues_parsed, sidecar)
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
         let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
-        let augmented_checkpoint_read_schema =
-            if let (true, Some(add_field)) = (needs_add_augmentation, action_schema.field("add")) {
+        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
+            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
+                (needs_add_augmentation, action_schema.field("add"))
+            {
                 let DataType::Struct(add_struct) = add_field.data_type() else {
                     return Err(Error::internal_error(
                         "add field in action schema must be a struct",
@@ -800,7 +802,7 @@ impl LogSegment {
                 }
 
                 // Rebuild schema with modified add field
-                let mut new_fields: Vec<StructField> = action_schema
+                action_schema
                     .fields()
                     .map(|f| {
                         if f.name() == "add" {
@@ -814,23 +816,21 @@ impl LogSegment {
                             f.clone()
                         }
                     })
-                    .collect();
-
-                // Add sidecar column at top-level for V2 checkpoints
-                if needs_sidecar {
-                    new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-                }
-
-                Arc::new(StructType::new_unchecked(new_fields))
-            } else if needs_sidecar {
-                // Only need to add sidecar, no stats_parsed or partitionValues_parsed
-                let mut new_fields: Vec<StructField> = action_schema.fields().cloned().collect();
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-                Arc::new(StructType::new_unchecked(new_fields))
+                    .collect()
             } else {
-                // No modifications needed, use schema as-is
-                action_schema.clone()
+                action_schema.fields().cloned().collect()
             };
+
+            // Add sidecar column at top-level for V2 checkpoints
+            if needs_sidecar {
+                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+            }
+
+            Arc::new(StructType::new_unchecked(new_fields))
+        } else {
+            // No modifications needed, use schema as-is
+            action_schema.clone()
+        };
 
         let checkpoint_file_meta: Vec<_> = self
             .listed

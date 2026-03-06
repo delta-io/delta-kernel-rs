@@ -229,6 +229,11 @@ impl StateInfo {
 
         // Build partition schema with physical names for checkpoint partition pruning.
         // Only needed when we have a predicate and partition columns.
+        // We filter logical_schema (which has logical names matching partition_columns) and then
+        // convert to physical names, because the local physical_schema excludes partition columns
+        // (they use MetadataDerivedColumn transforms) and table_configuration.physical_schema()
+        // uses physical names that don't match the logical partition_columns names under column
+        // mapping.
         let physical_partition_schema = if !matches!(
             physical_predicate,
             PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll

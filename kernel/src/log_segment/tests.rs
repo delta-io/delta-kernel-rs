@@ -3156,12 +3156,11 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     )]));
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .build()?,
+        },
         log_root,
         None,
         None,
@@ -3222,12 +3221,11 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
     let read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFilesBuilder {
+        LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        }
-        .build()?,
+        },
         log_root,
         None,
         None,
