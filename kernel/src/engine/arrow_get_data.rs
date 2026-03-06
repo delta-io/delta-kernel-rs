@@ -338,7 +338,9 @@ mod tests {
     }
 
     // =========================================================================
-    // LargeString/StringView/LargeBinary/BinaryView tests
+    // Alternative Arrow representations for STRING and BINARY:
+    //   STRING -> LargeUtf8 (LargeStringArray), Utf8View (StringViewArray)
+    //   BINARY -> LargeBinary (LargeBinaryArray), BinaryView (BinaryViewArray)
     // =========================================================================
 
     #[test]
