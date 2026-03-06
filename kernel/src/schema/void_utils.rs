@@ -5,7 +5,7 @@
 //! void placements make data writes impossible and must be rejected at write time:
 //! - Void nested inside Array or Map types (cannot represent in Parquet)
 //! - Structs where all fields are void (empty Parquet struct)
-//! - Tables where all columns are void (empty Parquet schema)
+//! - Tables where all fields are void (empty Parquet schema)
 
 use std::borrow::Cow;
 
@@ -15,13 +15,15 @@ use crate::{DeltaResult, Error};
 
 /// Schema visitor that detects void type nested inside Array or Map.
 #[derive(Debug, Default)]
-struct CheckVoidInComplexTypes(Option<&'static str>);
+struct CheckVoidInComplexTypes {
+    error_message: Option<&'static str>,
+}
 
 impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if self.0.is_some() {
+        if self.error_message.is_some() {
             return Some(Cow::Borrowed(field));
         }
         self.recurse_into_struct_field(field)
@@ -29,7 +31,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
 
     fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
         if *etype == DataType::VOID {
-            self.0 = Some("Void type is not allowed as an array element type");
+            self.error_message = Some("Void type is not allowed as an array element type");
             return Some(Cow::Borrowed(etype));
         }
         self.transform(etype)
@@ -37,7 +39,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
 
     fn transform_map_key(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
         if *etype == DataType::VOID {
-            self.0 = Some("Void type is not allowed as a map key type");
+            self.error_message = Some("Void type is not allowed as a map key type");
             return Some(Cow::Borrowed(etype));
         }
         self.transform(etype)
@@ -45,7 +47,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
 
     fn transform_map_value(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
         if *etype == DataType::VOID {
-            self.0 = Some("Void type is not allowed as a map value type");
+            self.error_message = Some("Void type is not allowed as a map value type");
             return Some(Cow::Borrowed(etype));
         }
         self.transform(etype)
@@ -56,7 +58,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
 fn validate_no_void_in_complex_types(schema: &Schema) -> DeltaResult<()> {
     let mut checker = CheckVoidInComplexTypes::default();
     let _ = checker.transform_struct(schema);
-    if let Some(msg) = checker.0 {
+    if let Some(msg) = checker.error_message {
         return Err(Error::schema(msg));
     }
     Ok(())
@@ -75,66 +77,63 @@ fn is_all_void_struct(st: &StructType) -> bool {
 /// Recursively strips void fields from a struct field. If the field's data type is a struct,
 /// void sub-fields are removed. Non-struct fields are returned as-is.
 pub(crate) fn strip_void_from_field(field: &StructField) -> StructField {
-    match field.data_type() {
-        DataType::Struct(inner) => {
-            let stripped_fields: Vec<StructField> = inner
-                .fields()
-                .filter(|f| *f.data_type() != DataType::VOID)
-                .map(strip_void_from_field)
-                .collect();
-            let mut result = field.clone();
-            result.data_type =
-                DataType::Struct(Box::new(StructType::new_unchecked(stripped_fields)));
-            result
+    struct StripVoidFields;
+
+    impl<'a> SchemaTransform<'a> for StripVoidFields {
+        fn transform_struct_field(
+            &mut self,
+            field: &'a StructField,
+        ) -> Option<Cow<'a, StructField>> {
+            if *field.data_type() == DataType::VOID {
+                return None;
+            }
+            self.recurse_into_struct_field(field)
         }
-        _ => field.clone(),
     }
+
+    let mut transformer = StripVoidFields;
+    transformer
+        .recurse_into_struct_field(field)
+        .map(|cow| cow.into_owned())
+        .unwrap_or_else(|| field.clone())
 }
 
 /// Validates that a schema is suitable for writing data. Writes are rejected when:
-/// - Void is nested inside Array or Map (cannot represent in Parquet)
+/// - Void is nested inside Array or Map (not written to Parquet by Delta)
 /// - A struct has only void fields (would produce an empty Parquet struct)
 /// - All top-level columns are void (would produce an empty Parquet schema)
 ///
 /// These checks are NOT applied at read time or for metadata-only operations.
 pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
+    struct CheckAllVoidStructs {
+        error_message: Option<&'static str>,
+    }
+
+    impl<'a> SchemaTransform<'a> for CheckAllVoidStructs {
+        fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+            if self.error_message.is_some() {
+                return Some(Cow::Borrowed(stype));
+            }
+            if is_all_void_struct(stype) {
+                self.error_message =
+                    Some("Cannot write to a table with a struct where all fields are void");
+                return Some(Cow::Borrowed(stype));
+            }
+            self.recurse_into_struct(stype)
+        }
+    }
+
     validate_no_void_in_complex_types(schema)?;
 
-    // Check for all-void table
-    if is_all_void_struct(schema) {
-        return Err(Error::schema(
-            "Cannot write to a table where all columns are void",
-        ));
+    let mut checker = CheckAllVoidStructs {
+        error_message: None,
+    };
+
+    let _ = checker.transform_struct(schema);
+    if let Some(msg) = checker.error_message {
+        return Err(Error::schema(msg));
     }
 
-    // Check for all-void structs at any nesting level
-    for field in schema.fields() {
-        check_all_void_structs(field.data_type())?;
-    }
-
-    Ok(())
-}
-
-/// Recursively checks for all-void structs inside the given data type.
-fn check_all_void_structs(dt: &DataType) -> DeltaResult<()> {
-    match dt {
-        DataType::Struct(inner) => {
-            if is_all_void_struct(inner) {
-                return Err(Error::schema(
-                    "Cannot write to a table with a struct where all fields are void",
-                ));
-            }
-            for field in inner.fields() {
-                check_all_void_structs(field.data_type())?;
-            }
-        }
-        DataType::Array(arr) => check_all_void_structs(&arr.element_type)?,
-        DataType::Map(map) => {
-            check_all_void_structs(map.key_type())?;
-            check_all_void_structs(map.value_type())?;
-        }
-        _ => {}
-    }
     Ok(())
 }
 
@@ -174,48 +173,42 @@ mod tests {
         assert!(validate_no_void_in_complex_types(&schema).is_err());
     }
 
-    #[test]
-    fn test_void_in_array_rejected() {
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
-        )]);
+    #[rstest::rstest]
+    #[case(
+        "void in array",
+        StructField::nullable(
+            "f",
+            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true)))
+        ),
+        "array element type"
+    )]
+    #[case(
+        "void in map value",
+        StructField::nullable(
+            "f",
+            DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true)))
+        ),
+        "map value type"
+    )]
+    #[case(
+        "void in map key",
+        StructField::nullable(
+            "f",
+            DataType::Map(Box::new(MapType::new(DataType::VOID, DataType::STRING, true)))
+        ),
+        "map key type"
+    )]
+    fn test_void_in_complex_type_rejected(
+        #[case] desc: &str,
+        #[case] field: StructField,
+        #[case] expected_msg: &str,
+    ) {
+        let schema = StructType::new_unchecked([field]);
         let result = validate_no_void_in_complex_types(&schema);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("array element type"));
-    }
-
-    #[test]
-    fn test_void_in_map_value_rejected() {
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::VOID,
-                true,
-            ))),
-        )]);
-        let result = validate_no_void_in_complex_types(&schema);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("map value type"));
-    }
-
-    #[test]
-    fn test_void_in_map_key_rejected() {
-        let schema = StructType::new_unchecked([StructField::nullable(
-            "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::VOID,
-                DataType::STRING,
-                true,
-            ))),
-        )]);
-        let result = validate_no_void_in_complex_types(&schema);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("map key type"));
+        assert!(
+            result.unwrap_err().to_string().contains(expected_msg),
+            "{desc}: expected error containing '{expected_msg}'"
+        );
     }
 
     #[test]
@@ -296,7 +289,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("all columns are void"));
+            .contains("all fields are void"));
     }
 
     #[test]

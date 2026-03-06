@@ -643,7 +643,7 @@ async fn write_rejects_all_void_table() {
     ]));
     let err = try_write_with_void_schema(schema).await;
     assert!(
-        err.to_string().contains("all columns are void"),
+        err.to_string().contains("all fields are void"),
         "Expected error about all-void table, got: {err}"
     );
 }
@@ -701,7 +701,7 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
     Ok(())
 }
 
-// Per ZiyaZa: metadata-only operations should always succeed, even for schemas that are
+// Metadata-only operations should always succeed, even for schemas that are
 // invalid for data writes (void-in-array, void-in-map, all-void structs).
 #[tokio::test]
 async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dyn std::error::Error>>
