@@ -29,7 +29,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::actions::{DomainMetadata, Metadata, Protocol};
+    use crate::actions::{DomainMetadata, Protocol};
     use crate::crc::reader::try_read_crc_file;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -62,17 +62,10 @@ mod tests {
             num_files: 5,
             num_metadata: 1,
             num_protocol: 1,
-            metadata: Metadata::default(),
             protocol,
-            txn_id: None,
             in_commit_timestamp_opt: Some(1234567890),
-            set_transactions: None,
             domain_metadata: Some(domain_metadata),
-            file_size_histogram: None,
-            all_files: None,
-            num_deleted_records_opt: None,
-            num_deletion_vectors_opt: None,
-            deleted_record_counts_histogram_opt: None,
+            ..Default::default()
         }
     }
 
