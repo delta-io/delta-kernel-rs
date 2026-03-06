@@ -1,6 +1,7 @@
 //! Data models for workload specifications
 
 use serde::Deserialize;
+use url::Url;
 
 use std::path::{Path, PathBuf};
 
@@ -29,21 +30,21 @@ pub enum ParallelScan {
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 pub struct TableInfo {
-    pub name: String,                // Table name used for identifying the table
-    pub description: Option<String>, // Human-readable description of the table
-    pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
+    pub name: String,            // Table name used for identifying the table
+    pub description: String,     // Human-readable description of the table
+    pub table_path: Option<Url>, // URL to the table (for remote tables); also used to override the default local table path
+    #[serde(default)]
+    pub tags: Vec<String>, // Tags for filtering workloads
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
 
 impl TableInfo {
-    pub fn resolved_table_root(&self) -> String {
-        // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
+    pub fn resolved_table_root(&self) -> Url {
         self.table_path.clone().unwrap_or_else(|| {
-            self.table_info_dir
-                .join("delta")
-                .to_string_lossy()
-                .to_string()
+            // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
+            Url::from_file_path(self.table_info_dir.join("delta"))
+                .expect("table_info_dir must be an absolute path")
         })
     }
 
@@ -137,30 +138,48 @@ mod tests {
 
     #[rstest]
     #[case(
-        r#"{"name": "basic_append", "description": "A basic table with two append writes"}"#,
-        "basic_append",
-        Some("A basic table with two append writes")
+        r#"{"name": "full_table", "description": "All fields specified", "table_path": "s3://bucket/full_table", "tags": ["base"]}"#,
+        "full_table",
+        "All fields specified",
+        Some(Url::parse("s3://bucket/full_table").unwrap()),
+        &["base"]
     )]
     #[case(
-        r#"{"name": "table_without_description"}"#,
-        "table_without_description",
-        None
+        r#"{"name": "no_path_table", "description": "No path specified", "tags": ["base"]}"#,
+        "no_path_table",
+        "No path specified",
+        None,
+        &["base"]
     )]
     #[case(
-       r#"{"name": "table_with_extra_fields", "description": "A table with extra fields", "extra_field": "should be ignored"}"#,
-       "table_with_extra_fields",
-       Some("A table with extra fields")
-   )]
+        r#"{"name": "no_tags_table", "description": "No tags field"}"#,
+        "no_tags_table",
+        "No tags field",
+        None,
+        &[]
+    )]
+    #[case(
+        r#"{"name": "extra_fields_table", "description": "Has extra fields", "extra_field": "should be ignored"}"#,
+        "extra_fields_table",
+        "Has extra fields",
+        None,
+        &[]
+    )]
     fn test_deserialize_table_info(
         #[case] json: &str,
         #[case] expected_name: &str,
-        #[case] expected_description: Option<&str>,
+        #[case] expected_description: &str,
+        #[case] expected_table_path: Option<Url>,
+        #[case] expected_tags: &[&str],
     ) {
         let table_info: TableInfo =
             serde_json::from_str(json).expect("Failed to deserialize table info");
 
         assert_eq!(table_info.name, expected_name);
-        assert_eq!(table_info.description.as_deref(), expected_description);
+        assert_eq!(table_info.description, expected_description);
+        assert_eq!(table_info.table_path, expected_table_path);
+        let expected_tags: Vec<String> = expected_tags.iter().map(|s| s.to_string()).collect();
+        assert_eq!(table_info.tags, expected_tags);
     }
 
     #[rstest]

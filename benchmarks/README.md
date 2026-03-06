@@ -3,6 +3,7 @@
 This crate contains benchmarking infrastructure for Delta Kernel using Criterion and JSON workload specs. It is separate from the `kernel` crate to keep benchmark-specific code and dependencies out of the core library.
 
 ## Running benchmarks
+
 ```bash
 # run all benchmarks
 cargo bench -p delta_kernel_benchmarks
@@ -13,17 +14,77 @@ cargo bench -p delta_kernel_benchmarks --bench workload_bench
 # filter to benchmarks whose name contains a substring (Criterion substring matching)
 cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
 
-# profile a benchmark and generate a flamegraph 
+# profile a benchmark and generate a flamegraph
 cargo install samply
 samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
 ```
 
-## Workload data layout
+### Filtering benchmarks
 
-Each table lives in its own subdirectory under `workloads/benchmarks/`:
+#### By benchmark name
+
+Benchmark names follow a hierarchical path structure assembled from the Criterion group name, the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
 
 ```
-workloads/
+workload_benchmarks/{table_name}/{spec_file_name}/{operation}/{config_name}
+```
+
+- `workload_benchmarks` — the Criterion benchmark group (always this literal string)
+- `{table_name}` — the `name` field from `table_info.json`
+- `{spec_file_name}` — the spec filename without its `.json` extension (the `case_name`)
+- `{operation}` — `snapshot_construction` or `read_metadata`
+- `{config_name}` — only present for `Read` workloads; e.g. `serial`, `parallel_2`, `parallel_4`
+
+Examples:
+```
+workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/snapshot_construction
+workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/read_metadata/serial
+workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/read_metadata/parallel_4
+```
+
+The filter argument is a regular expression, so you can create patterns to target the benchmarks that you want:
+
+```bash
+# all benchmarks for a specific table name
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_1009_versions"
+
+# all benchmarks for either of two tables (| for OR)
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_1009_versions|10_adds"
+
+# snapshot_construction workloads for a specific table (.* to AND two parts of the name)
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_1009_versions.*snapshot_construction"
+
+# profile a specific benchmark with samply
+samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/snapshot_construction"
+```
+
+#### By tag (`BENCH_TAGS`)
+
+Set the `BENCH_TAGS` environment variable to a comma-separated list of tags to run only tables whose `tags` field (in table_info.json) contains at least one matching tag. If `BENCH_TAGS` is unset or empty, all tables are loaded and benchmarked.
+
+```bash
+# run only tables tagged "base"
+BENCH_TAGS=base cargo bench -p delta_kernel_benchmarks
+```
+
+Built-in tags:
+- **`base`** — a base set of tables run in CI
+
+You can also add custom tags to any `table_info.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
+
+```bash
+BENCH_TAGS=my-feature cargo bench -p delta_kernel_benchmarks
+
+# run all tables tagged either "base" or "my-feature"
+BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
+```
+
+## Workload data layout
+
+Each table lives in its own subdirectory under `benchmarks/data/workloads/benchmarks/`:
+
+```
+benchmarks/data/workloads/
 ├── benchmarks/
 │   └── <table_name>/
 │       ├── table_info.json       # describes the table (name, path, etc.)
@@ -33,16 +94,51 @@ workloads/
 └── tests/                        # reserved for future test workloads (currently empty)
 ```
 
+## Loading workloads
+
+Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written (to `benchmarks/data/workloads/`) to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
+
+Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/data/workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
+
+## Adding a new table
+
+To benchmark against a custom Delta table:
+
+1. Extract the workload archive if you haven't already — the simplest way is to run any benchmark once, which auto-extracts it:
+   ```bash
+   cargo bench -p delta_kernel_benchmarks --bench workload_bench
+   ```
+2. Create a directory for the new table under `benchmarks/data/workloads/benchmarks/`:
+   ```
+   benchmarks/data/workloads/benchmarks/<table_name>/
+   ├── table_info.json      # {"name": "<table_name>", "description": "...", "tags": [...]}
+   ├── delta/               # Delta table files (_delta_log/, parquet data, etc.)
+   └── specs/
+       └── <case_name>.json # one or more spec files describing operations to benchmark
+   ```
+3. Run benchmarks — the new table is discovered automatically (you can filter by table name — see [By benchmark name](#by-benchmark-name)):
+   ```bash
+   cargo bench -p delta_kernel_benchmarks --bench workload_bench "<table_name>"
+   ```
+
+If you want to commit this change and add it to the `workloads.tar.gz` archive:
+```bash
+cd benchmarks/data
+tar -czf workloads.tar.gz workloads/
+```
+Then commit the updated archive and delete the `.done` file so it is re-extracted on the next run.
+
 ## Entities
 
 ### `TableInfo`
 
-Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, an optional human-readable description, and either an explicit `table_path` (for remote tables) or a local path (`delta/` subdirectory at the same directory level as `table_info.json`). Note that `table_path` is mainly intended for remote tables (e.g. S3), but support for remote tables is not yet implemented; all current workloads are under `delta/` as described.
+Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, a human-readable description, a list of tags for filtering, and either an explicit `table_path` (for remote tables) or a local path (`delta/` subdirectory at the same directory level as `table_info.json`). `name`, `description`, and `tags` are all required fields while `table_path` is optional. `tags` is used to filter which tables are loaded via the `BENCH_TAGS` environment variable — see [By tag (`BENCH_TAGS`)](#by-tag-bench_tags). Note that `table_path` is mainly intended for remote tables (e.g. S3), but support for remote tables is not yet implemented; all current workloads are under `delta/` as described.
 
 ```json
 {
   "name": "basic_append",
   "description": "A basic table with two append writes.",
+  "tags": ["base"]
 }
 ```
 
@@ -95,12 +191,6 @@ Specifies runtime parameters for `Read` workloads that are not part of the spec 
 
 Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so that `execute()` measures only the target operation. Each runner corresponds to one `Workload` plus whatever additional configuration that workload type requires — `Read` workloads take a `ReadConfig`, while `SnapshotConstruction` workloads require no extra configuration.
 
-
-## Loading workloads
-
-Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
-
-Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
 ## Source Layout
 

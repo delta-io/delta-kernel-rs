@@ -10,7 +10,7 @@ use crate::models::{
 use delta_kernel::parallel::parallel_phase::ParallelPhase;
 use delta_kernel::parallel::sequential_phase::AfterSequential;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{try_parse_uri, Engine, Error};
+use delta_kernel::{Engine, Error};
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -39,8 +39,7 @@ impl ReadMetadataRunner {
         config: ReadConfig,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = table_info.resolved_table_root();
-        let url = try_parse_uri(table_root)?;
+        let url = table_info.resolved_table_root();
 
         let mut builder = Snapshot::builder_for(url);
         if let Some(version) = read_spec.version {
@@ -180,8 +179,7 @@ impl SnapshotConstructionRunner {
         snapshot_spec: &SnapshotConstructionSpec,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = table_info.resolved_table_root();
-        let url = try_parse_uri(table_root)?;
+        let url = table_info.resolved_table_root();
 
         let name = format!(
             "{}/{}/{}",
@@ -224,13 +222,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_table_info() -> TableInfo {
+        let path = format!(
+            "{}/../kernel/tests/data/basic_partitioned",
+            env!("CARGO_MANIFEST_DIR")
+        );
         TableInfo {
             name: "basic_partitioned".to_string(),
-            description: None,
-            table_path: Some(format!(
-                "{}/../kernel/tests/data/basic_partitioned",
-                env!("CARGO_MANIFEST_DIR")
-            )),
+            description: "basic partitioned table for testing".to_string(),
+            table_path: Some(Url::from_file_path(path).unwrap()),
+            tags: vec![],
             table_info_dir: PathBuf::new(),
         }
     }
