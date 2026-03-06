@@ -218,20 +218,40 @@ mod tests {
     use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
     use delta_kernel::engine::default::DefaultEngine;
     use object_store::local::LocalFileSystem;
-    use std::path::PathBuf;
 
     fn test_table_info() -> TableInfo {
         let path = format!(
             "{}/../kernel/tests/data/basic_partitioned",
             env!("CARGO_MANIFEST_DIR")
         );
-        TableInfo {
-            name: "basic_partitioned".to_string(),
-            description: "basic partitioned table for testing".to_string(),
-            table_path: Some(Url::from_file_path(path).unwrap()),
-            tags: vec![],
-            table_info_dir: PathBuf::new(),
-        }
+        let json = format!(
+            r#"{{
+                "name": "basic_partitioned",
+                "description": "basic partitioned table for testing",
+                "tablePath": "{}",
+                "schema": {{
+                    "type": "struct",
+                    "fields": [
+                        {{"name": "letter",  "type": "string", "nullable": true, "metadata": {{}}}},
+                        {{"name": "number",  "type": "long",   "nullable": true, "metadata": {{}}}},
+                        {{"name": "a_float", "type": "double", "nullable": true, "metadata": {{}}}}
+                    ]
+                }},
+                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 2}},
+                "logInfo": {{
+                    "numAddFiles": 6,
+                    "numRemoveFiles": 0,
+                    "sizeInBytes": 4505,
+                    "numCommits": 2,
+                    "numActions": 10
+                }},
+                "properties": {{}},
+                "dataLayout": {{"numPartitionColumns": 1, "numDistinctPartitions": 5}},
+                "tags": []
+            }}"#,
+            Url::from_file_path(path).unwrap()
+        );
+        serde_json::from_str(&json).expect("failed to build test TableInfo")
     }
 
     fn test_read_spec() -> ReadSpec {

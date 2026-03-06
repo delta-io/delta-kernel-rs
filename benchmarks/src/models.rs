@@ -1,8 +1,11 @@
 //! Data models for workload specifications
 
+use delta_kernel::actions::Protocol;
+use delta_kernel::schema::StructType;
 use serde::Deserialize;
 use url::Url;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// ReadConfig represents a specific configuration for a read operation
@@ -29,11 +32,26 @@ pub enum ParallelScan {
 
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    pub name: String,            // Table name used for identifying the table
-    pub description: String,     // Human-readable description of the table
-    pub table_path: Option<Url>, // URL to the table (for remote tables); also used to override the default local table path
-    pub tags: Vec<String>,       // Tags for filtering workloads
+    /// Table name used for identifying the table
+    pub name: String,
+    /// Human-readable description of the table
+    pub description: String,
+    /// URL to the table (for remote tables); also used to override the default local table path
+    pub table_path: Option<Url>,
+    /// Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
+    pub schema: StructType,
+    /// Protocol version requirements and table features. Uses camelCase JSON keys
+    pub protocol: Protocol,
+    /// Log-level statistics for the table
+    pub log_info: LogInfo,
+    /// User-defined table properties
+    pub properties: HashMap<String, String>,
+    /// Physical data layout of the table
+    pub data_layout: DataLayout,
+    /// Tags for filtering workloads
+    pub tags: Vec<String>,
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
@@ -56,6 +74,51 @@ impl TableInfo {
         }
         Ok(table_info)
     }
+}
+
+/// Log-level statistics describing the history and structure of a Delta table.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogInfo {
+    /// Number of active Add file actions in the table.
+    pub num_add_files: u64,
+    /// Number of Remove file actions in the table.
+    pub num_remove_files: u64,
+    /// Total on-disk size of all data files in bytes.
+    pub size_in_bytes: u64,
+    /// Number of commits (JSON log files) in the table history.
+    pub num_commits: u64,
+    /// Total number of actions across all commits.
+    pub num_actions: u64,
+    /// Version of the most recent checkpoint, if any.
+    pub last_checkpoint_version: Option<u64>,
+    /// Version of the most recent CRC file, if any.
+    pub last_crc_version: Option<u64>,
+    /// Number of parquet part files in the most recent multi-part checkpoint, if any.
+    pub num_parallel_checkpoint_files: Option<u32>,
+}
+
+/// Physical data layout of a Delta table.
+///
+/// A table is either clustered (liquid clustering) or partitioned (Hive-style); never both.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DataLayout {
+    /// Hive-style partitioned table.
+    Partitioned {
+        /// Number of partition columns.
+        #[serde(rename = "numPartitionColumns")]
+        num_partition_columns: u32,
+        /// Number of distinct partition values observed in the table.
+        #[serde(rename = "numDistinctPartitions")]
+        num_distinct_partitions: u64,
+    },
+    /// Liquid-clustered table.
+    Clustered {
+        /// Number of clustering columns.
+        #[serde(rename = "numClusteringColumns")]
+        num_clustering_columns: u32,
+    },
 }
 
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
@@ -135,27 +198,66 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    // Baseline valid TableInfo JSON used as a template for tests.
+    // All keys are camelCase. Protocol and schema use Delta protocol format.
+    const BASE_TABLE_INFO_JSON: &str = r#"{
+        "name": "test_table",
+        "description": "A test table",
+        "tablePath": "s3://bucket/test_table",
+        "schema": {"type": "struct", "fields": [{"name": "id", "type": "long", "nullable": true, "metadata": {}}]},
+        "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+        "logInfo": {
+            "numAddFiles": 3,
+            "numRemoveFiles": 1,
+            "sizeInBytes": 1535,
+            "numCommits": 100,
+            "numActions": 10000
+        },
+        "properties": {},
+        "dataLayout": {"numPartitionColumns": 2, "numDistinctPartitions": 4},
+        "tags": ["base"]
+    }"#;
+
     #[rstest]
     #[case(
-        r#"{"name": "full_table", "description": "All fields specified", "table_path": "s3://bucket/full_table", "tags": ["base"]}"#,
-        "full_table",
-        "All fields specified",
-        Some(Url::parse("s3://bucket/full_table").unwrap()),
+        BASE_TABLE_INFO_JSON,
+        "test_table",
+        "A test table",
+        Some(Url::parse("s3://bucket/test_table").unwrap()),
         &["base"]
     )]
     #[case(
-        r#"{"name": "no_path_table", "description": "No path specified", "tags": ["base"]}"#,
+        r#"{
+            "name": "no_path_table",
+            "description": "No path specified",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {},
+            "dataLayout": {"numClusteringColumns": 2},
+            "tags": ["base"]
+        }"#,
         "no_path_table",
         "No path specified",
         None,
         &["base"]
     )]
     #[case(
-        r#"{"name": "extra_fields_table", "description": "Has extra fields", "extra_field": "should be ignored", "tags": ["base"]}"#,
+        r#"{
+            "name": "extra_fields_table",
+            "description": "Has extra fields",
+            "extraField": "should be ignored",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {},
+            "dataLayout": {"numClusteringColumns": 1},
+            "tags": []
+        }"#,
         "extra_fields_table",
         "Has extra fields",
         None,
-        &["base"]
+        &[]
     )]
     fn test_deserialize_table_info(
         #[case] json: &str,
@@ -175,8 +277,12 @@ mod tests {
     }
 
     #[rstest]
+    #[case(r#"{"description": "missing name"}"#, "missing field")]
     #[case(
-        r#"{"description": "A table missing the required name field"}"#,
+        r#"{"name": "missing_schema", "description": "d",
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {"numClusteringColumns": 1}, "tags": []}"#,
         "missing field"
     )]
     fn test_deserialize_table_info_errors(#[case] json: &str, #[case] expected_msg: &str) {
