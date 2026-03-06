@@ -18,24 +18,15 @@ fn commit_info_literal_exprs(
     Ok(vec![
         (
             "timestamp",
-            Arc::new(Expression::literal(match commit_info.timestamp {
-                Some(v) => Scalar::Long(v),
-                None => Scalar::Null(DataType::LONG),
-            })),
+            Arc::new(Expression::literal(commit_info.timestamp)),
         ),
         (
             "inCommitTimestamp",
-            Arc::new(Expression::literal(match commit_info.in_commit_timestamp {
-                Some(v) => Scalar::Long(v),
-                None => Scalar::Null(DataType::LONG),
-            })),
+            Arc::new(Expression::literal(commit_info.in_commit_timestamp)),
         ),
         (
             "operation",
-            Arc::new(Expression::literal(match commit_info.operation {
-                Some(v) => Scalar::String(v),
-                None => Scalar::Null(DataType::STRING),
-            })),
+            Arc::new(Expression::literal(commit_info.operation)),
         ),
         (
             "operationParameters",
@@ -52,32 +43,17 @@ fn commit_info_literal_exprs(
         ),
         (
             "kernelVersion",
-            Arc::new(Expression::literal(match commit_info.kernel_version {
-                Some(v) => Scalar::String(v),
-                None => Scalar::Null(DataType::STRING),
-            })),
+            Arc::new(Expression::literal(commit_info.kernel_version)),
         ),
         (
             "isBlindAppend",
-            Arc::new(Expression::literal(match commit_info.is_blind_append {
-                Some(v) => Scalar::Boolean(v),
-                None => Scalar::Null(DataType::BOOLEAN),
-            })),
+            Arc::new(Expression::literal(commit_info.is_blind_append)),
         ),
         (
             "engineInfo",
-            Arc::new(Expression::literal(match commit_info.engine_info {
-                Some(v) => Scalar::String(v),
-                None => Scalar::Null(DataType::STRING),
-            })),
+            Arc::new(Expression::literal(commit_info.engine_info)),
         ),
-        (
-            "txnId",
-            Arc::new(Expression::literal(match commit_info.txn_id {
-                Some(v) => Scalar::String(v),
-                None => Scalar::Null(DataType::STRING),
-            })),
-        ),
+        ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
     ])
 }
 
