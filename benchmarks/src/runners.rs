@@ -9,11 +9,10 @@ use crate::models::{
 };
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
-use delta_kernel::{Engine, Error};
+use delta_kernel::Engine;
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::thread;
 use url::Url;
 
 /// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
@@ -28,6 +27,7 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
+    thread_pool: Option<rayon::ThreadPool>, // None for serial, Some for parallel
 }
 
 impl ReadMetadataRunner {
@@ -55,11 +55,21 @@ impl ReadMetadataRunner {
             config.name,
         );
 
+        let thread_pool = match &config.parallel_scan {
+            ParallelScan::Enabled { num_threads } => Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(*num_threads)
+                    .build()?,
+            ),
+            ParallelScan::Disabled => None,
+        };
+
         Ok(Self {
             snapshot,
             engine,
             name,
             config,
+            thread_pool,
         })
     }
 
@@ -72,7 +82,12 @@ impl ReadMetadataRunner {
         Ok(())
     }
 
-    fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn execute_parallel(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = self
+            .thread_pool
+            .as_ref()
+            .ok_or("thread_pool must be Some for parallel execution")?;
+
         let scan = self.snapshot.clone().scan_builder().build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
@@ -83,9 +98,7 @@ impl ReadMetadataRunner {
         match phase1.finish()? {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
-                if num_threads == 0 {
-                    return Err("num_threads in ReadConfig must be greater than 0".into());
-                }
+                let num_threads = pool.current_num_threads();
                 let files_per_worker = files.len().div_ceil(num_threads);
 
                 let partitions: Vec<_> = files
@@ -95,33 +108,25 @@ impl ReadMetadataRunner {
 
                 let state = Arc::new(*state);
 
-                let handles: Vec<_> = partitions
-                    .into_iter()
-                    .map(|partition_files| {
+                pool.scope(|s| {
+                    for partition_files in partitions {
                         let engine = self.engine.clone();
                         let state = state.clone();
 
-                        thread::spawn(move || -> Result<(), Error> {
+                        s.spawn(move |_| {
                             if partition_files.is_empty() {
-                                return Ok(());
+                                return;
                             }
 
                             let parallel =
-                                ParallelScanMetadata::try_new(engine, state, partition_files)?;
+                                ParallelScanMetadata::try_new(engine, state, partition_files)
+                                    .expect("failed to create parallel scan");
                             for result in parallel {
-                                black_box(result?);
+                                black_box(result.expect("parallel scan error"));
                             }
-
-                            Ok(())
-                        })
-                    })
-                    .collect();
-
-                for handle in handles {
-                    handle.join().map_err(|_| -> Box<dyn std::error::Error> {
-                        "Worker thread panicked".into()
-                    })??;
-                }
+                        });
+                    }
+                });
             }
         }
         Ok(())
@@ -134,8 +139,8 @@ impl WorkloadRunner for ReadMetadataRunner {
             ParallelScan::Disabled => {
                 self.execute_serial()?;
             }
-            ParallelScan::Enabled { num_threads } => {
-                self.execute_parallel(*num_threads)?;
+            ParallelScan::Enabled { .. } => {
+                self.execute_parallel()?;
             }
         }
 
