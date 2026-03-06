@@ -1381,8 +1381,9 @@ impl<'a> Encoder for NullValueMapEncoder<'a> {
     }
 }
 
-// We only override encoding Maps with the encoder, so they include nulls. It's actually more
-// expected that other things drop the nulls
+/// This is a special encoder factory that will use the default encoder for all array types except
+/// MapArrays. For MapArrays, it will make a `NullValueMapEncoder` which encodes the map preserving
+/// keys that have null values.
 #[derive(Debug)]
 struct NullValueMapEncoderFactory;
 

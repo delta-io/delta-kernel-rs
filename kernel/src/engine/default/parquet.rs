@@ -631,9 +631,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_as_record_batch(
-        #[values(true, false)] test_empty_str: bool,
-    ) {
+    fn test_as_record_batch(#[values(true, false)] test_empty_str: bool) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
