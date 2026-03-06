@@ -131,6 +131,7 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
+        validate_commit_file_types(&listed_files.ascending_commit_files)?;
         validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
 
         // Filter commits before/at checkpoint version
@@ -1123,18 +1124,29 @@ impl LogSegment {
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
-    for pair in compactions.windows(2) {
-        match pair {
-            [ParsedLogPath {
-                version: version0,
-                file_type: LogPathFileType::CompactedCommit { hi: hi0 },
-                ..
-            }, ParsedLogPath {
-                version: version1,
-                file_type: LogPathFileType::CompactedCommit { hi: hi1 },
-                ..
-            }] if version0 < version1 || (version0 == version1 && hi0 <= hi1) => {}
-            _ => return Err(Error::generic("ascending_compaction_files is not sorted")),
+    for (i, f) in compactions.iter().enumerate() {
+        let LogPathFileType::CompactedCommit { hi } = f.file_type else {
+            return Err(Error::generic(
+                "ascending_compaction_files contains non-compaction file",
+            ));
+        };
+        if f.version > hi {
+            return Err(Error::generic(format!(
+                "compaction file has start version {} > end version {}",
+                f.version, hi
+            )));
+        }
+        if let Some(next) = compactions.get(i + 1) {
+            // next's type is validated on its own iteration; skip sort check if it isn't a
+            // CompactedCommit since the type error will be caught then.
+            if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
+                if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
+                    return Err(Error::generic(format!(
+                        "ascending_compaction_files is not sorted: {:?} -> {:?}",
+                        f, next
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -1157,12 +1169,30 @@ fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
                 "multi-part checkpoint parts have different versions",
             ));
         }
-        if matches!(
-            p.file_type,
-            LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                if n != num_parts as usize
-        ) {
-            return Err(Error::generic("multi-part checkpoint part count mismatch"));
+        match p.file_type {
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
+                return Err(Error::generic(format!(
+                    "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
+                )));
+            }
+            _ if n > 1 => {
+                return Err(Error::generic(format!(
+                    "multi-part checkpoint part count mismatch: expected {n} multi-part checkpoint files but got a non-multi-part checkpoint"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    for f in commits {
+        if !f.is_commit() {
+            return Err(Error::generic(
+                "ascending_commit_files contains non-commit file",
+            ));
         }
     }
     Ok(())
