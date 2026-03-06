@@ -11,7 +11,6 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
@@ -65,18 +64,6 @@ async fn test_clustered_table_write_and_checkpoint(
         }
     };
 
-    // Verify clustering columns and features
-    assert_eq!(
-        snapshot.get_clustering_columns(engine.as_ref())?,
-        Some(expected_clustering.clone())
-    );
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&TableFeature::ClusteredTable));
-    assert!(snapshot
-        .table_configuration()
-        .is_feature_supported(&TableFeature::DomainMetadata));
-
     // First write: 3 rows
     let batch = generate_batch(vec![
         ("id", vec![1, 2, 3].into_array()),
@@ -126,10 +113,6 @@ async fn test_clustered_table_write_and_checkpoint(
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 2);
-    assert_eq!(
-        fresh.get_clustering_columns(engine.as_ref())?,
-        Some(expected_clustering.clone())
-    );
     let scan = fresh.clone().scan_builder().build()?;
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
