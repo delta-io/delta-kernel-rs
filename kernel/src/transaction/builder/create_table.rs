@@ -15,10 +15,10 @@ use url::Url;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
-use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
-use crate::schema::SchemaRef;
+use crate::schema::variant_utils::UsesVariant;
+use crate::schema::{SchemaRef, SchemaTransform};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -200,7 +200,7 @@ fn apply_clustering_for_table_create(
 /// # Returns
 ///
 /// A tuple of (domain_metadata_list, clustering_columns_for_stats).
-/// The clustering columns returned are logical names (for stats_columns).
+/// The clustering columns returned are physical names.
 fn maybe_enable_clustering(
     data_layout: &DataLayout,
     effective_schema: &SchemaRef,
@@ -238,10 +238,24 @@ fn maybe_enable_clustering(
             // Create domain metadata with physical names
             let dm = create_clustering_domain_metadata(&physical_columns);
 
-            // Return logical names for stats_columns
-            Ok((vec![dm], Some(columns.clone())))
+            Ok((vec![dm], Some(physical_columns)))
         }
         DataLayout::None => Ok((vec![], None)),
+    }
+}
+
+/// Conditionally adds the `variantType` feature to the protocol when the schema contains
+/// Variant columns. Uses the [`UsesVariant`] schema visitor to detect Variant data types
+/// anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    let mut visitor = UsesVariant::default();
+    let _ = visitor.transform_struct(schema);
+    if visitor.found() {
+        add_feature_to_lists(
+            TableFeature::VariantType,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
     }
 }
 
@@ -526,6 +540,9 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
+        // Auto-enable variantType feature if schema contains Variant columns
+        maybe_enable_variant_type(&effective_schema, &mut validated);
+
         // Create Protocol action with table features support
         let protocol =
             Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
@@ -549,11 +566,7 @@ impl CreateTableTransactionBuilder {
 
         // Create Transaction<CreateTable> with pre-commit snapshot
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(
-                log_segment,
-                table_configuration,
-                Arc::new(LazyCrc::new(None)),
-            )),
+            Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
             system_domain_metadata,
@@ -842,5 +855,72 @@ mod tests {
             .with_data_layout(DataLayout::clustered(["id"]));
 
         assert!(builder.data_layout.is_clustered());
+    }
+
+    #[test]
+    fn test_variant_auto_enabled_from_schema() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("v", DataType::unshredded_variant(), true),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_variant_type(&schema, &mut validated);
+
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantType));
+    }
+
+    #[test]
+    fn test_variant_not_enabled_without_variant_columns() {
+        let schema = test_schema();
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_variant_type(&schema, &mut validated);
+
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[test]
+    fn test_variant_auto_enabled_nested() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(
+                "nested",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                    "inner_v",
+                    DataType::unshredded_variant(),
+                    true,
+                )]))),
+                true,
+            ),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_variant_type(&schema, &mut validated);
+
+        assert!(validated
+            .reader_features
+            .contains(&TableFeature::VariantType));
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::VariantType));
     }
 }

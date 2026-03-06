@@ -14,10 +14,14 @@ use delta_kernel_derive::internal_api;
 pub use column_mapping::get_any_level_column_physical_name;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
+pub(crate) use column_mapping::validate_column_mapping;
+#[deprecated = "Enable internal-api and use TableConfiguration instead"]
+pub use column_mapping::validate_schema_column_mapping;
+pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
+    assign_column_mapping_metadata, column_mapping_mode, get_any_level_columns_logical_names,
+    get_column_mapping_mode_from_properties,
 };
-pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
@@ -445,10 +449,7 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::WriterOnly,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
-    #[cfg(feature = "clustered-table")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "clustered-table"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

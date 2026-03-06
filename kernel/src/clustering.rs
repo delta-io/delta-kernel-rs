@@ -147,8 +147,10 @@ fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
 /// `Ok(None)` if no clustering domain metadata is found, or an error if the
 /// metadata is malformed.
 ///
+/// The clustering columns should be stored in the domain metadata using physical column
+/// names, so the returned columns are also physical column names.
 /// [`Snapshot::get_clustering_columns`]: crate::snapshot::Snapshot::get_clustering_columns
-pub(crate) fn get_clustering_columns(
+pub(crate) fn get_clustering_columns_from_domain_metadata(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<Vec<ColumnName>>> {

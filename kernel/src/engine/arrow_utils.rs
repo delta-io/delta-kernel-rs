@@ -16,14 +16,15 @@ use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
+use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
@@ -166,16 +167,13 @@ impl RowIndexBuilder {
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
 /// If `target_schema` is provided, coerces the batch's field nullability to match it.
-pub(crate) fn fixup_parquet_read<T>(
+pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
     target_schema: Option<&ArrowSchemaRef>,
-) -> DeltaResult<T>
-where
-    StructArray: Into<T>,
-{
+) -> DeltaResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     let data = if let Some(schema) = target_schema {
@@ -1142,20 +1140,9 @@ pub(crate) fn reorder_struct_array(
                             "File path column requested but file location not provided",
                         ));
                     };
-                    // Use run-end encoding for efficiency since the file path is constant for all rows
-                    // Run-end encoding stores: [run_ends: [num_rows], values: [file_path]]
-                    let run_ends = PrimitiveArray::<Int64Type>::from_iter_values([num_rows as i64]);
-                    let values = StringArray::from_iter_values([file_path]);
-                    let file_path_array = RunArray::try_new(&run_ends, &values)?;
-
-                    // Create a field with the RunEndEncoded data type to match the array
-                    let ree_field = Arc::new(ArrowField::new(
-                        field.name(),
-                        file_path_array.data_type().clone(),
-                        field.is_nullable(),
-                    ));
+                    let file_path_array = StringArray::from(vec![file_path; num_rows]);
                     final_fields_cols[reorder_index.index] =
-                        Some((ree_field, Arc::new(file_path_array)));
+                        Some((Arc::clone(field), Arc::new(file_path_array)));
                 }
             }
         }
@@ -1374,13 +1361,66 @@ pub(crate) fn filter_to_record_batch(
     Ok((*arrow_data).into())
 }
 
+// we want to keep nulls in our partition map, so we end up with data in the log like:
+// {partitionValues:{"foo": null}}, which is what is generally expected. Without this we would
+// get: {partitionValues:{}}
+struct NullValueMapEncoder<'a> {
+    field: &'a ArrowFieldRef,
+    array: &'a MapArray,
+}
+
+impl<'a> Encoder for NullValueMapEncoder<'a> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let options = EncoderOptions::default().with_explicit_nulls(true);
+        // this unwrap is technically unsafe, but we _know_ that the array is a MapArray, and that
+        // `make_encoder` won't return an error for that. It would still be nice if we could return
+        // a `Result`, but we cannot
+        #[allow(clippy::unwrap_used)]
+        let mut encoder = make_encoder(self.field, self.array, &options).unwrap();
+        encoder.encode(idx, out);
+    }
+}
+
+/// This is a special encoder factory that will use the default encoder for all array types except
+/// MapArrays. For MapArrays, it will make a `NullValueMapEncoder` which encodes the map preserving
+/// keys that have null values.
+#[derive(Debug)]
+struct NullValueMapEncoderFactory;
+
+impl EncoderFactory for NullValueMapEncoderFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        field: &'a ArrowFieldRef,
+        array: &'a dyn ArrowArray,
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
+        // It would be tempting to use `make_encoder` below, but we can't because we have to create
+        // a new `EncoderOptions` in order to set `with_explicit_nulls`. Then the lifetime of the
+        // created encoder becomes tied to the lifetime of the `EncoderOptions`, and we cannot
+        // return it from this method as the options would be freed here.  We _also_ can't put the
+        // options inside the NullValueMapEncoderFactory, because this method takes `&self` not
+        // `&'a self`, and we can't change that as it's part of the trait definition.
+        match array.data_type() {
+            ArrowDataType::Map(_, _) => {
+                let array = array.as_map();
+                let encoder = NullValueMapEncoder { field, array };
+                let array_encoder = Box::new(encoder) as Box<dyn Encoder + 'a>;
+                let nulls = array.nulls().cloned();
+                Ok(Some(NullableEncoder::new(array_encoder, nulls)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send,
 ) -> DeltaResult<Vec<u8>> {
-    let mut writer = LineDelimitedWriter::new(Vec::new());
+    let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
+    let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
         let batch = filter_to_record_batch(chunk?)?;
         writer.write(&batch)?;
@@ -1389,13 +1429,81 @@ pub(crate) fn to_json_bytes(
     Ok(writer.into_inner())
 }
 
+/// Applies post-processing to data read from a JSON file. Inserts synthesized metadata columns
+/// (e.g. [`MetadataColumnSpec::FilePath`]) at the positions specified by `reorder_indices`.
+///
+/// `reorder_indices` should be built once per schema via [`build_json_reorder_indices`] and
+/// reused for every batch from the same file.
+pub(crate) fn fixup_json_read(
+    batch: RecordBatch,
+    reorder_indices: &[ReorderIndex],
+    file_location: &str,
+) -> DeltaResult<ArrowEngineData> {
+    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
+    Ok(data.into())
+}
+
+/// Builds the [`ReorderIndex`] vec for post-processing JSON read batches.
+///
+/// The JSON reader is given a schema with metadata columns stripped (see [`json_arrow_schema`]).
+/// Its output therefore has non-metadata columns at contiguous indices 0..N in schema order.
+/// This function maps those source indices — and any metadata column specs — into a
+/// `Vec<ReorderIndex>` that [`reorder_struct_array`] can use to produce the final batch with
+/// every column at its correct position.
+///
+/// Build the index vec once per schema (e.g. once per file); apply it to every batch produced
+/// by the reader via [`reorder_struct_array`].
+///
+/// # Companion function
+/// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
+///   reader.
+pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec<ReorderIndex>> {
+    // Real columns: position in reorder_indices IS the source column index (0..N in schema
+    // order), and reorder_index.index carries the output position.
+    let mut reorder_indices = Vec::with_capacity(schema.num_fields());
+    // Metadata columns are appended after all real columns. reorder_struct_array never reads
+    // source data for metadata transforms, so their vec position doesn't correspond to a source
+    // column. Unsupported specs use Missing (null fill); non-nullable violations surface
+    // naturally via StructArray::try_new.
+    let mut metadata_entries = Vec::new();
+
+    for (output_pos, field) in schema.fields().enumerate() {
+        match field.get_metadata_column_spec() {
+            None => reorder_indices.push(ReorderIndex::identity(output_pos)),
+            Some(spec) => metadata_entries.push((output_pos, field, spec)),
+        }
+    }
+
+    for (output_pos, field, spec) in metadata_entries {
+        let field = Arc::new(field.try_into_arrow()?);
+        let rindex = match spec {
+            MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
+            _ => ReorderIndex::missing(output_pos, field),
+        };
+        reorder_indices.push(rindex);
+    }
+
+    Ok(reorder_indices)
+}
+
+/// Builds an Arrow [`ArrowSchema`] from `schema` containing only the "real" JSON columns,
+/// omitting any fields annotated with [`MetadataColumnSpec`].
+///
+/// Pass the returned schema to Arrow's JSON reader; then call [`build_json_reorder_indices`]
+/// once on the same schema and apply [`reorder_struct_array`] to each resulting batch to
+/// insert the synthesized metadata columns at their correct positions.
+pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
+    let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
+    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
-        MapArray, MapBuilder, StringArray, StructArray, StructBuilder,
+        MapArray, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
@@ -1407,7 +1515,8 @@ mod tests {
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1574,6 +1683,30 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
+    }
+
+    #[test]
+    fn test_parse_json_impl_propagates_type_errors() {
+        // Verify that parse_json_impl surfaces errors for values that don't match the schema,
+        // so the expression-level caller can catch them and return nulls.
+
+        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Decimal128(4, 2),
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": 99999}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
+
+        // Type mismatch: string where integer expected
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
     }
 
     #[test]
@@ -1988,8 +2121,6 @@ mod tests {
 
     #[test]
     fn test_match_parquet_fields_filters_metadata_columns() {
-        use crate::schema::MetadataColumnSpec;
-
         let kernel_schema = StructType::new_unchecked([
             StructField::not_null("regular_field", DataType::INTEGER),
             StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
@@ -2164,27 +2295,14 @@ mod tests {
         let ordered = reorder_struct_array(arry, &reorder, None, Some(file_location)).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "_file"]);
 
-        // Verify the file path column is run-end encoded and contains the expected value
+        // Verify the file path column is a plain StringArray with the path repeated for each row.
         let file_path_col = ordered.column(1);
-
-        // Check it's a RunArray<Int64Type, StringArray>
-        let run_array = file_path_col
+        let string_array = file_path_col
             .as_any()
-            .downcast_ref::<RunArray<Int64Type>>()
-            .expect("Expected RunArray");
-
-        // Verify it has 4 logical rows (same as input)
-        assert_eq!(run_array.len(), 4);
-
-        // Verify the physical representation is efficient: 1 run with value at end position 4
-        let run_ends = run_array.run_ends().values();
-        assert_eq!(run_ends.len(), 1, "Should have only 1 run");
-        assert_eq!(run_ends[0], 4, "Run should end at position 4");
-
-        // Verify the value
-        let values = run_array.values().as_string::<i32>();
-        assert_eq!(values.len(), 1, "Should have only 1 unique value");
-        assert_eq!(values.value(0), file_location);
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray");
+        assert_eq!(string_array.len(), 4);
+        assert!(string_array.iter().all(|v| v == Some(file_location)));
     }
 
     #[test]
@@ -3885,5 +4003,182 @@ mod tests {
         };
         assert_eq!(map_val.metadata(), &meta("value"));
         assert!(map_val.is_nullable());
+    }
+
+    // --- Tests for build_json_reorder_indices and json_arrow_schema ---
+
+    const FILE_PATH: &str = "s3://bucket/test.json";
+
+    struct JsonInsertCase {
+        /// Full schema; may include a `FilePath` metadata column at any position.
+        schema: StructType,
+        /// Field names that [`json_arrow_schema`] should expose (metadata columns stripped).
+        expected_json_names: &'static [&'static str],
+        /// Column names in the final output after [`reorder_struct_array`].
+        expected_output_names: &'static [&'static str],
+        /// Index of the `_file` column in the output, or `None` when the schema has no FilePath.
+        file_path_col: Option<usize>,
+    }
+
+    /// Verifies that `json_arrow_schema` + `build_json_reorder_indices` + `reorder_struct_array`
+    /// correctly insert (or omit) the `_file` column at the position declared in the schema.
+    #[rstest]
+    #[case::no_file_path(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["a", "b"],
+        file_path_col: None,
+    })]
+    #[case::file_path_at_start(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["_file", "a", "b"],
+        file_path_col: Some(0),
+    })]
+    #[case::file_path_in_middle(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::nullable("b", DataType::INTEGER),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["a", "_file", "b"],
+        file_path_col: Some(1),
+    })]
+    #[case::file_path_at_end(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["a", "b", "_file"],
+        file_path_col: Some(2),
+    })]
+    fn test_json_file_path_insertion(#[case] case: JsonInsertCase) {
+        // json_arrow_schema exposes only the non-metadata fields.
+        let json_schema = json_arrow_schema(&case.schema).unwrap();
+        let json_names: Vec<_> = json_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(json_names, case.expected_json_names);
+
+        // Build an input batch with the JSON schema (real columns only, each an Int32Array).
+        let arrow_schema = Arc::new(json_schema);
+        let cols: Vec<ArrowArrayRef> = (0..arrow_schema.fields().len())
+            .map(|_| Arc::new(Int32Array::from(vec![1i32, 2, 3])) as _)
+            .collect();
+        let batch = RecordBatch::try_new(arrow_schema, cols).unwrap();
+
+        // build_json_reorder_indices + reorder_struct_array inserts the _file column.
+        let indices = build_json_reorder_indices(&case.schema).unwrap();
+        let result = RecordBatch::from(
+            reorder_struct_array(batch.into(), &indices, None, Some(FILE_PATH)).unwrap(),
+        );
+
+        // Verify output column order and row count.
+        let schema = result.schema();
+        let output_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(output_names, case.expected_output_names);
+        assert_eq!(result.num_rows(), 3);
+
+        // When FilePath is in the schema, verify a plain StringArray with the path for every row.
+        // When absent, verify no _file column leaked into the output.
+        if let Some(idx) = case.file_path_col {
+            let arr = result
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("_file column should be a StringArray");
+            assert!(arr.iter().all(|v| v == Some(FILE_PATH)));
+        } else {
+            assert!(
+                result.schema().fields().iter().all(|f| f.name() != "_file"),
+                "_file should not appear when not declared in the schema"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_json_reorder_indices_unsupported_metadata_column_errors() {
+        // RowIndex is not supported for JSON reads. All metadata column specs are non-nullable,
+        // so the Missing transform inserts a null array — reorder_struct_array errors because
+        // the field is declared non-nullable.
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let indices = build_json_reorder_indices(&schema).unwrap();
+        assert!(reorder_struct_array(batch.into(), &indices, None, None).is_err());
+    }
+
+    #[test]
+    fn ensure_we_encode_maps_with_null_values() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("str_col", ArrowDataType::Utf8, false),
+            ArrowField::new(
+                "map_col",
+                ArrowDataType::Map(
+                    Arc::new(ArrowField::new(
+                        "entries",
+                        ArrowDataType::Struct(
+                            vec![
+                                ArrowField::new("keys", ArrowDataType::Utf8, false),
+                                ArrowField::new("values", ArrowDataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false, // sorted
+                ),
+                false,
+            ),
+        ]);
+        let s_array = StringArray::from(vec!["foo"]);
+
+        let string_builder = StringBuilder::new();
+        let string_builder2 = StringBuilder::new();
+        let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
+
+        // Append one entry: "bar" -> null
+        map_builder.keys().append_value("bar");
+        map_builder.values().append_null();
+        map_builder.append(true).unwrap(); // finish the map row
+
+        let map_array: MapArray = map_builder.finish();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(s_array), Arc::new(map_array)],
+        )
+        .unwrap();
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
+        assert_eq!(
+            json,
+            "{\"str_col\":\"foo\",\"map_col\":{\"bar\":null}}\n".as_bytes()
+        );
     }
 }
