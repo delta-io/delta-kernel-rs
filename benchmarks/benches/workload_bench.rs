@@ -85,10 +85,6 @@ fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
             name: "parallel_2".into(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         });
-        configs.push(ReadConfig {
-            name: "parallel_4".into(),
-            parallel_scan: ParallelScan::Enabled { num_threads: 4 },
-        });
     }
     configs
 }
