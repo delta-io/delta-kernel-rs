@@ -142,18 +142,9 @@ mod tests {
                 .build(&engine)?;
 
             // Check versions
-            assert_eq!(
-                snapshot.clone().get_app_id_version("app_id1", &engine)?,
-                Some(1)
-            );
-            assert_eq!(
-                snapshot.clone().get_app_id_version("app_id2", &engine)?,
-                Some(2)
-            );
-            assert_eq!(
-                snapshot.clone().get_app_id_version("app_id3", &engine)?,
-                None
-            );
+            assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
+            assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
+            assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
 
             // Check versions through ffi handles
             let version1 = ok_or_panic(unsafe {

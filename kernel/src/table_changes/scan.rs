@@ -9,8 +9,9 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
+use crate::scan::StatsOutputMode;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
@@ -113,12 +114,12 @@ impl TableChangesScanBuilder {
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
 
         // Create StateInfo using CDF field classifier
-        // CDF doesn't support stats_columns
+        // CDF doesn't support stats output
         let state_info = StateInfo::try_new(
             logical_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
-            None, // stats_columns
+            StatsOutputMode::default(),
             CdfTransformFieldClassifier,
         )?;
 
@@ -143,6 +144,7 @@ impl TableChangesScan {
         let commits = self
             .table_changes
             .log_segment
+            .listed
             .ascending_commit_files
             .clone();
         // NOTE: This is a cheap arc clone
@@ -261,7 +263,12 @@ fn read_scan_file(
     let location = table_root.join(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
-        size: 0,
+        size: match scan_file.size {
+            Some(s) => s
+                .try_into()
+                .map_err(|_| Error::generic(format!("invalid file size: {s}")))?,
+            None => 0,
+        },
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.

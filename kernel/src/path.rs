@@ -371,20 +371,6 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 
-    // TODO: remove after support for writing CRC files
-    #[allow(unused)]
-    /// Create a new ParsedCommitPath<Url> for a new CRC file
-    pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
-        let filename = format!("{version:020}.crc");
-        let path = Self::create_path(table_root, filename)?;
-        if path.file_type != LogPathFileType::Crc {
-            return Err(Error::internal_error(
-                "ParsedLogPath::new_crc created a non-crc path",
-            ));
-        }
-        Ok(path)
-    }
-
     /// Create a new ParsedLogPath<Url> for a log compaction file
     pub(crate) fn new_log_compaction(
         table_root: &Url,
@@ -500,6 +486,20 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
+            parsed
+        }
+
+        pub(crate) fn create_parsed_crc(table_root: &Url, version: Version) -> Self {
+            let filename = format!("{version:020}.crc");
+            let location = table_root
+                .join(DELTA_LOG_DIR_WITH_SLASH)
+                .unwrap()
+                .join(&filename)
+                .unwrap();
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+                .unwrap()
+                .unwrap();
+            assert!(parsed.file_type == LogPathFileType::Crc);
             parsed
         }
     }

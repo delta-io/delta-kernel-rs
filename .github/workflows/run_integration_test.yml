@@ -1,6 +1,6 @@
 name: Run tests to ensure we can compile across arrow versions
 
-on: [workflow_dispatch, push, pull_request]
+on: [workflow_dispatch, push, pull_request, merge_group]
 
 jobs:
   arrow_integration_test:
@@ -13,7 +13,7 @@ jobs:
           - os: macOS-latest
           - os: ubuntu-latest
           - os: windows-latest
-            skip: ${{ github.event_name == 'pull_request' }} # skip running windows tests on every PR since they are slow
+            skip: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }} # skip running windows tests on PRs and merge queue since they are slow
     steps:
       - name: Skip job for pull requests on Windows
         if: ${{ matrix.skip }}

@@ -70,6 +70,16 @@ impl Scalar {
             }};
         }
 
+        // Use append_value_n for primitive builders that support batch append
+        macro_rules! append_val_n_as {
+            ($t:ty, $val:expr) => {{
+                let builder = builder_as!($t);
+                builder.append_value_n($val, num_rows);
+            }};
+        }
+
+        // Use append_value in a loop for builders without batch append (String, Binary)
+        // TODO: Remove after https://github.com/apache/arrow-rs/pull/9426 gets in
         macro_rules! append_val_as {
             ($t:ty, $val:expr) => {{
                 let builder = builder_as!($t);
@@ -80,33 +90,34 @@ impl Scalar {
         }
 
         match self {
-            Integer(val) => append_val_as!(array::Int32Builder, *val),
-            Long(val) => append_val_as!(array::Int64Builder, *val),
-            Short(val) => append_val_as!(array::Int16Builder, *val),
-            Byte(val) => append_val_as!(array::Int8Builder, *val),
-            Float(val) => append_val_as!(array::Float32Builder, *val),
-            Double(val) => append_val_as!(array::Float64Builder, *val),
+            Integer(val) => append_val_n_as!(array::Int32Builder, *val),
+            Long(val) => append_val_n_as!(array::Int64Builder, *val),
+            Short(val) => append_val_n_as!(array::Int16Builder, *val),
+            Byte(val) => append_val_n_as!(array::Int8Builder, *val),
+            Float(val) => append_val_n_as!(array::Float32Builder, *val),
+            Double(val) => append_val_n_as!(array::Float64Builder, *val),
             String(val) => append_val_as!(array::StringBuilder, val),
-            Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
+            Boolean(val) => builder_as!(array::BooleanBuilder).append_n(num_rows, *val),
             Timestamp(val) | TimestampNtz(val) => {
                 // timezone was already set at builder construction time
-                append_val_as!(array::TimestampMicrosecondBuilder, *val)
+                append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
-            Date(val) => append_val_as!(array::Date32Builder, *val),
+            Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
             // precision and scale were already set at builder construction time
-            Decimal(val) => append_val_as!(array::Decimal128Builder, val.bits()),
+            Decimal(val) => append_val_n_as!(array::Decimal128Builder, val.bits()),
             Struct(data) => {
                 let builder = builder_as!(array::StructBuilder);
                 require!(
                     builder.num_fields() == data.fields().len(),
                     Error::generic("Struct builder has wrong number of fields")
                 );
+                let field_builders = builder.field_builders_mut().iter_mut();
+                for (builder, value) in field_builders.zip(data.values()) {
+                    value.append_to(builder, num_rows)?;
+                }
+                // TODO: Loop can be removed after: https://github.com/apache/arrow-rs/pull/9430
                 for _ in 0..num_rows {
-                    let field_builders = builder.field_builders_mut().iter_mut();
-                    for (builder, value) in field_builders.zip(data.values()) {
-                        value.append_to(builder, 1)?;
-                    }
                     builder.append(true);
                 }
             }
@@ -150,31 +161,29 @@ impl Scalar {
             }};
         }
 
-        macro_rules! append_null_as {
+        macro_rules! append_nulls_as {
             ($t:ty) => {{
                 let builder = builder_as!($t);
-                for _ in 0..num_rows {
-                    builder.append_null()
-                }
+                builder.append_nulls(num_rows);
             }};
         }
 
         match *data_type {
-            DataType::INTEGER => append_null_as!(array::Int32Builder),
-            DataType::LONG => append_null_as!(array::Int64Builder),
-            DataType::SHORT => append_null_as!(array::Int16Builder),
-            DataType::BYTE => append_null_as!(array::Int8Builder),
-            DataType::FLOAT => append_null_as!(array::Float32Builder),
-            DataType::DOUBLE => append_null_as!(array::Float64Builder),
-            DataType::STRING => append_null_as!(array::StringBuilder),
-            DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
+            DataType::INTEGER => append_nulls_as!(array::Int32Builder),
+            DataType::LONG => append_nulls_as!(array::Int64Builder),
+            DataType::SHORT => append_nulls_as!(array::Int16Builder),
+            DataType::BYTE => append_nulls_as!(array::Int8Builder),
+            DataType::FLOAT => append_nulls_as!(array::Float32Builder),
+            DataType::DOUBLE => append_nulls_as!(array::Float64Builder),
+            DataType::STRING => append_nulls_as!(array::StringBuilder),
+            DataType::BOOLEAN => append_nulls_as!(array::BooleanBuilder),
             DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
-                append_null_as!(array::TimestampMicrosecondBuilder)
+                append_nulls_as!(array::TimestampMicrosecondBuilder)
             }
-            DataType::DATE => append_null_as!(array::Date32Builder),
-            DataType::BINARY => append_null_as!(array::BinaryBuilder),
+            DataType::DATE => append_nulls_as!(array::Date32Builder),
+            DataType::BINARY => append_nulls_as!(array::BinaryBuilder),
             DataType::Primitive(PrimitiveType::Decimal(_)) => {
-                append_null_as!(array::Decimal128Builder)
+                append_nulls_as!(array::Decimal128Builder)
             }
             DataType::Struct(ref stype) => {
                 // WARNING: Unlike ArrayBuilder and MapBuilder, StructBuilder always requires us to
@@ -184,20 +193,19 @@ impl Scalar {
                     builder.num_fields() == stype.num_fields(),
                     Error::generic("Struct builder has wrong number of fields")
                 );
-                for _ in 0..num_rows {
-                    let field_builders = builder.field_builders_mut().iter_mut();
-                    for (builder, field) in field_builders.zip(stype.fields()) {
-                        Self::append_null(builder, &field.data_type, 1)?;
-                    }
-                    builder.append(false);
+                let field_builders = builder.field_builders_mut().iter_mut();
+                for (builder, field) in field_builders.zip(stype.fields()) {
+                    Self::append_null(builder, &field.data_type, num_rows)?;
                 }
+                builder.append_nulls(num_rows);
             }
-            DataType::Array(_) => append_null_as!(array::ListBuilder<Box<dyn ArrayBuilder>>),
+            DataType::Array(_) => append_nulls_as!(array::ListBuilder<Box<dyn ArrayBuilder>>),
             DataType::Map(_) => {
                 // For some reason, there is no `MapBuilder::append_null` method -- even tho
                 // StructBuilder and ListBuilder both provide it.
                 let builder =
                     builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
+                // TODO: Can be removed after https://github.com/apache/arrow-rs/pull/9432
                 for _ in 0..num_rows {
                     builder.append(false)?;
                 }

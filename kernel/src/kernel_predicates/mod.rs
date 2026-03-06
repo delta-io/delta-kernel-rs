@@ -177,12 +177,13 @@ pub trait KernelPredicateEvaluator {
             Expr::Opaque(OpaqueExpression { op, exprs }) => {
                 self.eval_pred_expr_opaque(op, exprs, inverted)
             }
-            Expr::Struct(_)
+            Expr::Struct(..)
             | Expr::Transform(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Variadic(_)
             | Expr::ParseJson(_)
+            | Expr::MapToStruct(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -204,13 +205,14 @@ pub trait KernelPredicateEvaluator {
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
                 Expr::Predicate(_)
-                | Expr::Struct(_)
+                | Expr::Struct(..)
                 | Expr::Transform(_)
                 | Expr::Unary(_)
                 | Expr::Binary(_)
                 | Expr::Variadic(_)
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
+                | Expr::MapToStruct(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
@@ -624,7 +626,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
             Expr::Literal(value) => Some(value.clone()),
             Expr::Column(name) => self.resolve_column(name),
             Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
-            Expr::Struct(_) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?
+            Expr::Struct(..) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?
             Expr::Binary(BinaryExpression { op, left, right }) => {
                 let op_fn = match op {
                     BinaryExpressionOp::Plus => Scalar::try_add,
@@ -641,7 +643,8 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
-            Expr::ParseJson(_) => None, // ParseJson is not expected to be a top-level predicate expression
+            // ParseJson and MapToStruct produce structured output, not scalar values
+            Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
         }
     }

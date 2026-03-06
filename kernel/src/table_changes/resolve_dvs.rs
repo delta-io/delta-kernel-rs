@@ -199,6 +199,7 @@ mod tests {
             partition_values: HashMap::new(),
             commit_version: 42,
             commit_timestamp: 1234,
+            size: None,
         }
     }
 

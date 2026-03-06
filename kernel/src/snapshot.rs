@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tracing::instrument;
+
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::{
     all_domain_metadata_configuration, domain_metadata_configuration,
@@ -11,11 +13,12 @@ use crate::actions::domain_metadata::{
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
-use crate::clustering::get_clustering_columns;
+use crate::clustering::get_clustering_columns_from_domain_metadata;
 use crate::committer::{Committer, PublishMetadata};
+use crate::crc::LazyCrc;
 use crate::expressions::ColumnName;
-use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
+use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
@@ -38,16 +41,39 @@ use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
 
+/// File-level statistics for a table snapshot.
+///
+/// NOTE: This is an unstable API expected to change in future releases.
+#[allow(unused)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct FileStats {
+    /// Total size of the table in bytes (sum of all active AddFile sizes).
+    pub table_size_bytes: i64,
+    /// Number of active AddFile actions in this table version.
+    pub num_files: i64,
+}
+
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
-#[derive(PartialEq, Eq)]
 pub struct Snapshot {
+    span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
+    lazy_crc: Arc<LazyCrc>,
 }
+
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.log_segment == other.log_segment
+            && self.table_configuration == other.table_configuration
+    }
+}
+
+impl Eq for Snapshot {}
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -70,7 +96,7 @@ impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
     /// using
-    pub fn builder_for(table_root: Url) -> SnapshotBuilder {
+    pub fn builder_for(table_root: impl AsRef<str>) -> SnapshotBuilder {
         SnapshotBuilder::new_for(table_root)
     }
 
@@ -97,12 +123,34 @@ impl Snapshot {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
+    /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
-        info!(version = table_configuration.version(), "Created snapshot");
-        Self {
+        Self::new_with_crc(
             log_segment,
             table_configuration,
+            Arc::new(LazyCrc::new(None)),
+        )
+    }
+
+    /// Internal constructor that accepts an explicit [`LazyCrc`].
+    pub(crate) fn new_with_crc(
+        log_segment: LogSegment,
+        table_configuration: TableConfiguration,
+        lazy_crc: Arc<LazyCrc>,
+    ) -> Self {
+        let span = tracing::info_span!(
+            parent: tracing::Span::none(),
+            "snap",
+            path = %table_configuration.table_root(),
+            version = table_configuration.version(),
+        );
+        info!(parent: &span, "Created snapshot");
+        Self {
+            span,
+            log_segment,
+            table_configuration,
+            lazy_crc,
         }
     }
 
@@ -137,7 +185,7 @@ impl Snapshot {
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
-        let new_listed_files = ListedLogFiles::list(
+        let new_listed_files = LogSegmentFiles::list(
             storage.as_ref(),
             &log_root,
             log_tail,
@@ -210,12 +258,24 @@ impl Snapshot {
         // 2. new logsegment             [commit4]
         // 3. new logsegment             [checkpoint2-commit3] -> caught above
         new_log_segment
+            .listed
             .ascending_commit_files
+            .retain(|log_path| old_version < log_path.version);
+        // Deduplicate compaction files the same way: the new listing re-lists from
+        // checkpoint_version, so it includes compaction files already in the old segment.
+        // Note: This removes all _new_ compaction files that start at or before `old_version`,
+        // which may drop useful compaction files that span across the old/new boundary
+        // (e.g. a new compaction(1, 3) when old_version=2). This is conservative but safe.
+        new_log_segment
+            .listed
+            .ascending_compaction_files
             .retain(|log_path| old_version < log_path.version);
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let (new_metadata, new_protocol) = new_log_segment.protocol_and_metadata(engine)?;
+        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.listed.latest_crc_file.clone()));
+        let (new_metadata, new_protocol) =
+            new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -224,10 +284,11 @@ impl Snapshot {
         )?;
 
         // NB: we must add the new log segment to the existing snapshot's log segment
-        let mut ascending_commit_files = old_log_segment.ascending_commit_files.clone();
-        ascending_commit_files.extend(new_log_segment.ascending_commit_files);
-        let mut ascending_compaction_files = old_log_segment.ascending_compaction_files.clone();
-        ascending_compaction_files.extend(new_log_segment.ascending_compaction_files);
+        let mut ascending_commit_files = old_log_segment.listed.ascending_commit_files.clone();
+        ascending_commit_files.extend(new_log_segment.listed.ascending_commit_files);
+        let mut ascending_compaction_files =
+            old_log_segment.listed.ascending_compaction_files.clone();
+        ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
         // Note that we _could_ go backwards if someone deletes a CRC:
         // old listing: 1, 2, 2.crc, 3, 3.crc (latest is 3.crc)
@@ -235,35 +296,41 @@ impl Snapshot {
         // and we would still pick the new listing's (older) CRC file since it ostensibly still
         // exists
         let latest_crc_file = new_log_segment
+            .listed
             .latest_crc_file
-            .or_else(|| old_log_segment.latest_crc_file.clone());
+            .or_else(|| old_log_segment.listed.latest_crc_file.clone());
 
         // Use the new latest_commit if available, otherwise use the old one
         // This handles the case where the new listing returned no commits
         let latest_commit_file =
-            new_latest_commit_file.or_else(|| old_log_segment.latest_commit_file.clone());
+            new_latest_commit_file.or_else(|| old_log_segment.listed.latest_commit_file.clone());
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFilesBuilder {
+            LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
-                checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
+                checkpoint_parts: old_log_segment.listed.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
                 max_published_version: new_log_segment
+                    .listed
                     .max_published_version
-                    .max(old_log_segment.max_published_version),
-            }
-            .build()?,
+                    .max(old_log_segment.listed.max_published_version),
+            },
             log_root,
             new_version,
             // Preserve checkpoint schema from old segment
             old_log_segment.checkpoint_schema.clone(),
         )?;
-        Ok(Arc::new(Snapshot::new(
+
+        let lazy_crc = Arc::new(LazyCrc::new(
+            combined_log_segment.listed.latest_crc_file.clone(),
+        ));
+        Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
+            lazy_crc,
         )))
     }
 
@@ -321,9 +388,12 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
-        // Read protocol and metadata
+        // Create lazy CRC loader for P&M optimization
+        let lazy_crc = Arc::new(LazyCrc::new(log_segment.listed.latest_crc_file.clone()));
+
+        // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let (metadata, protocol) = log_segment.read_protocol_metadata(engine, &lazy_crc)?;
         let read_metadata_duration = start.elapsed();
 
         reporter.as_ref().inspect(|r| {
@@ -336,7 +406,11 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new(log_segment, table_configuration))
+        Ok(Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            lazy_crc,
+        ))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -414,10 +488,11 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        Ok(Snapshot {
-            table_configuration: new_table_configuration,
-            log_segment: new_log_segment,
-        })
+        Ok(Snapshot::new_with_crc(
+            new_log_segment,
+            new_table_configuration,
+            self.lazy_crc.clone(),
+        ))
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -437,6 +512,7 @@ impl Snapshot {
     /// (e.g., `SyncEngine`).
     ///
     /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
+    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
         let writer = self.create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
@@ -491,7 +567,7 @@ impl Snapshot {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
-        self.table_configuration.schema()
+        self.table_configuration.logical_schema()
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].
@@ -526,8 +602,9 @@ impl Snapshot {
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
-        self: Arc<Self>,
+        &self,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
@@ -566,8 +643,10 @@ impl Snapshot {
     /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
     /// clustering metadata is malformed.
     ///
+    /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    pub(crate) fn get_clustering_columns(
+    #[internal_api]
+    pub(crate) fn get_clustering_columns_physical(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
@@ -576,10 +655,26 @@ impl Snapshot {
             .protocol()
             .has_table_feature(&TableFeature::ClusteredTable)
         {
-            get_clustering_columns(&self.log_segment, engine)
+            get_clustering_columns_from_domain_metadata(&self.log_segment, engine)
         } else {
             Ok(None)
         }
+    }
+
+    /// Returns file-level statistics from the CRC file, or `None` if no CRC exists at this
+    /// snapshot's version.
+    ///
+    /// NOTE: This is an unstable API expected to change in future releases.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
+        let crc = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())?;
+        Some(FileStats {
+            table_size_bytes: crc.table_size_bytes,
+            num_files: crc.num_files,
+        })
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
@@ -602,6 +697,7 @@ impl Snapshot {
     /// # See Also
     ///
     /// - [`Committer::publish`]
+    #[instrument(parent = &self.span, name = "snap.publish", skip_all, err)]
     pub fn publish(
         self: &SnapshotRef,
         engine: &dyn Engine,
@@ -624,7 +720,7 @@ impl Snapshot {
         );
 
         require!(
-            self.table_configuration().protocol().is_catalog_managed(),
+            self.table_configuration().is_catalog_managed(),
             Error::generic(
                 "There are catalog commits that need publishing, but the table is not catalog-managed.",
             )
@@ -642,9 +738,10 @@ impl Snapshot {
 
         committer.publish(engine, publish_metadata)?;
 
-        Ok(Arc::new(Snapshot::new(
+        Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
+            self.lazy_crc.clone(),
         )))
     }
 
@@ -683,6 +780,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
@@ -708,8 +806,24 @@ impl Snapshot {
             }
         }
 
-        // Read the ICT from latest_commit_file
-        match &self.log_segment.latest_commit_file {
+        // Fast path: try reading ICT from CRC file (if it is at this snapshot version)
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            match crc.in_commit_timestamp_opt {
+                Some(ict) => return Ok(Some(ict)),
+                None => {
+                    return Err(Error::generic(format!(
+                        "In-Commit Timestamp not found in CRC file at version {}",
+                        self.version()
+                    )));
+                }
+            }
+        }
+
+        // Fallback: read the ICT from latest_commit_file
+        match &self.log_segment.listed.latest_commit_file {
             Some(commit_file_meta) => {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
@@ -742,10 +856,13 @@ mod tests {
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFilesBuilder;
     use crate::log_segment::LogSegment;
+    use crate::log_segment_files::LogSegmentFiles;
     use crate::parquet::arrow::ArrowWriter;
-    use crate::path::ParsedLogPath;
+    use crate::path::{LogPathFileType, ParsedLogPath};
+    use crate::table_features::{
+        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    };
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use delta_kernel::actions::DomainMetadata;
 
@@ -772,13 +889,13 @@ mod tests {
             let mut protocol = json!({
                 "protocol": {
                     "minReaderVersion": reader_version,
-                    "minWriterVersion": 7,
+                    "minWriterVersion": TABLE_FEATURES_MIN_WRITER_VERSION,
                     "writerFeatures": ["inCommitTimestamp"]
                 }
             });
 
-            // Only include readerFeatures if minReaderVersion >= 3
-            if reader_version >= 3 {
+            // Only include readerFeatures if minReaderVersion >= table-features minimum.
+            if reader_version >= TABLE_FEATURES_MIN_READER_VERSION as u32 {
                 protocol["protocol"]["readerFeatures"] = json!([]);
             }
 
@@ -845,8 +962,7 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap();
         assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -863,8 +979,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::try_new_modern(["deletionVectors"], ["deletionVectors"]).unwrap();
         assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -872,7 +987,8 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    // TODO: unify this and lots of stuff in LogSegment tests and test_utils
+    // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
+    // Also make this function take in the path of the delta table (currently only can commit to tables at the root directory).
     async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
         let commit_data = commit
             .iter()
@@ -1180,6 +1296,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .log_segment
+                .listed
                 .latest_crc_file
                 .as_ref()
                 .unwrap()
@@ -1209,6 +1326,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .log_segment
+                .listed
                 .latest_crc_file
                 .as_ref()
                 .unwrap()
@@ -1339,18 +1457,22 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(location).build(&engine).unwrap();
 
-        assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
-        assert_eq!(
-            ParsedLogPath::try_from(snapshot.log_segment.checkpoint_parts[0].location.clone())
-                .unwrap()
-                .unwrap()
-                .version,
-            2,
-        );
-        assert_eq!(snapshot.log_segment.ascending_commit_files.len(), 1);
+        assert_eq!(snapshot.log_segment.listed.checkpoint_parts.len(), 1);
         assert_eq!(
             ParsedLogPath::try_from(
-                snapshot.log_segment.ascending_commit_files[0]
+                snapshot.log_segment.listed.checkpoint_parts[0]
+                    .location
+                    .clone()
+            )
+            .unwrap()
+            .unwrap()
+            .version,
+            2,
+        );
+        assert_eq!(snapshot.log_segment.listed.ascending_commit_files.len(), 1);
+        assert_eq!(
+            ParsedLogPath::try_from(
+                snapshot.log_segment.listed.ascending_commit_files[0]
                     .location
                     .clone()
             )
@@ -1572,15 +1694,15 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_enablement_version_in_future() -> DeltaResult<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
-        let url = Url::parse("memory:///table2")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
             json!({
                 "protocol": {
-                    "minReaderVersion": 3,
-                    "minWriterVersion": 7,
+                    "minReaderVersion": TABLE_FEATURES_MIN_READER_VERSION,
+                    "minWriterVersion": TABLE_FEATURES_MIN_WRITER_VERSION,
                     "readerFeatures": [],
                     "writerFeatures": ["inCommitTimestamp"]
                 }
@@ -1621,12 +1743,12 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_missing_ict_when_enabled() -> DeltaResult<()> {
         // Test missing ICT when it should be present - should error
-        let url = Url::parse("memory:///table3")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -1653,13 +1775,13 @@ mod tests {
         // When ICT is enabled but commit file is not found in log segment,
         // get_in_commit_timestamp should return an error
 
-        let url = Url::parse("memory:///missing_commit_test")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit with ICT enabled
         let commit_data = [
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -1684,11 +1806,10 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFilesBuilder {
+        let listed_files = LogSegmentFiles {
             checkpoint_parts,
             ..Default::default()
-        }
-        .build()?;
+        };
 
         let log_segment =
             LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
@@ -1707,14 +1828,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> DeltaResult<()> {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
-        let url = Url::parse("memory:///checkpoint_commit_test")?;
+        let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
             create_commit_info(1587968586154, None),
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
                 Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
@@ -1728,7 +1849,7 @@ mod tests {
         // Create 00000000000000000001.checkpoint.parquet
         let checkpoint_data = [
             create_commit_info(1587968586154, None),
-            create_protocol(true, Some(3)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
             create_metadata(
                 Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9"),
                 Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"),
@@ -1855,6 +1976,7 @@ mod tests {
         assert_eq!(
             base_snapshot
                 .log_segment
+                .listed
                 .latest_commit_file
                 .as_ref()
                 .map(|f| f.version),
@@ -1880,6 +2002,7 @@ mod tests {
         assert_eq!(
             new_snapshot
                 .log_segment
+                .listed
                 .latest_commit_file
                 .as_ref()
                 .map(|f| f.version),
@@ -1954,5 +2077,168 @@ mod tests {
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
+    }
+
+    // Helper: create a minimal test table with commits 0-N
+    async fn setup_test_table_with_commits(store: &InMemory, num_commits: u64) -> DeltaResult<()> {
+        // Commit 0: protocol + metadata + first file
+        let commit0 = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+            json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
+        ];
+        commit(store, 0, commit0).await;
+
+        // Additional commits with just add actions
+        for i in 1..num_commits {
+            let commit_i = vec![json!({
+                "add": {
+                    "path": format!("file{}.parquet", i + 1),
+                    "partitionValues": {},
+                    "size": (i + 1) * 100,
+                    "modificationTime": (i + 1) * 1000,
+                    "dataChange": true
+                }
+            })];
+            commit(store, i, commit_i).await;
+        }
+        Ok(())
+    }
+
+    // Helper: write a compaction file
+    async fn write_compaction_file(store: &InMemory, start: u64, end: u64) -> DeltaResult<()> {
+        let content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        store
+            .put(
+                &test_utils::compacted_log_path_for_versions(start, end, "json"),
+                content.into(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
+    /// version onwards. We must ensure that it deduplicates compaction files, since producing
+    /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
+    #[tokio::test]
+    async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create commits 0-3 and compaction files (1,1) and (1,2)
+        setup_test_table_with_commits(&store, 3).await?;
+        write_compaction_file(&store, 1, 1).await?;
+        write_compaction_file(&store, 1, 2).await?;
+
+        // Build snapshot at v2 (includes both compaction files)
+        let snapshot_v2 = Snapshot::builder_for(url.clone())
+            .at_version(2)
+            .build(&engine)?;
+        assert_eq!(
+            snapshot_v2
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .len(),
+            2
+        );
+
+        // Add commit 3
+        commit(
+            &store,
+            3,
+            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
+        )
+        .await;
+
+        // Build v3 incrementally - before the fix, this panicked due to duplicate compaction files
+        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+            .at_version(3)
+            .build(&engine)?;
+
+        assert_eq!(snapshot_v3.version(), 3);
+        assert_eq!(
+            snapshot_v3
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .len(),
+            2
+        );
+
+        Ok(())
+    }
+
+    /// This test documents a limitation: When deduplicating compactions, the deduplication logic
+    /// only checks the start version (lo), not the hi version. So a new compaction file (1,3)
+    /// added after building the base snapshot at v2 gets filtered out because its start version
+    /// (1) <= old_version (2).
+    #[tokio::test]
+    async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create commits 0-3 and compaction files (1,2) and (2,2)
+        setup_test_table_with_commits(&store, 4).await?;
+        write_compaction_file(&store, 1, 2).await?;
+        write_compaction_file(&store, 2, 2).await?;
+
+        // Build snapshot at v2
+        let snapshot_v2 = Snapshot::builder_for(url.clone())
+            .at_version(2)
+            .build(&engine)?;
+        assert_eq!(
+            snapshot_v2
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .len(),
+            2
+        );
+
+        // Add new compaction file (1,3) after building the base snapshot
+        write_compaction_file(&store, 1, 3).await?;
+
+        // Build v3 incrementally - the new (1,3) file gets filtered out because
+        // the deduplication only looks at start version: 1 <= old_version (2)
+        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+            .at_version(3)
+            .build(&engine)?;
+
+        assert_eq!(snapshot_v3.version(), 3);
+        assert_eq!(
+            snapshot_v3
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .len(),
+            2
+        );
+
+        // Verify we still have the original (1,2) and (2,2) files
+        let versions_and_his: Vec<_> = snapshot_v3
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .iter()
+            .map(|p| match p.file_type {
+                LogPathFileType::CompactedCommit { hi } => (p.version, hi),
+                _ => panic!("Expected CompactedCommit"),
+            })
+            .collect();
+        assert_eq!(versions_and_his, vec![(1, 2), (2, 2)]);
+
+        Ok(())
     }
 }

@@ -117,6 +117,10 @@ pub enum Error {
     #[error("Selection vector is larger than data length: {0}")]
     InvalidSelectionVector(String),
 
+    /// Transaction state is invalid for the requested operation
+    #[error("Invalid transaction state: {0}")]
+    InvalidTransactionState(String),
+
     /// A specified URL was invalid
     #[error("Invalid url: {0}")]
     InvalidUrl(#[from] url::ParseError),
@@ -211,6 +215,10 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Validation error for file statistics (e.g., missing required clustering column stats)
+    #[error("Stats validation error: {0}")]
+    StatsValidation(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -275,6 +283,10 @@ impl Error {
         Self::InvalidProtocol(msg.to_string())
     }
 
+    pub fn invalid_transaction_state(msg: impl ToString) -> Self {
+        Self::InvalidTransactionState(msg.to_string())
+    }
+
     pub fn unsupported(msg: impl ToString) -> Self {
         Self::Unsupported(msg.to_string())
     }
@@ -294,6 +306,10 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn stats_validation(msg: impl ToString) -> Self {
+        Self::StatsValidation(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

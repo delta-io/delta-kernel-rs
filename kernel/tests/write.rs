@@ -8,7 +8,7 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
+use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -17,9 +17,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
@@ -34,14 +37,51 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
+use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::FileMeta;
 
+use test_utils::create_default_engine_mt_executor;
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_add_files_metadata,
-    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
+    assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
+    copy_directory, create_add_files_metadata, create_default_engine, create_table,
+    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
+    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
+    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
 };
 
 mod common;
+
+/// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
+/// or `None` if the field has no `field_id` set.
+///
+/// Panics if the file cannot be read or the physical path doesn't exist in the parquet schema.
+fn get_parquet_field_id(parquet_file: &std::path::Path, physical_path: &[String]) -> Option<i32> {
+    let file = std::fs::File::open(parquet_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let root = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone();
+
+    let mut current = &root;
+    for name in physical_path {
+        current = current
+            .get_fields()
+            .iter()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("parquet schema missing field '{name}'"));
+    }
+
+    let info = current.get_basic_info();
+    info.has_id().then(|| info.id())
+}
 
 fn validate_txn_id(commit_info: &serde_json::Value) {
     let txn_id = commit_info["txnId"]
@@ -130,6 +170,100 @@ fn get_scan_files(
 
 fn get_simple_int_schema() -> Arc<StructType> {
     Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
+}
+
+/// Write a metadata-update commit that sets a table property on the existing table.
+/// Returns a fresh snapshot reflecting the new commit.
+/// Used in tests as a hack to set table properties when create table doesn't support the property.
+fn set_table_properties(
+    table_path: &str,
+    table_url: &Url,
+    engine: &dyn Engine,
+    current_version: Version,
+    properties: &[(&str, &str)],
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let v0_path = std::path::Path::new(table_path).join("_delta_log/00000000000000000000.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&v0_path)?
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|v| v.get("metaData").is_some())
+        })
+        .expect("version 0 should contain a metaData action");
+
+    for &(key, value) in properties {
+        meta["metaData"]["configuration"][key] = json!(value);
+    }
+
+    let new_commit = std::path::Path::new(table_path)
+        .join(format!("_delta_log/{:020}.json", current_version + 1));
+    std::fs::write(&new_commit, serde_json::to_string(&meta)?)?;
+    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+}
+
+/// Assert that the snapshot's column mapping mode matches the given `cm_mode` string,
+/// and return the resolved mode.
+fn assert_column_mapping_mode(snapshot: &Snapshot, cm_mode: &str) -> ColumnMappingMode {
+    let expected = match cm_mode {
+        "none" => ColumnMappingMode::None,
+        "name" => ColumnMappingMode::Name,
+        "id" => ColumnMappingMode::Id,
+        _ => panic!("unexpected cm_mode: {cm_mode}"),
+    };
+    let actual = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .expect("column mapping mode should be set");
+    assert_eq!(actual, expected);
+    actual
+}
+
+/// Resolve a nested column inside a [`StructArray`] by walking the given field-name path,
+/// and downcast the leaf to the requested array type.
+fn resolve_struct_field<'a, T: 'static>(root: &'a StructArray, path: &[String]) -> &'a T {
+    assert!(!path.is_empty(), "path must be non-empty");
+    let mut current: &StructArray = root;
+    for (i, name) in path.iter().enumerate() {
+        let col = current
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing field: {name}"));
+        if i == path.len() - 1 {
+            return col
+                .as_any()
+                .downcast_ref::<T>()
+                .expect("leaf array type mismatch");
+        }
+        current = col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap_or_else(|| panic!("expected StructArray at field: {name}"));
+    }
+    unreachable!()
+}
+
+/// Navigate into a nested JSON value by following a sequence of object keys.
+/// E.g. `resolve_json_path(stats, &["address", "street"])` returns `stats["address"]["street"]`.
+fn resolve_json_path<'a>(root: &'a serde_json::Value, path: &[String]) -> &'a serde_json::Value {
+    path.iter().fold(root, |v, key| &v[key])
+}
+
+/// Assert that `stats["minValues"]` and `stats["maxValues"]` at the given physical path equal the
+/// expected values.
+fn assert_min_max_stats(
+    stats: &serde_json::Value,
+    physical_path: &[String],
+    expected_min: impl Into<serde_json::Value>,
+    expected_max: impl Into<serde_json::Value>,
+) {
+    assert_eq!(
+        *resolve_json_path(&stats["minValues"], physical_path),
+        expected_min.into()
+    );
+    assert_eq!(
+        *resolve_json_path(&stats["maxValues"], physical_path),
+        expected_max.into()
+    );
 }
 
 #[tokio::test]
@@ -690,9 +824,12 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
         assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
+            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
-                if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
+                if matches!(
+                    &*source,
+                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+                ) =>
                 true,
             _ => false,
         }));
@@ -735,18 +872,9 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id1", &engine)?,
-            Some(1)
-        );
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id2", &engine)?,
-            Some(2)
-        );
-        assert_eq!(
-            snapshot.clone().get_app_id_version("app_id3", &engine)?,
-            None
-        );
+        assert_eq!(snapshot.get_app_id_version("app_id1", &engine)?, Some(1));
+        assert_eq!(snapshot.get_app_id_version("app_id2", &engine)?, Some(2));
+        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -2968,6 +3096,767 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
             _ => panic!("Commit {} should succeed", i),
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_parquet_succeed_with_logical_partition_names(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("letter", DataType::STRING),
+    ])?);
+
+    for (table_url, engine, _store, _table_name) in setup_test_tables(
+        schema.clone(),
+        &["letter"],
+        None,
+        "test_partition_translate",
+    )
+    .await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        // Create data with only the non-partition column
+        let data_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(data_schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        // Pass partition values with logical name — should succeed
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("letter".to_string(), "a".to_string())]),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "write_parquet should succeed with valid logical partition name"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_parquet_rejects_unknown_partition_column(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
+        )
+        .await;
+        let err = result.expect_err("write_parquet should fail with unknown partition column");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Partition column 'nonexistent' not found in table schema"),
+            "Error should mention the unknown column name, got: {err_msg}"
+        );
+    }
+    Ok(())
+}
+
+/// 1. Creates a table with the given column mapping mode
+/// 2. Writes two batches of data
+/// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
+/// 4. Reads a parquet footer to verify physical names/IDs
+/// 5. Reads data back to verify correctness
+/// 6. Removes files and verifies remove.stats matches the original add.stats
+#[rstest::rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_write(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = nested_schema()?;
+
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    // Step 1: Create table
+    let mode_str = match cm_mode {
+        ColumnMappingMode::None => "none",
+        ColumnMappingMode::Id => "id",
+        ColumnMappingMode::Name => "name",
+    };
+    let mut latest_snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", mode_str)],
+    )?;
+
+    // Get physical field paths for stats verification (top-level and nested)
+    let cm = latest_snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let row_number_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["row_number"]),
+        cm,
+    )?
+    .into_inner();
+    let street_physical = get_any_level_column_physical_name(
+        latest_snapshot.schema().as_ref(),
+        &ColumnName::new(["address", "street"]),
+        cm,
+    )?
+    .into_inner();
+
+    // Step 2: Write two batches
+    for data in nested_batches()? {
+        latest_snapshot =
+            write_batch_to_table(&latest_snapshot, engine.as_ref(), data, HashMap::new()).await?;
+    }
+
+    // Enable writeStatsAsStruct so the checkpoint contains native stats_parsed.
+    // CREATE TABLE doesn't allow this property yet, so we write a metadata-update commit directly.
+    latest_snapshot = set_table_properties(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        latest_snapshot.version(),
+        &[("delta.checkpoint.writeStatsAsStruct", "true")],
+    )?;
+
+    // Step 3: Checkpoint and verify add.stats uses correct column names
+    let snapshot_for_checkpoint = latest_snapshot.clone();
+    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
+    let mut all_stats: Vec<_> = add_actions
+        .iter()
+        .filter_map(|a| a.stats.as_ref())
+        .filter(|s| s.get("minValues").is_some())
+        .collect();
+    assert_eq!(all_stats.len(), 2, "should have stats for 2 files");
+    all_stats.sort_by_key(|s| s["minValues"][&row_number_physical[0]].as_i64().unwrap());
+
+    // Batch 1: row_number 1..3, address.street "st1".."st3"
+    assert_min_max_stats(all_stats[0], &row_number_physical, 1, 3);
+    assert_min_max_stats(all_stats[0], &street_physical, "st1", "st3");
+
+    // Batch 2: row_number 4..6, address.street "st4".."st6"
+    assert_min_max_stats(all_stats[1], &row_number_physical, 4, 6);
+    assert_min_max_stats(all_stats[1], &street_physical, "st4", "st6");
+
+    // Step 3b: Verify stats_parsed in scan metadata uses correct physical column names
+    {
+        let scan = ckpt_snapshot
+            .scan_builder()
+            .include_all_stats_columns()
+            .build()?;
+        let scan_metadata_results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
+        for sm in scan_metadata_results {
+            let (data, sel) = sm.scan_files.into_parts();
+            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
+
+            let batch_struct = StructArray::from(batch.clone());
+            let stats_parsed: &StructArray =
+                resolve_struct_field(&batch_struct, &["stats_parsed".into()]);
+
+            let min_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "minValues".into()], field].concat()
+            };
+            let max_path = |field: &[String]| -> Vec<String> {
+                [&["stats_parsed".into(), "maxValues".into()], field].concat()
+            };
+            let min_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &min_path(&row_number_physical));
+            let max_row_num: &Int64Array =
+                resolve_struct_field(&batch_struct, &max_path(&row_number_physical));
+            let min_st: &StringArray =
+                resolve_struct_field(&batch_struct, &min_path(&street_physical));
+            let max_st: &StringArray =
+                resolve_struct_field(&batch_struct, &max_path(&street_physical));
+
+            for (i, &selected) in sel.iter().enumerate().take(batch.num_rows()) {
+                if selected && !stats_parsed.is_null(i) {
+                    stats_rows.push((
+                        min_row_num.value(i),
+                        max_row_num.value(i),
+                        min_st.value(i).to_string(),
+                        max_st.value(i).to_string(),
+                    ));
+                }
+            }
+        }
+
+        stats_rows.sort_by_key(|r| r.0);
+        assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
+        assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
+        assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
+    }
+
+    // Step 4: Read parquet footer to verify physical names and native field_id
+    {
+        let parquet_path = &add_actions
+            .first()
+            .expect("should have at least one add file")
+            .path;
+        let parquet_url = table_url.join(parquet_path)?;
+        let local_path = parquet_url.to_file_path().unwrap();
+
+        let obj_meta = store
+            .head(&Path::from_url_path(parquet_url.path())?)
+            .await?;
+        let file_meta = FileMeta::new(
+            parquet_url,
+            0, /* last_modified */
+            obj_meta.size as u64,
+        );
+        let footer = engine.parquet_handler().read_parquet_footer(&file_meta)?;
+        let footer_schema = footer.schema;
+
+        let logical_schema = latest_snapshot.schema();
+        for logical_path in [&["row_number"][..], &["address", "street"]] {
+            let col = ColumnName::new(logical_path.iter().copied());
+            let physical =
+                get_any_level_column_physical_name(logical_schema.as_ref(), &col, cm)?.into_inner();
+            assert_schema_has_field(&footer_schema, &physical);
+
+            let field_id = get_parquet_field_id(&local_path, &physical);
+            let logical_field = resolve_field(logical_schema.as_ref(), logical_path).unwrap();
+            match cm_mode {
+                ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                    let expected_id =
+                        match logical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+                            Some(MetadataValue::Number(n)) => *n as i32,
+                            other => panic!("expected ColumnMappingId number, got {other:?}"),
+                        };
+                    assert_eq!(
+                        field_id,
+                        Some(expected_id),
+                        "parquet field_id mismatch for {logical_path:?}"
+                    );
+                }
+                ColumnMappingMode::None => {
+                    assert_eq!(
+                        field_id, None,
+                        "parquet field_id should not be set in None column mapping mode"
+                    );
+                }
+            }
+        }
+    }
+
+    // Step 5: Read data back to verify correctness
+    {
+        let post_ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = post_ckpt_snapshot.scan_builder().build()?;
+        let batches: Vec<RecordBatch> = scan
+            .execute(engine.clone())?
+            .map(|r| {
+                let data = r.unwrap();
+                let arrow = ArrowEngineData::try_from_engine_data(data).unwrap();
+                arrow.record_batch().clone()
+            })
+            .collect();
+
+        let result_schema = batches[0].schema();
+        let combined = delta_kernel::arrow::compute::concat_batches(&result_schema, &batches)?;
+        assert_eq!(
+            combined.num_rows(),
+            6,
+            "Should have 6 rows from two written batches"
+        );
+
+        // Verify logical column names and data values
+        let combined_struct = StructArray::from(combined);
+
+        // Top-level: row_number should contain [1..=6]
+        let row_numbers: &Int64Array =
+            resolve_struct_field(&combined_struct, &["row_number".into()]);
+        let mut vals: Vec<i64> = (0..row_numbers.len())
+            .map(|i| row_numbers.value(i))
+            .collect();
+        vals.sort();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+
+        // Nested: address.street should contain ["st1"..="st6"]
+        let streets: &StringArray =
+            resolve_struct_field(&combined_struct, &["address".into(), "street".into()]);
+        let mut street_vals: Vec<&str> = (0..streets.len()).map(|i| streets.value(i)).collect();
+        street_vals.sort();
+        assert_eq!(street_vals, vec!["st1", "st2", "st3", "st4", "st5", "st6"]);
+    }
+
+    // Step 6: Remove files and verify remove.stats matches original add.stats
+    {
+        let original_add_stats: Vec<serde_json::Value> =
+            add_actions.iter().filter_map(|a| a.stats.clone()).collect();
+        assert!(
+            !original_add_stats.is_empty(),
+            "should have at least one add with stats"
+        );
+
+        let remove_actions =
+            remove_all_and_get_remove_actions(&latest_snapshot, &table_url, engine.as_ref())?;
+        assert!(
+            !remove_actions.is_empty(),
+            "Expected at least one remove action"
+        );
+
+        let remove_stats: Vec<serde_json::Value> = remove_actions
+            .iter()
+            .filter_map(|r| {
+                r["stats"]
+                    .as_str()
+                    .map(|s| serde_json::from_str(s).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            remove_stats, original_add_stats,
+            "remove.stats should match original add.stats"
+        );
+    }
+
+    Ok(())
+}
+
+/// Verifies that partitioned writes use physical column names in add.partitionValues.
+#[rstest::rstest]
+#[case::cm_none("./tests/data/partition_cm/none")]
+#[case::cm_id("./tests/data/partition_cm/id")]
+#[case::cm_name("./tests/data/partition_cm/name")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_column_mapping_partitioned_write(
+    #[case] table_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy test data to a temp dir so we can write to it
+    let tmp_dir = tempdir()?;
+    copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let cm = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let physical_name = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["category"]),
+        cm,
+    )?
+    .into_inner()
+    .remove(0);
+
+    // Verify physical name for column mapping mode
+    if table_dir.ends_with("none") {
+        assert_eq!(physical_name, "category");
+    } else {
+        assert_ne!(
+            physical_name, "category",
+            "physical name should differ from logical name under column mapping"
+        );
+    }
+
+    // Write data with partition value
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+    let batch = RecordBatch::try_new(
+        Arc::new(data_schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )?;
+    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // Read commit log and verify add.partitionValues key uses physical name
+    let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+    assert!(!add_actions.is_empty(), "no add action found in commit log");
+    for add in &add_actions {
+        assert_partition_values(add, &physical_name, "A");
+    }
+
+    // Remove the written file and verify remove action preserves physical names
+    let post_write_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let remove_actions =
+        remove_all_and_get_remove_actions(&post_write_snapshot, &table_url, engine.as_ref())?;
+    assert!(
+        !remove_actions.is_empty(),
+        "no remove action found in commit log"
+    );
+    for remove in &remove_actions {
+        assert_partition_values(remove, &physical_name, "A");
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_non_kernel_written_table() {
+    // Table written by a non-kernel-integrated connector: 7 rows with columns (i, j, k), where
+    // parquet field nullabilities differ from the Delta schema. DefaultEngine reads it, coerces
+    // nullabilities to match the Delta schema, creates a checkpoint, and verifies the data is
+    // unchanged.
+    let source_path = std::path::Path::new("./tests/data/external-table-different-nullability");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("test-checkpoint-table");
+    test_utils::copy_directory(source_path, &table_path).unwrap();
+
+    let url = Url::from_directory_path(&table_path).unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let executor = Arc::new(
+        delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    let engine: Arc<delta_kernel::engine::default::DefaultEngine<_>> = Arc::new(
+        delta_kernel::engine::default::DefaultEngineBuilder::new(store)
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    // Read data before checkpoint
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan_before = Arc::clone(&snapshot).scan_builder().build().unwrap();
+    let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
+
+    // Create checkpoint via snapshot.checkpoint()
+    Arc::clone(&snapshot).checkpoint(engine.as_ref()).unwrap();
+
+    // Read data after checkpoint
+    let snapshot_after = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan_after = snapshot_after.scan_builder().build().unwrap();
+    let batches_after = test_utils::read_scan(&scan_after, engine.clone()).unwrap();
+
+    // Verify data unchanged
+    let formatted_before =
+        delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_before)
+            .unwrap()
+            .to_string();
+    let formatted_after = delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_after)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        formatted_before, formatted_after,
+        "Row data changed after checkpoint creation!"
+    );
+
+    // Verify checkpoint file exists
+    let delta_log_path = table_path.join("_delta_log");
+    let has_checkpoint = std::fs::read_dir(&delta_log_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".checkpoint.parquet"))
+        });
+    assert!(has_checkpoint, "Expected at least one checkpoint file");
+}
+
+struct ClusteredTableSetup {
+    _tmp_dir: TempDir,
+    table_path: String,
+    table_url: Url,
+    engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    snapshot: Arc<Snapshot>,
+}
+
+/// Creates a clustered table with column mapping and sets table properties.
+fn setup_clustered_table(
+    cm_mode: &str,
+    schema: Arc<StructType>,
+    clustering_cols: Vec<ColumnName>,
+    table_properties: &[(&str, &str)],
+) -> Result<ClusteredTableSetup, Box<dyn std::error::Error>> {
+    use delta_kernel::transaction::data_layout::DataLayout;
+
+    let (_tmp_dir, table_path, _) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let engine = create_default_engine_mt_executor(&table_url)?;
+
+    let _ = create_table_txn(table_url.as_str(), schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
+        .with_data_layout(DataLayout::Clustered {
+            columns: clustering_cols,
+        })
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = set_table_properties(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        0,
+        table_properties,
+    )?;
+
+    Ok(ClusteredTableSetup {
+        _tmp_dir,
+        table_path,
+        table_url,
+        engine,
+        snapshot,
+    })
+}
+
+/// E2E test: create a clustered table with column mapping, write data, and verify that
+/// add.stats in the commit log contains min/max statistics for the clustering columns
+/// (including a nested column).
+#[rstest::rstest]
+#[case::cm_none("none")]
+#[case::cm_name("name")]
+#[case::cm_id("id")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_clustered_table_write_has_stats(
+    #[case] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let clustering_cols = vec![
+        ColumnName::new(["row_number"]),
+        ColumnName::new(["address", "street"]),
+    ];
+    let setup = setup_clustered_table(
+        cm_mode,
+        nested_schema()?,
+        clustering_cols.clone(),
+        &[("delta.dataSkippingNumIndexedCols", "0")],
+    )?;
+    let engine = &setup.engine;
+    let mut snapshot = setup.snapshot;
+    for batch in nested_batches()? {
+        snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    }
+
+    let cm = assert_column_mapping_mode(&snapshot, cm_mode);
+    let physical_paths: Vec<Vec<String>> = clustering_cols
+        .iter()
+        .map(|c| {
+            get_any_level_column_physical_name(snapshot.schema().as_ref(), c, cm)
+                .unwrap()
+                .into_inner()
+        })
+        .collect();
+    if cm != ColumnMappingMode::None {
+        let logical_paths: Vec<Vec<&str>> = vec![vec!["row_number"], vec!["address", "street"]];
+        for (phys, logical) in physical_paths.iter().zip(&logical_paths) {
+            assert_ne!(
+                phys.iter().map(String::as_str).collect_vec(),
+                *logical,
+                "physical path should differ from logical when cm={cm:?}"
+            );
+        }
+    }
+
+    // Resolve a non-clustering column to verify it's excluded from stats
+    let non_clustering_physical = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["name"]),
+        cm,
+    )?
+    .into_inner();
+
+    // Verify stats for each write commit (v2 and v3, since v1 is the property update).
+    // Batch 1 (v2): row_number 1..3, address.street "st1".."st3"
+    // Batch 2 (v3): row_number 4..6, address.street "st4".."st6"
+    let expected: [(i64, i64, &str, &str); 2] = [(1, 3, "st1", "st3"), (4, 6, "st4", "st6")];
+    for (version, (min_rn, max_rn, min_st, max_st)) in expected.iter().enumerate() {
+        let version = (version + 2) as u64;
+        let add_actions = read_actions_from_commit(&setup.table_url, version, "add")?;
+        assert!(
+            !add_actions.is_empty(),
+            "v{version}: should have add actions"
+        );
+
+        for add in &add_actions {
+            let stats: serde_json::Value = serde_json::from_str(
+                add.get("stats")
+                    .and_then(|s| s.as_str())
+                    .expect("add action should have stats"),
+            )?;
+            // Clustering columns should have stats despite numIndexedCols=0
+            assert_min_max_stats(&stats, &physical_paths[0], *min_rn, *max_rn);
+            assert_min_max_stats(&stats, &physical_paths[1], *min_st, *max_st);
+
+            // Non-clustering column "name" should NOT have stats
+            let non_cluster_min = resolve_json_path(&stats["minValues"], &non_clustering_physical);
+            assert!(
+                non_cluster_min.is_null(),
+                "v{version}: non-clustering column 'name' should not have stats"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// E2E test: create a clustered table with column mapping, enable writeStatsAsStruct,
+/// write data, checkpoint, and verify stats_parsed.
+#[rstest::rstest]
+#[case::cm_none("none")]
+#[case::cm_name("name")]
+#[case::cm_id("id")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_clustered_table_write_has_stats_parsed(
+    #[case] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let clustering_cols = vec![
+        ColumnName::new(["row_number"]),
+        ColumnName::new(["address", "street"]),
+    ];
+    let setup = setup_clustered_table(
+        cm_mode,
+        nested_schema()?,
+        clustering_cols.clone(),
+        &[
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.dataSkippingNumIndexedCols", "0"),
+        ],
+    )?;
+    let engine = &setup.engine;
+    let mut snapshot = setup.snapshot;
+    for batch in nested_batches()? {
+        snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+    }
+
+    let cm = assert_column_mapping_mode(&snapshot, cm_mode);
+    let physical_paths: Vec<Vec<String>> = clustering_cols
+        .iter()
+        .map(|c| {
+            get_any_level_column_physical_name(snapshot.schema().as_ref(), c, cm)
+                .unwrap()
+                .into_inner()
+        })
+        .collect();
+    if cm != ColumnMappingMode::None {
+        let logical_paths: Vec<Vec<&str>> = vec![vec!["row_number"], vec!["address", "street"]];
+        for (phys, logical) in physical_paths.iter().zip(&logical_paths) {
+            assert_ne!(
+                phys.iter().map(String::as_str).collect_vec(),
+                *logical,
+                "physical path should differ from logical when cm={cm:?}"
+            );
+        }
+    }
+    let non_clustering_physical = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["name"]),
+        cm,
+    )?
+    .into_inner();
+
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
+    // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when
+    // dataSkippingNumIndexedCols=0. Read directly from the checkpoint parquet file instead.
+    use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let delta_log = std::path::Path::new(&setup.table_path).join("_delta_log");
+    let ckpt_path = std::fs::read_dir(&delta_log)?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".checkpoint.parquet"))
+        })
+        .expect("checkpoint parquet should exist")
+        .path();
+    let file = std::fs::File::open(&ckpt_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+
+    let min_path = |field: &[String]| -> Vec<String> { [&["minValues".into()], field].concat() };
+    let max_path = |field: &[String]| -> Vec<String> { [&["maxValues".into()], field].concat() };
+
+    let mut stats_rows: Vec<(i64, i64, String, String)> = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let batch_struct = StructArray::from(batch);
+        let add: &StructArray = resolve_struct_field(&batch_struct, &["add".into()]);
+        let stats_parsed: &StructArray = resolve_struct_field(add, &["stats_parsed".into()]);
+
+        // Non-clustering column should not appear in stats_parsed
+        let min_values: &StructArray = resolve_struct_field(stats_parsed, &["minValues".into()]);
+        assert!(
+            min_values
+                .column_by_name(&non_clustering_physical[0])
+                .is_none(),
+            "non-clustering column '{}' should not have stats_parsed",
+            non_clustering_physical[0]
+        );
+
+        let min_row_num: &Int64Array =
+            resolve_struct_field(stats_parsed, &min_path(&physical_paths[0]));
+        let max_row_num: &Int64Array =
+            resolve_struct_field(stats_parsed, &max_path(&physical_paths[0]));
+        let min_st: &StringArray =
+            resolve_struct_field(stats_parsed, &min_path(&physical_paths[1]));
+        let max_st: &StringArray =
+            resolve_struct_field(stats_parsed, &max_path(&physical_paths[1]));
+
+        for i in 0..stats_parsed.len() {
+            if !stats_parsed.is_null(i) {
+                stats_rows.push((
+                    min_row_num.value(i),
+                    max_row_num.value(i),
+                    min_st.value(i).to_string(),
+                    max_st.value(i).to_string(),
+                ));
+            }
+        }
+    }
+
+    stats_rows.sort_by_key(|r| r.0);
+    assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
+    assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
+    assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
 
     Ok(())
 }
