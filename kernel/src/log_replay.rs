@@ -341,17 +341,16 @@ pub(crate) trait LogReplayProcessor: Sized {
         batch: &dyn EngineData,
         metrics: &ScanMetrics,
     ) -> DeltaResult<Vec<bool>> {
-        let (selection_vector, num_filtered) = match self.data_skipping_filter() {
+        let selection_vector = match self.data_skipping_filter() {
             Some(filter) => {
                 let start = std::time::Instant::now();
-                let result = filter.apply(batch)?;
+                let result = filter.apply(batch, metrics)?;
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
                 metrics.add_data_skipping_time_ns(elapsed_ns);
                 result
             }
-            None => (vec![true; batch.len()], 0), // If no filter is provided, select all rows
+            None => vec![true; batch.len()],
         };
-        metrics.add_data_skipping_filtered(num_filtered);
         Ok(selection_vector)
     }
 

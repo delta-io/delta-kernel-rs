@@ -51,11 +51,6 @@ impl SequentialScanMetadata {
                     .log_with_message("Completed sequential scan metadata");
                 processor.get_metrics().reset_counters();
 
-                // Enable logging on drop for parallel
-                processor
-                    .get_metrics()
-                    .set_log_on_drop("Completed parallel scan metadata");
-
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState { inner: processor }),
                     files,
@@ -90,6 +85,16 @@ impl ParallelLogReplayProcessor for Arc<ParallelState> {
 }
 
 impl ParallelState {
+    /// Log the accumulated metrics from parallel processing.
+    ///
+    /// Call this method when parallel processing is complete to log the final
+    /// metrics accumulated across all workers.
+    pub fn log_parallel_metrics(&self) {
+        self.inner
+            .get_metrics()
+            .log_with_message("Completed parallel scan metadata");
+    }
+
     /// Get the schema to use for reading checkpoint files.
     ///
     /// Returns the checkpoint read schema which may have stats excluded
@@ -108,8 +113,6 @@ impl ParallelState {
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
-        // Disable logging on drop since we're serializing, not completing
-        self.inner.get_metrics().clear_log_on_drop();
         self.inner.into_serializable_state()
     }
 
@@ -126,11 +129,6 @@ impl ParallelState {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        // Enable logging on drop for the reconstructed state. This will include all the metrics
-        // across parallel workers.
-        inner
-            .get_metrics()
-            .set_log_on_drop("Completed parallel scan metadata");
         Ok(Self { inner })
     }
 

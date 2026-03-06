@@ -356,9 +356,10 @@ impl LogReplayScanner {
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.
-            let (selection_vector, _num_filtered) = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
-                None => (vec![true; actions.len()], 0),
+            let metrics = crate::scan::log_replay::ScanMetrics::default();
+            let selection_vector = match &filter {
+                Some(filter) => filter.apply(actions.as_ref(), &metrics)?,
+                None => vec![true; actions.len()],
             };
 
             let mut visitor =

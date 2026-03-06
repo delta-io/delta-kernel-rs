@@ -473,6 +473,9 @@ mod tests {
                     let paths = handle.join().expect("Thread panicked")?;
                     all_paths.extend(paths);
                 }
+
+                // Log metrics after all parallel workers complete
+                final_state.log_parallel_metrics();
             }
         }
 

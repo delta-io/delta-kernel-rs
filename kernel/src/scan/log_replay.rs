@@ -1,7 +1,7 @@
 use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
@@ -366,8 +366,6 @@ pub(crate) struct ScanMetrics {
     dedup_visitor_time_ns: AtomicU64,
     data_skipping_time_ns: AtomicU64,
     partition_pruning_time_ns: AtomicU64,
-    // If set, log metrics on drop with this message
-    log_on_drop_message: Mutex<Option<String>>,
 }
 
 impl Default for ScanMetrics {
@@ -382,7 +380,6 @@ impl Default for ScanMetrics {
             dedup_visitor_time_ns: AtomicU64::new(0),
             data_skipping_time_ns: AtomicU64::new(0),
             partition_pruning_time_ns: AtomicU64::new(0),
-            log_on_drop_message: Mutex::new(None),
         }
     }
 }
@@ -460,30 +457,6 @@ impl ScanMetrics {
             "{}",
             message.as_ref()
         );
-    }
-
-    /// Set the message to log when these metrics are dropped.
-    pub(crate) fn set_log_on_drop(&self, message: impl Into<String>) {
-        if let Ok(mut guard) = self.log_on_drop_message.lock() {
-            *guard = Some(message.into());
-        }
-    }
-
-    /// Clear the log-on-drop message (disables logging on drop).
-    pub(crate) fn clear_log_on_drop(&self) {
-        if let Ok(mut guard) = self.log_on_drop_message.lock() {
-            *guard = None;
-        }
-    }
-}
-
-impl Drop for ScanMetrics {
-    fn drop(&mut self) {
-        if let Ok(guard) = self.log_on_drop_message.lock() {
-            if let Some(message) = guard.as_ref() {
-                self.log_with_message(message);
-            }
-        }
     }
 }
 
