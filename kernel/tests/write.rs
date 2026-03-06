@@ -502,7 +502,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
             ],
         )?;
-        let kernel_schema = Arc::new(StructType::new_unchecked(vec![
+        let engine_schema = Arc::new(StructType::new_unchecked(vec![
             StructField::not_null("myApp", DataType::STRING),
             StructField::not_null("myVersion", DataType::STRING),
             StructField::nullable("operation", DataType::STRING),
@@ -512,7 +512,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("WRITE".to_string())
-            .with_commit_info(Some((Box::new(ArrowEngineData::new(batch)), kernel_schema)));
+            .with_commit_info(Some((Box::new(ArrowEngineData::new(batch)), engine_schema)));
 
         let _ = txn.commit(&engine)?;
 
