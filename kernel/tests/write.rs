@@ -45,7 +45,6 @@ use delta_kernel::schema::{
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
 
-#[cfg(feature = "clustered-table")]
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
@@ -205,7 +204,6 @@ fn set_table_properties(
 
 /// Assert that the snapshot's column mapping mode matches the given `cm_mode` string,
 /// and return the resolved mode.
-#[cfg(feature = "clustered-table")]
 fn assert_column_mapping_mode(snapshot: &Snapshot, cm_mode: &str) -> ColumnMappingMode {
     let expected = match cm_mode {
         "none" => ColumnMappingMode::None,
@@ -3601,7 +3599,6 @@ async fn test_checkpoint_non_kernel_written_table() {
     assert!(has_checkpoint, "Expected at least one checkpoint file");
 }
 
-#[cfg(feature = "clustered-table")]
 struct ClusteredTableSetup {
     _tmp_dir: TempDir,
     table_path: String,
@@ -3611,7 +3608,6 @@ struct ClusteredTableSetup {
 }
 
 /// Creates a clustered table with column mapping and sets table properties.
-#[cfg(feature = "clustered-table")]
 fn setup_clustered_table(
     cm_mode: &str,
     schema: Arc<StructType>,
@@ -3652,7 +3648,6 @@ fn setup_clustered_table(
 /// E2E test: create a clustered table with column mapping, write data, and verify that
 /// add.stats in the commit log contains min/max statistics for the clustering columns
 /// (including a nested column).
-#[cfg(feature = "clustered-table")]
 #[rstest::rstest]
 #[case::cm_none("none")]
 #[case::cm_name("name")]
@@ -3743,7 +3738,6 @@ async fn test_clustered_table_write_has_stats(
 
 /// E2E test: create a clustered table with column mapping, enable writeStatsAsStruct,
 /// write data, checkpoint, and verify stats_parsed.
-#[cfg(feature = "clustered-table")]
 #[rstest::rstest]
 #[case::cm_none("none")]
 #[case::cm_name("name")]

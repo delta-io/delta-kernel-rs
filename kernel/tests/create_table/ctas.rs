@@ -394,8 +394,6 @@ async fn test_ctas_column_mapping_combinations(
 /// source/target column-mapping mode (None/Name/Id) and clustering. Skips
 /// the 9 cases where neither table is clustered (covered by
 /// `test_ctas_column_mapping_combinations`).
-// TODO: Remove the feature gate once clustered table writes are publicly available for all engines.
-#[cfg(feature = "clustered-table")]
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ctas_clustering_and_column_mapping_combinations(
