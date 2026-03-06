@@ -501,29 +501,21 @@ mod tests {
             .unwrap_or_else(|_| panic!("Failed to parse {} value: {}", metric_name, value_str))
     }
 
-    /// Expected metric values for a test case
+    /// Expected metric values for a phase (sequential or parallel)
     #[derive(Debug, Clone)]
     struct ExpectedMetrics {
-        // Sequential phase counter metrics
-        sequential_adds: u64,
-        sequential_removes: u64,
-        sequential_non_file_actions: u64,
-        sequential_data_skipping_filtered: u64,
-        sequential_partition_pruning_filtered: u64,
-
-        // Parallel phase counter metrics (None if parallel phase not expected)
-        parallel_adds_per_run: Option<u64>,
-        parallel_removes_per_run: Option<u64>,
-        parallel_non_file_actions_per_run: Option<u64>,
-        parallel_data_skipping_filtered_per_run: Option<u64>,
-        parallel_partition_pruning_filtered_per_run: Option<u64>,
+        adds: u64,
+        removes: u64,
+        non_file_actions: u64,
+        data_skipping_filtered: u64,
+        partition_pruning_filtered: u64,
     }
 
     fn verify_metrics_in_logs(
         logs: &str,
         table_name: &str,
-        expected: &ExpectedMetrics,
-        num_test_runs: usize,
+        sequential_expected: &ExpectedMetrics,
+        parallel_expected: Option<&ExpectedMetrics>,
     ) {
         // Verify Sequentialmetrics were logged
         assert!(
@@ -540,29 +532,24 @@ mod tests {
         let partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
 
         assert_eq!(
-            sequential_adds, expected.sequential_adds,
-            "Sequentialnum_adds mismatch for {}",
-            table_name
+            sequential_adds, sequential_expected.adds,
+            "Sequential num_adds mismatch"
         );
         assert_eq!(
-            sequential_removes, expected.sequential_removes,
-            "Sequentialnum_removes mismatch for {}",
-            table_name
+            sequential_removes, sequential_expected.removes,
+            "Sequential num_removes mismatch"
         );
         assert_eq!(
-            sequential_non_file_actions, expected.sequential_non_file_actions,
-            "Sequentialnum_non_file_actions mismatch for {}",
-            table_name
+            sequential_non_file_actions, sequential_expected.non_file_actions,
+            "Sequential num_non_file_actions mismatch",
         );
         assert_eq!(
-            data_skipping_filtered, expected.sequential_data_skipping_filtered,
-            "Sequentialdata_skipping_filtered mismatch for {}",
-            table_name
+            data_skipping_filtered, sequential_expected.data_skipping_filtered,
+            "Sequential data_skipping_filtered mismatch",
         );
         assert_eq!(
-            partition_pruning_filtered, expected.sequential_partition_pruning_filtered,
-            "Sequentialpartition_pruning_filtered mismatch for {}",
-            table_name
+            partition_pruning_filtered, sequential_expected.partition_pruning_filtered,
+            "Sequential partition_pruning_filtered mismatch",
         );
 
         // Verify timing metrics are present and parseable
@@ -570,81 +557,53 @@ mod tests {
         let _data_skipping_time = extract_metric(logs, "data_skipping_time_ms");
         let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
 
-        // Verify Parallelmetrics if expected
-        if let Some(expected_adds_per_run) = expected.parallel_adds_per_run {
-            // Extract Parallelcounter values
-            // Note: There may be multiple "Completed Phase 2" logs (from multiple test configurations)
-            // Validate that EVERY Parallellog has the expected counter values
+        // Verify Parallel metrics if expected
+        if let Some(expected) = parallel_expected {
+            // Accumulate totals across all parallel logs
             let mut total_parallel_adds = 0u64;
+            let mut total_parallel_removes = 0u64;
+            let mut total_parallel_non_file_actions = 0u64;
+            let mut total_parallel_data_skipping_filtered = 0u64;
+            let mut total_parallel_partition_pruning_filtered = 0u64;
             let mut search_start = 0;
-            let mut parallel_count = 0;
 
             while let Some(pos) = logs[search_start..].find("Completed parallel scan metadata") {
                 let absolute_pos = search_start + pos;
                 let remaining = &logs[absolute_pos..];
-                parallel_count += 1;
 
-                // Extract and validate num_adds
-                let adds = extract_metric(remaining, "num_adds");
-                total_parallel_adds += adds;
-                assert_eq!(
-                    adds, expected_adds_per_run,
-                    "Parallellog #{} num_adds mismatch for {}",
-                    parallel_count, table_name
-                );
-
-                // Extract and validate num_removes
-                let removes = extract_metric(remaining, "num_removes");
-                assert_eq!(
-                    removes,
-                    expected.parallel_removes_per_run.unwrap(),
-                    "Parallellog #{} num_removes mismatch for {}",
-                    parallel_count,
-                    table_name
-                );
-
-                // Extract and validate num_non_file_actions
-                let non_file_actions = extract_metric(remaining, "num_non_file_actions");
-                assert_eq!(
-                    non_file_actions,
-                    expected.parallel_non_file_actions_per_run.unwrap(),
-                    "Parallellog #{} num_non_file_actions mismatch for {}",
-                    parallel_count,
-                    table_name
-                );
-
-                // Extract and validate data_skipping_filtered
-                let data_skipping_filtered = extract_metric(remaining, "data_skipping_filtered");
-                assert_eq!(
-                    data_skipping_filtered,
-                    expected.parallel_data_skipping_filtered_per_run.unwrap(),
-                    "Parallellog #{} data_skipping_filtered mismatch for {}",
-                    parallel_count,
-                    table_name
-                );
-
-                // Extract and validate partition_pruning_filtered
-                let partition_pruning_filtered =
+                // Extract and accumulate metrics
+                total_parallel_adds += extract_metric(remaining, "num_adds");
+                total_parallel_removes += extract_metric(remaining, "num_removes");
+                total_parallel_non_file_actions +=
+                    extract_metric(remaining, "num_non_file_actions");
+                total_parallel_data_skipping_filtered +=
+                    extract_metric(remaining, "data_skipping_filtered");
+                total_parallel_partition_pruning_filtered +=
                     extract_metric(remaining, "partition_pruning_filtered");
-                assert_eq!(
-                    partition_pruning_filtered,
-                    expected
-                        .parallel_partition_pruning_filtered_per_run
-                        .unwrap(),
-                    "Parallellog #{} partition_pruning_filtered mismatch for {}",
-                    parallel_count,
-                    table_name
-                );
 
                 search_start = absolute_pos + 1;
             }
 
-            // Verify total adds across all Parallelruns
-            let expected_total = expected_adds_per_run * num_test_runs as u64;
+            // Verify accumulated totals match expected values
             assert_eq!(
-                total_parallel_adds, expected_total,
-                "Expected total of {} adds across all Parallelruns for {} ({} runs × {} adds each), found: {}",
-                expected_total, table_name, num_test_runs, expected_adds_per_run, total_parallel_adds
+                total_parallel_adds, expected.adds,
+                "Parallel num_adds mismatch"
+            );
+            assert_eq!(
+                total_parallel_removes, expected.removes,
+                "Parallel num_removes mismatch"
+            );
+            assert_eq!(
+                total_parallel_non_file_actions, expected.non_file_actions,
+                "Parallel num_non_file_actions mismatch"
+            );
+            assert_eq!(
+                total_parallel_data_skipping_filtered, expected.data_skipping_filtered,
+                "Parallel data_skipping_filtered mismatch"
+            );
+            assert_eq!(
+                total_parallel_partition_pruning_filtered, expected.partition_pruning_filtered,
+                "Parallel partition_pruning_filtered mismatch"
             );
         }
     }
@@ -661,76 +620,260 @@ mod tests {
         "v2-checkpoints-json-with-sidecars",
         None,
         ExpectedMetrics {
-            sequential_adds: 0,
-            sequential_removes: 0,
-            sequential_non_file_actions: 5,
-            sequential_data_skipping_filtered: 0,
-            sequential_partition_pruning_filtered: 0,
-            parallel_adds_per_run: Some(101),
-            parallel_removes_per_run: Some(0),
-            parallel_non_file_actions_per_run: Some(0),
-            parallel_data_skipping_filtered_per_run: Some(0),
-            parallel_partition_pruning_filtered_per_run: Some(0),
-        }
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 101,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        })
     )]
     #[case::parquet_sidecars(
         "v2-checkpoints-parquet-with-sidecars",
         None,
         ExpectedMetrics {
-            sequential_adds: 0,
-            sequential_removes: 0,
-            sequential_non_file_actions: 5,
-            sequential_data_skipping_filtered: 0,
-            sequential_partition_pruning_filtered: 0,
-            parallel_adds_per_run: Some(101),
-            parallel_removes_per_run: Some(0),
-            parallel_non_file_actions_per_run: Some(0),
-            parallel_data_skipping_filtered_per_run: Some(0),
-            parallel_partition_pruning_filtered_per_run: Some(0),
-        }
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 101,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        })
     )]
-    #[case::json_sidecars_with_predicate(
+    #[case::json_sidecars_with_predicate_gt_20(
         "v2-checkpoints-json-with-sidecars",
         Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
         }),
         ExpectedMetrics {
-            sequential_adds: 0,
-            sequential_removes: 0,
-            sequential_non_file_actions: 5,
-            sequential_data_skipping_filtered: 0,
-            sequential_partition_pruning_filtered: 0,
-            // Data skipping predicate filters 4 files (101 → 97)
-            parallel_adds_per_run: Some(97),
-            parallel_removes_per_run: Some(0),
-            parallel_non_file_actions_per_run: Some(0),
-            parallel_data_skipping_filtered_per_run: Some(4),
-            parallel_partition_pruning_filtered_per_run: Some(0),
-        }
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        // Data skipping predicate filters 4 files (101 → 97)
+        Some(ExpectedMetrics {
+            adds: 97,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 4,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::json_sidecars_with_predicate_gt_80(
+        "v2-checkpoints-json-with-sidecars",
+        Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(80i64)))
+        }),
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 86,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 15,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::json_sidecars_with_predicate_lt_10(
+        "v2-checkpoints-json-with-sidecars",
+        Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::lt(column_expr!("id"), Expr::literal(10i64)))
+        }),
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 32,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 69,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::parquet_sidecars_with_predicate(
+        "v2-checkpoints-parquet-with-sidecars",
+        Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+        }),
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 97,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 4,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::json_sidecars_with_very_selective_predicate(
+        "v2-checkpoints-json-with-sidecars",
+        Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            // Highly selective predicate
+            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(99i64)))
+        }),
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 5,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 69,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 32,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::json_without_sidecars(
+        "v2-checkpoints-json-without-sidecars",
+        None,
+        ExpectedMetrics {
+            adds: 3,
+            removes: 0,
+            non_file_actions: 4,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        None
+    )]
+    #[case::json_with_last_checkpoint(
+        "v2-checkpoints-json-with-last-checkpoint",
+        None,
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 4,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 2,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::parquet_without_sidecars(
+        "v2-checkpoints-parquet-without-sidecars",
+        None,
+        ExpectedMetrics {
+            adds: 3,
+            removes: 0,
+            non_file_actions: 4,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        None
+    )]
+    #[case::parquet_with_last_checkpoint(
+        "v2-checkpoints-parquet-with-last-checkpoint",
+        None,
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 4,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 2,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::v2_classic_json(
+        "v2-classic-checkpoint-json",
+        None,
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 4,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 4,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        })
+    )]
+    #[case::v2_classic_parquet(
+        "v2-classic-checkpoint-parquet",
+        None,
+        ExpectedMetrics {
+            adds: 0,
+            removes: 0,
+            non_file_actions: 4,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        Some(ExpectedMetrics {
+            adds: 4,
+            removes: 0,
+            non_file_actions: 0,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        })
     )]
     #[case::no_parallel_needed(
         "table-without-dv-small",
         None,
         ExpectedMetrics {
-            // This table has single-part checkpoint, completes in Phase 1
-            sequential_adds: 1,
-            sequential_removes: 0,
-            sequential_non_file_actions: 3,
-            sequential_data_skipping_filtered: 0,
-            sequential_partition_pruning_filtered: 0,
-            // No Parallelneeded
-            parallel_adds_per_run: None,
-            parallel_removes_per_run: None,
-            parallel_non_file_actions_per_run: None,
-            parallel_data_skipping_filtered_per_run: None,
-            parallel_partition_pruning_filtered_per_run: None,
-        }
+            // This table has single-part checkpoint, completes in sequential phase
+            adds: 1,
+            removes: 0,
+            non_file_actions: 3,
+            data_skipping_filtered: 0,
+            partition_pruning_filtered: 0,
+        },
+        // No parallel phase needed
+        None
     )]
     fn test_parallel_workflow_with_metrics(
         #[case] table_name: &str,
         #[case] predicate: Option<PredicateRef>,
-        #[case] expected: ExpectedMetrics,
+        #[case] sequential_expected: ExpectedMetrics,
+        #[case] parallel_expected: Option<ExpectedMetrics>,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
     ) -> DeltaResult<()> {
@@ -752,7 +895,12 @@ mod tests {
 
         // Verify metrics were logged
         let logs = logging_test.logs();
-        verify_metrics_in_logs(&logs, table_name, &expected, 1);
+        verify_metrics_in_logs(
+            &logs,
+            table_name,
+            &sequential_expected,
+            parallel_expected.as_ref(),
+        );
 
         Ok(())
     }
