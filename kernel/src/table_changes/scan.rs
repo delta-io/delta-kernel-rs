@@ -11,7 +11,7 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::PhysicalPredicate;
 use crate::scan::StatsOutputMode;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
@@ -263,7 +263,12 @@ fn read_scan_file(
     let location = table_root.join(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
-        size: 0, // TODO: use the actual size of the file
+        size: match scan_file.size {
+            Some(s) => s
+                .try_into()
+                .map_err(|_| Error::generic(format!("invalid file size: {s}")))?,
+            None => 0,
+        },
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
