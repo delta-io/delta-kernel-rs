@@ -23,9 +23,8 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, validate_schema_column_mapping, ColumnMappingMode,
-    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, ColumnMappingMode, FeatureType, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
@@ -296,7 +295,6 @@ fn maybe_apply_column_mapping_for_table_create(
             // Transform schema: assign IDs and physical names to all fields
             let mut max_id = 0i64;
             let transformed_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
-            validate_schema_column_mapping(&transformed_schema, column_mapping_mode)?;
 
             // Add maxColumnId to properties
             validated
