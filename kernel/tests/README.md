@@ -2,8 +2,8 @@
 
 Test tables organized by feature area. Tables live in two locations:
 
-- **`data/`** -- Directory-based tables and `.tar.zst` archives
-- **`golden_data/`** -- `.tar.zst` archives loaded by `golden_test!`, `negative_test!`, or `skip_test!` macros in `golden_tables.rs`
+- **`data/`** -- Tables used by specific, targeted tests. Either unpacked directories or `.tar.zst` archives that individual test files decompress on the fly.
+- **`golden_data/`** -- Tables from the [Delta compatibility suite](https://github.com/delta-io/delta/tree/master/connectors/golden-tables). These are `.tar.zst` archives loaded by the `golden_test!`, `negative_test!`, or `skip_test!` macros in `golden_tables.rs`, which run a standard read-and-compare flow against each table.
 
 ## Deletion Vectors
 
@@ -89,7 +89,7 @@ The golden V2 checkpoint tables have a different protocol (v1/v2, no table featu
 | `parsed-stats` | data/ | `id: long, name: string, age: long, salary: long` | v1/v2 | `checkpointInterval=3` | 100 rows. Checkpoint at v3 with `stats_parsed` columns. | `scan/tests.rs::test_scan_metadata_with_stats_columns/test_data_skipping_with_parsed_stats/test_scan_metadata_stats_columns_with_predicate/test_prefix_columns_simple/test_build_actions_meta_predicate_with_predicate/test_build_actions_meta_predicate_no_predicate/test_build_actions_meta_predicate_static_skip_all/test_skip_stats_disables_data_skipping/test_skip_stats_and_include_stats_columns_errors` |
 | `parquet_row_group_skipping` | data/ | `bool, chrono{date32,timestamp,timestamp_ntz}, numeric{decimals{...},floats{...},ints{...}}, varlen{binary,utf8}` | v3/v7 | r:`timestampNtz` w:`timestampNtz`, `dataSkippingNumIndexedCols=0` | Deep nested structs, all types. Delta stats disabled; tests parquet-level row group skipping. | `read.rs::predicate_references_invalid_missing_column`, `scan/tests.rs::test_replay_for_scan_metadata/test_data_row_group_skipping/test_missing_column_row_group_skipping`, `set_transaction.rs::test_replay_for_app_ids`, `parquet_row_group_skipping/tests.rs`, `protocol_metadata_replay.rs` |
 | `mixed-nulls` | data/ | `id: long, part: long, value: string, n: string` partitioned by `part` | v1/v2 | | part=0: `n` all null. part=1: no nulls. part=2: mixed nulls. | `read.rs::mixed_null/mixed_not_null` |
-| `stats-writing-all-types` | data/ (under `delta/`) | 16 columns: all primitives + array, map, nested struct | v3/v7 | r:`timestampNtz,columnMapping` w:`timestampNtz,columnMapping`, `columnMapping.mode=name` | Verifies stats collection matches Spark output | `default/stats.rs::test_collect_stats_matches_spark` |
+| `stats-writing-all-types` | data/stats-writing-all-types/delta/ | 16 columns: all primitives + array, map, nested struct | v3/v7 | r:`timestampNtz,columnMapping` w:`timestampNtz,columnMapping`, `columnMapping.mode=name` | Verifies stats collection matches Spark output | `default/stats.rs::test_collect_stats_matches_spark` |
 | `data-skipping-basic-stats-all-types` | golden_data/ | `as_int: int, as_long: long, as_byte: byte, as_short: short, as_float: float, as_double: double, as_string: string, as_date: date, as_timestamp: timestamp, as_big_decimal: decimal(1,0)` | v1/v2 | | Basic stats for all types | `golden_tables.rs::golden_test!` |
 | `data-skipping-basic-stats-all-types-checkpoint` | golden_data/ | `as_int: int, as_long: long, as_byte: byte, as_short: short, as_float: float, as_double: double, as_string: string, as_date: date, as_timestamp: timestamp, as_big_decimal: decimal(1,0)` | v1/v2 | `checkpointInterval=1` | Stats from checkpoint | `golden_tables.rs::golden_test!` |
 | `data-skipping-basic-stats-all-types-columnmapping-id` | golden_data/ | `as_int: int, as_long: long, as_byte: byte, as_short: short, as_float: float, as_double: double, as_string: string, as_date: date, as_timestamp: timestamp, as_big_decimal: decimal(1,0)` | v2/v5 | `columnMapping.mode=id` | Stats with CM id mode (not supported) | `golden_tables.rs::skip_test!` |
