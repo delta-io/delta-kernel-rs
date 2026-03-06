@@ -1917,7 +1917,6 @@ mod test {
         );
     }
 
-    #[cfg(feature = "clustered-table")]
     #[test]
     fn test_clustered_table_writes() {
         // ClusteredTable requires DomainMetadata to be supported
@@ -1928,20 +1927,6 @@ mod test {
         assert!(
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
-        );
-    }
-
-    #[cfg(not(feature = "clustered-table"))]
-    #[test]
-    fn test_clustered_table_writes_not_supported() {
-        // Without the clustered-table feature, writes to clustered tables should fail
-        let config = create_mock_table_config(
-            &[],
-            &[TableFeature::ClusteredTable, TableFeature::DomainMetadata],
-        );
-        assert!(
-            config.ensure_operation_supported(Operation::Write).is_err(),
-            "ClusteredTable should not be supported for writes without feature flag"
         );
     }
 }
