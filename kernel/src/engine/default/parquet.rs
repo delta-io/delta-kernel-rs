@@ -651,7 +651,10 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_values = HashMap::from([("partition1".to_string(), "a".to_string()), ("empty_partition".to_string(), "".to_string())]);
+        let partition_values = HashMap::from([
+            ("partition1".to_string(), "a".to_string()),
+            ("empty_partition".to_string(), "".to_string()),
+        ]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
@@ -667,7 +670,9 @@ mod tests {
             StringBuilder::new(),
         );
 
-        partition_values_builder.keys().append_value("empty_partition");
+        partition_values_builder
+            .keys()
+            .append_value("empty_partition");
         partition_values_builder.values().append_null(); // empty string should go to null
         partition_values_builder.keys().append_value("partition1");
         partition_values_builder.values().append_value("a");
