@@ -1026,7 +1026,8 @@ impl StructType {
         self
     }
 
-    /// Returns a new [`StructType`] containing only the fields for which `predicate` returns `true`.
+    /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
+    /// returns `true`. This does not recurse into nested [`StructType`] fields.
     pub fn with_fields_filtered(
         &self,
         predicate: impl Fn(&StructField) -> bool,

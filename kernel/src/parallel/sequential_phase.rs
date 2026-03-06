@@ -110,7 +110,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
-        let checkpoint_manifest_phase = match log_segment.checkpoint_parts.as_slice() {
+        let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
             [single_part] => Some(CheckpointManifestReader::try_new(
                 engine,
                 single_part,
@@ -120,6 +120,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         };
 
         let checkpoint_parts = log_segment
+            .listed
             .checkpoint_parts
             .iter()
             .map(|path| path.location.clone())
@@ -205,7 +206,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::AfterPhase1ScanMetadata;
+    use crate::scan::AfterSequentialScanMetadata;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
@@ -239,14 +240,14 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = sequential.finish()?;
         match (expected_sidecars, result) {
-            (sidecars, AfterPhase1ScanMetadata::Done(_)) => {
+            (sidecars, AfterSequentialScanMetadata::Done) => {
                 assert!(
                     sidecars.is_empty(),
                     "Expected Done but got sidecars {:?}",
                     sidecars
                 );
             }
-            (expected_sidecars, AfterSequential::Parallel { files, .. }) => {
+            (expected_sidecars, AfterSequentialScanMetadata::Parallel { files, .. }) => {
                 assert_eq!(
                     files.len(),
                     expected_sidecars.len(),
