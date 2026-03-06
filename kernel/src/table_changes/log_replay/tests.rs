@@ -131,7 +131,7 @@ fn get_segment(
         start_version,
         end_version,
     )?;
-    Ok(log_segment.ascending_commit_files)
+    Ok(log_segment.listed.ascending_commit_files)
 }
 
 fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>) -> Vec<bool> {

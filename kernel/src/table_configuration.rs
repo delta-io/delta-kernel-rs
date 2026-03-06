@@ -18,7 +18,7 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform, StatsConfig,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
@@ -276,6 +276,38 @@ impl TableConfiguration {
             data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
         };
         stats_column_names(&self.physical_schema(), &config, required_columns)
+    }
+
+    /// Returns the physical partition schema for `partitionValues_parsed`.
+    ///
+    /// Field names are physical column names (respecting column mapping mode),
+    /// and field types are the actual partition column data types with their original nullability.
+    /// Returns `None` if the table has no partition columns.
+    pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
+        let partition_columns = self.metadata().partition_columns();
+        if partition_columns.is_empty() {
+            return None;
+        }
+        let logical_schema = self.logical_schema();
+        let column_mapping_mode = self.column_mapping_mode();
+        let partition_fields: Vec<StructField> = partition_columns
+            .iter()
+            .filter_map(|col_name| {
+                let field = logical_schema.field(col_name);
+                if field.is_none() {
+                    warn!("Partition column '{col_name}' not found in table schema");
+                }
+                field
+            })
+            .map(|field: &StructField| {
+                StructField::new(
+                    field.physical_name(column_mapping_mode).to_owned(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
+            .collect();
+        Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
     /// Returns the logical schema for data columns (excludes partition columns).
