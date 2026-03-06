@@ -14,7 +14,7 @@ pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) ->
     let protocol = tc.protocol();
     if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
         let mut uses_timestamp_ntz = UsesTimestampNtz(false);
-        let _ = uses_timestamp_ntz.transform_struct(&tc.schema());
+        let _ = uses_timestamp_ntz.transform_struct(&tc.logical_schema());
         require!(
             !uses_timestamp_ntz.0,
             Error::unsupported(

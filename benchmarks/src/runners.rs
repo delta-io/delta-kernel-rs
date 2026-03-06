@@ -7,9 +7,8 @@
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
-use delta_kernel::parallel::parallel_phase::ParallelPhase;
-use delta_kernel::parallel::sequential_phase::AfterSequential;
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::Snapshot;
 use delta_kernel::{try_parse_uri, Engine, Error};
 
 use std::hint::black_box;
@@ -83,8 +82,8 @@ impl ReadMetadataRunner {
         }
 
         match phase1.finish()? {
-            AfterSequential::Done(_) => {}
-            AfterSequential::Parallel { processor, files } => {
+            AfterSequentialScanMetadata::Done => {}
+            AfterSequentialScanMetadata::Parallel { state, files } => {
                 if num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
@@ -95,13 +94,13 @@ impl ReadMetadataRunner {
                     .map(|chunk| chunk.to_vec())
                     .collect();
 
-                let processor = Arc::new(processor);
+                let state = Arc::new(*state);
 
                 let handles: Vec<_> = partitions
                     .into_iter()
                     .map(|partition_files| {
                         let engine = self.engine.clone();
-                        let processor = processor.clone();
+                        let state = state.clone();
 
                         thread::spawn(move || -> Result<(), Error> {
                             if partition_files.is_empty() {
@@ -109,7 +108,7 @@ impl ReadMetadataRunner {
                             }
 
                             let parallel =
-                                ParallelPhase::try_new(engine, processor, partition_files)?;
+                                ParallelScanMetadata::try_new(engine, state, partition_files)?;
                             for result in parallel {
                                 black_box(result?);
                             }

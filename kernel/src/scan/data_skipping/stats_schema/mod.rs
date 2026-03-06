@@ -16,6 +16,7 @@ use crate::{
 };
 
 use column_filter::StatsColumnFilter;
+pub(crate) use column_filter::StatsConfig;
 
 /// Generates the expected schema for file statistics.
 ///
@@ -125,8 +126,11 @@ pub(crate) fn expected_stats_schema(
     // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
     // - always include required columns (e.g. clustering columns, per Delta protocol)
     // - optionally filter output to only requested columns
-    let mut base_transform =
-        BaseStatsTransform::new(table_properties, required_columns, requested_columns);
+    let config = StatsConfig {
+        data_skipping_stats_columns: table_properties.data_skipping_stats_columns.as_deref(),
+        data_skipping_num_indexed_cols: table_properties.data_skipping_num_indexed_cols,
+    };
+    let mut base_transform = BaseStatsTransform::new(&config, required_columns, requested_columns);
     if let Some(base_schema) = base_transform.transform_struct(logical_data_schema) {
         let base_schema = base_schema.into_owned();
 
@@ -155,7 +159,7 @@ pub(crate) fn expected_stats_schema(
     StructType::try_new(fields)
 }
 
-/// Returns the list of logical column names that should have statistics collected.
+/// Returns the column names that should have statistics collected.
 ///
 /// This extracts just the column names without building the full stats schema,
 /// making it more efficient when only the column list is needed.
@@ -165,13 +169,13 @@ pub(crate) fn expected_stats_schema(
 /// `delta.dataSkippingNumIndexedCols` settings.
 #[allow(unused)]
 pub(crate) fn stats_column_names(
-    logical_data_schema: &Schema,
-    table_properties: &TableProperties,
+    data_schema: &Schema,
+    config: &StatsConfig<'_>,
     required_columns: Option<&[ColumnName]>,
 ) -> Vec<ColumnName> {
-    let mut filter = StatsColumnFilter::new(table_properties, required_columns, None);
+    let mut filter = StatsColumnFilter::new(config, required_columns, None);
     let mut columns = Vec::new();
-    filter.collect_columns(logical_data_schema, &mut columns);
+    filter.collect_columns(data_schema, &mut columns);
     columns
 }
 
@@ -255,12 +259,12 @@ struct BaseStatsTransform<'col> {
 impl<'col> BaseStatsTransform<'col> {
     #[allow(unused)]
     fn new(
-        props: &'col TableProperties,
+        config: &StatsConfig<'col>,
         required_columns: Option<&'col [ColumnName]>,
         requested_columns: Option<&'col [ColumnName]>,
     ) -> Self {
         Self {
-            filter: StatsColumnFilter::new(props, required_columns, requested_columns),
+            filter: StatsColumnFilter::new(config, required_columns, requested_columns),
         }
     }
 }
@@ -800,7 +804,11 @@ mod tests {
             StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let config = StatsConfig {
+            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
+        };
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // With default settings, all leaf columns should be included
         assert_eq!(
@@ -828,7 +836,11 @@ mod tests {
             StructField::nullable("d", DataType::DOUBLE),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let config = StatsConfig {
+            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
+        };
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // Only first 2 columns should be included
         assert_eq!(
@@ -855,7 +867,11 @@ mod tests {
             StructField::nullable("extra", DataType::STRING),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let config = StatsConfig {
+            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
+        };
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // Only specified columns should be included (user.name and extra excluded)
         assert_eq!(
@@ -885,7 +901,11 @@ mod tests {
             StructField::nullable("name", DataType::STRING),
         ]);
 
-        let columns = stats_column_names(&file_schema, &properties, None);
+        let config = StatsConfig {
+            data_skipping_stats_columns: properties.data_skipping_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: properties.data_skipping_num_indexed_cols,
+        };
+        let columns = stats_column_names(&file_schema, &config, None);
 
         // Array and Map types should be excluded
         assert_eq!(

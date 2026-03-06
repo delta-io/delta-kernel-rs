@@ -3,6 +3,8 @@
 //! This module provides:
 //! - Read-side: Mode detection and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
+use itertools::Itertools;
+
 use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
@@ -53,7 +55,7 @@ pub(crate) fn column_mapping_mode(
 
 /// Validates that the schema annotations are consistent with the column mapping mode.
 pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
-    validate_schema_column_mapping(&tc.schema(), tc.column_mapping_mode())
+    validate_schema_column_mapping(&tc.logical_schema(), tc.column_mapping_mode())
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
@@ -344,6 +346,72 @@ pub(crate) fn get_any_level_column_physical_name(
     Ok(ColumnName::new(physical_path))
 }
 
+/// Translates a batch of physical [`ColumnName`]s back to logical. Supports nested columns.
+///
+/// The `logical_schema` must be a **logical** schema whose fields carry the
+/// `delta.columnMapping.physicalName` and `delta.columnMapping.id` metadata when column mapping is enabled.
+///
+/// This is the batch reverse of [`get_any_level_column_physical_name`]. It pre-builds a flat
+/// `HashMap<physical_name, logical_name>` at each schema depth (up to the deepest [`ColumnName`] in `physical_cols`),
+/// so every level of every [`ColumnName`] resolves in O(1).
+pub(crate) fn get_any_level_columns_logical_names(
+    logical_schema: &StructType,
+    physical_cols: &[ColumnName],
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<Vec<ColumnName>> {
+    if column_mapping_mode == ColumnMappingMode::None {
+        return Ok(physical_cols.to_vec());
+    }
+
+    let max_depth = physical_cols
+        .iter()
+        .map(|c| c.path().len())
+        .max()
+        .unwrap_or(0);
+
+    // Build one physical->logical map per level
+    let mut physical_to_logical_on_level: Vec<HashMap<&str, &str>> = Vec::with_capacity(max_depth);
+    let mut current_level_structs: Vec<&StructType> = vec![logical_schema];
+    for _ in 0..max_depth {
+        let mut physical_to_logical = HashMap::new();
+        let mut next_level_structs = Vec::new();
+        for s in &current_level_structs {
+            for f in s.fields() {
+                physical_to_logical.insert(f.physical_name(column_mapping_mode), f.name.as_str());
+                if let DataType::Struct(inner) = f.data_type() {
+                    next_level_structs.push(inner.as_ref());
+                }
+            }
+        }
+        physical_to_logical_on_level.push(physical_to_logical);
+        current_level_structs = next_level_structs;
+    }
+
+    physical_cols
+        .iter()
+        .map(|col| {
+            let logical: Vec<&str> = col
+                .path()
+                .iter()
+                .enumerate()
+                .map(|(depth, field_name_physical)| {
+                    let field_name_physical: &str = field_name_physical;
+                    physical_to_logical_on_level[depth]
+                        .get(field_name_physical)
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::generic(format!(
+                                "Could not resolve physical column '{col}': \
+                             no field with physical name '{field_name_physical}' found in schema",
+                            ))
+                        })
+                })
+                .try_collect()?;
+            Ok(ColumnName::new(logical))
+        })
+        .try_collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +419,8 @@ mod tests {
     use crate::schema::{DataType, StructType};
     use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
+
+    use crate::utils::test_utils::test_schema_nested_with_column_mapping;
 
     #[test]
     fn test_column_mapping_mode() {
@@ -1050,6 +1120,41 @@ mod tests {
         assert!(
             err.contains(expected_err),
             "Expected error containing '{expected_err}', got: {err}"
+        );
+    }
+    #[test]
+    fn test_get_any_level_columns_logical_names_success() {
+        let schema = test_schema_nested_with_column_mapping();
+
+        // Batch: top-level + nested in one call
+        let physical = vec![
+            ColumnName::new(["phys_id"]),
+            ColumnName::new(["phys_info", "phys_name"]),
+        ];
+        let result =
+            get_any_level_columns_logical_names(&schema, &physical, ColumnMappingMode::Name)
+                .unwrap();
+        assert_eq!(result[0], ColumnName::new(["id"]));
+        assert_eq!(result[1], ColumnName::new(["info", "name"]));
+
+        // Mode::None returns input unchanged
+        let result =
+            get_any_level_columns_logical_names(&schema, &physical, ColumnMappingMode::None)
+                .unwrap();
+        assert_eq!(result, physical);
+    }
+
+    #[test]
+    fn test_get_any_level_columns_logical_names_missing() {
+        let schema = test_schema_nested_with_column_mapping();
+
+        let physical = vec![ColumnName::new(["phys_info", "nonexistent"])];
+        let err = get_any_level_columns_logical_names(&schema, &physical, ColumnMappingMode::Name)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nonexistent"),
+            "Expected error mentioning the missing physical name, got: {err}"
         );
     }
 }

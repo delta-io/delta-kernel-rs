@@ -91,7 +91,12 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            builder.values().append_value(v);
+            if v.is_empty() {
+                // convert empty string to null as per the Delta Spec
+                builder.values().append_null();
+            } else {
+                builder.values().append_value(v);
+            }
         }
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
@@ -625,8 +630,8 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
-    #[test]
-    fn test_as_record_batch() {
+    #[rstest::rstest]
+    fn test_as_record_batch(#[values(true, false)] test_empty_str: bool) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
@@ -646,7 +651,12 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
+        let partition_value = if test_empty_str {
+            "".to_string()
+        } else {
+            "a".to_string()
+        };
+        let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
@@ -661,8 +671,13 @@ mod tests {
             StringBuilder::new(),
             StringBuilder::new(),
         );
+
         partition_values_builder.keys().append_value("partition1");
-        partition_values_builder.values().append_value("a");
+        if test_empty_str {
+            partition_values_builder.values().append_null(); // empty string should go to null
+        } else {
+            partition_values_builder.values().append_value("a");
+        }
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
 
@@ -871,46 +886,6 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 3);
         assert_eq!(data[0].num_columns(), 2);
-    }
-
-    #[test]
-    fn test_read_parquet_footer() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
-        ))
-        .unwrap();
-        let file_size = std::fs::metadata(&path).unwrap().len();
-        let url = Url::from_file_path(path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let footer = handler.read_parquet_footer(&file_meta).unwrap();
-        crate::utils::test_utils::validate_checkpoint_schema(&footer.schema);
-    }
-
-    #[test]
-    fn test_read_parquet_footer_invalid_file() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
-        let mut temp_path = std::env::temp_dir();
-        temp_path.push("non_existent_file_for_test.parquet");
-        let url = Url::from_file_path(temp_path).unwrap();
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: 0,
-        };
-
-        let result = handler.read_parquet_footer(&file_meta);
-        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[tokio::test]
@@ -1191,224 +1166,6 @@ mod tests {
         assert_eq!(decimal_col.value(4), 56789i128);
         assert_eq!(decimal_col.precision(), 10);
         assert_eq!(decimal_col.scale(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_parquet_handler_trait_write_overwrite_true() {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
-
-        let file_url = Url::parse("memory:///overwrite_test/data.parquet").unwrap();
-
-        // Create first data set
-        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "value",
-                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-        let data_iter1: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
-            Box::new(std::iter::once(Ok(engine_data1)));
-
-        // Write the first file
-        parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter1)
-            .unwrap();
-
-        // Create second data set with different data
-        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "value",
-                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-        let data_iter2: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
-            Box::new(std::iter::once(Ok(engine_data2)));
-
-        // Overwrite with second file (overwrite=true)
-        parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter2)
-            .unwrap();
-
-        // Read back and verify it contains the second data set
-        let path = Path::from_url_path(file_url.path()).unwrap();
-        let metadata = store.head(&path).await.unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
-        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .unwrap()
-            .schema()
-            .clone();
-
-        let file_meta = FileMeta {
-            location: file_url,
-            last_modified: 0,
-            size: metadata.size,
-        };
-
-        let data: Vec<RecordBatch> = parquet_handler
-            .read_parquet_files(
-                slice::from_ref(&file_meta),
-                Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
-            )
-            .unwrap()
-            .map(into_record_batch)
-            .try_collect()
-            .unwrap();
-
-        // Verify we have the second data set (2 rows, not 3)
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].num_rows(), 2);
-        let value_col = data[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(value_col.values(), &[10, 20]);
-    }
-
-    #[tokio::test]
-    async fn test_parquet_handler_trait_write_always_overwrites() {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
-
-        let file_url = Url::parse("memory:///no_overwrite_test/data.parquet").unwrap();
-
-        // Create first data set
-        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "value",
-                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-        let data_iter1: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
-            Box::new(std::iter::once(Ok(engine_data1)));
-
-        // Write the first file
-        parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter1)
-            .unwrap();
-
-        // Create second data set
-        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "value",
-                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
-            )])
-            .unwrap(),
-        ));
-        let data_iter2: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
-            Box::new(std::iter::once(Ok(engine_data2)));
-
-        // Write again - should overwrite successfully (new behavior always overwrites)
-        parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter2)
-            .unwrap();
-
-        // Verify the file was overwritten with the new data
-        let path = Path::from_url_path(file_url.path()).unwrap();
-        let metadata = store.head(&path).await.unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
-        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .unwrap()
-            .schema()
-            .clone();
-
-        let file_meta = FileMeta {
-            location: file_url,
-            last_modified: 0,
-            size: metadata.size,
-        };
-
-        let data: Vec<RecordBatch> = parquet_handler
-            .read_parquet_files(
-                slice::from_ref(&file_meta),
-                Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
-            )
-            .unwrap()
-            .map(into_record_batch)
-            .try_collect()
-            .unwrap();
-
-        // Verify we now have the second data set (2 rows)
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].num_rows(), 2);
-        let value_col = data[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(value_col.values(), &[10, 20]);
-    }
-
-    #[test]
-    fn test_read_parquet_footer_preserves_field_ids() {
-        // Create Arrow schema with field IDs in metadata
-        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-        );
-        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-        );
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
-
-        // Write a parquet file with this schema
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_field_ids.parquet");
-
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let file = std::fs::File::create(&file_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        // Read footer and verify schema
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
-        let file_size = std::fs::metadata(&file_path).unwrap().len();
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let footer = handler.read_parquet_footer(&file_meta).unwrap();
-
-        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
-        // The field IDs should be accessible using get_config_value (the documented API)
-        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        let id_value = id_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
-        assert!(id_value.is_some(), "Field ID should be present");
-        assert_eq!(id_value.unwrap().to_string(), "1");
-
-        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        let name_value =
-            name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
-        assert!(name_value.is_some(), "Field ID should be present");
-        assert_eq!(name_value.unwrap().to_string(), "2");
     }
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.

@@ -19,11 +19,11 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
-use crate::parallel::parallel_phase::ParallelPhase;
-use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
+use crate::log_segment_files::LogSegmentFiles;
+use crate::parallel::sequential_phase::SequentialPhase;
+use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -40,9 +40,6 @@ pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
-
-// Re-export types for public API
-pub use log_replay::ScanLogReplayProcessor;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -63,8 +60,8 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
 
 /// Checkpoint schema WITHOUT stats for column projection pushdown.
-/// When stats are skipped, we use this schema to avoid reading the stats column from parquet.
-static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+/// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
+pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
     let fields_no_stats: Vec<_> = add_schema
         .fields()
@@ -78,31 +75,10 @@ static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-/// Type alias for the sequential (Phase 1) scan metadata processing.
-///
-/// This phase processes commits and single-part checkpoint manifests sequentially.
-/// After exhaustion, call `finish()` to get the result which indicates whether
-/// a distributed phase is needed.
-#[internal_api]
 #[allow(unused)]
-pub(crate) type Phase1ScanMetadata = SequentialPhase<ScanLogReplayProcessor>;
-
-/// Type alias for the distributed (Phase 2) scan metadata processing.
-///
-/// This phase processes checkpoint sidecars or multi-part checkpoint parts in parallel.
-/// Create this phase from the files contained in [`AfterPhase1ScanMetadata::Parallel`].
-#[internal_api]
-#[allow(unused)]
-pub(crate) type Phase2ScanMetadata<P> = ParallelPhase<P>;
-
-/// Type alias for the result after Phase 1 scan metadata processing completes.
-///
-/// This enum indicates whether distributed processing is needed:
-/// - `Done`: All processing completed sequentially - no distributed phase needed.
-/// - `Parallel`: Contains processor and files for parallel processing.
-#[internal_api]
-#[allow(unused)]
-pub(crate) type AfterPhase1ScanMetadata = AfterSequential<ScanLogReplayProcessor>;
+pub use crate::parallel::parallel_scan_metadata::{
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
+};
 
 /// Controls how file statistics are handled during a scan.
 ///
@@ -708,16 +684,15 @@ impl Scan {
         }
 
         // create a new log segment containing only the commits added after the version hint.
-        let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
+        let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
-        let listed_log_files = ListedLogFilesBuilder {
+        let log_segment_files = LogSegmentFiles {
             ascending_commit_files,
-            latest_commit_file: log_segment.latest_commit_file.clone(),
+            latest_commit_file: log_segment.listed.latest_commit_file.clone(),
             ..Default::default()
-        }
-        .build()?;
+        };
         let new_log_segment = LogSegment::try_new(
-            listed_log_files,
+            log_segment_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
             None, // No checkpoint in this incremental segment
@@ -839,7 +814,7 @@ impl Scan {
 
     /// Start a parallel scan metadata processing for the table.
     ///
-    /// This method returns a [`Phase1ScanMetadata`] iterator that processes commits and
+    /// This method returns a [`SequentialScanMetadata`] iterator that processes commits and
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
     ///
@@ -848,7 +823,7 @@ impl Scan {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use delta_kernel::{Engine, DeltaResult};
-    /// # use delta_kernel::scan::{AfterPhase1ScanMetadata, Phase2ScanMetadata};
+    /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -862,30 +837,29 @@ impl Scan {
     ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
     ///     .build(engine.as_ref())?;
     /// let scan = snapshot.scan_builder().build()?;
-    /// let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
+    /// let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
     ///
     /// // Process sequential phase
-    /// for result in phase1.by_ref() {
+    /// for result in sequential.by_ref() {
     ///     let scan_metadata = result?;
     ///     // Process scan metadata...
     /// }
     ///
     /// // Check if distributed phase is needed
-    /// match phase1.finish()? {
-    ///     AfterPhase1ScanMetadata::Done(_) => {
+    /// match sequential.finish()? {
+    ///     AfterSequentialScanMetadata::Done => {
     ///         // All processing complete
     ///     }
-    ///     AfterPhase1ScanMetadata::Parallel { processor, files } => {
-    ///         // Wrap processor in Arc for sharing across threads
-    ///         let processor = Arc::new(processor);
+    ///     AfterSequentialScanMetadata::Parallel { state, files } => {
     ///         // Distribute files for parallel processing (e.g., one file per worker)
+    ///         let state = Arc::new(*state);
     ///         for file in files {
-    ///             let phase2 = Phase2ScanMetadata::try_new(
+    ///             let parallel = ParallelScanMetadata::try_new(
     ///                 engine.clone(),
-    ///                 processor.clone(),
+    ///                 state.clone(),
     ///                 vec![file],
     ///             )?;
-    ///             for result in phase2 {
+    ///             for result in parallel {
     ///                 let scan_metadata = result?;
     ///                 // Process scan metadata...
     ///             }
@@ -894,12 +868,10 @@ impl Scan {
     /// }
     /// # Ok(())
     /// # }
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn parallel_scan_metadata(
+    pub fn parallel_scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<Phase1ScanMetadata> {
+    ) -> DeltaResult<SequentialScanMetadata> {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
@@ -918,7 +890,9 @@ impl Scan {
             checkpoint_info,
             self.skip_stats(),
         )?;
-        SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)
+        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+
+        Ok(SequentialScanMetadata::new(sequential))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
