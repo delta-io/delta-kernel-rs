@@ -30,6 +30,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
+use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -402,9 +403,7 @@ impl<S> Transaction<S> {
         // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
         // Reads and metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
-            crate::schema::void_utils::validate_schema_for_write(
-                &self.effective_table_config.logical_schema(),
-            )?;
+            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
         // CDF check only applies to existing tables (not create table)

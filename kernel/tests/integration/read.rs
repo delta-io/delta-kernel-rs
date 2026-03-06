@@ -2250,8 +2250,7 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
 }
 
 // Regression test for https://github.com/delta-io/delta-kernel-rs/issues/739
-// Void columns should be dropped from the scan's logical schema and should not
-// appear in the read results.
+// Void columns should be present in scan results as all-null columns.
 #[tokio::test]
 async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>> {
     // Parquet batch has only the non-void column (parquet cannot represent void)
@@ -2756,8 +2755,8 @@ async fn read_all_void_struct() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Verify that a table where ALL columns are void can still be read (returns all-null rows).
-// Per ZiyaZa: reads always succeed; only writes fail for all-void tables.
+// Verify that a table where ALL field are void can still be read (returns all-null rows).
+// Reads always succeed; only writes fail for all-void tables.
 #[tokio::test]
 async fn read_all_void_table() -> Result<(), Box<dyn std::error::Error>> {
     // Empty Parquet file (no columns) — the row count comes from the Parquet metadata
