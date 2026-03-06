@@ -85,6 +85,7 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
+            engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             clustering_columns_physical: clustering_columns,
