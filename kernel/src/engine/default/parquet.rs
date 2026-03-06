@@ -399,6 +399,12 @@ async fn open_parquet_file(
 
     let mut reader = {
         use object_store::ObjectStoreScheme;
+        // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
+        // request which isn't supported by Azure. For now we just detect if the URL is
+        // pointing to azure and if so, do a HEAD request so we can pass in file size to the
+        // reader which will cause the reader to avoid a suffix range request.
+        // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
+
         // Since the `Remove` action's size value is optional as specified in the delta protocol
         // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file,
         // the extracted size will be zero in this case. Thus, this function
@@ -408,11 +414,6 @@ async fn open_parquet_file(
         } else if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
             ObjectStoreScheme::parse(&file_meta.location)
         {
-            // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
-            // request which isn't supported by Azure. For now we just detect if the URL is
-            // pointing to azure and if so, do a HEAD request so we can pass in file size to the
-            // reader which will cause the reader to avoid a suffix range request.
-            // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
             // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
             // to file changing between the two calls.
             let meta = store.head(&path).await?;
