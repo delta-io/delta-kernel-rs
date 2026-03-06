@@ -123,8 +123,8 @@ To benchmark against a custom Delta table:
 
 If you want to commit this change and add it to the `workloads.tar.gz` archive:
 ```bash
-cd benchmarks/data
-tar -czf workloads.tar.gz workloads/
+cd benchmarks/data/workloads
+tar -czf ../workloads.tar.gz .
 ```
 Then commit the updated archive and delete the `.done` file so it is re-extracted on the next run.
 
