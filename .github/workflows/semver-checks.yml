@@ -24,7 +24,7 @@ jobs:
         name: checkout full rep
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install cargo-semver-checks
@@ -39,7 +39,7 @@ jobs:
         # note that this won't run on proc macro/derive crates, so don't need to include
         # delta_kernel_derive etc.
         run: |
-          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features --baseline-rev ${{ github.event.pull_request.base.sha }}
+          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features --baseline-rev ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
       - name: On Failure
         id: set_failure
         if: ${{ steps.check.outcome == 'failure' }}
@@ -55,6 +55,7 @@ jobs:
     outputs:
       check_status: ${{ steps.set_failure.outputs.check_status || steps.set_success.outputs.check_status }}
   update_label_if_needed:
+    if: github.event_name == 'pull_request_target'
     needs: check_if_pr_breaks_semver
     runs-on: ubuntu-latest
     permissions:
