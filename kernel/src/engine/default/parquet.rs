@@ -630,8 +630,10 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
-    #[test]
-    fn test_as_record_batch() {
+    #[rstest::rstest]
+    fn test_as_record_batch(
+        #[values(true, false)] test_empty_str: bool,
+    ) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
@@ -651,10 +653,12 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_values = HashMap::from([
-            ("partition1".to_string(), "a".to_string()),
-            ("empty_partition".to_string(), "".to_string()),
-        ]);
+        let partition_value = if test_empty_str {
+            "".to_string()
+        } else {
+            "a".to_string()
+        };
+        let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
@@ -670,12 +674,12 @@ mod tests {
             StringBuilder::new(),
         );
 
-        partition_values_builder
-            .keys()
-            .append_value("empty_partition");
-        partition_values_builder.values().append_null(); // empty string should go to null
         partition_values_builder.keys().append_value("partition1");
-        partition_values_builder.values().append_value("a");
+        if test_empty_str {
+            partition_values_builder.values().append_null(); // empty string should go to null
+        } else {
+            partition_values_builder.values().append_value("a");
+        }
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
 
