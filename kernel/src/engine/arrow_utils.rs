@@ -4160,7 +4160,7 @@ mod tests {
         let string_builder2 = StringBuilder::new();
         let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
 
-        // Append one entry: "bar" -> ""
+        // Append one entry: "bar" -> null
         map_builder.keys().append_value("bar");
         map_builder.values().append_null();
         map_builder.append(true).unwrap(); // finish the map row
