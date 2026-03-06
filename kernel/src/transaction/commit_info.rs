@@ -33,7 +33,7 @@ fn commit_info_literal_exprs(
             Arc::new(Expression::literal(
                 match commit_info.operation_parameters {
                     Some(map) => Scalar::Map(MapData::try_new(
-                        op_params_map_type.clone(),
+                        op_params_map_type,
                         map.into_iter()
                             .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
                     )?),
