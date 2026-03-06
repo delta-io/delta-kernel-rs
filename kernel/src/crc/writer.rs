@@ -2,13 +2,15 @@
 
 use url::Url;
 
-use super::Crc;
-use crate::{DeltaResult, Engine};
+use super::{Crc, FileStatsValidity};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] struct to JSON via serde and writes the raw bytes using the storage
-/// handler. If `overwrite` is false and the file already exists, returns
+/// handler. Returns an error if file stats are not valid (a CRC file on disk must have correct
+/// stats). If `overwrite` is false and the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(
     engine: &dyn Engine,
@@ -16,6 +18,10 @@ pub(crate) fn try_write_crc_file(
     crc: &Crc,
     overwrite: bool,
 ) -> DeltaResult<()> {
+    require!(
+        crc.validity == FileStatsValidity::Valid,
+        Error::internal_error("Cannot write CRC file with invalid file stats")
+    );
     let data = serde_json::to_vec(crc)?;
     engine.storage_handler().put(path, data.into(), overwrite)
 }
@@ -157,5 +163,26 @@ mod tests {
 
         // Second write with overwrite=true should succeed
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc, true).unwrap();
+    }
+
+    #[test]
+    fn test_write_rejects_invalid_file_stats() {
+        use crate::crc::FileStatsValidity;
+
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store).build();
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        for invalid_validity in [
+            FileStatsValidity::RequiresCheckpointRead,
+            FileStatsValidity::Indeterminate,
+            FileStatsValidity::Untrackable,
+        ] {
+            let mut crc = test_crc();
+            crc.validity = invalid_validity;
+            let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc, false);
+            assert!(result.is_err(), "should reject {:?}", invalid_validity);
+        }
     }
 }

@@ -41,18 +41,12 @@ use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
 
-/// File-level statistics for a table snapshot.
+/// File-level statistics for a table version.
 ///
 /// NOTE: This is an unstable API expected to change in future releases.
 #[allow(unused)]
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
-pub(crate) struct FileStats {
-    /// Total size of the table in bytes (sum of all active AddFile sizes).
-    pub table_size_bytes: i64,
-    /// Number of active AddFile actions in this table version.
-    pub num_files: i64,
-}
+pub(crate) type FileStats = crate::crc::FileStats;
 
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
@@ -661,7 +655,7 @@ impl Snapshot {
         }
     }
 
-    /// Returns file-level statistics from the CRC file, or `None` if no CRC exists at this
+    /// Returns file-level statistics, or `None` if no CRC with valid stats exists at this
     /// snapshot's version.
     ///
     /// NOTE: This is an unstable API expected to change in future releases.
@@ -671,10 +665,7 @@ impl Snapshot {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
-        Some(FileStats {
-            table_size_bytes: crc.table_size_bytes,
-            num_files: crc.num_files,
-        })
+        crc.file_stats()
     }
 
     /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
