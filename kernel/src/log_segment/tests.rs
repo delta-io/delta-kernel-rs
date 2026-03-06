@@ -901,8 +901,8 @@ async fn test_non_contiguous_log() {
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
     // check the error message up to the timestamp
-    let expected_error_pattern = "Generic delta kernel error: Expected ordered contiguous \
-        commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
+    let expected_error_pattern = "Generic delta kernel error: Expected contiguous commit files, \
+        but found gap: ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
         cannot_be_a_base: false, username: \"\", password: None, host: None, port: None, path: \
         \"/_delta_log/00000000000000000000.json\", query: None, fragment: None }, last_modified:";
     assert_result_error_with_message(log_segment_res, expected_error_pattern);
@@ -1971,28 +1971,6 @@ fn test_validate_listed_log_file_different_multipart_checkpoint_versions() {
 }
 
 #[test]
-fn test_validate_listed_log_file_invalid_multipart_checkpoint() {
-    let log_root = Url::parse("file:///_delta_log/").unwrap();
-    assert!(LogSegment::try_new(
-        LogSegmentFiles {
-            checkpoint_parts: vec![
-                create_log_path(
-                    "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
-                ),
-                create_log_path(
-                    "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000003.parquet",
-                ),
-            ],
-            ..Default::default()
-        },
-        log_root,
-        None,
-        None,
-    )
-    .is_err());
-}
-
-#[test]
 fn test_validate_listed_log_file_out_of_order_commit_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2041,6 +2019,24 @@ fn test_validate_listed_log_file_multipart_checkpoint_part_count_mismatch() {
                     "file:///_delta_log/00000000000000000010.checkpoint.0000000002.0000000003.parquet",
                 ),
             ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch() {
+    // A single checkpoint file that claims num_parts=2: the count (1) disagrees with num_parts
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
+            )],
             ..Default::default()
         },
         log_root,
@@ -2469,16 +2465,16 @@ fn test_log_segment_contiguous_commit_files() {
     );
     assert_result_error_with_message(
         log_segment,
-        "Generic delta kernel error: Expected ordered \
-        contiguous commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \
+        "Generic delta kernel error: Expected contiguous commit files, but found gap: \
+        ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
         None, path: \"/_delta_log/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
         0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
-        file_type: Commit }, ParsedLogPath { location: FileMeta { location: Url { scheme: \
+        file_type: Commit } -> ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
         None, path: \"/_delta_log/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
         0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
-        file_type: Commit }]",
+        file_type: Commit }",
     );
 }
 

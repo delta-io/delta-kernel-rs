@@ -1141,43 +1141,41 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
 }
 
 fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
     let n = parts.len();
-    if n > 0 {
-        let first_version = parts[0].version;
-        for p in parts {
-            if !p.is_checkpoint() {
-                return Err(Error::generic(
-                    "checkpoint_parts contains non-checkpoint file",
-                ));
-            }
-            if p.version != first_version {
-                return Err(Error::generic(
-                    "multi-part checkpoint parts have different versions",
-                ));
-            }
-            if n > 1
-                && !matches!(
-                    p.file_type,
-                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                        if n == num_parts as usize
-                )
-            {
-                return Err(Error::generic("multi-part checkpoint part count mismatch"));
-            }
+    let first_version = parts[0].version;
+    for p in parts {
+        if !p.is_checkpoint() {
+            return Err(Error::generic(
+                "checkpoint_parts contains non-checkpoint file",
+            ));
+        }
+        if p.version != first_version {
+            return Err(Error::generic(
+                "multi-part checkpoint parts have different versions",
+            ));
+        }
+        if matches!(
+            p.file_type,
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                if n != num_parts as usize
+        ) {
+            return Err(Error::generic("multi-part checkpoint part count mismatch"));
         }
     }
     Ok(())
 }
 
 fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
-    require!(
-        commits
-            .windows(2)
-            .all(|cfs| cfs[0].version + 1 == cfs[1].version),
-        Error::generic(format!(
-            "Expected ordered contiguous commit files {:?}",
-            commits
-        ))
-    );
+    for pair in commits.windows(2) {
+        if pair[0].version + 1 != pair[1].version {
+            return Err(Error::generic(format!(
+                "Expected contiguous commit files, but found gap: {:?} -> {:?}",
+                pair[0], pair[1]
+            )));
+        }
+    }
     Ok(())
 }
