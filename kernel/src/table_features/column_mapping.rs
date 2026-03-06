@@ -59,7 +59,8 @@ pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id; when not enabled, verify that no fields are annotated.
+/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
+/// value. When not enabled, verifies that no fields are annotated.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
@@ -67,10 +68,21 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
         err: None,
     };
     let _ = validator.transform_struct(schema);
-    match validator.err {
-        Some(err) => Err(err),
-        None => Ok(()),
+    if let Some(err) = validator.err {
+        return Err(err);
     }
+
+    if mode != ColumnMappingMode::None {
+        let mut checker = DuplicateIdChecker {
+            seen: HashMap::new(),
+            err: None,
+        };
+        let _ = checker.transform_struct(schema);
+        if let Some(e) = checker.err {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 struct ValidateColumnMappings<'a> {
@@ -172,6 +184,37 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
         // annotations
         // TODO: this changes with icebergcompat right? see issue#1125 for icebergcompat.
         None
+    }
+}
+
+/// Validates that all `delta.columnMapping.id` values across the schema are unique. Field IDs
+/// must be globally unique (not just within a struct level).
+struct DuplicateIdChecker {
+    seen: HashMap<i64, String>, // id -> first field name that claimed it
+    err: Option<Error>,
+}
+
+impl<'a> SchemaTransform<'a> for DuplicateIdChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if self.err.is_none() {
+            if let Some(MetadataValue::Number(id)) = field
+                .metadata
+                .get(ColumnMetadataKey::ColumnMappingId.as_ref())
+            {
+                if let Some(prev) = self.seen.insert(*id, field.name().to_string()) {
+                    self.err = Some(Error::invalid_column_mapping_mode(format!(
+                        "Duplicate column mapping ID {} assigned to both '{}' and '{}'",
+                        id,
+                        prev,
+                        field.name()
+                    )));
+                }
+            }
+            if self.err.is_none() {
+                let _ = self.recurse_into_struct_field(field);
+            }
+        }
+        Some(Cow::Borrowed(field))
     }
 }
 
@@ -592,6 +635,91 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field id");
         let schema = create_schema(None, None, None, "\"col-5f422f40\"");
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
+    }
+
+    fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
+        StructField::new(name, data_type, false).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(format!("col-{name}")),
+            ),
+        ])
+    }
+
+    fn cm_schema_same_level_duplicates() -> StructType {
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field("b", 1, DataType::INTEGER),
+        ])
+    }
+
+    fn cm_schema_nested_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([
+            make_cm_field("x", 5, DataType::INTEGER),
+            make_cm_field("y", 5, DataType::INTEGER),
+        ]);
+        StructType::new_unchecked([make_cm_field(
+            "outer",
+            10,
+            DataType::Struct(Box::new(nested)),
+        )])
+    }
+
+    fn cm_schema_cross_level_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([make_cm_field("inner", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field("b", 2, DataType::Struct(Box::new(nested))),
+        ])
+    }
+
+    fn cm_schema_array_duplicates() -> StructType {
+        let element = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field(
+                "b",
+                2,
+                ArrayType::new(DataType::Struct(Box::new(element)), false),
+            ),
+        ])
+    }
+
+    fn cm_schema_map_duplicates() -> StructType {
+        let value = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field(
+                "b",
+                2,
+                MapType::new(DataType::STRING, DataType::Struct(Box::new(value)), false),
+            ),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::same_level(cm_schema_same_level_duplicates())]
+    #[case::nested_struct(cm_schema_nested_duplicates())]
+    #[case::across_nesting_levels(cm_schema_cross_level_duplicates())]
+    #[case::across_array(cm_schema_array_duplicates())]
+    #[case::across_map(cm_schema_map_duplicates())]
+    fn test_duplicate_column_mapping_ids_rejected(#[case] schema: StructType) {
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(&schema, ColumnMappingMode::Id),
+            "Duplicate column mapping ID",
+        );
+    }
+
+    #[test]
+    fn test_duplicate_column_mapping_ids_rejected_in_name_mode() {
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(&cm_schema_same_level_duplicates(), ColumnMappingMode::Name),
+            "Duplicate column mapping ID",
+        );
     }
 
     // =========================================================================

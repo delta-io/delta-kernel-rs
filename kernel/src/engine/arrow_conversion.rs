@@ -1,6 +1,5 @@
 //! Conversions from kernel schema types to arrow schema types.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,8 +13,8 @@ use itertools::Itertools;
 
 use crate::error::Error;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, SchemaTransform,
-    StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+    StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -93,58 +92,8 @@ where
     }
 }
 
-/// Validates that all field IDs across an entire kernel struct schema (including nested structs,
-/// arrays, and maps) are unique. Field IDs must be unique across the whole schema, not just within
-/// a single struct level, since parquet readers use them for global column matching.
-///
-/// TODO: switch to SchemaVisitor once https://github.com/delta-io/delta-kernel-rs/pull/1268 merges.
-#[derive(Default)]
-struct DuplicateFieldIdChecker {
-    seen: HashMap<String, String>,
-    error: Option<ArrowError>,
-}
-
-impl<'a> SchemaTransform<'a> for DuplicateFieldIdChecker {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if self.error.is_none() {
-            if let Some(id) = field
-                .metadata()
-                .get(ColumnMetadataKey::ParquetFieldId.as_ref())
-            {
-                let id_str = id.to_string();
-                if let Some(prev) = self.seen.insert(id_str.clone(), field.name().to_string()) {
-                    self.error = Some(ArrowError::SchemaError(format!(
-                        "Duplicate field ID {} assigned to both '{}' and '{}'",
-                        id_str,
-                        prev,
-                        field.name()
-                    )));
-                }
-            }
-            if self.error.is_none() {
-                let _ = self.recurse_into_struct_field(field);
-            }
-        }
-        Some(Cow::Borrowed(field))
-    }
-}
-
-impl DuplicateFieldIdChecker {
-    fn check(s: &StructType) -> Result<(), ArrowError> {
-        let mut checker = DuplicateFieldIdChecker::default();
-        let _ = checker.transform_struct(s);
-        match checker.error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Validates then converts a kernel [`StructType`] to a `Vec<ArrowField>`. The duplicate field ID
-/// check is always run before conversion so that every call site (full schema, nested struct,
-/// variant) is protected automatically — callers do not need to invoke the check separately.
+/// Converts a kernel [`StructType`] to a `Vec<ArrowField>`.
 fn try_kernel_struct_to_arrow_fields(s: &StructType) -> Result<Vec<ArrowField>, ArrowError> {
-    DuplicateFieldIdChecker::check(s)?;
     s.fields().map(|f| f.try_into_arrow()).try_collect()
 }
 
@@ -694,72 +643,6 @@ mod tests {
         crate::utils::test_utils::assert_result_error_with_message(
             StructField::try_from_arrow(&arrow_field),
             "conflicting parquet field IDs",
-        );
-    }
-
-    fn make_field_with_id(name: &str, id: i64) -> StructField {
-        StructField::new(name, DataType::INTEGER, false).with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(id),
-        )])
-    }
-
-    fn schema_same_level_duplicates() -> StructType {
-        StructType::new_unchecked([make_field_with_id("a", 1), make_field_with_id("b", 1)])
-    }
-
-    fn schema_nested_duplicates() -> StructType {
-        let nested =
-            StructType::new_unchecked([make_field_with_id("x", 5), make_field_with_id("y", 5)]);
-        StructType::new_unchecked([StructField::new(
-            "outer",
-            DataType::Struct(Box::new(nested)),
-            false,
-        )])
-    }
-
-    fn schema_cross_level_duplicates() -> StructType {
-        let nested = StructType::new_unchecked([make_field_with_id("inner", 1)]);
-        StructType::new_unchecked([
-            make_field_with_id("a", 1),
-            StructField::new("b", DataType::Struct(Box::new(nested)), false),
-        ])
-    }
-
-    fn schema_array_duplicates() -> StructType {
-        let element = StructType::new_unchecked([make_field_with_id("x", 1)]);
-        StructType::new_unchecked([
-            make_field_with_id("a", 1),
-            StructField::new(
-                "b",
-                ArrayType::new(DataType::Struct(Box::new(element)), false),
-                false,
-            ),
-        ])
-    }
-
-    fn schema_map_duplicates() -> StructType {
-        let value = StructType::new_unchecked([make_field_with_id("x", 1)]);
-        StructType::new_unchecked([
-            make_field_with_id("a", 1),
-            StructField::new(
-                "b",
-                MapType::new(DataType::STRING, DataType::Struct(Box::new(value)), false),
-                false,
-            ),
-        ])
-    }
-
-    #[rstest::rstest]
-    #[case::same_level(schema_same_level_duplicates())]
-    #[case::nested_struct(schema_nested_duplicates())]
-    #[case::across_nesting_levels(schema_cross_level_duplicates())]
-    #[case::across_array(schema_array_duplicates())]
-    #[case::across_map(schema_map_duplicates())]
-    fn test_duplicate_field_ids_rejected(#[case] schema: StructType) {
-        crate::utils::test_utils::assert_result_error_with_message(
-            ArrowSchema::try_from_kernel(&schema),
-            "Duplicate field ID",
         );
     }
 }
