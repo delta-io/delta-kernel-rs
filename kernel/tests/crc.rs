@@ -56,7 +56,6 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "clustered-table")]
 #[tokio::test]
 async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     use test_utils::copy_directory;
