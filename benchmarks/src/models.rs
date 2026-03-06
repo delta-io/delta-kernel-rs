@@ -33,8 +33,7 @@ pub struct TableInfo {
     pub name: String,            // Table name used for identifying the table
     pub description: String,     // Human-readable description of the table
     pub table_path: Option<Url>, // URL to the table (for remote tables); also used to override the default local table path
-    #[serde(default)]
-    pub tags: Vec<String>, // Tags for filtering workloads
+    pub tags: Vec<String>,       // Tags for filtering workloads
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
@@ -152,18 +151,11 @@ mod tests {
         &["base"]
     )]
     #[case(
-        r#"{"name": "no_tags_table", "description": "No tags field"}"#,
-        "no_tags_table",
-        "No tags field",
-        None,
-        &[]
-    )]
-    #[case(
-        r#"{"name": "extra_fields_table", "description": "Has extra fields", "extra_field": "should be ignored"}"#,
+        r#"{"name": "extra_fields_table", "description": "Has extra fields", "extra_field": "should be ignored", "tags": ["base"]}"#,
         "extra_fields_table",
         "Has extra fields",
         None,
-        &[]
+        &["base"]
     )]
     fn test_deserialize_table_info(
         #[case] json: &str,
