@@ -458,8 +458,8 @@ mod tests {
         Ok(())
     }
 
-    // Fokko review: void is inherently always-null, so nullable=false is semantically
-    // contradictory. We tolerate it on reads (be permissive), and the Arrow conversion still
+    // void is inherently always-null, so nullable=false is semantically contradictory.
+    // We tolerate it on reads (be permissive), and the Arrow conversion still
     // produces ArrowDataType::Null. The field retains nullable=false as-is — no coercion.
     #[test]
     fn test_void_type_not_nullable() -> DeltaResult<()> {
