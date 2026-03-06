@@ -246,11 +246,18 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
+    use rstest::rstest;
+
+    use crate::arrow::array::{
+        Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+        StructArray,
+    };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::stats::collect_stats;
+    use crate::expressions::column_name;
     use crate::EngineData;
 
     /// Creates test add file data with stats.nullCount.col, stats.minValues.col,
@@ -492,5 +499,42 @@ mod tests {
         assert!(err_msg.contains("col_b"));
         assert!(err_msg.contains("minValues"));
         assert!(!err_msg.contains("col_a"));
+    }
+
+    /// Verifies that stats collected from non-standard Arrow string representations
+    /// (LargeUtf8/LargeStringArray, Utf8View/StringViewArray) can be validated by
+    /// StatsVerifier, which expects Delta's logical STRING type. Engines may use any of
+    /// these representations, and the stats pipeline must handle them without type errors.
+    #[rstest]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
+    #[case::utf8_view(Arc::new(StringViewArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
+    fn test_verify_string_stats(#[case] values: ArrayRef) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "city",
+            values.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("city")]).unwrap();
+
+        let path_array = StringArray::from(vec!["file1.parquet"]);
+        let add_file_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("path", ArrowDataType::Utf8, false),
+            ArrowField::new("stats", stats.data_type().clone(), true),
+        ]));
+        let add_file_batch = RecordBatch::try_new(
+            add_file_schema,
+            vec![
+                Arc::new(path_array) as ArrayRef,
+                Arc::new(stats) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
+
+        let verifier = StatsVerifier::new(vec![(ColumnName::new(["city"]), DataType::STRING)]);
+        verifier.verify(&[engine_data]).unwrap();
     }
 }
