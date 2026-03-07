@@ -267,7 +267,7 @@ mod tests {
 
     fn parallel_config() -> ReadConfig {
         ReadConfig {
-            name: "parallel".to_string(),
+            name: "parallel_2".to_string(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         }
     }
@@ -281,7 +281,7 @@ mod tests {
     fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             serial_config(),
             test_engine(),
@@ -289,7 +289,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/test_case/read_metadata/serial"
+            "basic_partitioned/testCase/readMetadata/serial"
         );
         assert!(runner.execute().is_ok());
     }
@@ -298,7 +298,7 @@ mod tests {
     fn test_read_metadata_runner_parallel() {
         let runner = ReadMetadataRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             parallel_config(),
             test_engine(),
@@ -306,7 +306,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/test_case/read_metadata/parallel"
+            "basic_partitioned/testCase/readMetadata/parallel_2"
         );
         assert!(runner.execute().is_ok());
     }
@@ -319,7 +319,7 @@ mod tests {
     fn test_snapshot_construction_runner_setup() {
         let runner = SnapshotConstructionRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_snapshot_spec(),
             test_engine(),
         );
@@ -330,14 +330,14 @@ mod tests {
     fn test_snapshot_construction_runner_name() {
         let runner = SnapshotConstructionRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_snapshot_spec(),
             test_engine(),
         )
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/test_case/snapshot_construction"
+            "basic_partitioned/testCase/snapshotConstruction"
         );
     }
 
@@ -345,7 +345,7 @@ mod tests {
     fn test_snapshot_construction_runner_execute() {
         let runner = SnapshotConstructionRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_snapshot_spec(),
             test_engine(),
         )
@@ -357,7 +357,7 @@ mod tests {
     fn test_create_read_runner_read_metadata() {
         let runner = create_read_runner(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             ReadOperation::ReadMetadata,
             serial_config(),
@@ -371,7 +371,7 @@ mod tests {
     fn test_create_read_runner_read_data_unimplemented() {
         let result = create_read_runner(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             ReadOperation::ReadData,
             serial_config(),

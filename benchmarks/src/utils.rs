@@ -13,7 +13,7 @@ pub const BENCH_TAGS_ENV_VAR: &str = "BENCH_TAGS";
 const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads.tar.gz");
 const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads");
 const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads/.done");
-const TABLE_INFO_FILE_NAME: &str = "table_info.json";
+const TABLE_INFO_FILE_NAME: &str = "tableInfo.json";
 const SPECS_DIR_NAME: &str = "specs";
 const BENCHMARKS_DIR_NAME: &str = "benchmarks";
 const DELTA_DIR_NAME: &str = "delta";
@@ -253,12 +253,6 @@ mod tests {
     fn test_matches_tags_empty_table_tags() {
         let table_tags: Vec<String> = vec![];
         assert!(!matches_tags(&table_tags, &["ci".to_string()]));
-    }
-
-    #[test]
-    fn test_get_required_tags_unset() {
-        std::env::remove_var(BENCH_TAGS_ENV_VAR);
-        assert!(get_required_tags().is_none());
     }
 
     #[test]

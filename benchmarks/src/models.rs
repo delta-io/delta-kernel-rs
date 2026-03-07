@@ -124,7 +124,7 @@ pub enum DataLayout {
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 /// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum Spec {
     Read(ReadSpec),
     SnapshotConstruction(SnapshotConstructionSpec),
@@ -148,7 +148,7 @@ pub struct SnapshotConstructionSpec {
 
 impl SnapshotConstructionSpec {
     pub fn as_str(&self) -> &str {
-        "snapshot_construction"
+        "snapshotConstruction"
     }
 }
 
@@ -179,8 +179,8 @@ pub enum ReadOperation {
 impl ReadOperation {
     pub fn as_str(&self) -> &str {
         match self {
-            ReadOperation::ReadData => "read_data",
-            ReadOperation::ReadMetadata => "read_metadata",
+            ReadOperation::ReadData => "readData",
+            ReadOperation::ReadMetadata => "readMetadata",
         }
     }
 }
@@ -294,19 +294,19 @@ mod tests {
     #[case(r#"{"type": "read", "version": 5}"#, "read", Some(5))]
     #[case(r#"{"type": "read"}"#, "read", None)]
     #[case(
-        r#"{"type": "read", "version": 7, "extra_field": "should be ignored"}"#,
+        r#"{"type": "read", "version": 7, "extraField": "should be ignored"}"#,
         "read",
         Some(7)
     )]
     #[case(
-        r#"{"type": "snapshot_construction", "version": 5}"#,
-        "snapshot_construction",
+        r#"{"type": "snapshotConstruction", "version": 5}"#,
+        "snapshotConstruction",
         Some(5)
     )]
-    #[case(r#"{"type": "snapshot_construction"}"#, "snapshot_construction", None)]
+    #[case(r#"{"type": "snapshotConstruction"}"#, "snapshotConstruction", None)]
     #[case(
-        r#"{"type": "snapshot_construction", "version": 7, "extra_field": "should be ignored"}"#,
-        "snapshot_construction",
+        r#"{"type": "snapshotConstruction", "version": 7, "extraField": "should be ignored"}"#,
+        "snapshotConstruction",
         Some(7)
     )]
     fn test_deserialize_spec(
