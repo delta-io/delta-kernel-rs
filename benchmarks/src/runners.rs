@@ -6,6 +6,7 @@
 
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+    TimeTravel,
 };
 use crate::predicate_parser::parse_predicate;
 use delta_kernel::expressions::PredicateRef;
@@ -44,8 +45,12 @@ impl ReadMetadataRunner {
         let url = table_info.resolved_table_root();
 
         let mut builder = Snapshot::builder_for(url);
-        if let Some(version) = read_spec.version {
-            builder = builder.at_version(version);
+        match &read_spec.time_travel {
+            Some(TimeTravel::Version { version }) => builder = builder.at_version(*version),
+            Some(TimeTravel::Timestamp { .. }) => {
+                return Err("Timestamp-based time travel not supported in benchmarks".into())
+            }
+            None => {}
         }
 
         let snapshot = builder.build(engine.as_ref())?;
@@ -208,9 +213,17 @@ impl SnapshotConstructionRunner {
             snapshot_spec.as_str()
         );
 
+        let version = match &snapshot_spec.time_travel {
+            Some(TimeTravel::Version { version }) => Some(*version),
+            Some(TimeTravel::Timestamp { .. }) => {
+                return Err("Timestamp-based time travel not supported in benchmarks".into())
+            }
+            None => None,
+        };
+
         Ok(Self {
             url,
-            version: snapshot_spec.version,
+            version,
             engine,
             name,
         })
@@ -277,8 +290,10 @@ mod tests {
 
     fn test_read_spec() -> ReadSpec {
         ReadSpec {
-            version: None,
+            time_travel: None,
             predicate: None,
+            columns: None,
+            expected: None,
         }
     }
 
@@ -336,7 +351,10 @@ mod tests {
     }
 
     fn test_snapshot_spec() -> SnapshotConstructionSpec {
-        SnapshotConstructionSpec { version: None }
+        SnapshotConstructionSpec {
+            time_travel: None,
+            expected: None,
+        }
     }
 
     #[test]
