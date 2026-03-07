@@ -158,7 +158,7 @@ mod tests {
         Ok((table_id, table_uri))
     }
 
-    // ignored test which you can run manually to play around with reading a UC table. run with:
+    // ignored test which you can run manually to play around with reading a UC table, run with:
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test]
