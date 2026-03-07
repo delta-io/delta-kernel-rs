@@ -264,4 +264,59 @@ mod tests {
 
         Ok(())
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_snapshot_with_unsupported_type() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let engine = engine.as_ref();
+
+        // Create a table with an unsupported type in the schema
+        let protocol = json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2,
+        });
+
+        let metadata = json!({
+            "id": "test-table-id",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval second\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        });
+
+        let commit0 = [
+            json!({
+                "protocol": protocol
+            }),
+            json!({
+                "metaData": metadata
+            }),
+        ];
+
+        let commit0_data = commit0
+            .iter()
+            .map(ToString::to_string)
+            .collect_vec()
+            .join("\n");
+
+        let path = object_store::path::Path::from("_delta_log/00000000000000000000.json");
+        store.put(&path, commit0_data.into()).await?;
+
+        // Try to build a snapshot and expect a clear error message
+        let result = SnapshotBuilder::new_for(table_root.clone()).build(engine);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Unsupported Delta table type: 'interval second'"),
+            "Expected clear error message about unsupported type, got: {err_msg}"
+        );
+
+        Ok(())
+    }
 }
