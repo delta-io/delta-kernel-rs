@@ -260,6 +260,16 @@ pub(crate) enum PhysicalPredicate {
     None,
 }
 
+impl std::fmt::Display for PhysicalPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PhysicalPredicate::Some(pred, _) => write!(f, "{:?}", pred),
+            PhysicalPredicate::StaticSkipAll => write!(f, "StaticSkipAll"),
+            PhysicalPredicate::None => write!(f, "None"),
+        }
+    }
+}
+
 impl PhysicalPredicate {
     /// If we have a predicate, verify the columns it references and apply column mapping. First, get
     /// the set of references; use that to filter the schema to only the columns of interest (and
@@ -892,7 +902,15 @@ impl Scan {
         )?;
         let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        let parent_span = tracing::info_span!(
+            "scan_metadata",
+            table_root = %self.snapshot.table_root(),
+            version = %self.snapshot.version(),
+            schema = ?self.state_info.logical_schema,
+            physical_predicate = %self.state_info.physical_predicate
+        );
+
+        Ok(SequentialScanMetadata::new(sequential, parent_span))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

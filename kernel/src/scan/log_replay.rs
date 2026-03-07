@@ -1,6 +1,11 @@
 use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
@@ -24,8 +29,6 @@ use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
-use delta_kernel_derive::internal_api;
-use serde::{Deserialize, Serialize};
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -117,6 +120,8 @@ pub struct ScanLogReplayProcessor {
     skip_stats: bool,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
+    /// Metrics related to the scan
+    metrics: Arc<ScanMetrics>,
 }
 
 impl ScanLogReplayProcessor {
@@ -225,12 +230,17 @@ impl ScanLogReplayProcessor {
             state_info,
             skip_stats,
             checkpoint_info,
+            metrics: Default::default(),
         })
     }
 
     /// Get a reference to the checkpoint info.
     pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
         &self.checkpoint_info
+    }
+
+    pub(crate) fn get_metrics(&self) -> &ScanMetrics {
+        self.metrics.as_ref()
     }
 
     /// Serialize the processor state for distributed processing.
@@ -283,7 +293,7 @@ impl ScanLogReplayProcessor {
             predicate,
             internal_state_blob,
             seen_file_keys: self.seen_file_keys,
-            checkpoint_info: self.checkpoint_info,
+            checkpoint_info: CheckpointReadInfo::without_stats_parsed(),
         })
     }
 
@@ -343,6 +353,113 @@ impl ScanLogReplayProcessor {
     }
 }
 
+/// Metrics collected from [`ScanLogReplayProcessor`]
+#[internal_api]
+pub(crate) struct ScanMetrics {
+    num_adds: AtomicU64,
+    num_removes: AtomicU64,
+    num_non_file_actions: AtomicU64,
+    hash_set_size: AtomicUsize,
+    data_skipping_filtered: AtomicU64,
+    partition_pruning_filtered: AtomicU64,
+    // Timing metrics (in nanoseconds)
+    dedup_visitor_time_ns: AtomicU64,
+    data_skipping_time_ns: AtomicU64,
+    partition_pruning_time_ns: AtomicU64,
+}
+
+impl Default for ScanMetrics {
+    fn default() -> Self {
+        Self {
+            num_adds: AtomicU64::new(0),
+            num_removes: AtomicU64::new(0),
+            num_non_file_actions: AtomicU64::new(0),
+            hash_set_size: AtomicUsize::new(0),
+            data_skipping_filtered: AtomicU64::new(0),
+            partition_pruning_filtered: AtomicU64::new(0),
+            dedup_visitor_time_ns: AtomicU64::new(0),
+            data_skipping_time_ns: AtomicU64::new(0),
+            partition_pruning_time_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ScanMetrics {
+    pub(crate) fn reset_counters(&self) {
+        // NOTE: We do not reset hash set size because that never decreases. All subsequent uses of
+        // the processor will reuse the same hashset.
+        self.num_adds.store(0, Ordering::SeqCst);
+        self.num_removes.store(0, Ordering::SeqCst);
+        self.num_non_file_actions.store(0, Ordering::SeqCst);
+        self.data_skipping_filtered.store(0, Ordering::SeqCst);
+        self.partition_pruning_filtered.store(0, Ordering::SeqCst);
+        self.dedup_visitor_time_ns.store(0, Ordering::SeqCst);
+        self.data_skipping_time_ns.store(0, Ordering::SeqCst);
+        self.partition_pruning_time_ns.store(0, Ordering::SeqCst);
+    }
+    pub(crate) fn incr_adds(&self) {
+        self.num_adds.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_removes(&self) {
+        self.num_removes.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_partition_pruning_filtered(&self) {
+        self.partition_pruning_filtered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_non_file_actions(&self) {
+        self.num_non_file_actions.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn add_data_skipping_filtered(&self, value: u64) {
+        self.data_skipping_filtered
+            .fetch_add(value, Ordering::Relaxed);
+    }
+    pub(crate) fn set_hash_set(&self, value: usize) {
+        self.hash_set_size.fetch_max(value, Ordering::SeqCst);
+    }
+
+    pub(crate) fn add_dedup_visitor_time_ns(&self, duration_ns: u64) {
+        self.dedup_visitor_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_data_skipping_time_ns(&self, duration_ns: u64) {
+        self.data_skipping_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_partition_pruning_time_ns(&self, duration_ns: u64) {
+        self.partition_pruning_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn log_with_message(&self, message: impl AsRef<str>) {
+        let num_adds = self.num_adds.load(Ordering::Relaxed);
+        let num_removes = self.num_removes.load(Ordering::Relaxed);
+        let num_non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
+        let hash_set_size = self.hash_set_size.load(Ordering::Relaxed);
+        let data_skipping_filtered = self.data_skipping_filtered.load(Ordering::Relaxed);
+        let partition_pruning_filtered = self.partition_pruning_filtered.load(Ordering::Relaxed);
+        let dedup_visitor_time_ms = self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        let data_skipping_time_ms = self.data_skipping_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        let partition_pruning_time_ms =
+            self.partition_pruning_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        info!(
+            num_adds,
+            num_removes,
+            num_non_file_actions,
+            hash_set_size,
+            data_skipping_filtered,
+            partition_pruning_filtered,
+            dedup_visitor_time_ms,
+            data_skipping_time_ms,
+            partition_pruning_time_ms,
+            "{}",
+            message.as_ref()
+        );
+    }
+}
+
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
@@ -353,6 +470,7 @@ struct AddRemoveDedupVisitor<D: Deduplicator> {
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    metrics: Arc<ScanMetrics>,
 }
 
 impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
@@ -361,6 +479,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
+        metrics: Arc<ScanMetrics>,
     ) -> AddRemoveDedupVisitor<D> {
         AddRemoveDedupVisitor {
             deduplicator,
@@ -368,6 +487,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             state_info,
             partition_filter,
             row_transform_exprs: Vec::new(),
+            metrics,
         }
     }
 
@@ -404,7 +524,14 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
         else {
+            self.metrics.incr_non_file_actions();
             return Ok(false);
+        };
+
+        if is_add {
+            self.metrics.incr_adds()
+        } else {
+            self.metrics.incr_removes()
         };
 
         // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
@@ -415,6 +542,8 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
+                let start = std::time::Instant::now();
+
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values(
@@ -423,9 +552,17 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
                     &partition_values,
                     self.state_info.column_mapping_mode,
                 )?;
-                if self.is_file_partition_pruned(&partition_values) {
+
+                let is_pruned = self.is_file_partition_pruned(&partition_values);
+
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                self.metrics.add_partition_pruning_time_ns(elapsed_ns);
+
+                if is_pruned {
+                    self.metrics.incr_partition_pruning_filtered();
                     return Ok(false);
                 }
+
                 partition_values
             }
             _ => Default::default(),
@@ -493,6 +630,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let start = std::time::Instant::now();
+
         let is_log_batch = self.deduplicator.is_log_batch();
         let expected_getters = if is_log_batch { 10 } else { 6 };
         require!(
@@ -508,6 +647,10 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
                 self.selection_vector[i] = self.is_valid_add(i, getters)?;
             }
         }
+
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        self.metrics.add_dedup_visitor_time_ns(elapsed_ns);
+
         Ok(())
     }
 }
@@ -676,7 +819,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
         // This avoids double JSON parsing - the transform already parsed the stats.
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        let selection_vector =
+            self.build_selection_vector(transformed.as_ref(), self.metrics.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
             selection_vector.len() == actions.len(),
@@ -698,15 +842,18 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            self.metrics.clone(),
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics.set_hash_set(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 }
 
@@ -746,7 +893,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
         // This avoids double JSON parsing - the transform already parsed the stats.
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        let selection_vector =
+            self.build_selection_vector(transformed.as_ref(), self.metrics.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
             selection_vector.len() == actions.len(),
@@ -771,15 +919,18 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
+            self.metrics.clone(),
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics.set_hash_set(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
