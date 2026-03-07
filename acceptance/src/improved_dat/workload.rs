@@ -109,7 +109,7 @@ impl ReadResult {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        Ok(concat_batches(&stripped_schema, normalized_batches.iter()).map_err(Error::from)?)
+        concat_batches(&stripped_schema, normalized_batches.iter()).map_err(Error::from)
     }
 }
 
@@ -170,9 +170,9 @@ pub fn execute_workload(
                 execute_snapshot_workload(engine, table_root, *version, timestamp.as_deref())?;
             Ok(WorkloadResult::Snapshot(result))
         }
-        _ => Err(Error::generic(format!(
-            "Unsupported workload type in this harness build"
-        ))),
+        _ => Err(Error::generic(
+            "Unsupported workload type in this harness build",
+        )),
     }
 }
 
@@ -273,8 +273,8 @@ pub fn execute_snapshot_workload(
 
     Ok(SnapshotResult {
         version: snapshot.version(),
-        min_reader_version: protocol.min_reader_version() as i32,
-        min_writer_version: protocol.min_writer_version() as i32,
+        min_reader_version: protocol.min_reader_version(),
+        min_writer_version: protocol.min_writer_version(),
         reader_features: protocol
             .reader_features()
             .map(|f| f.iter().map(|feat| feat.to_string()).collect())

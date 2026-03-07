@@ -185,12 +185,16 @@ fn strip_metadata_from_datatype(dt: &DataType) -> DataType {
         }
         DataType::List(field) => {
             let new_dt = strip_metadata_from_datatype(field.data_type());
-            DataType::List(Arc::new(Field::new(field.name(), new_dt, field.is_nullable())).into())
+            DataType::List(Arc::new(Field::new(
+                field.name(),
+                new_dt,
+                field.is_nullable(),
+            )))
         }
         DataType::Map(field, sorted) => {
             let new_dt = strip_metadata_from_datatype(field.data_type());
             DataType::Map(
-                Arc::new(Field::new(field.name(), new_dt, field.is_nullable())).into(),
+                Arc::new(Field::new(field.name(), new_dt, field.is_nullable())),
                 *sorted,
             )
         }
@@ -222,8 +226,7 @@ fn normalize_struct_field_order(arr: Arc<dyn Array>) -> Arc<dyn Array> {
             let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
 
             // Build (name, index) pairs and sort by name
-            let mut indexed_fields: Vec<(usize, &Arc<Field>)> =
-                fields.iter().enumerate().map(|(i, f)| (i, f)).collect();
+            let mut indexed_fields: Vec<(usize, &Arc<Field>)> = fields.iter().enumerate().collect();
             indexed_fields.sort_by(|a, b| a.1.name().cmp(b.1.name()));
 
             // Reorder columns and fields, recursing into children
@@ -333,7 +336,7 @@ pub fn columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) -> 
         let expected = normalize_struct_field_order(strip_metadata_from_array(&normalize_col(
             expected.clone(),
         )));
-        if &actual != &expected {
+        if actual != expected {
             return false;
         }
     }
@@ -479,14 +482,14 @@ pub async fn validate_read_result(
             eprintln!("\n--- Expected Data ---");
             eprintln!(
                 "{}",
-                pretty_format_batches(&[expected.clone()])
+                pretty_format_batches(std::slice::from_ref(&expected))
                     .map(|d| d.to_string())
                     .unwrap_or_else(|_| "Failed to format".to_string())
             );
             eprintln!("\n--- Actual Data ---");
             eprintln!(
                 "{}",
-                pretty_format_batches(&[actual.clone()])
+                pretty_format_batches(std::slice::from_ref(&actual))
                     .map(|d| d.to_string())
                     .unwrap_or_else(|_| "Failed to format".to_string())
             );
@@ -513,14 +516,14 @@ pub async fn validate_read_result(
             eprintln!("\n--- Expected Data ---");
             eprintln!(
                 "{}",
-                pretty_format_batches(&[expected.clone()])
+                pretty_format_batches(std::slice::from_ref(&expected))
                     .map(|d| d.to_string())
                     .unwrap_or_else(|_| "Failed to format".to_string())
             );
             eprintln!("\n--- Actual Data ---");
             eprintln!(
                 "{}",
-                pretty_format_batches(&[actual.clone()])
+                pretty_format_batches(std::slice::from_ref(&actual))
                     .map(|d| d.to_string())
                     .unwrap_or_else(|_| "Failed to format".to_string())
             );

@@ -121,7 +121,7 @@ impl TestCase {
             let path = entry.path();
 
             let (name, spec_path) =
-                if path.is_file() && path.extension().map_or(false, |e| e == "json") {
+                if path.is_file() && path.extension().is_some_and(|e| e == "json") {
                     // Flat layout: specs/<name>.json
                     let name = path
                         .file_stem()

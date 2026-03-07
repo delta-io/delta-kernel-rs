@@ -186,19 +186,20 @@ fn improved_dat_test(spec_path: &Path) -> datatest_stable::Result<()> {
                         let batch = read_result.concat().expect("Failed to concat batches");
                         validate_read_result(batch, &expected_dir)
                             .await
-                            .expect(&format!(
-                                "Validation failed for workload '{}'",
-                                workload_name
-                            ));
+                            .unwrap_or_else(|e| {
+                                panic!("Validation failed for workload '{}': {}", workload_name, e)
+                            });
                     }
                 }
                 WorkloadResult::Snapshot(snapshot_result) => {
                     if expected_dir.exists() {
-                        validate_snapshot_metadata(&snapshot_result, &expected_dir).expect(
-                            &format!(
-                                "Metadata validation failed for workload '{}'",
-                                workload_name
-                            ),
+                        validate_snapshot_metadata(&snapshot_result, &expected_dir).unwrap_or_else(
+                            |e| {
+                                panic!(
+                                    "Metadata validation failed for workload '{}': {}",
+                                    workload_name, e
+                                )
+                            },
                         );
                     }
                 }
