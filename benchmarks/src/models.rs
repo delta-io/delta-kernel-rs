@@ -1,7 +1,7 @@
 //! Data models for workload specifications
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::schema::StructType;
+use delta_kernel::schema::Schema;
 use serde::Deserialize;
 use url::Url;
 
@@ -37,7 +37,7 @@ pub struct TableInfo {
     pub name: String,                        // Table name used for identifying the table
     pub description: String,                 // Human-readable description of the table
     pub table_path: Option<Url>, // URL to the table (for remote tables); also used to override the default local table path
-    pub schema: StructType, // Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
+    pub schema: Schema, // Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
     pub protocol: Protocol, // Protocol version requirements and table features. Uses camelCase JSON keys
     pub log_info: LogInfo,  // Log-level statistics for the table
     pub properties: HashMap<String, String>, // User-defined table properties
