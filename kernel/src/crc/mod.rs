@@ -17,6 +17,7 @@ mod writer;
 
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
+pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]

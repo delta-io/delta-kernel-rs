@@ -1,5 +1,3 @@
-// No consumers yet -- will be integrated in a follow-up PR.
-#![allow(dead_code)]
 //! File statistics delta: the file count and size changes from a single commit.
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
