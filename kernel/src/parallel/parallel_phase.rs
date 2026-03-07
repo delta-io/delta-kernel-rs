@@ -514,16 +514,24 @@ mod tests {
         partition_pruning_filtered: u64,
     }
 
+    /// Test case for parallel log replay workflow
+    struct ParallelLogReplayCase {
+        path: &'static str,
+        predicate: Option<PredicateRef>,
+        expected_sequential_metrics: ExpectedMetrics,
+        expected_parallel_metrics: Option<ExpectedMetrics>,
+    }
+
     fn verify_metrics_in_logs(
         logs: &str,
         table_name: &str,
         sequential_expected: &ExpectedMetrics,
         parallel_expected: Option<&ExpectedMetrics>,
     ) {
-        // Verify Sequentialmetrics were logged
+        // Verify Sequential metrics were logged
         assert!(
-            logs.contains("Completed sequential scan metadata"),
-            "Expected Sequentialcompletion log for table '{}'",
+            logs.contains("Sequential scan metadata completed"),
+            "Expected Sequential completion log for table '{}'",
             table_name
         );
 
@@ -619,49 +627,49 @@ mod tests {
     /// Note: This test captures logs from spawned threads by sharing the tracing dispatcher.
     /// If running with other tests in parallel causes flakiness, use `--test-threads=1`.
     #[rstest::rstest]
-    #[case::json_sidecars(
-        "v2-checkpoints-json-with-sidecars",
-        None,
-        ExpectedMetrics {
+    #[case::json_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 101,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::parquet_sidecars(
-        "v2-checkpoints-parquet-with-sidecars",
-        None,
-        ExpectedMetrics {
+        }),
+    })]
+    #[case::parquet_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-with-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 101,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::json_sidecars_with_predicate_gt_20(
-        "v2-checkpoints-json-with-sidecars",
-        Some({
+        }),
+    })]
+    #[case::json_sidecars_with_predicate_gt_20(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
         }),
-        ExpectedMetrics {
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
@@ -669,199 +677,199 @@ mod tests {
             partition_pruning_filtered: 0,
         },
         // Data skipping predicate filters 4 files (101 → 97)
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 97,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 4,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::json_sidecars_with_predicate_gt_80(
-        "v2-checkpoints-json-with-sidecars",
-        Some({
+        }),
+    })]
+    #[case::json_sidecars_with_predicate_gt_80(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(80i64)))
         }),
-        ExpectedMetrics {
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 86,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 15,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::json_sidecars_with_predicate_lt_10(
-        "v2-checkpoints-json-with-sidecars",
-        Some({
+        }),
+    })]
+    #[case::json_sidecars_with_predicate_lt_10(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::lt(column_expr!("id"), Expr::literal(10i64)))
         }),
-        ExpectedMetrics {
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 32,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 69,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::parquet_sidecars_with_predicate(
-        "v2-checkpoints-parquet-with-sidecars",
-        Some({
+        }),
+    })]
+    #[case::parquet_sidecars_with_predicate(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-with-sidecars",
+        predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
         }),
-        ExpectedMetrics {
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 97,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 4,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::json_sidecars_with_very_selective_predicate(
-        "v2-checkpoints-json-with-sidecars",
-        Some({
+        }),
+    })]
+    #[case::json_sidecars_with_very_selective_predicate(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             // Highly selective predicate
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(99i64)))
         }),
-        ExpectedMetrics {
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 5,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 69,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 32,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::json_without_sidecars(
-        "v2-checkpoints-json-without-sidecars",
-        None,
-        ExpectedMetrics {
+        }),
+    })]
+    #[case::json_without_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-without-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 3,
             removes: 0,
             non_file_actions: 4,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        None
-    )]
-    #[case::json_with_last_checkpoint(
-        "v2-checkpoints-json-with-last-checkpoint",
-        None,
-        ExpectedMetrics {
+        expected_parallel_metrics: None,
+    })]
+    #[case::json_with_last_checkpoint(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-last-checkpoint",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 4,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 2,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::parquet_without_sidecars(
-        "v2-checkpoints-parquet-without-sidecars",
-        None,
-        ExpectedMetrics {
+        }),
+    })]
+    #[case::parquet_without_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-without-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 3,
             removes: 0,
             non_file_actions: 4,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        None
-    )]
-    #[case::parquet_with_last_checkpoint(
-        "v2-checkpoints-parquet-with-last-checkpoint",
-        None,
-        ExpectedMetrics {
+        expected_parallel_metrics: None,
+    })]
+    #[case::parquet_with_last_checkpoint(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-with-last-checkpoint",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 4,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 2,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::v2_classic_json(
-        "v2-classic-checkpoint-json",
-        None,
-        ExpectedMetrics {
+        }),
+    })]
+    #[case::v2_classic_json(ParallelLogReplayCase {
+        path: "v2-classic-checkpoint-json",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 4,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 4,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::v2_classic_parquet(
-        "v2-classic-checkpoint-parquet",
-        None,
-        ExpectedMetrics {
+        }),
+    })]
+    #[case::v2_classic_parquet(ParallelLogReplayCase {
+        path: "v2-classic-checkpoint-parquet",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             adds: 0,
             removes: 0,
             non_file_actions: 4,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
         },
-        Some(ExpectedMetrics {
+        expected_parallel_metrics: Some(ExpectedMetrics {
             adds: 4,
             removes: 0,
             non_file_actions: 0,
             data_skipping_filtered: 0,
             partition_pruning_filtered: 0,
-        })
-    )]
-    #[case::no_parallel_needed(
-        "table-without-dv-small",
-        None,
-        ExpectedMetrics {
+        }),
+    })]
+    #[case::no_parallel_needed(ParallelLogReplayCase {
+        path: "table-without-dv-small",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
             // This table has single-part checkpoint, completes in sequential phase
             adds: 1,
             removes: 0,
@@ -870,13 +878,10 @@ mod tests {
             partition_pruning_filtered: 0,
         },
         // No parallel phase needed
-        None
-    )]
+        expected_parallel_metrics: None,
+    })]
     fn test_parallel_workflow_with_metrics(
-        #[case] table_name: &str,
-        #[case] predicate: Option<PredicateRef>,
-        #[case] sequential_expected: ExpectedMetrics,
-        #[case] parallel_expected: Option<ExpectedMetrics>,
+        #[case] test_case: ParallelLogReplayCase,
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
     ) -> DeltaResult<()> {
@@ -889,8 +894,8 @@ mod tests {
         let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
 
         verify_parallel_workflow(
-            table_name,
-            predicate,
+            test_case.path,
+            test_case.predicate,
             with_serde,
             one_file_per_worker,
             Some(dispatcher),
@@ -900,9 +905,9 @@ mod tests {
         let logs = logging_test.logs();
         verify_metrics_in_logs(
             &logs,
-            table_name,
-            &sequential_expected,
-            parallel_expected.as_ref(),
+            test_case.path,
+            &test_case.expected_sequential_metrics,
+            test_case.expected_parallel_metrics.as_ref(),
         );
 
         Ok(())
