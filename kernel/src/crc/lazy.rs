@@ -10,6 +10,7 @@ use tracing::warn;
 use super::{try_read_crc_file, Crc};
 use crate::path::ParsedLogPath;
 use crate::{Engine, Version};
+use crate::error::Error;
 
 /// Result of attempting to load a CRC file.
 ///
@@ -19,8 +20,10 @@ use crate::{Engine, Version};
 pub(crate) enum CrcLoadResult {
     /// No CRC file exists for this log segment.
     DoesNotExist,
-    /// CRC file exists but failed to read/parse (corrupted or I/O error).
-    CorruptOrFailed,
+    /// An I/O error occurred while attempting to read the existing CRC file.
+    ReadFailed,
+    /// The CRC file was read successfully, but the content was not valid JSON.
+    ParseFailed,
     /// CRC file was successfully loaded.
     Loaded(Arc<Crc>),
 }
@@ -67,12 +70,26 @@ impl LazyCrc {
             None => CrcLoadResult::DoesNotExist,
             Some(crc_path) => match try_read_crc_file(engine, crc_path) {
                 Ok(crc) => CrcLoadResult::Loaded(Arc::new(crc)),
+                Err(Error::IOError(_)) => {
+                    warn!(
+                        "Failed to read CRC file at {:?}.",
+                        crc_path.location.location
+                    );
+                    CrcLoadResult::ReadFailed
+                }
+                Err(Error::MalformedJson(_)) => {
+                    warn!(
+                        "CRC file at {:?} contains malformed JSON.",
+                        crc_path.location.location
+                    );
+                    CrcLoadResult::ParseFailed
+                }
                 Err(e) => {
                     warn!(
-                        "Failed to read CRC file {:?}: {}.",
+                        "Unexpected error reading CRC file {:?}: {}.",
                         crc_path.location.location, e
                     );
-                    CrcLoadResult::CorruptOrFailed
+                    CrcLoadResult::ReadFailed
                 }
             },
         })
@@ -142,7 +159,8 @@ mod tests {
 
     #[rstest]
     #[case::does_not_exist(CrcLoadResult::DoesNotExist)]
-    #[case::corrupt(CrcLoadResult::CorruptOrFailed)]
+    #[case::read_failed(CrcLoadResult::ReadFailed)]
+    #[case::parse_failed(CrcLoadResult::ParseFailed)]
     fn test_crc_load_result(#[case] result: CrcLoadResult) {
         assert!(result.get().is_none());
     }
@@ -172,7 +190,7 @@ mod tests {
         assert_eq!(lazy.crc_version(), Some(5));
 
         let result = lazy.get_or_load(&engine);
-        assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
+        assert!(matches!(result, CrcLoadResult::ReadFailed));
         assert!(result.get().is_none());
         assert!(lazy.is_loaded());
     }
@@ -208,7 +226,7 @@ mod tests {
         assert_eq!(lazy.crc_version(), Some(0));
 
         let result = lazy.get_or_load(&engine);
-        assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
+        assert!(matches!(result, CrcLoadResult::ParseFailed));
         assert!(result.get().is_none());
         assert!(lazy.is_loaded());
     }
