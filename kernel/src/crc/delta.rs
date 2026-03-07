@@ -1,5 +1,3 @@
-// No consumers yet -- will be integrated in a follow-up PR.
-#![allow(dead_code)]
 //! Incremental CRC state updates via commit deltas.
 //!
 //! A [`CrcDelta`] captures CRC-relevant changes from a single commit (produced by reading a
@@ -41,6 +39,37 @@ pub(crate) struct CrcDelta {
     /// A file action in this commit had a missing `size` field, making byte-level file stats
     /// impossible to compute.
     pub(crate) has_missing_file_size: bool,
+}
+
+impl CrcDelta {
+    /// Convert this delta into a fresh [`Crc`]. Used when the delta represents the entire table
+    /// state (e.g. CREATE TABLE or the first commit in a forward replay from version zero).
+    ///
+    /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
+    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
+        let protocol = self.protocol?;
+        let metadata = self.metadata?;
+        // Always wrap in Some -- an empty list means "zero domain metadata actions",
+        // while None means "unknown" (i.e. we couldn't determine the domain metadata state).
+        let domain_metadata = Some(
+            self.domain_metadata_changes
+                .into_iter()
+                .filter(|dm| !dm.is_removed())
+                .map(|dm| (dm.domain().to_string(), dm))
+                .collect(),
+        );
+        Some(Crc {
+            table_size_bytes: self.file_stats.net_bytes,
+            num_files: self.file_stats.net_files,
+            num_metadata: 1,
+            num_protocol: 1,
+            protocol,
+            metadata,
+            domain_metadata,
+            in_commit_timestamp_opt: self.in_commit_timestamp,
+            ..Default::default()
+        })
+    }
 }
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
@@ -385,5 +414,83 @@ mod tests {
         };
         crc.apply(delta);
         assert_eq!(crc.in_commit_timestamp_opt, None);
+    }
+
+    // ===== CrcDelta::into_crc_for_version_zero tests =====
+
+    fn test_protocol() -> Protocol {
+        Protocol::try_new(
+            1,
+            2,
+            None::<Vec<crate::table_features::TableFeature>>,
+            None::<Vec<crate::table_features::TableFeature>>,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_protocol_and_metadata() {
+        let protocol = test_protocol();
+        let metadata = Metadata::default();
+        let delta = CrcDelta {
+            protocol: Some(protocol.clone()),
+            metadata: Some(metadata.clone()),
+            ..write_delta(5, 1000)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        assert_eq!(crc.protocol, protocol);
+        assert_eq!(crc.metadata, metadata);
+        assert_eq!(crc.num_files, 5);
+        assert_eq!(crc.table_size_bytes, 1000);
+        assert_eq!(crc.num_metadata, 1);
+        assert_eq!(crc.num_protocol, 1);
+        assert_eq!(crc.validity, FileStatsValidity::Valid);
+        assert_eq!(crc.domain_metadata, Some(HashMap::new()));
+        assert_eq!(crc.in_commit_timestamp_opt, None);
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_returns_none_without_protocol() {
+        let delta = CrcDelta {
+            metadata: Some(Metadata::default()),
+            ..write_delta(5, 1000)
+        };
+        assert!(delta.into_crc_for_version_zero().is_none());
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_returns_none_without_metadata() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            ..write_delta(5, 1000)
+        };
+        assert!(delta.into_crc_for_version_zero().is_none());
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_domain_metadata() {
+        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            domain_metadata_changes: vec![dm],
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        let map = crc.domain_metadata.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my.domain"].configuration(), "config1");
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_in_commit_timestamp() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            in_commit_timestamp: Some(12345),
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
     }
 }

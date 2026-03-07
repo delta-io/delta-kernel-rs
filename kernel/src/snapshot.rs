@@ -15,7 +15,7 @@ use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::get_clustering_columns_from_domain_metadata;
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::LazyCrc;
+use crate::crc::{try_write_crc_file, CrcDelta, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -52,6 +52,16 @@ pub(crate) struct FileStats {
     pub table_size_bytes: i64,
     /// Number of active AddFile actions in this table version.
     pub num_files: i64,
+}
+
+/// Result of attempting to write a version checksum (CRC) file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumWriteResult {
+    /// A CRC file already exists at this version. Per the Delta protocol, writers MUST NOT
+    /// overwrite existing version checksum files.
+    AlreadyExists,
+    /// The CRC file was successfully written to storage.
+    Written,
 }
 
 // TODO expose methods for accessing the files of a table (with file pruning).
@@ -460,11 +470,19 @@ impl Snapshot {
     /// allows immediate use of the new and latest table state without re-reading metadata from
     /// storage.
     ///
-    /// TODO: Take in ICT.
-    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
-    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
-    #[allow(unused)]
-    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+    /// The `crc_delta` captures the CRC-relevant changes from the committed transaction. If the
+    /// pre-commit snapshot had a loaded CRC at its version, the delta is applied to produce a
+    /// precomputed CRC for the new version. CREATE TABLE is always able to produce a post-commit
+    /// in-memory CRC at v0. Otherwise,
+    /// the existing lazy CRC is carried forward unchanged.
+    ///
+    /// TODO: Handle Protocol changes in CrcDelta (when Kernel-RS supports protocol changes)
+    /// TODO: Handle Metadata changes in CrcDelta (when Kernel-RS supports metadata changes)
+    pub(crate) fn new_post_commit(
+        &self,
+        commit: ParsedLogPath,
+        crc_delta: CrcDelta,
+    ) -> DeltaResult<Self> {
         require!(
             commit.is_commit(),
             Error::internal_error(format!(
@@ -473,26 +491,60 @@ impl Snapshot {
                 commit.location.location, commit.file_type
             ))
         );
+        let read_version = self.version();
+        let new_version = commit.version;
         require!(
-            commit.version == self.version().wrapping_add(1),
+            new_version == read_version.wrapping_add(1),
             Error::internal_error(format!(
                 "Cannot create post-commit Snapshot. Log file version ({}) does not \
                 equal Snapshot version ({}) + 1.",
-                commit.version,
-                self.version()
+                new_version, read_version
             ))
         );
 
         let new_table_configuration =
-            TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
+            TableConfiguration::new_post_commit(self.table_configuration(), new_version);
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
+
+        let new_lazy_crc = self.compute_post_commit_crc(new_version, crc_delta);
 
         Ok(Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
-            self.lazy_crc.clone(),
+            new_lazy_crc,
         ))
+    }
+
+    /// Compute the lazy CRC for a post-commit snapshot by applying a [`CrcDelta`].
+    ///
+    /// For CREATE TABLE, builds a fresh CRC from the delta. For existing tables, applies the
+    /// delta to the current CRC if loaded, otherwise carries forward the existing lazy CRC.
+    fn compute_post_commit_crc(&self, new_version: Version, crc_delta: CrcDelta) -> Arc<LazyCrc> {
+        let crc = if self.version() == crate::PRE_COMMIT_VERSION {
+            crc_delta.into_crc_for_version_zero()
+        } else {
+            self.lazy_crc
+                .get_if_loaded_at_version(self.version())
+                .map(|base| {
+                    let mut crc = base.as_ref().clone();
+                    crc.apply(crc_delta);
+                    crc
+                })
+        };
+
+        match crc {
+            Some(c) => Arc::new(LazyCrc::new_precomputed(c, new_version)),
+            None => self.lazy_crc.clone(),
+        }
+    }
+
+    /// Returns the precomputed CRC if one is loaded at this snapshot's version.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_crc_for_testing(&self) -> Option<&crate::crc::Crc> {
+        self.lazy_crc
+            .get_if_loaded_at_version(self.version())
+            .map(|arc| arc.as_ref())
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -686,6 +738,58 @@ impl Snapshot {
             return None;
         }
         self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
+    }
+
+    /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
+    /// every commit -- checksums enable faster snapshot loading and table state validation.
+    ///
+    /// Currently only supports writing from a post-commit snapshot that has pre-computed CRC
+    /// information in memory (i.e. the snapshot returned by
+    /// [`CommittedTransaction::post_commit_snapshot`]).
+    ///
+    /// Returns [`ChecksumWriteResult::AlreadyExists`] if a checksum already exists at this
+    /// version (safe for concurrent writers). Returns [`ChecksumWriteResult::Written`] on
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this
+    ///   snapshot's version (e.g. the snapshot was loaded from disk without CRC tracking).
+    /// - I/O errors from the engine's storage handler if the write fails.
+    ///
+    /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
+    pub fn write_checksum(&self, engine: &dyn Engine) -> DeltaResult<ChecksumWriteResult> {
+        let has_crc_on_disk = self
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .is_some_and(|f| f.version == self.version());
+
+        if has_crc_on_disk {
+            return Ok(ChecksumWriteResult::AlreadyExists);
+        }
+
+        let crc = self
+            .lazy_crc
+            .get_if_loaded_at_version(self.version())
+            .ok_or_else(|| {
+                Error::ChecksumWriteUnsupported(
+                    "No in-memory CRC available at this snapshot version.".to_string(),
+                )
+            })?;
+
+        let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
+
+        // TODO: Would be nice to update LogSegment.listed.latest_crc_file here, but that probably
+        //       requires changing it to a OnceLock, which is a bit of an invasive change. Perhaps,
+        //       return an updated Snapshot instead.
+
+        match try_write_crc_file(engine, &crc_path.location, crc, false) {
+            Ok(()) => Ok(ChecksumWriteResult::Written),
+            Err(Error::FileAlreadyExists(_)) => Ok(ChecksumWriteResult::AlreadyExists),
+            Err(e) => Err(e),
+        }
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
@@ -2083,7 +2187,9 @@ mod tests {
 
         // WHEN
         let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+        let post_commit_snapshot = base_snapshot
+            .new_post_commit(fake_new_commit, CrcDelta::default())
+            .unwrap();
 
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
