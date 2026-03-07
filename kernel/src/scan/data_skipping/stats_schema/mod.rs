@@ -212,11 +212,10 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
 
 /// Strips all field metadata from a schema.
 ///
-/// Field metadata (e.g. `__CHAR_VARCHAR_TYPE_STRING`, column mapping properties) describes the
-/// logical table column, not the stats values themselves. This must be applied to stats schemas
-/// after all other transforms (including physical name mapping) to avoid schema mismatches when
-/// reading `stats_parsed` from older checkpoints that were written before the metadata was added
-/// to the table schema.
+/// Field metadata describes the logical table column, not the stats values themselves. This
+/// transform strips that metadata, and must be applied to stats schemas to avoid schema possible
+/// mismatches when reading `stats_parsed` from older data since that field metadata could have
+/// changed.
 pub(crate) struct StripFieldMetadataTransform;
 impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
