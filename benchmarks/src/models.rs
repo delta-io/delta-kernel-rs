@@ -34,26 +34,17 @@ pub enum ParallelScan {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    /// Table name used for identifying the table
-    pub name: String,
-    /// Human-readable description of the table
-    pub description: String,
-    /// URL to the table (for remote tables); also used to override the default local table path
-    pub table_path: Option<Url>,
-    /// Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
-    pub schema: StructType,
-    /// Protocol version requirements and table features. Uses camelCase JSON keys
-    pub protocol: Protocol,
-    /// Log-level statistics for the table
-    pub log_info: LogInfo,
-    /// User-defined table properties
-    pub properties: HashMap<String, String>,
-    /// Physical data layout of the table
-    pub data_layout: DataLayout,
-    /// Tags for filtering workloads
-    pub tags: Vec<String>,
+    pub name: String,                        // Table name used for identifying the table
+    pub description: String,                 // Human-readable description of the table
+    pub table_path: Option<Url>,             // URL to the table (for remote tables); also used to override the default local table path
+    pub schema: StructType,                  // Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
+    pub protocol: Protocol,                  // Protocol version requirements and table features. Uses camelCase JSON keys
+    pub log_info: LogInfo,                   // Log-level statistics for the table
+    pub properties: HashMap<String, String>, // User-defined table properties
+    pub data_layout: DataLayout,             // Physical data layout of the table
+    pub tags: Vec<String>,                   // Tags for filtering workloads
     #[serde(skip, default)]
-    pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
+    pub table_info_dir: PathBuf,             // Path to the directory containing the tableInfo.json file
 }
 
 impl TableInfo {
@@ -76,49 +67,35 @@ impl TableInfo {
     }
 }
 
-/// Log-level statistics describing the history and structure of a Delta table.
+/// Log-level information describing the history and structure of a Delta table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogInfo {
-    /// Number of active Add file actions in the table.
-    pub num_add_files: u64,
-    /// Number of Remove file actions in the table.
-    pub num_remove_files: u64,
-    /// Total on-disk size of all data files in bytes.
-    pub size_in_bytes: u64,
-    /// Number of commits (JSON log files) in the table history.
-    pub num_commits: u64,
-    /// Total number of actions across all commits.
-    pub num_actions: u64,
-    /// Version of the most recent checkpoint, if any.
-    pub last_checkpoint_version: Option<u64>,
-    /// Version of the most recent CRC file, if any.
-    pub last_crc_version: Option<u64>,
-    /// Number of parquet part files in the most recent multi-part checkpoint, if any.
-    pub num_parallel_checkpoint_files: Option<u32>,
+    pub num_add_files: u64,                        // Number of active Add file actions in the table
+    pub num_remove_files: u64,                     // Number of Remove file actions in the table
+    pub size_in_bytes: u64,                        // Total on-disk size of all data files in bytes
+    pub num_commits: u64,                          // Number of commits (JSON log files) in the table history
+    pub num_actions: u64,                          // Total number of actions across all commits
+    pub last_checkpoint_version: Option<u64>,      // Version of the most recent checkpoint, if any
+    pub last_crc_version: Option<u64>,             // Version of the most recent CRC file, if any
+    pub num_parallel_checkpoint_files: Option<u32>, // Number of parquet part files in the most recent multi-part checkpoint, if any
 }
 
-/// Physical data layout of a Delta table.
-///
-/// A table is either clustered (liquid clustering) or partitioned (Hive-style); never both.
+/// Physical data layout of a Delta table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum DataLayout {
-    /// Hive-style partitioned table.
-    Partitioned {
-        /// Number of partition columns.
+    Partitioned { 
         #[serde(rename = "numPartitionColumns")]
-        num_partition_columns: u32,
-        /// Number of distinct partition values observed in the table.
+        num_partition_columns: u32,  // Number of partition columns
         #[serde(rename = "numDistinctPartitions")]
-        num_distinct_partitions: u64,
+        num_distinct_partitions: u64, // Number of distinct partition values observed in the table
     },
-    /// Liquid-clustered table.
-    Clustered {
-        /// Number of clustering columns.
+    Clustered { 
         #[serde(rename = "numClusteringColumns")]
-        num_clustering_columns: u32,
+        num_clustering_columns: u32, // Number of clustering columns
     },
+    None {}, // No special data organization (default)
 }
 
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
