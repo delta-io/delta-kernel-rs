@@ -17,6 +17,7 @@ mod writer;
 
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
+pub(crate) use file_stats::FileStats;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]
@@ -74,10 +75,11 @@ pub enum FileStatsValidity {
 pub struct Crc {
     // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
-    /// [`Add`] actions.
-    pub table_size_bytes: i64,
+    /// [`Add`] actions. Private -- use [`Crc::file_stats()`] to access safely.
+    table_size_bytes: i64,
     /// Number of live [`Add`] actions in this table version after action reconciliation.
-    pub num_files: i64,
+    /// Private -- use [`Crc::file_stats()`] to access safely.
+    num_files: i64,
     /// Number of [`Metadata`] actions. Must be 1.
     pub num_metadata: i64,
     /// Number of [`Protocol`] actions. Must be 1.
@@ -128,6 +130,23 @@ pub struct Crc {
     /// Distribution of deleted record counts across files. See this section for more details.
     #[serde(skip)]
     pub deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+}
+
+impl Crc {
+    /// Returns file-level statistics only if they are known to be valid.
+    ///
+    /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
+    /// built from incremental replay that encountered a non-incremental operation or a
+    /// missing file size.
+    pub fn file_stats(&self) -> Option<FileStats> {
+        match self.validity {
+            FileStatsValidity::Valid => Some(FileStats {
+                num_files: self.num_files,
+                table_size_bytes: self.table_size_bytes,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Deserialize `Option<Vec<DomainMetadata>>` from JSON into `Option<HashMap<String, DomainMetadata>>`.
