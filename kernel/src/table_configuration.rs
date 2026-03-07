@@ -239,6 +239,27 @@ impl TableConfiguration {
             .map(|s| Arc::new(s.into_owned()))
             .unwrap_or_else(|| logical_stats_schema.clone()),
         };
+
+        // Strip field metadata from stats schemas. This metadata describes logical table columns,
+        // not the stats. Keeping it can cause schema mismatches when combining the parsed stats
+        // from a checkpoint written before logical metadata was added.
+        let strip_metadata = |schema: SchemaRef| -> SchemaRef {
+            use std::borrow::Cow;
+
+            use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
+
+            match StripFieldMetadataTransform.transform_struct(&schema) {
+                Some(Cow::Owned(s)) => Arc::new(s),
+                _ => schema,
+            }
+        };
+        let logical_stats_schema = strip_metadata(logical_stats_schema);
+        let physical_stats_schema = if Arc::ptr_eq(&logical_stats_schema, &physical_stats_schema) {
+            // no need to run a second strip if they are the same schema
+            logical_stats_schema.clone()
+        } else {
+            strip_metadata(physical_stats_schema)
+        };
         Ok(ExpectedStatsSchemas {
             logical: logical_stats_schema,
             physical: physical_stats_schema,
