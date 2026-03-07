@@ -94,8 +94,7 @@ fn test_bad_right_type_array() {
 /// inside the list. The correct behavior would be to return `Ok(BooleanArray::from(vec![true,
 /// false, true]))`.
 #[test]
-#[should_panic(expected = "string array")]
-fn test_in_predicate_fails_with_utf8view_list_column() {
+fn test_in_predicate_with_utf8view_list_column() {
     use crate::arrow::array::StringViewArray;
 
     // Build a List<Utf8View> column:
