@@ -9,13 +9,14 @@ use tracing::warn;
 
 use super::{try_read_crc_file, Crc};
 use crate::path::ParsedLogPath;
-use crate::{Engine, Version};
+use crate::{internal_api, Engine, Version};
 
 /// Result of attempting to load a CRC file.
 ///
 /// The "not yet loaded" state is represented by `OnceLock::get()` returning `None`, not as an enum
 /// variant.
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) enum CrcLoadResult {
     /// No CRC file exists for this log segment.
     DoesNotExist,
@@ -40,6 +41,7 @@ impl CrcLoadResult {
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
 #[derive(Debug)]
+#[internal_api]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
     crc_file: Option<ParsedLogPath>,
@@ -51,6 +53,7 @@ impl LazyCrc {
     /// Create a new lazy CRC loader.
     ///
     /// If `crc_file` is `None`, the loader will immediately return `DoesNotExist` when accessed.
+    #[internal_api]
     pub(crate) fn new(crc_file: Option<ParsedLogPath>) -> Self {
         Self {
             crc_file,
