@@ -15,7 +15,7 @@ use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::get_clustering_columns_from_domain_metadata;
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::{CrcDelta, LazyCrc};
+use crate::crc::{try_write_crc_file, CrcDelta, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -52,6 +52,16 @@ pub(crate) struct FileStats {
     pub table_size_bytes: i64,
     /// Number of active AddFile actions in this table version.
     pub num_files: i64,
+}
+
+/// Result of attempting to write a version checksum (CRC) file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumWriteResult {
+    /// A CRC file already exists at this version. Per the Delta protocol, writers MUST NOT
+    /// overwrite existing version checksum files.
+    AlreadyExists,
+    /// The CRC file was successfully written to storage.
+    Written,
 }
 
 // TODO expose methods for accessing the files of a table (with file pruning).
@@ -728,6 +738,58 @@ impl Snapshot {
             return None;
         }
         self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
+    }
+
+    /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
+    /// every commit -- checksums enable faster snapshot loading and table state validation.
+    ///
+    /// Currently only supports writing from a post-commit snapshot that has pre-computed CRC
+    /// information in memory (i.e. the snapshot returned by
+    /// [`CommittedTransaction::post_commit_snapshot`]).
+    ///
+    /// Returns [`ChecksumWriteResult::AlreadyExists`] if a checksum already exists at this
+    /// version (safe for concurrent writers). Returns [`ChecksumWriteResult::Written`] on
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this
+    ///   snapshot's version (e.g. the snapshot was loaded from disk without CRC tracking).
+    /// - I/O errors from the engine's storage handler if the write fails.
+    ///
+    /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
+    pub fn write_checksum(&self, engine: &dyn Engine) -> DeltaResult<ChecksumWriteResult> {
+        let has_crc_on_disk = self
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .is_some_and(|f| f.version == self.version());
+
+        if has_crc_on_disk {
+            return Ok(ChecksumWriteResult::AlreadyExists);
+        }
+
+        let crc = self
+            .lazy_crc
+            .get_if_loaded_at_version(self.version())
+            .ok_or_else(|| {
+                Error::ChecksumWriteUnsupported(
+                    "No in-memory CRC available at this snapshot version.".to_string(),
+                )
+            })?;
+
+        let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
+
+        // TODO: Would be nice to update LogSegment.listed.latest_crc_file here, but that probably
+        //       requires changing it to a OnceLock, which is a bit of an invasive change. Perhaps,
+        //       return an updated Snapshot instead.
+
+        match try_write_crc_file(engine, &crc_path.location, crc, false) {
+            Ok(()) => Ok(ChecksumWriteResult::Written),
+            Err(Error::FileAlreadyExists(_)) => Ok(ChecksumWriteResult::AlreadyExists),
+            Err(e) => Err(e),
+        }
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
