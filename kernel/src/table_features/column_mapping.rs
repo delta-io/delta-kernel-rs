@@ -19,11 +19,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use strum::EnumString;
+use strum::{AsRefStr, EnumString};
 use uuid::Uuid;
 
 /// Modes of column mapping a table can be in
-#[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
+#[derive(
+    Debug, strum::Display, AsRefStr, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq,
+)]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub enum ColumnMappingMode {
@@ -427,8 +429,10 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructType};
+    use crate::table_features::Operation;
     use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use crate::utils::test_utils::test_schema_nested_with_column_mapping;
 
@@ -707,6 +711,187 @@ mod tests {
             ),
             "Duplicate column mapping ID",
         );
+    }
+
+    // =========================================================================
+    // End-to-end TC-level tests for column mapping mode vs protocol vs schema.
+    //
+    // Column mapping is the only feature with BOTH a multi-valued toggle property
+    // (delta.columnMapping.mode) AND schema-level presence (annotations). This
+    // combination is not expressible in the generic test battery, so these tests
+    // cover the {support mechanism} × {mode} × {annotations} matrix directly.
+    // =========================================================================
+
+    /// Helper: build a TC from a schema, protocol, and optional mode property.
+    fn make_cm_tc(
+        schema: Arc<StructType>,
+        protocol: Protocol,
+        mode: Option<ColumnMappingMode>,
+    ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
+        use crate::actions::Metadata;
+        let props: HashMap<String, String> = mode
+            .map(|m| HashMap::from([("delta.columnMapping.mode".to_string(), m.to_string())]))
+            .unwrap_or_default();
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+        let table_root = url::Url::parse("file:///").unwrap();
+        crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
+    }
+
+    fn plain_schema() -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]))
+    }
+
+    fn annotated_schema() -> Arc<StructType> {
+        Arc::new(create_schema(
+            "5",
+            "\"col-a7f4159c\"",
+            "4",
+            "\"col-5f422f40\"",
+        ))
+    }
+
+    /// v3 + CM feature: mode=id/name without annotations → rejected (missing annotations).
+    #[test]
+    fn test_cm_v3_supported_mode_set_but_no_annotations() {
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
+        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
+            assert!(
+                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
+                "v3+feat, mode={mode:?}, no annotations: should fail"
+            );
+        }
+    }
+
+    /// v3 + CM feature: mode=none with annotations → rejected (orphaned annotations).
+    #[test]
+    fn test_cm_v3_supported_mode_none_with_annotations() {
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
+        assert!(
+            make_cm_tc(annotated_schema(), protocol, Some(ColumnMappingMode::None)).is_err(),
+            "v3+feat, mode=none, annotations present: should fail"
+        );
+    }
+
+    /// v3 + no CM feature: mode=id/name without annotations → silently downgrades to None.
+    /// The mode property is ignored per spec when the feature is not supported.
+    #[test]
+    fn test_cm_v3_not_supported_mode_set_no_annotations() {
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
+            let tc = make_cm_tc(plain_schema(), protocol.clone(), Some(mode))
+                .unwrap_or_else(|e| panic!("v3-feat, mode={mode:?}, no annotations: {e}"));
+            assert!(!tc.is_feature_supported(&TableFeature::ColumnMapping));
+            assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+        }
+    }
+
+    /// Mixed protocol (2,7): CM listed in writer features and reader=2 should support CM.
+    #[test]
+    fn test_cm_mixed_2_7_listed_reader_sufficient() {
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        )
+        .unwrap();
+
+        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
+            let tc = make_cm_tc(annotated_schema(), protocol.clone(), Some(mode))
+                .unwrap_or_else(|e| panic!("mixed (2,7), mode={mode:?}: {e}"));
+            assert!(
+                tc.is_feature_supported(&TableFeature::ColumnMapping),
+                "mixed (2,7), mode={mode:?}: CM should be supported"
+            );
+            assert_eq!(
+                tc.column_mapping_mode(),
+                mode,
+                "mixed (2,7), mode={mode:?}: expected active CM mode"
+            );
+        }
+    }
+
+    /// Mixed protocol with reader=1 and CM listed should be rejected by protocol validation.
+    #[test]
+    fn test_cm_mixed_1_7_listed_reader_insufficient_rejected() {
+        // FIXME: It's a layering violation for Protocol::try_new to catch this. It should only
+        // worry about structural validity, not semantics of specific features. TableConfiguration
+        // is responsible to validate feature support/enablement semantics of specific features.
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(
+            protocol.is_err(),
+            "mixed (1,7) with CM listed should be invalid"
+        );
+    }
+
+    /// Mixed protocol dependency bridge: modern iceberg writer-only features can coexist with CM
+    /// in (2,7), and missing CM should fail write support checks.
+    #[test]
+    fn test_cm_mixed_2_7_iceberg_dependency_bridge() {
+        for iceberg_feature in [TableFeature::IcebergCompatV1, TableFeature::IcebergCompatV2] {
+            // Valid bridge shape: (2,7) with both iceberg feature and columnMapping listed.
+            let protocol_with_cm = Protocol::try_new(
+                2,
+                7,
+                TableFeature::NO_LIST,
+                Some(vec![iceberg_feature.clone(), TableFeature::ColumnMapping]),
+            )
+            .unwrap();
+
+            let tc = make_cm_tc(
+                annotated_schema(),
+                protocol_with_cm,
+                Some(ColumnMappingMode::Name), // CM must be enabled for iceberg dependency
+            )
+            .unwrap();
+            assert!(
+                tc.is_feature_supported(&TableFeature::ColumnMapping),
+                "mixed bridge (2,7), feature={iceberg_feature}: CM should be supported"
+            );
+            assert!(
+                tc.is_feature_supported(&iceberg_feature),
+                "mixed bridge (2,7), feature={iceberg_feature}: feature should be supported"
+            );
+            // Kernel support for iceberg writes remains unsupported on this branch.
+            assert!(tc.ensure_operation_supported(Operation::Write).is_err());
+
+            // Missing CM from writer list should fail write support checks.
+            let protocol_missing_cm = Protocol::try_new(
+                2,
+                7,
+                TableFeature::NO_LIST,
+                Some(vec![iceberg_feature.clone()]),
+            )
+            .unwrap();
+            let tc_missing_cm = make_cm_tc(
+                annotated_schema(),
+                protocol_missing_cm,
+                Some(ColumnMappingMode::Name),
+            )
+            .unwrap();
+            assert!(
+                !tc_missing_cm.is_feature_supported(&TableFeature::ColumnMapping),
+                "mixed bridge (2,7), feature={iceberg_feature}: CM should not be supported when unlisted"
+            );
+            let write_check = tc_missing_cm.ensure_operation_supported(Operation::Write);
+            assert!(
+                write_check.is_err(),
+                "mixed bridge (2,7), feature={iceberg_feature}: missing CM should fail write support"
+            );
+        }
     }
 
     // =========================================================================
