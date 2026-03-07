@@ -8,7 +8,7 @@
 mod lazy;
 mod reader;
 
-pub(crate) use lazy::{CrcLoadResult, LazyCrc};
+pub use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 
 use std::sync::LazyLock;
@@ -20,7 +20,7 @@ use crate::schema::ToSchema as _;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
-use delta_kernel_derive::ToSchema;
+use delta_kernel_derive::{internal_api, ToSchema};
 
 /// Parsed content of a CRC (version checksum) file.
 ///
@@ -29,6 +29,7 @@ use delta_kernel_derive::ToSchema;
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
 /// 3. Contain exactly one JSON object with the schema of this struct.
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
 pub(crate) struct Crc {
     // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live

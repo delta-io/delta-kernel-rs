@@ -48,6 +48,7 @@ pub(crate) struct ListedLogFiles {
 /// Use struct literal syntax with `..Default::default()` to set only the fields you need,
 /// then call `.build()` to validate and produce a `ListedLogFiles`.
 #[derive(Debug, Default)]
+#[internal_api]
 pub(crate) struct ListedLogFilesBuilder {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
@@ -59,6 +60,7 @@ pub(crate) struct ListedLogFilesBuilder {
 
 impl ListedLogFilesBuilder {
     /// Validates the builder contents and produces a [`ListedLogFiles`].
+    #[internal_api]
     pub(crate) fn build(self) -> DeltaResult<ListedLogFiles> {
         // We are adding debug_assertions here since we want to validate invariants that are
         // (relatively) expensive to compute
