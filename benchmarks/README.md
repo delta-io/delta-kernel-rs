@@ -92,7 +92,7 @@ benchmarks/data/workloads/
 │       ├── tableInfo.json        # describes the table (name, schema, protocol, etc.)
 │       ├── delta/                # Delta table data (if no explicit tablePath)
 │       └── specs/
-│           └── <case_name>.json   # one file per benchmark operation
+│           └── <case_name>.json  # one file per benchmark operation
 └── tests/                        # reserved for future test workloads (currently empty)
 ```
 
