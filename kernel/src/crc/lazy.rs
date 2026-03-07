@@ -44,7 +44,7 @@ pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
     crc_file: Option<ParsedLogPath>,
     /// Cached load result (loaded lazily, at most once).
-    cached: OnceLock<CrcLoadResult>,
+    pub(crate) cached: OnceLock<CrcLoadResult>,
 }
 
 impl LazyCrc {
