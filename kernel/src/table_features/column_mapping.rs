@@ -78,7 +78,7 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
-    seen: HashMap<i64, String>, // column mapping id -> first field name that claimed it
+    seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
     err: Option<Error>,
 }
 
@@ -95,7 +95,7 @@ impl<'a> ValidateColumnMappings<'a> {
         }
         Some(Cow::Borrowed(data_type))
     }
-    fn check_annotations(&mut self, field: &StructField) {
+    fn check_annotations(&mut self, field: &'a StructField) {
         // The iterator yields `&&str` but `ColumnName::new` needs `&str`
         let column_name = || ColumnName::new(self.path.iter().copied());
         let annotation = "delta.columnMapping.physicalName";
@@ -128,7 +128,7 @@ impl<'a> ValidateColumnMappings<'a> {
             // Both Id and Name modes require a field ID annotation; None mode forbids it.
             (ColumnMappingMode::None, None) => {}
             (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(id))) => {
-                if let Some(prev) = self.seen.insert(*id, field.name().to_string()) {
+                if let Some(prev) = self.seen.insert(*id, &field.name) {
                     self.err = Some(Error::invalid_column_mapping_mode(format!(
                         "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
                         field.name()
@@ -606,11 +606,16 @@ mod tests {
 
     #[test]
     fn test_annotation_validation_reaches_struct_fields_in_map_value() {
-        let unannotated = StructType::new_unchecked([StructField::new("x", DataType::INTEGER, false)]);
+        let unannotated =
+            StructType::new_unchecked([StructField::new("x", DataType::INTEGER, false)]);
         let schema = StructType::new_unchecked([make_cm_field(
             "b",
             1,
-            MapType::new(DataType::STRING, DataType::Struct(Box::new(unannotated)), false),
+            MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(unannotated)),
+                false,
+            ),
         )]);
         validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
             .expect_err("missing annotation on struct field inside map value");
@@ -696,7 +701,10 @@ mod tests {
     #[test]
     fn test_duplicate_column_mapping_ids_rejected_in_name_mode() {
         crate::utils::test_utils::assert_result_error_with_message(
-            validate_schema_column_mapping(&cm_schema_same_level_duplicates(), ColumnMappingMode::Name),
+            validate_schema_column_mapping(
+                &cm_schema_same_level_duplicates(),
+                ColumnMappingMode::Name,
+            ),
             "Duplicate column mapping ID",
         );
     }
