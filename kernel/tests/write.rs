@@ -32,7 +32,7 @@ use test_utils::set_json_value;
 
 use itertools::Itertools;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;

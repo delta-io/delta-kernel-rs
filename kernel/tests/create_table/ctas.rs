@@ -22,7 +22,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use url::Url;
 
 use test_utils::{

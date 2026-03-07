@@ -117,7 +117,7 @@ mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
+#[cfg(feature = "arrow-58")]
 pub use arrow_compat::*;
 
 pub(crate) mod column_trie;

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use serde_json::json;
 use url::Url;
 

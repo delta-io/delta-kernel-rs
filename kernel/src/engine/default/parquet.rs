@@ -19,7 +19,7 @@ use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore};
+use object_store::{self, DynObjectStore, ObjectStoreExt};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -578,7 +578,7 @@ mod tests {
     use crate::EngineData;
 
     use itertools::Itertools;
-    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use object_store::{local::LocalFileSystem, memory::InMemory};
     use url::Url;
 
     use crate::utils::current_time_ms;

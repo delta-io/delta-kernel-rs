@@ -236,7 +236,7 @@ async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::table_features::TableFeature;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
     use std::sync::Arc;
 
     // Set up in-memory store

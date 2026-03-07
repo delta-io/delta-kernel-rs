@@ -141,7 +141,7 @@ mod tests {
     use crate::{PredicateRef, SnapshotRef};
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;

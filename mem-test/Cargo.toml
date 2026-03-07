@@ -16,7 +16,7 @@ release = false
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["arrow", "default-engine-rustls"] }
 dhat = "0.3"
-object_store = "0.12.3"
+object_store = "0.13.1"
 rayon = "1.10"
 serde_json = "1"
 tempfile = "3"

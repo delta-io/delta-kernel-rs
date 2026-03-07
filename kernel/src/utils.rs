@@ -151,7 +151,7 @@ pub(crate) mod test_utils {
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
