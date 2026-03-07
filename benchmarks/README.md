@@ -26,10 +26,10 @@ samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "som
 Benchmark names follow a hierarchical path structure assembled from the Criterion group name, the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
 
 ```
-workload_benchmarks/{table_name}/{spec_file_name}/{operation}/{config_name}
+workloadBenchmarks/{table_name}/{spec_file_name}/{operation}/{config_name}
 ```
 
-- `workload_benchmarks` — the Criterion benchmark group (always this literal string)
+- `workloadBenchmarks` — the Criterion benchmark group (always this literal string)
 - `{table_name}` — the `name` field from `tableInfo.json`
 - `{spec_file_name}` — the spec filename without its `.json` extension (the `case_name`)
 - `{operation}` — `snapshotConstruction` or `readMetadata`
@@ -39,9 +39,9 @@ All path components use camelCase to match the JSON keys used throughout the wor
 
 Examples:
 ```
-workload_benchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction
-workload_benchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/serial
-workload_benchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/parallel4
+workloadBenchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction
+workloadBenchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/serial
+workloadBenchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/parallel4
 ```
 
 The filter argument is a regular expression, so you can create patterns to target the benchmarks that you want:
@@ -57,7 +57,7 @@ cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009V
 cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions.*snapshotConstruction"
 
 # profile a specific benchmark with samply
-samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workload_benchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction"
+samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workloadBenchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction"
 ```
 
 #### By tag (`BENCH_TAGS`)
