@@ -9,11 +9,10 @@ use crate::models::{
 };
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
-use delta_kernel::{try_parse_uri, Engine, Error};
+use delta_kernel::Engine;
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::thread;
 use url::Url;
 
 /// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
@@ -28,6 +27,7 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
+    thread_pool: Option<rayon::ThreadPool>, // None for serial, Some for parallel
 }
 
 impl ReadMetadataRunner {
@@ -38,8 +38,7 @@ impl ReadMetadataRunner {
         config: ReadConfig,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = table_info.resolved_table_root();
-        let url = try_parse_uri(table_root)?;
+        let url = table_info.resolved_table_root();
 
         let mut builder = Snapshot::builder_for(url);
         if let Some(version) = read_spec.version {
@@ -56,11 +55,21 @@ impl ReadMetadataRunner {
             config.name,
         );
 
+        let thread_pool = match &config.parallel_scan {
+            ParallelScan::Enabled { num_threads } => Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(*num_threads)
+                    .build()?,
+            ),
+            ParallelScan::Disabled => None,
+        };
+
         Ok(Self {
             snapshot,
             engine,
             name,
             config,
+            thread_pool,
         })
     }
 
@@ -73,7 +82,12 @@ impl ReadMetadataRunner {
         Ok(())
     }
 
-    fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn execute_parallel(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = self
+            .thread_pool
+            .as_ref()
+            .ok_or("thread_pool must be Some for parallel execution")?;
+
         let scan = self.snapshot.clone().scan_builder().build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
@@ -84,9 +98,7 @@ impl ReadMetadataRunner {
         match phase1.finish()? {
             AfterSequentialScanMetadata::Done => {}
             AfterSequentialScanMetadata::Parallel { state, files } => {
-                if num_threads == 0 {
-                    return Err("num_threads in ReadConfig must be greater than 0".into());
-                }
+                let num_threads = pool.current_num_threads();
                 let files_per_worker = files.len().div_ceil(num_threads);
 
                 let partitions: Vec<_> = files
@@ -96,33 +108,25 @@ impl ReadMetadataRunner {
 
                 let state = Arc::new(*state);
 
-                let handles: Vec<_> = partitions
-                    .into_iter()
-                    .map(|partition_files| {
+                pool.scope(|s| {
+                    for partition_files in partitions {
                         let engine = self.engine.clone();
                         let state = state.clone();
 
-                        thread::spawn(move || -> Result<(), Error> {
+                        s.spawn(move |_| {
                             if partition_files.is_empty() {
-                                return Ok(());
+                                return;
                             }
 
                             let parallel =
-                                ParallelScanMetadata::try_new(engine, state, partition_files)?;
+                                ParallelScanMetadata::try_new(engine, state, partition_files)
+                                    .expect("failed to create parallel scan");
                             for result in parallel {
-                                black_box(result?);
+                                black_box(result.expect("parallel scan error"));
                             }
-
-                            Ok(())
-                        })
-                    })
-                    .collect();
-
-                for handle in handles {
-                    handle.join().map_err(|_| -> Box<dyn std::error::Error> {
-                        "Worker thread panicked".into()
-                    })??;
-                }
+                        });
+                    }
+                });
             }
         }
         Ok(())
@@ -135,8 +139,8 @@ impl WorkloadRunner for ReadMetadataRunner {
             ParallelScan::Disabled => {
                 self.execute_serial()?;
             }
-            ParallelScan::Enabled { num_threads } => {
-                self.execute_parallel(*num_threads)?;
+            ParallelScan::Enabled { .. } => {
+                self.execute_parallel()?;
             }
         }
 
@@ -179,8 +183,7 @@ impl SnapshotConstructionRunner {
         snapshot_spec: &SnapshotConstructionSpec,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = table_info.resolved_table_root();
-        let url = try_parse_uri(table_root)?;
+        let url = table_info.resolved_table_root();
 
         let name = format!(
             "{}/{}/{}",
@@ -220,18 +223,40 @@ mod tests {
     use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
     use delta_kernel::engine::default::DefaultEngine;
     use object_store::local::LocalFileSystem;
-    use std::path::PathBuf;
 
     fn test_table_info() -> TableInfo {
-        TableInfo {
-            name: "basic_partitioned".to_string(),
-            description: None,
-            table_path: Some(format!(
-                "{}/../kernel/tests/data/basic_partitioned",
-                env!("CARGO_MANIFEST_DIR")
-            )),
-            table_info_dir: PathBuf::new(),
-        }
+        let path = format!(
+            "{}/../kernel/tests/data/basic_partitioned",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let json = format!(
+            r#"{{
+                "name": "basic_partitioned",
+                "description": "basic partitioned table for testing",
+                "tablePath": "{}",
+                "schema": {{
+                    "type": "struct",
+                    "fields": [
+                        {{"name": "letter",  "type": "string", "nullable": true, "metadata": {{}}}},
+                        {{"name": "number",  "type": "long",   "nullable": true, "metadata": {{}}}},
+                        {{"name": "a_float", "type": "double", "nullable": true, "metadata": {{}}}}
+                    ]
+                }},
+                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 2}},
+                "logInfo": {{
+                    "numAddFiles": 6,
+                    "numRemoveFiles": 0,
+                    "sizeInBytes": 4505,
+                    "numCommits": 2,
+                    "numActions": 10
+                }},
+                "properties": {{}},
+                "dataLayout": {{"numPartitionColumns": 1, "numDistinctPartitions": 5}},
+                "tags": []
+            }}"#,
+            Url::from_file_path(path).unwrap()
+        );
+        serde_json::from_str(&json).expect("failed to build test TableInfo")
     }
 
     fn test_read_spec() -> ReadSpec {
@@ -247,7 +272,7 @@ mod tests {
 
     fn parallel_config() -> ReadConfig {
         ReadConfig {
-            name: "parallel".to_string(),
+            name: "parallel2".to_string(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         }
     }
@@ -261,7 +286,7 @@ mod tests {
     fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             serial_config(),
             test_engine(),
@@ -269,7 +294,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/test_case/read_metadata/serial"
+            "basic_partitioned/testCase/readMetadata/serial"
         );
         assert!(runner.execute().is_ok());
     }
@@ -278,7 +303,7 @@ mod tests {
     fn test_read_metadata_runner_parallel() {
         let runner = ReadMetadataRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             parallel_config(),
             test_engine(),
@@ -286,7 +311,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/test_case/read_metadata/parallel"
+            "basic_partitioned/testCase/readMetadata/parallel2"
         );
         assert!(runner.execute().is_ok());
     }
@@ -299,7 +324,7 @@ mod tests {
     fn test_snapshot_construction_runner_setup() {
         let runner = SnapshotConstructionRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_snapshot_spec(),
             test_engine(),
         );
@@ -310,14 +335,14 @@ mod tests {
     fn test_snapshot_construction_runner_name() {
         let runner = SnapshotConstructionRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_snapshot_spec(),
             test_engine(),
         )
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/test_case/snapshot_construction"
+            "basic_partitioned/testCase/snapshotConstruction"
         );
     }
 
@@ -325,7 +350,7 @@ mod tests {
     fn test_snapshot_construction_runner_execute() {
         let runner = SnapshotConstructionRunner::setup(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_snapshot_spec(),
             test_engine(),
         )
@@ -337,7 +362,7 @@ mod tests {
     fn test_create_read_runner_read_metadata() {
         let runner = create_read_runner(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             ReadOperation::ReadMetadata,
             serial_config(),
@@ -351,7 +376,7 @@ mod tests {
     fn test_create_read_runner_read_data_unimplemented() {
         let result = create_read_runner(
             &test_table_info(),
-            "test_case",
+            "testCase",
             &test_read_spec(),
             ReadOperation::ReadData,
             serial_config(),
