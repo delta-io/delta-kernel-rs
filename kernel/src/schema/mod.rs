@@ -1531,6 +1531,9 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
+// Custom Deserialize to provide clear error messages for unsupported types.
+// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'interval second'"
 impl<'de> serde::Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1659,19 +1662,10 @@ impl From<SchemaRef> for DataType {
     }
 }
 
-// Manual Deserialize implementation for DataType.
-//
-// Why manual instead of #[derive(Deserialize)]?
-// Serde's untagged enum deserialization tries each variant in order and only reports the error
-// from the last variant that failed. This means if PrimitiveType fails with a nice error like
-// "Unsupported Delta table type: 'interval second'", that error is lost and replaced with a
-// generic "data did not match any variant" message.
-//
-// This manual implementation:
-// 1. Tries PrimitiveType first for string values and immediately returns its error
-// 2. Handles Variant type specially (must be the string "variant")
-// 3. Dispatches complex types (Array/Struct/Map) based on their "type" field
-// 4. Preserves specific error messages throughout the chain
+// Custom Deserialize to preserve error messages from PrimitiveType.
+// Serde's untagged enum only reports the last variant's error, discarding PrimitiveType's
+// clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
+// dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
 impl<'de> serde::Deserialize<'de> for DataType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
