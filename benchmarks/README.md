@@ -3,6 +3,7 @@
 This crate contains benchmarking infrastructure for Delta Kernel using Criterion and JSON workload specs. It is separate from the `kernel` crate to keep benchmark-specific code and dependencies out of the core library.
 
 ## Running benchmarks
+
 ```bash
 # run all benchmarks
 cargo bench -p delta_kernel_benchmarks
@@ -18,7 +19,9 @@ cargo install samply
 samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "some_name"
 ```
 
-## Benchmark name format
+### Filtering benchmarks
+
+#### By benchmark name
 
 Benchmark names follow a hierarchical path structure assembled from the Criterion group name, the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
 
@@ -55,6 +58,27 @@ cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_100
 samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/snapshot_construction"
 ```
 
+#### By tag (`BENCH_TAGS`)
+
+Set the `BENCH_TAGS` environment variable to a comma-separated list of tags to run only tables whose `tags` field (in table_info.json) contains at least one matching tag. If `BENCH_TAGS` is unset or empty, all tables are loaded and benchmarked.
+
+```bash
+# run only tables tagged "base"
+BENCH_TAGS=base cargo bench -p delta_kernel_benchmarks
+```
+
+Built-in tags:
+- **`base`** — a base set of tables run in CI
+
+You can also add custom tags to any `table_info.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
+
+```bash
+BENCH_TAGS=my-feature cargo bench -p delta_kernel_benchmarks
+
+# run all tables tagged either "base" or "my-feature"
+BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
+```
+
 ## Workload data layout
 
 Each table lives in its own subdirectory under `benchmarks/data/workloads/benchmarks/`:
@@ -87,20 +111,20 @@ To benchmark against a custom Delta table:
 2. Create a directory for the new table under `benchmarks/data/workloads/benchmarks/`:
    ```
    benchmarks/data/workloads/benchmarks/<table_name>/
-   ├── table_info.json      # at minimum: {"name": "<table_name>"}
+   ├── table_info.json      # {"name": "<table_name>", "description": "...", "tags": [...]}
    ├── delta/               # Delta table files (_delta_log/, parquet data, etc.)
    └── specs/
        └── <case_name>.json # one or more spec files describing operations to benchmark
    ```
-3. Run benchmarks — the new table is discovered automatically (you can filter by table name — see [Benchmark name format](#benchmark-name-format)):
+3. Run benchmarks — the new table is discovered automatically (you can filter by table name — see [By benchmark name](#by-benchmark-name)):
    ```bash
    cargo bench -p delta_kernel_benchmarks --bench workload_bench "<table_name>"
    ```
 
 If you want to commit this change and add it to the `workloads.tar.gz` archive:
 ```bash
-cd benchmarks/data
-tar -czf workloads.tar.gz workloads/
+cd benchmarks/data/workloads
+tar -czf ../workloads.tar.gz .
 ```
 Then commit the updated archive and delete the `.done` file so it is re-extracted on the next run.
 
@@ -108,12 +132,13 @@ Then commit the updated archive and delete the `.done` file so it is re-extracte
 
 ### `TableInfo`
 
-Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, an optional human-readable description, and either an explicit `table_path` (for remote tables) or a local path (`delta/` subdirectory at the same directory level as `table_info.json`). Note that `table_path` is mainly intended for remote tables (e.g. S3), but support for remote tables is not yet implemented; all current workloads are under `delta/` as described.
+Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, a human-readable description, a list of tags for filtering, and either an explicit `table_path` (for remote tables) or a local path (`delta/` subdirectory at the same directory level as `table_info.json`). `name`, `description`, and `tags` are all required fields while `table_path` is optional. `tags` is used to filter which tables are loaded via the `BENCH_TAGS` environment variable — see [By tag (`BENCH_TAGS`)](#by-tag-bench_tags). Note that `table_path` is mainly intended for remote tables (e.g. S3), but support for remote tables is not yet implemented; all current workloads are under `delta/` as described.
 
 ```json
 {
   "name": "basic_append",
-  "description": "A basic table with two append writes."
+  "description": "A basic table with two append writes.",
+  "tags": ["base"]
 }
 ```
 
