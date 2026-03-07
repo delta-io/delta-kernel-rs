@@ -36,15 +36,15 @@ pub enum ParallelScan {
 pub struct TableInfo {
     pub name: String,                        // Table name used for identifying the table
     pub description: String,                 // Human-readable description of the table
-    pub table_path: Option<Url>,             // URL to the table (for remote tables); also used to override the default local table path
-    pub schema: StructType,                  // Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
-    pub protocol: Protocol,                  // Protocol version requirements and table features. Uses camelCase JSON keys
-    pub log_info: LogInfo,                   // Log-level statistics for the table
+    pub table_path: Option<Url>, // URL to the table (for remote tables); also used to override the default local table path
+    pub schema: StructType, // Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
+    pub protocol: Protocol, // Protocol version requirements and table features. Uses camelCase JSON keys
+    pub log_info: LogInfo,  // Log-level statistics for the table
     pub properties: HashMap<String, String>, // User-defined table properties
-    pub data_layout: DataLayout,             // Physical data layout of the table
-    pub tags: Vec<String>,                   // Tags for filtering workloads
+    pub data_layout: DataLayout, // Physical data layout of the table
+    pub tags: Vec<String>,  // Tags for filtering workloads
     #[serde(skip, default)]
-    pub table_info_dir: PathBuf,             // Path to the directory containing the tableInfo.json file
+    pub table_info_dir: PathBuf, // Path to the directory containing the tableInfo.json file
 }
 
 impl TableInfo {
@@ -71,13 +71,13 @@ impl TableInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogInfo {
-    pub num_add_files: u64,                        // Number of active Add file actions in the table
-    pub num_remove_files: u64,                     // Number of Remove file actions in the table
-    pub size_in_bytes: u64,                        // Total on-disk size of all data files in bytes
-    pub num_commits: u64,                          // Number of commits (JSON log files) in the table history
-    pub num_actions: u64,                          // Total number of actions across all commits
-    pub last_checkpoint_version: Option<u64>,      // Version of the most recent checkpoint, if any
-    pub last_crc_version: Option<u64>,             // Version of the most recent CRC file, if any
+    pub num_add_files: u64,    // Number of active Add file actions in the table
+    pub num_remove_files: u64, // Number of Remove file actions in the table
+    pub size_in_bytes: u64,    // Total on-disk size of all data files in bytes
+    pub num_commits: u64,      // Number of commits (JSON log files) in the table history
+    pub num_actions: u64,      // Total number of actions across all commits
+    pub last_checkpoint_version: Option<u64>, // Version of the most recent checkpoint, if any
+    pub last_crc_version: Option<u64>, // Version of the most recent CRC file, if any
     pub num_parallel_checkpoint_files: Option<u32>, // Number of parquet part files in the most recent multi-part checkpoint, if any
 }
 
@@ -85,13 +85,13 @@ pub struct LogInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum DataLayout {
-    Partitioned { 
+    Partitioned {
         #[serde(rename = "numPartitionColumns")]
-        num_partition_columns: u32,  // Number of partition columns
+        num_partition_columns: u32, // Number of partition columns
         #[serde(rename = "numDistinctPartitions")]
         num_distinct_partitions: u64, // Number of distinct partition values observed in the table
     },
-    Clustered { 
+    Clustered {
         #[serde(rename = "numClusteringColumns")]
         num_clustering_columns: u32, // Number of clustering columns
     },
