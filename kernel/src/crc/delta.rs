@@ -43,6 +43,70 @@ pub(crate) struct CrcDelta {
     pub(crate) has_missing_file_size: bool,
 }
 
+impl CrcDelta {
+    /// Convert this delta into a fresh [`Crc`], consuming the delta.
+    ///
+    /// Returns `Some(Crc)` if the delta contains both protocol and metadata (the minimum fields
+    /// required to form a valid CRC). Returns `None` otherwise.
+    ///
+    /// The resulting CRC has [`FileStatsValidity::Valid`] by default. File stats come from the
+    /// delta's `net_files`/`net_bytes`. The caller is responsible for adjusting validity afterward
+    /// if needed (e.g. for checkpoint-rooted tables).
+    pub(crate) fn into_crc(self) -> Option<Crc> {
+        let protocol = self.protocol?;
+        let metadata = self.metadata?;
+
+        let mut crc = Crc {
+            protocol,
+            metadata,
+            num_files: self.file_stats.net_files,
+            table_size_bytes: self.file_stats.net_bytes,
+            num_metadata: 1,
+            num_protocol: 1,
+            in_commit_timestamp_opt: self.in_commit_timestamp,
+            validity: FileStatsValidity::Valid,
+            ..Default::default()
+        };
+
+        apply_domain_metadata_changes(&mut crc.domain_metadata, self.domain_metadata_changes);
+
+        // Apply file stats validity degradation.
+        if self.has_missing_file_size {
+            crc.validity = FileStatsValidity::Untrackable;
+        } else {
+            let is_safe = self
+                .operation
+                .as_deref()
+                .is_some_and(FileStatsDelta::is_incremental_safe);
+            if !is_safe {
+                crc.validity = FileStatsValidity::Indeterminate;
+            }
+        }
+
+        Some(crc)
+    }
+}
+
+/// Apply domain metadata changes (inserts and removals) to an optional domain metadata map.
+/// Initializes the map if it is `None` and there are changes to apply.
+fn apply_domain_metadata_changes(
+    domain_metadata: &mut Option<HashMap<String, DomainMetadata>>,
+    changes: Vec<DomainMetadata>,
+) {
+    if changes.is_empty() {
+        return;
+    }
+    let map = domain_metadata.get_or_insert_with(HashMap::new);
+    for dm in changes {
+        if dm.is_removed() {
+            map.remove(dm.domain());
+        } else {
+            let domain = dm.domain().to_string();
+            map.insert(domain, dm);
+        }
+    }
+}
+
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
     /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
@@ -61,18 +125,7 @@ impl Crc {
             self.metadata = m;
         }
 
-        // Domain metadata: insert or remove by domain name.
-        if !delta.domain_metadata_changes.is_empty() {
-            let map = self.domain_metadata.get_or_insert_with(HashMap::new);
-            for dm in delta.domain_metadata_changes {
-                if dm.is_removed() {
-                    map.remove(dm.domain());
-                } else {
-                    let domain = dm.domain().to_string();
-                    map.insert(domain, dm);
-                }
-            }
-        }
+        apply_domain_metadata_changes(&mut self.domain_metadata, delta.domain_metadata_changes);
 
         // In-commit timestamp: unconditional replace (not guarded by `if let Some`).
         // If ICT was disabled after being enabled, the delta carries None, which correctly
@@ -133,6 +186,122 @@ mod tests {
             operation: Some("WRITE".to_string()),
             ..Default::default()
         }
+    }
+
+    fn test_protocol() -> Protocol {
+        Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap()
+    }
+
+    fn test_metadata() -> Metadata {
+        use crate::actions::Format;
+        Metadata::new_unchecked(
+            "test-id",
+            None,
+            None,
+            Format::default(),
+            r#"{"type":"struct","fields":[]}"#,
+            vec![],
+            Some(1000),
+            std::collections::HashMap::new(),
+        )
+    }
+
+    // ===== CrcDelta::into_crc tests =====
+
+    #[test]
+    fn into_crc_with_protocol_and_metadata() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(test_metadata()),
+            file_stats: FileStatsDelta {
+                net_files: 3,
+                net_bytes: 500,
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc().unwrap();
+        assert_eq!(crc.protocol, test_protocol());
+        assert_eq!(crc.metadata, test_metadata());
+        assert_eq!(crc.num_files, 3);
+        assert_eq!(crc.table_size_bytes, 500);
+        assert_eq!(crc.validity, FileStatsValidity::Valid);
+        assert_eq!(crc.num_metadata, 1);
+        assert_eq!(crc.num_protocol, 1);
+    }
+
+    #[test]
+    fn into_crc_without_protocol_returns_none() {
+        let delta = CrcDelta {
+            metadata: Some(test_metadata()),
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        assert!(delta.into_crc().is_none());
+    }
+
+    #[test]
+    fn into_crc_without_metadata_returns_none() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        assert!(delta.into_crc().is_none());
+    }
+
+    #[test]
+    fn into_crc_with_domain_metadata() {
+        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(test_metadata()),
+            domain_metadata_changes: vec![dm],
+            operation: Some("CREATE TABLE".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc().unwrap();
+        let map = crc.domain_metadata.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my.domain"].configuration(), "config1");
+    }
+
+    #[test]
+    fn into_crc_with_ict() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(test_metadata()),
+            in_commit_timestamp: Some(9999),
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc().unwrap();
+        assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
+    }
+
+    #[test]
+    fn into_crc_with_missing_file_size_is_untrackable() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(test_metadata()),
+            has_missing_file_size: true,
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc().unwrap();
+        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+    }
+
+    #[test]
+    fn into_crc_with_unsafe_op_is_indeterminate() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(test_metadata()),
+            operation: Some("ANALYZE STATS".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc().unwrap();
+        assert_eq!(crc.validity, FileStatsValidity::Indeterminate);
     }
 
     // ===== is_incremental_safe tests =====
