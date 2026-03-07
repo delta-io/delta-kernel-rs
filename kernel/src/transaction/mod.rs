@@ -9,8 +9,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_remove_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema,
+    DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
@@ -50,6 +50,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod commit_info;
 mod domain_metadata;
 mod stats_verifier;
 mod update;
@@ -194,6 +195,7 @@ pub struct Transaction<S = ExistingTable> {
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
@@ -326,15 +328,7 @@ impl<S> Transaction<S> {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
-        let commit_info = CommitInfo::new(
-            self.commit_timestamp,
-            self.get_in_commit_timestamp(engine)?,
-            self.operation.clone(),
-            self.engine_info.clone(),
-            self.is_blind_append,
-        );
-        let commit_info_action =
-            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
+        let commit_info_action = self.generate_commit_info(engine);
 
         // Step 3: Generate Protocol and Metadata actions for create-table
         let (protocol_action, metadata_action) = if self.is_create_table() {
@@ -455,6 +449,16 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Set the commit info field of this transaction's commit info action. This field is optional.
+    /// The engine's commit info will be overrided by the kernel commit info.
+    pub fn with_commit_info(
+        mut self,
+        engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    ) -> Self {
+        self.engine_commit_info = engine_commit_info;
+        self
+    }
+
     /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
     /// `last_updated` timestamp).
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
@@ -560,6 +564,7 @@ impl<S> Transaction<S> {
         // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
         self.read_snapshot.version().wrapping_add(1)
     }
+
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
     /// a Parquet write operation back to Kernel.
     ///
@@ -1237,6 +1242,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::CommitInfo;
     use crate::arrow::array::{
         ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
     };
