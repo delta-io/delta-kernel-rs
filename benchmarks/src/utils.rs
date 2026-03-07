@@ -256,6 +256,12 @@ mod tests {
     }
 
     #[test]
+    fn test_get_required_tags_unset() {
+        std::env::remove_var(BENCH_TAGS_ENV_VAR);
+        assert!(get_required_tags().is_none());
+    }
+
+    #[test]
     fn test_get_required_tags_empty() {
         std::env::set_var(BENCH_TAGS_ENV_VAR, "");
         assert!(get_required_tags().is_none());
