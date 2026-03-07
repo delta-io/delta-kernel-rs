@@ -30,37 +30,39 @@ workload_benchmarks/{table_name}/{spec_file_name}/{operation}/{config_name}
 ```
 
 - `workload_benchmarks` — the Criterion benchmark group (always this literal string)
-- `{table_name}` — the `name` field from `table_info.json`
+- `{table_name}` — the `name` field from `tableInfo.json`
 - `{spec_file_name}` — the spec filename without its `.json` extension (the `case_name`)
-- `{operation}` — `snapshot_construction` or `read_metadata`
-- `{config_name}` — only present for `Read` workloads; e.g. `serial`, `parallel_2`, `parallel_4`
+- `{operation}` — `snapshotConstruction` or `readMetadata`
+- `{config_name}` — only present for `Read` workloads; e.g. `serial`, `parallel2`, `parallel4`
+
+All path components use camelCase to match the JSON keys used throughout the workload spec format.
 
 Examples:
 ```
-workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/snapshot_construction
-workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/read_metadata/serial
-workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/read_metadata/parallel_4
+workload_benchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction
+workload_benchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/serial
+workload_benchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/parallel4
 ```
 
 The filter argument is a regular expression, so you can create patterns to target the benchmarks that you want:
 
 ```bash
 # all benchmarks for a specific table name
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_1009_versions"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions"
 
 # all benchmarks for either of two tables (| for OR)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_1009_versions|10_adds"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions|10Adds"
 
-# snapshot_construction workloads for a specific table (.* to AND two parts of the name)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpoint_v9_1009_versions.*snapshot_construction"
+# snapshotConstruction workloads for a specific table (.* to AND two parts of the name)
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions.*snapshotConstruction"
 
 # profile a specific benchmark with samply
-samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workload_benchmarks/checkpoint_v9_1009_versions/snapshot_latest/snapshot_construction"
+samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workload_benchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction"
 ```
 
 #### By tag (`BENCH_TAGS`)
 
-Set the `BENCH_TAGS` environment variable to a comma-separated list of tags to run only tables whose `tags` field (in table_info.json) contains at least one matching tag. If `BENCH_TAGS` is unset or empty, all tables are loaded and benchmarked.
+Set the `BENCH_TAGS` environment variable to a comma-separated list of tags to run only tables whose `tags` field (in `tableInfo.json`) contains at least one matching tag. If `BENCH_TAGS` is unset or empty, all tables are loaded and benchmarked.
 
 ```bash
 # run only tables tagged "base"
@@ -70,7 +72,7 @@ BENCH_TAGS=base cargo bench -p delta_kernel_benchmarks
 Built-in tags:
 - **`base`** — a base set of tables run in CI
 
-You can also add custom tags to any `table_info.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
+You can also add custom tags to any `tableInfo.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
 
 ```bash
 BENCH_TAGS=my-feature cargo bench -p delta_kernel_benchmarks
@@ -87,10 +89,10 @@ Each table lives in its own subdirectory under `benchmarks/data/workloads/benchm
 benchmarks/data/workloads/
 ├── benchmarks/
 │   └── <table_name>/
-│       ├── table_info.json       # describes the table (name, path, etc.)
-│       ├── delta/                # Delta table data (if no explicit table_path)
+│       ├── tableInfo.json        # describes the table (name, schema, protocol, etc.)
+│       ├── delta/                # Delta table data (if no explicit tablePath)
 │       └── specs/
-│           └── <case_name>.json  # one file per benchmark operation
+│           └── <case_name>.json   # one file per benchmark operation
 └── tests/                        # reserved for future test workloads (currently empty)
 ```
 
@@ -98,7 +100,7 @@ benchmarks/data/workloads/
 
 Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written (to `benchmarks/data/workloads/`) to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
 
-Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/data/workloads/benchmarks/`, loading `table_info.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
+Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/data/workloads/benchmarks/`, loading `tableInfo.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
 ## Adding a new table
 
@@ -110,8 +112,8 @@ To benchmark against a custom Delta table:
    ```
 2. Create a directory for the new table under `benchmarks/data/workloads/benchmarks/`:
    ```
-   benchmarks/data/workloads/benchmarks/<table_name>/
-   ├── table_info.json      # {"name": "<table_name>", "description": "...", "tags": [...]}
+   benchmarks/data/workloads/benchmarks/<tableName>/
+   ├── tableInfo.json       # see TableInfo section below for required fields
    ├── delta/               # Delta table files (_delta_log/, parquet data, etc.)
    └── specs/
        └── <case_name>.json # one or more spec files describing operations to benchmark
@@ -132,15 +134,33 @@ Then commit the updated archive and delete the `.done` file so it is re-extracte
 
 ### `TableInfo`
 
-Deserialized from a `table_info.json` file. Describes a Delta table and includes its name, a human-readable description, a list of tags for filtering, and either an explicit `table_path` (for remote tables) or a local path (`delta/` subdirectory at the same directory level as `table_info.json`). `name`, `description`, and `tags` are all required fields while `table_path` is optional. `tags` is used to filter which tables are loaded via the `BENCH_TAGS` environment variable — see [By tag (`BENCH_TAGS`)](#by-tag-bench_tags). Note that `table_path` is mainly intended for remote tables (e.g. S3), but support for remote tables is not yet implemented; all current workloads are under `delta/` as described.
+Deserialized from a `tableInfo.json` file. Describes a Delta table and includes its name, description, schema, protocol, log-level information, properties, data layout, and tags. All fields are required except `tablePath`. `tags` is used to filter which tables are loaded via the `BENCH_TAGS` environment variable — see [By tag (`BENCH_TAGS`)](#by-tag-bench_tags). Note that `tablePath` is mainly intended for remote tables (e.g. S3), but support for remote tables is not yet implemented; all current workloads are under `delta/` as described.
 
 ```json
 {
-  "name": "basic_append",
+  "name": "myTable",
   "description": "A basic table with two append writes.",
+  "schema": {"type": "struct", "fields": [
+    {"name": "id", "type": "long", "nullable": true, "metadata": {}}
+  ]},
+  "protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": [], "writerFeatures": []},
+  "logInfo": {
+    "numAddFiles": 10,
+    "numRemoveFiles": 0,
+    "sizeInBytes": 4096,
+    "numCommits": 2,
+    "numActions": 12
+  },
+  "properties": {},
+  "dataLayout": {},
   "tags": ["base"]
 }
 ```
+
+The `dataLayout` field describes how data is physically organized:
+- `{}` — no special organization (unpartitioned, unclustered)
+- `{"numPartitionColumns": 2, "numDistinctPartitions": 10}` — Hive-style partitioned table
+- `{"numClusteringColumns": 1}` — liquid-clustered table
 
 ### `Spec`
 
@@ -167,14 +187,14 @@ Or with a specific version:
 Snapshot construction specs:
 ```json
 {
-  "type": "snapshot_construction"
+  "type": "snapshotConstruction"
 }
 ```
 Or with a specific version:
 
 ```json
 {
-  "type": "snapshot_construction",
+  "type": "snapshotConstruction",
   "version": 0
 }
 ```

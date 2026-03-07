@@ -267,7 +267,7 @@ mod tests {
 
     fn parallel_config() -> ReadConfig {
         ReadConfig {
-            name: "parallel_2".to_string(),
+            name: "parallel2".to_string(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         }
     }
@@ -306,7 +306,7 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(
             runner.name(),
-            "basic_partitioned/testCase/readMetadata/parallel_2"
+            "basic_partitioned/testCase/readMetadata/parallel2"
         );
         assert!(runner.execute().is_ok());
     }
