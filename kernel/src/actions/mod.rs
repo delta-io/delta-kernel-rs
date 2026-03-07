@@ -981,6 +981,11 @@ impl DomainMetadata {
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
     }
+
+    /// Returns `true` if this action is a tombstone (marking domain removal).
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
+    }
 }
 
 #[cfg(test)]
