@@ -35,6 +35,7 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
