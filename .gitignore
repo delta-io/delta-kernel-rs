@@ -21,6 +21,7 @@ integration-tests/Cargo.lock
 
 # Project
 acceptance/tests/dat/
+/improved_dat/
 ffi/examples/read-table/build
 ffi/examples/visit-expression/build
 /build
