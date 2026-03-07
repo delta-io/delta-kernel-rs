@@ -15,9 +15,7 @@ use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{
-    and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
-};
+use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
