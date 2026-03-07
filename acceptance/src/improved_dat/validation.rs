@@ -81,7 +81,11 @@ fn normalize_batch_struct_order(batch: &RecordBatch) -> RecordBatch {
         .iter()
         .zip(new_columns.iter())
         .map(|(f, col)| {
-            Arc::new(Field::new(f.name(), col.data_type().clone(), f.is_nullable()))
+            Arc::new(Field::new(
+                f.name(),
+                col.data_type().clone(),
+                f.is_nullable(),
+            ))
         })
         .collect();
     let new_schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(new_fields));
@@ -144,7 +148,13 @@ fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
                 Some(z) if **z == *"+00:00" => true,
                 Some(z) if **z == *"UTC" => {
                     // Already UTC, but may need precision change
-                    !matches!(col.data_type(), DataType::Timestamp(delta_kernel::arrow::datatypes::TimeUnit::Microsecond, _))
+                    !matches!(
+                        col.data_type(),
+                        DataType::Timestamp(
+                            delta_kernel::arrow::datatypes::TimeUnit::Microsecond,
+                            _
+                        )
+                    )
                 }
                 _ => false, // Other timezones, leave as-is
             };
@@ -219,7 +229,9 @@ fn normalize_struct_field_order(arr: Arc<dyn Array>) -> Arc<dyn Array> {
             // Reorder columns and fields, recursing into children
             let new_columns: Vec<Arc<dyn Array>> = indexed_fields
                 .iter()
-                .map(|(orig_idx, _)| normalize_struct_field_order(struct_arr.column(*orig_idx).clone()))
+                .map(|(orig_idx, _)| {
+                    normalize_struct_field_order(struct_arr.column(*orig_idx).clone())
+                })
                 .collect();
             // Rebuild field declarations from the normalized child columns' actual data types
             let new_fields: Vec<Arc<Field>> = indexed_fields
@@ -240,34 +252,46 @@ fn normalize_struct_field_order(arr: Arc<dyn Array>) -> Arc<dyn Array> {
             )
         }
         DataType::List(field) => {
-            let list_arr = arr.as_any().downcast_ref::<GenericListArray<i32>>().unwrap();
+            let list_arr = arr
+                .as_any()
+                .downcast_ref::<GenericListArray<i32>>()
+                .unwrap();
             let normalized_values = normalize_struct_field_order(list_arr.values().clone());
             let new_field = Arc::new(Field::new(
                 field.name(),
                 normalized_values.data_type().clone(),
                 field.is_nullable(),
             ));
-            Arc::new(GenericListArray::try_new(
-                new_field,
-                list_arr.offsets().clone(),
-                normalized_values,
-                list_arr.nulls().cloned(),
-            ).unwrap())
+            Arc::new(
+                GenericListArray::try_new(
+                    new_field,
+                    list_arr.offsets().clone(),
+                    normalized_values,
+                    list_arr.nulls().cloned(),
+                )
+                .unwrap(),
+            )
         }
         DataType::LargeList(field) => {
-            let list_arr = arr.as_any().downcast_ref::<GenericListArray<i64>>().unwrap();
+            let list_arr = arr
+                .as_any()
+                .downcast_ref::<GenericListArray<i64>>()
+                .unwrap();
             let normalized_values = normalize_struct_field_order(list_arr.values().clone());
             let new_field = Arc::new(Field::new(
                 field.name(),
                 normalized_values.data_type().clone(),
                 field.is_nullable(),
             ));
-            Arc::new(GenericListArray::try_new(
-                new_field,
-                list_arr.offsets().clone(),
-                normalized_values,
-                list_arr.nulls().cloned(),
-            ).unwrap())
+            Arc::new(
+                GenericListArray::try_new(
+                    new_field,
+                    list_arr.offsets().clone(),
+                    normalized_values,
+                    list_arr.nulls().cloned(),
+                )
+                .unwrap(),
+            )
         }
         DataType::Map(field, sorted) => {
             let map_arr = arr.as_any().downcast_ref::<MapArray>().unwrap();
@@ -279,13 +303,20 @@ fn normalize_struct_field_order(arr: Arc<dyn Array>) -> Arc<dyn Array> {
                 normalized_entries.data_type().clone(),
                 field.is_nullable(),
             ));
-            Arc::new(MapArray::try_new(
-                new_field,
-                map_arr.offsets().clone(),
-                normalized_entries.as_any().downcast_ref::<StructArray>().unwrap().clone(),
-                map_arr.nulls().cloned(),
-                *sorted,
-            ).unwrap())
+            Arc::new(
+                MapArray::try_new(
+                    new_field,
+                    map_arr.offsets().clone(),
+                    normalized_entries
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap()
+                        .clone(),
+                    map_arr.nulls().cloned(),
+                    *sorted,
+                )
+                .unwrap(),
+            )
         }
         _ => arr,
     }
@@ -297,8 +328,11 @@ pub fn columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) -> 
         return false;
     }
     for (actual, expected) in actual.iter().zip(expected) {
-        let actual = normalize_struct_field_order(strip_metadata_from_array(&normalize_col(actual.clone())));
-        let expected = normalize_struct_field_order(strip_metadata_from_array(&normalize_col(expected.clone())));
+        let actual =
+            normalize_struct_field_order(strip_metadata_from_array(&normalize_col(actual.clone())));
+        let expected = normalize_struct_field_order(strip_metadata_from_array(&normalize_col(
+            expected.clone(),
+        )));
         if &actual != &expected {
             return false;
         }
@@ -374,41 +408,47 @@ pub async fn read_expected_data(expected_dir: &Path) -> DeltaResult<Option<Recor
 }
 
 /// Read and parse the summary.json file
-pub fn read_expected_summary(expected_dir: &Path) -> Result<Option<ExpectedSummary>, ValidationError> {
+pub fn read_expected_summary(
+    expected_dir: &Path,
+) -> Result<Option<ExpectedSummary>, ValidationError> {
     let summary_path = expected_dir.join("summary.json");
     if !summary_path.exists() {
         return Ok(None);
     }
 
     let file = std::fs::File::open(summary_path)?;
-    let summary: ExpectedSummary =
-        serde_json::from_reader(file).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let summary: ExpectedSummary = serde_json::from_reader(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(summary))
 }
 
 /// Read and parse the protocol.json file
-pub fn read_expected_protocol(expected_dir: &Path) -> Result<Option<ExpectedProtocol>, ValidationError> {
+pub fn read_expected_protocol(
+    expected_dir: &Path,
+) -> Result<Option<ExpectedProtocol>, ValidationError> {
     let protocol_path = expected_dir.join("protocol.json");
     if !protocol_path.exists() {
         return Ok(None);
     }
 
     let file = std::fs::File::open(protocol_path)?;
-    let wrapper: super::types::ProtocolWrapper =
-        serde_json::from_reader(file).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let wrapper: super::types::ProtocolWrapper = serde_json::from_reader(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(wrapper.protocol))
 }
 
 /// Read and parse the metadata.json file
-pub fn read_expected_metadata(expected_dir: &Path) -> Result<Option<ExpectedMetadata>, ValidationError> {
+pub fn read_expected_metadata(
+    expected_dir: &Path,
+) -> Result<Option<ExpectedMetadata>, ValidationError> {
     let metadata_path = expected_dir.join("metadata.json");
     if !metadata_path.exists() {
         return Ok(None);
     }
 
     let file = std::fs::File::open(metadata_path)?;
-    let wrapper: super::types::MetadataWrapper =
-        serde_json::from_reader(file).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let wrapper: super::types::MetadataWrapper = serde_json::from_reader(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(wrapper.meta_data))
 }
 
@@ -431,11 +471,25 @@ pub async fn validate_read_result(
         // Check row count
         if actual.num_rows() != expected.num_rows() {
             eprintln!("\n=== DATA MISMATCH ===");
-            eprintln!("Expected {} rows, got {} rows", expected.num_rows(), actual.num_rows());
+            eprintln!(
+                "Expected {} rows, got {} rows",
+                expected.num_rows(),
+                actual.num_rows()
+            );
             eprintln!("\n--- Expected Data ---");
-            eprintln!("{}", pretty_format_batches(&[expected.clone()]).map(|d| d.to_string()).unwrap_or_else(|_| "Failed to format".to_string()));
+            eprintln!(
+                "{}",
+                pretty_format_batches(&[expected.clone()])
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|_| "Failed to format".to_string())
+            );
             eprintln!("\n--- Actual Data ---");
-            eprintln!("{}", pretty_format_batches(&[actual.clone()]).map(|d| d.to_string()).unwrap_or_else(|_| "Failed to format".to_string()));
+            eprintln!(
+                "{}",
+                pretty_format_batches(&[actual.clone()])
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|_| "Failed to format".to_string())
+            );
             eprintln!("=== END MISMATCH ===\n");
             return Err(ValidationError::RowCountMismatch {
                 expected: expected.num_rows() as u64,
@@ -457,9 +511,19 @@ pub async fn validate_read_result(
             eprintln!("\n--- Actual Schema ---");
             eprintln!("{:#?}", actual.schema());
             eprintln!("\n--- Expected Data ---");
-            eprintln!("{}", pretty_format_batches(&[expected.clone()]).map(|d| d.to_string()).unwrap_or_else(|_| "Failed to format".to_string()));
+            eprintln!(
+                "{}",
+                pretty_format_batches(&[expected.clone()])
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|_| "Failed to format".to_string())
+            );
             eprintln!("\n--- Actual Data ---");
-            eprintln!("{}", pretty_format_batches(&[actual.clone()]).map(|d| d.to_string()).unwrap_or_else(|_| "Failed to format".to_string()));
+            eprintln!(
+                "{}",
+                pretty_format_batches(&[actual.clone()])
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|_| "Failed to format".to_string())
+            );
             eprintln!("=== END MISMATCH ===\n");
             return Err(ValidationError::DataMismatch {
                 column: "unknown".to_string(),

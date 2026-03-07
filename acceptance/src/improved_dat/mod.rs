@@ -81,12 +81,7 @@ impl TestCase {
             .table_info
             .as_ref()
             .map(|ti| ti.resolved_table_root())
-            .unwrap_or_else(|| {
-                self.root_dir
-                    .join("delta")
-                    .to_string_lossy()
-                    .to_string()
-            });
+            .unwrap_or_else(|| self.root_dir.join("delta").to_string_lossy().to_string());
         // If it looks like a URL already (s3://, etc.), parse directly
         if table_path.contains("://") {
             Url::parse(&table_path).map_err(|e| format!("Invalid table URL: {}", e))
@@ -118,38 +113,37 @@ impl TestCase {
         }
 
         let mut workloads = Vec::new();
-        let entries = std::fs::read_dir(&specs_dir)
-            .map_err(|e| format!("Cannot read specs dir: {}", e))?;
+        let entries =
+            std::fs::read_dir(&specs_dir).map_err(|e| format!("Cannot read specs dir: {}", e))?;
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
             let path = entry.path();
 
-            let (name, spec_path) = if path.is_file()
-                && path.extension().map_or(false, |e| e == "json")
-            {
-                // Flat layout: specs/<name>.json
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                (name, path)
-            } else if path.is_dir() {
-                // Subdirectory layout: specs/<name>/spec.json
-                let spec_file = path.join("spec.json");
-                if !spec_file.exists() {
+            let (name, spec_path) =
+                if path.is_file() && path.extension().map_or(false, |e| e == "json") {
+                    // Flat layout: specs/<name>.json
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (name, path)
+                } else if path.is_dir() {
+                    // Subdirectory layout: specs/<name>/spec.json
+                    let spec_file = path.join("spec.json");
+                    if !spec_file.exists() {
+                        continue;
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (name, spec_file)
+                } else {
                     continue;
-                }
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                (name, spec_file)
-            } else {
-                continue;
-            };
+                };
 
             let content = std::fs::read_to_string(&spec_path)
                 .map_err(|e| format!("Cannot read {}: {}", spec_path.display(), e))?;
@@ -178,8 +172,8 @@ pub fn discover_test_cases(root: impl AsRef<Path>) -> Result<Vec<TestCase>, Stri
     }
 
     let mut cases = Vec::new();
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| format!("Cannot read {}: {}", root.display(), e))?;
+    let entries =
+        std::fs::read_dir(root).map_err(|e| format!("Cannot read {}: {}", root.display(), e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
@@ -202,8 +196,7 @@ pub fn discover_test_cases(root: impl AsRef<Path>) -> Result<Vec<TestCase>, Stri
 /// Given a path like `.../improved_dat/<test_case>/specs/<workload>.json`,
 /// walks up to find the test case root directory.
 pub fn test_case_from_spec_path(spec_path: &Path) -> Result<(TestCase, String), String> {
-    let spec_path = std::fs::canonicalize(spec_path)
-        .unwrap_or_else(|_| spec_path.to_path_buf());
+    let spec_path = std::fs::canonicalize(spec_path).unwrap_or_else(|_| spec_path.to_path_buf());
 
     let workload_name = spec_path
         .file_stem()

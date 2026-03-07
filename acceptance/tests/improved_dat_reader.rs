@@ -45,8 +45,7 @@ fn assert_expected_kernel_failure(
         .build()?;
     rt.block_on(async {
         let content = std::fs::read_to_string(&spec_path).expect("Failed to read spec file");
-        let spec: WorkloadSpec =
-            serde_json::from_str(&content).expect("Failed to parse spec file");
+        let spec: WorkloadSpec = serde_json::from_str(&content).expect("Failed to parse spec file");
         let table_root = test_case.table_root().expect("Failed to get table URL");
         let engine =
             test_utils::create_default_engine(&table_root).expect("Failed to create engine");

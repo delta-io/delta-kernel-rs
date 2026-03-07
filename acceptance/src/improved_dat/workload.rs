@@ -88,23 +88,24 @@ impl ReadResult {
             .into_iter()
             .map(|batch| {
                 let columns: Vec<_> = batch.columns().to_vec();
-                RecordBatch::try_new(stripped_schema.clone(), columns).or_else(|_| {
-                    let cast_columns: Vec<_> = batch
-                        .columns()
-                        .iter()
-                        .zip(stripped_schema.fields())
-                        .map(|(col, field)| {
-                            if col.data_type() == field.data_type() {
-                                col.clone()
-                            } else {
-                                delta_kernel::arrow::compute::cast(col, field.data_type())
-                                    .unwrap_or_else(|_| col.clone())
-                            }
-                        })
-                        .collect();
-                    RecordBatch::try_new(stripped_schema.clone(), cast_columns)
-                })
-                .map_err(Error::from)
+                RecordBatch::try_new(stripped_schema.clone(), columns)
+                    .or_else(|_| {
+                        let cast_columns: Vec<_> = batch
+                            .columns()
+                            .iter()
+                            .zip(stripped_schema.fields())
+                            .map(|(col, field)| {
+                                if col.data_type() == field.data_type() {
+                                    col.clone()
+                                } else {
+                                    delta_kernel::arrow::compute::cast(col, field.data_type())
+                                        .unwrap_or_else(|_| col.clone())
+                                }
+                            })
+                            .collect();
+                        RecordBatch::try_new(stripped_schema.clone(), cast_columns)
+                    })
+                    .map_err(Error::from)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
@@ -185,7 +186,11 @@ pub fn execute_read_workload(
 ) -> DeltaResult<ReadResult> {
     // Resolve version from timestamp if needed
     let version = if let Some(ts) = timestamp {
-        Some(resolve_timestamp_to_version(engine.as_ref(), table_root, ts)?)
+        Some(resolve_timestamp_to_version(
+            engine.as_ref(),
+            table_root,
+            ts,
+        )?)
     } else {
         version.map(|v| v as Version)
     };
@@ -208,11 +213,10 @@ pub fn execute_read_workload(
             .filter_map(|col_name| table_schema.field(col_name).cloned())
             .collect();
         if !projected_fields.is_empty() {
-            let projected_schema = Arc::new(
-                StructType::try_new(projected_fields).map_err(|e| {
+            let projected_schema =
+                Arc::new(StructType::try_new(projected_fields).map_err(|e| {
                     Error::generic(format!("Failed to create projected schema: {}", e))
-                })?,
-            );
+                })?);
             scan_builder = scan_builder.with_schema(projected_schema);
         }
     }
@@ -248,7 +252,11 @@ pub fn execute_snapshot_workload(
     timestamp: Option<&str>,
 ) -> DeltaResult<SnapshotResult> {
     let version = if let Some(ts) = timestamp {
-        Some(resolve_timestamp_to_version(engine.as_ref(), table_root, ts)?)
+        Some(resolve_timestamp_to_version(
+            engine.as_ref(),
+            table_root,
+            ts,
+        )?)
     } else {
         version.map(|v| v as Version)
     };

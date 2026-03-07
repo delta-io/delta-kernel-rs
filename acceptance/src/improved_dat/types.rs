@@ -65,8 +65,7 @@ impl TableInfo {
 
     /// Load from a `table_info.json` file, setting `table_info_dir` to its parent.
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
-        let content =
-            std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
+        let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut info: Self = serde_json::from_str(&content)?;
         if let Some(parent) = path.as_ref().parent() {
             info.table_info_dir = parent.to_path_buf();
@@ -155,9 +154,9 @@ impl WorkloadSpec {
     /// The expected error, if any
     pub fn expected_error(&self) -> Option<&ExpectedError> {
         match self {
-            Self::Read { error, .. }
-            | Self::Snapshot { error, .. }
-            | Self::Cdf { error, .. } => error.as_ref(),
+            Self::Read { error, .. } | Self::Snapshot { error, .. } | Self::Cdf { error, .. } => {
+                error.as_ref()
+            }
             Self::Txn { .. } | Self::DomainMetadata { .. } => None,
         }
     }

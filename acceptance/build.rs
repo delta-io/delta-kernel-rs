@@ -97,8 +97,7 @@ fn extract_improved_dat() {
     let tarball_file = File::open(&tarball_path).expect("Failed to open improved_dat tarball");
     let decoder = GzDecoder::new(BufReader::new(tarball_file));
     let mut archive = Archive::new(decoder);
-    std::fs::create_dir_all(&output_dir)
-        .expect("Failed to create improved_dat output directory");
+    std::fs::create_dir_all(&output_dir).expect("Failed to create improved_dat output directory");
     archive
         .unpack(&output_dir)
         .expect("Failed to unpack improved_dat tarball");
