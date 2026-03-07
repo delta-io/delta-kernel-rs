@@ -122,21 +122,26 @@ pub enum WorkloadSpec {
         #[serde(default)]
         version: Option<i64>,
         expected: ExpectedTxn,
-        name: String,
-        description: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
     },
     /// Domain metadata workload
     DomainMetadata {
         #[serde(default)]
         version: Option<i64>,
         expected: ExpectedDomainMetadata,
-        name: String,
-        description: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
     },
     /// CDF (Change Data Feed) workload — read table changes
     Cdf {
+        #[serde(rename = "startVersion")]
         start_version: i64,
-        #[serde(default)]
+        #[serde(rename = "endVersion", default)]
         end_version: Option<i64>,
         #[serde(default)]
         predicate: Option<String>,
@@ -166,6 +171,7 @@ impl WorkloadSpec {
 
 /// Expected error specification
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExpectedError {
     /// Error code (e.g. "DELTA_CDC_NOT_ALLOWED_ON_NON_CDC_TABLE")
     pub error_code: String,
@@ -177,9 +183,11 @@ pub struct ExpectedError {
 /// Expected transaction information
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExpectedTxn {
+    #[serde(alias = "appId")]
     pub app_id: String,
+    #[serde(alias = "txnVersion")]
     pub txn_version: i64,
-    #[serde(default)]
+    #[serde(alias = "lastUpdated", default)]
     pub last_updated: Option<i64>,
 }
 
