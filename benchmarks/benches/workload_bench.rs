@@ -33,7 +33,7 @@ fn workload_benchmarks(c: &mut Criterion) {
     };
 
     let engine = setup_engine();
-    let mut group = c.benchmark_group("workload_benchmarks");
+    let mut group = c.benchmark_group("workloadBenchmarks");
 
     for workload in &workloads {
         match &workload.spec {
