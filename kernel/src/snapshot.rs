@@ -677,6 +677,17 @@ impl Snapshot {
         })
     }
 
+    /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
+    ///
+    /// This is a test-only helper for integration tests to inspect the CRC state.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_current_crc_if_loaded_for_testing(&self) -> Option<&crate::crc::Crc> {
+        if self.lazy_crc.crc_version() != Some(self.version()) {
+            return None;
+        }
+        self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
+    }
+
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
     /// tables. This method is a no-op for filesystem-managed tables or if there are no catalog
     /// commits to publish.
