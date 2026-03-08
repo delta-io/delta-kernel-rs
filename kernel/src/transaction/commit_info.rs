@@ -135,7 +135,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::actions::CommitInfo;
-    use crate::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, StructArray};
+    use crate::arrow::array::{
+        Array, ArrayRef, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
+        StringBuilder, StructArray,
+    };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
@@ -202,6 +205,27 @@ mod tests {
             .value(0)
     }
 
+    /// Helper: pull the map value at row 0 from a named MapArray column in a StructArray.
+    /// Returns the key-value pairs as a StructArray.
+    fn get_map(s: &StructArray, col: &str) -> StructArray {
+        s.column_by_name(col)
+            .unwrap_or_else(|| panic!("field '{col}' not found"))
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap_or_else(|| panic!("field '{col}' is not a MapArray"))
+            .value(0)
+    }
+
+    /// Helper: pull a non-null boolean value from a named column in a StructArray.
+    fn get_bool(s: &StructArray, col: &str) -> bool {
+        s.column_by_name(col)
+            .unwrap_or_else(|| panic!("field '{col}' not found"))
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap_or_else(|| panic!("field '{col}' is not an Int64Array"))
+            .value(0)
+    }
+
     /// Create a transaction with the given engine_commit_info, using the shared test table.
     fn make_txn(
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
@@ -251,36 +275,52 @@ mod tests {
 
         let result =
             ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
-        let ci = commit_info_struct(&result);
-
-        // Engine fields are first and their values pass through unchanged.
-        assert_eq!(ci.fields()[0].name(), "customApp");
-        assert_eq!(ci.fields()[1].name(), "customVersion");
-        assert_eq!(get_str(ci, "customApp"), "myApp");
-        assert_eq!(get_i64(ci, "customVersion"), 42);
+        let commit_info = commit_info_struct(&result);
 
         // All CommitInfo fields are appended -- total = 2 engine + 8 CommitInfo.
         assert_eq!(
-            ci.num_columns(),
+            commit_info.num_columns(),
             2 + CommitInfo::to_schema().fields().count()
         );
 
-        // Spot-check a couple of the appended kernel fields.
-        assert_eq!(get_str(ci, "operation"), "WRITE");
-        assert!(!get_str(ci, "kernelVersion").is_empty());
+        // Engine fields are first and their values pass through unchanged.
+        assert_eq!(commit_info.fields()[0].name(), "customApp");
+        assert_eq!(commit_info.fields()[1].name(), "customVersion");
+        assert_eq!(get_str(commit_info, "customApp"), "myApp");
+        assert_eq!(get_i64(commit_info, "customVersion"), 42);
+
+        assert_eq!(get_str(commit_info, "operation"), "WRITE");
+        assert!(!get_str(commit_info, "kernelVersion").is_empty());
+        assert!(get_map(commit_info, "operationParameters").len() == 0);
+        assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
+        assert!(get_i64(commit_info, "timestamp") > 0);
+        assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 0);
+        assert_eq!(get_str(commit_info, "engineInfo"), "");
+        assert!(!get_bool(commit_info, "isBlindAppend"));
+
         Ok(())
     }
 
-    /// Case 3: engine schema contains every CommitInfo field (minus the map field) with stale
-    /// values -- all overlapping fields must be replaced by kernel values, no new fields added
-    /// (except operationParameters which the engine schema omits).
+    /// Case 3: engine schema contains every kernel's CommitInfo field.
+    /// All overlapping fields must be replaced by kernel values, no new fields added.
     #[test]
     fn test_build_commit_info_full_overlap() -> DeltaResult<()> {
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        map_builder.keys().append_value("stale_key");
+        map_builder.values().append_value("stale_value");
+        map_builder.append(true).unwrap();
+        let stale_op_params = Arc::new(map_builder.finish()) as ArrayRef;
+
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("timestamp", ArrowDataType::Int64, true),
                 ArrowField::new("inCommitTimestamp", ArrowDataType::Int64, true),
                 ArrowField::new("operation", ArrowDataType::Utf8, true),
+                ArrowField::new(
+                    "operationParameters",
+                    stale_op_params.data_type().clone(),
+                    true,
+                ),
                 ArrowField::new("kernelVersion", ArrowDataType::Utf8, true),
                 ArrowField::new("isBlindAppend", ArrowDataType::Boolean, true),
                 ArrowField::new("engineInfo", ArrowDataType::Utf8, true),
@@ -290,6 +330,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(0i64)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
+                stale_op_params,
                 Arc::new(StringArray::from(vec!["v0.0.0"])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
@@ -300,19 +341,20 @@ mod tests {
 
         let result =
             ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
-        let ci = commit_info_struct(&result);
+        let commit_info = commit_info_struct(&result);
 
-        // Stale values must be replaced by kernel values.
-        assert_ne!(get_str(ci, "operation"), "STALE_OP");
-        assert_eq!(get_str(ci, "operation"), "WRITE");
-        assert_ne!(get_str(ci, "kernelVersion"), "v0.0.0");
-        assert!(!get_str(ci, "kernelVersion").is_empty());
-        assert_ne!(get_str(ci, "txnId"), "stale_txn");
-        assert!(!get_str(ci, "txnId").is_empty());
+        // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
+        assert_eq!(commit_info.num_columns(), 8);
 
-        // The only added field is operationParameters (not in engine schema).
-        // Total columns = 7 engine fields + 1 appended (operationParameters).
-        assert_eq!(ci.num_columns(), 8);
+        assert_eq!(get_str(commit_info, "operation"), "WRITE");
+        assert!(!get_str(commit_info, "kernelVersion").is_empty());
+        assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
+        assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
+        assert!(get_i64(commit_info, "timestamp") > 0);
+        assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 0);
+        assert_eq!(get_str(commit_info, "engineInfo"), "");
+        assert!(!get_bool(commit_info, "isBlindAppend"));
+
         Ok(())
     }
 
