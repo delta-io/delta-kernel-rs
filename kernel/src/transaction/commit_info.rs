@@ -141,11 +141,12 @@ mod tests {
     };
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
+    use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
+    use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
     use crate::transaction::Transaction;
     use crate::utils::test_utils::load_test_table;
-    use crate::{DataType, DeltaResult, Engine, EngineData};
+    use crate::{DeltaResult, Engine, EngineData};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
 
@@ -153,12 +154,15 @@ mod tests {
     fn make_engine_commit_info(
         arrow_fields: Vec<ArrowField>,
         columns: Vec<ArrayRef>,
-        kernel_fields: Vec<StructField>,
     ) -> (Box<dyn EngineData>, SchemaRef) {
-        let arrow_schema = Arc::new(ArrowSchema::new(arrow_fields));
-        let batch = RecordBatch::try_new(arrow_schema, columns).expect("valid RecordBatch");
-        let schema = Arc::new(StructType::new_unchecked(kernel_fields));
-        (Box::new(ArrowEngineData::new(batch)), schema)
+        let arrow_schema = ArrowSchema::new(arrow_fields);
+        let kernel_schema: Schema = arrow_schema.as_ref().try_into_kernel().unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid RecordBatch");
+        (
+            Box::new(ArrowEngineData::new(batch)),
+            Arc::new(kernel_schema),
+        )
     }
 
     /// Helper: extract the inner "commitInfo" StructArray from a top-level RecordBatch.
@@ -203,10 +207,12 @@ mod tests {
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let txn = snapshot
+        let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string())
-            .with_commit_info(engine_commit_info);
+            .with_operation("WRITE".to_string());
+        if let Some((engine_commit_info_data, engine_commit_info_schema)) = engine_commit_info {
+            txn = txn.with_commit_info(engine_commit_info_data, engine_commit_info_schema);
+        }
         Ok((engine, txn))
     }
 
@@ -239,10 +245,6 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["myApp"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![42i64])) as ArrayRef,
-            ],
-            vec![
-                StructField::not_null("customApp", DataType::STRING),
-                StructField::not_null("customVersion", DataType::LONG),
             ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
@@ -293,15 +295,6 @@ mod tests {
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_txn"])) as ArrayRef,
             ],
-            vec![
-                StructField::nullable("timestamp", DataType::LONG),
-                StructField::nullable("inCommitTimestamp", DataType::LONG),
-                StructField::nullable("operation", DataType::STRING),
-                StructField::nullable("kernelVersion", DataType::STRING),
-                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
-                StructField::nullable("engineInfo", DataType::STRING),
-                StructField::nullable("txnId", DataType::STRING),
-            ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
@@ -337,11 +330,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(0i64)])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["keep_me"])) as ArrayRef,
-            ],
-            vec![
-                StructField::nullable("timestamp", DataType::LONG),
-                StructField::nullable("operation", DataType::STRING),
-                StructField::not_null("myCustomField", DataType::STRING),
             ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;

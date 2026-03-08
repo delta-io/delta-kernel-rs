@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::Error as KernelError;
@@ -88,6 +89,23 @@ fn validate_txn_id(commit_info: &serde_json::Value) {
         .as_str()
         .expect("txnId should be present in commitInfo");
     Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
+}
+
+fn validate_timestamp(commit_info: &serde_json::Value) {
+    let timestamp = commit_info["timestamp"]
+        .as_i64()
+        .expect("timestamp should be present in commitInfo");
+    let current_ts: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let five_minutes_ms = 5 * 60 * 1000;
+    assert!(
+        (timestamp <= current_ts && timestamp > current_ts - five_minutes_ms),
+        "commit timestamp should be at most 5 minutes behind current system time: got {timestamp}, now {current_ts}"
+    );
 }
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -474,7 +492,6 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 /// - The written JSON is correctly wrapped in a top-level `"commitInfo"` key.
 /// - Engine-only fields (not in `CommitInfo::to_schema()`) pass through to the log unchanged.
 /// - Fields that overlap with kernel-managed CommitInfo fields are overridden by kernel values,
-///   even if the engine supplied stale values for them.
 /// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`)
 ///   are present with correct values.
 #[tokio::test]
@@ -512,7 +529,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_operation("WRITE".to_string())
-            .with_commit_info(Some((Box::new(ArrowEngineData::new(batch)), engine_schema)));
+            .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
 
         let _ = txn.commit(&engine)?;
 
@@ -526,8 +543,8 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // txnId must be a valid UUID before we zero it out.
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
+        validate_timestamp(&parsed_commits[0]["commitInfo"]);
 
         // Zero out non-deterministic fields for stable comparison.
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;

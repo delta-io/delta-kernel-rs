@@ -453,9 +453,10 @@ impl<S> Transaction<S> {
     /// The engine's commit info will be overrided by the kernel commit info.
     pub fn with_commit_info(
         mut self,
-        engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+        engine_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
     ) -> Self {
-        self.engine_commit_info = engine_commit_info;
+        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
         self
     }
 
