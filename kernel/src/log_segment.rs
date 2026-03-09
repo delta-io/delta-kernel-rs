@@ -146,35 +146,12 @@ impl LogSegment {
                 None
             };
 
-        // No gap between checkpoint and first commit
-        if let (Some(checkpoint_version), Some(commit_file)) = (
-            checkpoint_version,
-            listed_files.ascending_commit_files.first(),
-        ) {
-            require!(
-                checkpoint_version + 1 == commit_file.version,
-                Error::InvalidCheckpoint(format!(
-                    "Gap between checkpoint version {} and next commit {}",
-                    checkpoint_version, commit_file.version,
-                ))
-            )
-        }
-
-        // Get the effective version
-        let effective_version = listed_files
-            .ascending_commit_files
-            .last()
-            .or(listed_files.checkpoint_parts.first())
-            .ok_or(Error::generic("No files in log segment"))?
-            .version;
-        if let Some(end_version) = end_version {
-            require!(
-                effective_version == end_version,
-                Error::generic(format!(
-                    "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
-                ))
-            );
-        }
+        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
+        let effective_version = validate_end_version(
+            &listed_files.ascending_commit_files,
+            &listed_files.checkpoint_parts,
+            end_version,
+        )?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -1142,8 +1119,7 @@ fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
             if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
                 if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
                     return Err(Error::generic(format!(
-                        "ascending_compaction_files is not sorted: {:?} -> {:?}",
-                        f, next
+                        "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
                     )));
                 }
             }
@@ -1208,4 +1184,52 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()
         }
     }
     Ok(())
+}
+
+/// Validates that there is no gap between the checkpoint and the first commit file.
+///
+/// When a checkpoint exists and commits are also present (after filtering out commits at or before
+/// the checkpoint), the first commit must immediately follow the checkpoint (i.e., be at
+/// `checkpoint_version + 1`). A gap indicates missing log files.
+fn validate_checkpoint_commit_gap(
+    checkpoint_version: Option<Version>,
+    commits: &[ParsedLogPath],
+) -> DeltaResult<()> {
+    if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
+        require!(
+            checkpoint_version + 1 == first_commit.version,
+            Error::InvalidCheckpoint(format!(
+                "Gap between checkpoint version {checkpoint_version} and next commit {}",
+                first_commit.version
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// Validates that the log segment covers exactly `end_version` (when specified) and returns the
+/// effective version -- the version of the last commit, or the checkpoint version if no commits
+/// are present.
+///
+/// Returns an error if the segment is empty (no commits and no checkpoint parts), or if the
+/// effective version does not match the requested `end_version`.
+fn validate_end_version(
+    commits: &[ParsedLogPath],
+    checkpoint_parts: &[ParsedLogPath],
+    end_version: Option<Version>,
+) -> DeltaResult<Version> {
+    let effective_version = commits
+        .last()
+        .or(checkpoint_parts.first())
+        .ok_or(Error::generic("No files in log segment"))?
+        .version;
+    if let Some(end_version) = end_version {
+        require!(
+            effective_version == end_version,
+            Error::generic(format!(
+                "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
+            ))
+        );
+    }
+    Ok(effective_version)
 }
