@@ -303,6 +303,33 @@ fn test_physical_predicate_case_insensitive_with_column_mapping() {
     );
 }
 
+/// Case-insensitive matching also works for nested struct fields, where casing can differ at
+/// each level of the path (e.g., predicate references `nested.fieldname` but schema has
+/// `Nested.FieldName`).
+#[test]
+fn test_physical_predicate_case_insensitive_nested_fields() {
+    let logical_schema = StructType::new_unchecked(vec![StructField::nullable(
+        "Nested",
+        StructType::new_unchecked(vec![StructField::nullable("FieldName", DataType::LONG)]),
+    )]);
+    let predicate = column_pred!("nested.fieldname");
+    let result =
+        PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None).unwrap();
+    assert_eq!(
+        result,
+        PhysicalPredicate::Some(
+            column_pred!("Nested.FieldName").into(),
+            StructType::new_unchecked(vec![StructField::nullable(
+                "Nested",
+                StructType::new_unchecked(vec![
+                    StructField::nullable("FieldName", DataType::LONG,)
+                ]),
+            )])
+            .into(),
+        )
+    );
+}
+
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
