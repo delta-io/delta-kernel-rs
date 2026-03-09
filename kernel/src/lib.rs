@@ -101,6 +101,7 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod scan;
+pub(crate) mod scan_transforms;
 pub mod schema;
 pub mod snapshot;
 pub mod table_changes;
@@ -108,7 +109,6 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
-pub(crate) mod scan_transforms;
 
 pub use log_path::LogPath;
 

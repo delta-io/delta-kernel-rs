@@ -334,10 +334,10 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
     use crate::scan::PhysicalPredicate;
+    use crate::scan_transforms::FieldTransformSpec;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::TableChanges;
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
-    use crate::scan_transforms::FieldTransformSpec;
     use crate::Predicate;
 
     #[test]

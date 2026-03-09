@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::scan_transforms::{get_transform_expr, parse_partition_values};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, ExpressionRef};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
@@ -131,9 +131,9 @@ mod tests {
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
+    use crate::scan_transforms::FieldTransformSpec;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
-    use crate::scan_transforms::FieldTransformSpec;
     use std::collections::HashMap;
     use std::sync::Arc;
 
