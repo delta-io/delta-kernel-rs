@@ -69,7 +69,7 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
 /// physical names) on any field. Note: whether `ColumnMapping` appears in the protocol
 /// depends on whether the feature flag was explicitly set, so that check is left to the
 /// caller.
-fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: ColumnMappingMode) {
+pub(super) fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: ColumnMappingMode) {
     let table_config = snapshot.table_configuration();
 
     assert_eq!(

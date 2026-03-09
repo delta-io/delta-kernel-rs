@@ -4,19 +4,16 @@
 //! metadata actions from a [`LogSegment`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
 
 use tracing::instrument;
 
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
-use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
+use crate::actions::DomainMetadata;
 use crate::log_replay::ActionsBatch;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, RowVisitor as _};
 
 use super::LogSegment;
-
-const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
@@ -60,12 +57,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_log_domain_metadata_schema();
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(
-                Expr::column([DOMAIN_METADATA_NAME, DOMAIN_METADATA_DOMAIN_FIELD]).is_not_null(),
-            ))
-        });
-        self.read_actions(engine, schema.clone(), META_PREDICATE.clone())
+        self.read_actions(engine, schema.clone())
     }
 }
 

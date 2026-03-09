@@ -136,8 +136,8 @@ mod tests {
     ) -> DeltaResult<()> {
         let log_segment = snapshot.log_segment();
         let log_root = log_segment.log_root.clone();
-        assert_eq!(log_segment.checkpoint_parts.len(), 1);
-        let checkpoint_file = &log_segment.checkpoint_parts[0];
+        assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
+        let checkpoint_file = &log_segment.listed.checkpoint_parts[0];
         let mut manifest_phase =
             CheckpointManifestReader::try_new(engine.clone(), checkpoint_file, log_root)?;
 
@@ -218,7 +218,7 @@ mod tests {
 
         let manifest_phase = CheckpointManifestReader::try_new(
             engine.clone(),
-            &snapshot.log_segment().checkpoint_parts[0],
+            &snapshot.log_segment().listed.checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
         )?;
 
