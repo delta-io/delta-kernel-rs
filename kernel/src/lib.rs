@@ -88,6 +88,10 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+// Public under test-utils so integration tests can inspect CRC state via Snapshot::get_current_crc_if_loaded_for_testing.
+#[cfg(feature = "test-utils")]
+pub mod crc;
+#[cfg(not(feature = "test-utils"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -104,7 +108,6 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
-pub(crate) mod transforms;
 
 pub use log_path::LogPath;
 
