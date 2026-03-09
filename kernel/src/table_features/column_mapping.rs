@@ -154,11 +154,12 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
             if let Err(e) = validate_field_column_mapping(field, self.mode) {
                 self.err = Some(e);
             } else {
-                if let Some(MetadataValue::Number(id)) =
-                    field.metadata.get(ColumnMetadataKey::ColumnMappingId.as_ref())
+                if let Some(MetadataValue::Number(id)) = field
+                    .metadata
+                    .get(ColumnMetadataKey::ColumnMappingId.as_ref())
                 {
                     if let Some(prev) = self.seen.insert(*id, &field.name) {
-                        self.err = Some(Error::invalid_column_mapping_mode(format!(
+                        self.err = Some(Error::schema(format!(
                             "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
                             field.name()
                         )));
