@@ -696,7 +696,6 @@ fn get_indices(
                     if let DataType::Struct(ref requested_schema)
                     | DataType::Variant(ref requested_schema) = requested_field.data_type
                     {
-                        let prev_mask_len = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
                             parquet_index + parquet_offset,
                             requested_schema.as_ref(),
@@ -707,18 +706,10 @@ fn get_indices(
                         // struct will be counted by the `enumerate` call but doesn't count as
                         // an actual index.
                         parquet_offset += parquet_advance - 1;
-                        if mask_indices.len() > prev_mask_len {
-                            // At least one leaf was selected — the parquet reader will
-                            // materialize this struct, so emit a Nested reorder entry.
-                            found_fields.insert(requested_field.name());
-                            reorder_indices.push(ReorderIndex::nested(index, children));
-                        }
-                        // If no leaves were selected, the parquet reader won't materialize
-                        // this struct at all. We skip adding it to found_fields so the
-                        // missing-field loop below emits a Missing entry (filled with
-                        // nulls) at the correct position. This requires the struct field
-                        // to be nullable; a non-nullable struct with zero matching
-                        // children will error in the missing-field loop.
+                        // note that we found this field
+                        found_fields.insert(requested_field.name());
+                        // push the child reorder on
+                        reorder_indices.push(ReorderIndex::nested(index, children));
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
                     }

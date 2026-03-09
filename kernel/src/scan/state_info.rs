@@ -229,20 +229,21 @@ impl StateInfo {
 
         // Build partition schema with physical names for checkpoint partition pruning.
         // Only needed when we have a predicate and partition columns.
-        // We filter logical_schema (which has logical names matching partition_columns) and then
-        // convert to physical names, because the local physical_schema excludes partition columns
-        // (they use MetadataDerivedColumn transforms) and table_configuration.physical_schema()
-        // uses physical names that don't match the logical partition_columns names under column
-        // mapping.
+        // partition_columns stores logical names (per Delta protocol), so we zip the table's
+        // logical and physical schemas (same field ordering, guaranteed by `make_physical`)
+        // to match logical names and extract the corresponding physical fields without
+        // per-field metadata lookups.
         let physical_partition_schema = if !matches!(
             physical_predicate,
             PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
         ) && !partition_columns.is_empty()
         {
-            let partition_fields: Vec<StructField> = logical_schema
+            let partition_fields: Vec<StructField> = table_configuration
+                .logical_schema()
                 .fields()
-                .filter(|f| partition_columns.contains(f.name()))
-                .map(|f| f.make_physical(column_mapping_mode))
+                .zip(table_configuration.physical_schema().fields())
+                .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
+                .map(|(_, physical_f)| physical_f.clone())
                 .collect();
             if partition_fields.is_empty() {
                 None

@@ -14,7 +14,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, SchemaRef};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
@@ -135,6 +135,59 @@ impl DataSkippingFilter {
             skipping_evaluator,
             filter_evaluator,
         })
+    }
+
+    /// Builds the unified schema and extraction expression from separate data stats and partition
+    /// value inputs. Returns `None` if neither stats nor partition values are available.
+    #[allow(unused)]
+    fn build_unified_schema_and_expr(
+        stats_schema: Option<&SchemaRef>,
+        stats_expr: ExpressionRef,
+        partition_schema: Option<&SchemaRef>,
+        partition_expr: Option<ExpressionRef>,
+    ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
+        let has_stats = stats_schema.is_some();
+        let pv_schema = partition_schema.filter(|s| s.num_fields() > 0);
+        let has_partitions = pv_schema.is_some();
+
+        if !has_stats && !has_partitions {
+            return None;
+        }
+
+        let partition_columns: HashSet<String> = pv_schema
+            .map(|s| s.fields().map(|f| f.name().to_string()).collect())
+            .unwrap_or_default();
+
+        let stats_field = |stats: &SchemaRef| {
+            StructField::nullable(
+                "stats_parsed",
+                DataType::Struct(Box::new(stats.as_ref().clone())),
+            )
+        };
+        let pv_field = |pv: &SchemaRef| {
+            StructField::nullable(
+                "partitionValues_parsed",
+                DataType::Struct(Box::new(pv.as_ref().clone())),
+            )
+        };
+
+        let unified_schema = match (stats_schema, pv_schema) {
+            (Some(stats), Some(pv)) => Arc::new(StructType::new_unchecked([
+                stats_field(stats),
+                pv_field(pv),
+            ])),
+            (Some(stats), None) => Arc::new(StructType::new_unchecked([stats_field(stats)])),
+            (None, Some(pv)) => Arc::new(StructType::new_unchecked([pv_field(pv)])),
+            (None, None) => unreachable!("checked above"),
+        };
+
+        let unified_expr = match (has_stats, pv_schema, partition_expr) {
+            (true, Some(_), Some(pv_expr)) => Arc::new(Expr::struct_from([stats_expr, pv_expr])),
+            (false, Some(_), Some(pv_expr)) => Arc::new(Expr::struct_from([pv_expr])),
+            _ => Arc::new(Expr::struct_from([stats_expr])),
+        };
+
+        Some((unified_schema, unified_expr, partition_columns))
     }
 
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
