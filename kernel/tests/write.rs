@@ -37,15 +37,15 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{column_expr, ColumnName};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
+use delta_kernel::{Expression as Expr, Predicate as Pred};
 
-#[cfg(feature = "clustered-table")]
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
@@ -2830,6 +2830,135 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
                 assert_eq!(total_removed, 2);
                 assert_eq!(new_file_count, initial_file_count - total_removed);
                 assert!(new_file_count > 0, "At least one file should remain");
+            }
+            _ => panic!("Transaction did not succeed"),
+        }
+    }
+    Ok(())
+}
+
+/// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2040
+///
+/// When `scan_metadata()` is called with a predicate, the scan row schema includes a
+/// `stats_parsed` column (7th column). Passing that scan metadata to `remove_files()` then
+/// `commit()` previously failed with "Too few fields in output schema" because the transform
+/// evaluator exhausted the output schema when it encountered the extra column.
+///
+/// Both predicate and non-predicate scans are tested because `remove_files` should behave
+/// identically regardless. Cases also vary the checkpoint format:
+/// - `use_struct_stats_checkpoint=false`: `stats` is non-null (raw JSON from the Add action).
+///   The remove action's `stats` comes from passthrough.
+/// - `use_struct_stats_checkpoint=true`: a checkpoint is written with
+///   `writeStatsAsJson=false, writeStatsAsStruct=true`, so the checkpoint stores `stats_parsed`
+///   but omits the raw `stats` JSON string. Scan rows from that checkpoint have `stats=null` but
+///   `stats_parsed` non-null. The remove action's `stats` is produced via
+///   `coalesce(null, to_json(stats_parsed))`, which exercises the coalesce path in the fix.
+#[rstest::rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+// Multi-thread runtime required because the struct-stats checkpoint case calls
+// `Snapshot::checkpoint`, which makes nested `block_on` calls that deadlock
+// a single-threaded executor. `TokioMultiThreadExecutor` uses `block_in_place`
+// which avoids the deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
+    #[case] use_struct_stats_checkpoint: bool,
+    #[case] use_predicate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = get_simple_int_schema();
+
+    // Use a local directory so we can inspect the commit log for stats content.
+    let tmp_dir = tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], Some(&tmp_url), "test_table").await?
+    {
+        let engine = Arc::new(engine);
+
+        // Write data (two parquet files with numbers [1,2,3] and [4,5,6]).
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+
+        // When use_struct_stats_checkpoint=true, update table properties so the checkpoint
+        // omits the stats JSON string (writeStatsAsJson=false) but stores stats as a struct
+        // (writeStatsAsStruct=true). After checkpointing, scan rows from the checkpoint have
+        // stats=null and stats_parsed=non-null, exercising the coalesce path in the fix.
+        let snapshot = if use_struct_stats_checkpoint {
+            let table_path = table_url.to_file_path().unwrap();
+            let snapshot_v2 = set_table_properties(
+                table_path.to_str().unwrap(),
+                &table_url,
+                engine.as_ref(),
+                1,
+                &[
+                    ("delta.checkpoint.writeStatsAsJson", "false"),
+                    ("delta.checkpoint.writeStatsAsStruct", "true"),
+                ],
+            )?;
+            // `Snapshot::checkpoint` makes nested `block_on` calls internally (it reads the
+            // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
+            // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
+            let mt_engine = create_default_engine_mt_executor(&table_url)?;
+            snapshot_v2.checkpoint(mt_engine.as_ref())?;
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+        } else {
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+        };
+
+        // commit_version = 2 (no checkpoint) or 3 (properties commit + checkpoint bump)
+        let expected_commit_version = if use_struct_stats_checkpoint { 3 } else { 2 };
+
+        // Always request all stats columns so stats_parsed is present in scan metadata
+        // regardless of whether a predicate is used. This ensures remove_files can always
+        // reconstruct stats (including the coalesce path when writeStatsAsJson=false).
+        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        if use_predicate {
+            scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
+                column_expr!("number"),
+                Expr::literal(0_i32),
+            )));
+        }
+        let scan = scan_builder.build()?;
+
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_data_change(true);
+
+        // Pass scan metadata (which contains stats_parsed) directly to remove_files.
+        // This previously failed with "Too few fields in output schema".
+        for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+            txn.remove_files(scan_metadata?.scan_files);
+        }
+
+        match txn.commit(engine.as_ref())? {
+            CommitResult::CommittedTransaction(committed) => {
+                assert_eq!(committed.commit_version(), expected_commit_version);
+
+                let remove_actions =
+                    read_actions_from_commit(&table_url, expected_commit_version, "remove")?;
+                assert!(
+                    !remove_actions.is_empty(),
+                    "expected remove actions in commit"
+                );
+
+                // stats must be populated in every remove action: stats_parsed is always present
+                // (via include_all_stats_columns), so the coalesce path handles even checkpoints
+                // that omit the raw JSON stats string (writeStatsAsJson=false).
+                for remove in &remove_actions {
+                    let stats_str = remove["stats"]
+                        .as_str()
+                        .expect("stats field should be a non-null JSON string");
+                    let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+                    assert!(
+                        stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                        "stats.numRecords should be populated, got: {stats}"
+                    );
+                }
             }
             _ => panic!("Transaction did not succeed"),
         }

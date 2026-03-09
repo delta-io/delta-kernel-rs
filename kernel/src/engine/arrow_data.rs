@@ -15,7 +15,8 @@ use crate::arrow::array::{
 };
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef,
+    Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
@@ -331,6 +332,28 @@ impl EngineData for ArrowEngineData {
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
     }
+
+    fn has_field(&self, name: &ColumnName) -> bool {
+        let mut path = name.path();
+        let Some((first, rest)) = path.split_first() else {
+            return false;
+        };
+        let Some((_, mut field)) = self.data.schema_ref().fields().find(first.as_str()) else {
+            return false;
+        };
+        path = rest;
+        while let Some((component, rest)) = path.split_first() {
+            let ArrowDataType::Struct(nested) = field.data_type() else {
+                return false;
+            };
+            let Some((_, next)) = nested.find(component.as_str()) else {
+                return false;
+            };
+            field = next;
+            path = rest;
+        }
+        true
+    }
 }
 
 impl ArrowEngineData {
@@ -526,6 +549,7 @@ mod tests {
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
+    use crate::expressions::ColumnName;
 
     use super::{extract_record_batch, ArrowEngineData};
 
@@ -1567,5 +1591,33 @@ mod tests {
         assert_eq!(result2.get("d"), Some(&"4".to_string()));
 
         Ok(())
+    }
+
+    fn make_nested_batch() -> ArrowEngineData {
+        let inner = ArrowField::new(
+            "inner",
+            ArrowDataType::Struct(
+                vec![ArrowField::new("leaf", ArrowDataType::Int32, true)].into(),
+            ),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("top", ArrowDataType::Utf8, true),
+            ArrowField::new("nested", ArrowDataType::Struct(vec![inner].into()), true),
+        ]));
+        ArrowEngineData::new(RecordBatch::new_empty(schema))
+    }
+
+    #[rstest::rstest]
+    #[case::top_level_present(["top"].as_slice(), true)]
+    #[case::top_level_absent(["missing"].as_slice(), false)]
+    #[case::nested_present(["nested", "inner"].as_slice(), true)]
+    #[case::deeply_nested_present(["nested", "inner", "leaf"].as_slice(), true)]
+    #[case::deeply_nested_absent(["nested", "inner", "nope"].as_slice(), false)]
+    // "top" is Utf8, not a struct -- cannot descend further
+    #[case::non_struct_intermediate(["top", "child"].as_slice(), false)]
+    fn has_field(#[case] path: &[&str], #[case] expected: bool) {
+        let data = make_nested_batch();
+        assert_eq!(data.has_field(&ColumnName::new(path.iter().copied())), expected);
     }
 }
