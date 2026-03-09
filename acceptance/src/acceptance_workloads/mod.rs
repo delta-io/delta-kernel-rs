@@ -1,7 +1,7 @@
 //! Delta workload specification framework.
 //!
 //! Provides shared types and loading logic for both correctness testing
-//! (improved_dat) and benchmarking workloads. Workload specs follow a common
+//! and benchmarking workloads. Workload specs follow a common
 //! directory layout:
 //!
 //! ```text
@@ -46,9 +46,11 @@ impl TestCase {
         let table_info = {
             let path = root_dir.join("table_info.json");
             if path.exists() {
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Failed to read table_info.json: {}", e))?;
                 Some(
-                    TableInfo::from_json_path(&path)
-                        .map_err(|e| format!("Failed to load table_info.json: {}", e))?,
+                    serde_json::from_str(&content)
+                        .map_err(|e| format!("Failed to parse table_info.json: {}", e))?,
                 )
             } else {
                 None
@@ -69,7 +71,7 @@ impl TestCase {
         let table_path = self
             .table_info
             .as_ref()
-            .map(|ti| ti.resolved_table_root())
+            .map(|ti| ti.resolved_table_root(&self.root_dir))
             .unwrap_or_else(|| self.root_dir.join("delta").to_string_lossy().to_string());
         // If it looks like a URL already (s3://, etc.), parse directly
         if table_path.contains("://") {

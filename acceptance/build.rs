@@ -1,4 +1,4 @@
-//! Build script for DAT and improved_dat
+//! Build script for DAT and acceptance workload specs
 
 use std::env;
 use std::fs::File;

@@ -122,6 +122,7 @@ pub struct SnapshotResult {
 }
 
 /// Workload execution result
+#[allow(clippy::large_enum_variant)]
 pub enum WorkloadResult {
     Read(ReadResult),
     Snapshot(SnapshotResult),
@@ -156,7 +157,7 @@ pub fn execute_workload(
                 execute_snapshot_workload(engine, table_root, *version, timestamp.as_deref())?;
             Ok(WorkloadResult::Snapshot(result))
         }
-        _ => Err(Error::generic(
+        WorkloadSpec::Unsupported => Err(Error::generic(
             "Unsupported workload type in this harness build",
         )),
     }

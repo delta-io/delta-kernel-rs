@@ -51,5 +51,5 @@ name = "dat_reader"
 harness = false
 
 [[test]]
-name = "improved_dat_reader"
+name = "acceptance_workloads_reader"
 harness = false
