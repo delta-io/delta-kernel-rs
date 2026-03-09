@@ -843,8 +843,8 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-// TODO: Add serde Deserialize with rename_all = "camelCase" for CRC file reads.
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
