@@ -1,5 +1,3 @@
-// No consumers yet -- will be integrated in a follow-up PR.
-#![allow(dead_code)]
 //! Incremental CRC state updates via commit deltas.
 //!
 //! A [`CrcDelta`] captures CRC-relevant changes from a single commit (produced by reading a
@@ -43,6 +41,38 @@ pub(crate) struct CrcDelta {
     pub(crate) has_missing_file_size: bool,
 }
 
+impl CrcDelta {
+    /// Convert this delta into a fresh [`Crc`]. Used when the delta represents the entire table
+    /// state (e.g. CREATE TABLE or the first commit in a forward replay from version zero).
+    ///
+    /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
+    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
+        let protocol = self.protocol?;
+        let metadata = self.metadata?;
+        // For CREATE TABLE we always know the full domain metadata state: the transaction
+        // either included domain metadata actions or it didn't. So this is always `Some` --
+        // an empty map means "no domain metadata", not "unknown".
+        let domain_metadata = Some(
+            self.domain_metadata_changes
+                .into_iter()
+                .filter(|dm| !dm.is_removed())
+                .map(|dm| (dm.domain().to_string(), dm))
+                .collect(),
+        );
+        Some(Crc {
+            table_size_bytes: self.file_stats.net_bytes,
+            num_files: self.file_stats.net_files,
+            num_metadata: 1,
+            num_protocol: 1,
+            protocol,
+            metadata,
+            domain_metadata,
+            in_commit_timestamp_opt: self.in_commit_timestamp,
+            ..Default::default()
+        })
+    }
+}
+
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
     /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
@@ -80,19 +110,19 @@ impl Crc {
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
 
         // Bail if already Untrackable -- nothing can recover missing file stats.
-        if self.validity == FileStatsValidity::Untrackable {
+        if self.file_stats_validity == FileStatsValidity::Untrackable {
             return;
         }
 
         // Missing file size poisons stats permanently. Checked after the Untrackable bail-out
         // so that Untrackable can never transition to Indeterminate below.
         if delta.has_missing_file_size {
-            self.validity = FileStatsValidity::Untrackable;
+            self.file_stats_validity = FileStatsValidity::Untrackable;
             return;
         }
 
         // Bail if already Indeterminate (theoretically recoverable via full replay).
-        if self.validity == FileStatsValidity::Indeterminate {
+        if self.file_stats_validity == FileStatsValidity::Indeterminate {
             return;
         }
 
@@ -101,7 +131,7 @@ impl Crc {
             .as_deref()
             .is_some_and(FileStatsDelta::is_incremental_safe);
         if !is_safe {
-            self.validity = FileStatsValidity::Indeterminate;
+            self.file_stats_validity = FileStatsValidity::Indeterminate;
             return;
         }
         self.num_files += delta.file_stats.net_files;
@@ -169,7 +199,7 @@ mod tests {
     #[test]
     fn test_deserialized_crc_has_valid_stats() {
         let crc = base_crc();
-        assert_eq!(crc.validity, FileStatsValidity::Valid);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
         assert_eq!(crc.num_files, 10);
         assert_eq!(crc.table_size_bytes, 1000);
     }
@@ -182,7 +212,7 @@ mod tests {
         crc.apply(write_delta(3, 600));
         assert_eq!(crc.num_files, 13); // 10 + 3
         assert_eq!(crc.table_size_bytes, 1600); // 1000 + 600
-        assert_eq!(crc.validity, FileStatsValidity::Valid);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
     }
 
     /// Simulates forward log replay: apply multiple commit deltas sequentially.
@@ -193,7 +223,7 @@ mod tests {
         crc.apply(write_delta(-2, -400));
         assert_eq!(crc.num_files, 11); // 10 + 3 - 2
         assert_eq!(crc.table_size_bytes, 1200); // 1000 + 600 - 400
-        assert_eq!(crc.validity, FileStatsValidity::Valid);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
     }
 
     #[test]
@@ -204,7 +234,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
     }
 
     #[test]
@@ -215,7 +245,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unknown_delta);
-        assert_eq!(crc.validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
     }
 
     #[test]
@@ -226,11 +256,11 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
 
         // Subsequent safe op doesn't recover validity.
         crc.apply(write_delta(5, 500));
-        assert_eq!(crc.validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
     }
 
     // ===== apply: Untrackable (missing file size) tests =====
@@ -243,7 +273,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
     }
 
     #[test]
@@ -254,18 +284,18 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
 
         // Applying a safe delta does not recover from Untrackable.
         crc.apply(write_delta(5, 500));
-        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
 
         // Applying an unsafe delta also stays Untrackable (does not downgrade to Indeterminate).
         crc.apply(CrcDelta {
             operation: None,
             ..write_delta(1, 100)
         });
-        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
     }
 
     #[test]
@@ -276,7 +306,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
 
         // Missing size escalates Indeterminate to Untrackable.
         let delta = CrcDelta {
@@ -284,7 +314,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
     }
 
     // ===== apply: non-file-stats field updates =====
@@ -385,5 +415,83 @@ mod tests {
         };
         crc.apply(delta);
         assert_eq!(crc.in_commit_timestamp_opt, None);
+    }
+
+    // ===== CrcDelta::into_crc_for_version_zero tests =====
+
+    fn test_protocol() -> Protocol {
+        Protocol::try_new(
+            1,
+            2,
+            None::<Vec<crate::table_features::TableFeature>>,
+            None::<Vec<crate::table_features::TableFeature>>,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_protocol_and_metadata() {
+        let protocol = test_protocol();
+        let metadata = Metadata::default();
+        let delta = CrcDelta {
+            protocol: Some(protocol.clone()),
+            metadata: Some(metadata.clone()),
+            ..write_delta(5, 1000)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        assert_eq!(crc.protocol, protocol);
+        assert_eq!(crc.metadata, metadata);
+        assert_eq!(crc.num_files, 5);
+        assert_eq!(crc.table_size_bytes, 1000);
+        assert_eq!(crc.num_metadata, 1);
+        assert_eq!(crc.num_protocol, 1);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        assert_eq!(crc.domain_metadata, Some(HashMap::new()));
+        assert_eq!(crc.in_commit_timestamp_opt, None);
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_returns_none_without_protocol() {
+        let delta = CrcDelta {
+            metadata: Some(Metadata::default()),
+            ..write_delta(5, 1000)
+        };
+        assert!(delta.into_crc_for_version_zero().is_none());
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_returns_none_without_metadata() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            ..write_delta(5, 1000)
+        };
+        assert!(delta.into_crc_for_version_zero().is_none());
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_domain_metadata() {
+        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            domain_metadata_changes: vec![dm],
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        let map = crc.domain_metadata.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my.domain"].configuration(), "config1");
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_in_commit_timestamp() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            in_commit_timestamp: Some(12345),
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
     }
 }
