@@ -20,7 +20,7 @@ fn main() {
         write_done_file();
     }
 
-    extract_improved_dat();
+    extract_acceptance_workloads();
 }
 
 fn dat_exists() -> bool {
@@ -75,11 +75,11 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Extract improved_dat specs from the local tar.gz if not already done.
-fn extract_improved_dat() {
+/// Extract acceptance_workloads specs from the local tar.gz if not already done.
+fn extract_acceptance_workloads() {
     let root = repo_root();
     let tarball_path = root.join("kernel_benchmark_specs.tar.gz");
-    let output_dir = root.join("improved_dat");
+    let output_dir = root.join("acceptance_workloads");
     let done_marker = output_dir.join(".done");
 
     // Tell Cargo to re-run if the tarball changes
@@ -94,13 +94,13 @@ fn extract_improved_dat() {
         return;
     }
 
-    let tarball_file = File::open(&tarball_path).expect("Failed to open improved_dat tarball");
+    let tarball_file = File::open(&tarball_path).expect("Failed to open acceptance_workloads tarball");
     let decoder = GzDecoder::new(BufReader::new(tarball_file));
     let mut archive = Archive::new(decoder);
-    std::fs::create_dir_all(&output_dir).expect("Failed to create improved_dat output directory");
+    std::fs::create_dir_all(&output_dir).expect("Failed to create acceptance_workloads output directory");
     archive
         .unpack(&output_dir)
-        .expect("Failed to unpack improved_dat tarball");
+        .expect("Failed to unpack acceptance_workloads tarball");
 
     // Rename DV bin files: strip "test%dv%prefix-" from filenames.
     // Delta test resources use this prefix but the delta log references the unprefixed name.
@@ -108,9 +108,9 @@ fn extract_improved_dat() {
 
     // Write .done marker
     let mut done_file = BufWriter::new(
-        File::create(&done_marker).expect("Failed to create improved_dat .done file"),
+        File::create(&done_marker).expect("Failed to create acceptance_workloads .done file"),
     );
-    write!(done_file, "done").expect("Failed to write improved_dat .done file");
+    write!(done_file, "done").expect("Failed to write acceptance_workloads .done file");
 }
 
 /// Recursively rename files with "test%dv%prefix-" to strip that prefix.

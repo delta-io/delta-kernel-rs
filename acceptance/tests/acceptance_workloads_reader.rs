@@ -1,7 +1,7 @@
 //! Test harness for acceptance workloads.
 //!
 //! This test uses datatest-stable to discover and run all workload specs in the
-//! improved_dat directory. Each spec file becomes its own test.
+//! acceptance_workloads directory. Each spec file becomes its own test.
 
 use std::path::Path;
 
@@ -294,7 +294,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
 datatest_stable::harness! {
     {
         test = acceptance_workloads_test,
-        root = "../improved_dat/",
+        root = "../acceptance_workloads/",
         pattern = r"specs/.*\.json$"
     },
 }
