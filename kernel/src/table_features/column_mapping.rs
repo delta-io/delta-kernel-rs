@@ -430,8 +430,8 @@ mod tests {
     use crate::actions::Metadata;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructType};
-    use crate::table_features::Operation;
     use crate::table_configuration::TableConfiguration;
+    use crate::table_features::Operation;
     use crate::utils::test_utils::make_test_tc;
     use crate::DeltaResult;
     use std::collections::{HashMap, HashSet};
@@ -879,6 +879,25 @@ mod tests {
         assert!(
             protocol.is_err(),
             "mixed (1,7) with CM listed should be invalid"
+        );
+    }
+
+    /// Mixed protocol (3,5) with CM listed and no annotations should fail.
+    ///
+    /// NOTE: This matches current behavior for now. The intended semantics are that the
+    /// protocol shape should be valid, and rejection should come from missing annotations.
+    /// Today, `Protocol::try_new` directly rejects the (3, 5) shape first.
+    #[test]
+    fn test_cm_mixed_3_5_listed_no_annotations_should_fail() {
+        let protocol = Protocol::try_new(
+            3,
+            5,
+            Some(vec![TableFeature::ColumnMapping]),
+            TableFeature::NO_LIST,
+        );
+        assert!(
+            protocol.is_err(),
+            "mixed (3,5), no annotations: should fail (currently at protocol construction)"
         );
     }
 
