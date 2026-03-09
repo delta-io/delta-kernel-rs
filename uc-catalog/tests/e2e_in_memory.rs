@@ -191,7 +191,9 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
         .checkpoint(&engine)?;
 
     // Load a fresh snapshot and verify checkpoint was written
-    let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_uri)
+        .with_max_catalog_version(3)
+        .build(&engine)?;
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
 
     Ok(())

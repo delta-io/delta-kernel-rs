@@ -702,7 +702,7 @@ pub unsafe extern "C" fn snapshot(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, None, Vec::new()).into_extern_result(&engine)
+    snapshot_impl(url, engine, None, Vec::new(), None).into_extern_result(&engine)
 }
 
 /// Get the latest snapshot from the specified table with optional log tail
@@ -717,6 +717,7 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
     log_paths: log_path::LogPathArray,
+    max_catalog_version: Version,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
@@ -727,7 +728,8 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
         Err(err) => return Err(err).into_extern_result(&engine_ref),
     };
 
-    snapshot_impl(url, engine_ref, None, log_tail).into_extern_result(&engine_ref)
+    snapshot_impl(url, engine_ref, None, log_tail, Some(max_catalog_version))
+        .into_extern_result(&engine_ref)
 }
 
 /// Get the snapshot from the specified table at a specific version. Note this is only safe for
@@ -744,7 +746,7 @@ pub unsafe extern "C" fn snapshot_at_version(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, version.into(), Vec::new()).into_extern_result(&engine)
+    snapshot_impl(url, engine, version.into(), Vec::new(), None).into_extern_result(&engine)
 }
 
 /// Get the snapshot from the specified table at a specific version with log tail.
@@ -760,6 +762,7 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     engine: Handle<SharedExternEngine>,
     version: Version,
     log_tail: log_path::LogPathArray,
+    max_catalog_version: Version,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
@@ -770,7 +773,14 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
         Err(err) => return Err(err).into_extern_result(&engine_ref),
     };
 
-    snapshot_impl(url, engine_ref, version.into(), log_tail).into_extern_result(&engine_ref)
+    snapshot_impl(
+        url,
+        engine_ref,
+        version.into(),
+        log_tail,
+        Some(max_catalog_version),
+    )
+    .into_extern_result(&engine_ref)
 }
 
 fn snapshot_impl(
@@ -778,6 +788,7 @@ fn snapshot_impl(
     extern_engine: &dyn ExternEngine,
     version: Option<Version>,
     #[allow(unused_variables)] log_tail: Vec<LogPath>,
+    #[allow(unused_variables)] max_catalog_version: Option<Version>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
     let mut builder = Snapshot::builder_for(url?);
 
@@ -786,8 +797,13 @@ fn snapshot_impl(
     }
 
     #[cfg(feature = "catalog-managed")]
-    if !log_tail.is_empty() {
-        builder = builder.with_log_tail(log_tail);
+    {
+        if !log_tail.is_empty() {
+            builder = builder.with_log_tail(log_tail);
+        }
+        if let Some(mcv) = max_catalog_version {
+            builder = builder.with_max_catalog_version(mcv);
+        }
     }
 
     let snapshot = builder.build(extern_engine.engine().as_ref())?;
@@ -1300,12 +1316,12 @@ mod tests {
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
-        use test_utils::add_staged_commit;
+        use test_utils::{actions_to_string_catalog_managed, add_staged_commit};
         let storage = Arc::new(InMemory::new());
         add_commit(
             storage.as_ref(),
             0,
-            actions_to_string(vec![TestAction::Metadata]),
+            actions_to_string_catalog_managed(vec![TestAction::Metadata]),
         )
         .await?;
         let commit1 = add_staged_commit(
@@ -1335,6 +1351,7 @@ mod tests {
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
                 log_tail.clone(),
+                1, // max_catalog_version
             ))
         };
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
@@ -1347,6 +1364,7 @@ mod tests {
                 engine.shallow_copy(),
                 1,
                 log_tail,
+                1, // max_catalog_version
             ))
         };
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
