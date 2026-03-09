@@ -227,22 +227,23 @@ impl<S> Transaction<S> {
             .into_iter();
 
         // Chain all domain actions: system domains, row tracking, user domains, removals
-        let dm_changes: Vec<DomainMetadata> = self
+        let dm_actions_vec: Vec<DomainMetadata> = self
             .system_domain_metadata_additions
-            .clone()
-            .into_iter()
+            .iter()
+            .cloned()
             .chain(row_tracking_domain_action)
-            .chain(self.user_domain_metadata_additions.clone())
+            .chain(self.user_domain_metadata_additions.iter().cloned())
             .chain(removal_actions)
             .collect();
 
-        let actions = Box::new(
-            dm_changes
-                .clone()
-                .into_iter()
-                .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)),
-        );
+        let schema = get_log_domain_metadata_schema().clone();
 
-        Ok((actions, dm_changes))
+        let dm_actions_iter: Vec<_> = dm_actions_vec
+            .iter()
+            .cloned()
+            .map(|dm| dm.into_engine_data(schema.clone(), engine))
+            .collect();
+
+        Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))
     }
 }

@@ -117,9 +117,7 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
 
     // ===== THEN =====
-    let file_stats = crc
-        .file_stats()
-        .expect("CRC from disk should have valid file stats");
+    let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.table_size_bytes, 5259);
     assert_eq!(file_stats.num_files, 10);
     assert_eq!(crc.num_metadata, 1);
@@ -193,8 +191,9 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
     let snapshot = committed.post_commit_snapshot().unwrap();
     let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
 
-    assert_eq!(crc.num_files, 0);
-    assert_eq!(crc.table_size_bytes, 0);
+    let file_stats = crc.file_stats().unwrap();
+    assert_eq!(file_stats.num_files, 0);
+    assert_eq!(file_stats.table_size_bytes, 0);
     assert_eq!(crc.num_metadata, 1);
     assert_eq!(crc.num_protocol, 1);
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
@@ -272,8 +271,9 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     assert_eq!(committed.commit_version(), 1);
     let v1_snapshot = committed.post_commit_snapshot().unwrap();
     let crc_v1 = v1_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
-    assert_eq!(crc_v1.num_files, 1); // <--- 1 file added
-    let size_after_first_insert = crc_v1.table_size_bytes;
+    let stats_v1 = crc_v1.file_stats().unwrap();
+    assert_eq!(stats_v1.num_files, 1); // <--- 1 file added
+    let size_after_first_insert = stats_v1.table_size_bytes;
     assert!(size_after_first_insert > 0); // <--- size is non-zero
 
     // ===== WHEN: Insert values 11..=20 =====
@@ -286,8 +286,9 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     assert_eq!(committed.commit_version(), 2);
     let v2_snapshot = committed.post_commit_snapshot().unwrap();
     let crc_v2 = v2_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
-    assert_eq!(crc_v2.num_files, 2); // <--- 2 files added
-    let size_after_second_insert = crc_v2.table_size_bytes;
+    let stats_v2 = crc_v2.file_stats().unwrap();
+    assert_eq!(stats_v2.num_files, 2); // <--- 2 files added
+    let size_after_second_insert = stats_v2.table_size_bytes;
     assert!(size_after_second_insert > size_after_first_insert); // <--- size is greater than after first insert
 
     // ===== WHEN: Remove all files =====
@@ -306,8 +307,9 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     assert_eq!(committed.commit_version(), 3);
     let v3_snapshot = committed.post_commit_snapshot().unwrap();
     let crc_v3 = v3_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
-    assert_eq!(crc_v3.num_files, 0); // <--- 0 net file in the table
-    assert_eq!(crc_v3.table_size_bytes, 0); // <--- size is 0
+    let stats_v3 = crc_v3.file_stats().unwrap();
+    assert_eq!(stats_v3.num_files, 0); // <--- 0 net file in the table
+    assert_eq!(stats_v3.table_size_bytes, 0); // <--- size is 0
 
     Ok(())
 }

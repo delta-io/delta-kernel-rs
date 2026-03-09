@@ -19,7 +19,7 @@ pub(crate) fn try_write_crc_file(
     overwrite: bool,
 ) -> DeltaResult<()> {
     require!(
-        crc.validity == FileStatsValidity::Valid,
+        crc.file_stats_validity == FileStatsValidity::Valid,
         Error::internal_error("Cannot write CRC file with invalid file stats")
     );
     let data = serde_json::to_vec(crc)?;
@@ -193,7 +193,7 @@ mod tests {
             FileStatsValidity::Untrackable,
         ] {
             let mut crc = test_crc();
-            crc.validity = invalid_validity;
+            crc.file_stats_validity = invalid_validity;
             let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc, false);
             assert!(result.is_err(), "should reject {:?}", invalid_validity);
         }
