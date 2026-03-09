@@ -417,10 +417,13 @@ pub(crate) fn get_any_level_columns_logical_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::Metadata;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructType};
     use crate::table_features::Operation;
+    use crate::table_configuration::TableConfiguration;
     use crate::utils::test_utils::make_test_tc;
+    use crate::DeltaResult;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
@@ -612,8 +615,7 @@ mod tests {
         schema: Arc<StructType>,
         protocol: Protocol,
         mode: Option<ColumnMappingMode>,
-    ) -> crate::DeltaResult<crate::table_configuration::TableConfiguration> {
-        use crate::actions::Metadata;
+    ) -> DeltaResult<TableConfiguration> {
         let props: HashMap<String, String> = mode
             .map(|m| HashMap::from([("delta.columnMapping.mode".to_string(), m.to_string())]))
             .unwrap_or_default();
@@ -700,6 +702,49 @@ mod tests {
                 tc.column_mapping_mode(),
                 mode,
                 "mixed (2,7), mode={mode:?}: expected active CM mode"
+            );
+        }
+    }
+
+    /// Mixed protocol (2,7): CM listed and mode=id/name still requires schema annotations.
+    #[test]
+    fn test_cm_mixed_2_7_listed_reader_sufficient_no_annotations_rejected() {
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        )
+        .unwrap();
+
+        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
+            assert!(
+                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
+                "mixed (2,7), mode={mode:?}, no annotations: should fail"
+            );
+        }
+    }
+
+    /// Legacy protocol (2,5): mode=id/name is supported but still requires schema annotations.
+    #[test]
+    fn test_cm_legacy_2_5_mode_set_requires_annotations() {
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+
+        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
+            let tc = make_cm_tc(annotated_schema(), protocol.clone(), Some(mode))
+                .unwrap_or_else(|e| panic!("legacy (2,5), mode={mode:?}, annotated: {e}"));
+            assert!(
+                tc.is_feature_supported(&TableFeature::ColumnMapping),
+                "legacy (2,5), mode={mode:?}: CM should be supported"
+            );
+            assert_eq!(
+                tc.column_mapping_mode(),
+                mode,
+                "legacy (2,5), mode={mode:?}: expected active CM mode"
+            );
+            assert!(
+                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
+                "legacy (2,5), mode={mode:?}, no annotations: should fail"
             );
         }
     }
