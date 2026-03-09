@@ -100,8 +100,15 @@ pub struct Crc {
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub in_commit_timestamp_opt: Option<i64>,
     /// Live transaction identifier ([`SetTransaction`]) actions at this version.
-    #[serde(skip)]
-    pub set_transactions: Option<Vec<SetTransaction>>,
+    ///
+    /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
+    /// a Vec, which is converted via custom serde deserialization.
+    #[serde(
+        default,
+        deserialize_with = "de_opt_vec_to_opt_map",
+        serialize_with = "ser_opt_map_to_opt_vec"
+    )]
+    pub(crate) set_transactions: Option<HashMap<String, SetTransaction>>,
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored.
     ///
@@ -130,29 +137,48 @@ pub struct Crc {
     pub deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
-/// Deserialize `Option<Vec<DomainMetadata>>` from JSON into `Option<HashMap<String, DomainMetadata>>`.
-fn de_opt_vec_to_opt_map<'de, D>(
-    deserializer: D,
-) -> Result<Option<HashMap<String, DomainMetadata>>, D::Error>
+/// Trait for types that can be stored in a HashMap keyed by a string identifier.
+/// Used by CRC serde helpers to convert between Vec (JSON format) and HashMap (in-memory).
+trait MapKey {
+    fn map_key(&self) -> &str;
+}
+
+impl MapKey for DomainMetadata {
+    fn map_key(&self) -> &str {
+        self.domain()
+    }
+}
+
+impl MapKey for SetTransaction {
+    fn map_key(&self) -> &str {
+        &self.app_id
+    }
+}
+
+/// Deserialize an `Option<Vec<T>>` from JSON into `Option<HashMap<String, T>>`, using
+/// [`MapKey::map_key`] to derive the HashMap key for each element.
+fn de_opt_vec_to_opt_map<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
 where
     D: Deserializer<'de>,
+    T: Deserialize<'de> + MapKey,
 {
-    let opt_vec: Option<Vec<DomainMetadata>> = Option::deserialize(deserializer)?;
+    let opt_vec: Option<Vec<T>> = Option::deserialize(deserializer)?;
     Ok(opt_vec.map(|vec| {
         vec.into_iter()
-            .map(|dm| (dm.domain().to_string(), dm))
+            .map(|item| (item.map_key().to_string(), item))
             .collect()
     }))
 }
 
-/// Serialize `Option<HashMap<String, DomainMetadata>>` back to `Option<Vec<DomainMetadata>>` so
-/// the CRC JSON format uses an array (matching the Delta protocol spec).
-fn ser_opt_map_to_opt_vec<S>(
-    map: &Option<HashMap<String, DomainMetadata>>,
+/// Serialize `Option<HashMap<String, T>>` back to `Option<Vec<T>>` so the CRC JSON format
+/// uses an array (matching the Delta protocol spec).
+fn ser_opt_map_to_opt_vec<S, T>(
+    map: &Option<HashMap<String, T>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
+    T: Serialize,
 {
     match map {
         None => serializer.serialize_none(),
@@ -198,4 +224,241 @@ pub struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::Crc;
+    use crate::actions::{DomainMetadata, SetTransaction};
+
+    /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.
+    fn crc_with(
+        txns: Option<HashMap<String, SetTransaction>>,
+        domains: Option<HashMap<String, DomainMetadata>>,
+    ) -> Crc {
+        Crc {
+            set_transactions: txns,
+            domain_metadata: domains,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn de_vec_to_map_produces_correct_keys_and_values() {
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
+            "setTransactions": [
+                {"appId": "app-1", "version": 3, "lastUpdated": 1000},
+                {"appId": "app-2", "version": 7}
+            ],
+            "domainMetadata": [
+                {"domain": "delta.rowTracking", "configuration": "{\"rowIdHighWaterMark\":1}", "removed": false},
+                {"domain": "delta.clustering", "configuration": "{}", "removed": false}
+            ]
+        }"#;
+
+        let crc: Crc = serde_json::from_str(json).unwrap();
+
+        let txns = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(txns.len(), 2);
+
+        let txn1 = &txns["app-1"];
+        assert_eq!(txn1.app_id, "app-1");
+        assert_eq!(txn1.version, 3);
+        assert_eq!(txn1.last_updated, Some(1000));
+
+        let txn2 = &txns["app-2"];
+        assert_eq!(txn2.app_id, "app-2");
+        assert_eq!(txn2.version, 7);
+        assert_eq!(txn2.last_updated, None);
+
+        let domains = crc.domain_metadata.as_ref().unwrap();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains_key("delta.rowTracking"));
+        assert!(domains.contains_key("delta.clustering"));
+    }
+
+    #[test]
+    fn de_null_deserializes_to_none() {
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
+            "setTransactions": null,
+            "domainMetadata": null
+        }"#;
+        let crc: Crc = serde_json::from_str(json).unwrap();
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
+    }
+
+    #[test]
+    fn de_missing_field_deserializes_to_none() {
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1}
+        }"#;
+        let crc: Crc = serde_json::from_str(json).unwrap();
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
+    }
+
+    #[test]
+    fn ser_none_serializes_to_null() {
+        let crc = crc_with(None, None);
+        let json = serde_json::to_value(&crc).unwrap();
+        assert!(json["setTransactions"].is_null());
+        assert!(json["domainMetadata"].is_null());
+    }
+
+    #[test]
+    fn ser_map_round_trips_through_vec() {
+        let mut txns = HashMap::new();
+        txns.insert(
+            "app-1".to_string(),
+            SetTransaction::new("app-1".to_string(), 5, Some(2000)),
+        );
+        txns.insert(
+            "app-2".to_string(),
+            SetTransaction::new("app-2".to_string(), 10, None),
+        );
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
+        );
+
+        let original = crc_with(Some(txns), Some(domains));
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn round_trip_empty_maps() {
+        let original = crc_with(Some(HashMap::new()), Some(HashMap::new()));
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(original, deserialized);
+
+        // Verify the JSON has empty arrays (not null)
+        let json_value = serde_json::to_value(&original).unwrap();
+        assert_eq!(json_value["setTransactions"], serde_json::json!([]));
+        assert_eq!(json_value["domainMetadata"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_crc_with_multiple_domain_metadatas_and_set_transactions() {
+        let mut txns = HashMap::new();
+        txns.insert(
+            "streaming-app".to_string(),
+            SetTransaction::new("streaming-app".to_string(), 42, Some(1700000000)),
+        );
+        txns.insert(
+            "batch-job".to_string(),
+            SetTransaction::new("batch-job".to_string(), 100, None),
+        );
+        txns.insert(
+            "etl-pipeline".to_string(),
+            SetTransaction::new("etl-pipeline".to_string(), 7, Some(1700001000)),
+        );
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new(
+                "delta.rowTracking".to_string(),
+                r#"{"rowIdHighWaterMark":500}"#.to_string(),
+            ),
+        );
+        domains.insert(
+            "delta.clustering".to_string(),
+            DomainMetadata::new("delta.clustering".to_string(), "{}".to_string()),
+        );
+        domains.insert(
+            "custom.app".to_string(),
+            DomainMetadata::new("custom.app".to_string(), r#"{"version":"2.0"}"#.to_string()),
+        );
+
+        let crc = Crc {
+            table_size_bytes: 1024 * 1024,
+            num_files: 10,
+            num_metadata: 1,
+            num_protocol: 1,
+            set_transactions: Some(txns),
+            domain_metadata: Some(domains),
+            ..Default::default()
+        };
+
+        // Round-trip through JSON
+        let json_str = serde_json::to_string(&crc).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        // Verify scalar fields survive the round-trip
+        assert_eq!(deserialized.table_size_bytes, 1024 * 1024);
+        assert_eq!(deserialized.num_files, 10);
+
+        // Verify all set transactions
+        let txns = deserialized.set_transactions.as_ref().unwrap();
+        assert_eq!(txns.len(), 3);
+        assert_eq!(txns["streaming-app"].version, 42);
+        assert_eq!(txns["streaming-app"].last_updated, Some(1700000000));
+        assert_eq!(txns["batch-job"].version, 100);
+        assert_eq!(txns["batch-job"].last_updated, None);
+        assert_eq!(txns["etl-pipeline"].version, 7);
+
+        // Verify all domain metadatas
+        let domains = deserialized.domain_metadata.as_ref().unwrap();
+        assert_eq!(domains.len(), 3);
+        assert!(domains.contains_key("delta.rowTracking"));
+        assert!(domains.contains_key("delta.clustering"));
+        assert!(domains.contains_key("custom.app"));
+        assert_eq!(
+            domains["custom.app"].configuration(),
+            r#"{"version":"2.0"}"#
+        );
+
+        // Verify the original and deserialized are equal
+        assert_eq!(crc, deserialized);
+    }
 }

@@ -29,7 +29,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::actions::{DomainMetadata, Protocol};
+    use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -57,13 +57,19 @@ mod tests {
                 r#"{"rowIdHighWaterMark":1048576}"#.to_string(),
             ),
         )]);
+        let ict = 1234567890;
+        let app_id = "testAppId".to_string();
+        let set_transactions =
+            HashMap::from([(app_id.clone(), SetTransaction::new(app_id, 1, Some(ict)))]);
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
             num_metadata: 1,
             num_protocol: 1,
             protocol,
-            in_commit_timestamp_opt: Some(1234567890),
+            txn_id: None,
+            in_commit_timestamp_opt: Some(ict),
+            set_transactions: Some(set_transactions),
             domain_metadata: Some(domain_metadata),
             ..Default::default()
         }
@@ -134,6 +140,13 @@ mod tests {
                     "domain": "delta.rowTracking",
                     "configuration": "{\"rowIdHighWaterMark\":1048576}",
                     "removed": false
+                }
+            ],
+            "setTransactions": [
+                {
+                    "appId": "testAppId",
+                    "version": 1,
+                    "lastUpdated": 1234567890
                 }
             ]
         });
