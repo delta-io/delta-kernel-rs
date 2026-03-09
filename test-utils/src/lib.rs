@@ -221,26 +221,32 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
-// TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
-/// put a commit file into the specified object store.
+/// Put a commit file into the specified object store under `table_root`.
 pub async fn add_commit(
+    table_root: impl AsRef<str>,
     store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = delta_path_for_version(version, "json");
-    store.put(&path, data.into()).await?;
+    let table_url = url::Url::parse(table_root.as_ref())?;
+    let relative_path = delta_path_for_version(version, "json");
+    let table_path = Path::from(table_url.join(relative_path.as_ref())?.path());
+    store.put(&table_path, data.into()).await?;
     Ok(())
 }
 
+/// Put a staged commit file into the specified object store under `table_root`.
 pub async fn add_staged_commit(
+    table_root: impl AsRef<str>,
     store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
-    let path = staged_commit_path_for_version(version);
-    store.put(&path, data.into()).await?;
-    Ok(path)
+    let table_url = url::Url::parse(table_root.as_ref())?;
+    let relative_path = staged_commit_path_for_version(version);
+    let table_path = Path::from(table_url.join(relative_path.as_ref())?.path());
+    store.put(&table_path, data.into()).await?;
+    Ok(table_path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
