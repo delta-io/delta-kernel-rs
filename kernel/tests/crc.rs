@@ -259,18 +259,18 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
 
     // ===== GIVEN: Create the table =====
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
-    let v0_snapshot = committed.post_commit_snapshot().unwrap().clone();
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
 
     // ===== WHEN: Insert values 1..=10 =====
     let col1: ArrayRef = Arc::new(Int32Array::from((1..=10).collect::<Vec<_>>()));
-    let committed = insert_data(v0_snapshot, &engine, vec![col1])
+    let committed = insert_data(snapshot_v0, &engine, vec![col1])
         .await?
         .unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with right file stats =====
     assert_eq!(committed.commit_version(), 1);
-    let v1_snapshot = committed.post_commit_snapshot().unwrap();
-    let crc_v1 = v1_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+    let crc_v1 = snapshot_v1.get_current_crc_if_loaded_for_testing().unwrap();
     let stats_v1 = crc_v1.file_stats().unwrap();
     assert_eq!(stats_v1.num_files, 1); // <--- 1 file added
     let size_after_first_insert = stats_v1.table_size_bytes;
@@ -278,22 +278,22 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
 
     // ===== WHEN: Insert values 11..=20 =====
     let col2: ArrayRef = Arc::new(Int32Array::from((11..=20).collect::<Vec<_>>()));
-    let committed = insert_data(v1_snapshot.clone(), &engine, vec![col2])
+    let committed = insert_data(snapshot_v1.clone(), &engine, vec![col2])
         .await?
         .unwrap_committed();
 
     // ===== THEN: should have CRC at v2 with right file stats =====
     assert_eq!(committed.commit_version(), 2);
-    let v2_snapshot = committed.post_commit_snapshot().unwrap();
-    let crc_v2 = v2_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap();
+    let crc_v2 = snapshot_v2.get_current_crc_if_loaded_for_testing().unwrap();
     let stats_v2 = crc_v2.file_stats().unwrap();
     assert_eq!(stats_v2.num_files, 2); // <--- 2 files added
     let size_after_second_insert = stats_v2.table_size_bytes;
     assert!(size_after_second_insert > size_after_first_insert); // <--- size is greater than after first insert
 
     // ===== WHEN: Remove all files =====
-    let scan = v2_snapshot.clone().scan_builder().build()?;
-    let mut txn = v2_snapshot
+    let scan = snapshot_v2.clone().scan_builder().build()?;
+    let mut txn = snapshot_v2
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("DELETE".to_string())
@@ -320,15 +320,15 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
 
     // ===== WHEN: CREATE TABLE with zip -> zap0 =====
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
-    let v0_snapshot = committed.post_commit_snapshot().unwrap();
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap();
 
     // ===== THEN: should have CRC at v0 with zip -> zap0 =====
-    let crc = v0_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let crc = snapshot_v0.get_current_crc_if_loaded_for_testing().unwrap();
     let dms = crc.domain_metadata.as_ref().unwrap();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
-    let txn = v0_snapshot
+    let txn = snapshot_v0
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
@@ -337,14 +337,14 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
 
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
-    let v1_snapshot = committed.post_commit_snapshot().unwrap();
-    let crc = v1_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+    let crc = snapshot_v1.get_current_crc_if_loaded_for_testing().unwrap();
     let dms = crc.domain_metadata.as_ref().unwrap();
     assert_eq!(dms["zip"].configuration(), "zap1"); // <-- must be zap1
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must be bar
 
     // ===== WHEN: remove zip, keep foo =====
-    let txn = v1_snapshot
+    let txn = snapshot_v1
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
@@ -352,8 +352,8 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
 
     // ===== THEN: should have CRC at v2 with zip gone, foo still there =====
-    let v2_snapshot = committed.post_commit_snapshot().unwrap();
-    let crc = v2_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap();
+    let crc = snapshot_v2.get_current_crc_if_loaded_for_testing().unwrap();
     let dms = crc.domain_metadata.as_ref().unwrap();
     assert!(!dms.contains_key("zip")); // <-- must be gone
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must still be bar
@@ -368,16 +368,16 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
 
     // ===== GIVEN: Create table (v0) and insert data (v1) =====
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
-    let v0_snapshot = committed.post_commit_snapshot().unwrap().clone();
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
 
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    let committed = insert_data(v0_snapshot, &engine, vec![col])
+    let committed = insert_data(snapshot_v0, &engine, vec![col])
         .await?
         .unwrap_committed();
-    let v1_snapshot = committed.post_commit_snapshot().unwrap();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
     // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
-    let committed = v1_snapshot
+    let committed = snapshot_v1
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
@@ -386,8 +386,8 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
 
     // ===== THEN: CRC at v2 has indeterminate file stats =====
     assert_eq!(committed.commit_version(), 2);
-    let v2_snapshot = committed.post_commit_snapshot().unwrap();
-    let crc_v2 = v2_snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap();
+    let crc_v2 = snapshot_v2.get_current_crc_if_loaded_for_testing().unwrap();
     assert_eq!(crc_v2.file_stats_validity, FileStatsValidity::Indeterminate);
 
     Ok(())
