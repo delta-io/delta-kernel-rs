@@ -185,6 +185,11 @@ fn create_basic_protocol_action() -> Action {
     )
 }
 
+/// Create a Protocol action with catalogManaged feature support
+fn create_catalog_managed_protocol_action() -> Action {
+    Action::Protocol(Protocol::try_new_modern(["catalogManaged"], ["catalogManaged"]).unwrap())
+}
+
 /// Create a Protocol action with v2Checkpoint feature support
 fn create_v2_checkpoint_protocol_action() -> Action {
     Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
@@ -526,10 +531,13 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    // normal commit
+    // normal commit with catalog-managed protocol
     write_commit_to_store(
         &store,
-        vec![create_metadata_action(), create_basic_protocol_action()],
+        vec![
+            create_metadata_action(),
+            create_catalog_managed_protocol_action(),
+        ],
         0,
     )
     .await?;
@@ -555,6 +563,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     };
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .with_max_catalog_version(1)
         .build(&engine)?;
 
     assert!(matches!(

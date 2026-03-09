@@ -119,6 +119,11 @@ pub const METADATA_WITH_FEATURES: &str = concat!(
     r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
 );
 
+/// Like [`METADATA`] but with protocol v3/7 and the `catalogManaged` table feature enabled.
+pub const CATALOG_MANAGED_METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged"]}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),
@@ -134,6 +139,11 @@ pub enum TestAction {
 /// Convert a vector of actions into a newline delimited json string, with standard metadata
 pub fn actions_to_string(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA)
+}
+
+/// Convert a vector of actions into a newline delimited json string, with catalog-managed metadata
+pub fn actions_to_string_catalog_managed(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA)
 }
 
 /// Convert a vector of actions into a newline delimited json string, with metadata including a partition column
