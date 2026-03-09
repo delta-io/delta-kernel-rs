@@ -435,10 +435,10 @@ pub fn evaluate_predicate(
             let eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
                     let left = evaluate_expression(left, batch, None)?;
-                    let right = evaluate_expression(right, batch, None)?;
+                    let left = arrow_convert_to_non_view_type(left)?;
 
+                    let right = evaluate_expression(right, batch, None)?;
                     let right = arrow_convert_to_non_view_type(right)?;
-                    // TODO: convert right to non-view type.
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
                             if list_arr.value_type() == ArrowDataType::Utf8 {
