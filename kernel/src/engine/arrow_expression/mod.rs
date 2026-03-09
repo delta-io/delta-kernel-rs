@@ -210,6 +210,7 @@ impl Scalar {
                     builder.append(false)?;
                 }
             }
+            DataType::VOID => append_nulls_as!(array::NullBuilder),
             DataType::Variant(_) => {
                 return Err(Error::unsupported(
                     "Variant is not supported as scalar yet.",

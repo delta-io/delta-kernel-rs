@@ -710,6 +710,8 @@ impl PrimitiveType {
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
             Float => self.parse_str_as_scalar(raw, Scalar::Float),
             Double => self.parse_str_as_scalar(raw, Scalar::Double),
+            Void if raw.is_empty() => Ok(Scalar::Null(DataType::VOID)),
+            Void => Err(self.parse_error(raw)),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
                     Ok(Scalar::Boolean(true))
@@ -827,6 +829,16 @@ mod tests {
     use crate::{Expression as Expr, Predicate as Pred};
 
     use super::*;
+
+    #[test]
+    fn test_void_parse_scalar() {
+        // Empty string should produce Null (like all primitive types)
+        let scalar = PrimitiveType::Void.parse_scalar("").unwrap();
+        assert_eq!(scalar, Scalar::Null(DataType::VOID));
+
+        // Non-empty string should fail
+        PrimitiveType::Void.parse_scalar("anything").unwrap_err();
+    }
 
     #[test]
     fn test_bad_decimal() {
