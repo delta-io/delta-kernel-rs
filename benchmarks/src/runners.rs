@@ -27,7 +27,7 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
-    thread_pool: Option<rayon::ThreadPool>, // None for serial, Some for parallel
+    thread_pool: Option<rayon::ThreadPool>, // None for serial configuration, Some for parallel configuration
 }
 
 impl ReadMetadataRunner {
@@ -119,10 +119,9 @@ impl ReadMetadataRunner {
                             }
 
                             let parallel =
-                                ParallelScanMetadata::try_new(engine, state, partition_files)
-                                    .expect("failed to create parallel scan");
+                                ParallelScanMetadata::try_new(engine, state, partition_files).expect("Failed to create ParallelScanMetadata");
                             for result in parallel {
-                                black_box(result.expect("parallel scan error"));
+                                black_box(result.expect("Parallel scan error"));
                             }
                         });
                     }
