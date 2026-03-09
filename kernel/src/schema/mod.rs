@@ -431,13 +431,9 @@ impl StructField {
     /// `Id` or `Name`, this is specified in [`ColumnMetadataKey::ColumnMappingPhysicalName`].
     /// Otherwise, the field's logical name is used.
     ///
-    /// If the `column_mapping_mode` is `None`, then all column mapping metadata is removed.
-    /// If the `column_mapping_mode` is `Name`, then all Id mode column mapping metadata is
-    /// removed.
-    ///
-    /// Returns an error if column mapping is enabled and a field is missing
-    /// annotations, or if a metadata column is encountered (metadata columns should not participate
-    /// in column mapping).
+    /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
+    /// missing when column mapping is enabled, present when disabled, or wrong type), or if a
+    /// metadata column is encountered (metadata columns should not participate in column mapping).
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
@@ -511,7 +507,7 @@ impl StructField {
     /// Converts logical schema StructField metadata to physical schema metadata
     /// based on the specified `column_mapping_mode`.
     ///
-    /// NOTE: Caller affirms that the schema was already validated by
+    /// NOTE: Caller affirms that `self` was already validated by
     /// [`crate::table_features::validate_field_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
@@ -912,10 +908,6 @@ impl StructType {
     /// Applies physical name mappings to this field. If the `column_mapping_mode` is
     /// [`ColumnMappingMode::Id`], then each StructField will have its parquet field id in the
     /// [`ColumnMetadataKey::ParquetFieldId`] metadata field.
-    ///
-    /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn make_physical(
@@ -926,7 +918,7 @@ impl StructType {
             .fields()
             .map(|field| field.make_physical(column_mapping_mode))
             .try_collect()?;
-        Ok(Self::new_unchecked(fields))
+        Self::try_new(fields)
     }
 
     /// Validates that there are no metadata columns in the given fields.

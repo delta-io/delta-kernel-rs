@@ -125,7 +125,7 @@ pub(crate) fn validate_field_column_mapping(
 
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
-    seen: HashMap<i64, &'a str>,
+    seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
     err: Option<Error>,
 }
 
