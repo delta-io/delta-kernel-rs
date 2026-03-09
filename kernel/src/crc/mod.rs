@@ -93,7 +93,7 @@ pub struct Crc {
     /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
     /// by definition).
     #[serde(skip)]
-    pub validity: FileStatsValidity,
+    pub file_stats_validity: FileStatsValidity,
 
     // ===== Optional fields =====
     /// A unique identifier for the transaction that produced this commit.
