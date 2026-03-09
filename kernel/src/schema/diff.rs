@@ -4,7 +4,7 @@
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
 //! Supports nested field comparison within structs, arrays, and maps.
 
-// Allow dead code warnings since this API is not yet used by other modules
+// This module is not used outside the diff subsystem; suppress unused-code warnings.
 #![allow(dead_code)]
 
 use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
@@ -729,7 +729,8 @@ fn has_metadata_changes(before: &StructField, after: &StructField) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use std::collections::HashSet;
 
     fn create_field_with_id(
         name: &str,
@@ -744,6 +745,10 @@ mod tests {
                 MetadataValue::String(format!("col_{}", id)),
             ),
         ])
+    }
+
+    fn updated_paths(diff: &SchemaDiff) -> HashSet<ColumnName> {
+        diff.updated_fields.iter().map(|u| u.path.clone()).collect()
     }
 
     #[test]
@@ -1335,8 +1340,7 @@ mod tests {
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["new_struct"]));
 
         assert_eq!(diff.updated_fields.len(), 3);
-        let paths: HashSet<ColumnName> =
-            diff.updated_fields.iter().map(|u| u.path.clone()).collect();
+        let paths = updated_paths(&diff);
         assert!(paths.contains(&ColumnName::new(["existing"])));
         assert!(paths.contains(&ColumnName::new(["existing_struct"])));
         assert!(paths.contains(&ColumnName::new(["existing_struct", "new_name"])));
@@ -1559,10 +1563,9 @@ mod tests {
             diff.removed_fields.iter().map(|f| f.path.clone()).collect();
         assert!(removed_paths.contains(&ColumnName::new(["user", "email"])));
 
-        let updated_paths: HashSet<ColumnName> =
-            diff.updated_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(updated_paths.contains(&ColumnName::new(["identifier"])));
-        assert!(updated_paths.contains(&ColumnName::new(["user", "full_name"])));
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&ColumnName::new(["identifier"])));
+        assert!(paths.contains(&ColumnName::new(["user", "full_name"])));
     }
 
     #[test]
@@ -1895,6 +1898,63 @@ mod tests {
         );
         assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
+    #[test]
+    fn test_map_value_struct_field_changes() {
+        let before = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([
+                    create_field_with_id("value", DataType::INTEGER, false, 2),
+                    create_field_with_id("removed_field", DataType::STRING, true, 3),
+                ])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([
+                    create_field_with_id("count", DataType::INTEGER, false, 2), // Renamed!
+                    create_field_with_id("added_field", DataType::STRING, true, 4), // Added!
+                ])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        // Check added field
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["lookup", "value", "added_field"])
+        );
+
+        // Check removed field
+        assert_eq!(
+            diff.removed_fields[0].path,
+            ColumnName::new(["lookup", "value", "removed_field"])
+        );
+
+        // Check updated field (rename)
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
+
+        assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
+    }
 
     #[test]
     fn test_array_struct_element_nullability_loosened() {
@@ -1943,6 +2003,43 @@ mod tests {
             vec![FieldChangeType::ContainerNullabilityLoosened]
         );
         assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_map_nullability_loosened() {
+        let before = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                false, // Non-nullable values
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                true, // Nullable values now
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["lookup"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes());
     }
 
     #[test]
@@ -1995,6 +2092,43 @@ mod tests {
     }
 
     #[test]
+    fn test_map_nullability_tightened() {
+        let before = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                true, // Nullable values
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                false, // Non-nullable now
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["lookup"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
     fn test_array_combined_nullability_and_type_change() {
         // Test that both nullability and type change can be exercised at once in a single diff.
         // Before: items: array<string> not null (elements non-nullable)
@@ -2024,5 +2158,577 @@ mod tests {
         assert!(change_types.contains(&FieldChangeType::TypeChanged));
         assert!(change_types.contains(&FieldChangeType::ContainerNullabilityLoosened));
         assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
+    fn test_map_with_struct_key() {
+        // Test that maps with struct keys can be diffed
+        let before = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "id",
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::STRING,
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "identifier", // Renamed key field
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::STRING,
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        // Should see the nested key field renamed
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["lookup", "key", "identifier"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+    }
+
+    #[test]
+    fn test_nested_struct_in_array_in_struct_field_changes() {
+        // struct<items: array<struct<inner: struct<a int, b string>>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "data",
+            DataType::try_struct_type([create_field_with_id(
+                "items",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "inner",
+                        DataType::try_struct_type([
+                            create_field_with_id("a", DataType::INTEGER, false, 3),
+                            create_field_with_id("removed", DataType::STRING, true, 4),
+                        ])
+                        .unwrap(),
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+                5,
+            )])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "data",
+            DataType::try_struct_type([create_field_with_id(
+                "items",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "inner",
+                        DataType::try_struct_type([
+                            create_field_with_id("renamed_a", DataType::INTEGER, false, 3), // Renamed!
+                            create_field_with_id("added", DataType::LONG, true, 6), // Added!
+                        ])
+                        .unwrap(),
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+                5,
+            )])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["data", "items", "element", "inner", "added"])
+        );
+        assert_eq!(
+            diff.removed_fields[0].path,
+            ColumnName::new(["data", "items", "element", "inner", "removed"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["data", "items", "element", "inner", "renamed_a"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_nested_map_within_struct_within_map() {
+        // map<string, struct<nested: map<int, struct<x int>>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([create_field_with_id(
+                    "nested",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::INTEGER,
+                        DataType::try_struct_type([create_field_with_id(
+                            "x",
+                            DataType::INTEGER,
+                            false,
+                            3,
+                        )])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([create_field_with_id(
+                    "nested",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::INTEGER,
+                        DataType::try_struct_type([
+                            create_field_with_id("renamed_x", DataType::INTEGER, false, 3), // Renamed!
+                        ])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["lookup", "value", "nested", "value", "renamed_x"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_doubly_nested_array_with_struct_elements() {
+        // array<array<struct<x int>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "x",
+                        DataType::INTEGER,
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_x", DataType::INTEGER, false, 2), // Renamed!
+                        create_field_with_id("y", DataType::INTEGER, true, 3),          // Added!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["matrix", "element", "element", "y"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["matrix", "element", "element", "renamed_x"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_map_with_array_of_struct_key_and_value() {
+        // map<array<struct<a int>>, array<struct<b int>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "complex_map",
+            DataType::Map(Box::new(MapType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "key_field",
+                        DataType::INTEGER,
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "value_field",
+                        DataType::STRING,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "complex_map",
+            DataType::Map(Box::new(MapType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_key_field", DataType::INTEGER, false, 2), // Renamed!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_value_field", DataType::STRING, false, 3), // Renamed!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 2);
+
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&ColumnName::new([
+            "complex_map",
+            "key",
+            "element",
+            "renamed_key_field"
+        ])));
+        assert!(paths.contains(&ColumnName::new([
+            "complex_map",
+            "value",
+            "element",
+            "renamed_value_field"
+        ])));
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_map_struct_key_nested_map_value() {
+        // map<struct<id int>, map<struct<key int>, struct<data string>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "nested_maps",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "outer_key",
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::Map(Box::new(MapType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "inner_key",
+                        DataType::INTEGER,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    DataType::try_struct_type([
+                        create_field_with_id("data", DataType::STRING, false, 4),
+                        create_field_with_id("removed", DataType::INTEGER, true, 5),
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "nested_maps",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "renamed_outer_key", // Renamed!
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::Map(Box::new(MapType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "renamed_inner_key", // Renamed!
+                        DataType::INTEGER,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_data", DataType::STRING, false, 4), // Renamed!
+                        create_field_with_id("added", DataType::LONG, true, 6),           // Added!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 3);
+
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["nested_maps", "value", "value", "added"])
+        );
+        assert_eq!(
+            diff.removed_fields[0].path,
+            ColumnName::new(["nested_maps", "value", "value", "removed"])
+        );
+
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&ColumnName::new([
+            "nested_maps",
+            "key",
+            "renamed_outer_key"
+        ])));
+        assert!(paths.contains(&ColumnName::new([
+            "nested_maps",
+            "value",
+            "key",
+            "renamed_inner_key"
+        ])));
+        assert!(paths.contains(&ColumnName::new([
+            "nested_maps",
+            "value",
+            "value",
+            "renamed_data"
+        ])));
+
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_deeply_nested_nullability_tightening_is_breaking() {
+        // array<struct<items: array<struct<value int nullable>>>> -> array<struct<items: array<struct<value int not null>>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([
+                            create_field_with_id("value", DataType::INTEGER, true, 3), // Nullable
+                        ])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([
+                            create_field_with_id("value", DataType::INTEGER, false, 3), // Non-nullable now - BREAKING!
+                        ])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["wrapper", "element", "items", "element", "value"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::NullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_deeply_nested_container_nullability_tightening_is_breaking() {
+        // array<struct<items: array<struct<value int> nullable>>> -> array<struct<items: array<struct<value int> not null>>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([create_field_with_id(
+                            "value",
+                            DataType::INTEGER,
+                            false,
+                            3,
+                        )])
+                        .unwrap(),
+                        true, // Array elements are nullable
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([create_field_with_id(
+                            "value",
+                            DataType::INTEGER,
+                            false,
+                            3,
+                        )])
+                        .unwrap(),
+                        false, // Array elements now non-nullable - BREAKING!
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["wrapper", "element", "items"])
+        );
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes());
     }
 }
