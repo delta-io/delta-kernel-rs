@@ -417,10 +417,7 @@ mod tests {
         );
         domains.insert(
             "custom.app".to_string(),
-            DomainMetadata::new(
-                "custom.app".to_string(),
-                r#"{"version":"2.0"}"#.to_string(),
-            ),
+            DomainMetadata::new("custom.app".to_string(), r#"{"version":"2.0"}"#.to_string()),
         );
 
         let crc = Crc {
