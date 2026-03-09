@@ -337,16 +337,27 @@ struct GetReferencedFields<'a> {
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     // Capture the path mapping for this leaf field
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        // Record the physical name mappings for all referenced leaf columns
-        self.unresolved_references
-            .remove(self.logical_path.as_slice())
-            .then(|| {
-                self.column_mappings.insert(
-                    ColumnName::new(&self.logical_path),
-                    ColumnName::new(&self.physical_path),
-                );
-                Cow::Borrowed(ptype)
+        // Find and record the physical name mappings for all referenced leaf columns.
+        // Delta column names are case-insensitive, so we match predicate references against
+        // schema field names using case-insensitive comparison.
+        let matched = self
+            .unresolved_references
+            .iter()
+            .find(|r| {
+                r.len() == self.logical_path.len()
+                    && r.iter()
+                        .zip(self.logical_path.iter())
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
             })
+            .copied();
+        matched.map(|predicate_col| {
+            self.unresolved_references.remove(predicate_col);
+            // Use the predicate's column name as key so ApplyColumnMappings can look it up
+            // by the exact name used in the predicate expression.
+            self.column_mappings
+                .insert(predicate_col.clone(), ColumnName::new(&self.physical_path));
+            Cow::Borrowed(ptype)
+        })
     }
 
     // array and map fields are not eligible for data skipping, so filter them out.
