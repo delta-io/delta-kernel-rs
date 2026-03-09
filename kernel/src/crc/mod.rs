@@ -18,6 +18,8 @@ mod writer;
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
 pub(crate) use file_stats::FileStats;
+#[allow(unused)]
+pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]
@@ -93,7 +95,7 @@ pub struct Crc {
     /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
     /// by definition).
     #[serde(skip)]
-    pub validity: FileStatsValidity,
+    pub file_stats_validity: FileStatsValidity,
 
     // ===== Optional fields =====
     /// A unique identifier for the transaction that produced this commit.
@@ -146,7 +148,7 @@ impl Crc {
     /// built from incremental replay that encountered a non-incremental operation or a
     /// missing file size.
     pub fn file_stats(&self) -> Option<FileStats> {
-        match self.validity {
+        match self.file_stats_validity {
             FileStatsValidity::Valid => Some(FileStats {
                 num_files: self.num_files,
                 table_size_bytes: self.table_size_bytes,

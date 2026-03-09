@@ -584,6 +584,7 @@ pub async fn insert_data<E: TaskExecutor>(
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
         .with_data_change(true);
 
     let write_context = txn.get_write_context();
