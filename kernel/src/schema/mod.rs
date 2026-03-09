@@ -15,6 +15,7 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::table_features::validate_field_column_mapping;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
@@ -434,41 +435,45 @@ impl StructField {
     /// If the `column_mapping_mode` is `Name`, then all Id mode column mapping metadata is
     /// removed.
     ///
-    /// NOTE: The caller must ensure that the schema has been validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`] to ensure that annotations are
-    /// present only when column mapping mode is enabled.
+    /// Returns an error if column mapping is enabled and a field is missing
+    /// annotations, or if a metadata column is encountered (metadata columns should not participate
+    /// in column mapping).
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
-    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
+    pub(crate) fn make_physical(
+        &self,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
         struct MakePhysical {
             column_mapping_mode: ColumnMappingMode,
+            err: Option<Error>,
         }
         impl<'a> SchemaTransform<'a> for MakePhysical {
             fn transform_struct_field(
                 &mut self,
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
+                if self.err.is_some() {
+                    return None;
+                }
+                if let Err(e) = validate_field_column_mapping(field, self.column_mapping_mode) {
+                    self.err = Some(e);
+                    return None;
+                }
+
                 let field = self.recurse_into_struct_field(field)?;
 
                 let metadata = field.logical_to_physical_metadata(self.column_mapping_mode);
                 let name = match self.column_mapping_mode {
                     ColumnMappingMode::None => field.name().to_owned(),
                     ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                        // Assert that the physical name is present
-                        match field.is_metadata_column() {
-                            true => {
-                                debug_assert!(
-                                    false,
-                                    "Metadata column should not have a physical name"
-                                );
-                            }
-                            false => {
-                                debug_assert!(field
-                                    .metadata
-                                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                                    .is_some_and(|x| matches!(x, MetadataValue::String(_))));
-                            }
+                        if field.is_metadata_column() {
+                            self.err = Some(Error::internal_error(format!(
+                                "Metadata column '{}' should not participate in logical to physical translation",
+                                field.name()
+                            )));
+                            return None;
                         }
                         field.physical_name(self.column_mapping_mode).to_owned()
                     }
@@ -483,14 +488,19 @@ impl StructField {
                 Some(Cow::Borrowed(stype))
             }
         }
-        // NOTE: unwrap is safe because the transformer is incapable of returning None
-        #[allow(clippy::unwrap_used)]
-        MakePhysical {
+        let mut transformer = MakePhysical {
             column_mapping_mode,
+            err: None,
+        };
+        let result = transformer.transform_struct_field(self);
+        match (transformer.err, result) {
+            (Some(err), _) => Err(err),
+            // Theoretically impossible: MakePhysical only returns None when it sets an error
+            (None, None) => Err(Error::internal_error(
+                "make_physical: transform returned None without setting an error",
+            )),
+            (None, Some(field)) => Ok(field.into_owned()),
         }
-        .transform_struct_field(self)
-        .unwrap()
-        .into_owned()
     }
 
     fn has_invariants(&self) -> bool {
@@ -502,7 +512,7 @@ impl StructField {
     /// based on the specified `column_mapping_mode`.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_column_mapping`], to ensure that annotations are
+    /// [`crate::table_features::validate_field_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
@@ -516,7 +526,7 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `validate_column_mapping` should have verified that this has a field Id
+                    // `validate_field_annotations` should have verified that this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -908,11 +918,15 @@ impl StructType {
     /// always and only present when column mapping mode is enabled.
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
-        let fields = self
+    pub(crate) fn make_physical(
+        &self,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        let fields: Vec<StructField> = self
             .fields()
-            .map(|field| field.make_physical(column_mapping_mode));
-        Self::new_unchecked(fields)
+            .map(|field| field.make_physical(column_mapping_mode))
+            .try_collect()?;
+        Ok(Self::new_unchecked(fields))
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -2227,23 +2241,22 @@ mod tests {
 
     #[test]
     fn test_make_physical_no_column_mapping() {
-        let data = example_schema_metadata();
-        let field: StructField = serde_json::from_str(data).unwrap();
-        let physical_field = field.make_physical(ColumnMappingMode::None);
+        let field = StructField::nullable(
+            "e",
+            ArrayType::new(
+                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]).into(),
+                true,
+            ),
+        );
+        let physical_field = field.make_physical(ColumnMappingMode::None).unwrap();
 
-        let assert_field_metadata_is_wiped = |field: &StructField| {
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                .is_none());
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-                .is_none());
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                .is_none());
-        };
         assert_eq!(physical_field.name, "e");
-        assert_field_metadata_is_wiped(&physical_field);
+        assert!(physical_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+            .is_none());
+        assert!(physical_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_none());
 
         let DataType::Array(atype) = physical_field.data_type else {
             panic!("Expected an Array");
@@ -2253,7 +2266,13 @@ mod tests {
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(struct_field.name, "d");
-        assert_field_metadata_is_wiped(struct_field);
+    }
+
+    #[test]
+    fn test_make_physical_rejects_annotated_fields_when_column_mapping_disabled() {
+        let data = example_schema_metadata();
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert!(field.make_physical(ColumnMappingMode::None).is_err());
     }
 
     #[test]
@@ -2277,7 +2296,7 @@ mod tests {
                     field.physical_name(mode),
                     "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
                 );
-                let physical_field = field.make_physical(mode);
+                let physical_field = field.make_physical(mode).unwrap();
 
                 // Parquet field id should only be present in id column mapping mode
                 match mode {
