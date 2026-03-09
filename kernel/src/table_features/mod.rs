@@ -10,9 +10,7 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
-#[cfg(feature = "internal-api")]
-pub use column_mapping::get_any_level_column_physical_name;
-#[cfg(not(feature = "internal-api"))]
+#[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 pub(crate) use column_mapping::validate_column_mapping;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
