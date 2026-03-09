@@ -21,7 +21,7 @@ use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::scan_transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 use delta_kernel_derive::internal_api;

@@ -4,7 +4,7 @@ use crate::schema::StructField;
 use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
 };
-use crate::transforms::FieldTransformSpec;
+use crate::scan_transforms::FieldTransformSpec;
 
 /// Trait for classifying fields during StateInfo construction.  Allows different scan types
 /// (regular, CDF) to customize field handling. Note that the default set of field handling occurs

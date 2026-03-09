@@ -337,7 +337,7 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::TableChanges;
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
-    use crate::transforms::FieldTransformSpec;
+    use crate::scan_transforms::FieldTransformSpec;
     use crate::Predicate;
 
     #[test]
