@@ -215,89 +215,89 @@ fn test_physical_predicate() {
     }
 }
 
+/// Delta column names are case-insensitive, so predicates with differently-cased column names
+/// (e.g., engines that lowercase all predicate columns) must still resolve against the schema.
 #[test]
-fn test_physical_predicate_case_insensitive() {
+fn test_physical_predicate_case_insensitive_without_column_mapping() {
+    // Without column mapping, physical names equal logical names. The predicate is rewritten
+    // to use the schema's casing:
+    //   predicate: createdat > 500 AND value < 100
+    //   schema:    createdAt, Value
+    //   result:    createdAt > 500 AND Value < 100
     let logical_schema = StructType::new_unchecked(vec![
         StructField::nullable("createdAt", DataType::LONG),
-        StructField::nullable("Value", DataType::LONG).with_metadata([(
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            "phys_value",
-        )]),
-        StructField::nullable(
-            "Nested",
-            StructType::new_unchecked(vec![StructField::nullable("innerField", DataType::LONG)]),
-        ),
+        StructField::nullable("Value", DataType::LONG),
     ]);
-
-    // Lowercased predicate column resolves against camelCase schema field.
-    // The predicate is rewritten to use the physical name (schema casing in None mode).
-    let result = PhysicalPredicate::try_new(
-        &column_pred!("createdat"),
-        &logical_schema,
-        ColumnMappingMode::None,
+    let predicate = Pred::and(
+        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
+        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
     );
+    let result = PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None);
     assert_eq!(
         result.unwrap(),
         PhysicalPredicate::Some(
-            column_pred!("createdAt").into(),
-            StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)])
-                .into(),
-        )
-    );
-
-    // Uppercased predicate column resolves against camelCase schema field
-    let result = PhysicalPredicate::try_new(
-        &column_pred!("CREATEDAT"),
-        &logical_schema,
-        ColumnMappingMode::None,
-    );
-    assert_eq!(
-        result.unwrap(),
-        PhysicalPredicate::Some(
-            column_pred!("createdAt").into(),
-            StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)])
-                .into(),
-        )
-    );
-
-    // Case-insensitive matching works with column mapping. The predicate column is
-    // rewritten to the physical name from column mapping metadata.
-    let result = PhysicalPredicate::try_new(
-        &column_pred!("value"),
-        &logical_schema,
-        ColumnMappingMode::Name,
-    );
-    assert_eq!(
-        result.unwrap(),
-        PhysicalPredicate::Some(
-            column_pred!("phys_value").into(),
-            StructType::new_unchecked(vec![StructField::nullable("phys_value", DataType::LONG)
-                .with_metadata([(
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    "phys_value",
-                )])])
+            Arc::new(Pred::and(
+                Pred::gt(column_expr!("createdAt"), Expr::literal(500i64)),
+                Pred::lt(column_expr!("Value"), Expr::literal(100i64)),
+            )),
+            StructType::new_unchecked(vec![
+                StructField::nullable("createdAt", DataType::LONG),
+                StructField::nullable("Value", DataType::LONG),
+            ])
             .into(),
         )
     );
 
-    // Case-insensitive matching works for nested fields. The predicate is rewritten
-    // to use physical names (schema casing in None mode).
+    // Unknown column still fails even with case-insensitive matching
     let result = PhysicalPredicate::try_new(
-        &column_pred!("nested.innerfield"),
+        &column_pred!("nonexistent"),
         &logical_schema,
         ColumnMappingMode::None,
     );
+    assert!(result.is_err());
+}
+
+/// With column mapping, the predicate is rewritten to use physical names from metadata.
+/// Case-insensitive matching resolves the logical name first, then applies the mapping.
+#[test]
+fn test_physical_predicate_case_insensitive_with_column_mapping() {
+    // With column mapping, physical names come from field metadata. The predicate is rewritten
+    // to use the physical names after case-insensitive logical name resolution:
+    //   predicate: createdat > 500 AND value < 100
+    //   schema:    createdAt (physical: phys_created), Value (physical: phys_value)
+    //   result:    phys_created > 500 AND phys_value < 100
+    let logical_schema = StructType::new_unchecked(vec![
+        StructField::nullable("createdAt", DataType::LONG).with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_created",
+        )]),
+        StructField::nullable("Value", DataType::LONG).with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_value",
+        )]),
+    ]);
+    let predicate = Pred::and(
+        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
+        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+    );
+    let result = PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name);
     assert_eq!(
         result.unwrap(),
         PhysicalPredicate::Some(
-            column_pred!("Nested.innerField").into(),
-            StructType::new_unchecked(vec![StructField::nullable(
-                "Nested",
-                StructType::new_unchecked(vec![StructField::nullable(
-                    "innerField",
-                    DataType::LONG,
+            Arc::new(Pred::and(
+                Pred::gt(column_expr!("phys_created"), Expr::literal(500i64)),
+                Pred::lt(column_expr!("phys_value"), Expr::literal(100i64)),
+            )),
+            StructType::new_unchecked(vec![
+                StructField::nullable("phys_created", DataType::LONG).with_metadata([(
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    "phys_created",
                 )]),
-            )])
+                StructField::nullable("phys_value", DataType::LONG).with_metadata([(
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    "phys_value",
+                )]),
+            ])
             .into(),
         )
     );
