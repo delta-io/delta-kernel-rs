@@ -110,8 +110,11 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
 
     // ===== THEN =====
-    assert_eq!(crc.table_size_bytes, 5259);
-    assert_eq!(crc.num_files, 10);
+    let file_stats = crc
+        .file_stats()
+        .expect("CRC from disk should have valid file stats");
+    assert_eq!(file_stats.table_size_bytes, 5259);
+    assert_eq!(file_stats.num_files, 10);
     assert_eq!(crc.num_metadata, 1);
     assert_eq!(crc.num_protocol, 1);
 
