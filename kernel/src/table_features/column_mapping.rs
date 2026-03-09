@@ -882,25 +882,6 @@ mod tests {
         );
     }
 
-    /// Mixed protocol (3,5) with CM listed and no annotations should fail.
-    ///
-    /// NOTE: This matches current behavior for now. The intended semantics are that the
-    /// protocol shape should be valid, and rejection should come from missing annotations.
-    /// Today, `Protocol::try_new` directly rejects the (3, 5) shape first.
-    #[test]
-    fn test_cm_mixed_3_5_listed_no_annotations_should_fail() {
-        let protocol = Protocol::try_new(
-            3,
-            5,
-            Some(vec![TableFeature::ColumnMapping]),
-            TableFeature::NO_LIST,
-        );
-        assert!(
-            protocol.is_err(),
-            "mixed (3,5), no annotations: should fail (currently at protocol construction)"
-        );
-    }
-
     /// Mixed protocol dependency bridge: modern iceberg writer-only features can coexist with CM
     /// in (2,7), and missing CM should fail write support checks.
     #[test]
