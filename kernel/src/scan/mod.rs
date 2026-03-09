@@ -281,7 +281,7 @@ impl PhysicalPredicate {
             .iter()
             .map(|r| {
                 let folded: Vec<String> = r.iter().map(|s| s.to_ascii_lowercase()).collect();
-                (lowered, *r)
+                (folded, *r)
             })
             .collect();
         let mut get_referenced_fields = GetReferencedFields {
