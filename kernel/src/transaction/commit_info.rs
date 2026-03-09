@@ -15,7 +15,7 @@ fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
     let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
-    Ok(vec![
+    let literal_exprs = vec![
         (
             "timestamp",
             Arc::new(Expression::literal(commit_info.timestamp)),
@@ -54,7 +54,13 @@ fn commit_info_literal_exprs(
             Arc::new(Expression::literal(commit_info.engine_info)),
         ),
         ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
-    ])
+    ];
+    let expected_expr_len = CommitInfo::to_schema().fields().len();
+    if literal_exprs.len() != expected_expr_len {
+        Error::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. 
+            If CommitInfo field was added/removed, please update Expression::Literal in this function.", literal_exprs.len()));
+    }
+    Ok(literal_exprs)
 }
 
 impl<S> Transaction<S> {

@@ -449,8 +449,17 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Set the commit info field of this transaction's commit info action. This field is optional.
-    /// The engine's commit info will be overrided by the kernel commit info.
+    /// Set the content of the commitInfo action for this transaction. Note that kernel will _always_ write a commitInfo,
+    /// this function simply allows engines to add their own data into that action if they wish.
+    /// Note that the following fields in [`crate::actions::CommitInfo`] will be overridden by kernel if they are set (meaning you should not set them):
+    /// - timestamp
+    /// - inCommitTimestamp
+    /// - operation
+    /// - operationParameters
+    /// - kernelVersion
+    /// - isBlindAppend
+    /// - engineInfo
+    /// - txnId
     pub fn with_commit_info(
         mut self,
         engine_commit_info: Box<dyn EngineData>,
