@@ -108,7 +108,6 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
-pub(crate) mod transforms;
 
 pub use log_path::LogPath;
 
