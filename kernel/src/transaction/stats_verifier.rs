@@ -248,7 +248,6 @@ mod tests {
 
     use rstest::rstest;
 
-
     use crate::arrow::array::{
         Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
         StructArray,

@@ -103,9 +103,10 @@ impl From<Box<dyn EngineData>> for FilteredEngineData {
     }
 }
 
-/// Provides uniform read access to string values by index. Engines implement this for their
-/// string array types, enabling [`ListItem`] and [`MapItem`] to access elements via virtual
-/// dispatch instead of repeated type checking on every access.
+/// Uniform read access to a string array, abstracting over the various string representations
+/// that list and map columns may use (e.g. Utf8, LargeUtf8, Utf8View). Engines implement this
+/// for their string array types so that [`ListItem`] and [`MapItem`] can resolve the concrete
+/// type once at construction and access elements via virtual dispatch thereafter.
 pub trait StringArrayAccessor {
     /// Returns the number of elements in the array.
     fn len(&self) -> usize;
@@ -140,7 +141,17 @@ impl<'a> ListItem<'a> {
         self.offsets.is_empty()
     }
 
+    /// Returns the string at `list_index` within this list entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `list_index >= self.len()`.
     pub fn get(&self, list_index: usize) -> String {
+        assert!(
+            list_index < self.len(),
+            "list index {list_index} out of bounds for list of length {}",
+            self.len()
+        );
         self.values
             .value(self.offsets.start + list_index)
             .to_string()
@@ -183,11 +194,12 @@ impl<'a> MapItem<'a> {
     }
 
     pub fn get(&self, key: &str) -> Option<&'a str> {
-        self.offsets
+        let idx = self
+            .offsets
             .clone()
             .rev()
-            .find(|&idx| self.keys.value(idx) == key)
-            .and_then(|idx| self.values.is_valid(idx).then(|| self.values.value(idx)))
+            .find(|&idx| self.keys.value(idx) == key)?;
+        self.values.is_valid(idx).then(|| self.values.value(idx))
     }
 
     pub fn materialize(&self) -> HashMap<String, String> {

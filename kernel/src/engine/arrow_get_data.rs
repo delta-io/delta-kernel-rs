@@ -131,46 +131,45 @@ impl<O: OffsetSizeTrait> ListLikeArray for GenericListViewArray<O> {
 fn get_list_item<'a>(
     list: &'a impl ListLikeArray,
     row_index: usize,
+    field_name: &str,
 ) -> DeltaResult<Option<ListItem<'a>>> {
     if !list.is_valid(row_index) {
         return Ok(None);
     }
     let values = as_string_accessor(list.list_values()).ok_or_else(|| {
-        Error::unexpected_column_type("list values are not a supported string type")
+        Error::unexpected_column_type(format!(
+            "{field_name}: list values are not a supported string type"
+        ))
     })?;
     Ok(Some(ListItem::new(values, list.row_offsets(row_index))))
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListArray<OffsetSize> {
-    fn get_list(
-        &'a self,
-        row_index: usize,
-        _field_name: &str,
-    ) -> DeltaResult<Option<ListItem<'a>>> {
-        get_list_item(self, row_index)
+    fn get_list(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<ListItem<'a>>> {
+        get_list_item(self, row_index, field_name)
     }
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListViewArray<OffsetSize> {
-    fn get_list(
-        &'a self,
-        row_index: usize,
-        _field_name: &str,
-    ) -> DeltaResult<Option<ListItem<'a>>> {
-        get_list_item(self, row_index)
+    fn get_list(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<ListItem<'a>>> {
+        get_list_item(self, row_index, field_name)
     }
 }
 
 impl<'a> GetData<'a> for MapArray {
-    fn get_map(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<MapItem<'a>>> {
+    fn get_map(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<MapItem<'a>>> {
         if !self.is_valid(row_index) {
             return Ok(None);
         }
         let keys = as_string_accessor(self.keys().as_ref()).ok_or_else(|| {
-            Error::unexpected_column_type("map keys are not a supported string type")
+            Error::unexpected_column_type(format!(
+                "{field_name}: map keys are not a supported string type"
+            ))
         })?;
         let values = as_string_accessor(self.values().as_ref()).ok_or_else(|| {
-            Error::unexpected_column_type("map values are not a supported string type")
+            Error::unexpected_column_type(format!(
+                "{field_name}: map values are not a supported string type"
+            ))
         })?;
         let start = self.offsets()[row_index] as usize;
         let end = self.offsets()[row_index + 1] as usize;

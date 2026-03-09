@@ -153,7 +153,7 @@ pub(crate) fn as_string_accessor(array: &dyn Array) -> Option<&dyn StringArrayAc
     } else if let Some(a) = array.as_string_opt::<i64>() {
         Some(a)
     } else {
-        array.as_string_view_opt().map(|a| a as _)
+        Some(array.as_string_view_opt()?)
     }
 }
 
