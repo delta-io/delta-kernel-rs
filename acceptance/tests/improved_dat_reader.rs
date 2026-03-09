@@ -8,7 +8,7 @@ use std::path::Path;
 use acceptance::improved_dat::{
     test_case_from_spec_path,
     types::WorkloadSpec,
-    validation::{validate_read_result, validate_snapshot_metadata},
+    validation::{validate_read_result, validate_snapshot_from_inline, validate_snapshot_metadata},
     workload::{execute_workload, WorkloadResult},
 };
 
@@ -91,7 +91,6 @@ fn unsupported_workload_reason(spec: &WorkloadSpec) -> Option<&'static str> {
         WorkloadSpec::DomainMetadata { .. } => {
             Some("DomainMetadata workloads not supported in this build")
         }
-        WorkloadSpec::Cdf { .. } => Some("CDF workloads not supported in this build"),
         _ => None,
     }
 }
@@ -275,19 +274,42 @@ fn improved_dat_test(spec_path: &Path) -> datatest_stable::Result<()> {
                 .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", workload_name, e));
 
             // Validate results
+            let has_predicate = spec.has_predicate();
             match result {
                 WorkloadResult::Read(read_result) => {
-                    if expected_dir.exists() {
-                        let batch = read_result.concat().expect("Failed to concat batches");
-                        validate_read_result(batch, &expected_dir)
+                    let inline_expected = match &spec {
+                        WorkloadSpec::Read { expected: Some(ref e), .. } => Some(e),
+                        _ => None,
+                    };
+                    let batch = read_result.concat().expect("Failed to concat batches");
+                    if expected_dir.exists() || inline_expected.is_some() {
+                        validate_read_result(batch, &expected_dir, has_predicate, inline_expected)
                             .await
                             .unwrap_or_else(|e| {
                                 panic!("Validation failed for workload '{}': {}", workload_name, e)
                             });
+                    } else {
+                        println!(
+                            "  No expected data for '{}' ({} rows returned, not validated)",
+                            workload_name,
+                            batch.num_rows()
+                        );
                     }
                 }
                 WorkloadResult::Snapshot(snapshot_result) => {
-                    if expected_dir.exists() {
+                    let inline_expected = match &spec {
+                        WorkloadSpec::Snapshot { expected: Some(ref e), .. } => Some(e),
+                        _ => None,
+                    };
+                    if let Some(inline) = inline_expected {
+                        validate_snapshot_from_inline(&snapshot_result, inline)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Metadata validation failed for workload '{}': {}",
+                                    workload_name, e
+                                )
+                            });
+                    } else if expected_dir.exists() {
                         validate_snapshot_metadata(&snapshot_result, &expected_dir).unwrap_or_else(
                             |e| {
                                 panic!(
@@ -295,6 +317,11 @@ fn improved_dat_test(spec_path: &Path) -> datatest_stable::Result<()> {
                                     workload_name, e
                                 )
                             },
+                        );
+                    } else {
+                        println!(
+                            "  No expected metadata for '{}' (snapshot not validated)",
+                            workload_name
                         );
                     }
                 }

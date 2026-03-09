@@ -15,7 +15,7 @@ use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
-use super::types::{ExpectedMetadata, ExpectedProtocol, ExpectedSummary};
+use super::types::{ExpectedMetadata, ExpectedProtocol, ExpectedSummary, ReadExpected, SnapshotExpected};
 use super::workload::SnapshotResult;
 
 /// Validation error
@@ -459,6 +459,8 @@ pub fn read_expected_metadata(
 pub async fn validate_read_result(
     actual: RecordBatch,
     expected_dir: &Path,
+    _has_predicate: bool,
+    inline_expected: Option<&ReadExpected>,
 ) -> Result<(), ValidationError> {
     // Get actual row count before we potentially move the batch
     let actual_row_count = actual.num_rows() as u64;
@@ -535,16 +537,126 @@ pub async fn validate_read_result(
         }
     }
 
-    // Also validate against summary.json if present
-    // Use actual_row_count from summary (what Spark returned) rather than
-    // expected_row_count (theoretical count) — both kernel and Spark may apply
-    // data skipping, so we validate kernel matches Spark's behavior.
-    if let Some(summary) = read_expected_summary(expected_dir)? {
-        if actual_row_count != summary.actual_row_count {
+    // Validate row count: inline expected takes priority over summary.json
+    let expected_row_count = inline_expected
+        .map(|e| Some(e.row_count))
+        .unwrap_or_else(|| {
+            read_expected_summary(expected_dir)
+                .ok()
+                .flatten()
+                .map(|s| s.actual_row_count)
+        });
+
+    if let Some(expected) = expected_row_count {
+        if actual_row_count != expected {
             return Err(ValidationError::RowCountMismatch {
-                expected: summary.actual_row_count,
+                expected,
                 actual: actual_row_count,
             });
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate protocol against expected values
+pub fn validate_protocol(
+    result: &SnapshotResult,
+    expected_protocol: &ExpectedProtocol,
+) -> Result<(), ValidationError> {
+    if result.min_reader_version != expected_protocol.min_reader_version {
+        return Err(ValidationError::ProtocolMismatch {
+            message: format!(
+                "minReaderVersion mismatch: expected {}, got {}",
+                expected_protocol.min_reader_version, result.min_reader_version
+            ),
+        });
+    }
+    if result.min_writer_version != expected_protocol.min_writer_version {
+        return Err(ValidationError::ProtocolMismatch {
+            message: format!(
+                "minWriterVersion mismatch: expected {}, got {}",
+                expected_protocol.min_writer_version, result.min_writer_version
+            ),
+        });
+    }
+
+    // Check reader features if present
+    if let Some(expected_features) = &expected_protocol.reader_features {
+        let actual_set: std::collections::HashSet<_> = result.reader_features.iter().collect();
+        let expected_set: std::collections::HashSet<_> = expected_features.iter().collect();
+        if actual_set != expected_set {
+            return Err(ValidationError::ProtocolMismatch {
+                message: format!(
+                    "readerFeatures mismatch: expected {:?}, got {:?}",
+                    expected_features, result.reader_features
+                ),
+            });
+        }
+    }
+
+    // Check writer features if present
+    if let Some(expected_features) = &expected_protocol.writer_features {
+        let actual_set: std::collections::HashSet<_> = result.writer_features.iter().collect();
+        let expected_set: std::collections::HashSet<_> = expected_features.iter().collect();
+        if actual_set != expected_set {
+            return Err(ValidationError::ProtocolMismatch {
+                message: format!(
+                    "writerFeatures mismatch: expected {:?}, got {:?}",
+                    expected_features, result.writer_features
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate metadata against expected values
+pub fn validate_metadata(
+    result: &SnapshotResult,
+    expected_metadata: &ExpectedMetadata,
+) -> Result<(), ValidationError> {
+    // Check table ID
+    if result.table_id != expected_metadata.id {
+        return Err(ValidationError::MetadataMismatch {
+            message: format!(
+                "Table ID mismatch: expected {}, got {}",
+                expected_metadata.id, result.table_id
+            ),
+        });
+    }
+
+    // Check partition columns
+    if result.partition_columns != expected_metadata.partition_columns {
+        return Err(ValidationError::MetadataMismatch {
+            message: format!(
+                "Partition columns mismatch: expected {:?}, got {:?}",
+                expected_metadata.partition_columns, result.partition_columns
+            ),
+        });
+    }
+
+    // Check configuration (bidirectional: expected subset actual AND actual subset expected)
+    for (key, expected_value) in &expected_metadata.configuration {
+        match result.configuration.get(key) {
+            Some(actual_value) if actual_value == expected_value => {}
+            Some(actual_value) => {
+                return Err(ValidationError::MetadataMismatch {
+                    message: format!(
+                        "Configuration '{}' mismatch: expected '{}', got '{}'",
+                        key, expected_value, actual_value
+                    ),
+                });
+            }
+            None => {
+                return Err(ValidationError::MetadataMismatch {
+                    message: format!(
+                        "Configuration '{}' missing: expected '{}'",
+                        key, expected_value
+                    ),
+                });
+            }
         }
     }
 
@@ -556,99 +668,25 @@ pub fn validate_snapshot_metadata(
     result: &SnapshotResult,
     expected_dir: &Path,
 ) -> Result<(), ValidationError> {
-    // Validate protocol
     if let Some(expected_protocol) = read_expected_protocol(expected_dir)? {
-        if result.min_reader_version != expected_protocol.min_reader_version {
-            return Err(ValidationError::ProtocolMismatch {
-                message: format!(
-                    "minReaderVersion mismatch: expected {}, got {}",
-                    expected_protocol.min_reader_version, result.min_reader_version
-                ),
-            });
-        }
-        if result.min_writer_version != expected_protocol.min_writer_version {
-            return Err(ValidationError::ProtocolMismatch {
-                message: format!(
-                    "minWriterVersion mismatch: expected {}, got {}",
-                    expected_protocol.min_writer_version, result.min_writer_version
-                ),
-            });
-        }
-
-        // Check reader features if present
-        if let Some(expected_features) = &expected_protocol.reader_features {
-            let actual_set: std::collections::HashSet<_> = result.reader_features.iter().collect();
-            let expected_set: std::collections::HashSet<_> = expected_features.iter().collect();
-            if actual_set != expected_set {
-                return Err(ValidationError::ProtocolMismatch {
-                    message: format!(
-                        "readerFeatures mismatch: expected {:?}, got {:?}",
-                        expected_features, result.reader_features
-                    ),
-                });
-            }
-        }
-
-        // Check writer features if present
-        if let Some(expected_features) = &expected_protocol.writer_features {
-            let actual_set: std::collections::HashSet<_> = result.writer_features.iter().collect();
-            let expected_set: std::collections::HashSet<_> = expected_features.iter().collect();
-            if actual_set != expected_set {
-                return Err(ValidationError::ProtocolMismatch {
-                    message: format!(
-                        "writerFeatures mismatch: expected {:?}, got {:?}",
-                        expected_features, result.writer_features
-                    ),
-                });
-            }
-        }
+        validate_protocol(result, &expected_protocol)?;
     }
-
-    // Validate metadata
     if let Some(expected_metadata) = read_expected_metadata(expected_dir)? {
-        // Check table ID
-        if result.table_id != expected_metadata.id {
-            return Err(ValidationError::MetadataMismatch {
-                message: format!(
-                    "Table ID mismatch: expected {}, got {}",
-                    expected_metadata.id, result.table_id
-                ),
-            });
-        }
-
-        // Check partition columns
-        if result.partition_columns != expected_metadata.partition_columns {
-            return Err(ValidationError::MetadataMismatch {
-                message: format!(
-                    "Partition columns mismatch: expected {:?}, got {:?}",
-                    expected_metadata.partition_columns, result.partition_columns
-                ),
-            });
-        }
-
-        // Check configuration (bidirectional: expected ⊆ actual AND actual ⊆ expected)
-        for (key, expected_value) in &expected_metadata.configuration {
-            match result.configuration.get(key) {
-                Some(actual_value) if actual_value == expected_value => {}
-                Some(actual_value) => {
-                    return Err(ValidationError::MetadataMismatch {
-                        message: format!(
-                            "Configuration '{}' mismatch: expected '{}', got '{}'",
-                            key, expected_value, actual_value
-                        ),
-                    });
-                }
-                None => {
-                    return Err(ValidationError::MetadataMismatch {
-                        message: format!(
-                            "Configuration '{}' missing: expected '{}'",
-                            key, expected_value
-                        ),
-                    });
-                }
-            }
-        }
+        validate_metadata(result, &expected_metadata)?;
     }
+    Ok(())
+}
 
+/// Validate snapshot metadata against inline expected values from the spec.
+pub fn validate_snapshot_from_inline(
+    result: &SnapshotResult,
+    expected: &SnapshotExpected,
+) -> Result<(), ValidationError> {
+    if let Some(ref protocol) = expected.protocol {
+        validate_protocol(result, protocol)?;
+    }
+    if let Some(ref metadata) = expected.metadata {
+        validate_metadata(result, metadata)?;
+    }
     Ok(())
 }

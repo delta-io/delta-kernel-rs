@@ -103,6 +103,9 @@ pub enum WorkloadSpec {
         /// Benchmarking: operation sub-type (e.g. "read_metadata", "read_data")
         #[serde(default)]
         operation_type: Option<String>,
+        /// Inline expected values (row_count, file_count, files_skipped)
+        #[serde(default, skip_serializing)]
+        expected: Option<ReadExpected>,
     },
     /// Snapshot workload — construct a snapshot and validate metadata.
     /// Also accepts `"type": "snapshot_construction"` from benchmarking specs.
@@ -116,6 +119,9 @@ pub enum WorkloadSpec {
         name: Option<String>,
         #[serde(default)]
         error: Option<ExpectedError>,
+        /// Inline expected protocol + metadata
+        #[serde(default, skip_serializing)]
+        expected: Option<SnapshotExpected>,
     },
     /// Transaction workload — validate SetTransaction
     Txn {
@@ -139,9 +145,9 @@ pub enum WorkloadSpec {
     },
     /// CDF (Change Data Feed) workload — read table changes
     Cdf {
-        #[serde(rename = "startVersion")]
-        start_version: i64,
-        #[serde(rename = "endVersion", default)]
+        #[serde(alias = "startVersion", alias = "start_version", default)]
+        start_version: Option<i64>,
+        #[serde(alias = "endVersion", alias = "end_version", default)]
         end_version: Option<i64>,
         #[serde(default)]
         predicate: Option<String>,
@@ -165,18 +171,26 @@ impl WorkloadSpec {
             Self::Txn { .. } | Self::DomainMetadata { .. } => None,
         }
     }
+
+    /// Whether this workload has a predicate filter
+    pub fn has_predicate(&self) -> bool {
+        match self {
+            Self::Read { predicate, .. } => predicate.is_some(),
+            _ => false,
+        }
+    }
 }
 
 // ── Expected-value types (correctness testing) ──────────────────────────────
 
 /// Expected error specification
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ExpectedError {
     /// Error code (e.g. "DELTA_CDC_NOT_ALLOWED_ON_NON_CDC_TABLE")
+    #[serde(alias = "errorCode", alias = "error_code")]
     pub error_code: String,
     /// Optional error message pattern
-    #[serde(default)]
+    #[serde(alias = "errorMessage", alias = "error_message", default)]
     pub error_message: Option<String>,
 }
 
@@ -213,6 +227,27 @@ pub struct ExpectedSummary {
     pub matches_expected: Option<bool>,
 }
 
+// ── Inline expected values (self-contained in spec JSON) ────────────────────
+
+/// Inline expected values for read specs
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReadExpected {
+    pub row_count: u64,
+    #[serde(default)]
+    pub file_count: Option<u64>,
+    #[serde(default)]
+    pub files_skipped: Option<u64>,
+}
+
+/// Inline expected values for snapshot specs
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotExpected {
+    #[serde(default)]
+    pub protocol: Option<ExpectedProtocol>,
+    #[serde(default)]
+    pub metadata: Option<ExpectedMetadata>,
+}
+
 // ── Snapshot validation types ───────────────────────────────────────────────
 
 /// Wrapper for `protocol.json`
@@ -222,7 +257,7 @@ pub struct ProtocolWrapper {
 }
 
 /// Expected protocol definition
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpectedProtocol {
     pub min_reader_version: i32,
@@ -241,7 +276,7 @@ pub struct MetadataWrapper {
 }
 
 /// Format specification within metadata
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MetadataFormat {
     pub provider: String,
     #[serde(default)]
@@ -249,12 +284,13 @@ pub struct MetadataFormat {
 }
 
 /// Expected metadata definition
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpectedMetadata {
     pub id: String,
     pub format: MetadataFormat,
-    pub schema_string: String,
+    #[serde(default)]
+    pub schema_string: Option<String>,
     #[serde(default)]
     pub partition_columns: Vec<String>,
     #[serde(default)]

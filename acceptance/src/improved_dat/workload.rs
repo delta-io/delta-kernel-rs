@@ -9,6 +9,7 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
 use itertools::Itertools;
 use url::Url;
@@ -170,6 +171,21 @@ pub fn execute_workload(
                 execute_snapshot_workload(engine, table_root, *version, timestamp.as_deref())?;
             Ok(WorkloadResult::Snapshot(result))
         }
+        WorkloadSpec::Cdf {
+            start_version,
+            end_version,
+            predicate,
+            ..
+        } => {
+            let result = execute_cdf_workload(
+                engine,
+                table_root,
+                start_version.unwrap_or(0) as Version,
+                end_version.map(|v| v as Version),
+                predicate.as_deref(),
+            )?;
+            Ok(WorkloadResult::Read(result))
+        }
         _ => Err(Error::generic(
             "Unsupported workload type in this harness build",
         )),
@@ -227,6 +243,45 @@ pub fn execute_read_workload(
     let arrow_schema =
         delta_kernel::arrow::datatypes::Schema::try_from_kernel(scan.logical_schema().as_ref())
             .map_err(|e| Error::generic(format!("Failed to convert schema: {}", e)))?;
+    let schema = Arc::new(arrow_schema);
+
+    // Execute scan
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine)?
+        .map(|data| -> DeltaResult<_> {
+            let record_batch = data?.try_into_record_batch()?;
+            Ok(record_batch)
+        })
+        .try_collect()?;
+
+    Ok(ReadResult {
+        batches,
+        schema: Some(schema),
+    })
+}
+
+/// Execute a CDF (Change Data Feed) workload using kernel's TableChanges API.
+pub fn execute_cdf_workload(
+    engine: Arc<dyn Engine>,
+    table_root: &Url,
+    start_version: Version,
+    end_version: Option<Version>,
+    predicate: Option<&str>,
+) -> DeltaResult<ReadResult> {
+    if predicate.is_some() {
+        return Err(Error::generic("CDF predicates not supported in this build"));
+    }
+
+    let table_changes =
+        TableChanges::try_new(table_root.clone(), engine.as_ref(), start_version, end_version)?;
+
+    let scan = table_changes.into_scan_builder().build()?;
+
+    // Get schema from scan
+    use delta_kernel::engine::arrow_conversion::TryFromKernel;
+    let arrow_schema =
+        delta_kernel::arrow::datatypes::Schema::try_from_kernel(scan.logical_schema().as_ref())
+            .map_err(|e| Error::generic(format!("Failed to convert CDF schema: {}", e)))?;
     let schema = Arc::new(arrow_schema);
 
     // Execute scan
