@@ -1058,10 +1058,7 @@ fn test_clustered_table() {
         // Protocol-only, no metadata footprint.
         prop_cases: &[],
         expected_orphan: OpExpect::Ok,
-        #[cfg(feature = "clustered-table")]
         capability: ALL_SUPPORTED,
-        #[cfg(not(feature = "clustered-table"))]
-        capability: READS_ONLY,
     });
 }
 
