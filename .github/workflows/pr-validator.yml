@@ -1,0 +1,34 @@
+name: Validate PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+jobs:
+  validate-title:
+    runs-on: ubuntu-latest
+    outputs:
+      regex: ${{ steps.check.outputs.regex }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        uses: ./.github/actions/pr-title-validator
+        with:
+          regex: '^(feat|fix|chore|docs|refactor|test|ci)(\(.+\))?: .{1,72}$'
+
+  comment-on-failure:
+    runs-on: ubuntu-latest
+    needs: validate-title
+    if: ${{ failure() }}
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            PR title does not match the required pattern.
+
+            **Title:** `${{ github.event.pull_request.title }}`
+            **Pattern:** `${{ needs.validate-title.outputs.regex }}`

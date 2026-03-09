@@ -1,0 +1,28 @@
+name: 'PR Title Validator'
+description: 'Validates a pull request title against a regex pattern'
+
+inputs:
+  regex:
+    description: 'regex that the title must match'
+    required: true
+
+outputs:
+  regex:
+    description: 'pass through regex for error messages'
+    value: ${{ inputs.regex }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate PR title
+      shell: bash
+      env:
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        INPUT_REGEX: ${{ inputs.regex }}
+      run: |
+        if [[ "$PR_TITLE" =~ $INPUT_REGEX ]]; then
+          echo "PR title matches pattern."
+          exit 0
+        fi
+        echo "::error::PR title \"$PR_TITLE\" does not match pattern: $INPUT_REGEX"
+        exit 1
