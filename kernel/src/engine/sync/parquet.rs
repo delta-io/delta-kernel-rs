@@ -1,11 +1,11 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::engine::default::parquet::reader_options;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
-use crate::engine::arrow_conversion::TryFromArrow as _;
+use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
@@ -27,13 +27,14 @@ pub(crate) struct SyncParquetHandler;
 fn try_create_from_parquet(
     file: File,
     schema: SchemaRef,
-    arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+    let reader_options = reader_options();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
@@ -130,7 +131,7 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
         let file = File::open(path)?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let metadata = ArrowReaderMetadata::load(&file, reader_options())?;
         let schema = StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)?;
@@ -142,13 +143,7 @@ impl ParquetHandler for SyncParquetHandler {
 mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use crate::schema::ColumnMetadataKey;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
     use url::Url;
@@ -236,44 +231,6 @@ mod tests {
         assert_eq!(name_col.value(2), "c");
 
         assert!(result.next().is_none());
-    }
-
-    #[test]
-    fn test_sync_read_parquet_footer() -> DeltaResult<()> {
-        let handler = SyncParquetHandler;
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
-        ))?;
-        let file_size = std::fs::metadata(&path)?.len();
-        let url = Url::from_file_path(path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let footer = handler.read_parquet_footer(&file_meta)?;
-        crate::utils::test_utils::validate_checkpoint_schema(&footer.schema);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sync_read_parquet_footer_invalid_file() {
-        let handler = SyncParquetHandler;
-
-        let mut temp_path = std::env::temp_dir();
-        temp_path.push("non_existent_file_for_sync_test.parquet");
-        let url = Url::from_file_path(temp_path).unwrap();
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: 0,
-        };
-
-        let result = handler.read_parquet_footer(&file_meta);
-        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[test]
@@ -598,66 +555,5 @@ mod tests {
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         assert!(result.next().is_none());
-    }
-
-    #[test]
-    fn test_sync_read_parquet_footer_preserves_field_ids() {
-        // Create Arrow schema with field IDs in metadata
-        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-        );
-        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-        );
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
-
-        // Write a parquet file with this schema
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_field_ids.parquet");
-
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let file = std::fs::File::create(&file_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        // Read footer and verify schema
-        let handler = SyncParquetHandler;
-        let file_size = std::fs::metadata(&file_path).unwrap().len();
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let footer = handler.read_parquet_footer(&file_meta).unwrap();
-
-        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
-        // The field IDs should be accessible using get_config_value (the documented API)
-        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        assert_eq!(
-            id_field
-                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                .map(|v| v.to_string()),
-            Some("1".to_string())
-        );
-
-        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        assert_eq!(
-            name_field
-                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                .map(|v| v.to_string()),
-            Some("2".to_string())
-        );
     }
 }

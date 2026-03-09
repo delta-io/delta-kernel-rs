@@ -243,6 +243,12 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       printf("Column(%s)\n", column_name);
       break;
     }
+    case MapToStruct: {
+      struct MapToStructExpr* m2s = ref.ref;
+      printf("MapToStruct\n");
+      print_expression_item_list(m2s->child_expr, depth + 1);
+      break;
+    }
   }
 }
 
