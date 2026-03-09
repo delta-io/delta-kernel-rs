@@ -115,10 +115,6 @@ catalog-managed = []
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# WARNING: experimental feature, still under active development
-# enables write support for clustered tables
-clustered-table = []
-
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
 default-engine-base = [
@@ -140,7 +136,7 @@ default-engine-rustls = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "default-engine-rustls", "internal-api"] }
+delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "default-engine-rustls", "internal-api", "test-utils"] }
 test_utils = { path = "../test-utils" }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility

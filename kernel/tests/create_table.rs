@@ -4,6 +4,8 @@
 mod clustering;
 #[path = "create_table/column_mapping.rs"]
 mod column_mapping;
+#[path = "create_table/ctas.rs"]
+mod ctas;
 #[path = "create_table/variant.rs"]
 mod variant;
 

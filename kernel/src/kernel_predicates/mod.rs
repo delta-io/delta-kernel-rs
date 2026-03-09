@@ -177,7 +177,7 @@ pub trait KernelPredicateEvaluator {
             Expr::Opaque(OpaqueExpression { op, exprs }) => {
                 self.eval_pred_expr_opaque(op, exprs, inverted)
             }
-            Expr::Struct(_)
+            Expr::Struct(..)
             | Expr::Transform(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
@@ -205,7 +205,7 @@ pub trait KernelPredicateEvaluator {
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
                 Expr::Predicate(_)
-                | Expr::Struct(_)
+                | Expr::Struct(..)
                 | Expr::Transform(_)
                 | Expr::Unary(_)
                 | Expr::Binary(_)
@@ -626,7 +626,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
             Expr::Literal(value) => Some(value.clone()),
             Expr::Column(name) => self.resolve_column(name),
             Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
-            Expr::Struct(_) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?
+            Expr::Struct(..) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?
             Expr::Binary(BinaryExpression { op, left, right }) => {
                 let op_fn = match op {
                     BinaryExpressionOp::Plus => Scalar::try_add,
