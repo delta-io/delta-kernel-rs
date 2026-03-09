@@ -644,6 +644,31 @@ pub(crate) mod test_utils {
         ]))
     }
 
+    /// Deeply nested schema: struct -> array -> struct -> map(value) -> struct.
+    ///
+    /// The leaf struct field is intentionally **not** annotated with column mapping metadata,
+    /// so this schema can be used to test error paths when column mapping is enabled.
+    pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
+        let leaf_struct =
+            StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
+        let map_type = MapType::new(
+            KernelDataType::STRING,
+            KernelDataType::Struct(Box::new(leaf_struct)),
+            true,
+        );
+        let mid_struct = StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("mid_field", map_type),
+            2,
+            "phys_mid_field",
+        )]);
+        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
+        StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("top", array_type),
+            1,
+            "phys_top",
+        )])
+    }
+
     /// Build a create-table transaction with the given schema and column mapping mode.
     /// Returns the engine and uncommitted transaction.
     pub(crate) fn setup_column_mapping_txn(

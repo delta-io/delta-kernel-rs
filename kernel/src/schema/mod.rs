@@ -15,7 +15,7 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::validate_field_column_mapping;
+use crate::table_features::get_field_column_mapping_info;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
@@ -441,11 +441,36 @@ impl StructField {
         &self,
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
-        struct MakePhysical {
+        struct MakePhysical<'a> {
             column_mapping_mode: ColumnMappingMode,
+            path: Vec<&'a str>,
             err: Option<Error>,
         }
-        impl<'a> SchemaTransform<'a> for MakePhysical {
+        impl<'a> MakePhysical<'a> {
+            fn transform_inner_type(
+                &mut self,
+                data_type: &'a DataType,
+                name: &'a str,
+            ) -> Option<Cow<'a, DataType>> {
+                self.path.push(name);
+                let result = self.transform(data_type);
+                self.path.pop();
+                result
+            }
+        }
+        impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
+            fn transform_array_element(
+                &mut self,
+                etype: &'a DataType,
+            ) -> Option<Cow<'a, DataType>> {
+                self.transform_inner_type(etype, "<array element>")
+            }
+            fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
+                self.transform_inner_type(ktype, "<map key>")
+            }
+            fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
+                self.transform_inner_type(vtype, "<map value>")
+            }
             fn transform_struct_field(
                 &mut self,
                 field: &'a StructField,
@@ -453,28 +478,31 @@ impl StructField {
                 if self.err.is_some() {
                     return None;
                 }
-                if let Err(e) = validate_field_column_mapping(field, self.column_mapping_mode) {
-                    self.err = Some(e);
+                self.path.push(field.name());
+                let Ok((physical_name, _id)) =
+                    get_field_column_mapping_info(field, self.column_mapping_mode, &self.path)
+                        .map_err(|e| self.err = Some(e))
+                else {
+                    self.path.pop();
+                    return None;
+                };
+
+                if field.is_metadata_column() && self.column_mapping_mode != ColumnMappingMode::None
+                {
+                    self.err = Some(Error::internal_error(format!(
+                        "Metadata column '{}' should not participate in logical to physical translation",
+                        field.name()
+                    )));
+                    self.path.pop();
                     return None;
                 }
 
                 let field = self.recurse_into_struct_field(field)?;
 
                 let metadata = field.logical_to_physical_metadata(self.column_mapping_mode);
-                let name = match self.column_mapping_mode {
-                    ColumnMappingMode::None => field.name().to_owned(),
-                    ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                        if field.is_metadata_column() {
-                            self.err = Some(Error::internal_error(format!(
-                                "Metadata column '{}' should not participate in logical to physical translation",
-                                field.name()
-                            )));
-                            return None;
-                        }
-                        field.physical_name(self.column_mapping_mode).to_owned()
-                    }
-                };
+                let name = physical_name.to_owned();
 
+                self.path.pop();
                 Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
             }
 
@@ -486,6 +514,7 @@ impl StructField {
         }
         let mut transformer = MakePhysical {
             column_mapping_mode,
+            path: vec![],
             err: None,
         };
         let result = transformer.transform_struct_field(self);
@@ -508,7 +537,7 @@ impl StructField {
     /// based on the specified `column_mapping_mode`.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::validate_field_column_mapping`], to ensure that annotations are
+    /// [`crate::table_features::get_field_column_mapping_info`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
@@ -908,7 +937,6 @@ impl StructType {
     /// Applies physical name mappings to this field. If the `column_mapping_mode` is
     /// [`ColumnMappingMode::Id`], then each StructField will have its parquet field id in the
     /// [`ColumnMetadataKey::ParquetFieldId`] metadata field.
-    #[allow(unused)]
     #[internal_api]
     pub(crate) fn make_physical(
         &self,
@@ -2060,7 +2088,9 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 #[cfg(test)]
 mod tests {
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
+    };
 
     use super::*;
     use serde_json;
@@ -2265,6 +2295,20 @@ mod tests {
         let data = example_schema_metadata();
         let field: StructField = serde_json::from_str(data).unwrap();
         assert!(field.make_physical(ColumnMappingMode::None).is_err());
+    }
+
+    #[test]
+    fn test_make_physical_rejects_unannotated_leaf_in_deep_nesting() {
+        let schema = test_deep_nested_schema_missing_leaf_cm();
+        let field = schema.fields().next().unwrap();
+        let err = field
+            .make_physical(ColumnMappingMode::Name)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
+            "Expected full nested path in error, got: {err}"
+        );
     }
 
     #[test]

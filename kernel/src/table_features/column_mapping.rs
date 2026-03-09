@@ -59,6 +59,7 @@ pub(crate) fn column_mapping_mode(
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
+        path: vec![],
         seen: HashMap::new(),
         err: None,
     };
@@ -69,70 +70,93 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     }
 }
 
-/// Validates that a single field's column mapping annotations are consistent with the given mode.
+/// Validates a field's column mapping annotations and extracts the physical name and column
+/// mapping id.
 ///
 /// When column mapping is enabled (`Id` or `Name`), the field must have a
 /// `delta.columnMapping.physicalName` (string) and `delta.columnMapping.id` (number) annotation.
-/// When disabled (`None`), neither annotation should be present.
-pub(crate) fn validate_field_column_mapping(
-    field: &StructField,
+/// Returns the physical name and `Some(id)`.
+///
+/// When disabled (`None`), neither annotation should be present. Returns the logical field name
+/// and `None`.
+///
+/// `path` identifies the field in error messages (e.g. `&["a", "b"]` renders as `a.b`).
+pub(crate) fn get_field_column_mapping_info<'a>(
+    field: &'a StructField,
     mode: ColumnMappingMode,
-) -> DeltaResult<()> {
-    let name = field.name();
+    path: &[&str],
+) -> DeltaResult<(&'a str, Option<i64>)> {
+    let field_path = || ColumnName::new(path.iter().copied());
     let annotation = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
-    match (mode, field.metadata.get(annotation)) {
-        (ColumnMappingMode::None, None) => {}
-        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(_))) => {}
+    let physical_name = match (mode, field.metadata.get(annotation)) {
+        (ColumnMappingMode::None, None) => field.name(),
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(s))) => s,
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
             return Err(Error::schema(format!(
-                "The {annotation} annotation on field '{name}' must be a string",
+                "The {annotation} annotation on field '{}' must be a string",
+                field_path(),
             )));
         }
         (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
             return Err(Error::schema(format!(
-                "Column mapping is enabled but field '{name}' lacks the {annotation} annotation",
+                "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
+                field_path(),
             )));
         }
         (ColumnMappingMode::None, Some(_)) => {
             return Err(Error::schema(format!(
-                "Column mapping is not enabled but field '{name}' is annotated with {annotation}",
+                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                field_path(),
             )));
         }
-    }
+    };
 
     let annotation = ColumnMetadataKey::ColumnMappingId.as_ref();
-    match (mode, field.metadata.get(annotation)) {
-        (ColumnMappingMode::None, None) => {}
-        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(_))) => {}
+    let id = match (mode, field.metadata.get(annotation)) {
+        (ColumnMappingMode::None, None) => None,
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(n))) => {
+            Some(*n)
+        }
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
             return Err(Error::schema(format!(
-                "The {annotation} annotation on field '{name}' must be a number",
+                "The {annotation} annotation on field '{}' must be a number",
+                field_path(),
             )));
         }
         (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
             return Err(Error::schema(format!(
-                "Column mapping is enabled but field '{name}' lacks the {annotation} annotation",
+                "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
+                field_path(),
             )));
         }
         (ColumnMappingMode::None, Some(_)) => {
             return Err(Error::schema(format!(
-                "Column mapping is not enabled but field '{name}' is annotated with {annotation}",
+                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                field_path(),
             )));
         }
-    }
-    Ok(())
+    };
+
+    Ok((physical_name, id))
 }
 
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
+    path: Vec<&'a str>,
     seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
     err: Option<Error>,
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner_type(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_inner_type(
+        &mut self,
+        data_type: &'a DataType,
+        name: &'a str,
+    ) -> Option<Cow<'a, DataType>> {
         if self.err.is_none() {
+            self.path.push(name);
             let _ = self.transform(data_type);
+            self.path.pop();
         }
         Some(Cow::Borrowed(data_type))
     }
@@ -141,33 +165,33 @@ impl<'a> ValidateColumnMappings<'a> {
 impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     // Override array element and map key/value for better error messages
     fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(etype)
+        self.transform_inner_type(etype, "<array element>")
     }
     fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(ktype)
+        self.transform_inner_type(ktype, "<map key>")
     }
     fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(vtype)
+        self.transform_inner_type(vtype, "<map value>")
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         if self.err.is_none() {
-            if let Err(e) = validate_field_column_mapping(field, self.mode) {
-                self.err = Some(e);
-            } else {
-                if let Some(MetadataValue::Number(id)) = field
-                    .metadata
-                    .get(ColumnMetadataKey::ColumnMappingId.as_ref())
-                {
-                    if let Some(prev) = self.seen.insert(*id, &field.name) {
+            self.path.push(&field.name);
+            if let Ok((_name, id)) = get_field_column_mapping_info(field, self.mode, &self.path)
+                .map_err(|e| self.err = Some(e))
+            {
+                if let Some(id) = id {
+                    if let Some(prev) = self.seen.insert(id, &field.name) {
                         self.err = Some(Error::schema(format!(
                             "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
                             field.name()
                         )));
+                        self.path.pop();
                         return None;
                     }
                 }
                 let _ = self.recurse_into_struct_field(field);
             }
+            self.path.pop();
         }
         None
     }
@@ -424,7 +448,9 @@ mod tests {
     use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
 
-    use crate::utils::test_utils::test_schema_nested_with_column_mapping;
+    use crate::utils::test_utils::{
+        test_deep_nested_schema_missing_leaf_cm, test_schema_nested_with_column_mapping,
+    };
 
     #[test]
     fn test_column_mapping_mode() {
@@ -1251,6 +1277,18 @@ mod tests {
             get_any_level_columns_logical_names(&schema, &physical, ColumnMappingMode::None)
                 .unwrap();
         assert_eq!(result, physical);
+    }
+
+    #[test]
+    fn validate_schema_column_mapping_error_includes_full_path() {
+        let schema = test_deep_nested_schema_missing_leaf_cm();
+        let err = validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
+            "Expected full nested path in error, got: {err}"
+        );
     }
 
     #[test]
