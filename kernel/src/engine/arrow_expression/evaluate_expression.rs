@@ -355,8 +355,8 @@ pub fn evaluate_expression(
     }
 }
 
-/// only use for evaluate_predicate conversion, currently does not support nested conversion
-/// currently it support limited conversion, only convert from ArrayList<Utf8View>, ArrayList<BinaryView>,
+/// this function is used for evaluate_predicate conversion, currently does not support nested conversion.
+/// it support limited conversion, e.g only convert from ArrayList<Utf8View> to ArrayList<Utf8>
 fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => {
@@ -380,10 +380,24 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
             return Ok(cast(&vals, &ArrowDataType::LargeList(Arc::new(new_field)))?);
         }
         ArrowDataType::ListView(field) => {
-            return Ok(cast(&vals, &ArrowDataType::List(field.clone()))?);
+            let from_type = field.data_type();
+            let to_type = match from_type {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(cast(&vals, &ArrowDataType::List(field.clone()))?),
+            };
+            let new_field = field.as_ref().clone().with_data_type(to_type);
+            return Ok(cast(&vals, &ArrowDataType::List(Arc::new(new_field)))?);
         }
         ArrowDataType::LargeListView(field) => {
-            return Ok(cast(&vals, &ArrowDataType::LargeList(field.clone()))?);
+            let from_type = field.data_type();
+            let to_type = match from_type {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(cast(&vals, &ArrowDataType::LargeList(field.clone()))?),
+            };
+            let new_field = field.as_ref().clone().with_data_type(to_type);
+            return Ok(cast(&vals, &ArrowDataType::LargeList(Arc::new(new_field)))?);
         }
         ArrowDataType::Utf8View => return Ok(cast(&vals, &ArrowDataType::Utf8)?),
         ArrowDataType::BinaryView => return Ok(cast(&vals, &ArrowDataType::Binary)?),
