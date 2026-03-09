@@ -230,44 +230,50 @@ pub struct DeletedRecordCountsHistogram {
 mod tests {
     use std::collections::HashMap;
 
-    use serde::{Deserialize, Serialize};
-
-    use super::{de_opt_vec_to_opt_map, ser_opt_map_to_opt_vec};
+    use super::Crc;
     use crate::actions::{DomainMetadata, SetTransaction};
 
-    /// Wrapper struct to exercise the serde helpers, since they require a Deserializer/Serializer.
-    #[derive(Deserialize, Serialize, PartialEq, Debug)]
-    struct MapKeyTestWrapper {
-        #[serde(
-            default,
-            deserialize_with = "de_opt_vec_to_opt_map",
-            serialize_with = "ser_opt_map_to_opt_vec"
-        )]
+    /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.
+    fn crc_with(
         txns: Option<HashMap<String, SetTransaction>>,
-        #[serde(
-            default,
-            deserialize_with = "de_opt_vec_to_opt_map",
-            serialize_with = "ser_opt_map_to_opt_vec"
-        )]
         domains: Option<HashMap<String, DomainMetadata>>,
+    ) -> Crc {
+        Crc {
+            set_transactions: txns,
+            domain_metadata: domains,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn de_vec_to_map_produces_correct_keys_and_values() {
         let json = r#"{
-            "txns": [
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
+            "setTransactions": [
                 {"appId": "app-1", "version": 3, "lastUpdated": 1000},
                 {"appId": "app-2", "version": 7}
             ],
-            "domains": [
+            "domainMetadata": [
                 {"domain": "delta.rowTracking", "configuration": "{\"rowIdHighWaterMark\":1}", "removed": false},
                 {"domain": "delta.clustering", "configuration": "{}", "removed": false}
             ]
         }"#;
 
-        let wrapper: MapKeyTestWrapper = serde_json::from_str(json).unwrap();
+        let crc: Crc = serde_json::from_str(json).unwrap();
 
-        let txns = wrapper.txns.as_ref().unwrap();
+        let txns = crc.set_transactions.as_ref().unwrap();
         assert_eq!(txns.len(), 2);
 
         let txn1 = &txns["app-1"];
@@ -280,7 +286,7 @@ mod tests {
         assert_eq!(txn2.version, 7);
         assert_eq!(txn2.last_updated, None);
 
-        let domains = wrapper.domains.as_ref().unwrap();
+        let domains = crc.domain_metadata.as_ref().unwrap();
         assert_eq!(domains.len(), 2);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));
@@ -288,29 +294,56 @@ mod tests {
 
     #[test]
     fn de_null_deserializes_to_none() {
-        let json = r#"{"txns": null, "domains": null}"#;
-        let wrapper: MapKeyTestWrapper = serde_json::from_str(json).unwrap();
-        assert!(wrapper.txns.is_none());
-        assert!(wrapper.domains.is_none());
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
+            "setTransactions": null,
+            "domainMetadata": null
+        }"#;
+        let crc: Crc = serde_json::from_str(json).unwrap();
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
     }
 
     #[test]
     fn de_missing_field_deserializes_to_none() {
-        let json = r#"{}"#;
-        let wrapper: MapKeyTestWrapper = serde_json::from_str(json).unwrap();
-        assert!(wrapper.txns.is_none());
-        assert!(wrapper.domains.is_none());
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1}
+        }"#;
+        let crc: Crc = serde_json::from_str(json).unwrap();
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
     }
 
     #[test]
     fn ser_none_serializes_to_null() {
-        let wrapper = MapKeyTestWrapper {
-            txns: None,
-            domains: None,
-        };
-        let json = serde_json::to_value(&wrapper).unwrap();
-        assert!(json["txns"].is_null());
-        assert!(json["domains"].is_null());
+        let crc = crc_with(None, None);
+        let json = serde_json::to_value(&crc).unwrap();
+        assert!(json["setTransactions"].is_null());
+        assert!(json["domainMetadata"].is_null());
     }
 
     #[test]
@@ -331,32 +364,104 @@ mod tests {
             DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
         );
 
-        let original = MapKeyTestWrapper {
-            txns: Some(txns),
-            domains: Some(domains),
-        };
+        let original = crc_with(Some(txns), Some(domains));
 
         let json_str = serde_json::to_string(&original).unwrap();
-        let deserialized: MapKeyTestWrapper = serde_json::from_str(&json_str).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(original, deserialized);
     }
 
     #[test]
     fn round_trip_empty_maps() {
-        let original = MapKeyTestWrapper {
-            txns: Some(HashMap::new()),
-            domains: Some(HashMap::new()),
-        };
+        let original = crc_with(Some(HashMap::new()), Some(HashMap::new()));
 
         let json_str = serde_json::to_string(&original).unwrap();
-        let deserialized: MapKeyTestWrapper = serde_json::from_str(&json_str).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(original, deserialized);
 
         // Verify the JSON has empty arrays (not null)
         let json_value = serde_json::to_value(&original).unwrap();
-        assert_eq!(json_value["txns"], serde_json::json!([]));
-        assert_eq!(json_value["domains"], serde_json::json!([]));
+        assert_eq!(json_value["setTransactions"], serde_json::json!([]));
+        assert_eq!(json_value["domainMetadata"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_crc_with_multiple_domain_metadatas_and_set_transactions() {
+        let mut txns = HashMap::new();
+        txns.insert(
+            "streaming-app".to_string(),
+            SetTransaction::new("streaming-app".to_string(), 42, Some(1700000000)),
+        );
+        txns.insert(
+            "batch-job".to_string(),
+            SetTransaction::new("batch-job".to_string(), 100, None),
+        );
+        txns.insert(
+            "etl-pipeline".to_string(),
+            SetTransaction::new("etl-pipeline".to_string(), 7, Some(1700001000)),
+        );
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new(
+                "delta.rowTracking".to_string(),
+                r#"{"rowIdHighWaterMark":500}"#.to_string(),
+            ),
+        );
+        domains.insert(
+            "delta.clustering".to_string(),
+            DomainMetadata::new("delta.clustering".to_string(), "{}".to_string()),
+        );
+        domains.insert(
+            "custom.app".to_string(),
+            DomainMetadata::new(
+                "custom.app".to_string(),
+                r#"{"version":"2.0"}"#.to_string(),
+            ),
+        );
+
+        let crc = Crc {
+            table_size_bytes: 1024 * 1024,
+            num_files: 10,
+            num_metadata: 1,
+            num_protocol: 1,
+            set_transactions: Some(txns),
+            domain_metadata: Some(domains),
+            ..Default::default()
+        };
+
+        // Round-trip through JSON
+        let json_str = serde_json::to_string(&crc).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        // Verify scalar fields survive the round-trip
+        assert_eq!(deserialized.table_size_bytes, 1024 * 1024);
+        assert_eq!(deserialized.num_files, 10);
+
+        // Verify all set transactions
+        let txns = deserialized.set_transactions.as_ref().unwrap();
+        assert_eq!(txns.len(), 3);
+        assert_eq!(txns["streaming-app"].version, 42);
+        assert_eq!(txns["streaming-app"].last_updated, Some(1700000000));
+        assert_eq!(txns["batch-job"].version, 100);
+        assert_eq!(txns["batch-job"].last_updated, None);
+        assert_eq!(txns["etl-pipeline"].version, 7);
+
+        // Verify all domain metadatas
+        let domains = deserialized.domain_metadata.as_ref().unwrap();
+        assert_eq!(domains.len(), 3);
+        assert!(domains.contains_key("delta.rowTracking"));
+        assert!(domains.contains_key("delta.clustering"));
+        assert!(domains.contains_key("custom.app"));
+        assert_eq!(
+            domains["custom.app"].configuration(),
+            r#"{"version":"2.0"}"#
+        );
+
+        // Verify the original and deserialized are equal
+        assert_eq!(crc, deserialized);
     }
 }
