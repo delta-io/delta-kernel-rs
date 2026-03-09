@@ -8,8 +8,8 @@ use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
-use delta_kernel::Snapshot;
 use delta_kernel::Engine;
+use delta_kernel::Snapshot;
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -56,11 +56,16 @@ impl ReadMetadataRunner {
         );
 
         let thread_pool = match &config.parallel_scan {
-            ParallelScan::Enabled { num_threads } => Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(*num_threads)
-                    .build()?,
-            ),
+            ParallelScan::Enabled { num_threads } => {
+                if *num_threads == 0 {
+                    return Err("num_threads in ReadConfig must be greater than 0".into());
+                }
+                Some(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(*num_threads)
+                        .build()?,
+                )
+            }
             ParallelScan::Disabled => None,
         };
 
@@ -119,7 +124,8 @@ impl ReadMetadataRunner {
                             }
 
                             let parallel =
-                                ParallelScanMetadata::try_new(engine, state, partition_files).expect("Failed to create ParallelScanMetadata");
+                                ParallelScanMetadata::try_new(engine, state, partition_files)
+                                    .expect("Failed to create ParallelScanMetadata");
                             for result in parallel {
                                 black_box(result.expect("Parallel scan error"));
                             }
