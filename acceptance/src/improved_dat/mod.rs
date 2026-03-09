@@ -26,18 +26,7 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
-use types::{TableInfo, WorkloadSpec};
-
-/// A loaded workload: its name, parsed spec, and where to find expected results.
-#[derive(Debug)]
-pub struct LoadedWorkload {
-    /// Workload name (derived from spec filename)
-    pub name: String,
-    /// Parsed workload specification
-    pub spec: WorkloadSpec,
-    /// Path to the spec file on disk
-    pub spec_path: PathBuf,
-}
+use types::TableInfo;
 
 /// A fully resolved test case ready for execution.
 #[derive(Debug)]
@@ -100,95 +89,6 @@ impl TestCase {
     pub fn expected_dir(&self, workload_name: &str) -> PathBuf {
         self.root_dir.join("expected").join(workload_name)
     }
-
-    /// Discover and load all workload specs in this test case.
-    ///
-    /// Supports both layouts:
-    /// - Flat files: `specs/<name>.json`
-    /// - Subdirectories: `specs/<name>/spec.json`
-    pub fn load_workloads(&self) -> Result<Vec<LoadedWorkload>, String> {
-        let specs_dir = self.root_dir.join("specs");
-        if !specs_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut workloads = Vec::new();
-        let entries =
-            std::fs::read_dir(&specs_dir).map_err(|e| format!("Cannot read specs dir: {}", e))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
-            let path = entry.path();
-
-            let (name, spec_path) =
-                if path.is_file() && path.extension().is_some_and(|e| e == "json") {
-                    // Flat layout: specs/<name>.json
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    (name, path)
-                } else if path.is_dir() {
-                    // Subdirectory layout: specs/<name>/spec.json
-                    let spec_file = path.join("spec.json");
-                    if !spec_file.exists() {
-                        continue;
-                    }
-                    let name = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    (name, spec_file)
-                } else {
-                    continue;
-                };
-
-            let content = std::fs::read_to_string(&spec_path)
-                .map_err(|e| format!("Cannot read {}: {}", spec_path.display(), e))?;
-            let spec: WorkloadSpec = serde_json::from_str(&content)
-                .map_err(|e| format!("Cannot parse {}: {}", spec_path.display(), e))?;
-
-            workloads.push(LoadedWorkload {
-                name,
-                spec,
-                spec_path,
-            });
-        }
-
-        workloads.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(workloads)
-    }
-}
-
-/// Discover all test cases under a root directory.
-///
-/// Scans for subdirectories containing `table_info.json`.
-pub fn discover_test_cases(root: impl AsRef<Path>) -> Result<Vec<TestCase>, String> {
-    let root = root.as_ref();
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()));
-    }
-
-    let mut cases = Vec::new();
-    let entries =
-        std::fs::read_dir(root).map_err(|e| format!("Cannot read {}: {}", root.display(), e))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
-        let path = entry.path();
-        if path.is_dir() && path.join("table_info.json").exists() {
-            cases.push(TestCase::from_dir(&path)?);
-        }
-    }
-
-    cases.sort_by(|a, b| {
-        let a_name = a.table_info.as_ref().map(|t| t.name.as_str()).unwrap_or("");
-        let b_name = b.table_info.as_ref().map(|t| t.name.as_str()).unwrap_or("");
-        a_name.cmp(b_name)
-    });
-    Ok(cases)
 }
 
 /// Resolve a test case from a spec file path (for datatest_stable integration).

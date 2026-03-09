@@ -23,8 +23,6 @@ use super::workload::SnapshotResult;
 pub enum ValidationError {
     #[error("Row count mismatch: expected {expected}, got {actual}")]
     RowCountMismatch { expected: u64, actual: u64 },
-    #[error("Column count mismatch: expected {expected}, got {actual}")]
-    ColumnCountMismatch { expected: usize, actual: usize },
     #[error("Data mismatch at column {column}: {message}")]
     DataMismatch { column: String, message: String },
     #[error("Protocol mismatch: {message}")]
@@ -343,26 +341,6 @@ pub fn columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) -> 
     true
 }
 
-/// Assert that two sets of columns match
-pub fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) {
-    assert_eq!(
-        actual.len(),
-        expected.len(),
-        "Column count mismatch: actual={}, expected={}",
-        actual.len(),
-        expected.len()
-    );
-    for (i, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        let actual = normalize_col(actual.clone());
-        let expected = normalize_col(expected.clone());
-        assert_eq!(
-            &actual, &expected,
-            "Column {} data mismatch. Got {:?}, expected {:?}",
-            i, actual, expected
-        );
-    }
-}
-
 /// Read expected data from parquet files in the given directory
 pub async fn read_expected_data(expected_dir: &Path) -> DeltaResult<Option<RecordBatch>> {
     let expected_data_dir = expected_dir.join("expected_data");
@@ -459,7 +437,6 @@ pub fn read_expected_metadata(
 pub async fn validate_read_result(
     actual: RecordBatch,
     expected_dir: &Path,
-    _has_predicate: bool,
     inline_expected: Option<&ReadExpected>,
 ) -> Result<(), ValidationError> {
     // Get actual row count before we potentially move the batch

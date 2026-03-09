@@ -172,13 +172,6 @@ impl WorkloadSpec {
         }
     }
 
-    /// Whether this workload has a predicate filter
-    pub fn has_predicate(&self) -> bool {
-        match self {
-            Self::Read { predicate, .. } => predicate.is_some(),
-            _ => false,
-        }
-    }
 }
 
 // ── Expected-value types (correctness testing) ──────────────────────────────
