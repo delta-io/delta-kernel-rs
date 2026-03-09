@@ -141,17 +141,7 @@ impl<'a> ListItem<'a> {
         self.offsets.is_empty()
     }
 
-    /// Returns the string at `list_index` within this list entry.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `list_index >= self.len()`.
     pub fn get(&self, list_index: usize) -> String {
-        assert!(
-            list_index < self.len(),
-            "list index {list_index} out of bounds for list of length {}",
-            self.len()
-        );
         self.values
             .value(self.offsets.start + list_index)
             .to_string()
