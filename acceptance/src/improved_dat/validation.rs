@@ -15,7 +15,7 @@ use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
-use super::types::{ExpectedMetadata, ExpectedProtocol, ExpectedSummary, ReadExpected, SnapshotExpected};
+use super::types::{ExpectedSummary, Metadata, Protocol, ReadExpected, SnapshotExpected};
 use super::workload::SnapshotResult;
 
 /// Validation error
@@ -428,7 +428,7 @@ pub fn read_expected_summary(
 /// Read and parse the protocol.json file
 pub fn read_expected_protocol(
     expected_dir: &Path,
-) -> Result<Option<ExpectedProtocol>, ValidationError> {
+) -> Result<Option<Protocol>, ValidationError> {
     let protocol_path = expected_dir.join("protocol.json");
     if !protocol_path.exists() {
         return Ok(None);
@@ -443,7 +443,7 @@ pub fn read_expected_protocol(
 /// Read and parse the metadata.json file
 pub fn read_expected_metadata(
     expected_dir: &Path,
-) -> Result<Option<ExpectedMetadata>, ValidationError> {
+) -> Result<Option<Metadata>, ValidationError> {
     let metadata_path = expected_dir.join("metadata.json");
     if !metadata_path.exists() {
         return Ok(None);
@@ -559,134 +559,59 @@ pub async fn validate_read_result(
     Ok(())
 }
 
-/// Validate protocol against expected values
-pub fn validate_protocol(
-    result: &SnapshotResult,
-    expected_protocol: &ExpectedProtocol,
-) -> Result<(), ValidationError> {
-    if result.min_reader_version != expected_protocol.min_reader_version {
-        return Err(ValidationError::ProtocolMismatch {
-            message: format!(
-                "minReaderVersion mismatch: expected {}, got {}",
-                expected_protocol.min_reader_version, result.min_reader_version
-            ),
-        });
-    }
-    if result.min_writer_version != expected_protocol.min_writer_version {
-        return Err(ValidationError::ProtocolMismatch {
-            message: format!(
-                "minWriterVersion mismatch: expected {}, got {}",
-                expected_protocol.min_writer_version, result.min_writer_version
-            ),
-        });
-    }
-
-    // Check reader features if present
-    if let Some(expected_features) = &expected_protocol.reader_features {
-        let actual_set: std::collections::HashSet<_> = result.reader_features.iter().collect();
-        let expected_set: std::collections::HashSet<_> = expected_features.iter().collect();
-        if actual_set != expected_set {
-            return Err(ValidationError::ProtocolMismatch {
-                message: format!(
-                    "readerFeatures mismatch: expected {:?}, got {:?}",
-                    expected_features, result.reader_features
-                ),
-            });
-        }
-    }
-
-    // Check writer features if present
-    if let Some(expected_features) = &expected_protocol.writer_features {
-        let actual_set: std::collections::HashSet<_> = result.writer_features.iter().collect();
-        let expected_set: std::collections::HashSet<_> = expected_features.iter().collect();
-        if actual_set != expected_set {
-            return Err(ValidationError::ProtocolMismatch {
-                message: format!(
-                    "writerFeatures mismatch: expected {:?}, got {:?}",
-                    expected_features, result.writer_features
-                ),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate metadata against expected values
-pub fn validate_metadata(
-    result: &SnapshotResult,
-    expected_metadata: &ExpectedMetadata,
-) -> Result<(), ValidationError> {
-    // Check table ID
-    if result.table_id != expected_metadata.id {
-        return Err(ValidationError::MetadataMismatch {
-            message: format!(
-                "Table ID mismatch: expected {}, got {}",
-                expected_metadata.id, result.table_id
-            ),
-        });
-    }
-
-    // Check partition columns
-    if result.partition_columns != expected_metadata.partition_columns {
-        return Err(ValidationError::MetadataMismatch {
-            message: format!(
-                "Partition columns mismatch: expected {:?}, got {:?}",
-                expected_metadata.partition_columns, result.partition_columns
-            ),
-        });
-    }
-
-    // Check configuration (bidirectional: expected subset actual AND actual subset expected)
-    for (key, expected_value) in &expected_metadata.configuration {
-        match result.configuration.get(key) {
-            Some(actual_value) if actual_value == expected_value => {}
-            Some(actual_value) => {
-                return Err(ValidationError::MetadataMismatch {
-                    message: format!(
-                        "Configuration '{}' mismatch: expected '{}', got '{}'",
-                        key, expected_value, actual_value
-                    ),
-                });
-            }
-            None => {
-                return Err(ValidationError::MetadataMismatch {
-                    message: format!(
-                        "Configuration '{}' missing: expected '{}'",
-                        key, expected_value
-                    ),
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate snapshot metadata against expected protocol and metadata
-pub fn validate_snapshot_metadata(
+/// Validate snapshot result against expected protocol and metadata.
+///
+/// Loads expected values from `protocol.json` and `metadata.json` in the expected dir,
+/// or uses inline expected values from the spec. Comparison uses `PartialEq` on the
+/// shared `Protocol`/`Metadata` types. On mismatch, prints both as JSON.
+pub fn validate_snapshot(
     result: &SnapshotResult,
     expected_dir: &Path,
+    inline: Option<&SnapshotExpected>,
 ) -> Result<(), ValidationError> {
-    if let Some(expected_protocol) = read_expected_protocol(expected_dir)? {
-        validate_protocol(result, &expected_protocol)?;
+    // Protocol: inline takes priority over file
+    let expected_protocol = inline
+        .and_then(|e| e.protocol.clone())
+        .or_else(|| read_expected_protocol(expected_dir).ok().flatten());
+    if let Some(ref expected) = expected_protocol {
+        if result.protocol != *expected {
+            eprintln!("\n=== PROTOCOL MISMATCH ===");
+            eprintln!(
+                "expected: {}",
+                serde_json::to_string_pretty(expected).unwrap()
+            );
+            eprintln!(
+                "actual:   {}",
+                serde_json::to_string_pretty(&result.protocol).unwrap()
+            );
+            eprintln!("=== END MISMATCH ===\n");
+            return Err(ValidationError::ProtocolMismatch {
+                message: "protocol does not match".to_string(),
+            });
+        }
     }
-    if let Some(expected_metadata) = read_expected_metadata(expected_dir)? {
-        validate_metadata(result, &expected_metadata)?;
-    }
-    Ok(())
-}
 
-/// Validate snapshot metadata against inline expected values from the spec.
-pub fn validate_snapshot_from_inline(
-    result: &SnapshotResult,
-    expected: &SnapshotExpected,
-) -> Result<(), ValidationError> {
-    if let Some(ref protocol) = expected.protocol {
-        validate_protocol(result, protocol)?;
+    // Metadata: inline takes priority over file
+    let expected_metadata = inline
+        .and_then(|e| e.metadata.clone())
+        .or_else(|| read_expected_metadata(expected_dir).ok().flatten());
+    if let Some(ref expected) = expected_metadata {
+        if result.metadata != *expected {
+            eprintln!("\n=== METADATA MISMATCH ===");
+            eprintln!(
+                "expected: {}",
+                serde_json::to_string_pretty(expected).unwrap()
+            );
+            eprintln!(
+                "actual:   {}",
+                serde_json::to_string_pretty(&result.metadata).unwrap()
+            );
+            eprintln!("=== END MISMATCH ===\n");
+            return Err(ValidationError::MetadataMismatch {
+                message: "metadata does not match".to_string(),
+            });
+        }
     }
-    if let Some(ref metadata) = expected.metadata {
-        validate_metadata(result, metadata)?;
-    }
+
     Ok(())
 }

@@ -240,12 +240,12 @@ pub struct ReadExpected {
 }
 
 /// Inline expected values for snapshot specs
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SnapshotExpected {
     #[serde(default)]
-    pub protocol: Option<ExpectedProtocol>,
+    pub protocol: Option<Protocol>,
     #[serde(default)]
-    pub metadata: Option<ExpectedMetadata>,
+    pub metadata: Option<Metadata>,
 }
 
 // ── Snapshot validation types ───────────────────────────────────────────────
@@ -253,13 +253,16 @@ pub struct SnapshotExpected {
 /// Wrapper for `protocol.json`
 #[derive(Debug, Deserialize)]
 pub struct ProtocolWrapper {
-    pub protocol: ExpectedProtocol,
+    pub protocol: Protocol,
 }
 
-/// Expected protocol definition
-#[derive(Debug, Clone, Deserialize)]
+/// Protocol definition — shared between expected (from spec JSON) and actual (from kernel).
+///
+/// Custom `PartialEq` treats features as sets (order-independent) and
+/// `None` == empty vec.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExpectedProtocol {
+pub struct Protocol {
     pub min_reader_version: i32,
     pub min_writer_version: i32,
     #[serde(default)]
@@ -268,25 +271,48 @@ pub struct ExpectedProtocol {
     pub writer_features: Option<Vec<String>>,
 }
 
+impl PartialEq for Protocol {
+    fn eq(&self, other: &Self) -> bool {
+        self.min_reader_version == other.min_reader_version
+            && self.min_writer_version == other.min_writer_version
+            && sorted_features(&self.reader_features) == sorted_features(&other.reader_features)
+            && sorted_features(&self.writer_features) == sorted_features(&other.writer_features)
+    }
+}
+
+fn sorted_features(features: &Option<Vec<String>>) -> Vec<&str> {
+    let mut v: Vec<&str> = features
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    v.sort();
+    v
+}
+
 /// Wrapper for `metadata.json`
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataWrapper {
-    pub meta_data: ExpectedMetadata,
+    pub meta_data: Metadata,
 }
 
 /// Format specification within metadata
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct MetadataFormat {
     pub provider: String,
     #[serde(default)]
     pub options: HashMap<String, String>,
 }
 
-/// Expected metadata definition
-#[derive(Debug, Clone, Deserialize)]
+/// Metadata definition — shared between expected (from spec JSON) and actual (from kernel).
+///
+/// Custom `PartialEq` compares `schema_string` as parsed JSON (ignoring formatting),
+/// skips `created_time`, and treats `None` schema as matching anything.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExpectedMetadata {
+pub struct Metadata {
     pub id: String,
     pub format: MetadataFormat,
     #[serde(default)]
@@ -299,9 +325,27 @@ pub struct ExpectedMetadata {
     pub created_time: Option<i64>,
 }
 
-/// Actual metadata match result from `actual_meta.json`
-#[derive(Debug, Deserialize)]
-pub struct ActualMeta {
-    pub actual_row_count: u64,
-    pub matches_expected: bool,
+impl PartialEq for Metadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.format == other.format
+            && schemas_match(&self.schema_string, &other.schema_string)
+            && self.partition_columns == other.partition_columns
+            && self.configuration == other.configuration
+    }
+}
+
+/// Compare schema strings as parsed JSON. `None` matches anything.
+fn schemas_match(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let parsed_a: Result<serde_json::Value, _> = serde_json::from_str(a);
+            let parsed_b: Result<serde_json::Value, _> = serde_json::from_str(b);
+            match (parsed_a, parsed_b) {
+                (Ok(va), Ok(vb)) => va == vb,
+                _ => a == b, // fallback to string comparison if parse fails
+            }
+        }
+        (None, _) | (_, None) => true, // None means "don't check"
+    }
 }
