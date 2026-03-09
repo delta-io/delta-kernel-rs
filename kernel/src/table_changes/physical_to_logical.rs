@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
-use crate::scan_transforms::{get_transform_expr, parse_partition_values};
+use crate::scan::transform_spec::{get_transform_expr, parse_partition_values};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -130,8 +130,8 @@ mod tests {
     use crate::expressions::Expression;
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
+    use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::scan_transforms::FieldTransformSpec;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use std::collections::HashMap;

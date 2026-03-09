@@ -20,7 +20,7 @@ use crate::{
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
-use crate::scan_transforms::TransformSpec;
+use crate::scan::transform_spec::TransformSpec;
 use crate::table_features::ColumnMappingMode;
 
 // Generates a batch of sidecar actions with the given paths.

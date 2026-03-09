@@ -1,6 +1,6 @@
 //! Field classifier implementations for different scan types (regular and CDF scans)
 
-use crate::scan_transforms::FieldTransformSpec;
+use crate::scan::transform_spec::FieldTransformSpec;
 use crate::schema::StructField;
 use crate::table_changes::{
     CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,

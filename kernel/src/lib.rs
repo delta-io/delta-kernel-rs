@@ -101,7 +101,6 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod scan;
-pub(crate) mod scan_transforms;
 pub mod schema;
 pub mod snapshot;
 pub mod table_changes;
