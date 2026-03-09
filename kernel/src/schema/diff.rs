@@ -4,7 +4,7 @@
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
 //! Supports nested field comparison within structs, arrays, and maps.
 
-// Implementation is complete but not yet integrated with other modules
+// This module is not used outside the diff subsystem; suppress unused-code warnings.
 #![allow(dead_code)]
 
 use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
@@ -747,6 +747,10 @@ mod tests {
         ])
     }
 
+    fn updated_paths(diff: &SchemaDiff) -> HashSet<ColumnName> {
+        diff.updated_fields.iter().map(|u| u.path.clone()).collect()
+    }
+
     #[test]
     fn test_identical_schemas() {
         let schema = StructType::new_unchecked([
@@ -1336,8 +1340,7 @@ mod tests {
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["new_struct"]));
 
         assert_eq!(diff.updated_fields.len(), 3);
-        let paths: HashSet<ColumnName> =
-            diff.updated_fields.iter().map(|u| u.path.clone()).collect();
+        let paths = updated_paths(&diff);
         assert!(paths.contains(&ColumnName::new(["existing"])));
         assert!(paths.contains(&ColumnName::new(["existing_struct"])));
         assert!(paths.contains(&ColumnName::new(["existing_struct", "new_name"])));
@@ -1560,10 +1563,9 @@ mod tests {
             diff.removed_fields.iter().map(|f| f.path.clone()).collect();
         assert!(removed_paths.contains(&ColumnName::new(["user", "email"])));
 
-        let updated_paths: HashSet<ColumnName> =
-            diff.updated_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(updated_paths.contains(&ColumnName::new(["identifier"])));
-        assert!(updated_paths.contains(&ColumnName::new(["user", "full_name"])));
+        let paths = updated_paths(&diff);
+        assert!(paths.contains(&ColumnName::new(["identifier"])));
+        assert!(paths.contains(&ColumnName::new(["user", "full_name"])));
     }
 
     #[test]
@@ -2212,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cursed_deeply_nested_complex_types() {
+    fn test_deeply_nested_complex_type_combinations() {
         // Test frightening nested cases with multiple levels of complex types
 
         // Case 1: struct<items: array<struct<inner: struct<a int, b string>>>>
@@ -2478,11 +2480,7 @@ mod tests {
         assert_eq!(diff4.removed_fields.len(), 0);
         assert_eq!(diff4.updated_fields.len(), 2);
 
-        let paths: HashSet<ColumnName> = diff4
-            .updated_fields
-            .iter()
-            .map(|u| u.path.clone())
-            .collect();
+        let paths = updated_paths(&diff4);
         assert!(paths.contains(&ColumnName::new([
             "complex_map",
             "key",
@@ -2575,11 +2573,7 @@ mod tests {
             ColumnName::new(["nested_maps", "value", "value", "removed"])
         );
 
-        let paths: HashSet<ColumnName> = diff5
-            .updated_fields
-            .iter()
-            .map(|u| u.path.clone())
-            .collect();
+        let paths = updated_paths(&diff5);
         assert!(paths.contains(&ColumnName::new([
             "nested_maps",
             "key",
