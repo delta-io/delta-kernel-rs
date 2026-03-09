@@ -518,7 +518,6 @@ pub fn evaluate_predicate(
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
-            // need to cast array<ViewType> to array<Type>, so that the default fn work.
             let left = evaluate_expression(left, batch, None)?;
             let left = arrow_convert_to_non_view_type(left)?;
 
