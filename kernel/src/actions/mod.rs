@@ -179,12 +179,9 @@ pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
     )]))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
@@ -219,12 +216,9 @@ impl TryFrom<Format> for Scalar {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
@@ -702,7 +696,7 @@ pub(crate) struct Add {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
@@ -724,10 +718,10 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     /// Note: map values can be null.
-    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// We don't use `#[allow_null_container_values]` here because [`MapItem::materialize`]
     /// drops null values when that attribute is present.
     ///
-    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`MapItem::materialize`]: crate::engine_data::MapItem::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub tags: Option<HashMap<String, Option<String>>>,
 
@@ -831,7 +825,7 @@ pub(crate) struct Cdc {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
@@ -849,7 +843,8 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -942,7 +937,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
     domain: String,
@@ -985,6 +980,11 @@ impl DomainMetadata {
     #[internal_api]
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
+    }
+
+    /// Returns `true` if this action is a tombstone (marking domain removal).
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
     }
 }
 

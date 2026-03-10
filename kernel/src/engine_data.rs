@@ -1,6 +1,7 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use tracing::debug;
 
@@ -102,75 +103,106 @@ impl From<Box<dyn EngineData>> for FilteredEngineData {
     }
 }
 
-/// a trait that an engine exposes to give access to a list
-pub trait EngineList {
-    /// Return the length of the list at the specified row_index in the raw data
-    fn len(&self, row_index: usize) -> usize;
-    /// Get the item at `list_index` from the list at `row_index` in the raw data, and return it as a [`String`]
-    fn get(&self, row_index: usize, list_index: usize) -> String;
-    /// Materialize the entire list at row_index in the raw data into a `Vec<String>`
-    fn materialize(&self, row_index: usize) -> Vec<String>;
+/// Uniform read access to a string array, abstracting over the various string representations
+/// that list and map columns may use (e.g. Utf8, LargeUtf8, Utf8View). Engines implement this
+/// for their string array types so that [`ListItem`] and [`MapItem`] can resolve the concrete
+/// type once at construction and access elements via virtual dispatch thereafter.
+pub trait StringArrayAccessor {
+    /// Returns the number of elements in the array.
+    fn len(&self) -> usize;
+    /// Returns whether the array has no elements.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Returns the string value at the given index. The caller must ensure `index < len()`.
+    fn value(&self, index: usize) -> &str;
+    /// Returns whether the value at the given index is non-null.
+    fn is_valid(&self, index: usize) -> bool;
 }
 
-/// A list item is useful if the Engine needs to know what row of raw data it needs to access to
-/// implement the [`EngineList`] trait. It simply wraps such a list, and the row.
+/// A pre-resolved view into a single row's list of strings. The string array type is resolved
+/// once at construction, so subsequent element accesses use virtual dispatch rather than
+/// repeated downcasting.
 pub struct ListItem<'a> {
-    list: &'a dyn EngineList,
-    row: usize,
+    values: &'a dyn StringArrayAccessor,
+    offsets: Range<usize>,
 }
 
 impl<'a> ListItem<'a> {
-    pub fn new(list: &'a dyn EngineList, row: usize) -> ListItem<'a> {
-        ListItem { list, row }
+    pub fn new(values: &'a dyn StringArrayAccessor, offsets: Range<usize>) -> ListItem<'a> {
+        ListItem { values, offsets }
     }
 
     pub fn len(&self) -> usize {
-        self.list.len(self.row)
+        self.offsets.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.offsets.is_empty()
     }
 
     pub fn get(&self, list_index: usize) -> String {
-        self.list.get(self.row, list_index)
+        self.values
+            .value(self.offsets.start + list_index)
+            .to_string()
     }
 
     pub fn materialize(&self) -> Vec<String> {
-        self.list.materialize(self.row)
+        self.offsets
+            .clone()
+            .map(|i| self.values.value(i).to_string())
+            .collect()
     }
 }
 
-/// a trait that an engine exposes to give access to a map
-pub trait EngineMap {
-    /// Get the item with the specified key from the map at `row_index` in the raw data, and return it as an `Option<&'a str>`
-    fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
-    /// Materialize the entire map at `row_index` in the raw data into a `HashMap`. Note that in
-    /// conjunction with the `allow_null_container_values` attribute, `materialize` _drops_ any
-    /// (key, value) pairs where the underlying value was `null`. If preserving `null` values is
-    /// important, use the `allow_null_container_values` attribute, and manually materialize the map
-    /// using [`Self::get`].
-    fn materialize(&self, row_index: usize) -> HashMap<String, String>;
-}
-
-/// A map item is useful if the Engine needs to know what row of raw data it needs to access to
-/// implement the [`EngineMap`] trait. It simply wraps such a map, and the row.
+/// A pre-resolved view into a single row's map of string keys to string values. Like
+/// [`ListItem`], the string array types are resolved once at construction.
+///
+/// Note: in conjunction with the `allow_null_container_values` attribute, [`materialize`]
+/// _drops_ any (key, value) pairs where the underlying value was null. If preserving null
+/// values is important, use the `allow_null_container_values` attribute and manually
+/// materialize the map using [`MapItem::get`].
+///
+/// [`materialize`]: MapItem::materialize
 pub struct MapItem<'a> {
-    map: &'a dyn EngineMap,
-    row: usize,
+    keys: &'a dyn StringArrayAccessor,
+    values: &'a dyn StringArrayAccessor,
+    offsets: Range<usize>,
 }
 
 impl<'a> MapItem<'a> {
-    pub fn new(map: &'a dyn EngineMap, row: usize) -> MapItem<'a> {
-        MapItem { map, row }
+    pub fn new(
+        keys: &'a dyn StringArrayAccessor,
+        values: &'a dyn StringArrayAccessor,
+        offsets: Range<usize>,
+    ) -> MapItem<'a> {
+        MapItem {
+            keys,
+            values,
+            offsets,
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&'a str> {
-        self.map.get(self.row, key)
+        let idx = self
+            .offsets
+            .clone()
+            .rev()
+            .find(|&idx| self.keys.value(idx) == key)?;
+        self.values.is_valid(idx).then(|| self.values.value(idx))
     }
 
     pub fn materialize(&self) -> HashMap<String, String> {
-        self.map.materialize(self.row)
+        let mut ret = HashMap::with_capacity(self.offsets.len());
+        for idx in self.offsets.clone() {
+            if self.values.is_valid(idx) {
+                ret.insert(
+                    self.keys.value(idx).to_string(),
+                    self.values.value(idx).to_string(),
+                );
+            }
+        }
+        ret
     }
 }
 

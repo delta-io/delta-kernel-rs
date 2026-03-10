@@ -88,6 +88,10 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+// Public under test-utils so integration tests can inspect CRC state via Snapshot::get_current_crc_if_loaded_for_testing.
+#[cfg(feature = "test-utils")]
+pub mod crc;
+#[cfg(not(feature = "test-utils"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -104,7 +108,6 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
-pub(crate) mod transforms;
 
 pub use log_path::LogPath;
 
@@ -147,16 +150,12 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
-pub(crate) mod listed_log_files;
+pub(crate) mod log_segment_files;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
-
-// Benchmarking infrastructure (only public for benchmarks and tests)
-#[cfg(any(test, feature = "internal-api"))]
-pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -563,6 +562,12 @@ pub trait StorageHandler: AsAny {
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+
+    /// Write data to the specified path.
+    ///
+    /// If `overwrite` is false and the file already exists, this must return
+    /// `Err(Error::FileAlreadyExists)`.
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
 
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///

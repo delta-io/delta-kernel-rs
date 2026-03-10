@@ -5,22 +5,62 @@
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
+// Allow unreachable_pub because this module is pub when test-utils is enabled
+// but pub(crate) otherwise. The items need to be pub for integration tests.
+#![allow(unreachable_pub)]
+
+mod delta;
+mod file_stats;
 mod lazy;
 mod reader;
+mod writer;
 
+#[allow(unused)]
+pub(crate) use delta::CrcDelta;
+pub(crate) use file_stats::FileStats;
+#[allow(unused)]
+pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
+#[allow(unused)]
+pub(crate) use writer::try_write_crc_file;
 
-use std::sync::LazyLock;
+use std::collections::HashMap;
 
-use crate::actions::visitors::{visit_metadata_at, visit_protocol_at};
-use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction, PROTOCOL_NAME};
-use crate::engine_data::{GetData, TypedGetData};
-use crate::schema::ToSchema as _;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
-use delta_kernel_derive::ToSchema;
+use serde::de::Deserializer;
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+
+use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
+
+/// Tracks whether file stats (`num_files`, `table_size_bytes`) are trustworthy.
+///
+/// Defaults to [`Valid`](Self::Valid), which is the correct state when deserializing a CRC file
+/// from disk (a CRC file's stats are correct by definition).
+#[allow(dead_code)] // Variants used in follow-up PRs (forward replay, transaction delta).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileStatsValidity {
+    /// File stats are known-correct absolute totals. This is the case when seeded from a CRC
+    /// file (which contains `num_files` and `table_size_bytes`) or when replay starts from
+    /// version zero (where the initial state is trivially zero).
+    #[default]
+    Valid,
+    /// File stats are relative deltas, not absolute totals. This happens when seeding from a
+    /// checkpoint: we extract metadata fields but not file counts (reading all add actions from
+    /// a checkpoint just for counts is too expensive). The accumulated deltas are correct, but
+    /// without a baseline they cannot produce final totals.
+    RequiresCheckpointRead,
+    /// A non-incremental operation was seen: file stats cannot be determined incrementally.
+    /// For example, ANALYZE STATS re-adds existing files with updated statistics but no
+    /// corresponding removes, so naively counting adds would double-count.
+    /// A full log replay from scratch could recover correct file stats.
+    Indeterminate,
+    /// A file action had a missing size field: correct file stats are impossible to compute.
+    /// For example, the Delta protocol allows `remove.size` to be null -- when encountered,
+    /// we can no longer track byte totals. Unlike [`Indeterminate`](Self::Indeterminate), no
+    /// amount of replay can recover the missing data.
+    Untrackable,
+}
 
 /// Parsed content of a CRC (version checksum) file.
 ///
@@ -28,52 +68,151 @@ use delta_kernel_derive::ToSchema;
 /// 1. Be named `{version}.crc` with version zero-padded to 20 digits: `00000000000000000001.crc`
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
 /// 3. Contain exactly one JSON object with the schema of this struct.
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-pub(crate) struct Crc {
+///
+/// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
+/// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
+// Deserialized directly from JSON via serde. See `reader::try_read_crc_file`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Crc {
     // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
-    /// [`Add`] actions.
-    pub(crate) table_size_bytes: i64,
+    /// [`Add`] actions. Private -- use [`Crc::file_stats()`] to access safely.
+    table_size_bytes: i64,
     /// Number of live [`Add`] actions in this table version after action reconciliation.
-    pub(crate) num_files: i64,
+    /// Private -- use [`Crc::file_stats()`] to access safely.
+    num_files: i64,
     /// Number of [`Metadata`] actions. Must be 1.
-    pub(crate) num_metadata: i64,
+    pub num_metadata: i64,
     /// Number of [`Protocol`] actions. Must be 1.
-    pub(crate) num_protocol: i64,
+    pub num_protocol: i64,
     /// The table [`Metadata`] at this version.
-    pub(crate) metadata: Metadata,
+    pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
-    pub(crate) protocol: Protocol,
+    pub protocol: Protocol,
+    /// Whether the file stats (`num_files`, `table_size_bytes`) in this CRC are trustworthy.
+    /// Not serialized -- this is an in-memory replay concern only. When deserialized from a CRC
+    /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
+    /// by definition).
+    #[serde(skip)]
+    pub file_stats_validity: FileStatsValidity,
 
     // ===== Optional fields =====
     /// A unique identifier for the transaction that produced this commit.
-    pub(crate) txn_id: Option<String>,
+    #[serde(skip)]
+    pub txn_id: Option<String>,
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
-    pub(crate) in_commit_timestamp_opt: Option<i64>,
+    pub in_commit_timestamp_opt: Option<i64>,
     /// Live transaction identifier ([`SetTransaction`]) actions at this version.
-    pub(crate) set_transactions: Option<Vec<SetTransaction>>,
-    /// Live [`DomainMetadata`] actions at this version, excluding tombstones.
-    pub(crate) domain_metadata: Option<Vec<DomainMetadata>>,
+    ///
+    /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
+    /// a Vec, which is converted via custom serde deserialization.
+    #[serde(
+        default,
+        deserialize_with = "de_opt_vec_to_opt_map",
+        serialize_with = "ser_opt_map_to_opt_vec"
+    )]
+    pub(crate) set_transactions: Option<HashMap<String, SetTransaction>>,
+    /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
+    /// (`removed=true`) are never stored.
+    ///
+    /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
+    /// a Vec, which is converted via custom serde deserialization.
+    #[serde(
+        default,
+        deserialize_with = "de_opt_vec_to_opt_map",
+        serialize_with = "ser_opt_map_to_opt_vec"
+    )]
+    pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
-    pub(crate) file_size_histogram: Option<FileSizeHistogram>,
+    #[serde(skip)]
+    pub file_size_histogram: Option<FileSizeHistogram>,
     /// All live [`Add`] file actions at this version.
-    pub(crate) all_files: Option<Vec<Add>>,
+    #[serde(skip)]
+    pub all_files: Option<Vec<Add>>,
     /// Number of records deleted through Deletion Vectors in this table version.
-    pub(crate) num_deleted_records_opt: Option<i64>,
+    #[serde(skip)]
+    pub num_deleted_records_opt: Option<i64>,
     /// Number of Deletion Vectors active in this table version.
-    pub(crate) num_deletion_vectors_opt: Option<i64>,
+    #[serde(skip)]
+    pub num_deletion_vectors_opt: Option<i64>,
     /// Distribution of deleted record counts across files. See this section for more details.
-    pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+    #[serde(skip)]
+    pub deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+}
+
+impl Crc {
+    /// Returns file-level statistics only if they are known to be valid.
+    ///
+    /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
+    /// built from incremental replay that encountered a non-incremental operation or a
+    /// missing file size.
+    pub fn file_stats(&self) -> Option<FileStats> {
+        match self.file_stats_validity {
+            FileStatsValidity::Valid => Some(FileStats {
+                num_files: self.num_files,
+                table_size_bytes: self.table_size_bytes,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Trait for types that can be stored in a HashMap keyed by a string identifier.
+/// Used by CRC serde helpers to convert between Vec (JSON format) and HashMap (in-memory).
+trait MapKey {
+    fn map_key(&self) -> &str;
+}
+
+impl MapKey for DomainMetadata {
+    fn map_key(&self) -> &str {
+        self.domain()
+    }
+}
+
+impl MapKey for SetTransaction {
+    fn map_key(&self) -> &str {
+        &self.app_id
+    }
+}
+
+/// Deserialize an `Option<Vec<T>>` from JSON into `Option<HashMap<String, T>>`, using
+/// [`MapKey::map_key`] to derive the HashMap key for each element.
+fn de_opt_vec_to_opt_map<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + MapKey,
+{
+    let opt_vec: Option<Vec<T>> = Option::deserialize(deserializer)?;
+    Ok(opt_vec.map(|vec| {
+        vec.into_iter()
+            .map(|item| (item.map_key().to_string(), item))
+            .collect()
+    }))
+}
+
+/// Serialize `Option<HashMap<String, T>>` back to `Option<Vec<T>>` so the CRC JSON format
+/// uses an array (matching the Delta protocol spec).
+fn ser_opt_map_to_opt_vec<S, T>(
+    map: &Option<HashMap<String, T>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    match map {
+        None => serializer.serialize_none(),
+        Some(m) => m.values().collect::<Vec<_>>().serialize(serializer),
+    }
 }
 
 /// The [FileSizeHistogram] object represents a histogram tracking file counts and total bytes
 /// across different size ranges.
 ///
-/// TODO: This struct is defined for schema generation but not yet parsed from CRC files.
-///
 /// [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-pub(crate) struct FileSizeHistogram {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSizeHistogram {
     /// A sorted array of bin boundaries where each element represents the start of a bin
     /// (inclusive) and the next element represents the end of the bin (exclusive). The first
     /// element must be 0.
@@ -88,8 +227,6 @@ pub(crate) struct FileSizeHistogram {
 /// deleted record counts across files in the table. Each bin in the histogram represents a range
 /// of deletion counts and stores the number of files having that many deleted records.
 ///
-/// TODO: This struct is defined for schema generation but not yet parsed from CRC files.
-///
 /// The histogram bins correspond to the following ranges:
 /// Bin 0: [0, 0] (files with no deletions)
 /// Bin 1: [1, 9] (files with 1-9 deleted records)
@@ -100,182 +237,249 @@ pub(crate) struct FileSizeHistogram {
 /// Bin 6: [100000, 999999] (files with 100,000-999,999 deleted records)
 /// Bin 7: [1000000, 9999999] (files with 1,000,000-9,999,999 deleted records)
 /// Bin 8: [10000000, 2147483646] (files with 10,000,000 to 2,147,483,646 deleted records)
-/// Bin 9: [2147483647, ∞) (files with 2,147,483,647 or more deleted records)
+/// Bin 9: [2147483647, inf) (files with 2,147,483,647 or more deleted records)
 ///
 /// [DeletedRecordCountsHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deleted-record-counts-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-pub(crate) struct DeletedRecordCountsHistogram {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
 }
 
-/// Visitor for extracting data from CRC files.
-///
-/// This visitor extracts Protocol, Metadata, and additional fields needed for CRC optimizations
-/// (in-commit timestamp, table statistics). The visitor builds a [`Crc`] directly during visitation.
-#[derive(Debug, Default)]
-pub(crate) struct CrcVisitor {
-    pub(crate) crc: Option<Crc>,
-}
-
-impl CrcVisitor {
-    pub(crate) fn into_crc(self) -> DeltaResult<Crc> {
-        self.crc
-            .ok_or_else(|| Error::generic("CRC file was not visited"))
-    }
-}
-
-/// Number of leaf columns for Metadata in the visitor schema.
-const METADATA_LEAF_COUNT: usize = 9;
-/// Number of leaf columns for Protocol in the visitor schema.
-const PROTOCOL_LEAF_COUNT: usize = 4;
-
-impl RowVisitor for CrcVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let mut cols = ColumnNamesAndTypes::default();
-            cols.extend(
-                (
-                    vec![ColumnName::new(["tableSizeBytes"])],
-                    vec![DataType::LONG],
-                )
-                    .into(),
-            );
-            cols.extend((vec![ColumnName::new(["numFiles"])], vec![DataType::LONG]).into());
-            // num_metadata: hardcoded to 1
-            // num_protocol: hardcoded to 1
-            // NOTE: CRC uses 'metadata' not 'metaData' like in actions
-            cols.extend(Metadata::to_schema().leaves("metadata"));
-            cols.extend(Protocol::to_schema().leaves(PROTOCOL_NAME));
-            // txn_id: not extracted yet
-            cols.extend(
-                (
-                    vec![ColumnName::new(["inCommitTimestampOpt"])],
-                    vec![DataType::LONG],
-                )
-                    .into(),
-            );
-            cols
-        });
-        NAMES_AND_TYPES.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        // Getters follow Crc struct order:
-        // [0]: tableSizeBytes
-        // [1]: numFiles
-        // [2..11]: metadata (9 leaf columns)
-        // [11..15]: protocol (4 leaf columns)
-        // [15]: inCommitTimestampOpt
-        const EXPECTED_GETTERS: usize = 2 + METADATA_LEAF_COUNT + PROTOCOL_LEAF_COUNT + 1;
-        require!(
-            getters.len() == EXPECTED_GETTERS,
-            Error::InternalError(format!(
-                "Wrong number of CrcVisitor getters: {} (expected {})",
-                getters.len(),
-                EXPECTED_GETTERS
-            ))
-        );
-        if row_count != 1 {
-            return Err(Error::InternalError(format!(
-                "Expected 1 row for CRC file, but got {row_count}",
-            )));
-        }
-
-        let table_size_bytes: i64 = getters[0].get(0, "crc.tableSizeBytes")?;
-        let num_files: i64 = getters[1].get(0, "crc.numFiles")?;
-        let metadata_end = 2 + METADATA_LEAF_COUNT;
-        let protocol_end = metadata_end + PROTOCOL_LEAF_COUNT;
-        let metadata = visit_metadata_at(0, &getters[2..metadata_end])?
-            .ok_or_else(|| Error::generic("Metadata not found in CRC file"))?;
-        let protocol = visit_protocol_at(0, &getters[metadata_end..protocol_end])?
-            .ok_or_else(|| Error::generic("Protocol not found in CRC file"))?;
-        let in_commit_timestamp_opt: Option<i64> =
-            getters[protocol_end].get_opt(0, "crc.inCommitTimestampOpt")?;
-
-        self.crc = Some(Crc {
-            table_size_bytes,
-            num_files,
-            num_metadata: 1, // Always 1 per protocol
-            num_protocol: 1, // Always 1 per protocol
-            metadata,
-            protocol,
-            txn_id: None, // TODO: extract this
-            in_commit_timestamp_opt,
-            set_transactions: None,                    // TODO: extract this
-            domain_metadata: None,                     // TODO: extract this
-            file_size_histogram: None,                 // TODO: extract this
-            all_files: None,                           // TODO: extract this
-            num_deleted_records_opt: None,             // TODO: extract this
-            num_deletion_vectors_opt: None,            // TODO: extract this
-            deleted_record_counts_histogram_opt: None, // TODO: extract this
-        });
-
-        Ok(())
-    }
-}
-
-// See reader::tests::test_read_crc_file for the e2e test that tests CrcVisitor.
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
 
-    use crate::schema::derive_macro_utils::ToDataType as _;
-    use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use super::Crc;
+    use crate::actions::{DomainMetadata, SetTransaction};
 
-    #[test]
-    fn test_file_size_histogram_schema() {
-        let schema = FileSizeHistogram::to_schema();
-        let expected = StructType::new_unchecked([
-            StructField::not_null("sortedBinBoundaries", ArrayType::new(DataType::LONG, false)),
-            StructField::not_null("fileCounts", ArrayType::new(DataType::LONG, false)),
-            StructField::not_null("totalBytes", ArrayType::new(DataType::LONG, false)),
-        ]);
-        assert_eq!(schema, expected);
+    /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.
+    fn crc_with(
+        txns: Option<HashMap<String, SetTransaction>>,
+        domains: Option<HashMap<String, DomainMetadata>>,
+    ) -> Crc {
+        Crc {
+            set_transactions: txns,
+            domain_metadata: domains,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn test_deleted_record_counts_histogram_schema() {
-        let schema = DeletedRecordCountsHistogram::to_schema();
-        let expected = StructType::new_unchecked([StructField::not_null(
-            "deletedRecordCounts",
-            ArrayType::new(DataType::LONG, false),
-        )]);
-        assert_eq!(schema, expected);
+    fn de_vec_to_map_produces_correct_keys_and_values() {
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
+            "setTransactions": [
+                {"appId": "app-1", "version": 3, "lastUpdated": 1000},
+                {"appId": "app-2", "version": 7}
+            ],
+            "domainMetadata": [
+                {"domain": "delta.rowTracking", "configuration": "{\"rowIdHighWaterMark\":1}", "removed": false},
+                {"domain": "delta.clustering", "configuration": "{}", "removed": false}
+            ]
+        }"#;
+
+        let crc: Crc = serde_json::from_str(json).unwrap();
+
+        let txns = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(txns.len(), 2);
+
+        let txn1 = &txns["app-1"];
+        assert_eq!(txn1.app_id, "app-1");
+        assert_eq!(txn1.version, 3);
+        assert_eq!(txn1.last_updated, Some(1000));
+
+        let txn2 = &txns["app-2"];
+        assert_eq!(txn2.app_id, "app-2");
+        assert_eq!(txn2.version, 7);
+        assert_eq!(txn2.last_updated, None);
+
+        let domains = crc.domain_metadata.as_ref().unwrap();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains_key("delta.rowTracking"));
+        assert!(domains.contains_key("delta.clustering"));
     }
 
     #[test]
-    fn test_crc_schema() {
-        let schema = Crc::to_schema();
-        let expected = StructType::new_unchecked([
-            // Required fields
-            StructField::not_null("tableSizeBytes", DataType::LONG),
-            StructField::not_null("numFiles", DataType::LONG),
-            StructField::not_null("numMetadata", DataType::LONG),
-            StructField::not_null("numProtocol", DataType::LONG),
-            StructField::not_null("metadata", Metadata::to_data_type()),
-            StructField::not_null("protocol", Protocol::to_data_type()),
-            // Optional fields
-            StructField::nullable("txnId", DataType::STRING),
-            StructField::nullable("inCommitTimestampOpt", DataType::LONG),
-            StructField::nullable(
-                "setTransactions",
-                ArrayType::new(SetTransaction::to_data_type(), false),
+    fn de_null_deserializes_to_none() {
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1},
+            "setTransactions": null,
+            "domainMetadata": null
+        }"#;
+        let crc: Crc = serde_json::from_str(json).unwrap();
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
+    }
+
+    #[test]
+    fn de_missing_field_deserializes_to_none() {
+        let json = r#"{
+            "tableSizeBytes": 0,
+            "numFiles": 0,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 0
+            },
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 1}
+        }"#;
+        let crc: Crc = serde_json::from_str(json).unwrap();
+        assert!(crc.set_transactions.is_none());
+        assert!(crc.domain_metadata.is_none());
+    }
+
+    #[test]
+    fn ser_none_serializes_to_null() {
+        let crc = crc_with(None, None);
+        let json = serde_json::to_value(&crc).unwrap();
+        assert!(json["setTransactions"].is_null());
+        assert!(json["domainMetadata"].is_null());
+    }
+
+    #[test]
+    fn ser_map_round_trips_through_vec() {
+        let mut txns = HashMap::new();
+        txns.insert(
+            "app-1".to_string(),
+            SetTransaction::new("app-1".to_string(), 5, Some(2000)),
+        );
+        txns.insert(
+            "app-2".to_string(),
+            SetTransaction::new("app-2".to_string(), 10, None),
+        );
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
+        );
+
+        let original = crc_with(Some(txns), Some(domains));
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn round_trip_empty_maps() {
+        let original = crc_with(Some(HashMap::new()), Some(HashMap::new()));
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(original, deserialized);
+
+        // Verify the JSON has empty arrays (not null)
+        let json_value = serde_json::to_value(&original).unwrap();
+        assert_eq!(json_value["setTransactions"], serde_json::json!([]));
+        assert_eq!(json_value["domainMetadata"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_crc_with_multiple_domain_metadatas_and_set_transactions() {
+        let mut txns = HashMap::new();
+        txns.insert(
+            "streaming-app".to_string(),
+            SetTransaction::new("streaming-app".to_string(), 42, Some(1700000000)),
+        );
+        txns.insert(
+            "batch-job".to_string(),
+            SetTransaction::new("batch-job".to_string(), 100, None),
+        );
+        txns.insert(
+            "etl-pipeline".to_string(),
+            SetTransaction::new("etl-pipeline".to_string(), 7, Some(1700001000)),
+        );
+
+        let mut domains = HashMap::new();
+        domains.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new(
+                "delta.rowTracking".to_string(),
+                r#"{"rowIdHighWaterMark":500}"#.to_string(),
             ),
-            StructField::nullable(
-                "domainMetadata",
-                ArrayType::new(DomainMetadata::to_data_type(), false),
-            ),
-            StructField::nullable("fileSizeHistogram", FileSizeHistogram::to_data_type()),
-            StructField::nullable("allFiles", ArrayType::new(Add::to_data_type(), false)),
-            StructField::nullable("numDeletedRecordsOpt", DataType::LONG),
-            StructField::nullable("numDeletionVectorsOpt", DataType::LONG),
-            StructField::nullable(
-                "deletedRecordCountsHistogramOpt",
-                DeletedRecordCountsHistogram::to_data_type(),
-            ),
-        ]);
-        assert_eq!(schema, expected);
+        );
+        domains.insert(
+            "delta.clustering".to_string(),
+            DomainMetadata::new("delta.clustering".to_string(), "{}".to_string()),
+        );
+        domains.insert(
+            "custom.app".to_string(),
+            DomainMetadata::new("custom.app".to_string(), r#"{"version":"2.0"}"#.to_string()),
+        );
+
+        let crc = Crc {
+            table_size_bytes: 1024 * 1024,
+            num_files: 10,
+            num_metadata: 1,
+            num_protocol: 1,
+            set_transactions: Some(txns),
+            domain_metadata: Some(domains),
+            ..Default::default()
+        };
+
+        // Round-trip through JSON
+        let json_str = serde_json::to_string(&crc).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        // Verify scalar fields survive the round-trip
+        assert_eq!(deserialized.table_size_bytes, 1024 * 1024);
+        assert_eq!(deserialized.num_files, 10);
+
+        // Verify all set transactions
+        let txns = deserialized.set_transactions.as_ref().unwrap();
+        assert_eq!(txns.len(), 3);
+        assert_eq!(txns["streaming-app"].version, 42);
+        assert_eq!(txns["streaming-app"].last_updated, Some(1700000000));
+        assert_eq!(txns["batch-job"].version, 100);
+        assert_eq!(txns["batch-job"].last_updated, None);
+        assert_eq!(txns["etl-pipeline"].version, 7);
+
+        // Verify all domain metadatas
+        let domains = deserialized.domain_metadata.as_ref().unwrap();
+        assert_eq!(domains.len(), 3);
+        assert!(domains.contains_key("delta.rowTracking"));
+        assert!(domains.contains_key("delta.clustering"));
+        assert!(domains.contains_key("custom.app"));
+        assert_eq!(
+            domains["custom.app"].configuration(),
+            r#"{"version":"2.0"}"#
+        );
+
+        // Verify the original and deserialized are equal
+        assert_eq!(crc, deserialized);
     }
 }
