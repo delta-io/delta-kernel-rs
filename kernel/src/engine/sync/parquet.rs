@@ -23,7 +23,7 @@ use crate::{
 use url::Url;
 
 pub(crate) struct SyncParquetHandler {
-    pub(crate) writer_config: ParquetWriterConfig,
+    pub(crate) parquet_writer_config: ParquetWriterConfig,
 }
 
 fn try_create_from_parquet(
@@ -109,7 +109,7 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let options = writer_options(&self.writer_config);
+        let options = writer_options(&self.parquet_writer_config);
         let mut writer =
             ArrowWriter::try_new_with_options(&mut file, first_record_batch.schema(), options)?;
         writer.write(&first_record_batch)?;
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_sync_write_parquet_file() {
         let handler = SyncParquetHandler {
-            writer_config: Default::default(),
+            parquet_writer_config: Default::default(),
         };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test.parquet");
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn test_sync_write_parquet_file_with_filter() {
         let handler = SyncParquetHandler {
-            writer_config: Default::default(),
+            parquet_writer_config: Default::default(),
         };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_filtered.parquet");
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn test_sync_write_parquet_file_overwrite_true() {
         let handler = SyncParquetHandler {
-            writer_config: Default::default(),
+            parquet_writer_config: Default::default(),
         };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_overwrite.parquet");
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn test_sync_write_parquet_file_always_overwrites() {
         let handler = SyncParquetHandler {
-            writer_config: Default::default(),
+            parquet_writer_config: Default::default(),
         };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_no_overwrite.parquet");
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
         let handler = SyncParquetHandler {
-            writer_config: Default::default(),
+            parquet_writer_config: Default::default(),
         };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_multi_batch.parquet");

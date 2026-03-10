@@ -74,7 +74,7 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
-    writer_config: ParquetWriterConfig,
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -175,7 +175,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             store,
             task_executor,
             readahead: 10,
-            writer_config: ParquetWriterConfig {
+            parquet_writer_config: ParquetWriterConfig {
                 compression: ParquetCompression::Zstd,
             },
         }
@@ -193,7 +193,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     ///
     /// Controls compression and other write-time settings. Defaults to Zstd compression.
     pub fn with_writer_config(mut self, config: ParquetWriterConfig) -> Self {
-        self.writer_config = config;
+        self.parquet_writer_config = config;
         self
     }
 
@@ -215,7 +215,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
-        let options = writer_options(&self.writer_config);
+        let options = writer_options(&self.parquet_writer_config);
         let mut writer =
             ArrowWriter::try_new_with_options(&mut buffer, record_batch.schema(), options)?;
         writer.write(record_batch)?;
@@ -370,7 +370,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
-        let options = writer_options(&self.writer_config);
+        let options = writer_options(&self.parquet_writer_config);
 
         self.task_executor.block_on(async move {
             let path = Path::from_url_path(location.path())?;

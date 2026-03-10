@@ -33,7 +33,7 @@ impl SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
             parquet_handler: Arc::new(parquet::SyncParquetHandler {
-                writer_config: ParquetWriterConfig {
+                parquet_writer_config: ParquetWriterConfig {
                     compression: ParquetCompression::Zstd,
                 },
             }),

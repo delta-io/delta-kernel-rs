@@ -35,7 +35,7 @@ fn default_parquet_handler() -> Box<dyn ParquetHandler> {
 
 fn sync_parquet_handler() -> Box<dyn ParquetHandler> {
     Box::new(SyncParquetHandler {
-        writer_config: Default::default(),
+        parquet_writer_config: Default::default(),
     })
 }
 
