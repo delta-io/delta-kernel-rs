@@ -1198,7 +1198,7 @@ impl LogSegment {
         };
 
         let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
-            debug!(
+            warn!(
                 "partitionValues_parsed not compatible: add.partitionValues_parsed is not a Struct, got {:?}",
                 partition_parsed.data_type()
             );
