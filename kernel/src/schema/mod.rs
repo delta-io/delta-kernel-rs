@@ -1571,6 +1571,12 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .ok_or_else(|| {
                         serde::de::Error::custom(format!("Invalid scale in decimal: {decimal_str}"))
                     })?;
+                // Reject extra parts (e.g., decimal(10,2,99))
+                if parts.next().is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "Invalid decimal format (expected 2 parts): {decimal_str}"
+                    )));
+                }
                 DecimalType::try_new(precision, scale)
                     .map(PrimitiveType::Decimal)
                     .map_err(serde::de::Error::custom)
@@ -2357,6 +2363,7 @@ mod tests {
     #[case("decimal(invalid)", "Invalid precision in decimal")]
     #[case("decimal(10)", "Invalid scale in decimal")]
     #[case("decimal()", "Invalid precision in decimal")]
+    #[case("decimal(10,2,99)", "Invalid decimal format (expected 2 parts)")]
     fn test_invalid_decimal_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
         let data = format!(
             r#"{{
@@ -2373,6 +2380,39 @@ mod tests {
             err.to_string().contains(expected_error),
             "Expected error containing '{expected_error}', got: {err}"
         );
+    }
+
+    #[rstest]
+    #[case(
+        r#"{"type": "array", "elementType": "integer", "containsNull": false}"#,
+        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)))
+    )]
+    #[case(
+        r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
+        DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("b", DataType::STRING, true),
+        ])))
+    )]
+    #[case(
+        r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
+        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, true)))
+    )]
+    #[case("\"string\"", DataType::STRING)]
+    #[case("\"long\"", DataType::LONG)]
+    #[case("\"integer\"", DataType::INTEGER)]
+    #[case("\"short\"", DataType::SHORT)]
+    #[case("\"byte\"", DataType::BYTE)]
+    #[case("\"float\"", DataType::FLOAT)]
+    #[case("\"double\"", DataType::DOUBLE)]
+    #[case("\"boolean\"", DataType::BOOLEAN)]
+    #[case("\"binary\"", DataType::BINARY)]
+    #[case("\"date\"", DataType::DATE)]
+    #[case("\"timestamp\"", DataType::TIMESTAMP)]
+    #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
+        let data_type: DataType = serde_json::from_str(&type_json).unwrap();
+        assert_eq!(data_type, expected);
     }
 
     #[test]
