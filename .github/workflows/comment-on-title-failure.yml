@@ -1,0 +1,32 @@
+name: Comment on PR Title Failure
+
+on:
+  workflow_run:
+    workflows: ["Validate PR Title"]
+    types: [completed]
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Find associated PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          pr_json=$(gh api repos/${{ github.repository }}/pulls --jq ".[] | select(.head.sha == \"$HEAD_SHA\")" | head -1)
+          echo "number=$(echo "$pr_json" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+          echo "title=$(echo "$pr_json" | jq -r '.title')" >> "$GITHUB_OUTPUT"
+
+      - uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ steps.pr.outputs.number }}
+          body: |
+            PR title does not match the required pattern.
+
+            **Title:** `${{ steps.pr.outputs.title }}`
+            **Pattern:** `^(feat|fix|chore|docs|refactor|test|ci)(\(.+\))?: .{1,72}$`
