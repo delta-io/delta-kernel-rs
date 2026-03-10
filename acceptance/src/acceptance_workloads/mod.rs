@@ -95,7 +95,7 @@ impl TestCase {
 
 /// Resolve a test case from a spec file path (for datatest_stable integration).
 ///
-/// Given a path like `.../acceptance_workloads/<test_case>/specs/<workload>.json`,
+/// Given a path like `.../workloads/<test_case>/specs/<workload>.json`,
 /// walks up to find the test case root directory.
 pub fn test_case_from_spec_path(spec_path: &Path) -> Result<(TestCase, String), String> {
     let spec_path = std::fs::canonicalize(spec_path).unwrap_or_else(|_| spec_path.to_path_buf());

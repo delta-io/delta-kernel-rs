@@ -66,20 +66,19 @@ fn write_done_file() {
     write!(done_file, "done").expect("Failed to write .done file");
 }
 
-/// Get the repo root directory (parent of CARGO_MANIFEST_DIR for the acceptance crate).
-fn repo_root() -> PathBuf {
+/// Get the acceptance crate directory (CARGO_MANIFEST_DIR).
+fn acceptance_dir() -> PathBuf {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    Path::new(&manifest_dir)
-        .parent()
-        .expect("CARGO_MANIFEST_DIR has no parent")
-        .to_path_buf()
+    PathBuf::from(manifest_dir)
 }
 
-/// Extract acceptance_workloads specs from the local tar.gz if not already done.
+/// Extract acceptance workload specs from the local tar.gz if not already done.
+/// Tarball lives at `acceptance/acceptance_workloads.tar.gz` and extracts to
+/// `acceptance/workloads/`.
 fn extract_acceptance_workloads() {
-    let root = repo_root();
-    let tarball_path = root.join("kernel_benchmark_specs.tar.gz");
-    let output_dir = root.join("acceptance_workloads");
+    let dir = acceptance_dir();
+    let tarball_path = dir.join("acceptance_workloads.tar.gz");
+    let output_dir = dir.join("workloads");
     let done_marker = output_dir.join(".done");
 
     // Tell Cargo to re-run if the tarball changes
@@ -94,17 +93,18 @@ fn extract_acceptance_workloads() {
         return;
     }
 
-    let tarball_file = File::open(&tarball_path).expect("Failed to open acceptance_workloads tarball");
+    let tarball_file =
+        File::open(&tarball_path).expect("Failed to open acceptance_workloads tarball");
     let decoder = GzDecoder::new(BufReader::new(tarball_file));
     let mut archive = Archive::new(decoder);
-    std::fs::create_dir_all(&output_dir).expect("Failed to create acceptance_workloads output directory");
+    std::fs::create_dir_all(&dir).expect("Failed to create acceptance output directory");
     archive
-        .unpack(&output_dir)
+        .unpack(&dir)
         .expect("Failed to unpack acceptance_workloads tarball");
 
     // Write .done marker
     let mut done_file = BufWriter::new(
-        File::create(&done_marker).expect("Failed to create acceptance_workloads .done file"),
+        File::create(&done_marker).expect("Failed to create acceptance workloads .done file"),
     );
-    write!(done_file, "done").expect("Failed to write acceptance_workloads .done file");
+    write!(done_file, "done").expect("Failed to write acceptance workloads .done file");
 }

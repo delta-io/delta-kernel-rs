@@ -418,7 +418,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
 datatest_stable::harness! {
     {
         test = acceptance_workloads_test,
-        root = "../acceptance_workloads/",
+        root = "workloads/",
         pattern = r"specs/.*\.json$"
     },
 }
