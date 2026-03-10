@@ -232,8 +232,16 @@ pub(crate) enum FeatureRequirement {
 }
 
 /// Minimum protocol versions for legacy (pre-feature-list) inference.
-/// Fields are (min_reader_version, min_writer_version).
-pub(crate) struct MinReaderWriterVersion(pub i32, pub i32);
+pub(crate) struct MinReaderWriterVersion {
+    pub reader: i32,
+    pub writer: i32,
+}
+
+impl MinReaderWriterVersion {
+    pub(crate) const fn new(reader: i32, writer: i32) -> Self {
+        Self { reader, writer }
+    }
+}
 
 /// Rich metadata about a table feature including version requirements, dependencies, and support status
 pub(crate) struct FeatureInfo {
@@ -260,7 +268,7 @@ pub(crate) struct FeatureInfo {
 // Static FeatureInfo instances for each table feature
 static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
-    min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
@@ -271,7 +279,7 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
 // This is to allow legacy tables with the Invariants feature enabled but not in use.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
-    min_legacy_version: Some(MinReaderWriterVersion(1, 2)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -279,7 +287,7 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
 
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
-    min_legacy_version: Some(MinReaderWriterVersion(1, 3)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -287,7 +295,7 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
 
 static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
-    min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -297,7 +305,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
 
 static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
-    min_legacy_version: Some(MinReaderWriterVersion(1, 4)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(1, 4)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -305,7 +313,7 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 
 static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
-    min_legacy_version: Some(MinReaderWriterVersion(1, 6)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -453,7 +461,7 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 
 static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
-    min_legacy_version: Some(MinReaderWriterVersion(2, 5)),
+    min_legacy_version: Some(MinReaderWriterVersion::new(2, 5)),
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -599,19 +607,13 @@ impl TableFeature {
     /// Returns true if this feature can be inferred from a legacy reader protocol version.
     /// Always returns false for modern features (use feature lists instead).
     pub(crate) fn is_valid_for_legacy_reader(&self, reader_version: i32) -> bool {
-        matches!(
-            self.info().min_legacy_version,
-            Some(MinReaderWriterVersion(min_reader, _)) if reader_version >= min_reader
-        )
+        matches!(&self.info().min_legacy_version, Some(v) if reader_version >= v.reader)
     }
 
     /// Returns true if this feature can be inferred from a legacy writer protocol version.
     /// Always returns false for modern features (use feature lists instead).
     pub(crate) fn is_valid_for_legacy_writer(&self, writer_version: i32) -> bool {
-        matches!(
-            self.info().min_legacy_version,
-            Some(MinReaderWriterVersion(_, min_writer)) if writer_version >= min_writer
-        )
+        matches!(&self.info().min_legacy_version, Some(v) if writer_version >= v.writer)
     }
 
     /// Returns rich metadata about this table feature including protocol version requirements,

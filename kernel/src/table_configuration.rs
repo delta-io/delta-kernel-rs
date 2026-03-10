@@ -671,9 +671,9 @@ impl TableConfiguration {
         let info = feature.info();
         let min_legacy_version = info.min_legacy_version.as_ref();
         let min_reader_version =
-            min_legacy_version.map_or(TABLE_FEATURES_MIN_READER_VERSION, |v| v.0);
+            min_legacy_version.map_or(TABLE_FEATURES_MIN_READER_VERSION, |v| v.reader);
         let min_writer_version =
-            min_legacy_version.map_or(TABLE_FEATURES_MIN_WRITER_VERSION, |v| v.1);
+            min_legacy_version.map_or(TABLE_FEATURES_MIN_WRITER_VERSION, |v| v.writer);
         match info.feature_type {
             FeatureType::WriterOnly => {
                 if self.is_legacy_writer_version() {
