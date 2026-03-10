@@ -2411,7 +2411,7 @@ mod tests {
     #[case("\"timestamp\"", DataType::TIMESTAMP)]
     #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
     fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
-        let data_type: DataType = serde_json::from_str(&type_json).unwrap();
+        let data_type: DataType = serde_json::from_str(type_json).unwrap();
         assert_eq!(data_type, expected);
     }
 
