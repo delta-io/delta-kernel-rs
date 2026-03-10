@@ -188,14 +188,13 @@ impl DataSkippingFilter {
         partition_expr: ExpressionRef,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
         let has_stats = stats_schema.is_some();
-        let pv_schema = partition_schema;
-        let has_partitions = pv_schema.is_some();
+        let has_partitions = partition_schema.is_some();
 
         if !has_stats && !has_partitions {
             return None;
         }
 
-        let partition_columns: HashSet<String> = pv_schema
+        let partition_columns: HashSet<String> = partition_schema
             .map(|s| s.fields().map(|f| f.name().to_string()).collect())
             .unwrap_or_default();
 
@@ -205,20 +204,20 @@ impl DataSkippingFilter {
                 DataType::Struct(Box::new(stats.as_ref().clone())),
             )
         };
-        let pv_field = |pv: &SchemaRef| {
+        let partition_field = |ps: &SchemaRef| {
             StructField::nullable(
                 "partitionValues_parsed",
-                DataType::Struct(Box::new(pv.as_ref().clone())),
+                DataType::Struct(Box::new(ps.as_ref().clone())),
             )
         };
 
-        let unified_schema = match (stats_schema, pv_schema) {
-            (Some(stats), Some(pv)) => Arc::new(StructType::new_unchecked([
+        let unified_schema = match (stats_schema, partition_schema) {
+            (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
                 stats_field(stats),
-                pv_field(pv),
+                partition_field(ps),
             ])),
             (Some(stats), None) => Arc::new(StructType::new_unchecked([stats_field(stats)])),
-            (None, Some(pv)) => Arc::new(StructType::new_unchecked([pv_field(pv)])),
+            (None, Some(ps)) => Arc::new(StructType::new_unchecked([partition_field(ps)])),
             (None, None) => unreachable!("checked above"),
         };
 
