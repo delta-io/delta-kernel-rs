@@ -157,13 +157,6 @@ fn should_skip_test(test_path: &str) -> Option<&'static str> {
         ("_txn", "Transaction test type not yet supported"),
         ("_domain_metadata", "Domain metadata test type not yet supported"),
 
-        // ── Missing deletion vector files ──
-        // DV .bin files still have test%dv%prefix- prefix and need renaming in build.rs
-        ("DV-001/specs/DV-001_version_4", "Missing DV file: test%dv%prefix- not renamed"),
-        ("DV-002/specs/DV-002_version_4", "Missing DV file: test%dv%prefix- not renamed"),
-        ("DV-003/specs/DV-003_metadata_file_path", "Missing DV file: test%dv%prefix- not renamed"),
-        ("DV-005a/specs/DV-005a_count", "Missing DV file: test%dv%prefix- not renamed"),
-
         // ── Column mapping metadata on nested structs ──
         // Kernel includes delta.columnMapping.* metadata on nested struct fields,
         // but expected data has no such metadata. Data values are identical.
@@ -288,6 +281,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     ]),
     ("Kernel: snapshot construction succeeds even when data files are missing", &[
         "ct_missing_data_file/specs/ct_missing_data_file_error",
+        "dv_err_002_missing_file/specs/dv_err_002_missing_file_error",
     ]),
     ("Kernel: doesn't validate DV integrity", &[
         "dv_err_001_checksum/specs/dv_err_001_checksum_error",
@@ -309,22 +303,8 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         "tt_blocked_beyond_retention/specs/tt_blocked_beyond_retention_error",
         "tt_after_vacuum/specs/tt_after_vacuum_error",
     ]),
-    // ── Capture bugs ──
-    ("Capture bug: clone table AddFile references absolute temp path", &[
-        "ic_022_clone_basic/specs/ic_022_clone_basic_readAll",
-        "ic_022_clone_basic/specs/ic_022_clone_basic_read_all",
-        "ic_023_clone_higher_watermark/specs/ic_023_clone_higher_watermark_readAll",
-        "ic_023_clone_higher_watermark/specs/ic_023_clone_higher_watermark_read_all",
-    ]),
-    ("Capture bug: snapshot spec generated for invalid/broken table", &[
-        "dv_err_002_missing_file/specs/dv_err_002_missing_file_error.json",
-        "dsReadEmptyTable/specs/dsReadEmptyTable_snapshot",
-        "dsReadEmptyString/specs/dsReadEmptyString_snapshot",
-        "dsReadMissingCommitFile/specs/dsReadMissingCommitFile_snapshot",
-        "dsReadMissingDeltaLog/specs/dsReadMissingDeltaLog_snapshot",
-        "dsReadPathWithSpaces/specs/dsReadPathWithSpaces_snapshot",
-        "dsReadDuplicateColumns/specs/dsReadDuplicateColumns_snapshot",
-        "corrupt_checkpoint_corrupt_no_delta_files/specs/corrupt_checkpoint_corrupt_no_delta_files_snapshot",
+    ("Kernel: _metadata.file_path column projection not supported", &[
+        "DV-003/specs/DV-003_metadata_file_path",
     ]),
 ];
 
