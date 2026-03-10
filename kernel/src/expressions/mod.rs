@@ -28,25 +28,6 @@ mod scalars;
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
 
-/// Retrieves the set of column names referenced by an expression.
-#[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
-    references: HashSet<&'a ColumnName>,
-}
-
-impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
-        self.references
-    }
-}
-
-impl<'a> crate::transforms::ExpressionTransform<'a> for GetColumnReferences<'a> {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        self.references.insert(name);
-        Some(Cow::Borrowed(name))
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////
 // Operators
 ////////////////////////////////////////////////////////////////////////
@@ -660,7 +641,7 @@ impl Expression {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_expr(self);
-        references.into_inner()
+        references.0
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -825,7 +806,7 @@ impl Predicate {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_pred(self);
-        references.into_inner()
+        references.0
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
@@ -1168,6 +1149,17 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
     fn div(self, rhs: R) -> Self {
         Self::binary(BinaryExpressionOp::Divide, self, rhs)
+    }
+}
+
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+struct GetColumnReferences<'a>(HashSet<&'a ColumnName>);
+
+impl<'a> crate::transforms::ExpressionTransform<'a> for GetColumnReferences<'a> {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        self.0.insert(name);
+        Some(Cow::Borrowed(name))
     }
 }
 

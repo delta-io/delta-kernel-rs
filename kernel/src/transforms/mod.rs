@@ -6,16 +6,18 @@ mod schema;
 pub use self::expression::{ExpressionDepthChecker, ExpressionTransform};
 pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 
-/// Extension trait for converting borrowed nested transform results into transformed parents only
-/// when ownership is required.
+// Extension trait for Cow<'_, T>
 pub(crate) trait CowExt<T: ToOwned + ?Sized> {
+    /// The owned type that corresopnds to Self
     type Owned;
 
-    /// If this value is owned, map it into an owned parent with `f`. Otherwise, return borrowed
-    /// `s`.
+    /// Propagate the results of nested transforms. If the nested transform made no change (borrowed
+    /// `self`), then return a borrowed result `s` as well. Otherwise, invoke the provided mapping
+    /// function `f` to convert the owned nested result into an owned result.
     fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S>;
 }
 
+// Basic implementation for a single Cow value
 impl<T: ToOwned + ?Sized> CowExt<T> for Cow<'_, T> {
     type Owned = T::Owned;
 
@@ -27,6 +29,7 @@ impl<T: ToOwned + ?Sized> CowExt<T> for Cow<'_, T> {
     }
 }
 
+// Additional implementation for a pair of Cow values
 impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, Cow<'a, T>) {
     type Owned = (T::Owned, T::Owned);
 
