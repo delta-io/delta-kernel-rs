@@ -13,6 +13,10 @@ inputs:
     description: 'JSON array of label names on the PR'
     required: false
     default: '[]'
+  title:
+    description: 'PR title to validate. Defaults to github.event.pull_request.title.'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -20,7 +24,7 @@ runs:
     - name: Validate PR title
       shell: bash
       env:
-        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_TITLE: ${{ inputs.title || github.event.pull_request.title }}
         INPUT_REGEX: ${{ inputs.regex }}
         BREAKING_REGEX: ${{ inputs.breaking-change-regex }}
         LABELS: ${{ inputs.labels }}
