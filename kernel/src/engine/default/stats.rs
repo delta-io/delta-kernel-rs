@@ -775,6 +775,23 @@ mod tests {
             .unwrap();
         let max_col = max_values.column_by_name("value").unwrap();
         assert!(max_col.is_null(0));
+
+        // Verify the JSON serialization omits null min/max column names entirely,
+        // rather than writing "minValues":{"value":null}.
+        let json_array = to_json(&stats).unwrap();
+        let json_str = json_array.as_string::<i32>().value(0);
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(json["nullCount"]["value"], 3);
+        assert!(
+            json["minValues"].get("value").is_none(),
+            "Expected 'value' to be absent from minValues JSON, got: {}",
+            json["minValues"]
+        );
+        assert!(
+            json["maxValues"].get("value").is_none(),
+            "Expected 'value' to be absent from maxValues JSON, got: {}",
+            json["maxValues"]
+        );
     }
 
     #[test]
