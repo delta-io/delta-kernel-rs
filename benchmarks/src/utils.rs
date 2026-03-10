@@ -14,17 +14,23 @@ const DELTA_DIR_NAME: &str = "delta";
 
 /// Loads all workload specifications from `OUTPUT_FOLDER`, optionally filtered by `BENCH_TAGS`.
 ///
+/// If `KERNEL_BENCH_WORKLOAD_DIR` is set, loads from that directory instead (for remote/S3 tables).
+///
 /// Workloads are downloaded and extracted into `OUTPUT_FOLDER` at build time by `build.rs`.
 ///
 /// If the `BENCH_TAGS` environment variable is set (e.g. `BENCH_TAGS=base`),
 /// only workloads whose `table_info.json` has at least one matching tag are returned.
 /// If `BENCH_TAGS` is unset or empty, all workloads are returned.
 pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
-    let spec_dir = PathBuf::from(OUTPUT_FOLDER);
-    let benchmarks_dir = spec_dir.join(BENCHMARKS_DIR_NAME);
-    let table_directories = find_table_directories(&benchmarks_dir)?;
+    let (base_dir, required_tags) = if let Ok(dir) = std::env::var("KERNEL_BENCH_WORKLOAD_DIR") {
+        (PathBuf::from(dir), None)
+    } else {
+        let benchmarks_dir = PathBuf::from(OUTPUT_FOLDER).join(BENCHMARKS_DIR_NAME);
+        (benchmarks_dir, get_required_tags())
+    };
 
-    let required_tags = get_required_tags();
+    let table_directories = find_table_directories(&base_dir)?;
+
     let mut all_workloads = Vec::new();
 
     for table_dir in table_directories {
@@ -96,8 +102,10 @@ fn load_specs_from_table(
         }
     }
 
-    // If the table path is not provided, assume that the Delta table is in a DELTA_DIR_NAME/ subdirectory at the same level as table_info.json
-    if table_info.table_path.is_none() {
+    // Remote tables (table_path or catalog_managed_info set) don't need local data.
+    // Local tables must have a delta/ subdirectory next to tableInfo.json.
+    let is_remote = table_info.table_path.is_some() || table_info.catalog_managed_info.is_some();
+    if !is_remote {
         let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
             return Err(format!(

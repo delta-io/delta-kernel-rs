@@ -30,6 +30,13 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
+/// Info needed to access a table via Unity Catalog credential vending
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogManagedInfo {
+    pub table_name: String, // UC fully-qualified name: "catalog.schema.table"
+}
+
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +52,9 @@ pub struct TableInfo {
     /// absolute local paths. If `None`, the table is assumed to be in the `delta/` subdirectory
     /// next to `tableInfo.json`.
     pub table_path: Option<Url>,
+    /// Info needed to access a table via Unity Catalog credential vending.
+    /// When present, the engine is set up with UC credentials instead of local/S3 access.
+    pub catalog_managed_info: Option<CatalogManagedInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
     pub schema: Schema,
@@ -393,6 +403,46 @@ mod tests {
         assert_eq!(table_info.table_path, expected_table_path);
         let expected_tags: Vec<String> = expected_tags.iter().map(|s| s.to_string()).collect();
         assert_eq!(table_info.tags, expected_tags);
+    }
+
+    #[rstest]
+    #[case(
+        r#"{
+            "name": "uc_table", "description": "A UC managed table",
+            "catalogManagedInfo": {"tableName": "main.schema.table"},
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#,
+        true,
+        "main.schema.table"
+    )]
+    #[case(
+        r#"{
+            "name": "local_table", "description": "A local table",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#,
+        false,
+        ""
+    )]
+    fn test_deserialize_catalog_managed_info(
+        #[case] json: &str,
+        #[case] expect_present: bool,
+        #[case] expected_table_name: &str,
+    ) {
+        let table_info: TableInfo =
+            serde_json::from_str(json).expect("Failed to deserialize table info");
+        assert_eq!(table_info.catalog_managed_info.is_some(), expect_present);
+        if expect_present {
+            assert_eq!(
+                table_info.catalog_managed_info.unwrap().table_name,
+                expected_table_name
+            );
+        }
     }
 
     #[rstest]
