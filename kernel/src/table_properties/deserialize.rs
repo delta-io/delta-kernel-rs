@@ -9,7 +9,7 @@ use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
-use crate::ParquetCompression;
+use crate::{ParquetCompression, ParquetWriterConfig};
 
 use tracing::warn;
 
@@ -96,7 +96,9 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
         PARQUET_COMPRESSION_CODEC => {
-            props.parquet_compression_codec = ParquetCompression::from_str(v).ok()
+            props.parquet_writer_config = ParquetCompression::from_str(v)
+                .ok()
+                .map(|compression| ParquetWriterConfig { compression })
         }
         _ => return None,
     }
@@ -236,14 +238,19 @@ mod tests {
         #[case] expected: ParquetCompression,
     ) {
         let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, input)]);
-        assert_eq!(props.parquet_compression_codec, Some(expected));
+        assert_eq!(
+            props.parquet_writer_config,
+            Some(ParquetWriterConfig {
+                compression: expected
+            })
+        );
     }
 
     #[test]
     fn test_parse_parquet_compression_codec_unknown_value() {
         // Unknown value: field stays None (key consumed, not in unknown_properties)
         let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "gzip")]);
-        assert_eq!(props.parquet_compression_codec, None);
+        assert_eq!(props.parquet_writer_config, None);
         assert!(!props
             .unknown_properties
             .contains_key(PARQUET_COMPRESSION_CODEC));

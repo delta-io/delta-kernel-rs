@@ -27,7 +27,7 @@ use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
-    StorageHandler,
+    ParquetWriterConfig, StorageHandler,
 };
 
 pub mod executor;
@@ -121,6 +121,7 @@ pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+    writer_config: ParquetWriterConfig,
 }
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
@@ -130,6 +131,7 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
             object_store,
             task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
             metrics_reporter: None,
+            writer_config: Default::default(),
         }
     }
 }
@@ -144,6 +146,16 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
+    /// Set a custom Parquet writer configuration for all writes performed by this engine.
+    ///
+    /// Controls compression and other write-time settings. Defaults to Zstd compression.
+    /// Connectors can read the table property via [`crate::table_properties::TableProperties::parquet_writer_config`]
+    /// and pass it here to honor table-level compression settings.
+    pub fn with_parquet_writer_config(mut self, config: ParquetWriterConfig) -> Self {
+        self.writer_config = config;
+        self
+    }
+
     pub fn with_task_executor<F: TaskExecutor>(
         self,
         task_executor: Arc<F>,
@@ -152,12 +164,18 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
             object_store: self.object_store,
             task_executor,
             metrics_reporter: self.metrics_reporter,
+            writer_config: self.writer_config,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor,
+            self.metrics_reporter,
+            self.writer_config,
+        )
     }
 }
 
@@ -179,6 +197,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+        writer_config: ParquetWriterConfig,
     ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
@@ -190,10 +209,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 object_store.clone(),
                 task_executor.clone(),
             )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
+            parquet: Arc::new(
+                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
+                    .with_writer_config(writer_config),
+            ),
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -261,7 +280,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 physical_data,
                 physical_partition_values,
                 Some(write_context.stats_columns()),
-                write_context.parquet_writer_config(),
             )
             .await
     }

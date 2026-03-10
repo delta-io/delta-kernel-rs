@@ -34,7 +34,9 @@ fn default_parquet_handler() -> Box<dyn ParquetHandler> {
 }
 
 fn sync_parquet_handler() -> Box<dyn ParquetHandler> {
-    Box::new(SyncParquetHandler)
+    Box::new(SyncParquetHandler {
+        writer_config: Default::default(),
+    })
 }
 
 fn default_json_handler() -> Box<dyn JsonHandler> {
@@ -92,7 +94,7 @@ fn assert_no_arrow_schema(handler: &dyn ParquetHandler) {
         .unwrap(),
     ));
     handler
-        .write_parquet_file(url, Box::new(std::iter::once(Ok(data))), &Default::default())
+        .write_parquet_file(url, Box::new(std::iter::once(Ok(data))))
         .unwrap();
 
     let builder =

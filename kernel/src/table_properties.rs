@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
-use crate::{Error, ParquetCompression, Version};
+use crate::{Error, ParquetWriterConfig, Version};
 
 use strum::EnumString;
 
@@ -218,10 +218,10 @@ pub struct TableProperties {
     /// as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
-    /// The compression codec to use when writing Parquet data files.
+    /// The Parquet writer configuration derived from table properties.
     ///
     /// Parsed case-insensitively from the `delta.parquet.compression.codec` table property.
-    pub parquet_compression_codec: Option<ParquetCompression>,
+    pub parquet_writer_config: Option<ParquetWriterConfig>,
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
@@ -533,7 +533,7 @@ mod tests {
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
-            parquet_compression_codec: None,
+            parquet_writer_config: None,
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);

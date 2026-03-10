@@ -223,14 +223,12 @@ pub(crate) fn test_parquet_handler_write_always_overwrites(handler: &dyn Parquet
         .write_parquet_file(
             url.clone(),
             Box::new(std::iter::once(Ok(make_data(vec![1, 2, 3])))),
-            &Default::default(),
         )
         .unwrap();
     handler
         .write_parquet_file(
             url.clone(),
             Box::new(std::iter::once(Ok(make_data(vec![10, 20])))),
-            &Default::default(),
         )
         .unwrap();
 

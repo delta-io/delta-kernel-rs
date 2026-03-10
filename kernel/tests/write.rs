@@ -45,6 +45,7 @@ use delta_kernel::schema::{
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::FileMeta;
+use delta_kernel::{ParquetCompression, ParquetWriterConfig};
 
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
@@ -52,7 +53,7 @@ use test_utils::{
     copy_directory, create_add_files_metadata, create_default_engine, create_table,
     create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
     read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
-    setup_test_tables, test_read, test_table_setup, test_table_setup_mt, write_batch_to_table,
+    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
 };
 
 mod common;
@@ -1211,7 +1212,6 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
-            write_context.parquet_writer_config(),
         )
         .await?;
 
@@ -1386,7 +1386,6 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
-            write_context.parquet_writer_config(),
         )
         .await?;
 
@@ -3864,24 +3863,36 @@ async fn test_clustered_table_write_has_stats_parsed(
     Ok(())
 }
 
+/// Verifies that `DefaultEngineBuilder::with_parquet_writer_config` controls the compression
+/// codec used for all parquet writes, including checkpoints. Connectors can read
+/// `table_props.parquet_writer_config` and pass it to the engine builder to honor table-level
+/// compression settings.
 #[rstest::rstest]
-#[case(None, Compression::SNAPPY)]
-#[case(Some("zstd"), Compression::ZSTD(Default::default()))]
+#[case(ParquetCompression::Snappy, Compression::SNAPPY)]
+#[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_uses_configured_compression(
-    #[case] codec: Option<&str>,
+async fn test_engine_builder_with_parquet_writer_config(
+    #[case] kernel_compression: ParquetCompression,
     #[case] expected_compression: Compression,
 ) -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap().to_string();
+    let store = Arc::new(object_store::local::LocalFileSystem::new());
+    let rt = tokio::runtime::Handle::current();
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_parquet_writer_config(ParquetWriterConfig {
+                compression: kernel_compression,
+            })
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(rt)))
+            .build(),
+    );
+
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "id",
         DataType::INTEGER,
     )])?);
-    let mut builder = create_table_txn(&table_path, schema, "test_engine");
-    if let Some(codec) = codec {
-        builder = builder.with_table_properties([("delta.parquet.compression.codec", codec)]);
-    }
-    let commit_result = builder
+    let commit_result = create_table_txn(&table_path, schema, "test_engine")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
     assert!(
@@ -3889,11 +3900,11 @@ async fn test_checkpoint_uses_configured_compression(
         "table creation commit failed: {commit_result:?}"
     );
 
-    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let table_url = Url::from_directory_path(temp_dir.path()).unwrap();
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     snapshot.checkpoint(engine.as_ref())?;
 
-    // Find the checkpoint parquet file and verify its compression codec
+    // Find the checkpoint parquet file and verify its compression codec matches what was configured
     let delta_log_path = std::path::Path::new(&table_path).join("_delta_log");
     let checkpoint_file = std::fs::read_dir(&delta_log_path)
         .unwrap()

@@ -11,7 +11,7 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::default::parquet::build_writer_properties;
+use crate::engine::default::parquet::writer_options;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
@@ -22,7 +22,9 @@ use crate::{
 
 use url::Url;
 
-pub(crate) struct SyncParquetHandler;
+pub(crate) struct SyncParquetHandler {
+    pub(crate) writer_config: ParquetWriterConfig,
+}
 
 fn try_create_from_parquet(
     file: File,
@@ -92,7 +94,6 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         location: Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn crate::EngineData>>> + Send>,
-        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<()> {
         // Convert URL to file path
         let path = location
@@ -108,8 +109,9 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let props = build_writer_properties(write_config);
-        let mut writer = ArrowWriter::try_new(&mut file, first_record_batch.schema(), Some(props))?;
+        let options = writer_options(&self.writer_config);
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut file, first_record_batch.schema(), options)?;
         writer.write(&first_record_batch)?;
 
         // Write remaining batches
@@ -150,7 +152,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -176,9 +180,7 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the file
-        handler
-            .write_parquet_file(url.clone(), data_iter, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -235,7 +237,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_with_filter() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_filtered.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -261,9 +265,7 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the file
-        handler
-            .write_parquet_file(url.clone(), data_iter, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -320,7 +322,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_overwrite_true() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_overwrite.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -338,9 +342,7 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
-        handler
-            .write_parquet_file(url.clone(), data_iter1, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter1).unwrap();
         assert!(file_path.exists());
 
         // Create second data set with different data
@@ -356,9 +358,7 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data2)));
 
         // Overwrite with second file (overwrite=true)
-        handler
-            .write_parquet_file(url.clone(), data_iter2, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter2).unwrap();
 
         // Read back and verify it contains the second data set
         let file = File::open(&file_path).unwrap();
@@ -399,7 +399,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_always_overwrites() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_no_overwrite.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -417,9 +419,7 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
-        handler
-            .write_parquet_file(url.clone(), data_iter1, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter1).unwrap();
         assert!(file_path.exists());
 
         // Create second data set
@@ -435,9 +435,7 @@ mod tests {
         > = Box::new(std::iter::once(Ok(engine_data2)));
 
         // Write again - should overwrite successfully (new behavior always overwrites)
-        handler
-            .write_parquet_file(url.clone(), data_iter2, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter2).unwrap();
 
         // Verify the file was overwritten with the new data
         let file = File::open(&file_path).unwrap();
@@ -478,7 +476,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_multi_batch.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -513,9 +513,7 @@ mod tests {
         > = Box::new(batches.into_iter());
 
         // Write the file
-        handler
-            .write_parquet_file(url.clone(), data_iter, &Default::default())
-            .unwrap();
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());

@@ -682,7 +682,7 @@ pub enum ParquetCompression {
 }
 
 /// Configuration for writing Parquet files.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParquetWriterConfig {
     /// Compression codec to use. Defaults to [`ParquetCompression::Snappy`].
     pub compression: ParquetCompression,
@@ -835,8 +835,6 @@ pub trait ParquetHandler: AsAny {
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
-    /// - `write_config` - Configuration controlling how the Parquet file is written (e.g.
-    ///   compression codec).
     ///
     /// # Returns
     ///
@@ -845,7 +843,6 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
-        write_config: &ParquetWriterConfig,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
