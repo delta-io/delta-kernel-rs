@@ -5,11 +5,14 @@ use std::path::Path;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel::DeltaResult;
 use delta_kernel_benchmarks::models::{ReadExpected, SnapshotExpected};
 
-use super::workload::SnapshotResult;
+use super::workload::{ReadResult, SnapshotResult};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -158,91 +161,123 @@ fn read_expected_data(expected_dir: &Path) -> Result<Option<RecordBatch>, String
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
-/// Validate read results against expected data.
+/// Validate read results against expected outcome.
 pub fn validate_read_result(
-    actual: RecordBatch,
+    result: DeltaResult<ReadResult>,
     expected_dir: &Path,
-    expected: Option<&ReadExpected>,
+    expected: &ReadExpected,
 ) -> Result<(), String> {
-    let actual_row_count = actual.num_rows() as u64;
+    match (result, expected) {
+        (Ok(read_result), ReadExpected::Success { expected }) => {
+            // Convert schema and concat batches
+            let arrow_schema = ArrowSchema::try_from_kernel(read_result.schema.as_ref())
+                .map_err(|e| format!("Failed to convert schema: {}", e))?;
+            let schema = std::sync::Arc::new(arrow_schema);
+            let actual = concat_batches(&schema, read_result.batches.iter())
+                .map_err(|e| format!("Failed to concat batches: {}", e))?;
 
-    let expected_data = read_expected_data(expected_dir)?;
+            let actual_row_count = actual.num_rows() as u64;
 
-    if let Some(expected_data) = expected_data {
-        // Sort both batches for order-independent comparison. If sort fails (e.g., struct-only
-        // schemas that Arrow can't sort), fall back to comparing unsorted.
-        let actual = crate::data::sort_record_batch(actual.clone()).unwrap_or(actual);
-        let expected_data =
-            crate::data::sort_record_batch(expected_data.clone()).unwrap_or(expected_data);
+            // Validate against expected data files if present
+            if let Some(expected_data) = read_expected_data(expected_dir)? {
+                // Sort both batches for order-independent comparison
+                let actual = crate::data::sort_record_batch(actual.clone()).unwrap_or(actual);
+                let expected_data =
+                    crate::data::sort_record_batch(expected_data.clone()).unwrap_or(expected_data);
 
-        if actual.num_rows() != expected_data.num_rows() {
-            print_mismatch(
-                "ROW COUNT",
-                &format!(
-                    "{} rows\n{}",
-                    expected_data.num_rows(),
-                    format_batch(&expected_data)
-                ),
-                &format!("{} rows\n{}", actual.num_rows(), format_batch(&actual)),
-            );
-            return Err(format!(
-                "Row count mismatch: expected {}, got {}",
-                expected_data.num_rows(),
-                actual.num_rows()
-            ));
+                if actual.num_rows() != expected_data.num_rows() {
+                    print_mismatch(
+                        "ROW COUNT",
+                        &format!(
+                            "{} rows\n{}",
+                            expected_data.num_rows(),
+                            format_batch(&expected_data)
+                        ),
+                        &format!("{} rows\n{}", actual.num_rows(), format_batch(&actual)),
+                    );
+                    return Err(format!(
+                        "Row count mismatch: expected {}, got {}",
+                        expected_data.num_rows(),
+                        actual.num_rows()
+                    ));
+                }
+
+                if let Err(diff) = columns_match(&actual, &expected_data) {
+                    print_mismatch(
+                        "DATA",
+                        &format_batch(&expected_data),
+                        &format_batch(&actual),
+                    );
+                    return Err(format!("Data content does not match:\n{diff}"));
+                }
+            }
+
+            // Validate row count from spec
+            if actual_row_count != expected.row_count {
+                return Err(format!(
+                    "Row count mismatch: expected {}, got {actual_row_count}",
+                    expected.row_count
+                ));
+            }
+            Ok(())
         }
-
-        if let Err(diff) = columns_match(&actual, &expected_data) {
-            print_mismatch(
-                "DATA",
-                &format_batch(&expected_data),
-                &format_batch(&actual),
-            );
-            return Err(format!("Data content does not match:\n{diff}"));
+        (Err(e), ReadExpected::Error { error }) => {
+            println!("  Got expected error '{}': {}", error.error_code, e);
+            Ok(())
+        }
+        (Ok(_), ReadExpected::Error { error }) => Err(format!(
+            "Expected error '{}' but succeeded",
+            error.error_code
+        )),
+        (Err(e), ReadExpected::Success { .. }) => {
+            Err(format!("Expected success but got error: {}", e))
         }
     }
-
-    // Validate row count from expected
-    if let Some(expected) = expected {
-        if actual_row_count != expected.row_count {
-            return Err(format!(
-                "Row count mismatch: expected {}, got {actual_row_count}",
-                expected.row_count
-            ));
-        }
-    }
-
-    Ok(())
 }
 
-/// Validate snapshot result against expected protocol and metadata.
+/// Validate snapshot result against expected outcome.
 pub fn validate_snapshot(
-    result: &SnapshotResult,
+    result: DeltaResult<SnapshotResult>,
     expected: &SnapshotExpected,
 ) -> Result<(), String> {
-    let mut errors = Vec::new();
+    match (result, expected) {
+        (Ok(snapshot_result), SnapshotExpected::Success { expected }) => {
+            let mut errors = Vec::new();
 
-    if result.protocol != expected.protocol {
-        print_mismatch(
-            "PROTOCOL",
-            &format!("{:?}", expected.protocol),
-            &format!("{:?}", result.protocol),
-        );
-        errors.push("Protocol mismatch".to_string());
-    }
+            if snapshot_result.protocol != expected.protocol {
+                print_mismatch(
+                    "PROTOCOL",
+                    &format!("{:?}", expected.protocol),
+                    &format!("{:?}", snapshot_result.protocol),
+                );
+                errors.push("Protocol mismatch".to_string());
+            }
 
-    if result.metadata != expected.metadata {
-        print_mismatch(
-            "METADATA",
-            &format!("{:?}", expected.metadata),
-            &format!("{:?}", result.metadata),
-        );
-        errors.push("Metadata mismatch".to_string());
-    }
+            if snapshot_result.metadata != expected.metadata {
+                print_mismatch(
+                    "METADATA",
+                    &format!("{:?}", expected.metadata),
+                    &format!("{:?}", snapshot_result.metadata),
+                );
+                errors.push("Metadata mismatch".to_string());
+            }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+        (Err(e), SnapshotExpected::Error { error }) => {
+            println!("  Got expected error '{}': {}", error.error_code, e);
+            Ok(())
+        }
+        (Ok(_), SnapshotExpected::Error { error }) => Err(format!(
+            "Expected error '{}' but succeeded",
+            error.error_code
+        )),
+        (Err(e), SnapshotExpected::Success { .. }) => {
+            Err(format!("Expected success but got error: {}", e))
+        }
     }
 }
