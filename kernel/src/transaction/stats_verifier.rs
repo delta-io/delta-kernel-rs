@@ -244,10 +244,10 @@ impl RowVisitor for ColumnStatsVisitor<'_> {
             if null_count.is_none() {
                 self.missing_null_count.push(path.clone());
             }
-            if !all_null && !is_stat_present(getters[3], row_idx, self.data_type)? {
+            if !(all_null || is_stat_present(getters[3], row_idx, self.data_type)?) {
                 self.missing_min.push(path.clone());
             }
-            if !all_null && !is_stat_present(getters[4], row_idx, self.data_type)? {
+            if !(all_null || is_stat_present(getters[4], row_idx, self.data_type)?) {
                 self.missing_max.push(path);
             }
         }
@@ -468,7 +468,9 @@ mod tests {
 
         let columns = vec![(ColumnName::new(["col"]), DataType::LONG)];
         let verifier = StatsVerifier::new(columns);
-        let err = verifier.verify(&[batch]).unwrap_err().to_string();
+        let result = verifier.verify(&[batch]);
+        assert!(matches!(result, Err(Error::StatsValidation(_))));
+        let err = result.unwrap_err().to_string();
         assert!(err.contains("minValues"));
     }
 
