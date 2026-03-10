@@ -37,6 +37,10 @@ pub(crate) struct StateInfo {
     /// the engine receives stats with physical column names (for column mapping). This
     /// logical schema maps those stats back to the table's logical column names.
     pub(crate) logical_stats_schema: Option<SchemaRef>,
+    /// Physical partition schema with native types for checkpoint partition pruning via
+    /// `partitionValues_parsed`. Fields use physical column names (for column mapping).
+    /// Only present when the table has partition columns and a predicate is provided.
+    pub(crate) physical_partition_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -223,6 +227,33 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
+        // Build partition schema with physical names for checkpoint partition pruning.
+        // Only needed when we have a predicate and partition columns.
+        // partition_columns stores logical names (per Delta protocol), so we zip the table's
+        // logical and physical schemas (same field ordering, guaranteed by `make_physical`)
+        // to match logical names and extract the corresponding physical fields without
+        // per-field metadata lookups.
+        let physical_partition_schema = if !matches!(
+            physical_predicate,
+            PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
+        ) && !partition_columns.is_empty()
+        {
+            let partition_fields: Vec<StructField> = table_configuration
+                .logical_schema()
+                .fields()
+                .zip(table_configuration.physical_schema().fields())
+                .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
+                .map(|(_, physical_f)| physical_f.clone())
+                .collect();
+            if partition_fields.is_empty() {
+                None
+            } else {
+                Some(Arc::new(StructType::new_unchecked(partition_fields)))
+            }
+        } else {
+            None
+        };
+
         // Build stats schemas based on StatsOutputMode:
         // - AllColumns: output all stats from expected_stats_schema
         // - Columns(non-empty): merge requested + predicate columns for data skipping
@@ -285,6 +316,7 @@ impl StateInfo {
             column_mapping_mode,
             physical_stats_schema,
             logical_stats_schema,
+            physical_partition_schema,
         })
     }
 }
@@ -922,5 +954,76 @@ pub(crate) mod tests {
         } else {
             panic!("minValues should be a struct");
         }
+    }
+
+    #[test]
+    fn partition_schema_uses_physical_names_with_column_mapping() {
+        // Verify that physical_partition_schema uses physical column names when column
+        // mapping is enabled. The logical partition column "date" has physical name
+        // "col-date-phys", and the schema should reflect the physical name.
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING).with_metadata(HashMap::from([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                    MetadataValue::Number(1),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName
+                        .as_ref()
+                        .to_string(),
+                    MetadataValue::String("col-id-phys".to_string()),
+                ),
+            ])),
+            StructField::nullable("date", DataType::DATE).with_metadata(HashMap::from([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                    MetadataValue::Number(2),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName
+                        .as_ref()
+                        .to_string(),
+                    MetadataValue::String("col-date-phys".to_string()),
+                ),
+            ])),
+            StructField::nullable("value", DataType::LONG).with_metadata(HashMap::from([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                    MetadataValue::Number(3),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName
+                        .as_ref()
+                        .to_string(),
+                    MetadataValue::String("col-value-phys".to_string()),
+                ),
+            ])),
+        ]));
+
+        let predicate = Arc::new(column_expr!("date").lt(Expr::literal(100i32)));
+
+        let state_info = get_state_info(
+            schema,
+            vec!["date".to_string()],
+            Some(predicate),
+            &[TableFeature::ColumnMapping],
+            get_string_map(&[("delta.columnMapping.mode", "name")]),
+            vec![],
+        )
+        .unwrap();
+
+        // physical_partition_schema should exist and use the physical column name
+        let partition_schema = state_info
+            .physical_partition_schema
+            .as_ref()
+            .expect("should have physical_partition_schema with predicate + partition columns");
+        assert_eq!(partition_schema.num_fields(), 1);
+        let field = partition_schema.fields().next().unwrap();
+        assert_eq!(
+            field.name(),
+            "col-date-phys",
+            "partition schema should use physical column name, not logical"
+        );
+        assert_eq!(field.data_type(), &DataType::DATE);
     }
 }
