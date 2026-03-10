@@ -444,6 +444,7 @@ impl StructField {
         struct MakePhysical<'a> {
             column_mapping_mode: ColumnMappingMode,
             path: Vec<&'a str>,
+            seen: HashMap<i64, &'a str>,
             err: Option<Error>,
         }
         impl<'a> MakePhysical<'a> {
@@ -479,12 +480,22 @@ impl StructField {
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
                 self.transform_inner(field.name(), |this| {
-                    let Ok((physical_name, _id)) =
+                    let Ok((physical_name, id)) =
                         get_field_column_mapping_info(field, this.column_mapping_mode, &this.path)
                             .map_err(|e| this.err = Some(e))
                     else {
                         return None;
                     };
+
+                    if let Some(id) = id {
+                        if let Some(prev) = this.seen.insert(id, field.name()) {
+                            this.err = Some(Error::schema(format!(
+                                "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                                field.name()
+                            )));
+                            return None;
+                        }
+                    }
 
                     if field.is_metadata_column()
                         && this.column_mapping_mode != ColumnMappingMode::None
@@ -514,6 +525,7 @@ impl StructField {
         let mut transformer = MakePhysical {
             column_mapping_mode,
             path: vec![],
+            seen: HashMap::new(),
             err: None,
         };
         let result = transformer.transform_struct_field(self);
@@ -2307,6 +2319,34 @@ mod tests {
         assert!(
             err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
             "Expected full nested path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_make_physical_rejects_duplicate_column_mapping_ids() {
+        use crate::schema::ColumnMetadataKey;
+
+        fn cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
+            StructField::not_null(name, data_type).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(id),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String(format!("col-{name}")),
+                ),
+            ])
+        }
+
+        let nested = StructType::new_unchecked([
+            cm_field("x", 5, DataType::INTEGER),
+            cm_field("y", 5, DataType::INTEGER),
+        ]);
+        let outer = cm_field("outer", 10, DataType::Struct(Box::new(nested)));
+        assert_result_error_with_message(
+            outer.make_physical(ColumnMappingMode::Id),
+            "Duplicate column mapping ID",
         );
     }
 
