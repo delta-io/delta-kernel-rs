@@ -6,7 +6,6 @@
 //! Use [`create_table()`](super::super::create_table::create_table) as the entry point rather
 //! than constructing the builder directly.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,13 +17,14 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
-use crate::schema::{PrimitiveType, SchemaRef, SchemaTransform, StructType};
+use crate::schema::variant_utils::UsesVariant;
+use crate::schema::{SchemaRef, SchemaTransform};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, ColumnMappingMode, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    UsesTimestampNtz, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
@@ -243,47 +243,28 @@ fn maybe_enable_clustering(
     }
 }
 
-/// Single-pass schema visitor that detects data types requiring automatic table feature
-/// enablement during CREATE TABLE. Traverses the schema once and sets boolean flags for
-/// each detected type, avoiding repeated traversals as more schema-derived features are added.
-#[derive(Debug, Default)]
-struct SchemaFeatureDetector {
-    uses_timestamp_ntz: bool,
-    uses_variant: bool,
-}
-
-impl<'a> SchemaTransform<'a> for SchemaFeatureDetector {
-    // Called for every primitive leaf in the schema; sets uses_timestamp_ntz for TimestampNtz.
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if *ptype == PrimitiveType::TimestampNtz {
-            self.uses_timestamp_ntz = true;
-        }
-        None
-    }
-    // Called for every Variant node in the schema; sets uses_variant.
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.uses_variant = true;
-        None
-    }
-}
-
-/// Auto-enables table features based on data types present in the schema. Uses a single
-/// traversal via [`SchemaFeatureDetector`] to detect all schema-derived features at once.
-fn auto_enable_schema_derived_features(
-    schema: &SchemaRef,
-    validated: &mut ValidatedTableProperties,
-) {
-    let mut detector = SchemaFeatureDetector::default();
-    let _ = detector.transform_struct(schema);
-
-    if detector.uses_variant {
+/// Conditionally adds the `variantType` feature to the protocol when the schema contains
+/// Variant columns. Uses the [`UsesVariant`] schema visitor to detect Variant data types
+/// anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    let mut visitor = UsesVariant::default();
+    let _ = visitor.transform_struct(schema);
+    if visitor.found() {
         add_feature_to_lists(
             TableFeature::VariantType,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
     }
-    if detector.uses_timestamp_ntz {
+}
+
+/// Conditionally adds the `timestampNtz` feature to the protocol when the schema contains
+/// TimestampNTZ columns. Uses the [`UsesTimestampNtz`] schema visitor to detect TimestampNtz
+/// primitives anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    let mut visitor = UsesTimestampNtz::default();
+    let _ = visitor.transform_struct(schema);
+    if visitor.found() {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
             &mut validated.reader_features,
@@ -570,8 +551,11 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
-        // Auto-enable table features based on schema column types (single traversal)
-        auto_enable_schema_derived_features(&effective_schema, &mut validated);
+        // Auto-enable variantType feature if schema contains Variant columns
+        maybe_enable_variant_type(&effective_schema, &mut validated);
+
+        // Auto-enable timestampNtz feature if schema contains TimestampNTZ columns
+        maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -940,7 +924,7 @@ mod tests {
         test_schema(),
         &[],
     )]
-    fn test_auto_enable_schema_derived_features(
+    fn test_schema_driven_feature_auto_enablement(
         #[case] schema: SchemaRef,
         #[case] expected_features: &[TableFeature],
     ) {
@@ -950,7 +934,8 @@ mod tests {
             writer_features: vec![],
         };
 
-        auto_enable_schema_derived_features(&schema, &mut validated);
+        maybe_enable_variant_type(&schema, &mut validated);
+        maybe_enable_timestamp_ntz(&schema, &mut validated);
 
         for feature in expected_features {
             assert!(
