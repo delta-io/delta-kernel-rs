@@ -30,8 +30,11 @@ fn test_eval_is_null() {
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let resolver = HashMap::from_iter([
-            (column_name!("numRecords"), Scalar::from(2i64)),
-            (column_name!("nullCount.x"), Scalar::from(nullcount)),
+            (column_name!("stats_parsed.numRecords"), Scalar::from(2i64)),
+            (
+                column_name!("stats_parsed.nullCount.x"),
+                Scalar::from(nullcount),
+            ),
         ]);
         let filter = DefaultKernelPredicateEvaluator::from(resolver);
         for (pred, expect) in predicates.iter().zip(expected) {
@@ -73,8 +76,8 @@ fn test_eval_binary_comparisons() {
 
     let do_test = |min: &Scalar, max: &Scalar, expected: &[Option<bool>]| {
         let resolver = HashMap::from_iter([
-            (column_name!("minValues.x"), min.clone()),
-            (column_name!("maxValues.x"), max.clone()),
+            (column_name!("stats_parsed.minValues.x"), min.clone()),
+            (column_name!("stats_parsed.maxValues.x"), max.clone()),
         ]);
         let filter = DefaultKernelPredicateEvaluator::from(resolver);
         for (pred, expect) in predicates.iter().zip(expected.iter()) {
@@ -206,10 +209,13 @@ fn test_eval_distinct() {
 
     let do_test = |min: &Scalar, max: &Scalar, nullcount: i64, expected: &[Option<bool>]| {
         let resolver = HashMap::from_iter([
-            (column_name!("numRecords"), Scalar::from(2i64)),
-            (column_name!("nullCount.x"), Scalar::from(nullcount)),
-            (column_name!("minValues.x"), min.clone()),
-            (column_name!("maxValues.x"), max.clone()),
+            (column_name!("stats_parsed.numRecords"), Scalar::from(2i64)),
+            (
+                column_name!("stats_parsed.nullCount.x"),
+                Scalar::from(nullcount),
+            ),
+            (column_name!("stats_parsed.minValues.x"), min.clone()),
+            (column_name!("stats_parsed.maxValues.x"), max.clone()),
         ]);
         let filter = DefaultKernelPredicateEvaluator::from(resolver);
         for (pred, expect) in predicates.iter().zip(expected) {
@@ -277,10 +283,16 @@ fn test_sql_where() {
                 HashMap::new()
             } else {
                 HashMap::from_iter([
-                    (column_name!("numRecords"), Scalar::from(ROWCOUNT)),
-                    (column_name!("nullCount.x"), Scalar::from(nulls)),
-                    (column_name!("minValues.x"), min.clone()),
-                    (column_name!("maxValues.x"), max.clone()),
+                    (
+                        column_name!("stats_parsed.numRecords"),
+                        Scalar::from(ROWCOUNT),
+                    ),
+                    (
+                        column_name!("stats_parsed.nullCount.x"),
+                        Scalar::from(nulls),
+                    ),
+                    (column_name!("stats_parsed.minValues.x"), min.clone()),
+                    (column_name!("stats_parsed.maxValues.x"), max.clone()),
                 ])
             };
             let filter = DefaultKernelPredicateEvaluator::from(resolver);
@@ -290,7 +302,8 @@ fn test_sql_where() {
                 expect,
                 "{pred:#?} became {skipping_pred:#?} ({min}..{max}, {nulls} nulls)"
             );
-            let skipping_sql_pred = as_sql_data_skipping_predicate(pred).unwrap();
+            let skipping_sql_pred =
+                as_sql_data_skipping_predicate(pred, &Default::default()).unwrap();
             expect_eq!(
                 filter.eval(&skipping_sql_pred),
                 expect_sql,
@@ -345,7 +358,9 @@ fn test_sql_where() {
 // are truncated to milliseconds in add.stats.
 #[test]
 fn test_timestamp_skipping_disabled() {
-    let creator = DataSkippingPredicateCreator;
+    let creator = DataSkippingPredicateCreator {
+        partition_columns: Default::default(),
+    };
     let col = &column_name!("timestamp_col");
 
     assert!(
@@ -489,7 +504,7 @@ fn test_timestamp_predicates_dont_data_skip() {
         let skipping_pred = as_data_skipping_predicate(&pred);
         assert_eq!(
             skipping_pred.unwrap().to_string(),
-            "Column(minValues.ts_col) < 1000000"
+            "Column(stats_parsed.minValues.ts_col) < 1000000"
         );
 
         // GT will do maxValues -> BLOCKED
@@ -504,14 +519,222 @@ fn test_timestamp_predicates_dont_data_skip() {
         let skipping_pred = as_data_skipping_predicate(&pred);
         assert_eq!(
             skipping_pred.unwrap().to_string(),
-            "AND(NOT(Column(minValues.ts_col) > 1000000), null)"
+            "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), null)"
         );
 
         let pred = Pred::ne(col.clone(), timestamp.clone());
         let skipping_pred = as_data_skipping_predicate(&pred);
         assert_eq!(
             skipping_pred.unwrap().to_string(),
-            "OR(NOT(Column(minValues.ts_col) = 1000000), null)"
+            "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), null)"
         );
     }
+}
+
+// Tests for partition-aware data skipping
+
+/// Helper to build a partition columns set with a single "part_col" entry.
+fn test_partition_columns() -> HashSet<String> {
+    ["part_col".to_string()].into()
+}
+
+/// Helper to build a resolver for mixed partition + data stats evaluation.
+fn mixed_resolver(
+    part_val: &str,
+    max_data: i32,
+) -> DefaultKernelPredicateEvaluator<HashMap<ColumnName, Scalar>> {
+    DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from(part_val),
+        ),
+        (
+            column_name!("stats_parsed.maxValues.data_col"),
+            Scalar::from(max_data),
+        ),
+    ]))
+}
+
+#[test]
+fn test_partition_column_rewrite() {
+    let partition_columns = test_partition_columns();
+
+    // Partition column equality rewrites to partitionValues (not minValues/maxValues)
+    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("2025-01-01"));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("partitionValues_parsed.part_col")),
+        "Expected partitionValues_parsed.part_col, got {pred_str:?}"
+    );
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| !s.contains("minValues") && !s.contains("maxValues")),
+        "Should not contain minValues/maxValues for partition columns"
+    );
+
+    // Data column still rewrites to stats_parsed.minValues/maxValues
+    let pred = Pred::gt(column_expr!("data_col"), Scalar::from(100));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("stats_parsed.maxValues.data_col")),
+        "Expected stats_parsed.maxValues.data_col for data column, got {pred_str:?}"
+    );
+}
+
+#[rstest]
+#[case::is_null(
+    Pred::is_null(column_expr!("part_col")),
+    "Column(partitionValues_parsed.part_col) IS NULL"
+)]
+#[case::is_not_null(
+    Pred::is_not_null(column_expr!("part_col")),
+    "NOT(Column(partitionValues_parsed.part_col) IS NULL)"
+)]
+fn test_partition_column_is_null(#[case] pred: Pred, #[case] expected: &str) {
+    let partition_columns = test_partition_columns();
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    assert_eq!(
+        skipping_pred.as_ref().map(|p| p.to_string()).as_deref(),
+        Some(expected),
+    );
+}
+
+#[test]
+fn test_mixed_partition_and_data_or_predicate() {
+    let partition_columns = test_partition_columns();
+
+    // Mixed OR: partition_col = 'X' OR data_col > 100
+    // This should produce a valid skipping predicate (not None) because both
+    // operands are now eligible for data skipping.
+    let pred = Pred::or(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns.clone());
+    assert!(
+        skipping_pred.is_some(),
+        "Mixed partition+data OR should produce a valid skipping predicate"
+    );
+    let pred_str = skipping_pred.as_ref().map(|p| p.to_string());
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("partitionValues_parsed.part_col")),
+        "Should reference partitionValues for partition column"
+    );
+    assert!(
+        pred_str
+            .as_ref()
+            .is_some_and(|s| s.contains("stats_parsed.maxValues.data_col")),
+        "Should reference stats_parsed.maxValues for data column"
+    );
+}
+
+#[rstest]
+#[case::both_miss("Y", 50, FALSE)]
+#[case::partition_match("X", 50, TRUE)]
+#[case::data_match("Y", 200, TRUE)]
+fn test_mixed_partition_and_data_or_evaluation(
+    #[case] part_val: &str,
+    #[case] max_data: i32,
+    #[case] expected: Option<bool>,
+) {
+    let partition_columns = test_partition_columns();
+
+    // WHERE part_col = 'X' OR data_col > 100
+    let pred = Pred::or(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns).expect("should exist");
+
+    let filter = mixed_resolver(part_val, max_data);
+    assert_eq!(
+        filter.eval(&skipping_pred),
+        expected,
+        "part_col='{part_val}' max(data_col)={max_data}"
+    );
+}
+
+#[rstest]
+#[case::both_match("X", 200, TRUE)]
+#[case::partition_miss("Y", 200, FALSE)]
+#[case::data_miss("X", 50, FALSE)]
+#[case::both_miss("Y", 50, FALSE)]
+fn test_mixed_partition_and_data_and_evaluation(
+    #[case] part_val: &str,
+    #[case] max_data: i32,
+    #[case] expected: Option<bool>,
+) {
+    let partition_columns = test_partition_columns();
+
+    // WHERE part_col = 'X' AND data_col > 100
+    let pred = Pred::and(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns).expect("should exist");
+
+    let filter = mixed_resolver(part_val, max_data);
+    assert_eq!(
+        filter.eval(&skipping_pred),
+        expected,
+        "part_col='{part_val}' max(data_col)={max_data}"
+    );
+}
+
+#[test]
+fn test_partition_column_comparison_uses_exact_value() {
+    let partition_columns = test_partition_columns();
+
+    // part_col > 'B' rewrites both min and max to partitionValues_parsed.part_col
+    let pred = Pred::gt(column_expr!("part_col"), Scalar::from("B"));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns).expect("should exist");
+
+    // part_col='A': 'A' > 'B' is false -> skip
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        Scalar::from("A"),
+    )]));
+    assert_eq!(resolver.eval(&skipping_pred), FALSE);
+
+    // part_col='C': 'C' > 'B' is true -> keep
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        Scalar::from("C"),
+    )]));
+    assert_eq!(resolver.eval(&skipping_pred), TRUE);
+}
+
+#[test]
+fn test_partition_only_predicate() {
+    let partition_columns = test_partition_columns();
+
+    // Partition-only: no data columns involved
+    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("X"));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, partition_columns).expect("should exist");
+    let pred_str = skipping_pred.to_string();
+    assert!(
+        pred_str.contains("partitionValues_parsed.part_col"),
+        "Should reference partitionValues_parsed"
+    );
+    assert!(
+        !pred_str.contains("stats_parsed"),
+        "Partition-only predicate should not reference stats_parsed"
+    );
 }
