@@ -8,6 +8,7 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use url::Url;
@@ -16,6 +17,7 @@ use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform, StatsConfig,
+    StripFieldMetadataTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
@@ -59,6 +61,16 @@ pub(crate) enum InCommitTimestampEnablement {
         /// with ICT enabled from the beginning (no enablement properties needed).
         enablement: Option<(Version, i64)>,
     },
+}
+
+/// Utility function to strip field metadata from stats schemas. This metadata describes logical
+/// table columns, not the stats. Keeping it can cause schema mismatches when combining the parsed
+/// stats from a checkpoint written before logical metadata was added.
+fn strip_metadata(schema: SchemaRef) -> SchemaRef {
+    match StripFieldMetadataTransform.transform_struct(&schema) {
+        Some(Cow::Owned(s)) => Arc::new(s),
+        _ => schema,
+    }
 }
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
@@ -238,6 +250,14 @@ impl TableConfiguration {
             .transform_struct(&logical_stats_schema)
             .map(|s| Arc::new(s.into_owned()))
             .unwrap_or_else(|| logical_stats_schema.clone()),
+        };
+
+        let logical_stats_schema = strip_metadata(logical_stats_schema);
+        let physical_stats_schema = if Arc::ptr_eq(&logical_stats_schema, &physical_stats_schema) {
+            // no need to run a second strip if they are the same schema
+            logical_stats_schema.clone()
+        } else {
+            strip_metadata(physical_stats_schema)
         };
         Ok(ExpectedStatsSchemas {
             logical: logical_stats_schema,

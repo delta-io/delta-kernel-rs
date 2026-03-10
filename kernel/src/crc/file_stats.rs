@@ -1,6 +1,9 @@
-// No consumers yet -- will be integrated in a follow-up PR.
+// FileStatsDelta is not yet consumed outside this module.
 #![allow(dead_code)]
-//! File statistics delta: the file count and size changes from a single commit.
+//! File statistics and deltas for CRC tracking.
+//!
+//! [`FileStats`] represents absolute file-level statistics (count and size) for a table version.
+//! [`FileStatsDelta`] captures the net changes from a single commit.
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
@@ -13,6 +16,19 @@ use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, RowVisitor};
+
+/// File-level statistics for a table version: total file count and size.
+///
+/// Obtained via [`Crc::file_stats()`](super::Crc::file_stats), which returns `None` when
+/// the stats are not known to be valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStats {
+    /// Number of active [`Add`](crate::actions::Add) file actions in this table version.
+    pub num_files: i64,
+    /// Total size of the table in bytes (sum of all active
+    /// [`Add`](crate::actions::Add) file sizes).
+    pub table_size_bytes: i64,
+}
 
 /// Net file count and size changes from a single commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

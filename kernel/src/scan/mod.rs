@@ -40,6 +40,7 @@ pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
+pub(crate) mod transform_spec;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

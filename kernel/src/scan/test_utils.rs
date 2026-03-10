@@ -20,8 +20,8 @@ use crate::{
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
+use crate::scan::transform_spec::TransformSpec;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::TransformSpec;
 
 // Generates a batch of sidecar actions with the given paths.
 // The schema is provided as null columns affect equality checks.

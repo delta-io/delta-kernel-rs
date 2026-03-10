@@ -9,12 +9,12 @@ use tracing::debug;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
+use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::PhysicalPredicate;
 use crate::scan::StatsOutputMode;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{FieldTransformSpec, TransformSpec};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
