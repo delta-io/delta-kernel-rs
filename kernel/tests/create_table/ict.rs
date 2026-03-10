@@ -32,13 +32,11 @@ fn assert_ict_state(
         let protocol = table_config.protocol();
         assert!(
             protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION,
-            "Reader version should be at least {}",
-            TABLE_FEATURES_MIN_READER_VERSION
+            "Reader version should be at least {TABLE_FEATURES_MIN_READER_VERSION}"
         );
         assert!(
             protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION,
-            "Writer version should be at least {}",
-            TABLE_FEATURES_MIN_WRITER_VERSION
+            "Writer version should be at least {TABLE_FEATURES_MIN_WRITER_VERSION}"
         );
         assert!(
             protocol
