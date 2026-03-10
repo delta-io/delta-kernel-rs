@@ -442,6 +442,10 @@ pub(crate) struct PhysicalStatsSchemaTransform {
     active: bool,
 }
 
+/// Recursively converts fields to physical names, stripping all column mapping metadata
+/// (including [`ColumnMetadataKey::ParquetFieldId`]).
+///
+/// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
 pub(crate) fn make_physical_stats_schema(
     stype: &StructType,
     column_mapping_mode: ColumnMappingMode,
