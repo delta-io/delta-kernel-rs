@@ -28,9 +28,11 @@ pub enum ParallelScan {
 
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableInfo {
     pub name: String,                // Table name used for identifying the table
     pub description: Option<String>, // Human-readable description of the table
+    #[serde(alias = "table_root_path")]
     pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file

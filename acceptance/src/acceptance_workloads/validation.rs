@@ -1,5 +1,6 @@
 //! Result validation for acceptance workload test cases.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use delta_kernel::DeltaResult;
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
+use serde_json::Value;
 
 use super::types::{ExpectedSummary, ReadExpected, SnapshotExpected};
 use super::workload::SnapshotResult;
@@ -108,6 +110,75 @@ fn columns_match(actual: &RecordBatch, expected: &RecordBatch) -> Result<(), Str
     }
 }
 
+// ── Protocol/Metadata comparison helpers ────────────────────────────────────
+
+fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|v| v.as_str())
+}
+
+/// Compare protocol Values with set-based feature comparison (order-independent).
+fn protocols_match(actual: &Value, expected: &Value) -> bool {
+    let get_i64 = |v: &Value, key: &str| v.get(key).and_then(|v| v.as_i64());
+    if get_i64(actual, "minReaderVersion") != get_i64(expected, "minReaderVersion") {
+        return false;
+    }
+    if get_i64(actual, "minWriterVersion") != get_i64(expected, "minWriterVersion") {
+        return false;
+    }
+    features_match(actual.get("readerFeatures"), expected.get("readerFeatures"))
+        && features_match(actual.get("writerFeatures"), expected.get("writerFeatures"))
+}
+
+/// Compare feature lists as sets (order-independent).
+fn features_match(actual: Option<&Value>, expected: Option<&Value>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(Value::Null), None) | (None, Some(Value::Null)) => true,
+        (Some(Value::Array(a)), Some(Value::Array(e))) => {
+            let a_set: HashSet<&str> = a.iter().filter_map(|v| v.as_str()).collect();
+            let e_set: HashSet<&str> = e.iter().filter_map(|v| v.as_str()).collect();
+            a_set == e_set
+        }
+        _ => false,
+    }
+}
+
+/// Compare metadata Values, parsing schemaString as JSON for structural comparison
+/// and skipping createdTime (which varies between runs).
+fn metadata_matches(actual: &Value, expected: &Value) -> bool {
+    // Compare id
+    if get_str(actual, "id") != get_str(expected, "id") {
+        return false;
+    }
+    // Compare format
+    if actual.get("format") != expected.get("format") {
+        return false;
+    }
+    // Compare schemaString as parsed JSON (handles whitespace/key order differences)
+    let parse_schema = |v: &Value| -> Option<Value> {
+        get_str(v, "schemaString").and_then(|s| serde_json::from_str(s).ok())
+    };
+    match (parse_schema(actual), parse_schema(expected)) {
+        (Some(a), Some(e)) => {
+            if a != e {
+                return false;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    // Compare partitionColumns
+    if actual.get("partitionColumns") != expected.get("partitionColumns") {
+        return false;
+    }
+    // Compare configuration
+    if actual.get("configuration") != expected.get("configuration") {
+        return false;
+    }
+    // Skip createdTime — it varies between runs
+    true
+}
+
 // ── Expected data loading ───────────────────────────────────────────────────
 
 async fn read_expected_data(expected_dir: &Path) -> DeltaResult<Option<RecordBatch>> {
@@ -164,24 +235,33 @@ fn read_expected_summary(expected_dir: &Path) -> Option<ExpectedSummary> {
     serde_json::from_reader(file).ok()
 }
 
-fn read_expected_protocol(expected_dir: &Path) -> Option<super::types::Protocol> {
+fn read_expected_protocol(expected_dir: &Path) -> Option<Value> {
     let path = expected_dir.join("protocol.json");
     if !path.exists() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    let wrapper: super::types::ProtocolWrapper = serde_json::from_reader(file).ok()?;
-    Some(wrapper.protocol)
+    let content = std::fs::read_to_string(path).ok()?;
+    let wrapper: Value = serde_json::from_str(&content).ok()?;
+    // Support both wrapped {"protocol": {...}} and bare {...} formats
+    wrapper
+        .get("protocol")
+        .cloned()
+        .or(Some(wrapper))
 }
 
-fn read_expected_metadata(expected_dir: &Path) -> Option<super::types::Metadata> {
+fn read_expected_metadata(expected_dir: &Path) -> Option<Value> {
     let path = expected_dir.join("metadata.json");
     if !path.exists() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    let wrapper: super::types::MetadataWrapper = serde_json::from_reader(file).ok()?;
-    Some(wrapper.meta_data)
+    let content = std::fs::read_to_string(path).ok()?;
+    let wrapper: Value = serde_json::from_str(&content).ok()?;
+    // Support both wrapped {"metaData": {...}} and bare {...} formats
+    wrapper
+        .get("metaData")
+        .or_else(|| wrapper.get("meta_data"))
+        .cloned()
+        .or(Some(wrapper))
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -250,7 +330,7 @@ pub fn validate_snapshot(
         .and_then(|e| e.protocol.clone())
         .or_else(|| read_expected_protocol(expected_dir));
     if let Some(ref expected) = expected_protocol {
-        if result.protocol != *expected {
+        if !protocols_match(&result.protocol, expected) {
             print_mismatch(
                 "PROTOCOL",
                 &serde_json::to_string_pretty(expected).unwrap(),
@@ -265,7 +345,7 @@ pub fn validate_snapshot(
         .and_then(|e| e.metadata.clone())
         .or_else(|| read_expected_metadata(expected_dir));
     if let Some(ref expected) = expected_metadata {
-        if result.metadata != *expected {
+        if !metadata_matches(&result.metadata, expected) {
             print_mismatch(
                 "METADATA",
                 &serde_json::to_string_pretty(expected).unwrap(),

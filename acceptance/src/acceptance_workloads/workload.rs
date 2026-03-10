@@ -13,7 +13,7 @@ use delta_kernel::{DeltaResult, Engine, Error, Version};
 use itertools::Itertools;
 use url::Url;
 
-use super::types::{Metadata, MetadataFormat, Protocol, WorkloadSpec};
+use super::types::WorkloadSpec;
 
 /// Result of executing a read workload
 pub struct ReadResult {
@@ -113,12 +113,14 @@ impl ReadResult {
     }
 }
 
-/// Result of executing a snapshot workload
-#[derive(Debug, serde::Serialize)]
+/// Result of executing a snapshot workload.
+/// Protocol and metadata are stored as `serde_json::Value` to allow flexible
+/// comparison without duplicating kernel's Protocol/Metadata types.
+#[derive(Debug)]
 pub struct SnapshotResult {
     pub version: Version,
-    pub protocol: Protocol,
-    pub metadata: Metadata,
+    pub protocol: serde_json::Value,
+    pub metadata: serde_json::Value,
 }
 
 /// Workload execution result
@@ -258,34 +260,16 @@ pub fn execute_snapshot_workload(
     let protocol = config.protocol();
     let metadata = config.metadata();
 
+    // Serialize kernel types directly to serde_json::Value — no duplicate structs needed
+    let protocol_value = serde_json::to_value(protocol)
+        .map_err(|e| Error::generic(format!("Failed to serialize protocol: {e}")))?;
+    let metadata_value = serde_json::to_value(metadata)
+        .map_err(|e| Error::generic(format!("Failed to serialize metadata: {e}")))?;
+
     Ok(SnapshotResult {
         version: snapshot.version(),
-        protocol: Protocol {
-            min_reader_version: protocol.min_reader_version(),
-            min_writer_version: protocol.min_writer_version(),
-            reader_features: protocol
-                .reader_features()
-                .map(|f| f.iter().map(|feat| feat.to_string()).collect()),
-            writer_features: protocol
-                .writer_features()
-                .map(|f| f.iter().map(|feat| feat.to_string()).collect()),
-        },
-        metadata: Metadata {
-            id: metadata.id().to_string(),
-            // TODO: kernel doesn't expose Format through public API yet
-            format: MetadataFormat {
-                provider: "parquet".to_string(),
-                options: std::collections::HashMap::new(),
-            },
-            schema_string: Some(metadata.schema_string().to_string()),
-            partition_columns: metadata.partition_columns().to_vec(),
-            configuration: metadata
-                .configuration()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            created_time: None,
-        },
+        protocol: protocol_value,
+        metadata: metadata_value,
     })
 }
 

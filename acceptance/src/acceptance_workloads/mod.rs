@@ -48,10 +48,10 @@ impl TestCase {
             if path.exists() {
                 let content = std::fs::read_to_string(&path)
                     .map_err(|e| format!("Failed to read table_info.json: {}", e))?;
-                Some(
-                    serde_json::from_str(&content)
-                        .map_err(|e| format!("Failed to parse table_info.json: {}", e))?,
-                )
+                let mut info: TableInfo = serde_json::from_str(&content)
+                    .map_err(|e| format!("Failed to parse table_info.json: {}", e))?;
+                info.table_info_dir = root_dir.clone();
+                Some(info)
             } else {
                 None
             }
@@ -71,7 +71,7 @@ impl TestCase {
         let table_path = self
             .table_info
             .as_ref()
-            .map(|ti| ti.resolved_table_root(&self.root_dir))
+            .map(|ti| ti.resolved_table_root())
             .unwrap_or_else(|| self.root_dir.join("delta").to_string_lossy().to_string());
         // If it looks like a URL already (s3://, etc.), parse directly
         if table_path.contains("://") {
