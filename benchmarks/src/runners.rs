@@ -254,7 +254,6 @@ mod tests {
             time_travel: None,
             predicate: None,
             columns: None,
-            error: None,
             expected: None,
         }
     }
@@ -315,7 +314,6 @@ mod tests {
     fn test_snapshot_spec() -> SnapshotSpec {
         SnapshotSpec {
             time_travel: None,
-            error: None,
             expected: None,
         }
     }

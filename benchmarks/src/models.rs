@@ -66,13 +66,6 @@ impl Spec {
         }
     }
 
-    pub fn expected_error(&self) -> Option<&ExpectedError> {
-        match self {
-            Spec::Read(r) => r.error.as_ref(),
-            Spec::Snapshot(s) => s.error.as_ref(),
-        }
-    }
-
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         serde_json::from_str(&content)
@@ -88,9 +81,7 @@ pub struct ReadSpec {
     pub predicate: Option<String>,
     #[serde(default)]
     pub columns: Option<Vec<String>>,
-    #[serde(default)]
-    pub error: Option<ExpectedError>,
-    #[serde(default)]
+    #[serde(flatten)]
     pub expected: Option<ReadExpected>,
 }
 
@@ -105,9 +96,7 @@ impl ReadSpec {
 pub struct SnapshotSpec {
     #[serde(flatten)]
     pub time_travel: Option<TimeTravel>,
-    #[serde(default)]
-    pub error: Option<ExpectedError>,
-    #[serde(default)]
+    #[serde(flatten)]
     pub expected: Option<SnapshotExpected>,
 }
 
@@ -129,16 +118,32 @@ pub struct ExpectedError {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReadExpected {
+pub struct ReadSuccess {
     pub row_count: u64,
 }
 
 /// Expected snapshot values using kernel's Protocol and Metadata types.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SnapshotExpected {
+pub struct SnapshotSuccess {
     pub protocol: Protocol,
     pub metadata: Metadata,
+}
+
+/// Expected outcome: either success with expected values, or an expected error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ReadExpected {
+    Success { expected: ReadSuccess },
+    Error { error: ExpectedError },
+}
+
+/// Expected outcome for snapshot: either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SnapshotExpected {
+    Success { expected: Box<SnapshotSuccess> },
+    Error { error: ExpectedError },
 }
 
 // ── Benchmark-specific types ────────────────────────────────────────────────
