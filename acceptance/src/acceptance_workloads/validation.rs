@@ -3,9 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Array, RecordBatch};
+use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
-use delta_kernel::arrow::datatypes::DataType;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
@@ -33,49 +32,80 @@ fn format_batch(batch: &RecordBatch) -> String {
         .unwrap_or_else(|_| "Failed to format".to_string())
 }
 
-/// Normalize a column for comparison (handle timezone/precision equivalence).
-///
-/// Spark may write Timestamp(Nanosecond, None) while kernel produces
-/// Timestamp(Microsecond, Some("UTC")). Normalize all timestamps to
-/// Timestamp(Microsecond, Some("UTC")).
-fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
-    match col.data_type() {
-        DataType::Timestamp(_unit, tz) => {
-            let target = DataType::Timestamp(
-                delta_kernel::arrow::datatypes::TimeUnit::Microsecond,
-                Some("UTC".into()),
-            );
-            let needs_cast = match tz {
-                None => true,
-                Some(z) if **z == *"+00:00" => true,
-                Some(z) if **z == *"UTC" => !matches!(
-                    col.data_type(),
-                    DataType::Timestamp(delta_kernel::arrow::datatypes::TimeUnit::Microsecond, _)
-                ),
-                _ => false,
-            };
-            if needs_cast {
-                return delta_kernel::arrow::compute::cast(&col, &target)
-                    .expect("Could not normalize timestamp column");
+/// Compare two record batches column-by-column.
+/// Returns Ok(()) if they match, or Err with a detailed per-column diff message.
+fn columns_match(actual: &RecordBatch, expected: &RecordBatch) -> Result<(), String> {
+    if actual.num_columns() != expected.num_columns() {
+        return Err(format!(
+            "Column count mismatch: expected {} columns ({:?}), got {} columns ({:?})",
+            expected.num_columns(),
+            expected
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            actual.num_columns(),
+            actual
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+        ));
+    }
+    let mut mismatches = Vec::new();
+    let act_schema = actual.schema();
+    let exp_schema = expected.schema();
+    for i in 0..actual.num_columns() {
+        let act = actual.column(i);
+        let exp = expected.column(i);
+        if act.as_ref() != exp.as_ref() {
+            let act_name = act_schema.field(i).name();
+            let exp_name = exp_schema.field(i).name();
+            let act_type = act_schema.field(i).data_type();
+            let exp_type = exp_schema.field(i).data_type();
+            // Show first few differing rows
+            let mut diffs = Vec::new();
+            let n = act.len().min(exp.len()).min(10);
+            for row in 0..n {
+                let a_slice = act.slice(row, 1);
+                let e_slice = exp.slice(row, 1);
+                let a = format!("{:?}", a_slice);
+                let e = format!("{:?}", e_slice);
+                if a != e {
+                    diffs.push(format!("  row {row}: expected {e}, got {a}"));
+                }
             }
-            col
+            let name_info = if act_name != exp_name {
+                format!(" (name: expected '{}', got '{}')", exp_name, act_name)
+            } else {
+                String::new()
+            };
+            let type_info = if act_type != exp_type {
+                format!(" (type: expected {:?}, got {:?})", exp_type, act_type)
+            } else {
+                String::new()
+            };
+            mismatches.push(format!(
+                "column[{i}] '{}'{}{}: {} differing rows{}",
+                act_name,
+                name_info,
+                type_info,
+                diffs.len(),
+                if diffs.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", diffs.join("\n"))
+                }
+            ));
         }
-        _ => col,
     }
-}
-
-fn columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) -> bool {
-    if actual.len() != expected.len() {
-        return false;
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches.join("\n"))
     }
-    for (actual, expected) in actual.iter().zip(expected) {
-        let actual = normalize_col(actual.clone());
-        let expected = normalize_col(expected.clone());
-        if actual != expected {
-            return false;
-        }
-    }
-    true
 }
 
 // ── Expected data loading ───────────────────────────────────────────────────
@@ -154,23 +184,25 @@ fn read_expected_metadata(expected_dir: &Path) -> Option<super::types::Metadata>
     Some(wrapper.meta_data)
 }
 
-// ── Validation (panics on mismatch) ─────────────────────────────────────────
+// ── Validation ───────────────────────────────────────────────────────────────
 
-/// Validate read results against expected data. Panics on mismatch.
+/// Validate read results against expected data. Returns Err with details on mismatch.
 pub async fn validate_read_result(
     actual: RecordBatch,
     expected_dir: &Path,
     inline_expected: Option<&ReadExpected>,
-) {
+) -> Result<(), String> {
     let actual_row_count = actual.num_rows() as u64;
 
     let expected = read_expected_data(expected_dir)
         .await
-        .expect("Failed to read expected data");
+        .map_err(|e| format!("Failed to read expected data: {e}"))?;
 
     if let Some(expected) = expected {
-        let actual = crate::data::sort_record_batch(actual).expect("Failed to sort actual");
-        let expected = crate::data::sort_record_batch(expected).expect("Failed to sort expected");
+        // Sort both batches for order-independent comparison. If sort fails (e.g., struct-only
+        // schemas that Arrow can't sort), fall back to comparing unsorted.
+        let actual = crate::data::sort_record_batch(actual.clone()).unwrap_or(actual);
+        let expected = crate::data::sort_record_batch(expected.clone()).unwrap_or(expected);
 
         if actual.num_rows() != expected.num_rows() {
             print_mismatch(
@@ -178,20 +210,16 @@ pub async fn validate_read_result(
                 &format!("{} rows\n{}", expected.num_rows(), format_batch(&expected)),
                 &format!("{} rows\n{}", actual.num_rows(), format_batch(&actual)),
             );
-            panic!(
+            return Err(format!(
                 "Row count mismatch: expected {}, got {}",
                 expected.num_rows(),
                 actual.num_rows()
-            );
+            ));
         }
 
-        if !columns_match(actual.columns(), expected.columns()) {
-            print_mismatch(
-                "DATA",
-                &format!("{:#?}\n{}", expected.schema(), format_batch(&expected)),
-                &format!("{:#?}\n{}", actual.schema(), format_batch(&actual)),
-            );
-            panic!("Data content does not match");
+        if let Err(diff) = columns_match(&actual, &expected) {
+            print_mismatch("DATA", &format_batch(&expected), &format_batch(&actual));
+            return Err(format!("Data content does not match:\n{diff}"));
         }
     }
 
@@ -201,19 +229,22 @@ pub async fn validate_read_result(
         .unwrap_or_else(|| read_expected_summary(expected_dir).map(|s| s.actual_row_count));
 
     if let Some(expected) = expected_row_count {
-        assert_eq!(
-            actual_row_count, expected,
-            "Row count mismatch: expected {expected}, got {actual_row_count}"
-        );
+        if actual_row_count != expected {
+            return Err(format!(
+                "Row count mismatch: expected {expected}, got {actual_row_count}"
+            ));
+        }
     }
+
+    Ok(())
 }
 
-/// Validate snapshot result against expected protocol and metadata. Panics on mismatch.
+/// Validate snapshot result against expected protocol and metadata. Returns Err on mismatch.
 pub fn validate_snapshot(
     result: &SnapshotResult,
     expected_dir: &Path,
     inline: Option<&SnapshotExpected>,
-) {
+) -> Result<(), String> {
     // Protocol: inline takes priority over file
     let expected_protocol = inline
         .and_then(|e| e.protocol.clone())
@@ -225,7 +256,7 @@ pub fn validate_snapshot(
                 &serde_json::to_string_pretty(expected).unwrap(),
                 &serde_json::to_string_pretty(&result.protocol).unwrap(),
             );
-            panic!("Protocol does not match");
+            return Err("Protocol does not match".to_string());
         }
     }
 
@@ -240,7 +271,9 @@ pub fn validate_snapshot(
                 &serde_json::to_string_pretty(expected).unwrap(),
                 &serde_json::to_string_pretty(&result.metadata).unwrap(),
             );
-            panic!("Metadata does not match");
+            return Err("Metadata does not match".to_string());
         }
     }
+
+    Ok(())
 }

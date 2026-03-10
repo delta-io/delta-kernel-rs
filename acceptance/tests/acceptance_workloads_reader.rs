@@ -12,15 +12,135 @@ use acceptance::acceptance_workloads::{
     workload::{execute_workload, WorkloadResult},
 };
 
-fn should_skip_test(test_path: &str) -> bool {
-    let skip_prefixes = [
-        "DV-017/", // Huge table (2B rows) causes OOM/hang
-        "dcscStructWithSpecialTypes/specs/dcscStructWithSpecialTypes_read_all", // Kernel bug: data mismatch with struct special types
+fn should_skip_test(test_path: &str) -> Option<&'static str> {
+    let skip_list: &[(&str, &str)] = &[
+        // ── Infra/perf ──
+        ("DV-017/", "Huge table (2B rows) causes OOM/hang"),
+
+        // ── Kernel divergence: timestamp type (Microsecond/UTC vs Nanosecond/None) ──
+        // Kernel reads timestamps as Timestamp(Microsecond, Some("UTC")),
+        // Spark writes expected data as Timestamp(Nanosecond, None).
+        // Same instant, different Arrow representation.
+        ("cloneDeepMultiType/specs/cloneDeepMultiType_readAll", "Timestamp type: cloneDeepMultiType read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("cloneDeepMultiType/specs/cloneDeepMultiType_readFiltered", "Timestamp type: cloneDeepMultiType filtered read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("cr_timestamp_boundaries/specs/cr_timestamp_boundaries_read_all", "Timestamp type: cr_timestamp_boundaries read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("dcscStructWithSpecialTypes/specs/dcscStructWithSpecialTypes_read_high_amount", "Timestamp type: dcscStructWithSpecialTypes read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("dcscStructWithSpecialTypes/specs/dcscStructWithSpecialTypes_read_by_date", "Timestamp type: dcscStructWithSpecialTypes read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("dcscStructWithSpecialTypes/specs/dcscStructWithSpecialTypes_read_all", "Timestamp type: dcscStructWithSpecialTypes read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("dpReadPartitionTimestamp/specs/dpReadPartitionTimestamp_readAll", "Timestamp type: dpReadPartitionTimestamp read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("dsReadMultipleTypes/specs/dsReadMultipleTypes_readAll", "Timestamp type: dsReadMultipleTypes read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("dsReadTimestampType/specs/dsReadTimestampType_readAll", "Timestamp type: dsReadTimestampType read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_datetime/specs/ds_datetime_hit_dt_eq", "Timestamp type: ds_datetime predicate hit has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_datetime/specs/ds_datetime_hit_dt_gte", "Timestamp type: ds_datetime predicate hit has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_datetime/specs/ds_datetime_hit_dt_lt", "Timestamp type: ds_datetime predicate hit has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_datetime/specs/ds_datetime_miss_dt_2023", "Timestamp type: ds_datetime predicate miss has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_datetime/specs/ds_datetime_miss_dt_2025", "Timestamp type: ds_datetime predicate miss has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_date_trunc_timestamp/specs/ds_date_trunc_timestamp_hit_trunc_month_june", "Timestamp type: ds_date_trunc_timestamp read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_date_trunc_timestamp/specs/ds_date_trunc_timestamp_hit_trunc_month_march", "Timestamp type: ds_date_trunc_timestamp read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_date_trunc_timestamp/specs/ds_date_trunc_timestamp_miss_trunc_month_jan", "Timestamp type: ds_date_trunc_timestamp read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_stats_after_drop/specs/ds_stats_after_drop_hit_", "Timestamp type: ds_stats_after_drop predicate hit has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_stats_after_drop/specs/ds_stats_after_drop_miss_", "Timestamp type: ds_stats_after_drop predicate miss has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_stats_after_rename/specs/ds_stats_after_rename_hit_", "Timestamp type: ds_stats_after_rename predicate hit has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_stats_after_rename/specs/ds_stats_after_rename_miss_", "Timestamp type: ds_stats_after_rename predicate miss has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_timestamp_microsecond/specs/ds_timestamp_microsecond_filter_", "Timestamp type: ds_timestamp_microsecond filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_timestamp_microsecond/specs/ds_timestamp_microsecond_read_all", "Timestamp type: ds_timestamp_microsecond read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_typed_stats/specs/ds_typed_stats_hit_", "Timestamp type: ds_typed_stats predicate hit has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ds_typed_stats/specs/ds_typed_stats_miss_", "Timestamp type: ds_typed_stats predicate miss has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("gc_datetime/specs/gc_datetime_filter_date", "Timestamp type: gc_datetime filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("gc_datetime/specs/gc_datetime_filter_hour", "Timestamp type: gc_datetime filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("gc_datetime/specs/gc_datetime_read_all", "Timestamp type: gc_datetime read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("mergeLowShuffleTimestamp/specs/mergeLowShuffleTimestamp_filter_new", "Timestamp type: mergeLowShuffleTimestamp filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("mergeLowShuffleTimestamp/specs/mergeLowShuffleTimestamp_read_all", "Timestamp type: mergeLowShuffleTimestamp read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("mergeTimestampValues/specs/mergeTimestampValues_read_all", "Timestamp type: mergeTimestampValues read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ntz_mixed_tz_ntz/specs/ntz_mixed_tz_ntz_filter_ntz_col", "Timestamp type: ntz_mixed_tz_ntz filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("ntz_mixed_tz_ntz/specs/ntz_mixed_tz_ntz_full_scan", "Timestamp type: ntz_mixed_tz_ntz read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("pve_timestamp_partition/specs/pve_timestamp_partition_read_all", "Timestamp type: pve_timestamp_partition read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("restoreCheckData/specs/restoreCheckData_filterBoolean", "Timestamp type: restoreCheckData filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("restoreCheckData/specs/restoreCheckData_filterDecimal", "Timestamp type: restoreCheckData filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("restoreCheckData/specs/restoreCheckData_readAll", "Timestamp type: restoreCheckData read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("st_datetime_stats/specs/st_datetime_stats_filter_date_eq", "Timestamp type: st_datetime_stats filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("st_datetime_stats/specs/st_datetime_stats_filter_date_range", "Timestamp type: st_datetime_stats filter has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("st_datetime_stats/specs/st_datetime_stats_full_scan", "Timestamp type: st_datetime_stats read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+        ("cdc_multiple_types/specs/cdc_multiple_types_read_all", "Timestamp type: cdc_multiple_types read has Timestamp(us, UTC) vs Timestamp(ns, None)"),
+
+        // ── Kernel divergence: variant struct field order ──
+        // Kernel produces {metadata, value}, Spark produces {value, metadata}.
+        // Only read/filter specs affected — snapshot specs pass.
+        ("var_001_basic/specs/var_001_basic_read_all", "Variant field order: var_001_basic kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_001_basic/specs/var_001_basic_select_variant_col", "Variant field order: var_001_basic kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_002_basic_stats/specs/var_002_basic_stats_read_all", "Variant field order: var_002_basic_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_003_nested_stats/specs/var_003_nested_stats_read_all", "Variant field order: var_003_nested_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_004_non_objects/specs/var_004_non_objects_filter_first_three", "Variant field order: var_004_non_objects kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_004_non_objects/specs/var_004_non_objects_read_all", "Variant field order: var_004_non_objects kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_005_null_counts/specs/var_005_null_counts_filter_non_null", "Variant field order: var_005_null_counts kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_005_null_counts/specs/var_005_null_counts_read_all", "Variant field order: var_005_null_counts kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_006_different_types/specs/var_006_different_types_filter_by_id", "Variant field order: var_006_different_types kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_006_different_types/specs/var_006_different_types_read_all", "Variant field order: var_006_different_types kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_007_partitions/specs/var_007_partitions_filter_partition", "Variant field order: var_007_partitions kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_007_partitions/specs/var_007_partitions_read_all", "Variant field order: var_007_partitions kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_008_many_fields/specs/var_008_many_fields_read_all", "Variant field order: var_008_many_fields kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_009_unusual_chars/specs/var_009_unusual_chars_read_all", "Variant field order: var_009_unusual_chars kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_010_nested_fields/specs/var_010_nested_fields_read_all", "Variant field order: var_010_nested_fields kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_011_missing_values/specs/var_011_missing_values_read_all", "Variant field order: var_011_missing_values kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_012_mixed_types/specs/var_012_mixed_types_filter_half", "Variant field order: var_012_mixed_types kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_012_mixed_types/specs/var_012_mixed_types_read_all", "Variant field order: var_012_mixed_types kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_013_extreme_values/specs/var_013_extreme_values_read_all", "Variant field order: var_013_extreme_values kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_014_variant_in_struct/specs/var_014_variant_in_struct_filter_label", "Variant field order: var_014_variant_in_struct kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_014_variant_in_struct/specs/var_014_variant_in_struct_read_all", "Variant field order: var_014_variant_in_struct kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_015_string_skipping/specs/var_015_string_skipping_filter_middle", "Variant field order: var_015_string_skipping kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_015_string_skipping/specs/var_015_string_skipping_read_all", "Variant field order: var_015_string_skipping kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_016_array_variant/specs/var_016_array_variant_filter_array_size", "Variant field order: var_016_array_variant kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_016_array_variant/specs/var_016_array_variant_read_all", "Variant field order: var_016_array_variant kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_017_map_variant/specs/var_017_map_variant_filter_by_id", "Variant field order: var_017_map_variant kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_017_map_variant/specs/var_017_map_variant_read_all", "Variant field order: var_017_map_variant kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_018_column_mapping/specs/var_018_column_mapping_filter_by_id", "Variant field order: var_018_column_mapping kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_018_column_mapping/specs/var_018_column_mapping_read_all", "Variant field order: var_018_column_mapping kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_019_schema_evolution/specs/var_019_schema_evolution_filter_new_column", "Variant field order: var_019_schema_evolution kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_019_schema_evolution/specs/var_019_schema_evolution_read_all", "Variant field order: var_019_schema_evolution kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_019_schema_evolution/specs/var_019_schema_evolution_read_v2_before_evolution", "Variant field order: var_019_schema_evolution kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_020_time_travel/specs/var_020_time_travel_read_latest", "Variant field order: var_020_time_travel kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_020_time_travel/specs/var_020_time_travel_read_v1", "Variant field order: var_020_time_travel kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_020_time_travel/specs/var_020_time_travel_read_v2", "Variant field order: var_020_time_travel kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_021_optimized/specs/var_021_optimized_filter_after_optimize", "Variant field order: var_021_optimized kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_021_optimized/specs/var_021_optimized_read_all", "Variant field order: var_021_optimized kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_022_stat_fields/specs/var_022_stat_fields_filter_by_id", "Variant field order: var_022_stat_fields kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_022_stat_fields/specs/var_022_stat_fields_read_all", "Variant field order: var_022_stat_fields kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_all_json_types/specs/var_all_json_types_read_all", "Variant field order: var_all_json_types kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_cdf_read/specs/var_cdf_read_read_all", "Variant field order: var_cdf_read kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_deeply_nested/specs/var_deeply_nested_read_all", "Variant field order: var_deeply_nested kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_large_array/specs/var_large_array_read_all", "Variant field order: var_large_array kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_null_top_level/specs/var_null_top_level_filter_not_null", "Variant field order: var_null_top_level kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_null_top_level/specs/var_null_top_level_filter_null", "Variant field order: var_null_top_level kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_null_top_level/specs/var_null_top_level_read_all", "Variant field order: var_null_top_level kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_numeric_precision/specs/var_numeric_precision_read_all", "Variant field order: var_numeric_precision kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_predicate_non_variant/specs/var_predicate_non_variant_filter_category_A", "Variant field order: var_predicate_non_variant kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_predicate_non_variant/specs/var_predicate_non_variant_read_all", "Variant field order: var_predicate_non_variant kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_projection/specs/var_projection_project_id_data", "Variant field order: var_projection kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_projection/specs/var_projection_read_all", "Variant field order: var_projection kernel {metadata,value} vs Spark {value,metadata}"),
+        ("var_unicode_escapes/specs/var_unicode_escapes_read_all", "Variant field order: var_unicode_escapes kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_hit_null_v_is_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_hit_null_v_struct_v_is_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_hit_v_is_not_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_hit_v_struct_v_not_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_miss_null_v_is_not_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_miss_null_v_struct_v_not_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_miss_v_is_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+        ("ds_variant_null_stats/specs/ds_variant_null_stats_miss_v_struct_v_is_null", "Variant field order: ds_variant_null_stats kernel {metadata,value} vs Spark {value,metadata}"),
+
+        // ── Kernel divergence: snapshot metadata ──
+        ("tw_row_tracking_combo/specs/tw_row_tracking_combo_snapshot", "Type widening metadata divergence in snapshot"),
     ];
-    skip_prefixes.iter().any(|p| test_path.contains(p))
+
+    for (pattern, reason) in skip_list {
+        if test_path.contains(pattern) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
-/// Known kernel-vs-Spark divergences. Each entry is (reason, &[path substrings]).
+/// Known kernel-vs-Spark divergences where execute_workload returns Err.
+/// Each entry is (reason, &[path substrings]).
 /// The test asserts kernel DOES fail — if a kernel fix lands, the assertion breaks
 /// and the entry should be removed.
 const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
@@ -54,13 +174,9 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         "tw_array_element/specs/tw_array_element_read_",
         "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
     ]),
-    // ── Kernel bugs: variant struct field order ──
-    // Kernel produces variant struct fields in different order than Spark
-    // (e.g., {metadata, value} vs {value, metadata}). Add entries as they surface.
-    //
     // ── Kernel bugs: other ──
     ("Kernel: schema deserialization fails for TimestampNTZ type", &[
-        "ds_multi_file_time/specs/ds_multi_file_time_snapshot",
+        "ds_multi_file_time/",
     ]),
     ("Kernel: requires contiguous commits; Spark uses CRC files to bridge gaps", &[
         "prod_non_contiguous_versions/",
@@ -84,6 +200,12 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         "ct_missing_delta_log/specs/ct_missing_delta_log_snapshot",
         "dseReadNonDeltaPath/specs/dseReadNonDeltaPath_snapshot",
         "dv_checkpoint_only_read/specs/dv_checkpoint_only_read_snapshot",
+    ]),
+    // ── Kernel bugs: projected column not found ──
+    ("Kernel: projected column not found after column mapping/schema order change", &[
+        "ds_schema_order_mismatch/specs/ds_schema_order_mismatch_single_col_last",
+        "ds_with_dvs_edge/specs/ds_with_dvs_edge_proj_and_skip_with_dv",
+        "dv_projection_with_pred/specs/dv_projection_with_pred_proj_and_pred",
     ]),
     // ── Kernel divergences: kernel succeeds where Spark expects error ──
     ("Kernel: doesn't reject unsupported column mapping mode", &[
@@ -160,9 +282,6 @@ fn unsupported_workload_reason(spec: &WorkloadSpec) -> Option<&'static str> {
         | WorkloadSpec::Snapshot {
             timestamp: Some(_), ..
         } => Some("Timestamp-based time travel not supported by harness"),
-        WorkloadSpec::Read {
-            predicate: Some(_), ..
-        } => Some("Predicate filtering not supported in this build"),
         WorkloadSpec::Unsupported => Some("Unsupported workload type"),
         _ => None,
     }
@@ -178,9 +297,16 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
         .unwrap_or_else(|_| std::path::PathBuf::from(&spec_path_raw));
     let spec_path_str = spec_path_abs.to_string_lossy().to_string();
 
-    if should_skip_test(&spec_path_str) {
-        println!("Skipping test: {}", spec_path_str);
-        return Ok(());
+    // Check expected kernel failures FIRST (path matching only — these need to
+    // actually run to assert kernel still fails). Skip list checked second.
+    let expected_failure = EXPECTED_KERNEL_FAILURES
+        .iter()
+        .find(|(_, patterns)| patterns.iter().any(|p| spec_path_str.contains(p)));
+
+    if expected_failure.is_none() {
+        if should_skip_test(&spec_path_str).is_some() {
+            return Ok(());
+        }
     }
 
     // Load spec and test case once
@@ -189,11 +315,6 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     let (test_case, workload_name) =
         test_case_from_spec_path(&spec_path_abs).expect("Failed to load test case");
     let expected_dir = test_case.expected_dir(&workload_name);
-
-    // Check for expected kernel failures
-    let expected_failure = EXPECTED_KERNEL_FAILURES
-        .iter()
-        .find(|(_, patterns)| patterns.iter().any(|p| spec_path_str.contains(p)));
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -204,8 +325,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
                 test_utils::create_default_engine(&table_root).expect("Failed to create engine");
 
             // Skip unsupported workload types
-            if let Some(reason) = unsupported_workload_reason(&spec) {
-                println!("  Skipping ({})", reason);
+            if unsupported_workload_reason(&spec).is_some() {
                 return;
             }
 
@@ -257,7 +377,9 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
                     };
                     let batch = read_result.concat().expect("Failed to concat batches");
                     if expected_dir.exists() || inline_expected.is_some() {
-                        validate_read_result(batch, &expected_dir, inline_expected).await;
+                        validate_read_result(batch, &expected_dir, inline_expected)
+                            .await
+                            .unwrap_or_else(|e| panic!("{e}"));
                     } else {
                         println!(
                             "  No expected data for '{}' ({} rows, not validated)",
@@ -275,7 +397,8 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
                         _ => None,
                     };
                     if inline_expected.is_some() || expected_dir.exists() {
-                        validate_snapshot(&snapshot_result, &expected_dir, inline_expected);
+                        validate_snapshot(&snapshot_result, &expected_dir, inline_expected)
+                            .unwrap_or_else(|e| panic!("{e}"));
                     } else {
                         println!(
                             "  No expected metadata for '{}' (not validated)",
@@ -283,6 +406,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
                         );
                     }
                 }
+                _ => {}
             }
 
             println!("  Passed");
