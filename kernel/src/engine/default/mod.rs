@@ -197,7 +197,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         metrics_reporter: Option<Arc<dyn MetricsReporter>>,
-        writer_config: ParquetWriterConfig,
+        parquet_writer_config: ParquetWriterConfig,
     ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
@@ -210,8 +210,11 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 task_executor.clone(),
             )),
             parquet: Arc::new(
-                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
-                    .with_writer_config(writer_config),
+                DefaultParquetHandler::new(
+                    object_store.clone(),
+                    task_executor.clone(),
+                    parquet_writer_config,
+                ),
             ),
             object_store,
             task_executor,

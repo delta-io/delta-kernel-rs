@@ -30,6 +30,7 @@ fn default_parquet_handler() -> Box<dyn ParquetHandler> {
     Box::new(DefaultParquetHandler::new(
         Arc::new(LocalFileSystem::new()),
         Arc::new(TokioBackgroundExecutor::new()),
+        Default::default(),
     ))
 }
 
