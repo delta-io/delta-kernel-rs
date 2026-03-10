@@ -230,6 +230,7 @@ mod tests {
                 "{}/../kernel/tests/data/basic_partitioned",
                 env!("CARGO_MANIFEST_DIR")
             )),
+            catalog_managed_info: None,
             table_info_dir: PathBuf::new(),
         }
     }

@@ -15,10 +15,15 @@ const SPECS_DIR_NAME: &str = "specs";
 const BENCHMARKS_DIR_NAME: &str = "benchmarks";
 const DELTA_DIR_NAME: &str = "delta";
 
-/// Loads all workload specifications from OUTPUT_FOLDER
-/// On first run, extracts from WORKLOAD_TAR if it exists.
-/// Uses a .done file to avoid re-extracting on subsequent runs
+/// Loads all workload specifications.
+///
+/// If `KERNEL_BENCH_WORKLOAD_DIR` is set, loads from that directory (for remote/S3 tables).
+/// Otherwise, extracts from the bundled tarball (existing behavior).
 pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
+    if let Ok(dir) = std::env::var("KERNEL_BENCH_WORKLOAD_DIR") {
+        return load_workloads_from_dir(Path::new(&dir));
+    }
+
     if !workload_specs_exist() {
         extract_workload_specs()?;
     }
@@ -31,6 +36,20 @@ pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>>
 
     for table_dir in table_directories {
         all_workloads.extend(load_specs_from_table(&table_dir)?);
+    }
+
+    Ok(all_workloads)
+}
+
+/// Loads workloads from an external directory.
+/// Unlike tarball loading, this skips the `delta/` directory check for tables
+/// that have `table_path` or `catalog_managed_info` set (remote tables).
+pub fn load_workloads_from_dir(dir: &Path) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
+    let table_directories = find_table_directories(dir)?;
+
+    let mut all_workloads = Vec::new();
+    for table_dir in table_directories {
+        all_workloads.extend(load_specs_from_table_remote(&table_dir)?);
     }
 
     Ok(all_workloads)
@@ -127,6 +146,50 @@ fn load_specs_from_table(table_dir: &Path) -> Result<Vec<Workload>, Box<dyn std:
 
     // If the table path is not provided, assume that the Delta table is in a DELTA_DIR_NAME/ subdirectory at the same level as table_info.json
     if table_info.table_path.is_none() {
+        let delta_dir = table_dir.join(DELTA_DIR_NAME);
+        if !delta_dir.is_dir() {
+            return Err(format!(
+                "Table data not found for '{}'. Expected a 'delta' directory in {}",
+                table_info.name,
+                table_dir.display()
+            )
+            .into());
+        }
+    }
+
+    let spec_files = find_spec_files(&specs_dir)?;
+
+    let mut workloads = Vec::new();
+    for spec_file in spec_files {
+        workloads.push(load_single_spec(&spec_file, table_info.clone())?);
+    }
+
+    Ok(workloads)
+}
+
+/// Like `load_specs_from_table` but skips the `delta/` directory check when
+/// the table has `table_path` or `catalog_managed_info` (remote tables don't have local data).
+fn load_specs_from_table_remote(
+    table_dir: &Path,
+) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
+    let specs_dir = table_dir.join(SPECS_DIR_NAME);
+
+    if !specs_dir.is_dir() {
+        return Err(format!("Specs directory not found: {}", specs_dir.display()).into());
+    }
+
+    let table_info_path = table_dir.join(TABLE_INFO_FILE_NAME);
+    let table_info = TableInfo::from_json_path(&table_info_path).map_err(|e| {
+        format!(
+            "Failed to parse table_info.json at {}: {}",
+            table_info_path.display(),
+            e
+        )
+    })?;
+
+    // Only require delta/ directory for local tables without table_path or catalog_managed_info
+    let is_remote = table_info.table_path.is_some() || table_info.catalog_managed_info.is_some();
+    if !is_remote {
         let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
             return Err(format!(
