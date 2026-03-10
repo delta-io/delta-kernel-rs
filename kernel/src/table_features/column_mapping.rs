@@ -70,8 +70,8 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     }
 }
 
-/// Validates a field's column mapping annotations and extracts the physical name and column
-/// mapping id.
+/// Validates a field's column mapping annotations, extracts the physical name, and checks for
+/// duplicate column mapping IDs via the `seen` map.
 ///
 /// When column mapping is enabled (`Id` or `Name`), the field must have a
 /// `delta.columnMapping.physicalName` (string) and `delta.columnMapping.id` (number) annotation.
@@ -85,6 +85,7 @@ pub(crate) fn get_field_column_mapping_info<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
     path: &[&str],
+    seen: &mut HashMap<i64, &'a str>,
 ) -> DeltaResult<(&'a str, Option<i64>)> {
     let field_path = || ColumnName::new(path.iter().copied());
     let annotation = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
@@ -137,6 +138,15 @@ pub(crate) fn get_field_column_mapping_info<'a>(
         }
     };
 
+    if let Some(id) = id {
+        if let Some(prev) = seen.insert(id, field.name()) {
+            return Err(Error::schema(format!(
+                "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                field.name()
+            )));
+        }
+    }
+
     Ok((physical_name, id))
 }
 
@@ -179,19 +189,10 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
-            if let Ok((_name, id)) =
-                get_field_column_mapping_info(field, this.mode, &this.path)
-                    .map_err(|e| this.err = Some(e))
+            if get_field_column_mapping_info(field, this.mode, &this.path, &mut this.seen)
+                .map_err(|e| this.err = Some(e))
+                .is_ok()
             {
-                if let Some(id) = id {
-                    if let Some(prev) = this.seen.insert(id, &field.name) {
-                        this.err = Some(Error::schema(format!(
-                            "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
-                            field.name()
-                        )));
-                        return;
-                    }
-                }
                 let _ = this.recurse_into_struct_field(field);
             }
         });

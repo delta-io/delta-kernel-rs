@@ -480,22 +480,14 @@ impl StructField {
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
                 self.transform_inner(field.name(), |this| {
-                    let Ok((physical_name, id)) =
-                        get_field_column_mapping_info(field, this.column_mapping_mode, &this.path)
-                            .map_err(|e| this.err = Some(e))
-                    else {
-                        return None;
-                    };
-
-                    if let Some(id) = id {
-                        if let Some(prev) = this.seen.insert(id, field.name()) {
-                            this.err = Some(Error::schema(format!(
-                                "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
-                                field.name()
-                            )));
-                            return None;
-                        }
-                    }
+                    let (physical_name, _id) = get_field_column_mapping_info(
+                        field,
+                        this.column_mapping_mode,
+                        &this.path,
+                        &mut this.seen,
+                    )
+                    .map_err(|e| this.err = Some(e))
+                    .ok()?;
 
                     if field.is_metadata_column()
                         && this.column_mapping_mode != ColumnMappingMode::None
