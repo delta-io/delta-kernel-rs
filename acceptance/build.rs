@@ -102,40 +102,9 @@ fn extract_acceptance_workloads() {
         .unpack(&output_dir)
         .expect("Failed to unpack acceptance_workloads tarball");
 
-    // Rename DV bin files: strip "test%dv%prefix-" from filenames.
-    // Delta test resources use this prefix but the delta log references the unprefixed name.
-    rename_dv_bin_files(&output_dir);
-
     // Write .done marker
     let mut done_file = BufWriter::new(
         File::create(&done_marker).expect("Failed to create acceptance_workloads .done file"),
     );
     write!(done_file, "done").expect("Failed to write acceptance_workloads .done file");
-}
-
-/// Recursively rename files with "test%dv%prefix-" to strip that prefix.
-fn rename_dv_bin_files(dir: &Path) {
-    const DV_PREFIX: &str = "test%dv%prefix-";
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rename_dv_bin_files(&path);
-        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(stripped) = name.strip_prefix(DV_PREFIX) {
-                let new_path = path.with_file_name(stripped);
-                std::fs::rename(&path, &new_path).unwrap_or_else(|e| {
-                    eprintln!(
-                        "Warning: failed to rename {:?} -> {:?}: {}",
-                        path, new_path, e
-                    );
-                });
-            }
-        }
-    }
 }
