@@ -16,7 +16,7 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform, StatsConfig,
+    expected_stats_schema, make_physical_stats_schema, stats_column_names, StatsConfig,
     StripFieldMetadataTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
@@ -244,12 +244,10 @@ impl TableConfiguration {
         )?);
         let physical_stats_schema = match self.column_mapping_mode() {
             ColumnMappingMode::None => logical_stats_schema.clone(),
-            _ => PhysicalStatsSchemaTransform {
-                column_mapping_mode: self.column_mapping_mode(),
-            }
-            .transform_struct(&logical_stats_schema)
-            .map(|s| Arc::new(s.into_owned()))
-            .unwrap_or_else(|| logical_stats_schema.clone()),
+            _ => Arc::new(make_physical_stats_schema(
+                &logical_stats_schema,
+                self.column_mapping_mode(),
+            )),
         };
 
         let logical_stats_schema = strip_metadata(logical_stats_schema);

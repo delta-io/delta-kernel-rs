@@ -439,42 +439,35 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
 pub(crate) struct PhysicalStatsSchemaTransform {
     pub column_mapping_mode: ColumnMappingMode,
+    active: bool,
+}
+
+pub(crate) fn make_physical_stats_schema(
+    stype: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+) -> StructType {
+    PhysicalStatsSchemaTransform {
+        column_mapping_mode,
+        active: false,
+    }
+    .transform_struct(stype)
+    .unwrap_or_else(|| Cow::Borrowed(stype))
+    .into_owned()
 }
 
 impl<'a> SchemaTransform<'a> for PhysicalStatsSchemaTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        match field.data_type() {
-            DataType::Struct(inner) => {
-                let physical_inner = MakePhysicalStatsNames {
-                    column_mapping_mode: self.column_mapping_mode,
-                }
-                .transform_struct(inner)?
-                .into_owned();
-                Some(Cow::Owned(StructField {
-                    name: field.name.clone(),
-                    data_type: DataType::Struct(Box::new(physical_inner)),
-                    nullable: field.nullable,
-                    metadata: field.metadata.clone(),
-                }))
-            }
-            // Primitive fields (numRecords, tightBounds) don't need conversion
-            _ => Some(Cow::Borrowed(field)),
-        }
-    }
-}
-
-/// Recursively converts fields to physical names, stripping all column mapping metadata
-/// (including [`ColumnMetadataKey::ParquetFieldId`]).
-///
-/// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
-struct MakePhysicalStatsNames {
-    column_mapping_mode: ColumnMappingMode,
-}
-
-impl<'a> SchemaTransform<'a> for MakePhysicalStatsNames {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        let was_active = self.active;
+        // Activate rewriting only for children of top-level wrapper fields
+        // (e.g. nullCount/minValues/maxValues).
+        self.active = was_active || matches!(field.data_type(), DataType::Struct(_));
         let field = self.recurse_into_struct_field(field)?;
-        let name = field.physical_name(self.column_mapping_mode).to_owned();
+        self.active = was_active;
+
+        if !was_active {
+            return Some(field);
+        }
+
         let metadata = field
             .metadata
             .iter()
@@ -485,8 +478,9 @@ impl<'a> SchemaTransform<'a> for MakePhysicalStatsNames {
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+
         Some(Cow::Owned(StructField {
-            name,
+            name: field.physical_name(self.column_mapping_mode).to_owned(),
             data_type: field.data_type.clone(),
             nullable: field.nullable,
             metadata,
@@ -1019,12 +1013,7 @@ mod tests {
             StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
-        let result = PhysicalStatsSchemaTransform {
-            column_mapping_mode: ColumnMappingMode::Name,
-        }
-        .transform_struct(&stats_schema)
-        .unwrap()
-        .into_owned();
+        let result = make_physical_stats_schema(&stats_schema, ColumnMappingMode::Name);
 
         // Wrapper fields should be unchanged
         assert!(result.field("numRecords").is_some());
@@ -1041,12 +1030,7 @@ mod tests {
 
         let stats_schema = expected_stats(inner_schema.clone(), inner_schema);
 
-        let result = PhysicalStatsSchemaTransform {
-            column_mapping_mode: ColumnMappingMode::Name,
-        }
-        .transform_struct(&stats_schema)
-        .unwrap()
-        .into_owned();
+        let result = make_physical_stats_schema(&stats_schema, ColumnMappingMode::Name);
 
         // Wrapper field names should be preserved
         assert!(result.field("numRecords").is_some());
@@ -1130,12 +1114,7 @@ mod tests {
             StructField::nullable("minValues", DataType::Struct(Box::new(inner_schema))),
         ]);
 
-        let result = PhysicalStatsSchemaTransform {
-            column_mapping_mode: ColumnMappingMode::Name,
-        }
-        .transform_struct(&stats_schema)
-        .unwrap()
-        .into_owned();
+        let result = make_physical_stats_schema(&stats_schema, ColumnMappingMode::Name);
 
         // Check that deeply nested fields have physical names
         let min_values = result.field("minValues").unwrap();
