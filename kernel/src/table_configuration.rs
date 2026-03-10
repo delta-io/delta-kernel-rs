@@ -20,7 +20,7 @@ use crate::scan::data_skipping::stats_schema::{
     StripFieldMetadataTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
+use crate::schema::{InvariantChecker, SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureInfo,
@@ -29,6 +29,7 @@ use crate::table_features::{
     MAX_VALID_WRITER_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
+use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;

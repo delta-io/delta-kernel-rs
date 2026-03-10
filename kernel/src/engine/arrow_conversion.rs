@@ -357,9 +357,9 @@ mod tests {
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaTransform,
-        StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
+    use crate::transforms::SchemaTransform;
     use crate::DeltaResult;
     use std::collections::HashMap;
 
@@ -410,7 +410,7 @@ mod tests {
         }
     }
 
-    impl<'a> crate::schema::SchemaTransform<'a> for FieldIdCollector {
+    impl<'a> crate::transforms::SchemaTransform<'a> for FieldIdCollector {
         fn transform_struct_field(
             &mut self,
             field: &'a StructField,

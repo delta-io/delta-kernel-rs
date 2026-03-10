@@ -1,8 +1,9 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
 use super::TableFeature;
-use crate::schema::{PrimitiveType, SchemaTransform};
+use crate::schema::PrimitiveType;
 use crate::table_configuration::TableConfiguration;
+use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 

@@ -1,5 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -12,21 +13,39 @@ pub use self::column_names::{
     ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
-use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
+use crate::transforms::ExpressionTransform as _;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
 mod scalars;
-pub mod transforms;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
+
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+pub(crate) struct GetColumnReferences<'a> {
+    references: HashSet<&'a ColumnName>,
+}
+
+impl<'a> GetColumnReferences<'a> {
+    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
+        self.references
+    }
+}
+
+impl<'a> crate::transforms::ExpressionTransform<'a> for GetColumnReferences<'a> {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        self.references.insert(name);
+        Some(Cow::Borrowed(name))
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -284,7 +303,10 @@ where
 }
 
 impl OpaquePredicate {
-    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+    pub(crate) fn new(
+        op: OpaquePredicateOpRef,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
         let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
@@ -303,7 +325,10 @@ pub struct OpaqueExpression {
 }
 
 impl OpaqueExpression {
-    fn new(op: OpaqueExpressionOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+    pub(crate) fn new(
+        op: OpaqueExpressionOpRef,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
         let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
@@ -543,21 +568,21 @@ impl JunctionPredicateOp {
 }
 
 impl UnaryExpression {
-    fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl UnaryPredicate {
-    fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl BinaryExpression {
-    fn new(
+    pub(crate) fn new(
         op: BinaryExpressionOp,
         left: impl Into<Expression>,
         right: impl Into<Expression>,
@@ -569,7 +594,7 @@ impl BinaryExpression {
 }
 
 impl BinaryPredicate {
-    fn new(
+    pub(crate) fn new(
         op: BinaryPredicateOp,
         left: impl Into<Expression>,
         right: impl Into<Expression>,
@@ -581,7 +606,7 @@ impl BinaryPredicate {
 }
 
 impl VariadicExpression {
-    fn new(
+    pub(crate) fn new(
         op: VariadicExpressionOp,
         exprs: impl IntoIterator<Item = impl Into<Expression>>,
     ) -> Self {
@@ -591,7 +616,7 @@ impl VariadicExpression {
 }
 
 impl ParseJsonExpression {
-    fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+    pub(crate) fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self {
             json_expr: Box::new(json_expr.into()),
             output_schema,
@@ -617,7 +642,7 @@ pub struct MapToStructExpression {
 }
 
 impl MapToStructExpression {
-    fn new(map_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
         }
@@ -625,7 +650,7 @@ impl MapToStructExpression {
 }
 
 impl JunctionPredicate {
-    fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
+    pub(crate) fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
     }
 }

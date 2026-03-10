@@ -1,8 +1,9 @@
 //! Utility functions for the variant type and variant-related table features.
 
-use crate::schema::{SchemaTransform, StructType};
+use crate::schema::StructType;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
+use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use std::borrow::Cow;

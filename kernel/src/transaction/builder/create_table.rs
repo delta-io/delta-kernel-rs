@@ -18,7 +18,7 @@ use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::variant_utils::UsesVariant;
-use crate::schema::{SchemaRef, SchemaTransform};
+use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -32,6 +32,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
+use crate::transforms::SchemaTransform;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
 

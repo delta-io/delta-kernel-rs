@@ -28,8 +28,9 @@ use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
+use crate::transforms::SchemaTransform;
 use crate::utils::current_time_ms;
-use crate::{DataType, DeltaResult, Engine, Expression, RowVisitor, SchemaTransform};
+use crate::{DataType, DeltaResult, Engine, Expression, RowVisitor};
 use delta_kernel_derive::internal_api;
 
 use super::Transaction;

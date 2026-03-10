@@ -108,6 +108,7 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
+pub mod transforms;
 
 pub use log_path::LogPath;
 
@@ -175,7 +176,8 @@ pub use snapshot::SnapshotRef;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
-use schema::{SchemaTransform, StructField, StructType};
+use schema::{StructField, StructType};
+use transforms::SchemaTransform;
 
 #[cfg(any(
     feature = "default-engine-native-tls",

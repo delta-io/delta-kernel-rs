@@ -8,10 +8,11 @@ use std::sync::Arc;
 use crate::{
     schema::{
         ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, PrimitiveType, Schema,
-        SchemaRef, SchemaTransform, StructField, StructType,
+        SchemaRef, StructField, StructType,
     },
     table_features::ColumnMappingMode,
     table_properties::TableProperties,
+    transforms::SchemaTransform,
     DeltaResult,
 };
 

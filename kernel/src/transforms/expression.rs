@@ -1,5 +1,4 @@
-use std::borrow::{Cow, ToOwned};
-use std::collections::HashSet;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::expressions::{
@@ -7,7 +6,7 @@ use crate::expressions::{
     MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
     Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
 };
-use crate::utils::{map_owned_children_or_else, CowExt as _};
+use crate::transforms::{map_owned_children_or_else, CowExt as _};
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -390,25 +389,6 @@ pub trait ExpressionTransform<'a> {
     }
 }
 
-/// Retrieves the set of column names referenced by an expression.
-#[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
-    references: HashSet<&'a ColumnName>,
-}
-
-impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
-        self.references
-    }
-}
-
-impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        self.references.insert(name);
-        Some(Cow::Borrowed(name))
-    }
-}
-
 /// An expression "transform" that doesn't actually change the expression at all. Instead, it
 /// measures the maximum depth of a expression, with a depth limit to prevent stack overflow. Useful
 /// for verifying that a expression has reasonable depth before attempting to work with it.
@@ -553,8 +533,9 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
-        ParseJsonExpression, Predicate as Pred, ScalarExpressionEvaluator,
+        column_expr, column_pred, Expression, Expression as Expr, OpaqueExpressionOp,
+        OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
+        ScalarExpressionEvaluator, VariadicExpression,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -562,6 +543,7 @@ mod tests {
     };
     use crate::schema::{DataType, StructField, StructType};
     use crate::DeltaResult;
+    use std::sync::Arc;
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);

@@ -28,11 +28,12 @@ use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
+use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
+    RowVisitor, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
