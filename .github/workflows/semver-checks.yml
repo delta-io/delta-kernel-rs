@@ -7,6 +7,7 @@ on:
       - opened
       - synchronize
       - reopened
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,7 +24,10 @@ jobs:
         name: checkout full rep
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: >-
+            ${{ github.event_name == 'merge_group'
+                && github.event.merge_group.head_sha
+                || github.event.pull_request.head.sha }}
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install cargo-semver-checks
@@ -38,7 +42,10 @@ jobs:
         # note that this won't run on proc macro/derive crates, so don't need to include
         # delta_kernel_derive etc.
         run: |
-          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features --baseline-rev ${{ github.event.pull_request.base.sha }}
+          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
+            --baseline-rev ${{ github.event_name == 'merge_group'
+                && github.event.merge_group.base_sha
+                || github.event.pull_request.base.sha }}
       - name: On Failure
         id: set_failure
         if: ${{ steps.check.outcome == 'failure' }}
@@ -62,12 +69,12 @@ jobs:
       pull-requests: write
     steps:
       - name: On Failure
-        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
+        if: github.event_name == 'pull_request_target' && needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
         uses: actions-ecosystem/action-add-labels@v1
         with:
           labels: breaking-change
       - name: Remove breaking-change label
-        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
+        if: github.event_name == 'pull_request_target' && needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
         uses: actions-ecosystem/action-remove-labels@v1
         with:
           labels: breaking-change
