@@ -31,7 +31,7 @@ jobs:
           body: |
             PR title does not match the required pattern. Please ensure you follow the [conventional commits](https://www.conventionalcommits.org/) spec.
 
-            Your title should start with `feat:`, `fix:`, `chore:`, `docs:`, `refactor:` `test:`, or `ci:`, and if it's a breaking change that should be suffixed
+            Your title should start with `feat:`, `fix:`, `chore:`, `docs:`, `perf`, `refactor:`, `test:`, or `ci:`, and if it's a breaking change that should be suffixed
             with a `!` (like `feat!:`), and then a 1-72 character brief description of your change.
 
             **Title:** `${{ steps.pr.outputs.title }}`

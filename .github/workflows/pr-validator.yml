@@ -32,7 +32,7 @@ jobs:
 
       - uses: ./.github/actions/pr-title-validator
         with:
-          regex: '^(feat|fix|chore|docs|refactor|test|ci)!?(\(.+\))?: .{1,72}$'
-          breaking-change-regex: '^(feat|fix|chore|docs|refactor|test|ci)!(\(.+\))?: .{1,72}$'
+          regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!?(\(.+\))?: .{1,72}$'
+          breaking-change-regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!(\(.+\))?: .{1,72}$'
           labels: ${{ steps.pr.outputs.labels }}
           title: ${{ steps.pr.outputs.title }}
