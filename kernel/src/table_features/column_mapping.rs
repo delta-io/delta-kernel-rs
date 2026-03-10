@@ -148,51 +148,53 @@ struct ValidateColumnMappings<'a> {
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner_type(
-        &mut self,
-        data_type: &'a DataType,
-        name: &'a str,
-    ) -> Option<Cow<'a, DataType>> {
+    fn transform_inner(&mut self, field_name: &'a str, f: impl FnOnce(&mut Self)) {
         if self.err.is_none() {
-            self.path.push(name);
-            let _ = self.transform(data_type);
+            self.path.push(field_name);
+            f(self);
             self.path.pop();
         }
-        Some(Cow::Borrowed(data_type))
     }
 }
 
 impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     // Override array element and map key/value for better error messages
     fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(etype, "<array element>")
+        self.transform_inner("<array element>", |this| {
+            this.transform(etype);
+        });
+        Some(Cow::Borrowed(etype))
     }
     fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(ktype, "<map key>")
+        self.transform_inner("<map key>", |this| {
+            this.transform(ktype);
+        });
+        Some(Cow::Borrowed(ktype))
     }
     fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(vtype, "<map value>")
+        self.transform_inner("<map value>", |this| {
+            this.transform(vtype);
+        });
+        Some(Cow::Borrowed(vtype))
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if self.err.is_none() {
-            self.path.push(&field.name);
-            if let Ok((_name, id)) = get_field_column_mapping_info(field, self.mode, &self.path)
-                .map_err(|e| self.err = Some(e))
+        self.transform_inner(field.name(), |this| {
+            if let Ok((_name, id)) =
+                get_field_column_mapping_info(field, this.mode, &this.path)
+                    .map_err(|e| this.err = Some(e))
             {
                 if let Some(id) = id {
-                    if let Some(prev) = self.seen.insert(id, &field.name) {
-                        self.err = Some(Error::schema(format!(
+                    if let Some(prev) = this.seen.insert(id, &field.name) {
+                        this.err = Some(Error::schema(format!(
                             "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
                             field.name()
                         )));
-                        self.path.pop();
-                        return None;
+                        return;
                     }
                 }
-                let _ = self.recurse_into_struct_field(field);
+                let _ = this.recurse_into_struct_field(field);
             }
-            self.path.pop();
-        }
+        });
         None
     }
     fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {

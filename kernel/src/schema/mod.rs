@@ -447,13 +447,16 @@ impl StructField {
             err: Option<Error>,
         }
         impl<'a> MakePhysical<'a> {
-            fn transform_inner_type(
+            fn transform_inner<T>(
                 &mut self,
-                data_type: &'a DataType,
-                name: &'a str,
-            ) -> Option<Cow<'a, DataType>> {
-                self.path.push(name);
-                let result = self.transform(data_type);
+                field_name: &'a str,
+                transform: impl FnOnce(&mut Self) -> Option<T>,
+            ) -> Option<T> {
+                if self.err.is_some() {
+                    return None;
+                }
+                self.path.push(field_name);
+                let result = transform(self);
                 self.path.pop();
                 result
             }
@@ -463,47 +466,43 @@ impl StructField {
                 &mut self,
                 etype: &'a DataType,
             ) -> Option<Cow<'a, DataType>> {
-                self.transform_inner_type(etype, "<array element>")
+                self.transform_inner("<array element>", |this| this.transform(etype))
             }
             fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
-                self.transform_inner_type(ktype, "<map key>")
+                self.transform_inner("<map key>", |this| this.transform(ktype))
             }
             fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
-                self.transform_inner_type(vtype, "<map value>")
+                self.transform_inner("<map value>", |this| this.transform(vtype))
             }
             fn transform_struct_field(
                 &mut self,
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
-                if self.err.is_some() {
-                    return None;
-                }
-                self.path.push(field.name());
-                let Ok((physical_name, _id)) =
-                    get_field_column_mapping_info(field, self.column_mapping_mode, &self.path)
-                        .map_err(|e| self.err = Some(e))
-                else {
-                    self.path.pop();
-                    return None;
-                };
+                self.transform_inner(field.name(), |this| {
+                    let Ok((physical_name, _id)) =
+                        get_field_column_mapping_info(field, this.column_mapping_mode, &this.path)
+                            .map_err(|e| this.err = Some(e))
+                    else {
+                        return None;
+                    };
 
-                if field.is_metadata_column() && self.column_mapping_mode != ColumnMappingMode::None
-                {
-                    self.err = Some(Error::internal_error(format!(
-                        "Metadata column '{}' should not participate in logical to physical translation",
-                        field.name()
-                    )));
-                    self.path.pop();
-                    return None;
-                }
+                    if field.is_metadata_column()
+                        && this.column_mapping_mode != ColumnMappingMode::None
+                    {
+                        this.err = Some(Error::internal_error(format!(
+                            "Metadata column '{}' should not participate in logical to physical translation",
+                            field.name()
+                        )));
+                        return None;
+                    }
 
-                let field = self.recurse_into_struct_field(field)?;
+                    let field = this.recurse_into_struct_field(field)?;
 
-                let metadata = field.logical_to_physical_metadata(self.column_mapping_mode);
-                let name = physical_name.to_owned();
+                    let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
+                    let name = physical_name.to_owned();
 
-                self.path.pop();
-                Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+                    Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+                })
             }
 
             fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
