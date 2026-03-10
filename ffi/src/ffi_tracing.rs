@@ -603,9 +603,6 @@ mod tests {
         *MESSAGES.lock().unwrap() = Some(vec![]);
     }
 
-    // get the string that we should ensure is in log messages for the time. If current time seconds
-    // is >= 50, return None because the minute might roll over before we actually log which would
-    // invalidate this check
     /// Format the current time as a string using the same formatter that tracing uses, trimmed
     /// to hours, minutes, and seconds (e.g. `"2026-03-10T14:32:45"`). This is used by tests to
     /// verify that log output contains a reasonable timestamp.
@@ -663,14 +660,18 @@ mod tests {
 
     /// Assert that the log line contains a timestamp within [time_before, time_after].
     ///
-    /// Log lines may contain ANSI escape codes before the timestamp, so we search for the
-    /// timestamp by looking for a 4-digit year prefix. ISO 8601 timestamps are fixed-width
-    /// and sort lexicographically, so a simple string comparison works as a range check.
+    /// Log lines may contain ANSI escape codes before the timestamp, so we locate the
+    /// timestamp by searching for the `time_before` prefix (up to the seconds). Once found,
+    /// we extract the full timestamp and do a lexicographic range check. ISO 8601 timestamps
+    /// are fixed-width and sort lexicographically.
     fn assert_timestamp_in_range(log_line: &str, time_before: &str, time_after: &str) {
         let len = time_before.len();
-        // Find the timestamp start by searching for a 4-digit year (e.g., "202")
+        // Search for the date+hour+minute prefix (first 16 chars, e.g. "2026-03-10T14:32")
+        // to locate the timestamp start. We use 16 chars (excluding seconds) because the
+        // seconds may differ between time_before and the log line.
+        let prefix = &time_before[..16];
         let ts_start = log_line
-            .find(&time_before[..3])
+            .find(prefix)
             .unwrap_or_else(|| panic!("No timestamp found in log line: {log_line:?}"));
         let log_time = &log_line[ts_start..ts_start + len];
         assert!(
