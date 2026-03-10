@@ -1,22 +1,14 @@
 //! Result validation for acceptance workload test cases.
 
-use std::collections::HashSet;
+use std::fs::{self, File};
 use std::path::Path;
-use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
-};
-use delta_kernel::DeltaResult;
-use futures::StreamExt;
-use object_store::local::LocalFileSystem;
-use object_store::ObjectStore;
-use serde_json::Value;
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel_benchmarks::models::{ReadExpected, SnapshotExpected};
 
-use super::types::{ExpectedSummary, ReadExpected, SnapshotExpected};
 use super::workload::SnapshotResult;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -110,208 +102,112 @@ fn columns_match(actual: &RecordBatch, expected: &RecordBatch) -> Result<(), Str
     }
 }
 
-// ── Protocol/Metadata comparison helpers ────────────────────────────────────
-
-fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(|v| v.as_str())
-}
-
-/// Compare protocol Values with set-based feature comparison (order-independent).
-fn protocols_match(actual: &Value, expected: &Value) -> bool {
-    let get_i64 = |v: &Value, key: &str| v.get(key).and_then(|v| v.as_i64());
-    if get_i64(actual, "minReaderVersion") != get_i64(expected, "minReaderVersion") {
-        return false;
-    }
-    if get_i64(actual, "minWriterVersion") != get_i64(expected, "minWriterVersion") {
-        return false;
-    }
-    features_match(actual.get("readerFeatures"), expected.get("readerFeatures"))
-        && features_match(actual.get("writerFeatures"), expected.get("writerFeatures"))
-}
-
-/// Compare feature lists as sets (order-independent).
-fn features_match(actual: Option<&Value>, expected: Option<&Value>) -> bool {
-    match (actual, expected) {
-        (None, None) => true,
-        (Some(Value::Null), None) | (None, Some(Value::Null)) => true,
-        (Some(Value::Array(a)), Some(Value::Array(e))) => {
-            let a_set: HashSet<&str> = a.iter().filter_map(|v| v.as_str()).collect();
-            let e_set: HashSet<&str> = e.iter().filter_map(|v| v.as_str()).collect();
-            a_set == e_set
-        }
-        _ => false,
-    }
-}
-
-/// Compare metadata Values, parsing schemaString as JSON for structural comparison
-/// and skipping createdTime (which varies between runs).
-fn metadata_matches(actual: &Value, expected: &Value) -> bool {
-    // Compare id
-    if get_str(actual, "id") != get_str(expected, "id") {
-        return false;
-    }
-    // Compare format
-    if actual.get("format") != expected.get("format") {
-        return false;
-    }
-    // Compare schemaString as parsed JSON (handles whitespace/key order differences)
-    let parse_schema = |v: &Value| -> Option<Value> {
-        get_str(v, "schemaString").and_then(|s| serde_json::from_str(s).ok())
-    };
-    match (parse_schema(actual), parse_schema(expected)) {
-        (Some(a), Some(e)) => {
-            if a != e {
-                return false;
-            }
-        }
-        (None, None) => {}
-        _ => return false,
-    }
-    // Compare partitionColumns
-    if actual.get("partitionColumns") != expected.get("partitionColumns") {
-        return false;
-    }
-    // Compare configuration
-    if actual.get("configuration") != expected.get("configuration") {
-        return false;
-    }
-    // Skip createdTime — it varies between runs
-    true
-}
-
 // ── Expected data loading ───────────────────────────────────────────────────
 
-async fn read_expected_data(expected_dir: &Path) -> DeltaResult<Option<RecordBatch>> {
+/// Read expected data from parquet files in expected_dir/expected_data/.
+fn read_expected_data(expected_dir: &Path) -> Result<Option<RecordBatch>, String> {
     let expected_data_dir = expected_dir.join("expected_data");
     if !expected_data_dir.exists() {
         return Ok(None);
     }
 
-    let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_data_dir)?);
-    let files: Vec<_> = store
-        .list(None)
-        .filter_map(|r| async { r.ok() })
-        .collect()
-        .await;
+    let entries = fs::read_dir(&expected_data_dir)
+        .map_err(|e| format!("Failed to read expected_data dir: {e}"))?;
 
     let mut batches = vec![];
     let mut schema = None;
 
-    for meta in files {
-        let path_str = meta.location.to_string();
-        let filename = path_str.rsplit('/').next().unwrap_or(&path_str);
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read dir entry: {e}"))?;
+        let path = entry.path();
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
         if filename.starts_with('.') || filename.starts_with('_') {
             continue;
         }
-        if let Some(ext) = meta.location.extension() {
-            if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-                if schema.is_none() {
-                    schema = Some(builder.schema().clone());
-                }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
-                    batches.push(batch?);
-                }
+
+        if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+            let file = File::open(&path)
+                .map_err(|e| format!("Failed to open parquet file {}: {e}", path.display()))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| format!("Failed to create parquet reader: {e}"))?;
+
+            if schema.is_none() {
+                schema = Some(builder.schema().clone());
+            }
+
+            let reader = builder
+                .build()
+                .map_err(|e| format!("Failed to build parquet reader: {e}"))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| format!("Failed to read batch: {e}"))?;
+                batches.push(batch);
             }
         }
     }
 
     if let Some(schema) = schema {
-        let all_data = concat_batches(&schema, &batches)?;
+        let all_data = concat_batches(&schema, &batches)
+            .map_err(|e| format!("Failed to concat batches: {e}"))?;
         Ok(Some(all_data))
     } else {
         Ok(None)
     }
 }
 
-fn read_expected_summary(expected_dir: &Path) -> Option<ExpectedSummary> {
-    let path = expected_dir.join("summary.json");
-    if !path.exists() {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
-    serde_json::from_reader(file).ok()
-}
-
-fn read_expected_protocol(expected_dir: &Path) -> Option<Value> {
-    let path = expected_dir.join("protocol.json");
-    if !path.exists() {
-        return None;
-    }
-    let content = std::fs::read_to_string(path).ok()?;
-    let wrapper: Value = serde_json::from_str(&content).ok()?;
-    // Support both wrapped {"protocol": {...}} and bare {...} formats
-    wrapper
-        .get("protocol")
-        .cloned()
-        .or(Some(wrapper))
-}
-
-fn read_expected_metadata(expected_dir: &Path) -> Option<Value> {
-    let path = expected_dir.join("metadata.json");
-    if !path.exists() {
-        return None;
-    }
-    let content = std::fs::read_to_string(path).ok()?;
-    let wrapper: Value = serde_json::from_str(&content).ok()?;
-    // Support both wrapped {"metaData": {...}} and bare {...} formats
-    wrapper
-        .get("metaData")
-        .or_else(|| wrapper.get("meta_data"))
-        .cloned()
-        .or(Some(wrapper))
-}
-
 // ── Validation ───────────────────────────────────────────────────────────────
 
-/// Validate read results against expected data. Returns Err with details on mismatch.
-pub async fn validate_read_result(
+/// Validate read results against expected data.
+pub fn validate_read_result(
     actual: RecordBatch,
     expected_dir: &Path,
-    inline_expected: Option<&ReadExpected>,
+    expected: Option<&ReadExpected>,
 ) -> Result<(), String> {
     let actual_row_count = actual.num_rows() as u64;
 
-    let expected = read_expected_data(expected_dir)
-        .await
-        .map_err(|e| format!("Failed to read expected data: {e}"))?;
+    let expected_data = read_expected_data(expected_dir)?;
 
-    if let Some(expected) = expected {
+    if let Some(expected_data) = expected_data {
         // Sort both batches for order-independent comparison. If sort fails (e.g., struct-only
         // schemas that Arrow can't sort), fall back to comparing unsorted.
         let actual = crate::data::sort_record_batch(actual.clone()).unwrap_or(actual);
-        let expected = crate::data::sort_record_batch(expected.clone()).unwrap_or(expected);
+        let expected_data =
+            crate::data::sort_record_batch(expected_data.clone()).unwrap_or(expected_data);
 
-        if actual.num_rows() != expected.num_rows() {
+        if actual.num_rows() != expected_data.num_rows() {
             print_mismatch(
                 "ROW COUNT",
-                &format!("{} rows\n{}", expected.num_rows(), format_batch(&expected)),
+                &format!(
+                    "{} rows\n{}",
+                    expected_data.num_rows(),
+                    format_batch(&expected_data)
+                ),
                 &format!("{} rows\n{}", actual.num_rows(), format_batch(&actual)),
             );
             return Err(format!(
                 "Row count mismatch: expected {}, got {}",
-                expected.num_rows(),
+                expected_data.num_rows(),
                 actual.num_rows()
             ));
         }
 
-        if let Err(diff) = columns_match(&actual, &expected) {
-            print_mismatch("DATA", &format_batch(&expected), &format_batch(&actual));
+        if let Err(diff) = columns_match(&actual, &expected_data) {
+            print_mismatch(
+                "DATA",
+                &format_batch(&expected_data),
+                &format_batch(&actual),
+            );
             return Err(format!("Data content does not match:\n{diff}"));
         }
     }
 
-    // Validate row count: inline expected takes priority over summary.json
-    let expected_row_count = inline_expected
-        .map(|e| Some(e.row_count))
-        .unwrap_or_else(|| read_expected_summary(expected_dir).map(|s| s.actual_row_count));
-
-    if let Some(expected) = expected_row_count {
-        if actual_row_count != expected {
+    // Validate row count from expected
+    if let Some(expected) = expected {
+        if actual_row_count != expected.row_count {
             return Err(format!(
-                "Row count mismatch: expected {expected}, got {actual_row_count}"
+                "Row count mismatch: expected {}, got {actual_row_count}",
+                expected.row_count
             ));
         }
     }
@@ -319,41 +215,34 @@ pub async fn validate_read_result(
     Ok(())
 }
 
-/// Validate snapshot result against expected protocol and metadata. Returns Err on mismatch.
+/// Validate snapshot result against expected protocol and metadata.
 pub fn validate_snapshot(
     result: &SnapshotResult,
-    expected_dir: &Path,
-    inline: Option<&SnapshotExpected>,
+    expected: &SnapshotExpected,
 ) -> Result<(), String> {
-    // Protocol: inline takes priority over file
-    let expected_protocol = inline
-        .and_then(|e| e.protocol.clone())
-        .or_else(|| read_expected_protocol(expected_dir));
-    if let Some(ref expected) = expected_protocol {
-        if !protocols_match(&result.protocol, expected) {
-            print_mismatch(
-                "PROTOCOL",
-                &serde_json::to_string_pretty(expected).unwrap(),
-                &serde_json::to_string_pretty(&result.protocol).unwrap(),
-            );
-            return Err("Protocol does not match".to_string());
-        }
+    let mut errors = Vec::new();
+
+    if result.protocol != expected.protocol {
+        print_mismatch(
+            "PROTOCOL",
+            &format!("{:?}", expected.protocol),
+            &format!("{:?}", result.protocol),
+        );
+        errors.push("Protocol mismatch".to_string());
     }
 
-    // Metadata: inline takes priority over file
-    let expected_metadata = inline
-        .and_then(|e| e.metadata.clone())
-        .or_else(|| read_expected_metadata(expected_dir));
-    if let Some(ref expected) = expected_metadata {
-        if !metadata_matches(&result.metadata, expected) {
-            print_mismatch(
-                "METADATA",
-                &serde_json::to_string_pretty(expected).unwrap(),
-                &serde_json::to_string_pretty(&result.metadata).unwrap(),
-            );
-            return Err("Metadata does not match".to_string());
-        }
+    if result.metadata != expected.metadata {
+        print_mismatch(
+            "METADATA",
+            &format!("{:?}", expected.metadata),
+            &format!("{:?}", result.metadata),
+        );
+        errors.push("Metadata mismatch".to_string());
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }

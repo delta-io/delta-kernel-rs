@@ -20,6 +20,7 @@ delta_kernel = { path = "../kernel", features = [
   "arrow",
   "internal-api",
 ] }
+delta_kernel_benchmarks = { path = "../benchmarks" }
 chrono = "0.4"
 futures = "0.3"
 itertools = "0.14"

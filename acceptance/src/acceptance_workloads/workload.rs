@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
@@ -10,16 +11,15 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
+use delta_kernel_benchmarks::models::{ReadSpec, SnapshotSpec, Spec, TimeTravel};
 use itertools::Itertools;
 use url::Url;
 
-use super::types::WorkloadSpec;
-
-/// Result of executing a read workload
+/// Result of executing a read workload.
 pub struct ReadResult {
-    /// The record batches from the scan
+    /// The record batches from the scan.
     pub batches: Vec<RecordBatch>,
-    /// The schema of the data
+    /// The schema of the data.
     pub schema: Option<Arc<ArrowSchema>>,
 }
 
@@ -114,74 +114,53 @@ impl ReadResult {
 }
 
 /// Result of executing a snapshot workload.
-/// Protocol and metadata are stored as `serde_json::Value` to allow flexible
-/// comparison without duplicating kernel's Protocol/Metadata types.
 #[derive(Debug)]
 pub struct SnapshotResult {
     pub version: Version,
-    pub protocol: serde_json::Value,
-    pub metadata: serde_json::Value,
+    pub protocol: Protocol,
+    pub metadata: Metadata,
 }
 
-/// Workload execution result
+/// Workload execution result.
 #[allow(clippy::large_enum_variant)]
 pub enum WorkloadResult {
     Read(ReadResult),
     Snapshot(SnapshotResult),
 }
 
-/// Execute a workload specification and return the result
+/// Execute a workload specification and return the result.
 pub fn execute_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
-    spec: &WorkloadSpec,
+    spec: &Spec,
 ) -> DeltaResult<WorkloadResult> {
     match spec {
-        WorkloadSpec::Read {
-            version,
-            timestamp,
-            columns,
-            ..
-        } => {
-            let result = execute_read_workload(
-                engine,
-                table_root,
-                *version,
-                timestamp.as_deref(),
-                columns.as_deref(),
-            )?;
+        Spec::Read(read_spec) => {
+            let result = execute_read_workload(engine, table_root, read_spec)?;
             Ok(WorkloadResult::Read(result))
         }
-        WorkloadSpec::Snapshot {
-            version, timestamp, ..
-        } => {
-            let result =
-                execute_snapshot_workload(engine, table_root, *version, timestamp.as_deref())?;
+        Spec::Snapshot(snapshot_spec) => {
+            let result = execute_snapshot_workload(engine, table_root, snapshot_spec)?;
             Ok(WorkloadResult::Snapshot(result))
         }
-        WorkloadSpec::Unsupported => Err(Error::generic(
-            "Unsupported workload type in this harness build",
-        )),
     }
 }
 
-/// Execute a read workload
+/// Execute a read workload.
 pub fn execute_read_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
-    version: Option<i64>,
-    timestamp: Option<&str>,
-    columns: Option<&[String]>,
+    read_spec: &ReadSpec,
 ) -> DeltaResult<ReadResult> {
-    // Resolve version from timestamp if needed
-    let version = if let Some(ts) = timestamp {
-        Some(resolve_timestamp_to_version(
+    // Resolve version from time_travel
+    let version: Option<Version> = match &read_spec.time_travel {
+        Some(TimeTravel::Version { version }) => Some(*version),
+        Some(TimeTravel::Timestamp { timestamp }) => Some(resolve_timestamp_to_version(
             engine.as_ref(),
             table_root,
-            ts,
-        )?)
-    } else {
-        version.map(|v| v as Version)
+            timestamp,
+        )?),
+        None => None,
     };
 
     // Build snapshot
@@ -195,7 +174,7 @@ pub fn execute_read_workload(
 
     // Build scan with optional column projection
     let mut scan_builder = snapshot.scan_builder();
-    if let Some(cols) = columns {
+    if let Some(ref cols) = read_spec.columns {
         use delta_kernel::schema::StructType;
         let projected_fields: Vec<_> = cols
             .iter()
@@ -233,21 +212,20 @@ pub fn execute_read_workload(
     })
 }
 
-/// Execute a snapshot workload (for metadata validation)
+/// Execute a snapshot workload (for metadata validation).
 pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
-    version: Option<i64>,
-    timestamp: Option<&str>,
+    snapshot_spec: &SnapshotSpec,
 ) -> DeltaResult<SnapshotResult> {
-    let version = if let Some(ts) = timestamp {
-        Some(resolve_timestamp_to_version(
+    let version: Option<Version> = match &snapshot_spec.time_travel {
+        Some(TimeTravel::Version { version }) => Some(*version),
+        Some(TimeTravel::Timestamp { timestamp }) => Some(resolve_timestamp_to_version(
             engine.as_ref(),
             table_root,
-            ts,
-        )?)
-    } else {
-        version.map(|v| v as Version)
+            timestamp,
+        )?),
+        None => None,
     };
 
     let mut builder = Snapshot::builder_for(table_root.clone());
@@ -257,19 +235,11 @@ pub fn execute_snapshot_workload(
     let snapshot = builder.build(engine.as_ref())?;
 
     let config = snapshot.table_configuration();
-    let protocol = config.protocol();
-    let metadata = config.metadata();
-
-    // Serialize kernel types directly to serde_json::Value — no duplicate structs needed
-    let protocol_value = serde_json::to_value(protocol)
-        .map_err(|e| Error::generic(format!("Failed to serialize protocol: {e}")))?;
-    let metadata_value = serde_json::to_value(metadata)
-        .map_err(|e| Error::generic(format!("Failed to serialize metadata: {e}")))?;
 
     Ok(SnapshotResult {
         version: snapshot.version(),
-        protocol: protocol_value,
-        metadata: metadata_value,
+        protocol: config.protocol().clone(),
+        metadata: config.metadata().clone(),
     })
 }
 
@@ -325,4 +295,31 @@ fn resolve_timestamp_to_version(
             timestamp_str
         ))
     })
+}
+
+/// Execute a workload and validate results. Matches on Spec once for both execution and validation.
+pub fn execute_and_validate_workload(
+    engine: Arc<dyn Engine>,
+    table_root: &Url,
+    spec: &Spec,
+    expected_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use super::validation::{validate_read_result, validate_snapshot};
+
+    match spec {
+        Spec::Read(read_spec) => {
+            let result = execute_read_workload(engine, table_root, read_spec)?;
+            let batch = result.concat()?;
+            validate_read_result(batch, expected_dir, read_spec.expected.as_ref())?;
+        }
+        Spec::Snapshot(snapshot_spec) => {
+            let expected = snapshot_spec
+                .expected
+                .as_ref()
+                .ok_or("SnapshotSpec missing expected field")?;
+            let result = execute_snapshot_workload(engine, table_root, snapshot_spec)?;
+            validate_snapshot(&result, expected)?;
+        }
+    }
+    Ok(())
 }

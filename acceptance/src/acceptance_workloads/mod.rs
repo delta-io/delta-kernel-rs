@@ -18,15 +18,13 @@
 //!       expected_data/
 //! ```
 
-pub mod types;
 pub mod validation;
 pub mod workload;
 
 use std::path::{Path, PathBuf};
 
+use delta_kernel_benchmarks::models::TableInfo;
 use url::Url;
-
-use types::TableInfo;
 
 /// A fully resolved test case ready for execution.
 #[derive(Debug)]

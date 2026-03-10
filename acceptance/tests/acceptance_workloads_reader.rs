@@ -7,10 +7,9 @@ use std::path::Path;
 
 use acceptance::acceptance_workloads::{
     test_case_from_spec_path,
-    types::WorkloadSpec,
-    validation::{validate_read_result, validate_snapshot},
-    workload::{execute_workload, WorkloadResult},
+    workload::{execute_and_validate_workload, execute_workload},
 };
+use delta_kernel_benchmarks::models::{Spec, TimeTravel};
 
 fn should_skip_test(test_path: &str) -> Option<&'static str> {
     let skip_list: &[(&str, &str)] = &[
@@ -274,16 +273,20 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
 ];
 
 /// Check if workload type is unsupported by the harness.
-fn unsupported_workload_reason(spec: &WorkloadSpec) -> Option<&'static str> {
+fn unsupported_workload_reason(spec: &Spec) -> Option<&'static str> {
     match spec {
-        WorkloadSpec::Read {
-            timestamp: Some(_), ..
-        }
-        | WorkloadSpec::Snapshot {
-            timestamp: Some(_), ..
-        } => Some("Timestamp-based time travel not supported by harness"),
-        WorkloadSpec::Unsupported => Some("Unsupported workload type"),
-        _ => None,
+        Spec::Read(read_spec) => match &read_spec.time_travel {
+            Some(TimeTravel::Timestamp { .. }) => {
+                Some("Timestamp-based time travel not supported by harness")
+            }
+            _ => None,
+        },
+        Spec::Snapshot(snapshot_spec) => match &snapshot_spec.time_travel {
+            Some(TimeTravel::Timestamp { .. }) => {
+                Some("Timestamp-based time travel not supported by harness")
+            }
+            _ => None,
+        },
     }
 }
 
@@ -311,107 +314,57 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
 
     // Load spec and test case once
     let content = std::fs::read_to_string(&spec_path_abs).expect("Failed to read spec file");
-    let spec: WorkloadSpec = serde_json::from_str(&content).expect("Failed to parse spec file");
+    let spec: Spec = serde_json::from_str(&content).expect("Failed to parse spec file");
     let (test_case, workload_name) =
         test_case_from_spec_path(&spec_path_abs).expect("Failed to load test case");
     let expected_dir = test_case.expected_dir(&workload_name);
 
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let table_root = test_case.table_root().expect("Failed to get table URL");
-            let engine =
-                test_utils::create_default_engine(&table_root).expect("Failed to create engine");
+    let table_root = test_case.table_root().expect("Failed to get table URL");
+    let engine = test_utils::create_default_engine(&table_root).expect("Failed to create engine");
 
-            // Skip unsupported workload types
-            if unsupported_workload_reason(&spec).is_some() {
-                return;
+    // Skip unsupported workload types
+    if unsupported_workload_reason(&spec).is_some() {
+        return Ok(());
+    }
+
+    // Expected kernel failures: assert kernel DOES fail
+    if let Some((reason, _)) = expected_failure {
+        let result = execute_workload(engine, &table_root, &spec);
+        match result {
+            Err(e) => println!("  Expected kernel failure ({reason}): {e}"),
+            Ok(_) if spec.expected_error().is_some() => {
+                println!("  Expected kernel divergence ({reason}): kernel succeeded where spec expects error");
             }
+            Ok(_) => panic!(
+                "Workload '{workload_name}' was expected to fail but succeeded! \
+                 Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!"
+            ),
+        }
+        return Ok(());
+    }
 
-            // Expected kernel failures: assert kernel DOES fail
-            if let Some((reason, _)) = expected_failure {
-                let result = execute_workload(engine, &table_root, &spec);
-                match result {
-                    Err(e) => println!("  Expected kernel failure ({reason}): {e}"),
-                    Ok(_) if spec.expected_error().is_some() => {
-                        println!("  Expected kernel divergence ({reason}): kernel succeeded where spec expects error");
-                    }
-                    Ok(_) => panic!(
-                        "Workload '{workload_name}' was expected to fail but succeeded! \
-                         Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!"
-                    ),
-                }
-                return;
-            }
+    println!("Running workload: {}", workload_name);
 
-            println!("Running workload: {}", workload_name);
+    // Error workloads: assert kernel fails
+    if let Some(expected_error) = spec.expected_error() {
+        match execute_workload(engine, &table_root, &spec) {
+            Ok(_) => panic!(
+                "Workload '{}' expected error '{}' but succeeded",
+                workload_name, expected_error.error_code
+            ),
+            Err(e) => println!(
+                "  Got expected error (expected '{}'): {}",
+                expected_error.error_code, e
+            ),
+        }
+        return Ok(());
+    }
 
-            // Error workloads: assert kernel fails
-            if let Some(expected_error) = spec.expected_error() {
-                match execute_workload(engine, &table_root, &spec) {
-                    Ok(_) => panic!(
-                        "Workload '{}' expected error '{}' but succeeded",
-                        workload_name, expected_error.error_code
-                    ),
-                    Err(e) => println!(
-                        "  Got expected error (expected '{}'): {}",
-                        expected_error.error_code, e
-                    ),
-                }
-                return;
-            }
+    // Execute and validate
+    execute_and_validate_workload(engine, &table_root, &spec, &expected_dir)
+        .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", workload_name, e));
 
-            // Execute and validate
-            let result = execute_workload(engine, &table_root, &spec)
-                .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", workload_name, e));
-
-            match result {
-                WorkloadResult::Read(read_result) => {
-                    let inline_expected = match &spec {
-                        WorkloadSpec::Read {
-                            expected: Some(ref e),
-                            ..
-                        } => Some(e),
-                        _ => None,
-                    };
-                    let batch = read_result.concat().expect("Failed to concat batches");
-                    if expected_dir.exists() || inline_expected.is_some() {
-                        validate_read_result(batch, &expected_dir, inline_expected)
-                            .await
-                            .unwrap_or_else(|e| panic!("{e}"));
-                    } else {
-                        println!(
-                            "  No expected data for '{}' ({} rows, not validated)",
-                            workload_name,
-                            batch.num_rows()
-                        );
-                    }
-                }
-                WorkloadResult::Snapshot(snapshot_result) => {
-                    let inline_expected = match &spec {
-                        WorkloadSpec::Snapshot {
-                            expected: Some(ref e),
-                            ..
-                        } => Some(e),
-                        _ => None,
-                    };
-                    if inline_expected.is_some() || expected_dir.exists() {
-                        validate_snapshot(&snapshot_result, &expected_dir, inline_expected)
-                            .unwrap_or_else(|e| panic!("{e}"));
-                    } else {
-                        println!(
-                            "  No expected metadata for '{}' (not validated)",
-                            workload_name
-                        );
-                    }
-                }
-                _ => {}
-            }
-
-            println!("  Passed");
-        });
-
+    println!("  Passed");
     Ok(())
 }
 
