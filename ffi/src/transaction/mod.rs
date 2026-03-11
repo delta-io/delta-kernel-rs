@@ -611,7 +611,7 @@ mod tests {
 
             // Read the staged commit
             let staged_commit_url = table_url
-                .join(&format!("_delta_log/_staged_commits/{}", staged_file_name))
+                .join(&format!("_delta_log/_staged_commits/{staged_file_name}"))
                 .unwrap();
             let staged_commit = store
                 .get(&Path::from_url_path(staged_commit_url.path()).unwrap())

@@ -48,11 +48,8 @@ fn write_large_parquet_to(path: &Path) -> Result<(), Box<dyn std::error::Error>>
         .iter()
         .map(|rg| rg.total_byte_size())
         .sum();
-    println!("File size (compressed file size):    {} bytes", file_size);
-    println!(
-        "Total size (uncompressed file size): {} bytes",
-        total_row_group_size
-    );
+    println!("File size (compressed file size):    {file_size} bytes");
+    println!("Total size (uncompressed file size): {total_row_group_size} bytes");
 
     Ok(())
 }
@@ -93,7 +90,7 @@ fn create_commit(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for action in actions {
-        writeln!(file, "{}", action)?;
+        writeln!(file, "{action}")?;
     }
 
     Ok(())
@@ -109,7 +106,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Write the large parquet file
     write_large_parquet_to(table_path)?;
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after writing parquet:\n{:?}", stats);
+    println!("Heap stats after writing parquet:\n{stats:?}");
 
     // Step 2: Create the Delta log
     create_commit(table_path)?;
@@ -124,7 +121,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to create snapshot");
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after creating snapshot:\n{:?}", stats);
+    println!("Heap stats after creating snapshot:\n{stats:?}");
 
     // Step 4: Build and execute scan
     let scan = snapshot
@@ -133,7 +130,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to build scan");
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after building scan:\n{:?}", stats);
+    println!("Heap stats after building scan:\n{stats:?}");
 
     // Step 5: Execute the scan and read data
     let mut row_count = 0;
@@ -143,8 +140,8 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after scan execution:\n{:?}", stats);
-    println!("Total rows read: {}", row_count);
+    println!("Heap stats after scan execution:\n{stats:?}");
+    println!("Total rows read: {row_count}");
 
     Ok(())
 }

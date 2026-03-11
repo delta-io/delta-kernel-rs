@@ -118,7 +118,7 @@ fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
             UTF8_MAX_CHAR
         };
 
-        return Some(Cow::Owned(format!("{}{}", truncated, tie_breaker)));
+        return Some(Cow::Owned(format!("{truncated}{tie_breaker}")));
     }
 
     // Could not find a valid truncation point within expansion limit

@@ -180,8 +180,7 @@ pub(crate) fn get_transform_expr(
                     // Column doesn't exist physically - treat as partition column
                     let Some((_, partition_value)) = metadata_values.remove(field_index) else {
                         return Err(Error::MissingData(format!(
-                            "missing partition value for dynamic column '{}' at index {}",
-                            physical_name, field_index
+                            "missing partition value for dynamic column '{physical_name}' at index {field_index}"
                         )));
                     };
 

@@ -199,8 +199,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
     match properties.get(COLUMN_MAPPING_MODE) {
         Some(mode_str) => mode_str.parse::<ColumnMappingMode>().map_err(|_| {
             Error::generic(format!(
-                "Invalid column mapping mode '{}'. Must be one of: none, name, id",
-                mode_str
+                "Invalid column mapping mode '{mode_str}'. Must be one of: none, name, id"
             ))
         }),
         None => Ok(ColumnMappingMode::None),
@@ -727,8 +726,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("already has column mapping metadata"),
-            "Expected error about existing column mapping metadata, got: {}",
-            err_msg
+            "Expected error about existing column mapping metadata, got: {err_msg}"
         );
     }
 
@@ -819,7 +817,7 @@ mod tests {
     fn unwrap_struct<'a>(data_type: &'a DataType, context: &str) -> &'a StructType {
         match data_type {
             DataType::Struct(s) => s,
-            _ => panic!("Expected Struct for {}, got {:?}", context, data_type),
+            _ => panic!("Expected Struct for {context}, got {data_type:?}"),
         }
     }
 

@@ -742,7 +742,7 @@ mod tests {
             ("delta.columnMapping.id", MetadataValue::Number(id)),
             (
                 "delta.columnMapping.physicalName",
-                MetadataValue::String(format!("col_{}", id)),
+                MetadataValue::String(format!("col_{id}")),
             ),
         ])
     }

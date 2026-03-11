@@ -1359,7 +1359,7 @@ mod tests {
         };
         DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: format!("dv_{}", path_suffix),
+            path_or_inline_dv: format!("dv_{path_suffix}"),
             offset: Some(0),
             size_in_bytes: 100,
             cardinality: 1,
@@ -1545,8 +1545,7 @@ mod tests {
         let expr_str = format!("{}", wc_without.logical_to_physical());
         assert!(
             expr_str.contains("drop letter"),
-            "Partition column 'letter' should be dropped. Expression: {}",
-            expr_str
+            "Partition column 'letter' should be dropped. Expression: {expr_str}"
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
@@ -1565,8 +1564,7 @@ mod tests {
         let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
             !expr_str.contains("drop"),
-            "No columns should be dropped with materializePartitionColumns. Expression: {}",
-            expr_str
+            "No columns should be dropped with materializePartitionColumns. Expression: {expr_str}"
         );
 
         Ok(())
@@ -1614,8 +1612,7 @@ mod tests {
         assert!(
             err_msg.contains("Deletion vector")
                 && (err_msg.contains("require") || err_msg.contains("version")),
-            "Expected protocol error about DV requirements, got: {}",
-            err_msg
+            "Expected protocol error about DV requirements, got: {err_msg}"
         );
         Ok(())
     }
@@ -1640,8 +1637,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
-            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {}",
-            err_msg);
+            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
         Ok(())
     }
 
@@ -1657,8 +1653,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Empty DV updates should succeed as no-op, got error: {:?}",
-            result
+            "Empty DV updates should succeed as no-op, got error: {result:?}"
         );
 
         Ok(())
@@ -1833,7 +1828,7 @@ mod tests {
     #[test]
     fn test_existing_table_txn_debug() -> DeltaResult<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
-        let debug_str = format!("{:?}", txn);
+        let debug_str = format!("{txn:?}");
         // Existing-table transactions should include the snapshot version number
         assert!(
             debug_str.contains("Transaction") && debug_str.contains("read_snapshot version"),
@@ -2203,8 +2198,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Stats validation error") || err_msg.contains("no stats"),
-            "Expected stats validation error, got: {}",
-            err_msg
+            "Expected stats validation error, got: {err_msg}"
         );
     }
 
@@ -2226,8 +2220,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass when stats are present, got: {:?}",
-            result
+            "Stats validation should pass when stats are present, got: {result:?}"
         );
     }
 
@@ -2248,8 +2241,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Stats validation should be skipped without clustering, got: {:?}",
-            result
+            "Stats validation should be skipped without clustering, got: {result:?}"
         );
     }
 }
