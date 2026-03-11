@@ -1327,68 +1327,6 @@ mod tests {
         assert_eq!(decimal_col.scale(), 2);
     }
 
-    #[test]
-    fn test_read_parquet_footer_preserves_field_ids() {
-        // Create Arrow schema with field IDs in metadata
-        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-        );
-        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-        );
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
-
-        // Write a parquet file with this schema
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_field_ids.parquet");
-
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let file = std::fs::File::create(&file_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        // Read footer and verify schema
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(
-            store,
-            Arc::new(TokioBackgroundExecutor::new()),
-            Default::default(),
-        );
-
-        let file_size = std::fs::metadata(&file_path).unwrap().len();
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        let footer = handler.read_parquet_footer(&file_meta).unwrap();
-
-        // Verify field IDs are transformed from PARQUET:field_id to parquet.field.id when reading
-        // The field IDs should be accessible using get_config_value (the documented API)
-        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
-        let id_value = id_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
-        assert!(id_value.is_some(), "Field ID should be present");
-        assert_eq!(id_value.unwrap().to_string(), "1");
-
-        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
-        let name_value =
-            name_field.get_config_value(&crate::schema::ColumnMetadataKey::ParquetFieldId);
-        assert!(name_value.is_some(), "Field ID should be present");
-        assert_eq!(name_value.unwrap().to_string(), "2");
-    }
-
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.
     ///
     /// Per trait definitions in lib.rs, field IDs should be accessible via StructField::get_config_value
