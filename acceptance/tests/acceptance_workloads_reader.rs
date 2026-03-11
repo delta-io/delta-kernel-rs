@@ -10,8 +10,10 @@ use acceptance::acceptance_workloads::{
 };
 use delta_kernel_benchmarks::models::{Spec, TimeTravel};
 
-fn should_skip_test(test_path: &str) -> Option<&'static str> {
-    let skip_list: &[(&str, &str)] = &[
+/// Tests that cannot even be executed (skip before running).
+/// These are either unsupported test types, infra issues, or known divergences
+/// that would cause false test failures.
+const SKIP_LIST: &[(&str, &str)] = &[
         // ── Infra/perf ──
         ("DV-017/", "Huge table (2B rows) causes OOM/hang"),
 
@@ -177,9 +179,10 @@ fn should_skip_test(test_path: &str) -> Option<&'static str> {
         // ── Kernel divergence: negative version handling ──
         // Kernel succeeds when reading at version -1, Spark returns DELTA_TABLE_RESTORE_VERSION_INVALID
         ("dsReadVersionNegative/specs/dsReadVersionNegative_error", "Kernel allows negative version, Spark rejects"),
-    ];
+];
 
-    for (pattern, reason) in skip_list {
+fn should_skip_test(test_path: &str) -> Option<&'static str> {
+    for (pattern, reason) in SKIP_LIST {
         if test_path.contains(pattern) {
             return Some(reason);
         }
@@ -187,14 +190,12 @@ fn should_skip_test(test_path: &str) -> Option<&'static str> {
     None
 }
 
-/// Known kernel-vs-Spark divergences where execute_workload returns Err.
-/// Each entry is (reason, &[path substrings]).
-/// The test asserts kernel DOES fail — if a kernel fix lands, the assertion breaks
-/// and the entry should be removed.
+/// Tests that CAN be executed but are expected to fail (kernel bugs or divergences).
+/// Unlike SKIP_LIST, these workloads run and we assert they fail with an error.
+/// When a kernel fix lands, the test will pass and the entry should be removed.
 const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
-    // ── Kernel bugs: unsupported types ──
     (
-        "Kernel: void/NullType not supported in schema deserialization",
+        "void/NullType not supported in schema deserialization",
         &[
             "void_001_void_top_level/",
             "void_002_void_nested_struct/",
@@ -205,7 +206,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel: interval types not supported in schema deserialization",
+        "Interval types not supported in schema deserialization",
         &[
             "intv_001_interval_ym_basic/",
             "intv_002_interval_dt_basic/",
@@ -217,9 +218,8 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "intv_sub_second/",
         ],
     ),
-    // ── Kernel bugs: null schemaString in metadata ──
     (
-        "Kernel: fails with null schemaString in metadata",
+        "Null schemaString in metadata action",
         &[
             "pv_old_protocol_read/specs/pv_old_protocol_read_snapshot",
             "pv_empty_reader_features/specs/pv_empty_reader_features_snapshot",
@@ -228,41 +228,38 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "pv_unknown_writer_feature_ok/specs/pv_unknown_writer_feature_ok_snapshot",
         ],
     ),
-    // ── Kernel bugs: checkpoint handling ──
     (
-        "Kernel: can't fall back to log replay when checkpoint has missing parts/files",
+        "Cannot fall back to log replay when checkpoint files are missing or incomplete",
         &[
             "corrupt_incomplete_multipart_checkpoint/",
             "ckp_incomplete_multipart/",
             "ckp_missing_checkpoint_file/",
         ],
     ),
-    // ── Kernel bugs: type widening ──
     (
-        "Kernel: cannot cast list to non-list data types during type widening",
+        "Cannot cast list to non-list data types during type widening",
         &[
             "tw_array_element/specs/tw_array_element_read_",
             "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
         ],
     ),
-    // ── Kernel bugs: other ──
     (
-        "Kernel: schema deserialization fails for TimestampNTZ type",
+        "Schema deserialization fails for TimestampNTZ type",
         &["ds_multi_file_time/"],
     ),
     (
-        "Kernel: requires contiguous commits; Spark uses CRC files to bridge gaps",
+        "Requires contiguous commits; Spark uses CRC files to bridge gaps",
         &["prod_non_contiguous_versions/"],
     ),
     (
-        "Kernel: column mapping id mode fails with None in final_fields_cols",
+        "Column mapping id mode fails with None in final_fields_cols",
         &[
             "cm_id_matching_swapped/specs/cm_id_matching_swapped_select_",
             "cm_id_matching_nonexistent/specs/cm_id_matching_nonexistent_select_",
         ],
     ),
     (
-        "Kernel: can't resolve percent-encoded filenames in AddFile paths",
+        "Cannot resolve percent-encoded filenames in AddFile paths",
         &[
             "DV-005b/specs/DV-005b_count",
             "DV-008/specs/DV-008_table2_latest",
@@ -270,15 +267,15 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel: inline DV has invalid magic number",
+        "Inline DV has invalid magic number",
         &["dv_storage_type_i/specs/dv_storage_type_i_read_after_inline_dv"],
     ),
     (
-        "Kernel: absolute-path DV has invalid percent-encoded path",
+        "Absolute-path DV has invalid percent-encoded path",
         &["dv_storage_type_p/specs/dv_storage_type_p_read_after_absolute_path_dv"],
     ),
     (
-        "Kernel: fails on missing/empty delta log (no files in log segment)",
+        "Fails on missing/empty delta log (no files in log segment)",
         &[
             "ct_empty_delta_log/specs/ct_empty_delta_log_snapshot",
             "ct_missing_delta_log/specs/ct_missing_delta_log_snapshot",
@@ -286,22 +283,20 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "dv_checkpoint_only_read/specs/dv_checkpoint_only_read_snapshot",
         ],
     ),
-    // ── Kernel bugs: projected column not found ──
     (
-        "Kernel: projected column not found after column mapping/schema order change",
+        "Projected column not found after column mapping/schema order change",
         &[
             "ds_schema_order_mismatch/specs/ds_schema_order_mismatch_single_col_last",
             "ds_with_dvs_edge/specs/ds_with_dvs_edge_proj_and_skip_with_dv",
             "dv_projection_with_pred/specs/dv_projection_with_pred_proj_and_pred",
         ],
     ),
-    // ── Kernel divergences: kernel succeeds where Spark expects error ──
     (
-        "Kernel: doesn't reject unsupported column mapping mode",
+        "Does not reject unsupported column mapping mode",
         &["cm_err_003_invalid_mode/specs/cm_err_003_invalid_mode_error"],
     ),
     (
-        "Kernel: reads corrupt/invalid commit or checkpoint without error",
+        "Reads corrupt/invalid commit or checkpoint without error",
         &[
             "corrupt_truncated_commit_json/specs/corrupt_truncated_commit_json_error",
             "cp_err_missing_protocol/specs/cp_err_missing_protocol_error",
@@ -313,7 +308,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel: doesn't reject duplicate actions in commit",
+        "Does not reject duplicate actions in commit",
         &[
             "ct_duplicate_metadata/specs/ct_duplicate_metadata_error",
             "ct_duplicate_protocol/specs/ct_duplicate_protocol_error",
@@ -321,7 +316,7 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel: doesn't reject missing metadata/protocol actions",
+        "Does not reject missing metadata/protocol actions",
         &[
             "ct_missing_metadata/specs/ct_missing_metadata_error",
             "ct_missing_protocol/specs/ct_missing_protocol_error",
@@ -330,14 +325,14 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel: snapshot construction succeeds even when data files are missing",
+        "Snapshot construction succeeds even when data files are missing",
         &[
             "ct_missing_data_file/specs/ct_missing_data_file_error",
             "dv_err_002_missing_file/specs/dv_err_002_missing_file_error",
         ],
     ),
     (
-        "Kernel: doesn't validate DV integrity",
+        "Does not validate DV integrity",
         &[
             "dv_err_001_checksum/specs/dv_err_001_checksum_error",
             "dv_err_003_malformed_path/specs/dv_err_003_malformed_path_error",
@@ -346,29 +341,29 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel: doesn't validate schema integrity",
+        "Does not validate schema integrity",
         &[
             "err_schema_empty/specs/err_schema_empty_error",
             "err_schema_invalid_json/specs/err_schema_invalid_json_error",
         ],
     ),
     (
-        "Kernel: doesn't require version 0 to exist",
+        "Does not require version 0 to exist",
         &["err_missing_version_0/specs/err_missing_version_0_error"],
     ),
     (
-        "Kernel: doesn't reject unknown reader features",
+        "Does not reject unknown reader features",
         &["ev_unknown_reader_feature/specs/ev_unknown_reader_feature_error"],
     ),
     (
-        "Kernel: doesn't enforce time travel safety",
+        "Does not enforce time travel safety",
         &[
             "tt_blocked_beyond_retention/specs/tt_blocked_beyond_retention_error",
             "tt_after_vacuum/specs/tt_after_vacuum_error",
         ],
     ),
     (
-        "Kernel: _metadata.file_path column projection not supported",
+        "_metadata.file_path column projection not supported",
         &["DV-003/specs/DV-003_metadata_file_path"],
     ),
 ];
@@ -387,6 +382,10 @@ fn unsupported_workload_reason(spec: &Spec) -> Option<&'static str> {
                 _ => None,
             }
         }
+        Spec::SnapshotConstruction(snapshot_spec) => match &snapshot_spec.time_travel {
+            Some(TimeTravel::Timestamp { .. }) => Some("Timestamp-based time travel not supported"),
+            _ => None,
+        },
         Spec::Snapshot(snapshot_spec) => match &snapshot_spec.time_travel {
             Some(TimeTravel::Timestamp { .. }) => Some("Timestamp-based time travel not supported"),
             _ => None,

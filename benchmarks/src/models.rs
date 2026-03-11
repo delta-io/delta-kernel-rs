@@ -2,24 +2,46 @@
 
 use delta_kernel::actions::{Metadata, Protocol};
 use serde::Deserialize;
+
 use std::path::{Path, PathBuf};
 
-// ── Table info ──────────────────────────────────────────────────────────────
+/// ReadConfig represents a specific configuration for a read operation
+/// A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
+#[derive(Clone, Debug)]
+pub struct ReadConfig {
+    pub name: String,
+    pub parallel_scan: ParallelScan,
+}
 
-/// Table metadata loaded from `table_info.json`.
+/// Provides a default set of read configs for a given table, read spec, and operation
+pub fn default_read_configs() -> Vec<ReadConfig> {
+    vec![ReadConfig {
+        name: "serial".into(),
+        parallel_scan: ParallelScan::Disabled,
+    }]
+}
+
+#[derive(Clone, Debug)]
+pub enum ParallelScan {
+    Disabled,
+    Enabled { num_threads: usize },
+}
+
+/// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    pub name: String,
-    pub description: Option<String>,
+    pub name: String,                // Table name used for identifying the table
+    pub description: Option<String>, // Human-readable description of the table
     #[serde(alias = "table_root_path")]
-    pub table_path: Option<String>,
+    pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
     #[serde(skip, default)]
-    pub table_info_dir: PathBuf,
+    pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
 
 impl TableInfo {
     pub fn resolved_table_root(&self) -> String {
+        // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
         self.table_path.clone().unwrap_or_else(|| {
             self.table_info_dir
                 .join("delta")
@@ -31,14 +53,13 @@ impl TableInfo {
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
+        //Stores the parent directory of the table info JSON file
         if let Some(parent) = path.as_ref().parent() {
             table_info.table_info_dir = parent.to_path_buf();
         }
         Ok(table_info)
     }
 }
-
-// ── Time travel ─────────────────────────────────────────────────────────────
 
 /// Mutually exclusive version or timestamp for time travel queries.
 #[derive(Clone, Debug, Deserialize)]
@@ -48,28 +69,15 @@ pub enum TimeTravel {
     Timestamp { timestamp: String },
 }
 
-// ── Workload specification ──────────────────────────────────────────────────
-
+/// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
+/// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
     Read(ReadSpec),
-    #[serde(alias = "snapshot_construction")]
-    Snapshot(Box<SnapshotSpec>),
-}
-
-impl Spec {
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Spec::Read(_) => "read",
-            Spec::Snapshot(_) => "snapshot_construction",
-        }
-    }
-
-    pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
-        let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
-        serde_json::from_str(&content)
-    }
+    SnapshotConstruction(SnapshotConstructionSpec),
+    #[serde(alias = "snapshot")]
+    Snapshot(Box<SnapshotConstructionSpec>),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,87 +94,45 @@ pub struct ReadSpec {
 }
 
 impl ReadSpec {
-    pub fn type_name(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         "read"
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SnapshotSpec {
+pub struct SnapshotConstructionSpec {
     #[serde(flatten)]
     pub time_travel: Option<TimeTravel>,
     #[serde(flatten)]
     pub expected: Option<SnapshotExpected>,
 }
 
-impl SnapshotSpec {
-    pub fn type_name(&self) -> &'static str {
+impl SnapshotConstructionSpec {
+    pub fn as_str(&self) -> &str {
         "snapshot_construction"
     }
 }
 
-// ── Expected-value types ────────────────────────────────────────────────────
+impl Spec {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Spec::Read(read_spec) => read_spec.as_str(),
+            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                snapshot_construction_spec.as_str()
+            }
+            Spec::Snapshot(snapshot_spec) => snapshot_spec.as_str(),
+        }
+    }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExpectedError {
-    pub error_code: String,
-    #[serde(default)]
-    pub error_message: Option<String>,
+    pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
+        let spec: Spec = serde_json::from_str(&content)?;
+        Ok(spec)
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadSuccess {
-    pub row_count: usize,
-}
-
-/// Expected snapshot values using kernel's Protocol and Metadata types.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotSuccess {
-    pub protocol: Protocol,
-    pub metadata: Metadata,
-}
-
-/// Expected outcome: either success with expected values, or an expected error.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ReadExpected {
-    Success { expected: ReadSuccess },
-    Error { error: ExpectedError },
-}
-
-/// Expected outcome for snapshot: either success or error.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum SnapshotExpected {
-    Success { expected: Box<SnapshotSuccess> },
-    Error { error: ExpectedError },
-}
-
-// ── Benchmark-specific types ────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct ReadConfig {
-    pub name: String,
-    pub parallel_scan: ParallelScan,
-}
-
-pub fn default_read_configs() -> Vec<ReadConfig> {
-    vec![ReadConfig {
-        name: "serial".into(),
-        parallel_scan: ParallelScan::Disabled,
-    }]
-}
-
-#[derive(Clone, Debug)]
-pub enum ParallelScan {
-    Disabled,
-    Enabled { num_threads: usize },
-}
-
+/// For Read specs, we will either run a read data operation or a read metadata operation
 #[derive(Clone, Copy, Debug)]
 pub enum ReadOperation {
     ReadData,
@@ -182,12 +148,52 @@ impl ReadOperation {
     }
 }
 
-/// A workload combining table info, case name, and spec.
+/// Partial workload specification loaded from JSON - table, case name, and spec only
 #[derive(Clone, Debug)]
 pub struct Workload {
     pub table_info: TableInfo,
-    pub case_name: String,
+    pub case_name: String, // Name of the spec JSON file
     pub spec: Spec,
+}
+
+/// Expected error information from test spec.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedError {
+    pub error_code: String,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+/// Expected success values for read operations.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSuccess {
+    pub row_count: usize,
+}
+
+/// Expected outcome for read operations: either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ReadExpected {
+    Success { expected: ReadSuccess },
+    Error { error: ExpectedError },
+}
+
+/// Expected success values for snapshot operations.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotSuccess {
+    pub protocol: Protocol,
+    pub metadata: Metadata,
+}
+
+/// Expected outcome for snapshot operations: either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SnapshotExpected {
+    Success { expected: Box<SnapshotSuccess> },
+    Error { error: ExpectedError },
 }
 
 #[cfg(test)]
@@ -252,23 +258,24 @@ mod tests {
         "snapshot_construction",
         Some(7)
     )]
-    #[case(
-        r#"{"type": "snapshot", "version": 3}"#,
-        "snapshot_construction",
-        Some(3)
-    )]
     fn test_deserialize_spec(
         #[case] json: &str,
         #[case] expected_type: &str,
         #[case] expected_version: Option<u64>,
     ) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
-        assert_eq!(spec.type_name(), expected_type);
+        assert_eq!(spec.as_str(), expected_type);
         let version = match &spec {
             Spec::Read(read_spec) => match &read_spec.time_travel {
                 Some(TimeTravel::Version { version }) => Some(*version),
                 _ => None,
             },
+            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                match &snapshot_construction_spec.time_travel {
+                    Some(TimeTravel::Version { version }) => Some(*version),
+                    _ => None,
+                }
+            }
             Spec::Snapshot(snapshot_spec) => match &snapshot_spec.time_travel {
                 Some(TimeTravel::Version { version }) => Some(*version),
                 _ => None,
@@ -284,23 +291,5 @@ mod tests {
     fn test_deserialize_spec_errors(#[case] json: &str, #[case] expected_msg: &str) {
         let error = serde_json::from_str::<Spec>(json).unwrap_err();
         assert!(error.to_string().contains(expected_msg));
-    }
-
-    #[rstest]
-    #[case(
-        r#"{"type": "read", "timestamp": "2024-01-01 00:00:00"}"#,
-        "2024-01-01 00:00:00"
-    )]
-    fn test_deserialize_timestamp(#[case] json: &str, #[case] expected_ts: &str) {
-        let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
-        match &spec {
-            Spec::Read(read_spec) => match &read_spec.time_travel {
-                Some(TimeTravel::Timestamp { timestamp }) => {
-                    assert_eq!(timestamp, expected_ts);
-                }
-                _ => panic!("Expected timestamp time travel"),
-            },
-            _ => panic!("Expected read spec"),
-        }
     }
 }

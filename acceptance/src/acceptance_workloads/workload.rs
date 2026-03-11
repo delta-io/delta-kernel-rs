@@ -9,7 +9,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
-use delta_kernel_benchmarks::models::{ReadSpec, SnapshotSpec, Spec, TimeTravel};
+use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use itertools::Itertools;
 use url::Url;
 
@@ -89,7 +89,7 @@ pub fn execute_read_workload(
 pub fn execute_snapshot_workload(
     engine: Arc<dyn Engine>,
     table_root: &Url,
-    snapshot_spec: &SnapshotSpec,
+    snapshot_spec: &SnapshotConstructionSpec,
 ) -> DeltaResult<SnapshotResult> {
     let version: Option<Version> = match &snapshot_spec.time_travel {
         Some(TimeTravel::Version { version }) => Some(*version),
@@ -132,12 +132,20 @@ pub fn execute_and_validate_workload(
             let result = execute_read_workload(engine, table_root, read_spec);
             validate_read_result(result, expected_dir, expected)?;
         }
-        Spec::Snapshot(snapshot_spec) => {
+        Spec::SnapshotConstruction(snapshot_spec) => {
             let expected = snapshot_spec
                 .expected
                 .as_ref()
                 .ok_or("SnapshotSpec missing expected field")?;
             let result = execute_snapshot_workload(engine, table_root, snapshot_spec);
+            validate_snapshot(result, expected)?;
+        }
+        Spec::Snapshot(snapshot_spec) => {
+            let expected = snapshot_spec
+                .expected
+                .as_ref()
+                .ok_or("SnapshotSpec missing expected field")?;
+            let result = execute_snapshot_workload(engine, table_root, snapshot_spec.as_ref());
             validate_snapshot(result, expected)?;
         }
     }

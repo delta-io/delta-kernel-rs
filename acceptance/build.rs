@@ -66,17 +66,13 @@ fn write_done_file() {
     write!(done_file, "done").expect("Failed to write .done file");
 }
 
-/// Get the acceptance crate directory (CARGO_MANIFEST_DIR).
-fn acceptance_dir() -> PathBuf {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    PathBuf::from(manifest_dir)
-}
-
 /// Extract acceptance workload specs from the local tar.gz if not already done.
 /// Tarball lives at `acceptance/acceptance_workloads.tar.gz` and extracts to
 /// `acceptance/workloads/`.
 fn extract_acceptance_workloads() {
-    let dir = acceptance_dir();
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let dir = PathBuf::from(manifest_dir);
+
     let tarball_path = dir.join("acceptance_workloads.tar.gz");
     let output_dir = dir.join("workloads");
     let done_marker = output_dir.join(".done");

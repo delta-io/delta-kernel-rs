@@ -29,7 +29,8 @@ use url::Url;
 /// A fully resolved test case ready for execution.
 #[derive(Debug)]
 pub struct TestCase {
-    /// Table metadata (absent if `table_info.json` doesn't exist)
+    /// Table metadata (absent if `table_info.json` doesn't exist). This
+    /// occurs when a table is corrupt table used for testing.
     pub table_info: Option<TableInfo>,
     /// Root directory of the test case
     pub root_dir: PathBuf,
@@ -41,19 +42,17 @@ impl TestCase {
     pub fn from_dir(root_dir: impl AsRef<Path>) -> Result<Self, String> {
         let root_dir = root_dir.as_ref().to_path_buf();
 
-        let table_info = {
-            let path = root_dir.join("table_info.json");
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("Failed to read table_info.json: {}", e))?;
-                let mut info: TableInfo = serde_json::from_str(&content)
-                    .map_err(|e| format!("Failed to parse table_info.json: {}", e))?;
-                info.table_info_dir = root_dir.clone();
-                Some(info)
-            } else {
-                None
-            }
-        };
+        let path = root_dir.join("table_info.json");
+
+        let mut table_info = None;
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read table_info.json: {}", e))?;
+            let mut info: TableInfo = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse table_info.json: {}", e))?;
+            info.table_info_dir = root_dir.clone();
+            table_info = Some(info)
+        }
 
         Ok(Self {
             table_info,

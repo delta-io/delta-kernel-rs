@@ -5,7 +5,8 @@
 //! Results are discarded for benchmarking purposes.
 
 use crate::models::{
-    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotSpec, TableInfo, TimeTravel,
+    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+    TimeTravel,
 };
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
@@ -183,7 +184,7 @@ impl SnapshotConstructionRunner {
     pub fn setup(
         table_info: &TableInfo,
         case_name: &str,
-        snapshot_spec: &SnapshotSpec,
+        snapshot_spec: &SnapshotConstructionSpec,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let table_root = table_info.resolved_table_root();
@@ -201,7 +202,7 @@ impl SnapshotConstructionRunner {
             "{}/{}/{}",
             table_info.name,
             case_name,
-            snapshot_spec.type_name()
+            snapshot_spec.as_str()
         );
 
         Ok(Self {
@@ -232,7 +233,7 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ParallelScan, ReadConfig, ReadSpec, SnapshotSpec, TableInfo};
+    use crate::models::{ParallelScan, ReadConfig, ReadSpec, SnapshotConstructionSpec, TableInfo};
     use delta_kernel::engine::default::DefaultEngine;
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
@@ -311,8 +312,8 @@ mod tests {
         assert!(runner.execute().is_ok());
     }
 
-    fn test_snapshot_spec() -> SnapshotSpec {
-        SnapshotSpec {
+    fn test_snapshot_spec() -> SnapshotConstructionSpec {
+        SnapshotConstructionSpec {
             time_travel: None,
             expected: None,
         }
