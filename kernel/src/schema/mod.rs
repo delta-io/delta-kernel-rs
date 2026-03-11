@@ -2041,6 +2041,17 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
+            if field.is_metadata_column() {
+                if field.has_physical_name_annotation() || field.has_id_annotation() {
+                    this.err = Some(Error::internal_error(format!(
+                        "Metadata column '{}' must not have column mapping annotations",
+                        field.name()
+                    )));
+                    return None;
+                }
+                return Some(Cow::Borrowed(field));
+            }
+
             let (physical_name, _id) = get_field_column_mapping_info(
                 field,
                 this.column_mapping_mode,
@@ -2049,16 +2060,6 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
             )
             .map_err(|e| this.err = Some(e))
             .ok()?;
-
-            if field.is_metadata_column()
-                && this.column_mapping_mode != ColumnMappingMode::None
-            {
-                this.err = Some(Error::internal_error(format!(
-                    "Metadata column '{}' should not participate in logical to physical translation",
-                    field.name()
-                )));
-                return None;
-            }
 
             let field = this.recurse_into_struct_field(field)?;
 
@@ -2429,6 +2430,39 @@ mod tests {
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
             });
+    }
+
+    #[test]
+    fn test_make_physical_passes_metadata_column_through() {
+        let field = StructField::create_metadata_column(
+            "_metadata.row_index",
+            MetadataColumnSpec::RowIndex,
+        );
+        for mode in [
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id,
+        ] {
+            let physical = field.make_physical(mode).unwrap();
+            assert_eq!(physical.name(), "_metadata.row_index");
+            assert!(physical.is_metadata_column());
+        }
+    }
+
+    #[test]
+    fn test_make_physical_rejects_metadata_column_with_cm_annotations() {
+        let field = StructField::create_metadata_column(
+            "_metadata.row_index",
+            MetadataColumnSpec::RowIndex,
+        )
+        .add_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            MetadataValue::String("phys".to_string()),
+        )]);
+        assert_result_error_with_message(
+            field.make_physical(ColumnMappingMode::Name),
+            "must not have column mapping annotations",
+        );
     }
 
     #[test]

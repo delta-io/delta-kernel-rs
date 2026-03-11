@@ -377,7 +377,6 @@ mod tests {
 
     use crate::utils::test_utils::test_deep_nested_schema_missing_leaf_cm;
 
-
     #[test]
     fn test_column_mapping_mode() {
         let annotated = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
@@ -1195,5 +1194,4 @@ mod tests {
             "Expected full nested path in error, got: {err}"
         );
     }
-
 }
