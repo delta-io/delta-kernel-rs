@@ -8,10 +8,12 @@ use tracing::info;
 /// Metrics collected during scan log replay.
 #[internal_api]
 pub(crate) struct ScanMetrics {
-    /// Add files seen during log replay (before deduplication).
+    /// Add files seen during add remove deduplication. This does not include data skipped add
+    /// files.
     /// Java equivalent: `addFilesCounter`
     num_add_files_seen: AtomicU64,
-    /// Add files that survived log replay (files to read).
+    /// Add files that survived log replay (files to read). includes files that survivd
+    /// dataskipping, partition pruning, and add/remove deduplication.
     /// Java equivalent: `activeAddFilesCounter`
     num_surviving_add_files: AtomicU64,
     /// Remove files seen (from delta/commit files only).
@@ -47,7 +49,8 @@ impl Default for ScanMetrics {
 impl ScanMetrics {
     /// Resets all counters to zero for a new phase of log replay.
     pub(crate) fn reset_counters(&self) {
-        // NOTE: hash_set_size is not reset.
+        // NOTE: hash_set_size is not reset since it is the same across different phases of log
+        // replay.
         self.num_add_files_seen.store(0, Ordering::Relaxed);
         self.num_surviving_add_files.store(0, Ordering::Relaxed);
         self.num_remove_files_seen.store(0, Ordering::Relaxed);

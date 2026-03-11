@@ -563,7 +563,7 @@ mod tests {
             "Sequential predicate_filtered mismatch",
         );
 
-        // Verify timing metrics are present and parseable
+        // Verify timing metrics are present and parseable (values may be 0 for fast operations)
         let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
         let _predicate_eval_time = extract_metric(logs, "predicate_eval_time_ms");
 
@@ -587,6 +587,10 @@ mod tests {
                 total_remove_files_seen += extract_metric(remaining, "remove_files_seen");
                 total_non_file_actions += extract_metric(remaining, "non_file_actions");
                 total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
+
+                // Verify timing metrics are present and parseable in parallel phase
+                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ms");
+                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ms");
 
                 search_start = absolute_pos + 1;
             }
