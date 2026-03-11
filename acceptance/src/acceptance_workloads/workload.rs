@@ -132,20 +132,12 @@ pub fn execute_and_validate_workload(
             let result = execute_read_workload(engine, table_root, read_spec);
             validate_read_result(result, expected_dir, expected)?;
         }
-        Spec::SnapshotConstruction(snapshot_spec) => {
-            let expected = snapshot_spec
-                .expected
-                .as_ref()
-                .ok_or("SnapshotSpec missing expected field")?;
-            let result = execute_snapshot_workload(engine, table_root, snapshot_spec);
-            validate_snapshot(result, expected)?;
-        }
         Spec::Snapshot(snapshot_spec) => {
             let expected = snapshot_spec
                 .expected
                 .as_ref()
                 .ok_or("SnapshotSpec missing expected field")?;
-            let result = execute_snapshot_workload(engine, table_root, snapshot_spec.as_ref());
+            let result = execute_snapshot_workload(engine, table_root, snapshot_spec);
             validate_snapshot(result, expected)?;
         }
     }

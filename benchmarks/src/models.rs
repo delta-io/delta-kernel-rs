@@ -61,7 +61,7 @@ impl TableInfo {
     }
 }
 
-/// Mutually exclusive version or timestamp for time travel queries.
+/// Time travel parameter. Either version or timestamp.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TimeTravel {
@@ -75,9 +75,7 @@ pub enum TimeTravel {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Spec {
     Read(ReadSpec),
-    SnapshotConstruction(SnapshotConstructionSpec),
-    #[serde(alias = "snapshot")]
-    Snapshot(Box<SnapshotConstructionSpec>),
+    Snapshot(SnapshotConstructionSpec),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -118,9 +116,6 @@ impl Spec {
     pub fn as_str(&self) -> &str {
         match self {
             Spec::Read(read_spec) => read_spec.as_str(),
-            Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                snapshot_construction_spec.as_str()
-            }
             Spec::Snapshot(snapshot_spec) => snapshot_spec.as_str(),
         }
     }
@@ -170,6 +165,8 @@ pub struct ExpectedError {
 #[serde(rename_all = "camelCase")]
 pub struct ReadSuccess {
     pub row_count: usize,
+    pub file_count: usize,
+    pub files_skipped: usize,
 }
 
 /// Expected outcome for read operations: either success or error.
@@ -270,12 +267,6 @@ mod tests {
                 Some(TimeTravel::Version { version }) => Some(*version),
                 _ => None,
             },
-            Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                match &snapshot_construction_spec.time_travel {
-                    Some(TimeTravel::Version { version }) => Some(*version),
-                    _ => None,
-                }
-            }
             Spec::Snapshot(snapshot_spec) => match &snapshot_spec.time_travel {
                 Some(TimeTravel::Version { version }) => Some(*version),
                 _ => None,

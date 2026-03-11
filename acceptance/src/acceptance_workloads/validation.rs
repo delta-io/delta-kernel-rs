@@ -14,55 +14,61 @@ use crate::data::assert_data_matches;
 use super::workload::{ReadResult, SnapshotResult};
 
 /// Read expected data from parquet files in expected_dir/expected_data/.
-fn read_expected_data(expected_dir: &Path) -> Result<Option<RecordBatch>, String> {
+fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
     let expected_data_dir = expected_dir.join("expected_data");
     if !expected_data_dir.exists() {
-        return Ok(None);
+        return Err(format!(
+            "Expected data directory not found: {}",
+            expected_data_dir.display()
+        ));
     }
 
-    let entries = fs::read_dir(&expected_data_dir)
-        .map_err(|e| format!("Failed to read expected_data dir: {e}"))?;
+    let parquet_paths: Vec<_> = fs::read_dir(&expected_data_dir)
+        .map_err(|e| format!("Failed to read expected_data dir: {e}"))?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let filename = path.file_name()?.to_str()?;
+
+            if filename.starts_with('.') || filename.starts_with('_') {
+                return None;
+            }
+
+            if path.extension()?.to_str()? == "parquet" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let mut batches = vec![];
     let mut schema = None;
 
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read dir entry: {e}"))?;
-        let path = entry.path();
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for path in parquet_paths {
+        let file = File::open(&path)
+            .map_err(|e| format!("Failed to open parquet file {}: {e}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("Failed to create parquet reader: {e}"))?;
 
-        if filename.starts_with('.') || filename.starts_with('_') {
-            continue;
+        if schema.is_none() {
+            schema = Some(builder.schema().clone());
         }
 
-        if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
-            let file = File::open(&path)
-                .map_err(|e| format!("Failed to open parquet file {}: {e}", path.display()))?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-                .map_err(|e| format!("Failed to create parquet reader: {e}"))?;
+        let reader = builder
+            .build()
+            .map_err(|e| format!("Failed to build parquet reader: {e}"))?;
 
-            if schema.is_none() {
-                schema = Some(builder.schema().clone());
-            }
-
-            let reader = builder
-                .build()
-                .map_err(|e| format!("Failed to build parquet reader: {e}"))?;
-
-            for batch in reader {
-                let batch = batch.map_err(|e| format!("Failed to read batch: {e}"))?;
-                batches.push(batch);
-            }
+        for batch in reader {
+            let batch = batch.map_err(|e| format!("Failed to read batch: {e}"))?;
+            batches.push(batch);
         }
     }
 
-    if let Some(schema) = schema {
-        let all_data = concat_batches(&schema, &batches)
-            .map_err(|e| format!("Failed to concat batches: {e}"))?;
-        Ok(Some(all_data))
-    } else {
-        Ok(None)
-    }
+    let schema =
+        schema.ok_or_else(|| format!("No parquet files found in {}", expected_data_dir.display()))?;
+    let all_data = concat_batches(&schema, &batches)
+        .map_err(|e| format!("Failed to concat batches: {e}"))?;
+    Ok(all_data)
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -75,13 +81,7 @@ pub fn validate_read_result(
 ) -> Result<(), String> {
     match (result, expected) {
         (Ok(read_result), ReadExpected::Success { expected }) => {
-            // Validate against expected data files if present
-            let Some(expected_data) = read_expected_data(expected_dir)? else {
-                panic!(
-                    "Failed to find expected data in {}",
-                    expected_dir.to_str().unwrap()
-                );
-            };
+            let expected_data = read_expected_data(expected_dir)?;
             assert_data_matches(
                 read_result.batches,
                 &read_result.schema,

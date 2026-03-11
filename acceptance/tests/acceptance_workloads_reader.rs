@@ -382,10 +382,6 @@ fn unsupported_workload_reason(spec: &Spec) -> Option<&'static str> {
                 _ => None,
             }
         }
-        Spec::SnapshotConstruction(snapshot_spec) => match &snapshot_spec.time_travel {
-            Some(TimeTravel::Timestamp { .. }) => Some("Timestamp-based time travel not supported"),
-            _ => None,
-        },
         Spec::Snapshot(snapshot_spec) => match &snapshot_spec.time_travel {
             Some(TimeTravel::Timestamp { .. }) => Some("Timestamp-based time travel not supported"),
             _ => None,
