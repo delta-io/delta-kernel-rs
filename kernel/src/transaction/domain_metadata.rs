@@ -168,8 +168,7 @@ impl<S> Transaction<S> {
             .collect();
         let existing_domains = self
             .read_snapshot
-            .log_segment()
-            .scan_domain_metadatas(Some(&domains), engine)?;
+            .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
