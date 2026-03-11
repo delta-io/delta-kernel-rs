@@ -1293,8 +1293,8 @@ mod test {
     #[derive(Debug, Clone, Copy)]
     enum UnknownFeatureShape {
         NotListed,
-        WriterOnlyListed,
-        ReaderWriterListed,
+        WriterOnly,
+        ReaderWriter,
     }
 
     fn create_unknown_feature_config(
@@ -1316,7 +1316,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
 
         let reader_features = match shape {
-            UnknownFeatureShape::ReaderWriterListed => vec![UNKNOWN],
+            UnknownFeatureShape::ReaderWriter => vec![UNKNOWN],
             _ => vec![],
         };
         let writer_features = match shape {
@@ -1331,8 +1331,8 @@ mod test {
 
     #[rstest]
     #[case(UnknownFeatureShape::NotListed, false)]
-    #[case(UnknownFeatureShape::WriterOnlyListed, false)]
-    #[case(UnknownFeatureShape::ReaderWriterListed, false)]
+    #[case(UnknownFeatureShape::WriterOnly, false)]
+    #[case(UnknownFeatureShape::ReaderWriter, false)]
     // FIXME: Listed unknown features should be protocol-supported for forward compatibility.
     fn test_unknown_feature_protocol_support(
         #[case] shape: UnknownFeatureShape,
@@ -1344,8 +1344,8 @@ mod test {
 
     #[rstest]
     #[case(UnknownFeatureShape::NotListed, false)]
-    #[case(UnknownFeatureShape::WriterOnlyListed, false)]
-    #[case(UnknownFeatureShape::ReaderWriterListed, false)]
+    #[case(UnknownFeatureShape::WriterOnly, false)]
+    #[case(UnknownFeatureShape::ReaderWriter, false)]
     // FIXME: Listed unknown features should be protocol-enabled for forward compatibility.
     fn test_unknown_feature_protocol_enablement(
         #[case] shape: UnknownFeatureShape,
@@ -1359,12 +1359,12 @@ mod test {
     #[case(UnknownFeatureShape::NotListed, Operation::Scan, true)]
     #[case(UnknownFeatureShape::NotListed, Operation::Cdf, true)]
     #[case(UnknownFeatureShape::NotListed, Operation::Write, true)]
-    #[case(UnknownFeatureShape::WriterOnlyListed, Operation::Scan, true)]
-    #[case(UnknownFeatureShape::WriterOnlyListed, Operation::Cdf, true)]
-    #[case(UnknownFeatureShape::WriterOnlyListed, Operation::Write, false)]
-    #[case(UnknownFeatureShape::ReaderWriterListed, Operation::Scan, false)]
-    #[case(UnknownFeatureShape::ReaderWriterListed, Operation::Cdf, false)]
-    #[case(UnknownFeatureShape::ReaderWriterListed, Operation::Write, false)]
+    #[case(UnknownFeatureShape::WriterOnly, Operation::Scan, true)]
+    #[case(UnknownFeatureShape::WriterOnly, Operation::Cdf, true)]
+    #[case(UnknownFeatureShape::WriterOnly, Operation::Write, false)]
+    #[case(UnknownFeatureShape::ReaderWriter, Operation::Scan, false)]
+    #[case(UnknownFeatureShape::ReaderWriter, Operation::Cdf, false)]
+    #[case(UnknownFeatureShape::ReaderWriter, Operation::Write, false)]
     fn test_unknown_feature_capabilities(
         #[case] shape: UnknownFeatureShape,
         #[case] operation: Operation,
