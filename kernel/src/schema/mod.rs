@@ -467,7 +467,7 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `validate_field_annotations` should have verified that this has a field Id
+                    // `get_field_column_mapping_info` should have verified that this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
