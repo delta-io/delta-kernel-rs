@@ -246,7 +246,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             expression,
             output_type,
         }))
@@ -258,7 +258,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
         Ok(Arc::new(DefaultPredicateEvaluator {
-            _input_schema: schema,
+            input_schema: schema,
             predicate,
         }))
     }
@@ -279,7 +279,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef, // prefixed _ since unused (reserved for future schema validation)
+    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -288,14 +288,16 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(Error::Generic(format!(
         //         "input schema does not match batch schema: {:?} != {:?}",
-        //         self._input_schema,
+        //         input_schema,
         //         batch.schema()
         //     )));
         // };
+
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
@@ -315,10 +317,8 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
                 let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
-                let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    "output", arrow_type, true,
-                )]));
-                RecordBatch::try_new(schema, vec![array_ref])?
+                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+                RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
             }
         };
 
@@ -328,7 +328,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    _input_schema: SchemaRef,
+    input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
@@ -336,21 +336,22 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(Error::Generic(format!(
         //         "input schema does not match batch schema: {:?} != {:?}",
-        //         self._input_schema,
+        //         input_schema,
         //         batch.schema()
         //     )));
         // };
         let array = evaluate_predicate(&self.predicate, batch, false)?;
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
             ArrowDataType::Boolean,
             true,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])?;
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

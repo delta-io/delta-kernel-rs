@@ -1,25 +1,25 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::instrument;
+use delta_kernel_derive::internal_api;
+use tracing::{debug, info, instrument};
+use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::domain_metadata::{
-    all_domain_metadata_configuration, domain_metadata_configuration,
-};
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::INTERNAL_DOMAIN_PREFIX;
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::clustering::get_clustering_columns_from_domain_metadata;
+use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::crc::Crc;
 use crate::crc::{CrcDelta, LazyCrc};
 use crate::expressions::ColumnName;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -32,14 +32,9 @@ use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::LogCompactionWriter;
 use crate::{DeltaResult, Engine, Error, Version};
-use delta_kernel_derive::internal_api;
 
 mod builder;
 pub use builder::SnapshotBuilder;
-
-use delta_kernel::actions::DomainMetadata;
-use tracing::{debug, info};
-use url::Url;
 
 pub type SnapshotRef = Arc<Snapshot>;
 
@@ -482,9 +477,8 @@ impl Snapshot {
         require!(
             new_version == read_version.wrapping_add(1),
             Error::internal_error(format!(
-                "Cannot create post-commit Snapshot. Log file version ({}) does not \
-                equal Snapshot version ({}) + 1.",
-                new_version, read_version
+                "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
+                equal Snapshot version ({read_version}) + 1."
             ))
         );
 
@@ -664,7 +658,7 @@ impl Snapshot {
             ));
         }
 
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        self.get_domain_metadata_internal(domain, engine)
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
@@ -680,15 +674,32 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        if self
+        if !self
             .table_configuration
             .protocol()
             .has_table_feature(&TableFeature::ClusteredTable)
         {
-            get_clustering_columns_from_domain_metadata(&self.log_segment, engine)
-        } else {
-            Ok(None)
+            return Ok(None);
         }
+        match self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)? {
+            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load domain metadata from this snapshot. If `domains` is `Some`, only load the specified
+    /// domains (with early termination). If `None`, load all domains.
+    ///
+    /// This is the single entry point for all domain metadata reads on a snapshot. All public
+    /// and internal domain metadata APIs delegate to this method.
+    #[internal_api]
+    pub(crate) fn get_domain_metadatas_internal(
+        &self,
+        engine: &dyn Engine,
+        domains: Option<&HashSet<&str>>,
+    ) -> DeltaResult<DomainMetadataMap> {
+        // TODO: utilize Checksum
+        self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
     /// Returns file-level statistics, or `None` if no CRC with valid stats exists at this
@@ -783,10 +794,11 @@ impl Snapshot {
         )))
     }
 
-    /// An API guarded by the `internal-api` feature flag for fetching both user-controlled and
-    /// system-controlled domain metadata for a specific domain in this snapshot.
+    /// Fetch both user-controlled and system-controlled domain metadata for a specific domain
+    /// in this snapshot.
     ///
-    /// Returns the latest configuration for the domain, or None if the domain does not exist.
+    /// Returns the latest configuration for the domain, or `None` if the domain does not exist
+    /// (or was removed). Unlike [`Snapshot::get_domain_metadata`], this does not reject `delta.*` domains.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_domain_metadata_internal(
@@ -794,18 +806,22 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
+    /// Fetch all non-internal domain metadata for this snapshot as a `Vec`.
+    ///
+    /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_domain_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
+        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
         Ok(all_metadata
-            .into_iter()
+            .into_values()
             .filter(|domain| !domain.is_internal())
             .collect())
     }
@@ -885,7 +901,7 @@ mod tests {
     use serde_json::json;
     use test_utils::{add_commit, delta_path_for_version};
 
-    use crate::actions::Protocol;
+    use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -902,7 +918,6 @@ mod tests {
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
-    use delta_kernel::actions::DomainMetadata;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -985,7 +1000,7 @@ mod tests {
     fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
         let protocol = create_protocol(ict_enabled, None);
         let metadata = create_metadata(None, None, None, ict_config, false);
-        format!("{}\n{}", protocol, metadata)
+        format!("{protocol}\n{metadata}")
     }
 
     #[test]
@@ -1465,7 +1480,7 @@ mod tests {
 
         // Write all test files to the in memory file system
         for (path_prefix, data, _) in &test_cases {
-            let path = Path::from(format!("{}/_last_checkpoint", path_prefix));
+            let path = Path::from(format!("{path_prefix}/_last_checkpoint"));
             store
                 .put(&path, data.clone().into())
                 .await
@@ -1478,7 +1493,7 @@ mod tests {
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
-            let url = Url::parse(&format!("memory:///{}/", path_prefix)).expect("valid url");
+            let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
             let result =
                 LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);

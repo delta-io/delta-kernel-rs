@@ -33,6 +33,7 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
     let (fields, columns, _nulls) = applied.into_parts();
+
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(fields)),
         columns,
@@ -206,7 +207,9 @@ mod apply_schema_validation_tests {
 
     use crate::arrow::array::{Int32Array, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -325,11 +328,11 @@ mod apply_schema_validation_tests {
         assert_eq!(col_b.value(2), 30);
     }
 
-    /// Test that apply_schema translates "parquet.field.id" kernel metadata to the
-    /// Arrow-specific "PARQUET:field_id" key. This ensures the same key translation applied during
-    /// schema conversion (`TryFromKernel<&StructField> for ArrowField`) is also applied when
-    /// `apply_schema` is used to map data onto an existing schema (e.g. in the arrow
-    /// expression evaluator).
+    /// Test that apply_schema translates "parquet.field.id" kernel metadata to the Arrow-specific
+    /// "PARQUET:field_id" key. This ensures the same key translation applied during schema
+    /// conversion (`TryFromKernel<&StructField> for ArrowField`) is also applied when
+    /// `apply_schema` is used to map data onto an existing schema (e.g. in the arrow expression
+    /// evaluator).
     #[test]
     fn test_apply_schema_transforms_parquet_field_id_metadata() {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
@@ -364,8 +367,8 @@ mod apply_schema_validation_tests {
         );
     }
 
-    /// Test that apply_schema succeeds when the input Arrow field already carries the
-    /// same field ID as the target kernel schema field (no conflict).
+    /// Test that apply_schema succeeds when the input Arrow field already carries the same field
+    /// ID as the target kernel schema field (no conflict).
     #[test]
     fn test_apply_schema_matching_field_ids_succeed() {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
@@ -386,8 +389,8 @@ mod apply_schema_validation_tests {
         assert!(result.is_ok(), "Matching field IDs should succeed");
     }
 
-    /// Test that apply_schema fails when the input Arrow field already carries a
-    /// *different* field ID than the target kernel schema field.
+    /// Test that apply_schema fails when the input Arrow field already carries a *different* field
+    /// ID than the target kernel schema field.
     #[test]
     fn test_apply_schema_conflicting_field_ids_fail() {
         let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();

@@ -568,7 +568,7 @@ impl Display for StructField {
                 metadata_str.push_str(", ");
             }
             first = false;
-            metadata_str.push_str(&format!("{}: {:?}", k, v));
+            metadata_str.push_str(&format!("{k}: {v:?}"));
         }
         metadata_str.push('}');
         write!(
@@ -981,7 +981,7 @@ impl StructType {
                 self.fields
                     .get_index_of(after)
                     .map(|index| index + 1)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))
+                    .ok_or_else(|| Error::generic(format!("Field {after} not found")))
             })
             .unwrap_or_else(|| Ok(self.fields.len()))?;
 
@@ -1010,7 +1010,7 @@ impl StructType {
             .map(|before| {
                 self.fields
                     .get_index_of(before)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", before)))
+                    .ok_or_else(|| Error::generic(format!("Field {before} not found")))
             })
             .unwrap_or_else(|| Ok(0))?;
 
@@ -1045,7 +1045,7 @@ impl StructType {
         let replace_field = self
             .fields
             .get_mut(name)
-            .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
+            .ok_or_else(|| Error::generic(format!("Field {name} not found")))?;
 
         *replace_field = new_field;
         Ok(self)
@@ -1081,7 +1081,7 @@ fn write_struct_type(
         levels.push(is_last);
 
         write_indent(f, levels)?;
-        writeln!(f, "{}", field)?;
+        writeln!(f, "{field}")?;
 
         field.data_type.fmt_recursive(f, levels)?;
 
@@ -2772,7 +2772,7 @@ mod tests {
                 1 => assert_eq!(field.name, "required_int"),
                 2 => assert_eq!(field.name, "nullable_bool"),
                 3 => assert_eq!(field.name, "required_long"),
-                _ => panic!("Unexpected field index: {}", index),
+                _ => panic!("Unexpected field index: {index}"),
             }
         }
     }

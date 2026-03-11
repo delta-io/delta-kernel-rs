@@ -100,7 +100,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -387,7 +387,7 @@ pub(crate) mod test_utils {
         struct_type
             .fields()
             .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{}' not found", name))
+            .unwrap_or_else(|| panic!("Field '{name}' not found"))
             .clone()
     }
 
@@ -400,8 +400,7 @@ pub(crate) mod test_utils {
             let field = get_schema_field(schema, field_name);
             assert!(
                 matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{}' should be a struct type",
-                field_name
+                "Field '{field_name}' should be a struct type"
             );
         }
 
@@ -791,7 +790,7 @@ pub(crate) mod test_utils {
                 path.push("tests/data");
                 path.push(table_name);
                 let path = std::fs::canonicalize(path)
-                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {e}")))?;
                 (path, None)
             }
         };

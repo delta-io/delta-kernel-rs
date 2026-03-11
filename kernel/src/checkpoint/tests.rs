@@ -568,8 +568,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 /// Create an Add action with JSON stats
 fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
     let stats = format!(
-        r#"{{"numRecords":{},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#,
-        num_records
+        r#"{{"numRecords":{num_records},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#
     );
     Action::Add(Add {
         path: path.into(),
@@ -838,18 +837,15 @@ fn verify_checkpoint_schema_with_partitions(
 
         assert_eq!(
             has_stats, expect_stats,
-            "stats field: expected={}, actual={}",
-            expect_stats, has_stats
+            "stats field: expected={expect_stats}, actual={has_stats}"
         );
         assert_eq!(
             has_stats_parsed, expect_stats_parsed,
-            "stats_parsed field: expected={}, actual={}",
-            expect_stats_parsed, has_stats_parsed
+            "stats_parsed field: expected={expect_stats_parsed}, actual={has_stats_parsed}"
         );
         assert_eq!(
             has_pv_parsed, expect_partition_values_parsed,
-            "partitionValues_parsed field: expected={}, actual={}",
-            expect_partition_values_parsed, has_pv_parsed
+            "partitionValues_parsed field: expected={expect_partition_values_parsed}, actual={has_pv_parsed}"
         );
     } else {
         panic!("add field should be a struct");
