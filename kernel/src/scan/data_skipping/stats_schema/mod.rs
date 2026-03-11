@@ -38,6 +38,13 @@ pub(crate) use column_filter::StatsConfig;
 /// column hierarchy. They additionally filter out leaf fields with non-eligible data types
 /// (e.g., Boolean, Binary) via [`is_skipping_eligible_datatype`].
 ///
+/// For columns where statistics are required (e.g. clustering columns), when a column
+/// contains only null values, `minValues` and `maxValues` for that column should be null.
+/// This is the only case where null min/max is valid -- it requires `nullCount == numRecords`
+/// for the file. Engines that implement stats collection must still include the column field
+/// in the `minValues`/`maxValues` struct (with a null value) rather than omitting it entirely,
+/// so that downstream consumers can distinguish "all nulls" from "stats not collected".
+///
 /// The `tightBounds` field is a boolean indicating whether the min/max statistics are "tight"
 /// (accurate) or "wide" (potentially outdated). When `tightBounds` is `true`, the statistics
 /// accurately reflect the data in the file. When `false`, the file may have deletion vectors
