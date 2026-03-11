@@ -19,7 +19,7 @@ pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
 };
-pub(crate) use timestamp_ntz::{validate_timestamp_ntz_feature_support, UsesTimestampNtz};
+pub(crate) use timestamp_ntz::{schema_contains_timestamp_ntz, validate_timestamp_ntz_feature_support};
 mod column_mapping;
 mod timestamp_ntz;
 

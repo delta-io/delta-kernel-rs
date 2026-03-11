@@ -41,19 +41,11 @@ fn assert_variant_protocol(snapshot: &Snapshot) {
 
 /// Variant schema auto-enables variantType across schema shapes and column mapping modes.
 #[rstest::rstest]
-#[case::top_level_no_cm(top_level_variant_schema(), "none")]
-#[case::top_level_cm_name(top_level_variant_schema(), "name")]
-#[case::top_level_cm_id(top_level_variant_schema(), "id")]
-#[case::nested_no_cm(nested_variant_schema(), "none")]
-#[case::nested_cm_name(nested_variant_schema(), "name")]
-#[case::nested_cm_id(nested_variant_schema(), "id")]
-#[case::multiple_no_cm(multiple_variant_schema(), "none")]
-#[case::multiple_cm_name(multiple_variant_schema(), "name")]
-#[case::multiple_cm_id(multiple_variant_schema(), "id")]
-#[test]
 fn test_create_table_with_variant(
-    #[case] schema: Arc<StructType>,
-    #[case] cm_mode: &str,
+    #[values(top_level_variant_schema(), nested_variant_schema(), multiple_variant_schema())]
+    schema: Arc<StructType>,
+    #[values("none", "name", "id")]
+    cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 

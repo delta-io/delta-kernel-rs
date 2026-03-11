@@ -13,10 +13,8 @@ use std::borrow::Cow;
 pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
     let protocol = tc.protocol();
     if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
-        let mut uses_timestamp_ntz = UsesTimestampNtz::default();
-        let _ = uses_timestamp_ntz.transform_struct(&tc.logical_schema());
         require!(
-            !uses_timestamp_ntz.found(),
+            !schema_contains_timestamp_ntz(&tc.logical_schema()),
             Error::unsupported(
                 "Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features"
             )
@@ -25,15 +23,16 @@ pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) ->
     Ok(())
 }
 
-/// Schema visitor that checks if any column in the schema uses TIMESTAMP_NTZ type
-#[derive(Debug, Default)]
-pub(crate) struct UsesTimestampNtz(bool);
-
-impl UsesTimestampNtz {
-    pub(crate) fn found(&self) -> bool {
-        self.0
-    }
+/// Checks if any column in the schema (including nested structs, arrays, maps) uses
+/// the TIMESTAMP_NTZ primitive type.
+pub(crate) fn schema_contains_timestamp_ntz(schema: &crate::schema::StructType) -> bool {
+    let mut checker = UsesTimestampNtz::default();
+    let _ = checker.transform_struct(schema);
+    checker.0
 }
+
+#[derive(Default)]
+struct UsesTimestampNtz(bool);
 
 impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {

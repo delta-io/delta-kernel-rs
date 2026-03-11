@@ -729,32 +729,26 @@ pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
     ]))
 }
 
-/// Schema with a top-level TimestampNTZ column.
 pub fn top_level_ntz_schema() -> SchemaRef {
     schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
-/// Schema with a TimestampNTZ nested inside a struct.
 pub fn nested_ntz_schema() -> SchemaRef {
     nested_schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
-/// Schema with multiple top-level TimestampNTZ columns.
 pub fn multiple_ntz_schema() -> SchemaRef {
     multi_schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
-/// Schema with a top-level variant column.
 pub fn top_level_variant_schema() -> SchemaRef {
     schema_with_type(DataType::unshredded_variant())
 }
 
-/// Schema with a variant nested inside a struct.
 pub fn nested_variant_schema() -> SchemaRef {
     nested_schema_with_type(DataType::unshredded_variant())
 }
 
-/// Schema with multiple top-level variant columns.
 pub fn multiple_variant_schema() -> SchemaRef {
     multi_schema_with_type(DataType::unshredded_variant())
 }

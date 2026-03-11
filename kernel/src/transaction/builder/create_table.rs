@@ -23,8 +23,9 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, ColumnMappingMode, FeatureType, TableFeature,
-    UsesTimestampNtz, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
+    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
@@ -259,12 +260,9 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
 }
 
 /// Conditionally adds the `timestampNtz` feature to the protocol when the schema contains
-/// TimestampNTZ columns. Uses the [`UsesTimestampNtz`] schema visitor to detect TimestampNtz
-/// primitives anywhere in the schema tree (top-level, nested structs, arrays, maps).
+/// TimestampNTZ columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
 fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
-    let mut visitor = UsesTimestampNtz::default();
-    let _ = visitor.transform_struct(schema);
-    if visitor.found() {
+    if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
             &mut validated.reader_features,
