@@ -1791,6 +1791,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_parse_json_impl_propagates_type_errors() {
         // Verify that parse_json_impl surfaces errors for values that don't match the schema,
         // so the expression-level caller can catch them and return nulls.
