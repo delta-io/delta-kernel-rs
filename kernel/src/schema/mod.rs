@@ -484,7 +484,7 @@ impl StructField {
                         field,
                         this.column_mapping_mode,
                         &this.path,
-                        &mut this.seen,
+                        Some(&mut this.seen),
                     )
                     .map_err(|e| this.err = Some(e))
                     .ok()?;

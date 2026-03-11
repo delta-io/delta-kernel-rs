@@ -70,8 +70,8 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     }
 }
 
-/// Validates a field's column mapping annotations, extracts the physical name, and checks for
-/// duplicate column mapping IDs via the `seen` map.
+/// Validates a field's column mapping annotations and extracts the physical name and column
+/// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs.
 ///
 /// When column mapping is enabled (`Id` or `Name`), the field must have a
 /// `delta.columnMapping.physicalName` (string) and `delta.columnMapping.id` (number) annotation.
@@ -85,7 +85,7 @@ pub(crate) fn get_field_column_mapping_info<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
     path: &[&str],
-    seen: &mut HashMap<i64, &'a str>,
+    seen: Option<&mut HashMap<i64, &'a str>>,
 ) -> DeltaResult<(&'a str, Option<i64>)> {
     let field_path = || ColumnName::new(path.iter().copied());
     let annotation = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
@@ -138,13 +138,13 @@ pub(crate) fn get_field_column_mapping_info<'a>(
         }
     };
 
-    if let Some(id) = id {
-        if let Some(prev) = seen.insert(id, field.name()) {
-            return Err(Error::schema(format!(
+    if let (Some(id), Some(seen)) = (id, seen) {
+        seen.insert(id, field.name()).map_or(Ok(()), |prev| {
+            Err(Error::schema(format!(
                 "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
                 field.name()
-            )));
-        }
+            )))
+        })?;
     }
 
     Ok((physical_name, id))
@@ -158,10 +158,10 @@ struct ValidateColumnMappings<'a> {
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner(&mut self, field_name: &'a str, f: impl FnOnce(&mut Self)) {
+    fn transform_inner(&mut self, field_name: &'a str, validate: impl FnOnce(&mut Self)) {
         if self.err.is_none() {
             self.path.push(field_name);
-            f(self);
+            validate(self);
             self.path.pop();
         }
     }
@@ -189,12 +189,10 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
-            if get_field_column_mapping_info(field, this.mode, &this.path, &mut this.seen)
-                .map_err(|e| this.err = Some(e))
-                .is_ok()
-            {
-                let _ = this.recurse_into_struct_field(field);
-            }
+            let _ =
+                get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
+                    .map_err(|e| this.err = Some(e))
+                    .map(|_| this.recurse_into_struct_field(field));
         });
         None
     }
