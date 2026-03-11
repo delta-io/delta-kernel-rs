@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use tracing::{debug, error, info};
 
@@ -61,7 +61,6 @@ pub(crate) struct DataSkippingFilter {
     ///   JSON from a raw action batch (where stats are nested under `add.stats`).
     stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
-    filter_evaluator: Arc<dyn PredicateEvaluator>,
 }
 
 impl DataSkippingFilter {
@@ -86,9 +85,6 @@ impl DataSkippingFilter {
         input_schema: SchemaRef,
         stats_expr: ExpressionRef,
     ) -> Option<Self> {
-        static FILTER_PRED: LazyLock<PredicateRef> =
-            LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
-
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
 
@@ -102,7 +98,7 @@ impl DataSkippingFilter {
             .inspect_err(|e| error!("Failed to create stats evaluator: {e}"))
             .ok()?;
 
-        // Skipping happens in several steps:
+        // Skipping happens in two steps:
         //
         // 1. The stats evaluator extracts file-level statistics from the batch (the expression
         //    provided by the caller determines how: reading a pre-parsed column, parsing JSON, etc.)
@@ -110,30 +106,19 @@ impl DataSkippingFilter {
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
         //    null means we could not determine whether the file is safe to skip, because its stats
-        //    were missing/null.
-        //
-        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true
-        //    (= keep) when the predicate is true/null and false (= skip) when the predicate
-        //    is false.
+        //    were missing/null. The SelectionVectorVisitor treats null as true (= keep).
         let skipping_evaluator = engine
             .evaluation_handler()
             .new_predicate_evaluator(
-                stats_schema.clone(),
+                stats_schema,
                 Arc::new(as_sql_data_skipping_predicate(&predicate)?),
             )
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
-        let filter_evaluator = engine
-            .evaluation_handler()
-            .new_predicate_evaluator(stats_schema, FILTER_PRED.clone())
-            .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
-            .ok()?;
-
         Some(Self {
             stats_evaluator,
             skipping_evaluator,
-            filter_evaluator,
         })
     }
 
@@ -164,21 +149,8 @@ impl DataSkippingFilter {
             ))
         );
 
-        let selection_vector = self
-            .filter_evaluator
-            .evaluate(skipping_predicate.as_ref())?;
-        debug_assert_eq!(selection_vector.len(), batch_len);
-        require!(
-            selection_vector.len() == batch_len,
-            Error::internal_error(format!(
-                "filter evaluator output length {} != batch length {}",
-                selection_vector.len(),
-                batch_len
-            ))
-        );
-
         let mut visitor = SelectionVectorVisitor::default();
-        visitor.visit_rows_of(selection_vector.as_ref())?;
+        visitor.visit_rows_of(skipping_predicate.as_ref())?;
 
         let skipped = visitor
             .selection_vector

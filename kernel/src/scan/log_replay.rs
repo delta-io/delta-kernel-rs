@@ -166,6 +166,7 @@ impl ScanLogReplayProcessor {
         let CheckpointReadInfo {
             has_stats_parsed,
             checkpoint_read_schema,
+            skip_raw_stats,
         } = checkpoint_info.clone();
 
         // Extract the physical predicate for data skipping and partition filtering.
@@ -212,13 +213,23 @@ impl ScanLogReplayProcessor {
             // Log transform: always parse JSON (no stats_parsed in JSON commit files)
             log_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema.clone(),
-                get_add_transform_expr(stats_schema_for_transform.clone(), false, skip_stats),
+                get_add_transform_expr(
+                    stats_schema_for_transform.clone(),
+                    false,
+                    skip_stats,
+                    skip_raw_stats,
+                ),
                 output_schema.clone().into(),
             )?,
             // Checkpoint transform: read stats_parsed directly when available, otherwise parse JSON
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
-                get_add_transform_expr(stats_schema_for_transform, has_stats_parsed, skip_stats),
+                get_add_transform_expr(
+                    stats_schema_for_transform,
+                    has_stats_parsed,
+                    skip_stats,
+                    skip_raw_stats,
+                ),
                 output_schema.into(),
             )?,
             seen_file_keys,
@@ -573,6 +584,8 @@ fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaR
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
+/// - `skip_raw_stats`: When true and `has_stats_parsed` is true, replaces the stats
+///   column with a null literal since the checkpoint has pre-parsed stats available.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
 /// Stats are output using physical column names. Engines can use `Scan::logical_stats_schema()`
@@ -581,8 +594,10 @@ fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
+    skip_raw_stats: bool,
 ) -> ExpressionRef {
-    let stats_expr = if skip_stats {
+    let producing_stats_parsed = has_stats_parsed || physical_stats_schema.is_some();
+    let stats_expr = if skip_stats || (skip_raw_stats && producing_stats_parsed) {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
     } else {
         column_expr_ref!("add.stats")

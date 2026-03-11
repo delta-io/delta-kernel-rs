@@ -53,6 +53,11 @@ pub(crate) struct CheckpointReadInfo {
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
+    /// Whether to skip reading raw JSON `add.stats` from checkpoint parquet when `stats_parsed`
+    /// is available. When true and `has_stats_parsed` is true, the checkpoint transform uses
+    /// a null literal instead of reading the stats column.
+    #[serde(default)]
+    pub skip_raw_stats: bool,
 }
 
 impl CheckpointReadInfo {
@@ -63,6 +68,7 @@ impl CheckpointReadInfo {
         Self {
             has_stats_parsed: false,
             checkpoint_read_schema: get_log_add_schema().clone(),
+            skip_raw_stats: false,
         }
     }
 }
@@ -544,6 +550,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        skip_raw_stats: bool,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -555,6 +562,7 @@ impl LogSegment {
             checkpoint_read_schema,
             meta_predicate,
             stats_schema,
+            skip_raw_stats,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -577,6 +585,7 @@ impl LogSegment {
             action_schema,
             meta_predicate,
             None,
+            false,
         )?;
         Ok(result.actions)
     }
@@ -734,6 +743,7 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        skip_raw_stats: bool,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -768,7 +778,16 @@ impl LogSegment {
                     "add field in action schema must be a struct",
                 ));
             };
-            let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+            let mut add_fields: Vec<StructField> = if skip_raw_stats {
+                // Skip reading add.stats from parquet since we have stats_parsed
+                add_struct
+                    .fields()
+                    .filter(|f| f.name() != "stats")
+                    .cloned()
+                    .collect()
+            } else {
+                add_struct.fields().cloned().collect()
+            };
             add_fields.push(StructField::nullable(
                 "stats_parsed",
                 DataType::Struct(Box::new(stats_schema.clone())),
@@ -869,6 +888,7 @@ impl LogSegment {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
+            skip_raw_stats: skip_raw_stats && has_stats_parsed,
         };
         Ok(ActionsWithCheckpointInfo {
             actions: actions_iter,

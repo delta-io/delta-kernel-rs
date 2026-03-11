@@ -7,6 +7,8 @@
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
+use crate::predicate_parser::parse_predicate;
+use delta_kernel::expressions::PredicateRef;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
 use delta_kernel::{try_parse_uri, Engine, Error};
@@ -28,6 +30,8 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
+    predicate: Option<PredicateRef>,
+    include_stats: bool,
 }
 
 impl ReadMetadataRunner {
@@ -48,6 +52,13 @@ impl ReadMetadataRunner {
 
         let snapshot = builder.build(engine.as_ref())?;
 
+        let predicate = read_spec
+            .predicate
+            .as_deref()
+            .map(parse_predicate)
+            .transpose()?
+            .map(Arc::new);
+
         let name = format!(
             "{}/{}/{}/{}",
             table_info.name,
@@ -56,16 +67,29 @@ impl ReadMetadataRunner {
             config.name,
         );
 
+        let include_stats = read_spec.include_stats;
+
         Ok(Self {
             snapshot,
             engine,
             name,
             config,
+            predicate,
+            include_stats,
         })
     }
 
     fn execute_serial(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let scan = self.snapshot.clone().scan_builder().build()?;
+        let mut scan_builder = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .with_skip_raw_stats(true);
+        if self.include_stats {
+            scan_builder = scan_builder.include_all_stats_columns();
+        }
+        let scan = scan_builder.build()?;
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
             black_box(result?);
@@ -74,7 +98,16 @@ impl ReadMetadataRunner {
     }
 
     fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
-        let scan = self.snapshot.clone().scan_builder().build()?;
+        let mut scan_builder = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .with_skip_raw_stats(true);
+        if self.include_stats {
+            scan_builder = scan_builder.include_all_stats_columns();
+        }
+        let scan = scan_builder.build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
         for result in phase1.by_ref() {
@@ -235,7 +268,11 @@ mod tests {
     }
 
     fn test_read_spec() -> ReadSpec {
-        ReadSpec { version: None }
+        ReadSpec {
+            version: None,
+            predicate: None,
+            include_stats: false,
+        }
     }
 
     fn serial_config() -> ReadConfig {

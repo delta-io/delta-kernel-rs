@@ -1,5 +1,5 @@
 //! Expression handling based on arrow-rs compute kernels.
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
@@ -241,12 +241,11 @@ pub struct ArrowEvaluationHandler;
 impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
         &self,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            input_schema: schema,
             expression,
             output_type,
         }))
@@ -254,13 +253,10 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
     fn new_predicate_evaluator(
         &self,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
-        Ok(Arc::new(DefaultPredicateEvaluator {
-            input_schema: schema,
-            predicate,
-        }))
+        Ok(Arc::new(DefaultPredicateEvaluator { predicate }))
     }
 
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
@@ -279,7 +275,6 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -288,16 +283,6 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
-
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
@@ -328,30 +313,23 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        static OUTPUT_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "output",
+                ArrowDataType::Boolean,
+                true,
+            )]))
+        });
+
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
         let array = evaluate_predicate(&self.predicate, batch, false)?;
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "output",
-            ArrowDataType::Boolean,
-            true,
-        )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
+        let batch = RecordBatch::try_new(OUTPUT_SCHEMA.clone(), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

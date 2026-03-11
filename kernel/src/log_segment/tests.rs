@@ -1142,6 +1142,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        false,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1211,6 +1212,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        false,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1275,6 +1277,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        false,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1323,8 +1326,13 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let checkpoint_result =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None, None)?;
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema,
+        None,
+        None,
+        false,
+    )?;
     let mut iter = checkpoint_result.actions;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1415,6 +1423,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         v2_checkpoint_read_schema.clone(),
         None,
         None,
+        false,
     )?;
     let mut iter = checkpoint_result.actions;
 

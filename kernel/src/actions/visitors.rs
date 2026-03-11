@@ -45,7 +45,8 @@ pub(crate) struct SelectionVectorVisitor {
     pub(crate) selection_vector: Vec<bool>,
 }
 
-/// A single non-nullable BOOL column
+/// A single nullable BOOL column. Null values are treated as true (= keep the row), which
+/// allows the data skipping pipeline to skip the filter evaluator step that maps null -> true.
 impl RowVisitor for SelectionVectorVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
@@ -61,8 +62,10 @@ impl RowVisitor for SelectionVectorVisitor {
             ))
         );
         for i in 0..row_count {
-            self.selection_vector
-                .push(getters[0].get(i, "selectionvector.output")?);
+            let keep = getters[0]
+                .get_opt(i, "selectionvector.output")?
+                .unwrap_or(true);
+            self.selection_vector.push(keep);
         }
         Ok(())
     }

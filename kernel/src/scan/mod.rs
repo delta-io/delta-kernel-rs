@@ -107,6 +107,7 @@ pub struct ScanBuilder {
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats_output_mode: StatsOutputMode,
+    skip_raw_stats: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -127,6 +128,7 @@ impl ScanBuilder {
             schema: None,
             predicate: None,
             stats_output_mode: StatsOutputMode::default(),
+            skip_raw_stats: false,
         }
     }
 
@@ -223,6 +225,23 @@ impl ScanBuilder {
         self
     }
 
+    /// Skip reading the raw JSON `stats` column from checkpoint parquet files when pre-parsed
+    /// `stats_parsed` is available.
+    ///
+    /// When enabled and the checkpoint contains a compatible `stats_parsed` column:
+    /// - The `stats` field in [`ScanFile`] will be `None` for checkpoint-sourced files
+    /// - Data skipping still works (using `stats_parsed`)
+    /// - Avoids reading the potentially large raw JSON stats column from parquet
+    ///
+    /// JSON commit files are unaffected -- they always read `add.stats` since they don't
+    /// have `stats_parsed`.
+    ///
+    /// [`ScanFile`]: crate::scan::state::ScanFile
+    pub fn with_skip_raw_stats(mut self, skip: bool) -> Self {
+        self.skip_raw_stats = skip;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -249,6 +268,7 @@ impl ScanBuilder {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats_output_mode: self.stats_output_mode,
+            skip_raw_stats: self.skip_raw_stats,
         })
     }
 }
@@ -480,6 +500,7 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats_output_mode: StatsOutputMode,
+    skip_raw_stats: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -667,6 +688,7 @@ impl Scan {
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
                     checkpoint_read_schema: restored_add_schema().clone(),
+                    skip_raw_stats: false,
                 },
             };
             return Ok(Box::new(
@@ -717,6 +739,7 @@ impl Scan {
                 .physical_stats_schema
                 .as_ref()
                 .map(|s| s.as_ref()),
+            self.skip_raw_stats,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -777,6 +800,7 @@ impl Scan {
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                self.skip_raw_stats,
             )
     }
 
@@ -883,6 +907,7 @@ impl Scan {
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
             checkpoint_read_schema,
+            skip_raw_stats: false,
         };
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),
