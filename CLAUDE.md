@@ -162,6 +162,8 @@ Keep this list updated when new protocol features are added to kernel.
 - Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
+- NEVER panic in production code -- use errors instead. Panicking
+  (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 
 ## Pull Requests
 
