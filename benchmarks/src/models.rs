@@ -34,23 +34,40 @@ pub enum ParallelScan {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    pub name: String,                        // Table name used for identifying the table
-    pub description: String,                 // Human-readable description of the table
-    pub table_path: Option<Url>, // URL to the table (for remote tables); also used to override the default local table path
-    pub schema: Schema, // Schema of the table. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}`
-    pub protocol: Protocol, // Protocol version requirements and table features. Uses camelCase JSON keys
-    pub log_info: LogInfo,  // Log-level statistics for the table
-    pub properties: HashMap<String, String>, // User-defined table properties
-    pub data_layout: DataLayout, // Physical data layout of the table
-    pub tags: Vec<String>,  // Tags for filtering workloads
+    /// Table name used for identifying the table (part of the final benchmark name) - e.g. 100Adds0Chkpts
+    pub name: String,
+    /// Human-readable description of the table
+    pub description: String,
+    /// URL to the table. Used for remote tables or (rarely) absolute local paths.
+    /// If `None`, the table is assumed to be in the `delta/` subdirectory next to `tableInfo.json`
+    pub table_path: Option<Url>,
+    /// Schema at the latest version of the table
+    pub schema: Schema,
+    /// Delta Protocol struct, containing version requirements and table features at the latest version of the table
+    pub protocol: Protocol,
+    /// Log-level statistics for the table
+    pub log_info: LogInfo,
+    /// Table properties from the Delta metadata
+    pub properties: HashMap<String, String>,
+    /// Physical data layout of the table
+    pub data_layout: DataLayout,
+    /// Tags for filtering which tables are benchmarked via `BENCH_TAGS`
+    pub tags: Vec<String>,
+    /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
-    pub table_info_dir: PathBuf, // Path to the directory containing the tableInfo.json file
+    pub table_info_dir: PathBuf,
 }
 
 impl TableInfo {
+    /// Returns true if the table has at least one tag in common with `required`
+    /// Tag matching uses union semantics; any single matching tag is sufficient
+    pub fn matches_tags(&self, required: &[String]) -> bool {
+        required.iter().any(|r| self.tags.contains(r))
+    }
+
     pub fn resolved_table_root(&self) -> Url {
         self.table_path.clone().unwrap_or_else(|| {
-            // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
+            // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as tableInfo.json
             Url::from_file_path(self.table_info_dir.join("delta"))
                 .expect("table_info_dir must be an absolute path")
         })
@@ -59,7 +76,7 @@ impl TableInfo {
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
-        //Stores the parent directory of the table info JSON file
+        // Stores the parent directory of the `tableInfo.json` file
         if let Some(parent) = path.as_ref().parent() {
             table_info.table_info_dir = parent.to_path_buf();
         }
@@ -71,14 +88,22 @@ impl TableInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogInfo {
-    pub num_add_files: u64,    // Number of active Add file actions in the table
-    pub num_remove_files: u64, // Number of Remove file actions in the table
-    pub size_in_bytes: u64,    // Total on-disk size of all data files in bytes
-    pub num_commits: u64,      // Number of commits (JSON log files) in the table history
-    pub num_actions: u64,      // Total number of actions across all commits
-    pub last_checkpoint_version: Option<u64>, // Version of the most recent checkpoint, if any
-    pub last_crc_version: Option<u64>, // Version of the most recent CRC file, if any
-    pub num_parallel_checkpoint_files: Option<u32>, // Number of parquet part files in the most recent multi-part checkpoint, if any
+    /// Number of active Add file actions in the table
+    pub num_add_files: u64,
+    /// Number of Remove file actions in the table
+    pub num_remove_files: u64,
+    /// Total on-disk size of all data files in bytes
+    pub size_in_bytes: u64,
+    /// Number of commits (JSON log files) in the table history
+    pub num_commits: u64,
+    /// Total number of actions across all commits
+    pub num_actions: u64,
+    /// Version of the most recent checkpoint, if any
+    pub last_checkpoint_version: Option<u64>,
+    /// Version of the most recent CRC file, if any
+    pub last_crc_version: Option<u64>,
+    /// Number of parquet part files in the most recent multi-part checkpoint, if any
+    pub num_parallel_checkpoint_files: Option<u32>,
 }
 
 /// Physical data layout of a Delta table
@@ -86,16 +111,20 @@ pub struct LogInfo {
 #[serde(untagged)]
 pub enum DataLayout {
     Partitioned {
+        /// Number of partition columns
         #[serde(rename = "numPartitionColumns")]
-        num_partition_columns: u32, // Number of partition columns
+        num_partition_columns: u32,
+        /// Number of distinct partition values observed in the table
         #[serde(rename = "numDistinctPartitions")]
-        num_distinct_partitions: u64, // Number of distinct partition values observed in the table
+        num_distinct_partitions: u64,
     },
     Clustered {
+        /// Number of clustering columns
         #[serde(rename = "numClusteringColumns")]
-        num_clustering_columns: u32, // Number of clustering columns
+        num_clustering_columns: u32,
     },
-    None {}, // No special data organization (default)
+    /// No special data organization (default)
+    None {},
 }
 
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
@@ -109,7 +138,8 @@ pub enum Spec {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReadSpec {
-    pub version: Option<u64>, // If version is None, read at latest version
+    /// Version to read; if `None`, reads the latest version
+    pub version: Option<u64>,
 }
 
 impl ReadSpec {
@@ -120,7 +150,8 @@ impl ReadSpec {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SnapshotConstructionSpec {
-    pub version: Option<u64>, // If version is None, read at latest version
+    /// Version to construct the snapshot at; if `None`, uses the latest version
+    pub version: Option<u64>,
 }
 
 impl SnapshotConstructionSpec {
@@ -166,7 +197,8 @@ impl ReadOperation {
 #[derive(Clone, Debug)]
 pub struct Workload {
     pub table_info: TableInfo,
-    pub case_name: String, // Name of the spec JSON file
+    /// Spec filename without extension; used as the benchmark case label
+    pub case_name: String,
     pub spec: Spec,
 }
 
@@ -175,29 +207,43 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    // Baseline valid TableInfo JSON used as a template for tests.
-    // All keys are camelCase. Protocol and schema use Delta protocol format.
-    const BASE_TABLE_INFO_JSON: &str = r#"{
-        "name": "test_table",
-        "description": "A test table",
-        "tablePath": "s3://bucket/test_table",
-        "schema": {"type": "struct", "fields": [{"name": "id", "type": "long", "nullable": true, "metadata": {}}]},
-        "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
-        "logInfo": {
-            "numAddFiles": 3,
-            "numRemoveFiles": 1,
-            "sizeInBytes": 1535,
-            "numCommits": 100,
-            "numActions": 10000
-        },
-        "properties": {},
-        "dataLayout": {"numPartitionColumns": 2, "numDistinctPartitions": 4},
-        "tags": ["base"]
-    }"#;
+    fn make_table_info(tags: &[&str]) -> TableInfo {
+        let tags_json = serde_json::to_string(tags).unwrap();
+        let json = format!(
+            r#"{{"name":"t","description":"d","schema":{{"type":"struct","fields":[]}},"protocol":{{"minReaderVersion":1,"minWriterVersion":2}},"logInfo":{{"numAddFiles":0,"numRemoveFiles":0,"sizeInBytes":0,"numCommits":1,"numActions":1}},"properties":{{}},"dataLayout":{{}},"tags":{}}}"#,
+            tags_json
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[rstest]
+    #[case(&["ci", "checkpoints"], &["ci"], true)]
+    #[case(&["ci", "checkpoints"], &["ci", "large"], true)]
+    #[case(&["large"], &["ci", "checkpoints"], false)]
+    #[case(&[], &["ci"], false)]
+    fn test_matches_tags(
+        #[case] table_tags: &[&str],
+        #[case] required: &[&str],
+        #[case] expected: bool,
+    ) {
+        let info = make_table_info(table_tags);
+        let required: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+        assert_eq!(info.matches_tags(&required), expected);
+    }
 
     #[rstest]
     #[case(
-        BASE_TABLE_INFO_JSON,
+        r#"{
+            "name": "test_table",
+            "description": "A test table",
+            "tablePath": "s3://bucket/test_table",
+            "schema": {"type": "struct", "fields": [{"name": "id", "type": "long", "nullable": true, "metadata": {}}]},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 3, "numRemoveFiles": 1, "sizeInBytes": 1535, "numCommits": 100, "numActions": 10000},
+            "properties": {},
+            "dataLayout": {"numPartitionColumns": 2, "numDistinctPartitions": 4},
+            "tags": ["base"]
+        }"#,
         "test_table",
         "A test table",
         Some(Url::parse("s3://bucket/test_table").unwrap()),
