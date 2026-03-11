@@ -260,13 +260,15 @@ fn write_and_verify_crc(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
 ) -> Crc {
-    let in_memory = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let crc_in_memory = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
     snapshot.write_checksum(engine).unwrap();
 
-    let fresh = Snapshot::builder_for(table_path).build(engine).unwrap();
-    let from_disk = fresh.get_current_crc_if_loaded_for_testing().unwrap();
-    assert_eq!(in_memory, from_disk);
-    from_disk.clone()
+    let snapshot_fresh = Snapshot::builder_for(table_path).build(engine).unwrap();
+    let crc_from_disk = snapshot_fresh
+        .get_current_crc_if_loaded_for_testing()
+        .unwrap();
+    assert_eq!(crc_in_memory, crc_from_disk);
+    crc_from_disk.clone()
 }
 
 #[tokio::test]

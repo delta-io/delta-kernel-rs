@@ -38,6 +38,7 @@ mod tests {
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
+    use crate::crc::FileStatsValidity;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
@@ -178,8 +179,6 @@ mod tests {
 
     #[test]
     fn test_write_rejects_invalid_file_stats_with_checksum_write_unsupported() {
-        use crate::crc::FileStatsValidity;
-
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store).build();
         let table_root = url::Url::parse("memory:///test_table/").unwrap();
