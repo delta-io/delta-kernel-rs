@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
@@ -148,7 +148,15 @@ fn build_physical_stats_schema(
             let all_needed_physical: Vec<ColumnName> = all_needed_logical
                 .iter()
                 .filter_map(|col| {
+                    // Theoretically this should always resolve -- if it doesn't,
+                    // the column was not found in the logical schema (e.g. a
+                    // requested stats column or predicate column that doesn't
+                    // exist in the table schema),
+                    // which is safe to ignore.
                     get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
+                        .inspect_err(|e| {
+                            warn!("Failed to resolve physical name for column {col}: {e}")
+                        })
                         .ok()
                 })
                 .collect();
