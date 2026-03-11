@@ -16,8 +16,7 @@ use crate::{internal_api, Engine, Version};
 /// The "not yet loaded" state is represented by `OnceLock::get()` returning `None`, not as an enum
 /// variant.
 #[derive(Debug, Clone)]
-#[internal_api]
-pub(crate) enum CrcLoadResult {
+pub enum CrcLoadResult {
     /// No CRC file exists for this log segment.
     DoesNotExist,
     /// CRC file exists but failed to read/parse (corrupted or I/O error).
@@ -41,8 +40,7 @@ impl CrcLoadResult {
 ///
 /// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
 #[derive(Debug)]
-#[internal_api]
-pub(crate) struct LazyCrc {
+pub struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
     crc_file: Option<ParsedLogPath>,
     /// Cached load result (loaded lazily, at most once).
