@@ -507,11 +507,11 @@ mod tests {
     /// Expected metric values for a phase (sequential or parallel)
     #[derive(Debug, Clone)]
     struct ExpectedMetrics {
-        adds: u64,
-        removes: u64,
+        add_files_seen: u64,
+        surviving_add_files: u64,
+        remove_files_seen: u64,
         non_file_actions: u64,
-        data_skipping_filtered: u64,
-        partition_pruning_filtered: u64,
+        predicate_filtered: u64,
     }
 
     /// Test case for parallel log replay workflow
@@ -536,46 +536,45 @@ mod tests {
         );
 
         // Extract and verify counter values from Phase 1
-        let sequential_adds = extract_metric(logs, "num_adds");
-        let sequential_removes = extract_metric(logs, "num_removes");
-        let sequential_non_file_actions = extract_metric(logs, "num_non_file_actions");
-        let data_skipping_filtered = extract_metric(logs, "data_skipping_filtered");
-        let partition_pruning_filtered = extract_metric(logs, "partition_pruning_filtered");
+        let add_files_seen = extract_metric(logs, "add_files_seen");
+        let surviving_add_files = extract_metric(logs, "surviving_add_files");
+        let remove_files_seen = extract_metric(logs, "remove_files_seen");
+        let non_file_actions = extract_metric(logs, "non_file_actions");
+        let predicate_filtered = extract_metric(logs, "predicate_filtered");
 
         assert_eq!(
-            sequential_adds, sequential_expected.adds,
-            "Sequential num_adds mismatch"
+            add_files_seen, sequential_expected.add_files_seen,
+            "Sequential add_files_seen mismatch"
         );
         assert_eq!(
-            sequential_removes, sequential_expected.removes,
-            "Sequential num_removes mismatch"
+            surviving_add_files, sequential_expected.surviving_add_files,
+            "Sequential surviving_add_files mismatch"
         );
         assert_eq!(
-            sequential_non_file_actions, sequential_expected.non_file_actions,
-            "Sequential num_non_file_actions mismatch",
+            remove_files_seen, sequential_expected.remove_files_seen,
+            "Sequential remove_files_seen mismatch"
         );
         assert_eq!(
-            data_skipping_filtered, sequential_expected.data_skipping_filtered,
-            "Sequential data_skipping_filtered mismatch",
+            non_file_actions, sequential_expected.non_file_actions,
+            "Sequential non_file_actions mismatch",
         );
         assert_eq!(
-            partition_pruning_filtered, sequential_expected.partition_pruning_filtered,
-            "Sequential partition_pruning_filtered mismatch",
+            predicate_filtered, sequential_expected.predicate_filtered,
+            "Sequential predicate_filtered mismatch",
         );
 
         // Verify timing metrics are present and parseable
         let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
-        let _data_skipping_time = extract_metric(logs, "data_skipping_time_ms");
-        let _partition_pruning_time = extract_metric(logs, "partition_pruning_time_ms");
+        let _predicate_eval_time = extract_metric(logs, "predicate_eval_time_ms");
 
         // Verify Parallel metrics if expected
         if let Some(expected) = parallel_expected {
             // Accumulate totals across all parallel logs
-            let mut total_parallel_adds = 0u64;
-            let mut total_parallel_removes = 0u64;
-            let mut total_parallel_non_file_actions = 0u64;
-            let mut total_parallel_data_skipping_filtered = 0u64;
-            let mut total_parallel_partition_pruning_filtered = 0u64;
+            let mut total_add_files_seen = 0u64;
+            let mut total_surviving_add_files = 0u64;
+            let mut total_remove_files_seen = 0u64;
+            let mut total_non_file_actions = 0u64;
+            let mut total_predicate_filtered = 0u64;
             let mut search_start = 0;
 
             while let Some(pos) = logs[search_start..].find("Completed parallel scan metadata") {
@@ -583,38 +582,35 @@ mod tests {
                 let remaining = &logs[absolute_pos..];
 
                 // Extract and accumulate metrics
-                total_parallel_adds += extract_metric(remaining, "num_adds");
-                total_parallel_removes += extract_metric(remaining, "num_removes");
-                total_parallel_non_file_actions +=
-                    extract_metric(remaining, "num_non_file_actions");
-                total_parallel_data_skipping_filtered +=
-                    extract_metric(remaining, "data_skipping_filtered");
-                total_parallel_partition_pruning_filtered +=
-                    extract_metric(remaining, "partition_pruning_filtered");
+                total_add_files_seen += extract_metric(remaining, "add_files_seen");
+                total_surviving_add_files += extract_metric(remaining, "surviving_add_files");
+                total_remove_files_seen += extract_metric(remaining, "remove_files_seen");
+                total_non_file_actions += extract_metric(remaining, "non_file_actions");
+                total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
 
                 search_start = absolute_pos + 1;
             }
 
             // Verify accumulated totals match expected values
             assert_eq!(
-                total_parallel_adds, expected.adds,
-                "Parallel num_adds mismatch"
+                total_add_files_seen, expected.add_files_seen,
+                "Parallel add_files_seen mismatch"
             );
             assert_eq!(
-                total_parallel_removes, expected.removes,
-                "Parallel num_removes mismatch"
+                total_surviving_add_files, expected.surviving_add_files,
+                "Parallel surviving_add_files mismatch"
             );
             assert_eq!(
-                total_parallel_non_file_actions, expected.non_file_actions,
-                "Parallel num_non_file_actions mismatch"
+                total_remove_files_seen, expected.remove_files_seen,
+                "Parallel remove_files_seen mismatch"
             );
             assert_eq!(
-                total_parallel_data_skipping_filtered, expected.data_skipping_filtered,
-                "Parallel data_skipping_filtered mismatch"
+                total_non_file_actions, expected.non_file_actions,
+                "Parallel non_file_actions mismatch"
             );
             assert_eq!(
-                total_parallel_partition_pruning_filtered, expected.partition_pruning_filtered,
-                "Parallel partition_pruning_filtered mismatch"
+                total_predicate_filtered, expected.predicate_filtered,
+                "Parallel predicate_filtered mismatch"
             );
         }
     }
@@ -631,36 +627,36 @@ mod tests {
         path: "v2-checkpoints-json-with-sidecars",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 101,
-            removes: 0,
+            add_files_seen: 101,
+            surviving_add_files: 101,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         }),
     })]
     #[case::parquet_sidecars(ParallelLogReplayCase {
         path: "v2-checkpoints-parquet-with-sidecars",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 101,
-            removes: 0,
+            add_files_seen: 101,
+            surviving_add_files: 101,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         }),
     })]
     #[case::json_sidecars_with_predicate_gt_20(ParallelLogReplayCase {
@@ -670,19 +666,20 @@ mod tests {
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
-        // Data skipping predicate filters 4 files (101 → 97)
+        // Data skipping predicate filters 4 files (101 -> 97)
+        // add_files_seen counts files AFTER data skipping
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 97,
-            removes: 0,
+            add_files_seen: 97,
+            surviving_add_files: 97,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 4,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 4,
         }),
     })]
     #[case::json_sidecars_with_predicate_gt_80(ParallelLogReplayCase {
@@ -692,18 +689,19 @@ mod tests {
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(80i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
+        // Data skipping filters 15 files (101 -> 86)
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 86,
-            removes: 0,
+            add_files_seen: 86,
+            surviving_add_files: 86,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 15,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 15,
         }),
     })]
     #[case::json_sidecars_with_predicate_lt_10(ParallelLogReplayCase {
@@ -713,18 +711,19 @@ mod tests {
             Arc::new(Expr::lt(column_expr!("id"), Expr::literal(10i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
+        // Data skipping filters 69 files (101 -> 32)
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 32,
-            removes: 0,
+            add_files_seen: 32,
+            surviving_add_files: 32,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 69,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 69,
         }),
     })]
     #[case::parquet_sidecars_with_predicate(ParallelLogReplayCase {
@@ -734,51 +733,52 @@ mod tests {
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
+        // Data skipping filters 4 files (101 -> 97)
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 97,
-            removes: 0,
+            add_files_seen: 97,
+            surviving_add_files: 97,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 4,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 4,
         }),
     })]
     #[case::json_sidecars_with_very_selective_predicate(ParallelLogReplayCase {
         path: "v2-checkpoints-json-with-sidecars",
         predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
-            // Highly selective predicate
+            // Highly selective predicate filters 32 files (101 -> 69)
             Arc::new(Expr::gt(column_expr!("id"), Expr::literal(99i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 5,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 69,
-            removes: 0,
+            add_files_seen: 69,
+            surviving_add_files: 69,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 32,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 32,
         }),
     })]
     #[case::json_without_sidecars(ParallelLogReplayCase {
         path: "v2-checkpoints-json-without-sidecars",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 3,
-            removes: 0,
+            add_files_seen: 3,
+            surviving_add_files: 3,
+            remove_files_seen: 0,
             non_file_actions: 4,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: None,
     })]
@@ -786,29 +786,29 @@ mod tests {
         path: "v2-checkpoints-json-with-last-checkpoint",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 4,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 2,
-            removes: 0,
+            add_files_seen: 2,
+            surviving_add_files: 2,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         }),
     })]
     #[case::parquet_without_sidecars(ParallelLogReplayCase {
         path: "v2-checkpoints-parquet-without-sidecars",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 3,
-            removes: 0,
+            add_files_seen: 3,
+            surviving_add_files: 3,
+            remove_files_seen: 0,
             non_file_actions: 4,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: None,
     })]
@@ -816,54 +816,54 @@ mod tests {
         path: "v2-checkpoints-parquet-with-last-checkpoint",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 4,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 2,
-            removes: 0,
+            add_files_seen: 2,
+            surviving_add_files: 2,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         }),
     })]
     #[case::v2_classic_json(ParallelLogReplayCase {
         path: "v2-classic-checkpoint-json",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 4,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 4,
-            removes: 0,
+            add_files_seen: 4,
+            surviving_add_files: 4,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         }),
     })]
     #[case::v2_classic_parquet(ParallelLogReplayCase {
         path: "v2-classic-checkpoint-parquet",
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
-            adds: 0,
-            removes: 0,
+            add_files_seen: 0,
+            surviving_add_files: 0,
+            remove_files_seen: 0,
             non_file_actions: 4,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
-            adds: 4,
-            removes: 0,
+            add_files_seen: 4,
+            surviving_add_files: 4,
+            remove_files_seen: 0,
             non_file_actions: 0,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         }),
     })]
     #[case::no_parallel_needed(ParallelLogReplayCase {
@@ -871,11 +871,11 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             // This table has single-part checkpoint, completes in sequential phase
-            adds: 1,
-            removes: 0,
+            add_files_seen: 1,
+            surviving_add_files: 1,
+            remove_files_seen: 0,
             non_file_actions: 3,
-            data_skipping_filtered: 0,
-            partition_pruning_filtered: 0,
+            predicate_filtered: 0,
         },
         // No parallel phase needed
         expected_parallel_metrics: None,

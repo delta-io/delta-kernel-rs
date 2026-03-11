@@ -421,9 +421,9 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         };
 
         if is_add {
-            self.metrics.incr_add_actions_seen()
+            self.metrics.incr_add_files_seen()
         } else {
-            self.metrics.incr_remove_actions_seen()
+            self.metrics.incr_remove_files_seen()
         };
 
         // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
@@ -448,10 +448,10 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                 let is_pruned = self.is_file_partition_pruned(&partition_values);
 
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
-                self.metrics.add_partition_pruning_time_ns(elapsed_ns);
+                self.metrics.add_predicate_eval_time_ns(elapsed_ns);
 
                 if is_pruned {
-                    self.metrics.incr_partition_pruning_filtered();
+                    self.metrics.incr_predicate_filtered();
                     return Ok(false);
                 }
 
@@ -484,6 +484,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.row_transform_exprs.resize_with(i, Default::default);
             self.row_transform_exprs.push(transform);
         }
+        self.metrics.incr_surviving_add_files();
         Ok(true)
     }
 }

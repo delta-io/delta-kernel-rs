@@ -197,7 +197,7 @@ impl DataSkippingFilter {
         }
 
         if let Some(metrics) = metrics {
-            metrics.add_data_skipping_filtered(visitor.num_filtered);
+            metrics.add_predicate_filtered(visitor.num_filtered);
         }
         Ok(visitor.selection_vector)
     }

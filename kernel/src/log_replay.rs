@@ -346,7 +346,7 @@ pub(crate) trait LogReplayProcessor: Sized {
                 let start = std::time::Instant::now();
                 let result = filter.apply(batch, Some(metrics))?;
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
-                metrics.add_data_skipping_time_ns(elapsed_ns);
+                metrics.add_predicate_eval_time_ns(elapsed_ns);
                 result
             }
             None => vec![true; batch.len()],
