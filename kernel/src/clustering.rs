@@ -40,25 +40,20 @@ struct ClusteringDomainMetadata {
 /// The domain name for clustering metadata.
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 
-/// Maximum number of columns that can be used for clustering.
-///
-/// TODO(#1794): This limit is a Delta-Spark connector configuration, not a protocol requirement.
-/// Consider removing or making this configurable.
-pub(crate) const MAX_CLUSTERING_COLUMNS: usize = 4;
-
 /// Validates clustering columns against the table schema.
 ///
 /// This function performs comprehensive validation of clustering columns:
 ///
 /// **Structural validations:**
 /// 1. At least one column must be specified
-/// 2. At most [`MAX_CLUSTERING_COLUMNS`] columns allowed (currently 4)
-/// 3. No duplicate columns
+/// 2. No duplicate columns
 ///
 /// **Schema validations:**
-/// 4. Columns must be top-level (not nested paths)
-/// 5. Columns must exist in the schema
-/// 6. Columns must have data types eligible for statistics collection
+/// 3. Column paths must resolve in the schema (including nested paths through structs)
+/// 4. Leaf field must have a data type eligible for statistics collection
+///
+/// Both top-level and nested columns are supported. For nested columns, all intermediate
+/// fields must be struct types and the leaf field must be a stats-eligible primitive.
 ///
 /// # Errors
 ///
@@ -74,60 +69,31 @@ pub(crate) fn validate_clustering_columns(
         return Err(Error::generic("Clustering requires at least one column"));
     }
 
-    // Structural validation: max columns check
-    // TODO(#1794): This limit is a Delta-Spark connector configuration, not a protocol
-    // requirement. Consider removing or making this configurable.
-    if columns.len() > MAX_CLUSTERING_COLUMNS {
-        return Err(Error::generic(format!(
-            "Clustering supports at most {} columns, got {}",
-            MAX_CLUSTERING_COLUMNS,
-            columns.len()
-        )));
-    }
-
     // Validate each column and check for duplicates
     let mut seen = HashSet::new();
     for col in columns {
-        // TODO(#1794): The Delta protocol doesn't explicitly require clustering columns to be
-        // top-level. Consider allowing nested columns.
-        if col.path().is_empty() {
-            return Err(Error::generic("Clustering column name cannot be empty"));
-        }
-        if col.path().len() != 1 {
+        if !seen.insert(col) {
             return Err(Error::generic(format!(
-                "Clustering column '{}' must be a top-level column, not a nested path",
+                "Duplicate clustering column: '{}'",
                 col
             )));
         }
 
-        // Safe to access path()[0] now that we've validated it's a single-element path
-        let col_name = &col.path()[0];
-
-        // Check for duplicates
-        if !seen.insert(col_name) {
-            return Err(Error::generic(format!(
-                "Duplicate clustering column: '{}'",
-                col_name
-            )));
-        }
-
-        // Validate column exists in schema
-        let field = schema.field(col_name).ok_or_else(|| {
-            Error::generic(format!(
-                "Clustering column '{}' not found in schema",
-                col_name
-            ))
-        })?;
-
-        // Clustering requires per-file statistics, so only stats-eligible types are allowed
-        match field.data_type() {
+        // Walk the column path through nested structs and validate the leaf type.
+        // walk_column_fields validates: non-empty path, each field exists, intermediates are structs.
+        let fields = schema.walk_column_fields(col)?;
+        let leaf_type = fields
+            .last()
+            .ok_or_else(|| Error::generic(format!("Could not resolve column '{col}' in schema")))?
+            .data_type();
+        match leaf_type {
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
                 return Err(Error::generic(format!(
                     "Clustering column '{}' has unsupported type '{}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
                      Decimal, Date, Timestamp, TimestampNtz, String",
-                    col_name, dt
+                    col, dt
                 )));
             }
         }
@@ -249,16 +215,75 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_clustering_columns_nested_rejected() {
+    fn test_validate_clustering_columns_nested_valid() {
+        let address_struct = StructType::new_unchecked(vec![
+            StructField::new("city", DataType::STRING, true),
+            StructField::new("zip", DataType::STRING, true),
+        ]);
+        let user_struct = StructType::new_unchecked(vec![
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+        ]);
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("user", DataType::Struct(Box::new(user_struct)), true),
+        ]);
+
+        // Nested leaf column with eligible type should succeed
+        let columns = vec![ColumnName::new(["user", "address", "city"])];
+        assert!(validate_clustering_columns(&schema, &columns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_clustering_nested_struct_leaf_rejected() {
+        let inner_struct =
+            StructType::new_unchecked(vec![StructField::new("field", DataType::STRING, false)]);
+        let schema = StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(inner_struct)),
+            false,
+        )]);
+
+        // Clustering on an entire struct (not a leaf primitive) should fail
+        let columns = vec![ColumnName::new(["parent"])];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported type"));
+    }
+
+    #[test]
+    fn test_validate_clustering_nested_intermediate_not_struct() {
         let schema =
-            StructType::new_unchecked(vec![StructField::new("nested", DataType::STRING, true)]);
-        let columns = vec![ColumnName::new(["nested", "field"])];
+            StructType::new_unchecked(vec![StructField::new("flat_col", DataType::STRING, false)]);
+
+        // Trying to traverse into a non-struct field should fail
+        let columns = vec![ColumnName::new(["flat_col", "child"])];
         let result = validate_clustering_columns(&schema, &columns);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("must be a top-level column"));
+            .contains("is not a struct type"));
+    }
+
+    #[test]
+    fn test_validate_clustering_nested_path_not_found() {
+        let inner_struct =
+            StructType::new_unchecked(vec![StructField::new("field", DataType::STRING, false)]);
+        let schema = StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(inner_struct)),
+            false,
+        )]);
+
+        // Nested field that doesn't exist should fail
+        let columns = vec![ColumnName::new(["parent", "nonexistent"])];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in schema"));
     }
 
     #[test]
@@ -377,14 +402,12 @@ mod tests {
 
     // Structural validation tests - parameterized with rstest
 
-    /// Test that the correct number of clustering columns is allowed.
+    /// Test that any number of clustering columns is allowed (no protocol-imposed limit).
     #[rstest::rstest]
-    #[case::max_allowed(4, true)]
-    #[case::too_many(5, false)]
-    fn test_validate_clustering_column_count(
-        #[case] num_columns: usize,
-        #[case] should_succeed: bool,
-    ) {
+    #[case::four(4)]
+    #[case::five(5)]
+    #[case::ten(10)]
+    fn test_validate_clustering_column_count(#[case] num_columns: usize) {
         let fields: Vec<StructField> = (0..num_columns)
             .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, false))
             .collect();
@@ -394,11 +417,7 @@ mod tests {
             .map(|i| ColumnName::new([format!("col{}", i)]))
             .collect();
 
-        let result = validate_clustering_columns(&schema, &columns);
-        assert_eq!(result.is_ok(), should_succeed);
-        if !should_succeed {
-            assert!(result.unwrap_err().to_string().contains("at most"));
-        }
+        assert!(validate_clustering_columns(&schema, &columns).is_ok());
     }
 
     /// Test various structural validation error cases.
