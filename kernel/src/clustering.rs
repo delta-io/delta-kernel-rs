@@ -10,13 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
-use crate::log_segment::LogSegment;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::schema::{DataType, StructType};
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
 /// Domain metadata structure for clustering columns.
 ///
@@ -127,38 +125,13 @@ pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> Domai
 /// Parses clustering columns from a JSON configuration string.
 ///
 /// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
-fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
+pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
     let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
     Ok(metadata
         .clustering_columns
         .into_iter()
         .map(ColumnName::new)
         .collect())
-}
-
-/// Reads clustering columns from the log segment's domain metadata.
-///
-/// This function performs a log scan to find the clustering domain metadata.
-/// Callers should first check if the `ClusteredTable` feature is enabled via
-/// the protocol before calling this function to avoid unnecessary I/O.
-/// See [`Snapshot::get_clustering_columns`] which performs this check.
-///
-/// Returns `Ok(Some(columns))` if clustering domain metadata exists,
-/// `Ok(None)` if no clustering domain metadata is found, or an error if the
-/// metadata is malformed.
-///
-/// The clustering columns should be stored in the domain metadata using physical column
-/// names, so the returned columns are also physical column names.
-/// [`Snapshot::get_clustering_columns`]: crate::snapshot::Snapshot::get_clustering_columns
-pub(crate) fn get_clustering_columns_from_domain_metadata(
-    log_segment: &LogSegment,
-    engine: &dyn Engine,
-) -> DeltaResult<Option<Vec<ColumnName>>> {
-    let config = domain_metadata_configuration(log_segment, CLUSTERING_DOMAIN_NAME, engine)?;
-    match config {
-        Some(json_str) => Ok(Some(parse_clustering_columns(&json_str)?)),
-        None => Ok(None),
-    }
 }
 
 #[cfg(test)]
