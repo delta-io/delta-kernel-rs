@@ -1802,7 +1802,7 @@ mod tests {
             true,
         )]));
         let input: Vec<Option<&str>> = vec![Some(r#"{"a": 99999}"#)];
-        assert!(parse_json_impl(&input.into(), schema).is_err());
+        assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
 
         // Type mismatch: string where integer expected
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1811,7 +1811,7 @@ mod tests {
             true,
         )]));
         let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
-        assert!(parse_json_impl(&input.into(), schema).is_err());
+        assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
     }
 
     #[test]
