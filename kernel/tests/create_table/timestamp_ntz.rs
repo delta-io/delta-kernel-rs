@@ -42,10 +42,10 @@ fn assert_timestamp_ntz_protocol(snapshot: &Snapshot) {
 /// TimestampNTZ schema auto-enables timestampNtz across schema shapes and column mapping modes.
 #[rstest::rstest]
 fn test_create_table_with_timestamp_ntz(
-    #[values(top_level_ntz_schema(), nested_ntz_schema(), multiple_ntz_schema())]
-    schema: Arc<StructType>,
-    #[values("none", "name", "id")]
-    cm_mode: &str,
+    #[values(top_level_ntz_schema(), nested_ntz_schema(), multiple_ntz_schema())] schema: Arc<
+        StructType,
+    >,
+    #[values("none", "name", "id")] cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
