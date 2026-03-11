@@ -17,8 +17,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          pr_json=$(gh api repos/${{ github.repository }}/pulls \
-            --jq ".[] | select(.head.sha == \"$HEAD_SHA\")" | head -1)
+          pr_json=$(gh api --paginate repos/${{ github.repository }}/pulls \
+            --jq ".[] | select(.head.sha == \"$HEAD_SHA\")")
           echo "number=$(echo "$pr_json" | jq -r '.number')" >> "$GITHUB_OUTPUT"
           echo "title=$(echo "$pr_json" | jq -r '.title')" >> "$GITHUB_OUTPUT"
 
