@@ -27,7 +27,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{get_any_level_columns_logical_names, ColumnMappingMode, TableFeature};
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -616,19 +616,8 @@ impl<S> Transaction<S> {
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         let tc = self.read_snapshot.table_configuration();
-        let clustering_columns_logical = self
-            .clustering_columns_physical
-            .as_deref()
-            .map(|cols| {
-                get_any_level_columns_logical_names(
-                    &tc.logical_schema(),
-                    cols,
-                    tc.column_mapping_mode(),
-                )
-            })
-            .transpose()?;
         let stats_schemas =
-            tc.build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?;
+            tc.build_expected_stats_schemas(self.clustering_columns_physical.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -1370,7 +1359,7 @@ mod tests {
         };
         DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: format!("dv_{}", path_suffix),
+            path_or_inline_dv: format!("dv_{path_suffix}"),
             offset: Some(0),
             size_in_bytes: 100,
             cardinality: 1,
@@ -1556,8 +1545,7 @@ mod tests {
         let expr_str = format!("{}", wc_without.logical_to_physical());
         assert!(
             expr_str.contains("drop letter"),
-            "Partition column 'letter' should be dropped. Expression: {}",
-            expr_str
+            "Partition column 'letter' should be dropped. Expression: {expr_str}"
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
@@ -1576,8 +1564,7 @@ mod tests {
         let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
             !expr_str.contains("drop"),
-            "No columns should be dropped with materializePartitionColumns. Expression: {}",
-            expr_str
+            "No columns should be dropped with materializePartitionColumns. Expression: {expr_str}"
         );
 
         Ok(())
@@ -1625,8 +1612,7 @@ mod tests {
         assert!(
             err_msg.contains("Deletion vector")
                 && (err_msg.contains("require") || err_msg.contains("version")),
-            "Expected protocol error about DV requirements, got: {}",
-            err_msg
+            "Expected protocol error about DV requirements, got: {err_msg}"
         );
         Ok(())
     }
@@ -1651,8 +1637,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
-            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {}",
-            err_msg);
+            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
         Ok(())
     }
 
@@ -1668,8 +1653,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Empty DV updates should succeed as no-op, got error: {:?}",
-            result
+            "Empty DV updates should succeed as no-op, got error: {result:?}"
         );
 
         Ok(())
@@ -1844,7 +1828,7 @@ mod tests {
     #[test]
     fn test_existing_table_txn_debug() -> DeltaResult<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
-        let debug_str = format!("{:?}", txn);
+        let debug_str = format!("{txn:?}");
         // Existing-table transactions should include the snapshot version number
         assert!(
             debug_str.contains("Transaction") && debug_str.contains("read_snapshot version"),
@@ -2043,10 +2027,18 @@ mod tests {
     // Stats validation tests for clustering columns
     // =========================================================================
 
-    /// Creates test add file metadata with configurable stats.
-    /// If `has_stats` is false, the stats struct will be null (indicating no stats).
-    /// If `has_stats` is true, creates full stats with nullCount, minValues, maxValues for "value" column.
-    fn create_test_add_files(paths: Vec<&str>, has_stats: Vec<bool>) -> Box<dyn EngineData> {
+    /// Per-file stats configuration for test add file helpers.
+    enum TestFileStats {
+        /// No stats (null stats struct)
+        None,
+        /// Normal stats with non-null min/max
+        Present,
+        /// All-null column: nullCount == numRecords, null min/max
+        AllNull,
+    }
+
+    /// Creates test add file metadata with configurable stats for the "value" column.
+    fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
         let path_array = StringArray::from(paths.to_vec());
         let size_array = Int64Array::from(vec![1024i64; paths.len()]);
         let mod_time_array = Int64Array::from(vec![1000000i64; paths.len()]);
@@ -2054,48 +2046,55 @@ mod tests {
         // Create stats struct with full structure for "value" column (matches test table schema)
         let value_field = Arc::new(ArrowField::new("value", ArrowDataType::Int64, true));
 
-        // nullCount.value
-        let null_count_values: Vec<Option<i64>> = has_stats
+        let num_records: Vec<Option<i64>> = stats
             .iter()
-            .map(|&h| if h { Some(0) } else { None })
+            .map(|s| match s {
+                TestFileStats::None => Option::None,
+                _ => Some(100),
+            })
             .collect();
+        let null_count_values: Vec<Option<i64>> = stats
+            .iter()
+            .map(|s| match s {
+                TestFileStats::None => Option::None,
+                TestFileStats::Present => Some(0),
+                TestFileStats::AllNull => Some(100),
+            })
+            .collect();
+        let min_values: Vec<Option<i64>> = stats
+            .iter()
+            .map(|s| match s {
+                TestFileStats::Present => Some(1),
+                _ => Option::None,
+            })
+            .collect();
+        let max_values: Vec<Option<i64>> = stats
+            .iter()
+            .map(|s| match s {
+                TestFileStats::Present => Some(100),
+                _ => Option::None,
+            })
+            .collect();
+
+        let num_records_array = Int64Array::from(num_records);
         let null_count_array = Int64Array::from(null_count_values);
         let null_count_struct = StructArray::new(
             Fields::from(vec![value_field.clone()]),
             vec![Arc::new(null_count_array) as ArrayRef],
             None,
         );
-
-        // minValues.value
-        let min_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(1) } else { None })
-            .collect();
         let min_values_array = Int64Array::from(min_values);
         let min_values_struct = StructArray::new(
             Fields::from(vec![value_field.clone()]),
             vec![Arc::new(min_values_array) as ArrayRef],
             None,
         );
-
-        // maxValues.value
-        let max_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(100) } else { None })
-            .collect();
         let max_values_array = Int64Array::from(max_values);
         let max_values_struct = StructArray::new(
             Fields::from(vec![value_field]),
             vec![Arc::new(max_values_array) as ArrayRef],
             None,
         );
-
-        // numRecords
-        let num_records: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(100) } else { None })
-            .collect();
-        let num_records_array = Int64Array::from(num_records);
 
         // Build stats struct fields
         let value_struct_type = ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
@@ -2110,8 +2109,11 @@ mod tests {
             ArrowField::new("maxValues", value_struct_type, true),
         ]);
 
-        // Create validity bitmap - stats struct is null when has_stats is false
-        let stats_validity: Vec<bool> = has_stats.clone();
+        // Create validity bitmap - stats struct is null when stats are absent
+        let stats_validity: Vec<bool> = stats
+            .iter()
+            .map(|s| !matches!(s, TestFileStats::None))
+            .collect();
         let stats_struct = StructArray::new(
             stats_fields.clone(),
             vec![
@@ -2191,6 +2193,26 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_validation_allows_all_null_clustering_column() {
+        let (engine, snapshot) = setup_non_dv_table();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap()
+            .with_operation("WRITE".to_string())
+            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::AllNull]);
+
+        let result = txn.validate_add_files_stats(&[add_files]);
+
+        assert!(
+            result.is_ok(),
+            "Stats validation should pass for all-null clustering columns, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_stats_validation_when_clustering_cols_missing_stats() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
@@ -2201,7 +2223,7 @@ mod tests {
             .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
 
         // Add files WITHOUT stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![false]);
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
 
         // Directly test the validation method instead of committing
         let result = txn.validate_add_files_stats(&[add_files]);
@@ -2214,8 +2236,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Stats validation error") || err_msg.contains("no stats"),
-            "Expected stats validation error, got: {}",
-            err_msg
+            "Expected stats validation error, got: {err_msg}"
         );
     }
 
@@ -2230,15 +2251,14 @@ mod tests {
             .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
 
         // Add files WITH stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![true]);
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::Present]);
 
         // Directly test the validation method
         let result = txn.validate_add_files_stats(&[add_files]);
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass when stats are present, got: {:?}",
-            result
+            "Stats validation should pass when stats are present, got: {result:?}"
         );
     }
 
@@ -2252,15 +2272,14 @@ mod tests {
         // No clustering columns set (default)
 
         // Add files WITHOUT stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![false]);
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
 
         // Directly test the validation method - should pass because no clustering
         let result = txn.validate_add_files_stats(&[add_files]);
 
         assert!(
             result.is_ok(),
-            "Stats validation should be skipped without clustering, got: {:?}",
-            result
+            "Stats validation should be skipped without clustering, got: {result:?}"
         );
     }
 }

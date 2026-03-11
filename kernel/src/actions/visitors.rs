@@ -13,8 +13,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
-use super::domain_metadata::DomainMetadataMap;
 use super::*;
+use crate::log_segment::DomainMetadataMap;
 
 #[derive(Default)]
 #[internal_api]

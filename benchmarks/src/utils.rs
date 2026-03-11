@@ -68,7 +68,7 @@ fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
     let tar_path = Path::new(WORKLOAD_TAR);
 
     if !tar_path.exists() {
-        return Err(format!("Workload tarball not found at {}", WORKLOAD_TAR).into());
+        return Err(format!("Workload tarball not found at {WORKLOAD_TAR}").into());
     }
 
     extract_tarball(tar_path)?;
@@ -85,11 +85,11 @@ fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut archive = Archive::new(tarball);
 
     std::fs::create_dir_all(OUTPUT_FOLDER)
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+        .map_err(|e| format!("Failed to create output directory: {e}"))?;
 
     archive
         .unpack(OUTPUT_FOLDER)
-        .map_err(|e| format!("Failed to unpack tarball: {}", e))?;
+        .map_err(|e| format!("Failed to unpack tarball: {e}"))?;
 
     Ok(())
 }
@@ -98,9 +98,9 @@ fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// See TODO(#1939) for `workload_specs_exist` above; this file must be manually deleted to force re-extraction
 fn write_done_file() -> Result<(), Box<dyn std::error::Error>> {
     let mut done_file = std::fs::File::create(DONE_FILE)
-        .map_err(|e| format!("Failed to create .done file: {}", e))?;
+        .map_err(|e| format!("Failed to create .done file: {e}"))?;
 
-    write!(done_file, "done").map_err(|e| format!("Failed to write .done file: {}", e))?;
+    write!(done_file, "done").map_err(|e| format!("Failed to write .done file: {e}"))?;
 
     Ok(())
 }

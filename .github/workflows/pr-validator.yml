@@ -25,7 +25,7 @@ jobs:
           else
             echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
             echo "title=${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
-            echo "labels=$(echo '${{ toJson(github.event.pull_request.labels.*.name) }}')" >> "$GITHUB_OUTPUT"
+            echo "labels=$(echo '${{ toJson(github.event.pull_request.labels.*.name) }}' | jq -c '.')" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v4

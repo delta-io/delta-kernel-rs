@@ -492,8 +492,7 @@ fn visit_engine_expression_impl(
 
     let expr = unwrap_kernel_expression(&mut visitor_state, expr_id).ok_or_else(|| {
         delta_kernel::Error::generic(format!(
-            "Invalid expression ID {} returned from engine visitor",
-            expr_id
+            "Invalid expression ID {expr_id} returned from engine visitor"
         ))
     })?;
 
@@ -523,8 +522,7 @@ fn visit_engine_predicate_impl(
 
     let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
         delta_kernel::Error::generic(format!(
-            "Invalid predicate ID {} returned from engine visitor",
-            pred_id
+            "Invalid predicate ID {pred_id} returned from engine visitor"
         ))
     })?;
 

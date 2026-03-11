@@ -180,9 +180,8 @@ mod tests {
         );
     }
 
-    /// scan_domain_metadatas returns the correct metadata for a single requested domain.
     #[tokio::test]
-    async fn test_scan_domain_metadatas_one() {
+    async fn test_scan_domain_metadatas_with_single_domain_filter_returns_only_that_domain() {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
@@ -192,9 +191,8 @@ mod tests {
         assert_eq!(result["domainA"].configuration(), "cfgA");
     }
 
-    /// scan_domain_metadatas returns the correct metadata for a specific subset of domains.
     #[tokio::test]
-    async fn test_scan_domain_metadatas_subset() {
+    async fn test_scan_domain_metadatas_with_subset_filter_returns_matching_domains() {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
@@ -205,9 +203,8 @@ mod tests {
         assert_eq!(result["domainC"].configuration(), "cfgC");
     }
 
-    /// scan_domain_metadatas with no filter returns all domains across all commits.
     #[tokio::test]
-    async fn test_scan_domain_metadatas_all() {
+    async fn test_scan_domain_metadatas_with_no_filter_returns_all_domains() {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
@@ -219,10 +216,8 @@ mod tests {
         assert_eq!(result["domainC"].configuration(), "cfgC");
     }
 
-    /// Proves that when requested domains span two commits, both batches ARE consumed
-    /// (i.e., we don't terminate early until all N domains are found).
     #[tokio::test]
-    async fn test_scan_domain_metadatas_no_early_termination_when_split_across_commits() {
+    async fn test_scan_domain_metadatas_with_split_domains_does_not_terminate_early() {
         let (engine, snapshot) = build_two_commit_log();
         let log_segment = snapshot.log_segment();
 
