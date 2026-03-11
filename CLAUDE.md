@@ -29,12 +29,15 @@ cargo nextest run -p delta_kernel --lib --all-features test_name_here
 # Run a test by name, searching all crates (slow -- compiles everything)
 cargo nextest run --workspace --all-features test_name_here
 
-# Format and lint (always run after code changes)
-cargo fmt && cargo clippy --workspace --benches --tests --all-features -- -D warnings
+# Format, lint, and doc check (always run after code changes)
+cargo fmt \
+  && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
+  && cargo doc --workspace --all-features --no-deps
 
 # Quick pre-push check (mimics CI)
 cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
+  && cargo doc --workspace --all-features --no-deps \
   && cargo nextest run --workspace --all-features
 ```
 
@@ -159,6 +162,8 @@ Keep this list updated when new protocol features are added to kernel.
 - Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
+- NEVER panic in production code -- use errors instead. Panicking
+  (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 
 ## Pull Requests
 
