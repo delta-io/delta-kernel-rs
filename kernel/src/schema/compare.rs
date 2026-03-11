@@ -95,14 +95,13 @@ impl SchemaComparison for StructType {
     ///     2. For each field in this struct, you can read it as the `read_type`'s field. See
     ///        [`StructField::can_read_as`].
     ///     3. If a field in `read_type` is not present in this struct, then it must be nullable.
-    ///     4. Both [`StructTypes`] must be valid schemas. No two fields of a structs may share a
-    ///        name that only differs by case. TODO: This check should be moved into the constructor
-    ///        for [`StructType`].
+    ///     4. Both [`StructTypes`] must be valid schemas. No two fields of a struct may share a
+    ///        name that only differs by case.
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
         let lowercase_field_map: HashMap<String, &StructField> = self
             .fields
             .iter()
-            .map(|(name, field)| (name.to_lowercase(), field))
+            .map(|(name, field)| (name.to_ascii_lowercase(), field))
             .collect();
         require!(
             lowercase_field_map.len() == self.fields.len(),
@@ -110,7 +109,7 @@ impl SchemaComparison for StructType {
         );
 
         let lowercase_read_field_names: HashSet<String> =
-            read_type.fields.keys().map(|x| x.to_lowercase()).collect();
+            read_type.fields.keys().map(|x| x.to_ascii_lowercase()).collect();
         require!(
             lowercase_read_field_names.len() == read_type.fields.len(),
             Error::InvalidSchema
@@ -124,7 +123,7 @@ impl SchemaComparison for StructType {
             return Err(Error::MissingColumn);
         }
         for read_field in read_type.fields() {
-            match lowercase_field_map.get(&read_field.name().to_lowercase()) {
+            match lowercase_field_map.get(&read_field.name().to_ascii_lowercase()) {
                 Some(existing_field) => existing_field.can_read_as(read_field)?,
                 None => {
                     // Note: Delta spark does not perform the following check. Hence it ignores

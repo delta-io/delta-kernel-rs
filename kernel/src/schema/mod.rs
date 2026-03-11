@@ -1,7 +1,7 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
@@ -643,7 +643,7 @@ impl StructType {
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
-        let mut seen_lowercase_names: HashMap<String, String> = HashMap::new();
+        let mut seen_lowercase_names = HashSet::new();
 
         // Validate each field during insertion
         for (i, field) in fields.into_iter().enumerate() {
@@ -661,16 +661,14 @@ impl StructType {
                 }
             }
 
-            // Check for duplicate field names (case-insensitive per Delta protocol). Use a
-            // separate map keyed by lowercase name for O(1) check without scanning all keys.
-            let key = field.name.to_lowercase();
-            if let Some(existing_name) = seen_lowercase_names.get(&key) {
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
+            let key = field.name.to_ascii_lowercase();
+            if !seen_lowercase_names.insert(key) {
                 return Err(Error::schema(format!(
-                    "Duplicate field name (case-insensitive): '{}' and '{}'",
-                    existing_name, field.name
+                    "Duplicate field name (case-insensitive): '{}'",
+                    field.name
                 )));
             }
-            seen_lowercase_names.insert(key, field.name.clone());
 
             field_map.insert(field.name.clone(), field);
         }
@@ -979,7 +977,8 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        if self.fields.contains_key(&new_field.name) {
+        let new_key = new_field.name.to_ascii_lowercase();
+        if self.fields.keys().any(|k| k.to_ascii_lowercase() == new_key) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
                 new_field.name
@@ -1009,7 +1008,8 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        if self.fields.contains_key(&new_field.name) {
+        let new_key = new_field.name.to_ascii_lowercase();
+        if self.fields.keys().any(|k| k.to_ascii_lowercase() == new_key) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
                 new_field.name
@@ -3570,6 +3570,21 @@ mod tests {
     }
 
     #[test]
+    fn test_with_field_inserted_after_case_insensitive_duplicate_field() {
+        let schema = StructType::try_new([
+            StructField::new("Id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        let new_schema = schema.with_field_inserted_after(
+            Some("name"),
+            StructField::new("iD", DataType::STRING, true),
+        );
+        assert!(new_schema.is_err());
+        assert_result_error_with_message(new_schema, "Field iD already exists");
+    }
+
+    #[test]
     fn test_with_field_inserted_before() {
         let schema = StructType::try_new([
             StructField::new("id", DataType::INTEGER, false),
@@ -3601,6 +3616,21 @@ mod tests {
         );
         assert!(new_schema.is_err());
         assert_result_error_with_message(new_schema, "Field id already exists");
+    }
+
+    #[test]
+    fn test_with_field_inserted_before_case_insensitive_duplicate_field() {
+        let schema = StructType::try_new([
+            StructField::new("Id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+        .unwrap();
+        let new_schema = schema.with_field_inserted_before(
+            Some("name"),
+            StructField::new("iD", DataType::STRING, true),
+        );
+        assert!(new_schema.is_err());
+        assert_result_error_with_message(new_schema, "Field iD already exists");
     }
 
     #[test]
