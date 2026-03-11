@@ -277,18 +277,20 @@ impl PhysicalPredicate {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
         let unresolved_references = predicate.references();
-        let folded_references: HashMap<Vec<String>, &ColumnName> = unresolved_references
-            .iter()
-            .map(|r| {
-                let folded: Vec<String> = r.iter().map(|s| s.to_ascii_lowercase()).collect();
-                (folded, *r)
-            })
-            .collect();
+        // Group predicate references by case-folded path so that multiple references to the
+        // same column with different casings (e.g., `col > 5 AND COL < 10`) all resolve
+        // correctly instead of one being silently dropped.
+        let mut folded_references: HashMap<Vec<String>, Vec<&ColumnName>> = HashMap::new();
+        for r in &unresolved_references {
+            let folded: Vec<String> = r.iter().map(|s| s.to_lowercase()).collect();
+            folded_references.entry(folded).or_default().push(r);
+        }
         let mut get_referenced_fields = GetReferencedFields {
             unresolved_references,
             folded_references,
             column_mappings: HashMap::new(),
             logical_path: vec![],
+            folded_logical_path: vec![],
             physical_path: vec![],
             column_mapping_mode,
         };
@@ -338,12 +340,15 @@ fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
 // mappings so we can access the correct physical stats column for each logical column.
 struct GetReferencedFields<'a> {
     unresolved_references: HashSet<&'a ColumnName>,
-    /// Case-folded (lowercased) column path -> original predicate column name, for O(1)
-    /// case-insensitive matching. Delta column names are case-insensitive, so we case-fold
-    /// both predicate references and schema paths to find matches.
-    folded_references: HashMap<Vec<String>, &'a ColumnName>,
+    /// Case-folded (lowercased) column path -> all predicate column names that fold to it,
+    /// for O(1) case-insensitive matching. Grouped as a `Vec` so that multiple references to
+    /// the same column with different casings all resolve correctly.
+    folded_references: HashMap<Vec<String>, Vec<&'a ColumnName>>,
     column_mappings: HashMap<ColumnName, ColumnName>,
     logical_path: Vec<String>,
+    /// Case-folded version of `logical_path`, maintained incrementally via push/pop to avoid
+    /// re-folding the entire path at every leaf field.
+    folded_logical_path: Vec<String>,
     physical_path: Vec<String>,
     column_mapping_mode: ColumnMappingMode,
 }
@@ -352,17 +357,17 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         // Record the physical name mappings for all referenced leaf columns. Delta column names
         // are case-insensitive, so we probe the case-folded lookup map for O(1) matching.
-        let folded_path: Vec<String> = self
-            .logical_path
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        let predicate_col = self.folded_references.remove(folded_path.as_slice())?;
-        self.unresolved_references.remove(predicate_col);
-        // Use the predicate's column name as key so ApplyColumnMappings can look it up
-        // by the exact name used in the predicate expression.
-        self.column_mappings
-            .insert(predicate_col.clone(), ColumnName::new(&self.physical_path));
+        let pred_cols = self
+            .folded_references
+            .remove(self.folded_logical_path.as_slice())?;
+        let physical = ColumnName::new(&self.physical_path);
+        for pred_col in pred_cols {
+            self.unresolved_references.remove(pred_col);
+            // Use the predicate's column name as key so ApplyColumnMappings can look it up
+            // by the exact name used in the predicate expression.
+            self.column_mappings
+                .insert(pred_col.clone(), physical.clone());
+        }
         Some(Cow::Borrowed(ptype))
     }
 
@@ -377,9 +382,11 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         let physical_name = field.physical_name(self.column_mapping_mode);
         self.logical_path.push(field.name.clone());
+        self.folded_logical_path.push(field.name.to_lowercase());
         self.physical_path.push(physical_name.to_string());
         let field = self.recurse_into_struct_field(field);
         self.logical_path.pop();
+        self.folded_logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
     }
