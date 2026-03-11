@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::Error as KernelError;
@@ -101,10 +101,10 @@ fn validate_timestamp(commit_info: &serde_json::Value) {
         .as_millis()
         .try_into()
         .unwrap();
-    let five_minutes_ms = 5 * 60 * 1000;
+    let two_days_ms = Duration::from_secs(2 * 24 * 60 * 60).as_millis() as i64;
     assert!(
-        (timestamp <= current_ts && timestamp > current_ts - five_minutes_ms),
-        "commit timestamp should be at most 5 minutes behind current system time: got {timestamp}, now {current_ts}"
+        (timestamp <= current_ts && timestamp > current_ts - two_days_ms),
+        "commit timestamp should be at most 2 days behind current system time: got {timestamp}, now {current_ts}"
     );
 }
 

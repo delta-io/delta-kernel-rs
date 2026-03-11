@@ -463,7 +463,7 @@ impl<S> Transaction<S> {
 
     /// Set the content of the commitInfo action for this transaction. Note that kernel will _always_ write a commitInfo,
     /// this function simply allows engines to add their own data into that action if they wish.
-    /// Note that the following fields in [`crate::actions::CommitInfo`] will be overridden by kernel if they are set (meaning you should not set them):
+    /// Note that the following fields in `engine_commit_info` will be overridden by kernel if they are set (meaning you should not set them):
     /// - timestamp
     /// - inCommitTimestamp
     /// - operation
