@@ -209,13 +209,11 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 object_store.clone(),
                 task_executor.clone(),
             )),
-            parquet: Arc::new(
-                DefaultParquetHandler::new(
-                    object_store.clone(),
-                    task_executor.clone(),
-                    parquet_writer_config,
-                ),
-            ),
+            parquet: Arc::new(DefaultParquetHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+                parquet_writer_config,
+            )),
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),

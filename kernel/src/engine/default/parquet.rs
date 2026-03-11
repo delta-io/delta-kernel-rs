@@ -717,7 +717,11 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 files,
@@ -873,8 +877,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_parquet() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -952,8 +959,11 @@ mod tests {
     #[tokio::test]
     async fn test_disallow_non_trailing_slash() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -1348,7 +1358,11 @@ mod tests {
 
         // Read footer and verify schema
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let url = Url::from_file_path(&file_path).unwrap();
@@ -1402,7 +1416,11 @@ mod tests {
 
         // Read footer and verify field ID accessibility
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: Url::from_file_path(&file_path).unwrap(),
@@ -1496,7 +1514,11 @@ mod tests {
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
         let file_meta = FileMeta {
             location: Url::from_file_path(&file_path).unwrap(),
             last_modified: 0,
@@ -1537,8 +1559,11 @@ mod tests {
     #[tokio::test]
     async fn write_parquet_omits_arrow_schema_metadata() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()), Default::default());
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
