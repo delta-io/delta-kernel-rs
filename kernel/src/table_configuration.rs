@@ -9,6 +9,7 @@
 //!
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use url::Url;
@@ -16,8 +17,7 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    expected_stats_schema, stats_column_names, PhysicalStatsSchemaTransform, StatsConfig,
-    StripFieldMetadataTransform,
+    expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
@@ -34,18 +34,12 @@ use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
 use tracing::warn;
 
-/// Expected schemas for file statistics.
+/// Expected schema for file statistics, using physical column names.
 ///
-/// Contains both logical and physical versions of the stats schema:
-/// - **Logical schema**: Uses original column names (matching table schema)
-/// - **Physical schema**: Uses physical column names (for column mapping)
-///
-/// When column mapping is disabled (`ColumnMappingMode::None`), both schemas are identical.
+/// Wrapped in a struct so it can be extended with a logical-name variant if needed.
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub(crate) struct ExpectedStatsSchemas {
-    /// Stats schema using logical (user-facing) column names.
-    pub logical: SchemaRef,
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,
 }
@@ -195,17 +189,13 @@ impl TableConfiguration {
         }
     }
 
-    /// Generates the expected schemas for file statistics (both logical and physical).
+    /// Generates the expected schema for file statistics.
     ///
     /// Engines can provide statistics for files written to the delta table, enabling
-    /// data skipping and other optimizations. This method generates the expected schemas
-    /// for structured statistics based on the table configuration.
+    /// data skipping and other optimizations. Returns the physical stats schema wrapped in
+    /// an `ExpectedStatsSchemas`.
     ///
-    /// Returns a tuple of `(logical_stats_schema, physical_stats_schema)`:
-    /// - **Logical schema**: Uses original column names (matching table schema)
-    /// - **Physical schema**: Uses physical column names (respecting column mapping mode)
-    ///
-    /// Both schemas are structured as:
+    /// The schema is structured as:
     /// ```text
     /// {
     ///   numRecords: long,
@@ -232,35 +222,24 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn build_expected_stats_schemas(
         &self,
-        required_columns: Option<&[ColumnName]>,
-        requested_columns: Option<&[ColumnName]>,
+        required_columns_physical: Option<&[ColumnName]>,
+        requested_columns_physical: Option<&[ColumnName]>,
     ) -> DeltaResult<ExpectedStatsSchemas> {
-        let logical_data_schema = self.logical_data_schema();
-        let logical_stats_schema = Arc::new(expected_stats_schema(
-            &logical_data_schema,
-            self.table_properties(),
-            required_columns,
-            requested_columns,
+        let physical_data_schema = self.physical_data_schema_without_partition_columns();
+        let required_physical_stats_columns = self.required_stats_columns_physical();
+        let config = StatsConfig {
+            data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
+            data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
+        };
+        let physical_stats_schema = Arc::new(expected_stats_schema(
+            &physical_data_schema,
+            &config,
+            required_columns_physical,
+            requested_columns_physical,
         )?);
-        let physical_stats_schema = match self.column_mapping_mode() {
-            ColumnMappingMode::None => logical_stats_schema.clone(),
-            _ => PhysicalStatsSchemaTransform {
-                column_mapping_mode: self.column_mapping_mode(),
-            }
-            .transform_struct(&logical_stats_schema)
-            .map(|s| Arc::new(s.into_owned()))
-            .unwrap_or_else(|| logical_stats_schema.clone()),
-        };
+        let physical_stats_schema = strip_metadata(physical_stats_schema);
 
-        let logical_stats_schema = strip_metadata(logical_stats_schema);
-        let physical_stats_schema = if Arc::ptr_eq(&logical_stats_schema, &physical_stats_schema) {
-            // no need to run a second strip if they are the same schema
-            logical_stats_schema.clone()
-        } else {
-            strip_metadata(physical_stats_schema)
-        };
         Ok(ExpectedStatsSchemas {
-            logical: logical_stats_schema,
             physical: physical_stats_schema,
         })
     }
@@ -270,30 +249,10 @@ impl TableConfiguration {
         &self,
         required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let props = self.table_properties();
-        let physical_stats_columns: Option<Vec<ColumnName>> =
-            props.data_skipping_stats_columns.as_ref().map(|cols| {
-                let logical_schema = self.logical_data_schema();
-                let mode = self.column_mapping_mode();
-                cols.iter()
-                    .filter_map(|col| {
-                        get_any_level_column_physical_name(&logical_schema, col, mode)
-                            .inspect_err(|e| {
-                                // Theoretically this should always resolve — if it doesn't,
-                                // the user specified a non-existent column in
-                                // delta.dataSkippingStatsColumns, which is safe to ignore.
-                                warn!(
-                                    "Couldn't translate dataSkippingStatsColumns entry '{col}' \
-                                     to physical name: {e}; skipping"
-                                );
-                            })
-                            .ok()
-                    })
-                    .collect()
-            });
+        let physical_stats_columns = self.required_stats_columns_physical();
         let config = StatsConfig {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
-            data_skipping_num_indexed_cols: props.data_skipping_num_indexed_cols,
+            data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
         };
         stats_column_names(&self.physical_schema(), &config, required_columns)
     }
@@ -343,6 +302,55 @@ impl TableConfiguration {
                 .filter(|field| !partition_columns.contains(field.name()))
                 .cloned(),
         ))
+    }
+
+    /// Returns the physical data schema excluding partition columns.
+    fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
+        let partition_columns: HashSet<&str> = self
+            .partition_columns()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        // Safety: subset of an already-valid schema.
+        let schema = StructType::new_unchecked(
+            self.logical_schema()
+                .fields()
+                .zip(self.physical_schema().fields())
+                .filter(|(logical_field, _)| {
+                    !partition_columns.contains(logical_field.name().as_str())
+                })
+                .map(|(_, physical_field)| physical_field.clone()),
+        );
+        Arc::new(schema)
+    }
+
+    /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
+    ///
+    /// Returns `None` if the table property is not set. Entries that cannot be resolved
+    /// (e.g. non-existent columns) are silently skipped with a warning.
+    fn required_stats_columns_physical(&self) -> Option<Vec<ColumnName>> {
+        self.table_properties()
+            .data_skipping_stats_columns
+            .as_ref()
+            .map(|cols| {
+                let logical_schema = self.logical_data_schema();
+                let mode = self.column_mapping_mode();
+                cols.iter()
+                    .filter_map(|col| {
+                        get_any_level_column_physical_name(&logical_schema, col, mode)
+                            // Theoretically this should always resolve — if it doesn't,
+                            // the user specified a non-existent column in
+                            // delta.dataSkippingStatsColumns, which is safe to ignore.
+                            .inspect_err(|e| {
+                                warn!(
+                                    "Couldn't translate dataSkippingStatsColumns entry '{col}' \
+                                     to physical name: {e}; skipping"
+                                );
+                            })
+                            .ok()
+                    })
+                    .collect()
+            })
     }
 
     /// The [`Metadata`] for this table at this version.
@@ -1560,7 +1568,6 @@ mod test {
 
     #[test]
     fn test_build_expected_stats_schemas_no_column_mapping() {
-        // Without column mapping, logical and physical schemas should be identical
         let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("col_a", DataType::LONG),
             StructField::nullable("col_b", DataType::STRING),
@@ -1574,12 +1581,9 @@ mod test {
 
         let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
-        // Both schemas should be identical (same Arc)
-        assert!(Arc::ptr_eq(&stats_schemas.logical, &stats_schemas.physical));
-
         // Verify field names are logical names
         let min_values = stats_schemas
-            .logical
+            .physical
             .field("minValues")
             .unwrap()
             .data_type();
@@ -1593,40 +1597,13 @@ mod test {
 
     #[test]
     fn test_build_expected_stats_schemas_with_column_mapping() {
-        // With column mapping, logical schema should have logical names,
-        // physical schema should have physical names
+        // With column mapping, physical schema should have physical names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Name);
 
         let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
-
-        // Schemas should be different (not the same Arc)
-        assert!(!Arc::ptr_eq(
-            &stats_schemas.logical,
-            &stats_schemas.physical
-        ));
-
-        // Verify logical schema has logical names
-        let logical_min_values = stats_schemas
-            .logical
-            .field("minValues")
-            .unwrap()
-            .data_type();
-        if let DataType::Struct(inner) = logical_min_values {
-            assert!(
-                inner.field("col_a").is_some(),
-                "Logical schema should have col_a"
-            );
-            assert!(
-                inner.field("col_b").is_some(),
-                "Logical schema should have col_b"
-            );
-            assert!(inner.field("phys_col_a").is_none());
-        } else {
-            panic!("Expected minValues to be a struct");
-        }
 
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
@@ -1704,6 +1681,67 @@ mod test {
                 Some(MetadataValue::Number(_))
             ),
             "make_physical should inject ParquetFieldId for data schemas in Id mode"
+        );
+    }
+
+    #[test]
+    fn test_build_expected_stats_schemas_excludes_partition_columns() {
+        let field_a: StructField = serde_json::from_str(
+            r#"{
+                "name": "data_col",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "phys_data"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let field_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "part_col",
+                "type": "string",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 2,
+                    "delta.columnMapping.physicalName": "phys_part"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
+        let mut props = HashMap::new();
+        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
+
+        let DataType::Struct(inner) = stats_schemas
+            .physical
+            .field("minValues")
+            .unwrap()
+            .data_type()
+        else {
+            panic!("Expected minValues to be a struct");
+        };
+        assert!(
+            inner.field("phys_data").is_some(),
+            "Data column should be present with physical name"
+        );
+        assert!(
+            inner.field("phys_part").is_none(),
+            "Partition column should be excluded"
+        );
+        assert!(
+            inner.field("part_col").is_none(),
+            "Partition column logical name should also be absent"
         );
     }
 
