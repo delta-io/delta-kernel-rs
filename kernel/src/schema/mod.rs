@@ -16,7 +16,7 @@ use tracing::warn;
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, CowExt as _};
+use crate::utils::{map_owned_children_or_else, require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
@@ -1026,6 +1026,15 @@ impl StructType {
         self
     }
 
+    /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
+    /// returns `true`. This does not recurse into nested [`StructType`] fields.
+    pub fn with_fields_filtered(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Self> {
+        Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
+    }
+
     /// Returns a StructType with the named field replaced.
     /// Returns an error if field doesn't exist.
     pub fn with_field_replaced(
@@ -1286,11 +1295,6 @@ impl ColumnNamesAndTypes {
     #[internal_api]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
-    }
-
-    pub(crate) fn extend(&mut self, other: ColumnNamesAndTypes) {
-        self.0.extend(other.0);
-        self.1.extend(other.1);
     }
 }
 
@@ -1902,28 +1906,8 @@ pub trait SchemaTransform<'a> {
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
     /// update the struct to reference all surviving fields. Otherwise, no-op.
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        use Cow::*;
-        let mut num_borrowed = 0;
-        let fields: Vec<_> = stype
-            .fields()
-            .filter_map(|field| self.transform_struct_field(field))
-            .inspect(|field| {
-                if let Borrowed(_) = field {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if fields.is_empty() {
-            None
-        } else if num_borrowed < stype.fields.len() {
-            // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new_unchecked(
-                fields.into_iter().map(|f| f.into_owned()),
-            )))
-        } else {
-            Some(Borrowed(stype))
-        }
+        let transformed_children = stype.fields().map(|f| self.transform_struct_field(f));
+        map_owned_children_or_else(stype, transformed_children, StructType::new_unchecked)
     }
 
     /// Recursively transforms an array's element type. If the element type changes, update the
