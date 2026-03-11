@@ -60,11 +60,10 @@ impl ReadMetadataRunner {
                 if *num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
-                Some(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(*num_threads)
-                        .build()?,
-                )
+                let thread_pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(*num_threads)
+                    .build()?;
+                Some(thread_pool)
             }
             ParallelScan::Disabled => None,
         };
