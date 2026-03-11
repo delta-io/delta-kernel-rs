@@ -189,8 +189,7 @@ fn validate_and_get_physical_index(
 ) -> DeltaResult<usize> {
     if row_index >= run_array.len() {
         return Err(Error::generic(format!(
-            "Row index {} out of bounds for field '{}'",
-            row_index, field_name
+            "Row index {row_index} out of bounds for field '{field_name}'"
         )));
     }
 

@@ -124,7 +124,7 @@ async fn verify_row_tracking_in_commit(
     expected_base_row_ids: Vec<i64>,
     expected_row_id_high_water_mark: i64,
 ) -> DeltaResult<()> {
-    let commit_url = table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
+    let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
     let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
 
     let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)

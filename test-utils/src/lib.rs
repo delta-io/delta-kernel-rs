@@ -1009,7 +1009,7 @@ pub fn read_actions_from_commit(
     action_type: &str,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
-    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
     let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
         .into_iter::<serde_json::Value>()

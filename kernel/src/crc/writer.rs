@@ -195,7 +195,7 @@ mod tests {
             let mut crc = test_crc();
             crc.file_stats_validity = invalid_validity;
             let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc, false);
-            assert!(result.is_err(), "should reject {:?}", invalid_validity);
+            assert!(result.is_err(), "should reject {invalid_validity:?}");
         }
     }
 }
