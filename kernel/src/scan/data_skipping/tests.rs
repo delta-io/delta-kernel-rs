@@ -154,6 +154,14 @@ fn test_eval_junction() {
         (&[NULL, FALSE, TRUE], FALSE, TRUE),
     ];
     let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
+
+    // Helper: evaluate a skipping predicate, treating None (can't create skipping predicate)
+    // as NULL (unknown/can't skip) -- both mean "keep all files".
+    let eval_skipping = |pred: &Pred| -> Option<bool> {
+        let skipping_pred = as_data_skipping_predicate(pred)?;
+        filter.eval(&skipping_pred)
+    };
+
     for (inputs, expect_and, expect_or) in test_cases {
         let inputs: Vec<_> = inputs
             .iter()
@@ -164,25 +172,21 @@ fn test_eval_junction() {
             .collect();
 
         let pred = Pred::and_from(inputs.clone());
-        let pred = as_data_skipping_predicate(&pred).unwrap();
-        expect_eq!(filter.eval(&pred), *expect_and, "AND({inputs:?})");
+        expect_eq!(eval_skipping(&pred), *expect_and, "AND({inputs:?})");
 
         let pred = Pred::or_from(inputs.clone());
-        let pred = as_data_skipping_predicate(&pred).unwrap();
-        expect_eq!(filter.eval(&pred), *expect_or, "OR({inputs:?})");
+        expect_eq!(eval_skipping(&pred), *expect_or, "OR({inputs:?})");
 
         let pred = Pred::not(Pred::and_from(inputs.clone()));
-        let pred = as_data_skipping_predicate(&pred).unwrap();
         expect_eq!(
-            filter.eval(&pred),
+            eval_skipping(&pred),
             expect_and.map(|val| !val),
             "NOT AND({inputs:?})"
         );
 
         let pred = Pred::not(Pred::or_from(inputs.clone()));
-        let pred = as_data_skipping_predicate(&pred).unwrap();
         expect_eq!(
-            filter.eval(&pred),
+            eval_skipping(&pred),
             expect_or.map(|val| !val),
             "NOT OR({inputs:?})"
         );
@@ -532,6 +536,7 @@ fn test_timestamp_predicates_dont_data_skip() {
     }
 }
 
+<<<<<<< HEAD
 // Tests for partition-aware data skipping
 
 /// Helper to build a partition columns set with a single "part_col" entry.
@@ -791,5 +796,19 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
         filter.eval(&sql_pred),
         expected,
         "part_col='{part_val}' max(data_col)={max_data}"
+    );
+}
+
+// Without normalization, `AND([unknown])` would become `AND([NULL])` via
+// `collect_junction_preds`, which evaluates to `Some(false)` under `eval_sql_where` and
+// incorrectly prunes all row groups. The junction constructor normalizes `AND([unknown])`
+// to just `unknown`, which correctly returns `None` (no pushdown).
+#[test]
+fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
+    let pred = Pred::and_from([Pred::unknown("unsupported")]);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]);
+    assert!(
+        skipping_pred.is_none(),
+        "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
     );
 }

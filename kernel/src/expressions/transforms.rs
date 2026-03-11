@@ -230,9 +230,10 @@ pub trait ExpressionTransform<'a> {
             Predicate::Binary(b) => self
                 .transform_pred_binary(b)?
                 .map_owned_or_else(pred, Predicate::Binary),
+            // Route through the constructor to normalize in case the transform removed children.
             Predicate::Junction(j) => self
                 .transform_pred_junction(j)?
-                .map_owned_or_else(pred, Predicate::Junction),
+                .map_owned_or_else(pred, |j| Predicate::junction(j.op, j.preds)),
             Predicate::Opaque(o) => self
                 .transform_pred_opaque(o)?
                 .map_owned_or_else(pred, Predicate::Opaque),
@@ -1131,5 +1132,43 @@ mod tests {
         assert_eq!(check_with_call_count(5), (6, 15));
         assert_eq!(check_with_call_count(6), (6, 16));
         assert_eq!(check_with_call_count(7), (6, 16));
+    }
+
+    #[test]
+    fn transform_junction_to_single_child_unwraps() {
+        // A transform that removes one child from AND(a, b) should produce the surviving
+        // predicate directly, not a degenerate single-element junction AND(a).
+        struct LiteralRemover;
+        impl<'a> ExpressionTransform<'a> for LiteralRemover {
+            fn transform_expr_literal(&mut self, _value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+                None
+            }
+        }
+
+        let pred = Pred::and(column_pred!("x"), Pred::literal(true));
+        let mut transform = LiteralRemover;
+        let result = transform.transform_pred(&pred);
+        let result = result.map(Cow::into_owned);
+        assert_eq!(result.as_ref(), Some(&column_pred!("x")));
+        assert!(!matches!(result, Some(Pred::Junction(_))));
+    }
+
+    #[test]
+    fn transform_junction_removing_all_children_returns_none() {
+        // Removing all children propagates None (the junction is dropped entirely),
+        // rather than producing an empty junction or identity literal.
+        struct ColumnRemover;
+        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+            fn transform_expr_column(
+                &mut self,
+                _name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                None
+            }
+        }
+
+        let pred = Pred::and(column_pred!("x"), column_pred!("y"));
+        let mut transform = ColumnRemover;
+        assert!(transform.transform_pred(&pred).is_none());
     }
 }
