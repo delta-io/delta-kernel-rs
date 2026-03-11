@@ -64,10 +64,10 @@ fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
         }
     }
 
-    let schema =
-        schema.ok_or_else(|| format!("No parquet files found in {}", expected_data_dir.display()))?;
-    let all_data = concat_batches(&schema, &batches)
-        .map_err(|e| format!("Failed to concat batches: {e}"))?;
+    let schema = schema
+        .ok_or_else(|| format!("No parquet files found in {}", expected_data_dir.display()))?;
+    let all_data =
+        concat_batches(&schema, &batches).map_err(|e| format!("Failed to concat batches: {e}"))?;
     Ok(all_data)
 }
 
