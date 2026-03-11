@@ -129,7 +129,7 @@ pub fn get_engine(
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
     if args.env_creds {
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
-            delta_kernel::Error::Generic(format!("Object store could not parse url: {}", e))
+            delta_kernel::Error::Generic(format!("Object store could not parse url: {e}"))
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();

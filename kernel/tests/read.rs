@@ -1520,7 +1520,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         // Verify the file path column contains the expected file name
         let file_path_array = batch.column(1);
         let expected_file_name = expected_files[file_count];
-        let expected_path = format!("{}{}", location, expected_file_name);
+        let expected_path = format!("{location}{expected_file_name}");
 
         // The file path array should be a plain StringArray with the path repeated for each row.
         let string_array = file_path_array
@@ -1539,8 +1539,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             string_array
                 .iter()
                 .all(|v| v == Some(expected_path.as_str())),
-            "All rows should contain file path '{}'",
-            expected_path
+            "All rows should contain file path '{expected_path}'"
         );
 
         file_count += 1;

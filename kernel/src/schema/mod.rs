@@ -16,7 +16,7 @@ use tracing::warn;
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, CowExt as _};
+use crate::utils::{map_owned_children_or_else, require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
@@ -568,7 +568,7 @@ impl Display for StructField {
                 metadata_str.push_str(", ");
             }
             first = false;
-            metadata_str.push_str(&format!("{}: {:?}", k, v));
+            metadata_str.push_str(&format!("{k}: {v:?}"));
         }
         metadata_str.push('}');
         write!(
@@ -981,7 +981,7 @@ impl StructType {
                 self.fields
                     .get_index_of(after)
                     .map(|index| index + 1)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))
+                    .ok_or_else(|| Error::generic(format!("Field {after} not found")))
             })
             .unwrap_or_else(|| Ok(self.fields.len()))?;
 
@@ -1010,7 +1010,7 @@ impl StructType {
             .map(|before| {
                 self.fields
                     .get_index_of(before)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", before)))
+                    .ok_or_else(|| Error::generic(format!("Field {before} not found")))
             })
             .unwrap_or_else(|| Ok(0))?;
 
@@ -1045,7 +1045,7 @@ impl StructType {
         let replace_field = self
             .fields
             .get_mut(name)
-            .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
+            .ok_or_else(|| Error::generic(format!("Field {name} not found")))?;
 
         *replace_field = new_field;
         Ok(self)
@@ -1081,7 +1081,7 @@ fn write_struct_type(
         levels.push(is_last);
 
         write_indent(f, levels)?;
-        writeln!(f, "{}", field)?;
+        writeln!(f, "{field}")?;
 
         field.data_type.fmt_recursive(f, levels)?;
 
@@ -1906,28 +1906,8 @@ pub trait SchemaTransform<'a> {
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
     /// update the struct to reference all surviving fields. Otherwise, no-op.
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        use Cow::*;
-        let mut num_borrowed = 0;
-        let fields: Vec<_> = stype
-            .fields()
-            .filter_map(|field| self.transform_struct_field(field))
-            .inspect(|field| {
-                if let Borrowed(_) = field {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if fields.is_empty() {
-            None
-        } else if num_borrowed < stype.fields.len() {
-            // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new_unchecked(
-                fields.into_iter().map(|f| f.into_owned()),
-            )))
-        } else {
-            Some(Borrowed(stype))
-        }
+        let transformed_children = stype.fields().map(|f| self.transform_struct_field(f));
+        map_owned_children_or_else(stype, transformed_children, StructType::new_unchecked)
     }
 
     /// Recursively transforms an array's element type. If the element type changes, update the
@@ -2792,7 +2772,7 @@ mod tests {
                 1 => assert_eq!(field.name, "required_int"),
                 2 => assert_eq!(field.name, "nullable_bool"),
                 3 => assert_eq!(field.name, "required_long"),
-                _ => panic!("Unexpected field index: {}", index),
+                _ => panic!("Unexpected field index: {index}"),
             }
         }
     }

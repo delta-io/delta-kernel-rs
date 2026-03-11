@@ -277,10 +277,21 @@ impl PhysicalPredicate {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
+        let unresolved_references = predicate.references();
+        // Group predicate references by case-folded path so that multiple references to the
+        // same column with different casings (e.g., `col > 5 AND COL < 10`) all resolve
+        // correctly instead of one being silently dropped.
+        let mut folded_references: HashMap<Vec<String>, Vec<&ColumnName>> = HashMap::new();
+        for r in &unresolved_references {
+            let folded: Vec<String> = r.iter().map(|s| s.to_lowercase()).collect();
+            folded_references.entry(folded).or_default().push(r);
+        }
         let mut get_referenced_fields = GetReferencedFields {
-            unresolved_references: predicate.references(),
+            unresolved_references,
+            folded_references,
             column_mappings: HashMap::new(),
             logical_path: vec![],
+            folded_logical_path: vec![],
             physical_path: vec![],
             column_mapping_mode,
         };
@@ -330,24 +341,35 @@ fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
 // mappings so we can access the correct physical stats column for each logical column.
 struct GetReferencedFields<'a> {
     unresolved_references: HashSet<&'a ColumnName>,
+    /// Case-folded (lowercased) column path -> all predicate column names that fold to it,
+    /// for O(1) case-insensitive matching. Grouped as a `Vec` so that multiple references to
+    /// the same column with different casings all resolve correctly.
+    folded_references: HashMap<Vec<String>, Vec<&'a ColumnName>>,
     column_mappings: HashMap<ColumnName, ColumnName>,
     logical_path: Vec<String>,
+    /// Case-folded version of `logical_path`, maintained incrementally via push/pop to avoid
+    /// re-folding the entire path at every leaf field.
+    folded_logical_path: Vec<String>,
     physical_path: Vec<String>,
     column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     // Capture the path mapping for this leaf field
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        // Record the physical name mappings for all referenced leaf columns
-        self.unresolved_references
-            .remove(self.logical_path.as_slice())
-            .then(|| {
-                self.column_mappings.insert(
-                    ColumnName::new(&self.logical_path),
-                    ColumnName::new(&self.physical_path),
-                );
-                Cow::Borrowed(ptype)
-            })
+        // Record the physical name mappings for all referenced leaf columns. Delta column names
+        // are case-insensitive, so we probe the case-folded lookup map for O(1) matching.
+        let pred_cols = self
+            .folded_references
+            .remove(self.folded_logical_path.as_slice())?;
+        let physical = ColumnName::new(&self.physical_path);
+        for pred_col in pred_cols {
+            self.unresolved_references.remove(pred_col);
+            // Use the predicate's column name as key so ApplyColumnMappings can look it up
+            // by the exact name used in the predicate expression.
+            self.column_mappings
+                .insert(pred_col.clone(), physical.clone());
+        }
+        Some(Cow::Borrowed(ptype))
     }
 
     // array and map fields are not eligible for data skipping, so filter them out.
@@ -361,9 +383,11 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         let physical_name = field.physical_name(self.column_mapping_mode);
         self.logical_path.push(field.name.clone());
+        self.folded_logical_path.push(field.name.to_lowercase());
         self.physical_path.push(physical_name.to_string());
         let field = self.recurse_into_struct_field(field);
         self.logical_path.pop();
+        self.folded_logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
     }
@@ -542,21 +566,6 @@ impl Scan {
         }
     }
 
-    /// Get the logical schema for file statistics.
-    ///
-    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
-    /// contains file statistics read using physical column names (to handle column mapping).
-    /// This method returns the corresponding logical schema that maps those physical column
-    /// names back to the table's logical column names, enabling engines to interpret the stats
-    /// correctly.
-    ///
-    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
-        self.state_info.logical_stats_schema.as_ref()
-    }
-
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:
@@ -667,6 +676,7 @@ impl Scan {
                 actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
+                    has_partition_values_parsed: false,
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
@@ -718,6 +728,7 @@ impl Scan {
                 .physical_stats_schema
                 .as_ref()
                 .map(|s| s.as_ref()),
+            None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -776,6 +787,10 @@ impl Scan {
                 meta_predicate,
                 self.state_info
                     .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+                self.state_info
+                    .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
             )
@@ -883,6 +898,7 @@ impl Scan {
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema,
         };
         let processor = ScanLogReplayProcessor::new(

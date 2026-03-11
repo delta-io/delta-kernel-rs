@@ -56,8 +56,7 @@ impl<S> Transaction<S> {
             // Check for duplicates
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
+                    "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
         }
@@ -76,8 +75,7 @@ impl<S> Transaction<S> {
             // Check for duplicates (spans both system and user domains)
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
+                    "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
         }
@@ -103,8 +101,7 @@ impl<S> Transaction<S> {
             // Check for duplicates
             if !seen_domains.insert(domain.as_str()) {
                 return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
+                    "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
         }
@@ -126,8 +123,7 @@ impl<S> Transaction<S> {
             "delta.clustering" => Some(TableFeature::ClusteredTable),
             _ => {
                 return Err(Error::generic(format!(
-                    "Unknown system domain '{}'. Only known system domains are allowed.",
-                    domain
+                    "Unknown system domain '{domain}'. Only known system domains are allowed."
                 )));
             }
         };
@@ -136,8 +132,7 @@ impl<S> Transaction<S> {
         if let Some(feature) = required_feature {
             if !table_config.is_feature_supported(&feature) {
                 return Err(Error::generic(format!(
-                    "System domain '{}' requires the '{}' feature to be enabled",
-                    domain, feature
+                    "System domain '{domain}' requires the '{feature}' feature to be enabled"
                 )));
             }
         }
@@ -168,8 +163,7 @@ impl<S> Transaction<S> {
             .collect();
         let existing_domains = self
             .read_snapshot
-            .log_segment()
-            .scan_domain_metadatas(Some(&domains), engine)?;
+            .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self

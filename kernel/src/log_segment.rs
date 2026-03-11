@@ -52,6 +52,12 @@ pub(crate) struct CheckpointReadInfo {
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
     #[allow(unused)]
     pub has_stats_parsed: bool,
+    /// Whether the checkpoint has compatible pre-parsed partition values.
+    /// When `true`, checkpoint batches can read typed partition values directly from
+    /// `partitionValues_parsed` instead of parsing strings from `partitionValues`.
+    #[serde(default)]
+    #[allow(unused)]
+    pub has_partition_values_parsed: bool,
     /// The schema used to read checkpoint files, potentially including stats_parsed.
     #[allow(unused)]
     pub checkpoint_read_schema: SchemaRef,
@@ -64,6 +70,7 @@ impl CheckpointReadInfo {
     pub(crate) fn without_stats_parsed() -> Self {
         Self {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema: get_log_add_schema().clone(),
         }
     }
@@ -494,6 +501,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -514,6 +522,7 @@ impl LogSegment {
             checkpoint_read_schema,
             effective_predicate,
             stats_schema,
+            partition_schema,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -535,6 +544,7 @@ impl LogSegment {
             engine,
             action_schema.clone(),
             action_schema,
+            None,
             None,
             None,
         )?;
@@ -694,6 +704,7 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -717,50 +728,64 @@ impl LogSegment {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
 
-        // Build final schema with any additional fields needed (stats_parsed, sidecar)
-        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let augmented_checkpoint_read_schema = if let (true, Some(add_field), Some(stats_schema)) =
-            (has_stats_parsed, action_schema.field("add"), stats_schema)
-        {
-            // Add stats_parsed to the "add" field
-            let DataType::Struct(add_struct) = add_field.data_type() else {
-                return Err(Error::internal_error(
-                    "add field in action schema must be a struct",
-                ));
-            };
-            let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-            add_fields.push(StructField::nullable(
-                "stats_parsed",
-                DataType::Struct(Box::new(stats_schema.clone())),
-            ));
+        let has_partition_values_parsed = partition_schema
+            .zip(file_actions_schema.as_ref())
+            .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
-            // Rebuild schema with modified add field
-            let mut new_fields: Vec<StructField> = action_schema
-                .fields()
-                .map(|f| {
-                    if f.name() == "add" {
-                        StructField::new(
-                            add_field.name(),
-                            StructType::new_unchecked(add_fields.clone()),
-                            add_field.is_nullable(),
-                        )
-                        .with_metadata(add_field.metadata.clone())
-                    } else {
-                        f.clone()
-                    }
-                })
-                .collect();
+        // Build final schema with any additional fields needed
+        // (stats_parsed, partitionValues_parsed, sidecar)
+        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
+        let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
+        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
+            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
+                (needs_add_augmentation, action_schema.field("add"))
+            {
+                let DataType::Struct(add_struct) = add_field.data_type() else {
+                    return Err(Error::internal_error(
+                        "add field in action schema must be a struct",
+                    ));
+                };
+                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+
+                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
+                    add_fields.push(StructField::nullable(
+                        "stats_parsed",
+                        DataType::Struct(Box::new(ss.clone())),
+                    ));
+                }
+
+                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
+                    add_fields.push(StructField::nullable(
+                        "partitionValues_parsed",
+                        DataType::Struct(Box::new(ps.clone())),
+                    ));
+                }
+
+                // Rebuild schema with modified add field
+                action_schema
+                    .fields()
+                    .map(|f| {
+                        if f.name() == "add" {
+                            StructField::new(
+                                add_field.name(),
+                                StructType::new_unchecked(add_fields.clone()),
+                                add_field.is_nullable(),
+                            )
+                            .with_metadata(add_field.metadata.clone())
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect()
+            } else {
+                action_schema.fields().cloned().collect()
+            };
 
             // Add sidecar column at top-level for V2 checkpoints
             if needs_sidecar {
                 new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
             }
 
-            Arc::new(StructType::new_unchecked(new_fields))
-        } else if needs_sidecar {
-            // Only need to add sidecar, no stats_parsed
-            let mut new_fields: Vec<StructField> = action_schema.fields().cloned().collect();
-            new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
             Arc::new(StructType::new_unchecked(new_fields))
         } else {
             // No modifications needed, use schema as-is
@@ -828,6 +853,7 @@ impl LogSegment {
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
+            has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
@@ -1145,6 +1171,186 @@ impl LogSegment {
         }
         true
     }
+
+    /// Checks if a checkpoint schema contains a usable `add.partitionValues_parsed` field.
+    ///
+    /// Validates that:
+    /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
+    /// 2. The types for partition columns present in both schemas are compatible
+    ///
+    /// Missing partition columns in the checkpoint are OK (they simply won't contribute
+    /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
+    /// or has incompatible types for any shared column.
+    pub(crate) fn schema_has_compatible_partition_values_parsed(
+        checkpoint_schema: &StructType,
+        partition_schema: &StructType,
+    ) -> bool {
+        let Some(partition_parsed) =
+            checkpoint_schema
+                .field("add")
+                .and_then(|f| match f.data_type() {
+                    DataType::Struct(s) => s.field("partitionValues_parsed"),
+                    _ => None,
+                })
+        else {
+            debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
+            return false;
+        };
+
+        let DataType::Struct(partition_struct) = partition_parsed.data_type() else {
+            warn!(
+                "partitionValues_parsed not compatible: add.partitionValues_parsed is not a Struct, got {:?}",
+                partition_parsed.data_type()
+            );
+            return false;
+        };
+
+        // Flat struct: reuse the recursive type checker (trivial case with no nesting)
+        if !Self::structs_have_compatible_types(
+            partition_struct,
+            partition_schema,
+            "partitionValues_parsed",
+        ) {
+            return false;
+        }
+
+        debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
+        true
+    }
+}
+
+fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
+    for (i, f) in compactions.iter().enumerate() {
+        let LogPathFileType::CompactedCommit { hi } = f.file_type else {
+            return Err(Error::generic(
+                "ascending_compaction_files contains non-compaction file",
+            ));
+        };
+        if f.version > hi {
+            return Err(Error::generic(format!(
+                "compaction file has start version {} > end version {}",
+                f.version, hi
+            )));
+        }
+        if let Some(next) = compactions.get(i + 1) {
+            // next's type is validated on its own iteration; skip sort check if it isn't a
+            // CompactedCommit since the type error will be caught then.
+            if let LogPathFileType::CompactedCommit { hi: next_hi } = next.file_type {
+                if !(f.version < next.version || (f.version == next.version && hi <= next_hi)) {
+                    return Err(Error::generic(format!(
+                        "ascending_compaction_files is not sorted: {f:?} -> {next:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_parts(parts: &[ParsedLogPath]) -> DeltaResult<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let n = parts.len();
+    let first_version = parts[0].version;
+    for p in parts {
+        if !p.is_checkpoint() {
+            return Err(Error::generic(
+                "checkpoint_parts contains non-checkpoint file",
+            ));
+        }
+        if p.version != first_version {
+            return Err(Error::generic(
+                "multi-part checkpoint parts have different versions",
+            ));
+        }
+        match p.file_type {
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } if num_parts as usize == n => {}
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } => {
+                return Err(Error::generic(format!(
+                    "multi-part checkpoint part count mismatch: slice has {n} parts but num_parts field says {num_parts}"
+                )));
+            }
+            _ if n > 1 => {
+                return Err(Error::generic(format!(
+                    "multi-part checkpoint part count mismatch: expected {n} multi-part checkpoint files but got a non-multi-part checkpoint"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    for f in commits {
+        if !f.is_commit() {
+            return Err(Error::generic(
+                "ascending_commit_files contains non-commit file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+    for pair in commits.windows(2) {
+        if pair[0].version + 1 != pair[1].version {
+            return Err(Error::generic(format!(
+                "Expected contiguous commit files, but found gap: {:?} -> {:?}",
+                pair[0], pair[1]
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates that there is no gap between the checkpoint and the first commit file.
+///
+/// When a checkpoint exists and commits are also present (after filtering out commits at or before
+/// the checkpoint), the first commit must immediately follow the checkpoint (i.e., be at
+/// `checkpoint_version + 1`). A gap indicates missing log files.
+fn validate_checkpoint_commit_gap(
+    checkpoint_version: Option<Version>,
+    commits: &[ParsedLogPath],
+) -> DeltaResult<()> {
+    if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
+        require!(
+            checkpoint_version + 1 == first_commit.version,
+            Error::InvalidCheckpoint(format!(
+                "Gap between checkpoint version {checkpoint_version} and next commit {}",
+                first_commit.version
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// Validates that the log segment covers exactly `end_version` (when specified) and returns the
+/// effective version -- the version of the last commit, or the checkpoint version if no commits
+/// are present.
+///
+/// Returns an error if the segment is empty (no commits and no checkpoint parts), or if the
+/// effective version does not match the requested `end_version`.
+fn validate_end_version(
+    commits: &[ParsedLogPath],
+    checkpoint_parts: &[ParsedLogPath],
+    end_version: Option<Version>,
+) -> DeltaResult<Version> {
+    let effective_version = commits
+        .last()
+        .or(checkpoint_parts.first())
+        .ok_or(Error::generic("No files in log segment"))?
+        .version;
+    if let Some(end_version) = end_version {
+        require!(
+            effective_version == end_version,
+            Error::generic(format!(
+                "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
+            ))
+        );
+    }
+    Ok(effective_version)
 }
 
 fn validate_compaction_files(compactions: &[ParsedLogPath]) -> DeltaResult<()> {
