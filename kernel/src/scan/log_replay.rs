@@ -286,7 +286,7 @@ impl ScanLogReplayProcessor {
             physical_partition_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
-            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
 
         Ok(SerializableScanState {
             predicate,

@@ -482,9 +482,8 @@ impl Snapshot {
         require!(
             new_version == read_version.wrapping_add(1),
             Error::internal_error(format!(
-                "Cannot create post-commit Snapshot. Log file version ({}) does not \
-                equal Snapshot version ({}) + 1.",
-                new_version, read_version
+                "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
+                equal Snapshot version ({read_version}) + 1."
             ))
         );
 
@@ -985,7 +984,7 @@ mod tests {
     fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
         let protocol = create_protocol(ict_enabled, None);
         let metadata = create_metadata(None, None, None, ict_config, false);
-        format!("{}\n{}", protocol, metadata)
+        format!("{protocol}\n{metadata}")
     }
 
     #[test]
@@ -1465,7 +1464,7 @@ mod tests {
 
         // Write all test files to the in memory file system
         for (path_prefix, data, _) in &test_cases {
-            let path = Path::from(format!("{}/_last_checkpoint", path_prefix));
+            let path = Path::from(format!("{path_prefix}/_last_checkpoint"));
             store
                 .put(&path, data.clone().into())
                 .await
@@ -1478,7 +1477,7 @@ mod tests {
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
-            let url = Url::parse(&format!("memory:///{}/", path_prefix)).expect("valid url");
+            let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
             let result =
                 LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);

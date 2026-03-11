@@ -157,7 +157,7 @@ impl StateInfo {
 
                                 // ensure we have a column name that isn't already in our schema
                                 let index_column_name = (0..)
-                                    .map(|i| format!("row_indexes_for_row_id_{}", i))
+                                    .map(|i| format!("row_indexes_for_row_id_{i}"))
                                     .find(|name| logical_schema.field(name).is_none())
                                     .ok_or(Error::generic(
                                         "Couldn't generate row index column name",

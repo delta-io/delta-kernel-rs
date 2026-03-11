@@ -74,8 +74,7 @@ pub(crate) fn validate_clustering_columns(
     for col in columns {
         if !seen.insert(col) {
             return Err(Error::generic(format!(
-                "Duplicate clustering column: '{}'",
-                col
+                "Duplicate clustering column: '{col}'"
             )));
         }
 
@@ -90,10 +89,9 @@ pub(crate) fn validate_clustering_columns(
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
                 return Err(Error::generic(format!(
-                    "Clustering column '{}' has unsupported type '{}'. \
+                    "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
-                     Decimal, Date, Timestamp, TimestampNtz, String",
-                    col, dt
+                     Decimal, Date, Timestamp, TimestampNtz, String"
                 )));
             }
         }
@@ -411,12 +409,12 @@ mod tests {
     #[case::ten(10)]
     fn test_validate_clustering_column_count(#[case] num_columns: usize) {
         let fields: Vec<StructField> = (0..num_columns)
-            .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, false))
+            .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false))
             .collect();
         let schema = StructType::new_unchecked(fields);
 
         let columns: Vec<ColumnName> = (0..num_columns)
-            .map(|i| ColumnName::new([format!("col{}", i)]))
+            .map(|i| ColumnName::new([format!("col{i}")]))
             .collect();
 
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
@@ -441,8 +439,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains(expected_error),
-            "Expected error containing '{}'",
-            expected_error
+            "Expected error containing '{expected_error}'"
         );
     }
 

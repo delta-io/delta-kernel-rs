@@ -91,8 +91,7 @@ fn ensure_table_does_not_exist(
             // - None means empty iterator -> OK for new table
             match files.next() {
                 Some(Ok(_)) => Err(Error::generic(format!(
-                    "Table already exists at path: {}",
-                    table_path
+                    "Table already exists at path: {table_path}"
                 ))),
                 Some(Err(Error::FileNotFound(_))) | None => {
                     // Path doesn't exist or empty - OK for new table
@@ -341,8 +340,7 @@ fn validate_extract_table_features_and_properties(
         // Validate that the value is "supported"
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
             return Err(Error::generic(format!(
-                "Invalid value '{}' for '{}'. Only '{}' is allowed.",
-                value, key, SET_TABLE_FEATURE_SUPPORTED_VALUE
+                "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
             )));
         }
 
@@ -353,8 +351,7 @@ fn validate_extract_table_features_and_properties(
 
         if !ALLOWED_DELTA_FEATURES.contains(&feature) {
             return Err(Error::generic(format!(
-                "Enabling feature '{}' via '{}' is not supported during CREATE TABLE",
-                feature_name, key
+                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             )));
         }
 
@@ -368,8 +365,7 @@ fn validate_extract_table_features_and_properties(
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
             return Err(Error::generic(format!(
-                "Setting delta property '{}' is not supported during CREATE TABLE",
-                key
+                "Setting delta property '{key}' is not supported during CREATE TABLE"
             )));
         }
     }

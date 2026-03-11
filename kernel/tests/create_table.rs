@@ -201,7 +201,7 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
         .commit(engine.as_ref())?;
 
     // Read the actual Delta log file
-    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
     let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
 
     // Parse each line (each line is a separate JSON action)
@@ -323,7 +323,7 @@ fn create_test_create_table_txn() -> DeltaResult<(
 #[tokio::test]
 async fn test_create_table_txn_debug() -> DeltaResult<()> {
     let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-    let debug_str = format!("{:?}", txn);
+    let debug_str = format!("{txn:?}");
     assert!(
         debug_str.contains("Transaction") && debug_str.contains("create_table"),
         "Debug output should contain Transaction info: {debug_str}"

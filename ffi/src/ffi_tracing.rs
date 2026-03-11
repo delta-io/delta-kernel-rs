@@ -744,7 +744,7 @@ mod tests {
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
         let events_str = events
             .iter()
-            .map(|(s, lvl)| format!("{}:{}", s, lvl))
+            .map(|(s, lvl)| format!("{s}:{lvl}"))
             .collect::<Vec<_>>()
             .join(", ");
         events_str
@@ -767,7 +767,7 @@ mod tests {
 
         // file path will use \ on windows
         use std::path::MAIN_SEPARATOR;
-        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+        let expected_file = format!("ffi{MAIN_SEPARATOR}src{MAIN_SEPARATOR}ffi_tracing.rs");
 
         let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
             && file == expected_file

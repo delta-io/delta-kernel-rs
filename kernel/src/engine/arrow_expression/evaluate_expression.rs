@@ -1236,14 +1236,13 @@ mod tests {
         for (name, expr, schema) in test_cases {
             let result =
                 evaluate_expression(&expr, &batch, Some(&DataType::Struct(Box::new(schema))));
-            assert!(result.is_err(), "Test case '{}' should fail", name);
+            assert!(result.is_err(), "Test case '{name}' should fail");
             assert!(
                 result
                     .unwrap_err()
                     .to_string()
                     .contains("field count mismatch"),
-                "Test case '{}' should contain 'field count mismatch' error",
-                name
+                "Test case '{name}' should contain 'field count mismatch' error"
             );
         }
     }
