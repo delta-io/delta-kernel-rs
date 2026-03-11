@@ -13,8 +13,6 @@
 //!   Once validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a
 //!   missing file size), file stats stop updating for the lifetime of that CRC.
 
-use std::collections::HashMap;
-
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 
 use super::file_stats::FileStatsDelta;
@@ -30,11 +28,13 @@ pub(crate) struct CrcDelta {
     pub(crate) protocol: Option<Protocol>,
     /// New metadata action, if this commit changed it.
     pub(crate) metadata: Option<Metadata>,
-    /// Domain metadata additions and removals in this commit.
+    /// All DM actions in this commit (additions and removals). `apply()` only processes these
+    /// when the base CRC's `domain_metadata` is `Some` (tracked).
     pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
     /// In-commit timestamp, if present in this commit.
     pub(crate) in_commit_timestamp: Option<i64>,
-    /// The operation that produced this commit (e.g. "WRITE", "MERGE").
+    /// Must be `Some` with an incremental-safe value for file stats to update. `None` or
+    /// unrecognized values transition validity to `Indeterminate`.
     pub(crate) operation: Option<String>,
     /// A file action in this commit had a missing `size` field, making byte-level file stats
     /// impossible to compute.
@@ -91,15 +91,18 @@ impl Crc {
             self.metadata = m;
         }
 
-        // Domain metadata: insert or remove by domain name.
+        // Domain metadata: insert or remove by domain name. Only update if the base CRC
+        // tracks domain metadata (Some). If None ("not tracked"), leave it as None --
+        // applying partial changes would create an incomplete map.
         if !delta.domain_metadata_changes.is_empty() {
-            let map = self.domain_metadata.get_or_insert_with(HashMap::new);
-            for dm in delta.domain_metadata_changes {
-                if dm.is_removed() {
-                    map.remove(dm.domain());
-                } else {
-                    let domain = dm.domain().to_string();
-                    map.insert(domain, dm);
+            if let Some(map) = &mut self.domain_metadata {
+                for dm in delta.domain_metadata_changes {
+                    if dm.is_removed() {
+                        map.remove(dm.domain());
+                    } else {
+                        let domain = dm.domain().to_string();
+                        map.insert(domain, dm);
+                    }
                 }
             }
         }
@@ -141,6 +144,8 @@ impl Crc {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
 
@@ -339,8 +344,9 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_adds_domain_metadata() {
+    fn test_apply_adds_domain_metadata_to_tracked_map() {
         let mut crc = base_crc();
+        crc.domain_metadata = Some(HashMap::new());
         let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
         let delta = CrcDelta {
             domain_metadata_changes: vec![dm],
@@ -351,6 +357,21 @@ mod tests {
         let map = crc.domain_metadata.as_ref().unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
+    }
+
+    #[test]
+    fn test_apply_with_untracked_domain_metadata_skips_changes() {
+        let mut crc = base_crc();
+        assert!(crc.domain_metadata.is_none()); // Not tracked (default)
+        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
+        let delta = CrcDelta {
+            domain_metadata_changes: vec![dm],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        // domain_metadata stays None -- apply() must not create a partial map.
+        assert!(crc.domain_metadata.is_none());
     }
 
     #[test]
