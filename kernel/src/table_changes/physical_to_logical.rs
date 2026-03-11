@@ -185,7 +185,6 @@ mod tests {
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             physical_partition_schema: None,
         }
     }
@@ -407,7 +406,6 @@ mod tests {
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             physical_partition_schema: None,
         };
 

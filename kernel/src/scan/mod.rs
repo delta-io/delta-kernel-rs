@@ -566,21 +566,6 @@ impl Scan {
         }
     }
 
-    /// Get the logical schema for file statistics.
-    ///
-    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
-    /// contains file statistics read using physical column names (to handle column mapping).
-    /// This method returns the corresponding logical schema that maps those physical column
-    /// names back to the table's logical column names, enabling engines to interpret the stats
-    /// correctly.
-    ///
-    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
-        self.state_info.logical_stats_schema.as_ref()
-    }
-
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:

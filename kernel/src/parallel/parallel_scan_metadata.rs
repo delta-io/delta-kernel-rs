@@ -123,9 +123,8 @@ impl ParallelState {
     #[allow(unused)]
     pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
-        serde_json::to_vec(&state).map_err(|e| {
-            Error::generic(format!("Failed to serialize ParallelState to bytes: {}", e))
-        })
+        serde_json::to_vec(&state)
+            .map_err(|e| Error::generic(format!("Failed to serialize ParallelState to bytes: {e}")))
     }
 
     /// Reconstruct a ParallelState from bytes.

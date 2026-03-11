@@ -30,7 +30,7 @@ fn generate_delta_log(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut current_file_id = 0u64;
 
     for commit_id in 0..NUM_COMMITS {
-        let commit_filename = format!("{:020}.json", commit_id);
+        let commit_filename = format!("{commit_id:020}.json");
         let commit_path = delta_log_path.join(&commit_filename);
         let mut file = File::create(&commit_path)?;
 
@@ -84,7 +84,7 @@ fn generate_delta_log(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         // Write actions to file
         for action in actions {
-            writeln!(file, "{}", action)?;
+            writeln!(file, "{action}")?;
         }
     }
 
@@ -117,7 +117,7 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to get latest snapshot");
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after PM replay:\n{:?}", stats);
+    println!("Heap stats after PM replay:\n{stats:?}");
 
     let scan = snapshot
         .scan_builder()
@@ -131,7 +131,7 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after Scan replay:\n{:?}", stats);
+    println!("Heap stats after Scan replay:\n{stats:?}");
 
     Ok(())
 }
