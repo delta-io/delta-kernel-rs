@@ -147,7 +147,7 @@ mod tests {
     use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
-    use object_store::memory::InMemory;
+    use crate::object_store::memory::InMemory;
 
     fn table_root() -> url::Url {
         url::Url::parse("memory:///").unwrap()

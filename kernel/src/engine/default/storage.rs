@@ -1,10 +1,11 @@
-use object_store::path::Path;
-use object_store::{self, Error, ObjectStore};
-use url::Url;
-
-use crate::Error as DeltaError;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
+
+use url::Url;
+
+use crate::object_store::path::Path;
+use crate::object_store::{parse_url_opts, Error, ObjectStore};
+use crate::Error as DeltaError;
 
 /// Alias for convenience
 type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
@@ -20,7 +21,7 @@ type Handlers = HashMap<String, HandlerClosure>;
 static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(HashMap::default()));
 
 /// Insert a new URL handler for [store_from_url_opts] with the given `scheme`. This allows
-/// users to provide their own custom URL handler to plug new [object_store::ObjectStore]
+/// users to provide their own custom URL handler to plug new [crate::object_store::ObjectStore]
 /// instances into delta-kernel, which is used by [store_from_url_opts] to parse the URL.
 pub fn insert_url_handler(
     scheme: impl AsRef<str>,
@@ -89,7 +90,7 @@ where
     V: Into<String>,
 {
     // First attempt to use any schemes registered via insert_url_handler,
-    // falling back to the default behavior of object_store::parse_url_opts
+    // falling back to the default behavior of crate::object_store::parse_url_opts
     let (store, _path) = if let Ok(handlers) = URL_REGISTRY.read() {
         if let Some(handler) = handlers.get(url.scheme()) {
             let options = options
@@ -98,10 +99,10 @@ where
                 .collect();
             handler(url, options)?
         } else {
-            object_store::parse_url_opts(url, options)?
+            parse_url_opts(url, options)?
         }
     } else {
-        object_store::parse_url_opts(url, options)?
+        parse_url_opts(url, options)?
     };
 
     Ok(Arc::new(store))
@@ -111,8 +112,9 @@ where
 mod tests {
     use super::*;
 
+    use crate::object_store::path::Path;
+    use crate::object_store::Error as ObjectStoreError;
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
-    use object_store::{self, path::Path};
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
     fn parse_url_opts_hdfs_native<I, K, V>(
@@ -158,7 +160,7 @@ mod tests {
         // to connect to, so the only way to really verify that we got the object store we
         // expected is to inspect the `store` on the error v_v
         match store_from_url_opts(&url, options) {
-            Err(crate::Error::ObjectStore(object_store::Error::Generic { store, source: _ })) => {
+            Err(crate::Error::ObjectStore(ObjectStoreError::Generic { store, source: _ })) => {
                 assert_eq!(store, "HdfsObjectStore");
             }
             Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),

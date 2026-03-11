@@ -1285,6 +1285,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
@@ -1738,7 +1739,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
+        let store = Arc::new(LocalFileSystem::new());
         let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),

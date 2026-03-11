@@ -24,12 +24,12 @@ use itertools::Itertools;
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
 async fn write_parquet_file(
-    store: &Arc<dyn object_store::ObjectStore>,
+    store: &Arc<dyn delta_kernel::object_store::ObjectStore>,
     table_url: &url::Url,
     file_suffix: &str,
     data: &delta_kernel::arrow::record_batch::RecordBatch,
 ) -> Result<(String, usize), Box<dyn std::error::Error>> {
-    use object_store::path::Path as ObjectStorePath;
+    use delta_kernel::object_store::path::Path as ObjectStorePath;
 
     let parquet_data = record_batch_to_bytes(data);
     let parquet_data_len = parquet_data.len();
@@ -97,7 +97,7 @@ fn get_write_context(
 
 /// Helper to write a deletion vector to object store and return its descriptor.
 async fn write_deletion_vector_to_store(
-    store: &Arc<dyn object_store::ObjectStore>,
+    store: &Arc<dyn delta_kernel::object_store::ObjectStore>,
     write_context: &delta_kernel::transaction::WriteContext,
     dv: KernelDeletionVector,
     prefix: &str,
@@ -105,7 +105,7 @@ async fn write_deletion_vector_to_store(
     delta_kernel::actions::deletion_vector::DeletionVectorDescriptor,
     Box<dyn std::error::Error>,
 > {
-    use object_store::path::Path as ObjectStorePath;
+    use delta_kernel::object_store::path::Path as ObjectStorePath;
 
     let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
     let dv_absolute_path = dv_path.absolute_path()?;
