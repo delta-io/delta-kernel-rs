@@ -978,7 +978,11 @@ impl StructType {
         new_field: StructField,
     ) -> DeltaResult<Self> {
         let new_key = new_field.name.to_ascii_lowercase();
-        if self.fields.keys().any(|k| k.to_ascii_lowercase() == new_key) {
+        if self
+            .fields
+            .keys()
+            .any(|k| k.to_ascii_lowercase() == new_key)
+        {
             return Err(Error::generic(format!(
                 "Field {} already exists",
                 new_field.name
@@ -1009,7 +1013,11 @@ impl StructType {
         new_field: StructField,
     ) -> DeltaResult<Self> {
         let new_key = new_field.name.to_ascii_lowercase();
-        if self.fields.keys().any(|k| k.to_ascii_lowercase() == new_key) {
+        if self
+            .fields
+            .keys()
+            .any(|k| k.to_ascii_lowercase() == new_key)
+        {
             return Err(Error::generic(format!(
                 "Field {} already exists",
                 new_field.name
