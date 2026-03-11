@@ -2007,6 +2007,7 @@ impl<'a> MakePhysical<'a> {
         let result = self.transform_struct_field(field);
         match (self.err.take(), result) {
             (Some(err), _) => Err(err),
+            // Theoretically impossible: MakePhysical only returns None when it sets an error
             (None, None) => Err(Error::internal_error(
                 "make_physical: transform returned None without setting an error",
             )),
