@@ -83,6 +83,15 @@ BENCH_TAGS=my-feature cargo bench -p delta_kernel_benchmarks
 BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
 ```
 
+### Running benchmarking on a PR
+
+To trigger benchmarks on a pull request, post a comment on the PR with one of the following:
+
+- `bench` — runs benchmarks with `BENCH_TAGS=base`
+- `bench <tags>` — runs benchmarks with `BENCH_TAGS=<tags>` (e.g. `bench base,tag1`)
+
+See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for details on how tags work. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
+
 ## Workload data layout
 
 Each table lives in its own subdirectory under `benchmarks/data/workloads/benchmarks/`:
