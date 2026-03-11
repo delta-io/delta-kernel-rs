@@ -145,7 +145,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: trybuild tests
-        run: cargo test --package delta_kernel_ffi --features internal-api invalid_handle_code
+        run: cargo nextest --package delta_kernel_ffi --features internal-api -E 'test(invalid_handle)'
 
   ffi_test:
     runs-on: ${{ matrix.os }}
