@@ -158,10 +158,10 @@ struct ValidateColumnMappings<'a> {
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner(&mut self, field_name: &'a str, validate: impl FnOnce(&mut Self)) {
+    fn transform_inner<R>(&mut self, field_name: &'a str, validate: impl FnOnce(&mut Self) -> R) {
         if self.err.is_none() {
             self.path.push(field_name);
-            validate(self);
+            let _ = validate(self);
             self.path.pop();
         }
     }
@@ -170,29 +170,23 @@ impl<'a> ValidateColumnMappings<'a> {
 impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     // Override array element and map key/value for better error messages
     fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner("<array element>", |this| {
-            this.transform(etype);
-        });
+        self.transform_inner("<array element>", |this| this.transform(etype));
         Some(Cow::Borrowed(etype))
     }
     fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner("<map key>", |this| {
-            this.transform(ktype);
-        });
+        self.transform_inner("<map key>", |this| this.transform(ktype));
         Some(Cow::Borrowed(ktype))
     }
     fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner("<map value>", |this| {
-            this.transform(vtype);
-        });
+        self.transform_inner("<map value>", |this| this.transform(vtype));
         Some(Cow::Borrowed(vtype))
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
-            let _ =
-                get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
-                    .map_err(|e| this.err = Some(e))
-                    .map(|_| this.recurse_into_struct_field(field));
+            get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
+                .map_err(|e| this.err = Some(e))
+                .ok()?;
+            this.recurse_into_struct_field(field)
         });
         None
     }
