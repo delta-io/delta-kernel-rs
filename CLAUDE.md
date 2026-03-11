@@ -29,12 +29,15 @@ cargo nextest run -p delta_kernel --lib --all-features test_name_here
 # Run a test by name, searching all crates (slow -- compiles everything)
 cargo nextest run --workspace --all-features test_name_here
 
-# Format and lint (always run after code changes)
-cargo fmt && cargo clippy --workspace --benches --tests --all-features -- -D warnings
+# Format, lint, and doc check (always run after code changes)
+cargo fmt \
+  && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
+  && cargo doc --workspace --all-features --no-deps
 
 # Quick pre-push check (mimics CI)
 cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
+  && cargo doc --workspace --all-features --no-deps \
   && cargo nextest run --workspace --all-features
 ```
 
@@ -99,6 +102,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 - Prefer descriptive test names over doc comments. Encode the scenario and expected
   behavior in the test name. Only add a test doc comment when the intent is too
   verbose or complex to express succinctly in the name.
+- Use `rstest` to parameterize tests that share the same logic but differ in setup
+  or inputs. Prefer `#[case]` over duplicating test functions.
+- Reuse helpers from `test_utils` instead of writing custom ones when possible.
 
 ## Protocol TLDR
 

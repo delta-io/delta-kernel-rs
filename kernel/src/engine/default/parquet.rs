@@ -12,7 +12,7 @@ use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::AsyncArrowWriter;
 use crate::parquet::arrow::async_writer::ParquetObjectWriter;
@@ -39,6 +39,22 @@ use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
+
+/// Returns the standard [`ArrowReaderOptions`] for all kernel parquet reads.
+///
+/// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
+/// ensures that type resolution is driven by the kernel schema rather than the file's schema.
+pub(in crate::engine) fn reader_options() -> ArrowReaderOptions {
+    ArrowReaderOptions::new().with_skip_arrow_metadata(true)
+}
+
+/// Returns the standard [`ArrowWriterOptions`] for all kernel parquet writes.
+///
+/// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
+/// non-Arrow readers and avoids encoding Arrow-specific type information.
+pub(in crate::engine) fn writer_options() -> ArrowWriterOptions {
+    ArrowWriterOptions::new().with_skip_arrow_metadata(true)
+}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -91,7 +107,12 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            builder.values().append_value(v);
+            if v.is_empty() {
+                // convert empty string to null as per the Delta Spec
+                builder.values().append_null();
+            } else {
+                builder.values().append_value(v);
+            }
         }
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
@@ -169,7 +190,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
+        let mut writer = ArrowWriter::try_new_with_options(
+            &mut buffer,
+            record_batch.schema(),
+            writer_options(),
+        )?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -335,7 +360,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
-            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
+            let mut writer =
+                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
 
             // Write the first batch
             writer.write(&first_record_batch).await?;
@@ -370,11 +396,11 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                     .bytes()
                     .await
                     .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
-                ArrowReaderMetadata::load(&bytes, Default::default())?
+                ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
                 let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
-                ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?
+                ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
             let schema = StructType::try_from_arrow(metadata.schema().as_ref())
@@ -404,11 +430,14 @@ async fn open_parquet_file(
         // pointing to azure and if so, do a HEAD request so we can pass in file size to the
         // reader which will cause the reader to avoid a suffix range request.
         // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
-        //
-        // TODO(#1010): Note that we don't need this at all and can actually just _always_
-        // do the `with_file_size` but need to (1) update our unit tests which often
-        // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
-        if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
+
+        // Since the `Remove` action's size value is optional as specified in the delta protocol
+        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file,
+        // the extracted size will be zero in this case. Thus, this function
+        // need to handle the case of zero file_meta.size.
+        if file_meta.size != 0 {
+            ParquetObjectReader::new(store, path).with_file_size(file_meta.size)
+        } else if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
             ObjectStoreScheme::parse(&file_meta.location)
         {
             // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
@@ -420,11 +449,12 @@ async fn open_parquet_file(
         }
     };
 
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+    let reader_options = reader_options();
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options.clone()).await?;
     let parquet_schema = metadata.schema();
     let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
-    let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+    let mut builder =
+        ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options).await?;
     if let Some(mask) = generate_mask(
         &table_schema,
         parquet_schema,
@@ -500,14 +530,14 @@ impl FileOpener for PresignedUrlOpener {
         Ok(Box::pin(async move {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
-            let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
+            let reader_options = reader_options();
+            let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
 
-            let options = ArrowReaderOptions::new();
             let mut builder =
-                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)?;
+                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options)?;
             if let Some(mask) = generate_mask(
                 &table_schema,
                 parquet_schema,
@@ -564,7 +594,8 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::engine::default::DEFAULT_BATCH_SIZE;
+    use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
 
@@ -583,6 +614,65 @@ mod tests {
         engine_data
             .and_then(ArrowEngineData::try_from_engine_data)
             .map(Into::into)
+    }
+
+    async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
+        let store = Arc::new(LocalFileSystem::new());
+        let path = Path::from_url_path(file_meta.location.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+        let stream = open_parquet_file(
+            store,
+            Arc::new(physical_schema.try_into_kernel().unwrap()),
+            None,
+            None,
+            DEFAULT_BATCH_SIZE,
+            file_meta,
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        Ok(batches)
+    }
+
+    #[tokio::test]
+    async fn test_open_parquet_file_with_size() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+        let data = read_all_rows_helper(file_meta).await.unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_open_parquet_file_without_size() {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        )).unwrap();
+        let url = Url::from_file_path(path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+        let data = read_all_rows_helper(file_meta).await.unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 10);
     }
 
     #[tokio::test]
@@ -625,8 +715,8 @@ mod tests {
         assert_eq!(data[0].num_rows(), 10);
     }
 
-    #[test]
-    fn test_as_record_batch() {
+    #[rstest::rstest]
+    fn test_as_record_batch(#[values(true, false)] test_empty_str: bool) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
@@ -646,7 +736,12 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
+        let partition_value = if test_empty_str {
+            "".to_string()
+        } else {
+            "a".to_string()
+        };
+        let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
@@ -661,8 +756,13 @@ mod tests {
             StringBuilder::new(),
             StringBuilder::new(),
         );
+
         partition_values_builder.keys().append_value("partition1");
-        partition_values_builder.values().append_value("a");
+        if test_empty_str {
+            partition_values_builder.values().append_null(); // empty string should go to null
+        } else {
+            partition_values_builder.values().append_value("a");
+        }
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
 
@@ -1308,5 +1408,38 @@ mod tests {
         assert_eq!(name_col.value(0), "alice", "Should match by field ID 2");
         assert_eq!(name_col.value(1), "bob");
         assert_eq!(name_col.value(2), "charlie");
+    }
+
+    // Verifies that write_parquet (the internal stats-collecting path) does not embed the Arrow
+    // IPC schema in the Parquet file metadata.
+    #[tokio::test]
+    async fn write_parquet_omits_arrow_schema_metadata() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler =
+            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        let data = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let metadata = parquet_handler
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .await
+            .unwrap();
+
+        let path = Path::from_url_path(metadata.file_meta.location.path()).unwrap();
+        let reader = ParquetObjectReader::new(store, path);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
+        let kv = builder.metadata().file_metadata().key_value_metadata();
+        let has = kv
+            .map(|kv| kv.iter().any(|e| e.key == ARROW_SCHEMA_META_KEY))
+            .unwrap_or(false);
+        assert!(
+            !has,
+            "Parquet file should not contain embedded Arrow schema metadata"
+        );
     }
 }

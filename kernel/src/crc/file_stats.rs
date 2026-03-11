@@ -1,6 +1,9 @@
-// No consumers yet -- will be integrated in a follow-up PR.
+// FileStatsDelta is not yet consumed outside this module.
 #![allow(dead_code)]
-//! File statistics delta: the file count and size changes from a single commit.
+//! File statistics and deltas for CRC tracking.
+//!
+//! [`FileStats`] represents absolute file-level statistics (count and size) for a table version.
+//! [`FileStatsDelta`] captures the net changes from a single commit.
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
@@ -14,8 +17,21 @@ use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, RowVisitor};
 
-/// Net file count and size changes from a single commit.
+/// File-level statistics for a table version: total file count and size.
+///
+/// Obtained via [`Crc::file_stats()`](super::Crc::file_stats), which returns `None` when
+/// the stats are not known to be valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStats {
+    /// Number of active [`Add`](crate::actions::Add) file actions in this table version.
+    pub num_files: i64,
+    /// Total size of the table in bytes (sum of all active
+    /// [`Add`](crate::actions::Add) file sizes).
+    pub table_size_bytes: i64,
+}
+
+/// Net file count and size changes from a single commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileStatsDelta {
     /// Net change in file count (files added minus files removed).
     pub(crate) net_files: i64,
@@ -24,6 +40,29 @@ pub(crate) struct FileStatsDelta {
 }
 
 impl FileStatsDelta {
+    /// Returns `true` if the given operation can be safely tracked by incremental file stats.
+    ///
+    /// Incremental-safe operations produce add/remove actions whose net counts give correct
+    /// file stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE
+    /// STATS re-adds existing files with updated statistics -- if we naively counted those
+    /// adds, we'd double count file stats.
+    const INCREMENTAL_SAFE_OPS: &[&str] = &[
+        "WRITE",
+        "MERGE",
+        "UPDATE",
+        "DELETE",
+        "OPTIMIZE",
+        "CREATE TABLE",
+        "REPLACE TABLE",
+        "CREATE TABLE AS SELECT",
+        "REPLACE TABLE AS SELECT",
+        "CREATE OR REPLACE TABLE AS SELECT",
+    ];
+
+    pub(crate) fn is_incremental_safe(operation: &str) -> bool {
+        Self::INCREMENTAL_SAFE_OPS.contains(&operation)
+    }
+
     /// Compute file stats from a transaction's staged add and remove file metadata.
     ///
     /// A commit writes three kinds of file actions:
