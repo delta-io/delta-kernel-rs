@@ -776,22 +776,22 @@ mod tests {
         let max_col = max_values.column_by_name("value").unwrap();
         assert!(max_col.is_null(0));
 
-        // Verify the JSON serialization omits null min/max column names entirely,
-        // rather than writing "minValues":{"value":null}.
+        // Verify the JSON serialization includes null min/max with explicit null values,
+        // matching Delta Spark behavior (e.g. "minValues":{"value":null}).
         let json_array = to_json(&stats).unwrap();
         let json_str = json_array.as_string::<i32>().value(0);
         let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(json["nullCount"]["value"], 3);
         assert!(
-            json["minValues"].get("value").is_none(),
-            "Expected 'value' to be absent from minValues JSON, got: {}",
-            json["minValues"]
+            json["minValues"].get("value").is_some(),
+            "Expected 'value' to be present in minValues JSON"
         );
+        assert!(json["minValues"]["value"].is_null());
         assert!(
-            json["maxValues"].get("value").is_none(),
-            "Expected 'value' to be absent from maxValues JSON, got: {}",
-            json["maxValues"]
+            json["maxValues"].get("value").is_some(),
+            "Expected 'value' to be present in maxValues JSON"
         );
+        assert!(json["maxValues"]["value"].is_null());
     }
 
     #[test]
