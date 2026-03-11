@@ -161,7 +161,7 @@ Deserialized from `tableInfo.json`. Describes the Delta table being benchmarked.
 | `numActions` | u64 | yes | Total number of actions across all commits |
 | `lastCheckpointVersion` | Option\<u64\> | no | Version of the most recent checkpoint, if any |
 | `lastCrcVersion` | Option\<u64\> | no | Version of the most recent CRC (version checksum) file, if any |
-| `numParallelCheckpointFiles` | Option\<u32\> | no | Number of part files in the most recent multi-part checkpoint, if any. For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints this is the number of sidecar files. `None` if the table has no multi-part checkpoints or sidecars |
+| `numCheckpointFiles` | Option\<u32\> | no | Number of part files in the most recent multi-part checkpoint, if any. For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints this is the number of sidecar files. `None` if the table has no multi-part checkpoints or sidecars |
 
 #### `dataLayout`
 
