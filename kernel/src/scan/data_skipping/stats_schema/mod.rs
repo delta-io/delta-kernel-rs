@@ -193,12 +193,52 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
         .transform_struct(&stats_schema)?
         .into_owned();
 
-    Some(Arc::new(StructType::new_unchecked([
+    let schema = StructType::new_unchecked([
         StructField::nullable("numRecords", DataType::LONG),
         StructField::nullable("nullCount", nullcount_schema),
         StructField::nullable("minValues", stats_schema.clone()),
         StructField::nullable("maxValues", stats_schema),
-    ])))
+    ]);
+
+    // Strip field metadata. The stats types are derived from the table schema, but the metadata on
+    // the fields should not be included in the stats fields
+    let schema = StripFieldMetadataTransform
+        .transform_struct(&schema)
+        .map(|s| s.into_owned())
+        .unwrap_or(schema);
+
+    Some(Arc::new(schema))
+}
+
+/// Strips all field metadata from a schema.
+///
+/// Field metadata describes the logical table column, not the stats values themselves. This
+/// transform strips that metadata, and must be applied to stats schemas to avoid schema possible
+/// mismatches when reading `stats_parsed` from older data since that field metadata could have
+/// changed.
+pub(crate) struct StripFieldMetadataTransform;
+impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if field.metadata.is_empty() {
+            // Recurse into children but don't allocate if this field has no metadata
+            match self.transform(&field.data_type)? {
+                Cow::Borrowed(_) => Some(Cow::Borrowed(field)),
+                data_type => Some(Cow::Owned(StructField {
+                    name: field.name.clone(),
+                    data_type: data_type.into_owned(),
+                    nullable: field.is_nullable(),
+                    metadata: Default::default(),
+                })),
+            }
+        } else {
+            Some(Cow::Owned(StructField {
+                name: field.name.clone(),
+                data_type: self.transform(&field.data_type)?.into_owned(),
+                nullable: field.is_nullable(),
+                metadata: Default::default(),
+            }))
+        }
+    }
 }
 
 /// Transforms a schema to make all fields nullable.

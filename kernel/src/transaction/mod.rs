@@ -9,10 +9,11 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema,
+    as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
@@ -328,7 +329,15 @@ impl<S> Transaction<S> {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
-        let commit_info_action = self.generate_commit_info(engine);
+        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
+        let kernel_commit_info = CommitInfo::new(
+            self.commit_timestamp,
+            in_commit_timestamp,
+            self.operation.clone(),
+            self.engine_info.clone(),
+            self.is_blind_append,
+        );
+        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions for create-table
         let (protocol_action, metadata_action) = if self.is_create_table() {
@@ -353,7 +362,7 @@ impl<S> Transaction<S> {
             self.generate_adds(engine, commit_version)?;
 
         // Step 4b: Generate all domain metadata actions (user and system domains)
-        let domain_metadata_actions =
+        let (domain_metadata_actions, dm_changes) =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
@@ -406,9 +415,12 @@ impl<S> Transaction<S> {
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
-            Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(file_meta)?,
-            )),
+            Ok(CommitResponse::Committed { file_meta }) => {
+                let crc_delta = self.build_crc_delta(in_commit_timestamp, dm_changes)?;
+                Ok(CommitResult::CommittedTransaction(
+                    self.into_committed(file_meta, crc_delta)?,
+                ))
+            }
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
             )),
@@ -910,7 +922,11 @@ impl<S> Transaction<S> {
         }
     }
 
-    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+    fn into_committed(
+        self,
+        file_meta: FileMeta,
+        crc_delta: CrcDelta,
+    ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -929,8 +945,33 @@ impl<S> Transaction<S> {
             commit_version,
             post_commit_stats,
             post_commit_snapshot: Some(Arc::new(
-                self.read_snapshot.new_post_commit(parsed_commit)?,
+                self.read_snapshot
+                    .new_post_commit(parsed_commit, crc_delta)?,
             )),
+        })
+    }
+
+    /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
+    fn build_crc_delta(
+        &self,
+        in_commit_timestamp: Option<i64>,
+        dm_changes: Vec<DomainMetadata>,
+    ) -> DeltaResult<CrcDelta> {
+        let file_stats = FileStatsDelta::try_compute_for_txn(
+            &self.add_files_metadata,
+            &self.remove_files_metadata,
+        )?;
+        let is_create = self.is_create_table();
+        Ok(CrcDelta {
+            file_stats,
+            protocol: is_create
+                .then(|| self.read_snapshot.table_configuration().protocol().clone()),
+            metadata: is_create
+                .then(|| self.read_snapshot.table_configuration().metadata().clone()),
+            domain_metadata_changes: dm_changes,
+            in_commit_timestamp,
+            operation: self.operation.clone(),
+            has_missing_file_size: false, // writes always have sizes
         })
     }
 
@@ -1177,6 +1218,18 @@ impl<S> CommitResult<S> {
     /// Returns true if the commit was successful.
     pub fn is_committed(&self) -> bool {
         matches!(self, CommitResult::CommittedTransaction(_))
+    }
+}
+
+impl<S: std::fmt::Debug> CommitResult<S> {
+    /// Unwraps the [`CommittedTransaction`], panicking if the commit was not successful.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic)]
+    pub fn unwrap_committed(self) -> CommittedTransaction {
+        match self {
+            CommitResult::CommittedTransaction(c) => c,
+            other => panic!("Expected CommittedTransaction, got: {other:?}"),
+        }
     }
 }
 

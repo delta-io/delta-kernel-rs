@@ -56,7 +56,7 @@ pub(crate) fn make_temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
 }
 
 /// Builds a [`FileMeta`] for a local file path, reading the actual size from the filesystem.
-fn file_meta_for(path: &std::path::Path) -> FileMeta {
+pub(crate) fn file_meta_for(path: &std::path::Path) -> FileMeta {
     let url = Url::from_file_path(path).unwrap();
     let size = std::fs::metadata(path).unwrap().len();
     FileMeta {

@@ -67,14 +67,8 @@ impl<S> Transaction<S> {
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,
+        kernel_commit_info: CommitInfo,
     ) -> Result<Box<dyn EngineData>, Error> {
-        let commit_info = CommitInfo::new(
-            self.commit_timestamp,
-            self.get_in_commit_timestamp(engine)?,
-            self.operation.clone(),
-            self.engine_info.clone(),
-            self.is_blind_append,
-        );
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
@@ -92,7 +86,7 @@ impl<S> Transaction<S> {
                 let output_schema = StructType::new_unchecked(output_fields);
 
                 // Step 2: Build literal expressions for each CommitInfo field.
-                let literal_exprs = commit_info_literal_exprs(commit_info)?;
+                let literal_exprs = commit_info_literal_exprs(kernel_commit_info)?;
 
                 // Step 3: Build Transform. Replacements must be registered before insertions so
                 // that for the last engine field (which may itself be replaced), exprs is ordered
@@ -131,7 +125,9 @@ impl<S> Transaction<S> {
                 )?;
                 evaluator.evaluate(engine_commit_info.as_ref())
             }
-            None => commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine),
+            None => {
+                kernel_commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine)
+            }
         }
     }
 }
@@ -158,6 +154,17 @@ mod tests {
     use crate::{DeltaResult, Engine, EngineData};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
+
+    /// Helper: create a kernel `CommitInfo` that mirrors what `Transaction::commit` produces.
+    fn make_kernel_commit_info() -> CommitInfo {
+        CommitInfo::new(
+            1_700_000_000_000i64,
+            Some(134_000_000i64),
+            Some("WRITE".to_string()),
+            Some("test_engine/1.0".to_string()),
+            false,
+        )
+    }
 
     /// Helper: build an Arrow RecordBatch + kernel SchemaRef for use as engine_commit_info.
     fn make_engine_commit_info(
@@ -251,8 +258,9 @@ mod tests {
     #[test]
     fn test_build_commit_info_none_branch() -> DeltaResult<()> {
         let (engine, txn) = make_txn(None)?;
-        let result =
-            ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
         let ci = commit_info_struct(&result);
 
         let kernel_schema = CommitInfo::to_schema();
@@ -279,8 +287,9 @@ mod tests {
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
-        let result =
-            ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
         let commit_info = commit_info_struct(&result);
 
         // All CommitInfo fields are appended -- total = 2 engine + 8 CommitInfo.
@@ -300,8 +309,8 @@ mod tests {
         assert!(get_map(commit_info, "operationParameters").len() == 0);
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
-        assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 0);
-        assert_eq!(get_str(commit_info, "engineInfo"), "");
+        assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
+        assert_eq!(get_str(commit_info, "engineInfo"), "test_engine/1.0");
         assert!(!get_bool(commit_info, "isBlindAppend"));
 
         Ok(())
@@ -345,8 +354,9 @@ mod tests {
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
-        let result =
-            ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
         let commit_info = commit_info_struct(&result);
 
         // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
@@ -357,8 +367,8 @@ mod tests {
         assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
-        assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 0);
-        assert_eq!(get_str(commit_info, "engineInfo"), "");
+        assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
+        assert_eq!(get_str(commit_info, "engineInfo"), "test_engine/1.0");
         assert!(!get_bool(commit_info, "isBlindAppend"));
 
         Ok(())
@@ -382,8 +392,9 @@ mod tests {
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
 
-        let result =
-            ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
         let ci = commit_info_struct(&result);
 
         // Engine-only field passes through unchanged.
@@ -419,8 +430,9 @@ mod tests {
             empty_schema,
         )))?;
 
-        let result =
-            ArrowEngineData::try_from_engine_data(txn.generate_commit_info(engine.as_ref())?)?;
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
         let ci = commit_info_struct(&result);
 
         // With no engine fields, the inner schema matches CommitInfo::to_schema().
