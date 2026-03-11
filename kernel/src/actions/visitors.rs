@@ -16,6 +16,31 @@ use super::deletion_vector::DeletionVectorDescriptor;
 use super::domain_metadata::DomainMetadataMap;
 use super::*;
 
+/// Error type for visitor-specific failures when extracting action data
+#[derive(Debug, thiserror::Error)]
+pub enum VisitorError {
+    /// The visitor has an incorrect number of getters
+    #[error("Invalid getter count for {action_type}: expected {expected}, got {actual}")]
+    InvalidGetterCount {
+        action_type: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Underlying delta kernel error
+    #[error("Delta error: {0}")]
+    Delta(#[from] Error),
+}
+
+impl From<VisitorError> for Error {
+    fn from(err: VisitorError) -> Self {
+        match err {
+            VisitorError::Delta(e) => e,
+            other => Error::InternalError(other.to_string()),
+        }
+    }
+}
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct MetadataVisitor {
@@ -55,10 +80,12 @@ impl RowVisitor for SelectionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
-                "Wrong number of SelectionVectorVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "SelectionVector",
+                expected: 1,
+                actual: getters.len(),
+            }
+            .into()
         );
         for i in 0..row_count {
             self.selection_vector
@@ -104,13 +131,14 @@ impl AddVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Add> {
+    ) -> Result<Add, VisitorError> {
         require!(
             getters.len() == 15,
-            Error::InternalError(format!(
-                "Wrong number of AddVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Add",
+                expected: 15,
+                actual: getters.len(),
+            }
         );
         let partition_values: HashMap<_, _> = getters[1].get(row_index, "add.partitionValues")?;
         let size: i64 = getters[2].get(row_index, "add.size")?;
@@ -177,13 +205,14 @@ impl RemoveVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Remove> {
+    ) -> Result<Remove, VisitorError> {
         require!(
             getters.len() == 15,
-            Error::InternalError(format!(
-                "Wrong number of RemoveVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Remove",
+                expected: 15,
+                actual: getters.len(),
+            }
         );
         let deletion_timestamp: Option<i64> =
             getters[1].get_opt(row_index, "remove.deletionTimestamp")?;
@@ -273,10 +302,12 @@ impl RowVisitor for CdcVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 5,
-            Error::InternalError(format!(
-                "Wrong number of CdcVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Cdc",
+                expected: 5,
+                actual: getters.len(),
+            }
+            .into()
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Cdc action
@@ -323,13 +354,14 @@ impl SetTransactionVisitor {
         row_index: usize,
         app_id: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<SetTransaction> {
+    ) -> Result<SetTransaction, VisitorError> {
         require!(
             getters.len() == 3,
-            Error::InternalError(format!(
-                "Wrong number of SetTransactionVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "SetTransaction",
+                expected: 3,
+                actual: getters.len(),
+            }
         );
         let version: i64 = getters[1].get(row_index, "txn.version")?;
         let last_updated: Option<i64> = getters[2].get_opt(row_index, "txn.lastUpdated")?;
@@ -408,10 +440,12 @@ impl RowVisitor for SidecarVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 4,
-            Error::InternalError(format!(
-                "Wrong number of SidecarVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Sidecar",
+                expected: 4,
+                actual: getters.len(),
+            }
+            .into()
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Sidecar action
@@ -452,13 +486,14 @@ impl DomainMetadataVisitor {
         row_index: usize,
         domain: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<DomainMetadata> {
+    ) -> Result<DomainMetadata, VisitorError> {
         require!(
             getters.len() == 3,
-            Error::InternalError(format!(
-                "Wrong number of DomainMetadataVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "DomainMetadata",
+                expected: 3,
+                actual: getters.len(),
+            }
         );
         let configuration: String = getters[1].get(row_index, "domainMetadata.configuration")?;
         let removed: bool = getters[2].get(row_index, "domainMetadata.removed")?;
@@ -550,13 +585,14 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 pub(crate) fn visit_metadata_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<Metadata>> {
+) -> Result<Option<Metadata>, VisitorError> {
     require!(
         getters.len() == 9,
-        Error::InternalError(format!(
-            "Wrong number of MetadataVisitor getters: {}",
-            getters.len()
-        ))
+        VisitorError::InvalidGetterCount {
+            action_type: "Metadata",
+            expected: 9,
+            actual: getters.len(),
+        }
     );
 
     // Since id column is required, use it to detect presence of a metadata action
@@ -598,13 +634,14 @@ pub(crate) fn visit_metadata_at<'a>(
 pub(crate) fn visit_protocol_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<Protocol>> {
+) -> Result<Option<Protocol>, VisitorError> {
     require!(
         getters.len() == 4,
-        Error::InternalError(format!(
-            "Wrong number of ProtocolVisitor getters: {}",
-            getters.len()
-        ))
+        VisitorError::InvalidGetterCount {
+            action_type: "Protocol",
+            expected: 4,
+            actual: getters.len(),
+        }
     );
     // Since minReaderVersion column is required, use it to detect presence of a Protocol action
     let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
@@ -673,10 +710,12 @@ impl RowVisitor for InCommitTimestampVisitor {
     ) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
-                "Wrong number of InCommitTimestampVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "InCommitTimestamp",
+                expected: 1,
+                actual: getters.len(),
+            }
+            .into()
         );
 
         // If the batch is empty, return
@@ -1299,4 +1338,89 @@ mod tests {
             Some(1677811178585), // Retrieved ICT
         );
     }
+
+    // Empty mock GetData for testing error cases where we need wrong number of getters
+    struct MockGetter;
+    impl<'a> GetData<'a> for MockGetter {}
+
+    /// Helper function to assert that an error is an InvalidGetterCount with the expected values
+    fn assert_invalid_getter_count(
+        err: VisitorError,
+        expected_action_type: &'static str,
+        expected_count: usize,
+        actual_count: usize,
+    ) {
+        match err {
+            VisitorError::InvalidGetterCount {
+                action_type,
+                expected,
+                actual,
+            } => {
+                assert_eq!(
+                    action_type, expected_action_type,
+                    "action_type mismatch: expected '{}', got '{}'",
+                    expected_action_type, action_type
+                );
+                assert_eq!(
+                    expected, expected_count,
+                    "expected count mismatch: expected {}, got {}",
+                    expected_count, expected
+                );
+                assert_eq!(
+                    actual, actual_count,
+                    "actual count mismatch: expected {}, got {}",
+                    actual_count, actual
+                );
+            }
+            other => panic!(
+                "Expected InvalidGetterCount error for action '{}' with expected={} and actual={}, got {:?}",
+                expected_action_type, expected_count, actual_count, other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_add_visitor_wrong_getter_count() {
+        let json_strings: StringArray = vec![add_action()].into();
+        let batch = parse_json_batch(json_strings);
+
+        // Verify normal operation with correct number of getters
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.adds.len(), 1);
+
+        // Test error case: call visit_add with only 5 getters instead of required 15
+        let mock = MockGetter;
+        let wrong_getters: Vec<&dyn GetData<'_>> = vec![&mock, &mock, &mock, &mock, &mock];
+
+        let result = AddVisitor::visit_add(0, "test.parquet".to_string(), &wrong_getters);
+
+        assert!(result.is_err());
+        assert_invalid_getter_count(result.unwrap_err(), "Add", 15, 5);
+    }
+
+    #[test]
+    fn test_remove_visitor_wrong_getter_count() {
+        // Parse real JSON to create proper Remove action data
+        let json_strings: StringArray = vec![
+            r#"{"remove":{"path":"test.parquet","deletionTimestamp":1670892998135,"dataChange":true}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        // Verify normal operation with correct number of getters
+        let mut visitor = RemoveVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.removes.len(), 1);
+
+        // Test error case: call visit_remove with only 3 getters instead of required 15
+        let mock = MockGetter;
+        let wrong_getters: Vec<&dyn GetData<'_>> = vec![&mock, &mock, &mock];
+
+        let result = RemoveVisitor::visit_remove(0, "test.parquet".to_string(), &wrong_getters);
+
+        assert!(result.is_err());
+        assert_invalid_getter_count(result.unwrap_err(), "Remove", 15, 3);
+    }
+
 }
