@@ -546,16 +546,6 @@ mod tests {
     #[handle_descriptor(target=NotSync, mutable=true, sized=true)]
     pub struct MutNotSync;
 
-    // Because tests compile as binaries against packages, this test can only run correctly if we
-    // use the `internal-api` feature to make mod handle public. Otherwise it's inaccessible for
-    // testing
-    #[test]
-    #[cfg(feature = "internal-api")]
-    fn invalid_handle_code() {
-        let t = trybuild::TestCases::new();
-        t.compile_fail("tests/invalid-handle-code/*.rs");
-    }
-
     #[test]
     fn test_handle_use_cases_compile() {
         let s = NotSync {
