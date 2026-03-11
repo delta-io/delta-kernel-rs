@@ -799,7 +799,7 @@ impl Snapshot {
     /// in this snapshot.
     ///
     /// Returns the latest configuration for the domain, or `None` if the domain does not exist
-    /// (or was removed). Unlike [`get_domain_metadata`], this does not reject `delta.*` domains.
+    /// (or was removed). Unlike [`Snapshot::get_domain_metadata`], this does not reject `delta.*` domains.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_domain_metadata_internal(
