@@ -17,6 +17,9 @@ mod writer;
 
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
+pub(crate) use file_stats::FileStats;
+#[allow(unused)]
+pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]
@@ -39,27 +42,30 @@ use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 pub enum FileStatsValidity {
     /// File stats are known-correct absolute totals. This is the case when seeded from a CRC
     /// file (which contains `num_files` and `table_size_bytes`) or when replay starts from
-    /// version zero (where the initial state is trivially zero).
+    /// version zero (where the initial state is trivially zero). Safe to write to disk.
     #[default]
     Valid,
     /// File stats are relative deltas, not absolute totals. This happens when seeding from a
     /// checkpoint: we extract metadata fields but not file counts (reading all add actions from
     /// a checkpoint just for counts is too expensive). The accumulated deltas are correct, but
-    /// without a baseline they cannot produce final totals.
+    /// without a baseline they cannot produce final totals. Not safe to write to disk.
     RequiresCheckpointRead,
     /// A non-incremental operation was seen: file stats cannot be determined incrementally.
     /// For example, ANALYZE STATS re-adds existing files with updated statistics but no
     /// corresponding removes, so naively counting adds would double-count.
-    /// A full log replay from scratch could recover correct file stats.
+    /// A full log replay from scratch could recover correct file stats. Not safe to write to disk.
     Indeterminate,
     /// A file action had a missing size field: correct file stats are impossible to compute.
     /// For example, the Delta protocol allows `remove.size` to be null -- when encountered,
     /// we can no longer track byte totals. Unlike [`Indeterminate`](Self::Indeterminate), no
-    /// amount of replay can recover the missing data.
+    /// amount of replay can recover the missing data. Not safe to write to disk.
     Untrackable,
 }
 
 /// Parsed content of a CRC (version checksum) file.
+///
+/// A `Crc` is either (a) loaded from disk (deserialized from a `.crc` JSON file) or (b) computed
+/// in memory (built incrementally via `Crc::apply`).
 ///
 /// A CRC file must:
 /// 1. Be named `{version}.crc` with version zero-padded to 20 digits: `00000000000000000001.crc`
@@ -74,10 +80,11 @@ pub enum FileStatsValidity {
 pub struct Crc {
     // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
-    /// [`Add`] actions.
-    pub table_size_bytes: i64,
+    /// [`Add`] actions. Private -- use [`Crc::file_stats()`] to access safely.
+    table_size_bytes: i64,
     /// Number of live [`Add`] actions in this table version after action reconciliation.
-    pub num_files: i64,
+    /// Private -- use [`Crc::file_stats()`] to access safely.
+    num_files: i64,
     /// Number of [`Metadata`] actions. Must be 1.
     pub num_metadata: i64,
     /// Number of [`Protocol`] actions. Must be 1.
@@ -89,9 +96,9 @@ pub struct Crc {
     /// Whether the file stats (`num_files`, `table_size_bytes`) in this CRC are trustworthy.
     /// Not serialized -- this is an in-memory replay concern only. When deserialized from a CRC
     /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
-    /// by definition).
+    /// by definition). A CRC is only safe to write to disk when validity is `Valid`.
     #[serde(skip)]
-    pub validity: FileStatsValidity,
+    pub file_stats_validity: FileStatsValidity,
 
     // ===== Optional fields =====
     /// A unique identifier for the transaction that produced this commit.
@@ -110,7 +117,9 @@ pub struct Crc {
     )]
     pub(crate) set_transactions: Option<HashMap<String, SetTransaction>>,
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
-    /// (`removed=true`) are never stored.
+    /// (`removed=true`) are never stored. `None` = not tracked (field absent in CRC JSON or not
+    /// computed). `Some(empty_map)` = tracked, no active domain metadata. `apply()` skips
+    /// updates when `None`.
     ///
     /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
     /// a Vec, which is converted via custom serde deserialization.
@@ -135,6 +144,23 @@ pub struct Crc {
     /// Distribution of deleted record counts across files. See this section for more details.
     #[serde(skip)]
     pub deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+}
+
+impl Crc {
+    /// Returns file-level statistics only if they are known to be valid.
+    ///
+    /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
+    /// built from incremental replay that encountered a non-incremental operation or a
+    /// missing file size.
+    pub fn file_stats(&self) -> Option<FileStats> {
+        match self.file_stats_validity {
+            FileStatsValidity::Valid => Some(FileStats {
+                num_files: self.num_files,
+                table_size_bytes: self.table_size_bytes,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Trait for types that can be stored in a HashMap keyed by a string identifier.
