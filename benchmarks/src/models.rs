@@ -45,7 +45,7 @@ pub struct TableInfo {
     pub schema: Schema,
     /// Delta Protocol struct, containing version requirements and table features at the latest version of the table
     pub protocol: Protocol,
-    /// Log-level statistics for the table
+    /// Log-level statistics for the table, such as the number of add files, remove files, number of commits, etc.
     pub log_info: LogInfo,
     /// Table properties from the Delta metadata (e.g. `{"delta.enableDeletionVector": "true", "delta.columnMapping.mode": "none"}`)
     pub properties: HashMap<String, String>,
