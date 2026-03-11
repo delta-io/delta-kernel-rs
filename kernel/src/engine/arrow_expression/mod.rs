@@ -301,7 +301,6 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             }
         }
 
-        // Build one builder per column, then fill column-major for cache locality.
         let mut builders: Vec<Box<dyn ArrayBuilder>> = arrow_schema
             .fields()
             .iter()
