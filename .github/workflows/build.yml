@@ -141,10 +141,18 @@ jobs:
           - ubuntu-latest
           - windows-latest
     steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ffi:
+              - 'ffi/**'
+              - 'ffi-proc-macros/**'
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: trybuild tests
+        if: steps.filter.outputs.ffi == 'true'
         run: cargo test --package delta_kernel_ffi --features internal-api invalid_handle_code
 
   ffi_test:
