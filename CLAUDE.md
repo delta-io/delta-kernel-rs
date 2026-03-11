@@ -103,7 +103,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   behavior in the test name. Only add a test doc comment when the intent is too
   verbose or complex to express succinctly in the name.
 - Use `rstest` to parameterize tests that share the same logic but differ in setup
-  or inputs. Prefer `#[case]` over duplicating test functions.
+  or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
+  independent and form a cartesian product, prefer `#[values]` over enumerating
+  every combination with `#[case]`.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
 
 ## Protocol TLDR

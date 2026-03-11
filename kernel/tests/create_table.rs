@@ -6,6 +6,8 @@ mod clustering;
 mod column_mapping;
 #[path = "create_table/ctas.rs"]
 mod ctas;
+#[path = "create_table/timestamp_ntz.rs"]
+mod timestamp_ntz;
 #[path = "create_table/variant.rs"]
 mod variant;
 
