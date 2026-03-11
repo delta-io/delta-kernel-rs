@@ -12,7 +12,7 @@ use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::AsyncArrowWriter;
 use crate::parquet::arrow::async_writer::ParquetObjectWriter;
@@ -39,6 +39,22 @@ use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
+
+/// Returns the standard [`ArrowReaderOptions`] for all kernel parquet reads.
+///
+/// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
+/// ensures that type resolution is driven by the kernel schema rather than the file's schema.
+pub(in crate::engine) fn reader_options() -> ArrowReaderOptions {
+    ArrowReaderOptions::new().with_skip_arrow_metadata(true)
+}
+
+/// Returns the standard [`ArrowWriterOptions`] for all kernel parquet writes.
+///
+/// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
+/// non-Arrow readers and avoids encoding Arrow-specific type information.
+pub(in crate::engine) fn writer_options() -> ArrowWriterOptions {
+    ArrowWriterOptions::new().with_skip_arrow_metadata(true)
+}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -174,7 +190,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
+        let mut writer = ArrowWriter::try_new_with_options(
+            &mut buffer,
+            record_batch.schema(),
+            writer_options(),
+        )?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -340,7 +360,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
-            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
+            let mut writer =
+                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
 
             // Write the first batch
             writer.write(&first_record_batch).await?;
@@ -369,17 +390,17 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 let client = reqwest::Client::new();
                 let response =
                     client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {}", e))
+                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
                     })?;
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
-                ArrowReaderMetadata::load(&bytes, Default::default())?
+                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
+                ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
                 let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
-                ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?
+                ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
             let schema = StructType::try_from_arrow(metadata.schema().as_ref())
@@ -428,11 +449,12 @@ async fn open_parquet_file(
         }
     };
 
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+    let reader_options = reader_options();
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options.clone()).await?;
     let parquet_schema = metadata.schema();
     let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
-    let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+    let mut builder =
+        ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options).await?;
     if let Some(mask) = generate_mask(
         &table_schema,
         parquet_schema,
@@ -508,14 +530,14 @@ impl FileOpener for PresignedUrlOpener {
         Ok(Box::pin(async move {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
-            let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
+            let reader_options = reader_options();
+            let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
 
-            let options = ArrowReaderOptions::new();
             let mut builder =
-                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)?;
+                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, reader_options)?;
             if let Some(mask) = generate_mask(
                 &table_schema,
                 parquet_schema,
@@ -573,7 +595,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DEFAULT_BATCH_SIZE;
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
 
@@ -1288,7 +1310,7 @@ mod tests {
         match field_id {
             crate::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
             crate::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
-            other => panic!("Expected String or Number, got {:?}", other),
+            other => panic!("Expected String or Number, got {other:?}"),
         }
     }
 
@@ -1386,5 +1408,38 @@ mod tests {
         assert_eq!(name_col.value(0), "alice", "Should match by field ID 2");
         assert_eq!(name_col.value(1), "bob");
         assert_eq!(name_col.value(2), "charlie");
+    }
+
+    // Verifies that write_parquet (the internal stats-collecting path) does not embed the Arrow
+    // IPC schema in the Parquet file metadata.
+    #[tokio::test]
+    async fn write_parquet_omits_arrow_schema_metadata() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler =
+            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        let data = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let metadata = parquet_handler
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .await
+            .unwrap();
+
+        let path = Path::from_url_path(metadata.file_meta.location.path()).unwrap();
+        let reader = ParquetObjectReader::new(store, path);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
+        let kv = builder.metadata().file_metadata().key_value_metadata();
+        let has = kv
+            .map(|kv| kv.iter().any(|e| e.key == ARROW_SCHEMA_META_KEY))
+            .unwrap_or(false);
+        assert!(
+            !has,
+            "Parquet file should not contain embedded Arrow schema metadata"
+        );
     }
 }

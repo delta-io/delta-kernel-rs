@@ -568,8 +568,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
 /// Create an Add action with JSON stats
 fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
     let stats = format!(
-        r#"{{"numRecords":{},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#,
-        num_records
+        r#"{{"numRecords":{num_records},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#
     );
     Action::Add(Add {
         path: path.into(),
@@ -838,18 +837,15 @@ fn verify_checkpoint_schema_with_partitions(
 
         assert_eq!(
             has_stats, expect_stats,
-            "stats field: expected={}, actual={}",
-            expect_stats, has_stats
+            "stats field: expected={expect_stats}, actual={has_stats}"
         );
         assert_eq!(
             has_stats_parsed, expect_stats_parsed,
-            "stats_parsed field: expected={}, actual={}",
-            expect_stats_parsed, has_stats_parsed
+            "stats_parsed field: expected={expect_stats_parsed}, actual={has_stats_parsed}"
         );
         assert_eq!(
             has_pv_parsed, expect_partition_values_parsed,
-            "partitionValues_parsed field: expected={}, actual={}",
-            expect_partition_values_parsed, has_pv_parsed
+            "partitionValues_parsed field: expected={expect_partition_values_parsed}, actual={has_pv_parsed}"
         );
     } else {
         panic!("add field should be a struct");
@@ -1049,6 +1045,95 @@ async fn test_stats_config_round_trip_partitioned(
         }
         assert!(found_add, "should have found an add action");
     }
+
+    Ok(())
+}
+
+// This tests that we can change the metadata of a schema field in between checkpoints and still
+// manage to checkpoint, with parsed stats enabled.
+// The checkpoint at version 0 is written with a schema without field metadata, so its
+// stats_parsed nullCount fields are plain Int64. Then a new metadata action at version 1
+// adds `__CHAR_VARCHAR_TYPE_STRING` to the "name" field. When checkpointing version 1,
+// the kernel builds a stats schema with that metadata on nullCount fields (via
+// NullCountStatsTransform), but the stats_parsed data from the old checkpoint lacks it,
+// causing an Arrow schema mismatch in the COALESCE expression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    let config = HashMap::from([
+        ("delta.checkpoint.writeStatsAsJson".into(), "true".into()),
+        ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),
+    ]);
+
+    // Version 0: schema WITHOUT __CHAR_VARCHAR_TYPE_STRING + add with stats
+    let schema_v0 = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", KernelDataType::LONG),
+        StructField::nullable("name", KernelDataType::STRING),
+    ]));
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            Action::Metadata(
+                Metadata::try_new(
+                    Some("test".into()),
+                    None,
+                    schema_v0,
+                    vec![],
+                    0,
+                    config.clone(),
+                )
+                .unwrap(),
+            ),
+            Action::Add(Add {
+                path: "file1.parquet".into(),
+                data_change: true,
+                stats: Some(
+                    r#"{"numRecords":10,"minValues":{"id":1,"name":"alice"},"maxValues":{"id":100,"name":"zoe"},"nullCount":{"id":0,"name":2}}"#.into(),
+                ),
+                ..Default::default()
+            }),
+        ],
+        0,
+    )
+    .await?;
+
+    // Checkpoint version 0: stats_parsed nullCount fields are plain Int64 (no metadata)
+    let table_root = Url::parse("memory:///")?;
+    Snapshot::builder_for(table_root.clone())
+        .build(&engine)?
+        .checkpoint(&engine)?;
+
+    // Version 1: new metadata WITH __CHAR_VARCHAR_TYPE_STRING on the "name" field
+    let schema_v1 = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", KernelDataType::LONG),
+        StructField::nullable("name", KernelDataType::STRING).with_metadata([(
+            "__CHAR_VARCHAR_TYPE_STRING",
+            crate::schema::MetadataValue::String("varchar(255)".to_string()),
+        )]),
+    ]));
+    write_commit_to_store(
+        &store,
+        vec![Action::Metadata(
+            Metadata::try_new(Some("test".into()), None, schema_v1, vec![], 0, config).unwrap(),
+        )],
+        1,
+    )
+    .await?;
+
+    // Checkpoint version 1: the add from checkpoint 0 has stats_parsed with nullCount fields
+    // lacking metadata. Ensure our checkpointing drops the new metadata for the stats fields and
+    // doesn't see a mismatch
+    Snapshot::builder_for(table_root)
+        .build(&engine)?
+        .checkpoint(&engine)?;
 
     Ok(())
 }

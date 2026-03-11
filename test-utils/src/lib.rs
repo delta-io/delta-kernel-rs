@@ -584,6 +584,7 @@ pub async fn insert_data<E: TaskExecutor>(
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
         .with_data_change(true);
 
     let write_context = txn.get_write_context();
@@ -690,6 +691,75 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
             vec![Some(40), None, Some(60)],
         )?,
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Schema helpers for feature auto-enablement tests (TimestampNTZ, Variant)
+// ---------------------------------------------------------------------------
+
+/// Schema with one column of the given type: `(id INT, col <dtype>)`.
+pub fn schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col", dtype, true),
+    ]))
+}
+
+/// Schema with the given type nested inside a struct:
+/// `(id INT, nested STRUCT<inner <dtype>>)`.
+pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new(
+            "nested",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "inner", dtype, true,
+            )]))),
+            true,
+        ),
+    ]))
+}
+
+/// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
+pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col1", dtype.clone(), true),
+        StructField::new("col2", dtype, true),
+    ]))
+}
+
+pub fn top_level_ntz_schema() -> SchemaRef {
+    schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn nested_ntz_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn multiple_ntz_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn top_level_variant_schema() -> SchemaRef {
+    schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn nested_variant_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn multiple_variant_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::unshredded_variant())
+}
+
+/// Returns column mapping table properties for the given mode, or empty for `"none"`.
+pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
+    if mode == "none" {
+        vec![]
+    } else {
+        vec![("delta.columnMapping.mode", mode)]
+    }
 }
 
 /// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
@@ -900,7 +970,7 @@ pub fn read_add_infos(
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = get_log_add_schema().clone();
-    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
+    let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
     for batch_result in batches {
         let actions_batch = batch_result?;
@@ -1008,7 +1078,7 @@ pub fn read_actions_from_commit(
     action_type: &str,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
-    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
     let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
         .into_iter::<serde_json::Value>()
