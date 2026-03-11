@@ -192,9 +192,10 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 }
 
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
-/// Note this doesn't work for inline module definitions (see `internal_mod!` macro in delta_kernel
-/// crate - can't export macro_rules! from proc macro crate).
-/// Ref: <https://github.com/rust-lang/rust/issues/54727>
+///
+/// NOTE: This macro does not support `mod` declarations because of nuances in how the mod expander
+/// and proc macro system interact for non-inline modules such as `mod foo;`. Use explicit
+/// cfg-gated `pub mod` / `pub(crate) mod` for module visibility control instead.
 #[proc_macro_attribute]
 pub fn internal_api(
     _attr: proc_macro::TokenStream,
@@ -235,7 +236,7 @@ fn make_public(mut item: Item) -> Item {
         Item::Enum(e) => set_pub(&mut e.vis),
         Item::Trait(t) => set_pub(&mut t.vis),
         Item::Type(t) => set_pub(&mut t.vis),
-        Item::Mod(m) => set_pub(&mut m.vis),
+        Item::Use(m) => set_pub(&mut m.vis),
         Item::Static(s) => set_pub(&mut s.vis),
         Item::Const(c) => set_pub(&mut c.vis),
         Item::Union(u) => set_pub(&mut u.vis),

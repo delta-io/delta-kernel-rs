@@ -6,11 +6,11 @@ use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int32Type, Int64Type,
     TimestampMicrosecondType,
 };
 use crate::arrow::array::{
-    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, RunArray,
+    Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
     StructArray,
 };
 use crate::arrow::compute::filter_record_batch;
@@ -18,7 +18,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
+use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::{DeltaResult, Error};
@@ -121,98 +121,39 @@ impl From<Box<ArrowEngineData>> for RecordBatch {
     }
 }
 
-/// Extract a string value from any Arrow string-typed array.
-///
-/// Arrow has three string representations that all map to Delta's logical STRING type:
-/// - `Utf8` (i32 offsets, aka `StringArray`)
-/// - `LargeUtf8` (i64 offsets, aka `LargeStringArray`)
-/// - `Utf8View` (inline/buffer views, aka `StringViewArray`)
-///
-/// The caller is responsible for ensuring `array` has a string data type. This is guaranteed
-/// by the type checks in `extract_leaf_column`, `col_as_list`, and `col_as_map`.
-fn get_string_value(array: &ArrayRef, index: usize) -> &str {
+impl<O: OffsetSizeTrait> StringArrayAccessor for GenericByteArray<GenericStringType<O>> {
+    fn len(&self) -> usize {
+        Array::len(self)
+    }
+    fn value(&self, index: usize) -> &str {
+        self.value(index)
+    }
+    fn is_valid(&self, index: usize) -> bool {
+        Array::is_valid(self, index)
+    }
+}
+
+impl StringArrayAccessor for StringViewArray {
+    fn len(&self) -> usize {
+        Array::len(self)
+    }
+    fn value(&self, index: usize) -> &str {
+        self.value(index)
+    }
+    fn is_valid(&self, index: usize) -> bool {
+        Array::is_valid(self, index)
+    }
+}
+
+/// Downcast an Arrow array to a [`StringArrayAccessor`], trying Utf8, LargeUtf8, and
+/// Utf8View in order. Returns `None` if the array is not a string type.
+pub(crate) fn as_string_accessor(array: &dyn Array) -> Option<&dyn StringArrayAccessor> {
     if let Some(a) = array.as_string_opt::<i32>() {
-        // Utf8 / StringArray
-        a.value(index)
+        Some(a)
     } else if let Some(a) = array.as_string_opt::<i64>() {
-        // LargeUtf8 / LargeStringArray
-        a.value(index)
+        Some(a)
     } else {
-        // Utf8View / StringViewArray — the only remaining string variant after the
-        // checks above, guaranteed by callers validating the array is a string type.
-        array.as_string_view().value(index)
-    }
-}
-
-impl<OffsetSize> EngineList for GenericListArray<OffsetSize>
-where
-    OffsetSize: OffsetSizeTrait,
-{
-    fn len(&self, row_index: usize) -> usize {
-        self.value(row_index).len()
-    }
-
-    fn get(&self, row_index: usize, index: usize) -> String {
-        let arry = self.value(row_index);
-        get_string_value(&arry, index).to_string()
-    }
-
-    fn materialize(&self, row_index: usize) -> Vec<String> {
-        (0..EngineList::len(self, row_index))
-            .map(|i| self.get(row_index, i))
-            .collect()
-    }
-}
-
-impl EngineMap for MapArray {
-    fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
-        // Check if the map element itself is null
-        if self.is_null(row_index) {
-            return None;
-        }
-
-        let offsets = self.offsets();
-        let start_offset = offsets[row_index] as usize;
-        let end_offset = offsets[row_index + 1] as usize;
-        let keys = self.keys();
-        let vals = self.values();
-
-        // Iterate backwards for potential cache locality benefits
-        for idx in (start_offset..end_offset).rev() {
-            let map_key = get_string_value(keys, idx);
-            if key == map_key {
-                if vals.is_valid(idx) {
-                    return Some(get_string_value(vals, idx));
-                }
-                return None;
-            }
-        }
-        None
-    }
-
-    fn materialize(&self, row_index: usize) -> HashMap<String, String> {
-        // Check if the map element itself is null
-        if self.is_null(row_index) {
-            return HashMap::new();
-        }
-
-        let offsets = self.offsets();
-        let start_offset = offsets[row_index] as usize;
-        let end_offset = offsets[row_index + 1] as usize;
-        let keys = self.keys();
-        let vals = self.values();
-        let mut ret = HashMap::with_capacity(end_offset - start_offset);
-
-        // Use direct array access for better performance vs Arrow's high-level API
-        for idx in start_offset..end_offset {
-            if vals.is_valid(idx) {
-                // Arrow maps always have non-null keys.
-                let key = get_string_value(keys, idx);
-                let value = get_string_value(vals, idx);
-                ret.insert(key.to_string(), value.to_string());
-            }
-        }
-        ret
+        Some(array.as_string_view_opt()?)
     }
 }
 
@@ -307,8 +248,7 @@ impl EngineData for ArrowEngineData {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
                 _ => {
                     return Err(Error::MissingColumn(format!(
-                        "Column {} not found in the data",
-                        column
+                        "Column {column} not found in the data"
                     )));
                 }
             }
@@ -423,20 +363,27 @@ impl ArrowEngineData {
         data_type: &DataType,
         col: &'a dyn Array,
     ) -> DeltaResult<&'a dyn GetData<'a>> {
+        // TODO: Replace with `ArrowDataType::is_string()` once we bump arrow-schema past 57.2.0
         let is_string_type = |dt: &ArrowDataType| {
             matches!(
                 dt,
                 ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
             )
         };
-        let col_as_list = || {
-            if let Some(array) = col.as_list_opt::<i32>() {
-                is_string_type(&array.value_type()).then_some(array as _)
-            } else if let Some(array) = col.as_list_opt::<i64>() {
-                is_string_type(&array.value_type()).then_some(array as _)
-            } else {
-                None
+        let col_as_list = || -> Option<&'a dyn GetData<'a>> {
+            match col.data_type() {
+                ArrowDataType::List(f)
+                | ArrowDataType::LargeList(f)
+                | ArrowDataType::ListView(f)
+                | ArrowDataType::LargeListView(f)
+                    if is_string_type(f.data_type()) => {}
+                _ => return None,
             }
+            col.as_list_opt::<i32>()
+                .map(|a| a as _)
+                .or_else(|| col.as_list_opt::<i64>().map(|a| a as _))
+                .or_else(|| col.as_list_view_opt::<i32>().map(|a| a as _))
+                .or_else(|| col.as_list_view_opt::<i64>().map(|a| a as _))
         };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
@@ -548,15 +495,15 @@ mod tests {
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, MapArray, RecordBatch, RunArray, StringArray,
-        StringViewArray, StructArray,
+        LargeBinaryArray, LargeStringArray, ListViewArray, MapArray, RecordBatch, RunArray,
+        StringArray, StringViewArray, StructArray,
     };
-    use crate::arrow::buffer::OffsetBuffer;
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::engine_data::{EngineMap, GetData, RowVisitor, TypedGetData};
+    use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, ColumnName, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
@@ -1413,6 +1360,15 @@ mod tests {
         .unwrap()
     }
 
+    /// Helper to construct a MapItem from a MapArray for a given row.
+    fn map_item_from<'a>(map: &'a MapArray, row: usize) -> MapItem<'a> {
+        let keys = super::as_string_accessor(map.keys().as_ref()).unwrap();
+        let values = super::as_string_accessor(map.values().as_ref()).unwrap();
+        let start = map.offsets()[row] as usize;
+        let end = map.offsets()[row + 1] as usize;
+        MapItem::new(keys, values, start..end)
+    }
+
     #[test]
     fn test_materialize_matches_get() -> DeltaResult<()> {
         // Create MapArray with various keys
@@ -1422,11 +1378,12 @@ mod tests {
             ("key3", Some("value3")),
         ]]);
 
-        let materialized = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let materialized = item.materialize();
 
         // Verify that get(key) matches materialize()[key] for all keys
         for (key, value) in &materialized {
-            let get_result = map_array.get(0, key);
+            let get_result = item.get(key);
             assert_eq!(get_result, Some(value.as_str()));
         }
 
@@ -1441,7 +1398,8 @@ mod tests {
         let map_array =
             create_map_array(vec![vec![("a", Some("1")), ("b", None), ("c", Some("3"))]]);
 
-        let result = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let result = item.materialize();
 
         // Null values should be excluded from materialized map
         assert_eq!(result.len(), 2);
@@ -1456,7 +1414,8 @@ mod tests {
         // Create MapArray with empty map
         let map_array = create_map_array(vec![vec![]]);
 
-        let result = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let result = item.materialize();
 
         assert_eq!(result.len(), 0);
         Ok(())
@@ -1470,12 +1429,14 @@ mod tests {
             vec![("x", Some("10")), ("y", Some("20"))],
         ]);
 
-        let result0 = map_array.materialize(0);
+        let item0 = map_item_from(&map_array, 0);
+        let result0 = item0.materialize();
         assert_eq!(result0.len(), 2);
         assert_eq!(result0.get("a"), Some(&"1".to_string()));
         assert_eq!(result0.get("b"), Some(&"2".to_string()));
 
-        let result1 = map_array.materialize(1);
+        let item1 = map_item_from(&map_array, 1);
+        let result1 = item1.materialize();
         assert_eq!(result1.len(), 2);
         assert_eq!(result1.get("x"), Some(&"10".to_string()));
         assert_eq!(result1.get("y"), Some(&"20".to_string()));
@@ -1494,7 +1455,8 @@ mod tests {
             ("a", Some("5")), // Another duplicate 'a' - should be final value
         ]]);
 
-        let materialized = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let materialized = item.materialize();
 
         // Verify materialize() handles duplicates correctly (last wins)
         assert_eq!(materialized.len(), 3); // Only 3 unique keys
@@ -1503,9 +1465,9 @@ mod tests {
         assert_eq!(materialized.get("c"), Some(&"4".to_string()));
 
         // Verify get() and materialize() return same values
-        assert_eq!(map_array.get(0, "a"), Some("5")); // Matches materialized
-        assert_eq!(map_array.get(0, "b"), Some("2"));
-        assert_eq!(map_array.get(0, "c"), Some("4"));
+        assert_eq!(item.get("a"), Some("5")); // Matches materialized
+        assert_eq!(item.get("b"), Some("2"));
+        assert_eq!(item.get("c"), Some("4"));
 
         Ok(())
     }
@@ -1563,20 +1525,19 @@ mod tests {
         .unwrap();
 
         // First element should have 2 entries
-        let result0 = map_array.materialize(0);
+        let item0 = map_item_from(&map_array, 0);
+        let result0 = item0.materialize();
         assert_eq!(result0.len(), 2);
         assert_eq!(result0.get("a"), Some(&"1".to_string()));
         assert_eq!(result0.get("b"), Some(&"2".to_string()));
 
-        // Second element is null, should return empty HashMap
-        let result1 = map_array.materialize(1);
-        assert_eq!(result1.len(), 0);
-
-        // get() on null element should return None, even for key that exists in underlying data
-        assert_eq!(map_array.get(1, "c"), None); // "c" exists in data but element is null
+        // Second element is null — GetData::get_map returns None for null elements
+        let map_item_1: Option<MapItem<'_>> = map_array.get_map(1, "test")?;
+        assert!(map_item_1.is_none());
 
         // Third element should have 1 entry
-        let result2 = map_array.materialize(2);
+        let item2 = map_item_from(&map_array, 2);
+        let result2 = item2.materialize();
         assert_eq!(result2.len(), 1);
         assert_eq!(result2.get("d"), Some(&"4".to_string()));
 
@@ -1682,6 +1643,64 @@ mod tests {
         assert_eq!(
             visitor.values,
             vec![Some(b"hello".to_vec()), None, Some(b"\x00\x01".to_vec())]
+        );
+        Ok(())
+    }
+
+    /// visit_rows must accept ListView columns when the visitor declares a DataType::Array.
+    #[test]
+    fn test_visit_rows_list_view() -> DeltaResult<()> {
+        // Build a ListViewArray with string values: [["a", "b"], ["c"]]
+        let values = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
+        let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
+        let offsets = ScalarBuffer::from(vec![0i32, 2]);
+        let sizes = ScalarBuffer::from(vec![2i32, 1]);
+        let list_view = ListViewArray::new(field.clone(), offsets, sizes, values, None);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "tags",
+                list_view.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(list_view)],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Vec<String>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["tags"])]);
+                static TYPES: LazyLock<Vec<DataType>> =
+                    LazyLock::new(|| vec![ArrayType::new(DataType::STRING, false).into()]);
+                (&NAMES, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let list: ListItem<'_> = getters[0].get(i, "tags")?;
+                    self.values.push(list.materialize());
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["tags"])], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            ]
         );
         Ok(())
     }

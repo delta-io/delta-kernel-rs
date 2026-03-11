@@ -172,7 +172,7 @@ mod tests {
         Commit::new(
             version,
             version * 1000,
-            format!("{:020}.json", version),
+            format!("{version:020}.json"),
             100,
             version * 1000,
         )

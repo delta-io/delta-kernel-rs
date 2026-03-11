@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::sync::Arc;
 
+use crate::engine::default::parquet::{reader_options, writer_options};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
@@ -29,9 +30,10 @@ fn try_create_from_parquet(
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
-    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let reader_options = reader_options();
+    let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
     let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
@@ -91,7 +93,7 @@ impl ParquetHandler for SyncParquetHandler {
         // Convert URL to file path
         let path = location
             .to_file_path()
-            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", location)))?;
+            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {location}")))?;
 
         let mut file = File::create(&path)?;
 
@@ -102,7 +104,11 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let mut writer = ArrowWriter::try_new(&mut file, first_record_batch.schema(), None)?;
+        let mut writer = ArrowWriter::try_new_with_options(
+            &mut file,
+            first_record_batch.schema(),
+            writer_options(),
+        )?;
         writer.write(&first_record_batch)?;
 
         // Write remaining batches
@@ -124,7 +130,7 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
         let file = File::open(path)?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let metadata = ArrowReaderMetadata::load(&file, reader_options())?;
         let schema = StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)?;

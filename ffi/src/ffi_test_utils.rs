@@ -107,18 +107,15 @@ mod tests {
 
         assert!(
             panic_str.contains("Got engine error with type"),
-            "Panic message should contain 'Got engine error with type', got: {}",
-            panic_str
+            "Panic message should contain 'Got engine error with type', got: {panic_str}"
         );
         assert!(
             panic_str.contains("GenericError"),
-            "Panic message should contain error type 'GenericError', got: {}",
-            panic_str
+            "Panic message should contain error type 'GenericError', got: {panic_str}"
         );
         assert!(
             panic_str.contains(message),
-            "Panic message should contain error message 'Test error message', got: {}",
-            panic_str
+            "Panic message should contain error message 'Test error message', got: {panic_str}"
         );
     }
 

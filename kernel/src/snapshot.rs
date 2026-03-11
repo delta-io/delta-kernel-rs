@@ -1,23 +1,25 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::instrument;
+use delta_kernel_derive::internal_api;
+use tracing::{debug, info, instrument};
+use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::domain_metadata::{
-    all_domain_metadata_configuration, domain_metadata_configuration,
-};
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::INTERNAL_DOMAIN_PREFIX;
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::clustering::get_clustering_columns_from_domain_metadata;
+use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::LazyCrc;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::crc::Crc;
+use crate::crc::{CrcDelta, LazyCrc};
 use crate::expressions::ColumnName;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -30,29 +32,18 @@ use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::LogCompactionWriter;
 use crate::{DeltaResult, Engine, Error, Version};
-use delta_kernel_derive::internal_api;
 
 mod builder;
 pub use builder::SnapshotBuilder;
 
-use delta_kernel::actions::DomainMetadata;
-use tracing::{debug, info};
-use url::Url;
-
 pub type SnapshotRef = Arc<Snapshot>;
 
-/// File-level statistics for a table snapshot.
+/// File-level statistics for a table version.
 ///
 /// NOTE: This is an unstable API expected to change in future releases.
 #[allow(unused)]
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
-pub(crate) struct FileStats {
-    /// Total size of the table in bytes (sum of all active AddFile sizes).
-    pub table_size_bytes: i64,
-    /// Number of active AddFile actions in this table version.
-    pub num_files: i64,
-}
+pub(crate) type FileStats = crate::crc::FileStats;
 
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
@@ -455,16 +446,24 @@ impl Snapshot {
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
     ///
-    /// This method takes a pre-commit snapshot (i.e. the read_snapshot) and incorporates a newly
-    /// committed transaction to produce a post-commit snapshot at the committed version. This
-    /// allows immediate use of the new and latest table state without re-reading metadata from
-    /// storage.
+    /// Appends the newly committed file to this snapshot's log segment and bumps the version,
+    /// producing a post-commit snapshot without a full log replay from storage.
     ///
-    /// TODO: Take in ICT.
-    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
-    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
-    #[allow(unused)]
-    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+    /// The `crc_delta` captures the CRC-relevant changes from the committed transaction
+    /// (file stats, domain metadata, ICT, etc.). If the pre-commit snapshot had a loaded CRC
+    /// at its version, the delta is applied to produce a precomputed in-memory CRC for the new
+    /// version -- this CRC contains all important table metadata (protocol, metadata, domain
+    /// metadata, set transactions, ICT) and avoids re-reading them from storage. CREATE TABLE
+    /// always produces a CRC at v0. If no CRC was available on the pre-commit snapshot, the
+    /// existing lazy CRC is carried forward unchanged.
+    ///
+    /// TODO: Handle Protocol changes in CrcDelta (when Kernel-RS supports protocol changes)
+    /// TODO: Handle Metadata changes in CrcDelta (when Kernel-RS supports metadata changes)
+    pub(crate) fn new_post_commit(
+        &self,
+        commit: ParsedLogPath,
+        crc_delta: CrcDelta,
+    ) -> DeltaResult<Self> {
         require!(
             commit.is_commit(),
             Error::internal_error(format!(
@@ -473,26 +472,51 @@ impl Snapshot {
                 commit.location.location, commit.file_type
             ))
         );
+        let read_version = self.version();
+        let new_version = commit.version;
         require!(
-            commit.version == self.version().wrapping_add(1),
+            new_version == read_version.wrapping_add(1),
             Error::internal_error(format!(
-                "Cannot create post-commit Snapshot. Log file version ({}) does not \
-                equal Snapshot version ({}) + 1.",
-                commit.version,
-                self.version()
+                "Cannot create post-commit Snapshot. Log file version ({new_version}) does not \
+                equal Snapshot version ({read_version}) + 1."
             ))
         );
 
         let new_table_configuration =
-            TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
+            TableConfiguration::new_post_commit(self.table_configuration(), new_version);
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
+
+        let new_lazy_crc = self.compute_post_commit_crc(new_version, crc_delta);
 
         Ok(Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
-            self.lazy_crc.clone(),
+            new_lazy_crc,
         ))
+    }
+
+    /// Compute the lazy CRC for a post-commit snapshot by applying a [`CrcDelta`].
+    ///
+    /// For CREATE TABLE, builds a fresh CRC from the `crc_delta`. For existing tables, applies
+    /// the `crc_delta` to the current CRC if loaded, otherwise carries forward the existing lazy CRC.
+    fn compute_post_commit_crc(&self, new_version: Version, crc_delta: CrcDelta) -> Arc<LazyCrc> {
+        let crc = if self.version() == crate::PRE_COMMIT_VERSION {
+            crc_delta.into_crc_for_version_zero()
+        } else {
+            self.lazy_crc
+                .get_if_loaded_at_version(self.version())
+                .map(|base| {
+                    let mut crc = base.as_ref().clone();
+                    crc.apply(crc_delta);
+                    crc
+                })
+        };
+
+        match crc {
+            Some(c) => Arc::new(LazyCrc::new_precomputed(c, new_version)),
+            None => self.lazy_crc.clone(),
+        }
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -634,7 +658,7 @@ impl Snapshot {
             ));
         }
 
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        self.get_domain_metadata_internal(domain, engine)
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
@@ -650,18 +674,35 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        if self
+        if !self
             .table_configuration
             .protocol()
             .has_table_feature(&TableFeature::ClusteredTable)
         {
-            get_clustering_columns_from_domain_metadata(&self.log_segment, engine)
-        } else {
-            Ok(None)
+            return Ok(None);
+        }
+        match self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)? {
+            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
+            None => Ok(None),
         }
     }
 
-    /// Returns file-level statistics from the CRC file, or `None` if no CRC exists at this
+    /// Load domain metadata from this snapshot. If `domains` is `Some`, only load the specified
+    /// domains (with early termination). If `None`, load all domains.
+    ///
+    /// This is the single entry point for all domain metadata reads on a snapshot. All public
+    /// and internal domain metadata APIs delegate to this method.
+    #[internal_api]
+    pub(crate) fn get_domain_metadatas_internal(
+        &self,
+        engine: &dyn Engine,
+        domains: Option<&HashSet<&str>>,
+    ) -> DeltaResult<DomainMetadataMap> {
+        // TODO: utilize Checksum
+        self.log_segment().scan_domain_metadatas(domains, engine)
+    }
+
+    /// Returns file-level statistics, or `None` if no CRC with valid stats exists at this
     /// snapshot's version.
     ///
     /// NOTE: This is an unstable API expected to change in future releases.
@@ -671,10 +712,18 @@ impl Snapshot {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
-        Some(FileStats {
-            table_size_bytes: crc.table_size_bytes,
-            num_files: crc.num_files,
-        })
+        crc.file_stats()
+    }
+
+    /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
+    ///
+    /// This is a test-only helper for integration tests to inspect the CRC state.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_current_crc_if_loaded_for_testing(&self) -> Option<&Crc> {
+        if self.lazy_crc.crc_version() != Some(self.version()) {
+            return None;
+        }
+        self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
@@ -745,10 +794,11 @@ impl Snapshot {
         )))
     }
 
-    /// An API guarded by the `internal-api` feature flag for fetching both user-controlled and
-    /// system-controlled domain metadata for a specific domain in this snapshot.
+    /// Fetch both user-controlled and system-controlled domain metadata for a specific domain
+    /// in this snapshot.
     ///
-    /// Returns the latest configuration for the domain, or None if the domain does not exist.
+    /// Returns the latest configuration for the domain, or `None` if the domain does not exist
+    /// (or was removed). Unlike [`Snapshot::get_domain_metadata`], this does not reject `delta.*` domains.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_domain_metadata_internal(
@@ -756,18 +806,22 @@ impl Snapshot {
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
-        domain_metadata_configuration(self.log_segment(), domain, engine)
+        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
+    /// Fetch all non-internal domain metadata for this snapshot as a `Vec`.
+    ///
+    /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_domain_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Vec<DomainMetadata>> {
-        let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
+        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
         Ok(all_metadata
-            .into_iter()
+            .into_values()
             .filter(|domain| !domain.is_internal())
             .collect())
     }
@@ -847,7 +901,7 @@ mod tests {
     use serde_json::json;
     use test_utils::{add_commit, delta_path_for_version};
 
-    use crate::actions::Protocol;
+    use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -864,7 +918,6 @@ mod tests {
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
-    use delta_kernel::actions::DomainMetadata;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -947,7 +1000,7 @@ mod tests {
     fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
         let protocol = create_protocol(ict_enabled, None);
         let metadata = create_metadata(None, None, None, ict_config, false);
-        format!("{}\n{}", protocol, metadata)
+        format!("{protocol}\n{metadata}")
     }
 
     #[test]
@@ -1427,7 +1480,7 @@ mod tests {
 
         // Write all test files to the in memory file system
         for (path_prefix, data, _) in &test_cases {
-            let path = Path::from(format!("{}/_last_checkpoint", path_prefix));
+            let path = Path::from(format!("{path_prefix}/_last_checkpoint"));
             store
                 .put(&path, data.clone().into())
                 .await
@@ -1440,7 +1493,7 @@ mod tests {
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
-            let url = Url::parse(&format!("memory:///{}/", path_prefix)).expect("valid url");
+            let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
             let result =
                 LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
@@ -2072,7 +2125,9 @@ mod tests {
 
         // WHEN
         let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+        let post_commit_snapshot = base_snapshot
+            .new_post_commit(fake_new_commit, CrcDelta::default())
+            .unwrap();
 
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
