@@ -1,5 +1,5 @@
 //! Expression handling based on arrow-rs compute kernels.
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
@@ -249,7 +249,6 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             _input_schema: schema,
             expression,
             output_type,
-            output_schema: OnceLock::new(),
         }))
     }
 
@@ -280,31 +279,9 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    _input_schema: SchemaRef,
+    _input_schema: SchemaRef, // prefixed _ since unused (reserved for future schema validation)
     expression: ExpressionRef,
     output_type: DataType,
-    // Cached Arrow schema derived from `output_type`. Converting a kernel schema to Arrow requires
-    // allocating fields and metadata, so repeated conversion for large schemas can have non-trivial
-    // overhead. The cache ensures we pay that cost at most once per evaluator instance.
-    output_schema: OnceLock<Arc<ArrowSchema>>,
-}
-
-impl DefaultExpressionEvaluator {
-    fn get_or_init_output_schema(&self) -> DeltaResult<Arc<ArrowSchema>> {
-        if let Some(schema) = self.output_schema.get() {
-            return Ok(schema.clone());
-        }
-        let schema = match &self.output_type {
-            DataType::Struct(struct_type) => Arc::new(struct_type.as_ref().try_into_arrow()?),
-            output_type => {
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
-                Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    "output", arrow_type, true,
-                )]))
-            }
-        };
-        Ok(self.output_schema.get_or_init(|| schema).clone())
-    }
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
@@ -319,7 +296,6 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //         batch.schema()
         //     )));
         // };
-        let output_schema = self.get_or_init_output_schema()?;
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
@@ -329,16 +305,20 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                     None => Arc::new(StructArray::from(batch.clone())),
                     Some(path) => extract_column(batch, path)?,
                 };
-                apply_schema(&array, &self.output_type, output_schema)?
+                apply_schema(&array, &self.output_type)?
             }
             (expr, output_type @ DataType::Struct(_)) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                apply_schema(&array_ref, output_type, output_schema)?
+                apply_schema(&array_ref, output_type)?
             }
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
-                RecordBatch::try_new(output_schema, vec![array_ref])?
+                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
+                let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "output", arrow_type, true,
+                )]));
+                RecordBatch::try_new(schema, vec![array_ref])?
             }
         };
 
