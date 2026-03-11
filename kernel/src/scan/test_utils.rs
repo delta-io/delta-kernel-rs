@@ -20,8 +20,8 @@ use crate::{
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
+use crate::scan::transform_spec::TransformSpec;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::TransformSpec;
 
 // Generates a batch of sidecar actions with the given paths.
 // The schema is provided as null columns affect equality checks.
@@ -148,7 +148,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         transform_spec,
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
-        logical_stats_schema: None,
+        physical_partition_schema: None,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let iter = scan_action_iter(

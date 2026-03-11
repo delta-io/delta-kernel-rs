@@ -9,8 +9,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
-    PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
+    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
 use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
 use crate::arrow::datatypes::{
@@ -118,7 +118,7 @@ fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
             UTF8_MAX_CHAR
         };
 
-        return Some(Cow::Owned(format!("{}{}", truncated, tie_breaker)));
+        return Some(Cow::Owned(format!("{truncated}{tie_breaker}")));
     }
 
     // Could not find a valid truncation point within expansion limit
@@ -427,10 +427,11 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
+            let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
             Ok(ColumnStats {
                 null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: compute_leaf_agg(column, Agg::Min)?,
-                max_value: compute_leaf_agg(column, Agg::Max)?,
+                min_value: Some(compute_leaf_agg(column, Agg::Min)?.unwrap_or_else(&null_fallback)),
+                max_value: Some(compute_leaf_agg(column, Agg::Max)?.unwrap_or_else(null_fallback)),
             })
         }
     }
@@ -474,8 +475,8 @@ impl StatsAccumulator {
 /// Returns a StructArray with the following fields:
 /// - `numRecords`: total row count
 /// - `nullCount`: nested struct with null counts per column
-/// - `minValues`: nested struct with min values per column
-/// - `maxValues`: nested struct with max values per column
+/// - `minValues`: nested struct with min values per column (null when all values are null)
+/// - `maxValues`: nested struct with max values per column (null when all values are null)
 /// - `tightBounds`: always true for new file writes
 ///
 /// # Arguments
@@ -756,11 +757,41 @@ mod tests {
             .unwrap();
         assert_eq!(value_null_count.value(0), 3);
 
-        // minValues/maxValues should not have "value" field (all nulls)
-        if let Some(min_values) = stats.column_by_name("minValues") {
-            let min_struct = min_values.as_any().downcast_ref::<StructArray>().unwrap();
-            assert!(min_struct.column_by_name("value").is_none());
-        }
+        // minValues/maxValues should have "value" field present but with a null value
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let min_col = min_values.column_by_name("value").unwrap();
+        assert!(min_col.is_null(0));
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let max_col = max_values.column_by_name("value").unwrap();
+        assert!(max_col.is_null(0));
+
+        // Verify the JSON serialization includes null min/max with explicit null values,
+        // matching Delta Spark behavior (e.g. "minValues":{"value":null}).
+        let json_array = to_json(&stats).unwrap();
+        let json_str = json_array.as_string::<i32>().value(0);
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(json["nullCount"]["value"], 3);
+        assert!(
+            json["minValues"].get("value").is_some(),
+            "Expected 'value' to be present in minValues JSON"
+        );
+        assert!(json["minValues"]["value"].is_null());
+        assert!(
+            json["maxValues"].get("value").is_some(),
+            "Expected 'value' to be present in maxValues JSON"
+        );
+        assert!(json["maxValues"]["value"].is_null());
     }
 
     #[test]

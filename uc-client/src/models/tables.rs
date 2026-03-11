@@ -57,7 +57,7 @@ impl Display for TablesResponse {
             writeln!(f)?;
             writeln!(f, "Properties:")?;
             for (key, value) in &self.properties {
-                writeln!(f, "  {}: {}", key, value)?;
+                writeln!(f, "  {key}: {value}")?;
             }
         }
 

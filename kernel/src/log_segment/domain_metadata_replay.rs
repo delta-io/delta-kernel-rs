@@ -4,19 +4,16 @@
 //! metadata actions from a [`LogSegment`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
 
 use tracing::instrument;
 
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
-use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
+use crate::actions::DomainMetadata;
 use crate::log_replay::ActionsBatch;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, RowVisitor as _};
 
 use super::LogSegment;
-
-const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
@@ -60,12 +57,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_log_domain_metadata_schema();
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(
-                Expr::column([DOMAIN_METADATA_NAME, DOMAIN_METADATA_DOMAIN_FIELD]).is_not_null(),
-            ))
-        });
-        self.read_actions(engine, schema.clone(), META_PREDICATE.clone())
+        self.read_actions(engine, schema.clone())
     }
 }
 
@@ -188,9 +180,8 @@ mod tests {
         );
     }
 
-    /// scan_domain_metadatas returns the correct metadata for a single requested domain.
     #[tokio::test]
-    async fn test_scan_domain_metadatas_one() {
+    async fn test_scan_domain_metadatas_with_single_domain_filter_returns_only_that_domain() {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
@@ -200,9 +191,8 @@ mod tests {
         assert_eq!(result["domainA"].configuration(), "cfgA");
     }
 
-    /// scan_domain_metadatas returns the correct metadata for a specific subset of domains.
     #[tokio::test]
-    async fn test_scan_domain_metadatas_subset() {
+    async fn test_scan_domain_metadatas_with_subset_filter_returns_matching_domains() {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
@@ -213,9 +203,8 @@ mod tests {
         assert_eq!(result["domainC"].configuration(), "cfgC");
     }
 
-    /// scan_domain_metadatas with no filter returns all domains across all commits.
     #[tokio::test]
-    async fn test_scan_domain_metadatas_all() {
+    async fn test_scan_domain_metadatas_with_no_filter_returns_all_domains() {
         let (engine, snapshot) = build_two_commit_log();
         let result = snapshot
             .log_segment()
@@ -227,10 +216,8 @@ mod tests {
         assert_eq!(result["domainC"].configuration(), "cfgC");
     }
 
-    /// Proves that when requested domains span two commits, both batches ARE consumed
-    /// (i.e., we don't terminate early until all N domains are found).
     #[tokio::test]
-    async fn test_scan_domain_metadatas_no_early_termination_when_split_across_commits() {
+    async fn test_scan_domain_metadatas_with_split_domains_does_not_terminate_early() {
         let (engine, snapshot) = build_two_commit_log();
         let log_segment = snapshot.log_segment();
 
