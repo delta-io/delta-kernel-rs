@@ -193,119 +193,184 @@ fn should_skip_test(test_path: &str) -> Option<&'static str> {
 /// and the entry should be removed.
 const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
     // ── Kernel bugs: unsupported types ──
-    ("Kernel: void/NullType not supported in schema deserialization", &[
-        "void_001_void_top_level/", "void_002_void_nested_struct/",
-        "void_005_void_schema_evolution/", "void_006_void_multiple_columns/",
-        "void_007_void_with_backticks/", "void_in_struct/",
-    ]),
-    ("Kernel: interval types not supported in schema deserialization", &[
-        "intv_001_interval_ym_basic/", "intv_002_interval_dt_basic/",
-        "intv_003_interval_partitioned/", "intv_004_interval_negative/",
-        "intv_005_interval_mixed/", "intv_006_create_insert_select/",
-        "intv_boundary_values/", "intv_sub_second/",
-    ]),
+    (
+        "Kernel: void/NullType not supported in schema deserialization",
+        &[
+            "void_001_void_top_level/",
+            "void_002_void_nested_struct/",
+            "void_005_void_schema_evolution/",
+            "void_006_void_multiple_columns/",
+            "void_007_void_with_backticks/",
+            "void_in_struct/",
+        ],
+    ),
+    (
+        "Kernel: interval types not supported in schema deserialization",
+        &[
+            "intv_001_interval_ym_basic/",
+            "intv_002_interval_dt_basic/",
+            "intv_003_interval_partitioned/",
+            "intv_004_interval_negative/",
+            "intv_005_interval_mixed/",
+            "intv_006_create_insert_select/",
+            "intv_boundary_values/",
+            "intv_sub_second/",
+        ],
+    ),
     // ── Kernel bugs: null schemaString in metadata ──
-    ("Kernel: fails with null schemaString in metadata", &[
-        "pv_old_protocol_read/specs/pv_old_protocol_read_snapshot",
-        "pv_empty_reader_features/specs/pv_empty_reader_features_snapshot",
-        "pv_protocol_downgrade/specs/pv_protocol_downgrade_snapshot",
-        "pv_reader_feature_not_in_writer/specs/pv_reader_feature_not_in_writer_snapshot",
-        "pv_unknown_writer_feature_ok/specs/pv_unknown_writer_feature_ok_snapshot",
-    ]),
+    (
+        "Kernel: fails with null schemaString in metadata",
+        &[
+            "pv_old_protocol_read/specs/pv_old_protocol_read_snapshot",
+            "pv_empty_reader_features/specs/pv_empty_reader_features_snapshot",
+            "pv_protocol_downgrade/specs/pv_protocol_downgrade_snapshot",
+            "pv_reader_feature_not_in_writer/specs/pv_reader_feature_not_in_writer_snapshot",
+            "pv_unknown_writer_feature_ok/specs/pv_unknown_writer_feature_ok_snapshot",
+        ],
+    ),
     // ── Kernel bugs: checkpoint handling ──
-    ("Kernel: can't fall back to log replay when checkpoint has missing parts/files", &[
-        "corrupt_incomplete_multipart_checkpoint/",
-        "ckp_incomplete_multipart/", "ckp_missing_checkpoint_file/",
-    ]),
+    (
+        "Kernel: can't fall back to log replay when checkpoint has missing parts/files",
+        &[
+            "corrupt_incomplete_multipart_checkpoint/",
+            "ckp_incomplete_multipart/",
+            "ckp_missing_checkpoint_file/",
+        ],
+    ),
     // ── Kernel bugs: type widening ──
-    ("Kernel: cannot cast list to non-list data types during type widening", &[
-        "tw_array_element/specs/tw_array_element_read_",
-        "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
-    ]),
+    (
+        "Kernel: cannot cast list to non-list data types during type widening",
+        &[
+            "tw_array_element/specs/tw_array_element_read_",
+            "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
+        ],
+    ),
     // ── Kernel bugs: other ──
-    ("Kernel: schema deserialization fails for TimestampNTZ type", &[
-        "ds_multi_file_time/",
-    ]),
-    ("Kernel: requires contiguous commits; Spark uses CRC files to bridge gaps", &[
-        "prod_non_contiguous_versions/",
-    ]),
-    ("Kernel: column mapping id mode fails with None in final_fields_cols", &[
-        "cm_id_matching_swapped/specs/cm_id_matching_swapped_select_",
-        "cm_id_matching_nonexistent/specs/cm_id_matching_nonexistent_select_",
-    ]),
-    ("Kernel: can't resolve percent-encoded filenames in AddFile paths", &[
-        "DV-005b/specs/DV-005b_count", "DV-008/specs/DV-008_table2_latest",
-        "DV-009/specs/DV-009_table2_latest_v1",
-    ]),
-    ("Kernel: inline DV has invalid magic number", &[
-        "dv_storage_type_i/specs/dv_storage_type_i_read_after_inline_dv",
-    ]),
-    ("Kernel: absolute-path DV has invalid percent-encoded path", &[
-        "dv_storage_type_p/specs/dv_storage_type_p_read_after_absolute_path_dv",
-    ]),
-    ("Kernel: fails on missing/empty delta log (no files in log segment)", &[
-        "ct_empty_delta_log/specs/ct_empty_delta_log_snapshot",
-        "ct_missing_delta_log/specs/ct_missing_delta_log_snapshot",
-        "dseReadNonDeltaPath/specs/dseReadNonDeltaPath_snapshot",
-        "dv_checkpoint_only_read/specs/dv_checkpoint_only_read_snapshot",
-    ]),
+    (
+        "Kernel: schema deserialization fails for TimestampNTZ type",
+        &["ds_multi_file_time/"],
+    ),
+    (
+        "Kernel: requires contiguous commits; Spark uses CRC files to bridge gaps",
+        &["prod_non_contiguous_versions/"],
+    ),
+    (
+        "Kernel: column mapping id mode fails with None in final_fields_cols",
+        &[
+            "cm_id_matching_swapped/specs/cm_id_matching_swapped_select_",
+            "cm_id_matching_nonexistent/specs/cm_id_matching_nonexistent_select_",
+        ],
+    ),
+    (
+        "Kernel: can't resolve percent-encoded filenames in AddFile paths",
+        &[
+            "DV-005b/specs/DV-005b_count",
+            "DV-008/specs/DV-008_table2_latest",
+            "DV-009/specs/DV-009_table2_latest_v1",
+        ],
+    ),
+    (
+        "Kernel: inline DV has invalid magic number",
+        &["dv_storage_type_i/specs/dv_storage_type_i_read_after_inline_dv"],
+    ),
+    (
+        "Kernel: absolute-path DV has invalid percent-encoded path",
+        &["dv_storage_type_p/specs/dv_storage_type_p_read_after_absolute_path_dv"],
+    ),
+    (
+        "Kernel: fails on missing/empty delta log (no files in log segment)",
+        &[
+            "ct_empty_delta_log/specs/ct_empty_delta_log_snapshot",
+            "ct_missing_delta_log/specs/ct_missing_delta_log_snapshot",
+            "dseReadNonDeltaPath/specs/dseReadNonDeltaPath_snapshot",
+            "dv_checkpoint_only_read/specs/dv_checkpoint_only_read_snapshot",
+        ],
+    ),
     // ── Kernel bugs: projected column not found ──
-    ("Kernel: projected column not found after column mapping/schema order change", &[
-        "ds_schema_order_mismatch/specs/ds_schema_order_mismatch_single_col_last",
-        "ds_with_dvs_edge/specs/ds_with_dvs_edge_proj_and_skip_with_dv",
-        "dv_projection_with_pred/specs/dv_projection_with_pred_proj_and_pred",
-    ]),
+    (
+        "Kernel: projected column not found after column mapping/schema order change",
+        &[
+            "ds_schema_order_mismatch/specs/ds_schema_order_mismatch_single_col_last",
+            "ds_with_dvs_edge/specs/ds_with_dvs_edge_proj_and_skip_with_dv",
+            "dv_projection_with_pred/specs/dv_projection_with_pred_proj_and_pred",
+        ],
+    ),
     // ── Kernel divergences: kernel succeeds where Spark expects error ──
-    ("Kernel: doesn't reject unsupported column mapping mode", &[
-        "cm_err_003_invalid_mode/specs/cm_err_003_invalid_mode_error",
-    ]),
-    ("Kernel: reads corrupt/invalid commit or checkpoint without error", &[
-        "corrupt_truncated_commit_json/specs/corrupt_truncated_commit_json_error",
-        "cp_err_missing_protocol/specs/cp_err_missing_protocol_error",
-        "ct_corrupt_parquet/specs/ct_corrupt_parquet_error",
-        "ct_invalid_json/specs/ct_invalid_json_error",
-        "dsReadCorruptCheckpoint/specs/dsReadCorruptCheckpoint_error",
-        "dsReadCorruptJson/specs/dsReadCorruptJson_error",
-        "dsReadModifyCheckpoint/specs/dsReadModifyCheckpoint_error",
-    ]),
-    ("Kernel: doesn't reject duplicate actions in commit", &[
-        "ct_duplicate_metadata/specs/ct_duplicate_metadata_error",
-        "ct_duplicate_protocol/specs/ct_duplicate_protocol_error",
-        "err_duplicate_add_same_version/specs/err_duplicate_add_same_version_error",
-    ]),
-    ("Kernel: doesn't reject missing metadata/protocol actions", &[
-        "ct_missing_metadata/specs/ct_missing_metadata_error",
-        "ct_missing_protocol/specs/ct_missing_protocol_error",
-        "log_err_missing_metadata/specs/log_err_missing_metadata_error",
-        "log_err_missing_protocol/specs/log_err_missing_protocol_error",
-    ]),
-    ("Kernel: snapshot construction succeeds even when data files are missing", &[
-        "ct_missing_data_file/specs/ct_missing_data_file_error",
-        "dv_err_002_missing_file/specs/dv_err_002_missing_file_error",
-    ]),
-    ("Kernel: doesn't validate DV integrity", &[
-        "dv_err_001_checksum/specs/dv_err_001_checksum_error",
-        "dv_err_003_malformed_path/specs/dv_err_003_malformed_path_error",
-        "err_dv_invalid_storage_type/specs/err_dv_invalid_storage_type_error",
-        "err_add_and_remove_same_path_dv/specs/err_add_and_remove_same_path_dv_error",
-    ]),
-    ("Kernel: doesn't validate schema integrity", &[
-        "err_schema_empty/specs/err_schema_empty_error",
-        "err_schema_invalid_json/specs/err_schema_invalid_json_error",
-    ]),
-    ("Kernel: doesn't require version 0 to exist", &[
-        "err_missing_version_0/specs/err_missing_version_0_error",
-    ]),
-    ("Kernel: doesn't reject unknown reader features", &[
-        "ev_unknown_reader_feature/specs/ev_unknown_reader_feature_error",
-    ]),
-    ("Kernel: doesn't enforce time travel safety", &[
-        "tt_blocked_beyond_retention/specs/tt_blocked_beyond_retention_error",
-        "tt_after_vacuum/specs/tt_after_vacuum_error",
-    ]),
-    ("Kernel: _metadata.file_path column projection not supported", &[
-        "DV-003/specs/DV-003_metadata_file_path",
-    ]),
+    (
+        "Kernel: doesn't reject unsupported column mapping mode",
+        &["cm_err_003_invalid_mode/specs/cm_err_003_invalid_mode_error"],
+    ),
+    (
+        "Kernel: reads corrupt/invalid commit or checkpoint without error",
+        &[
+            "corrupt_truncated_commit_json/specs/corrupt_truncated_commit_json_error",
+            "cp_err_missing_protocol/specs/cp_err_missing_protocol_error",
+            "ct_corrupt_parquet/specs/ct_corrupt_parquet_error",
+            "ct_invalid_json/specs/ct_invalid_json_error",
+            "dsReadCorruptCheckpoint/specs/dsReadCorruptCheckpoint_error",
+            "dsReadCorruptJson/specs/dsReadCorruptJson_error",
+            "dsReadModifyCheckpoint/specs/dsReadModifyCheckpoint_error",
+        ],
+    ),
+    (
+        "Kernel: doesn't reject duplicate actions in commit",
+        &[
+            "ct_duplicate_metadata/specs/ct_duplicate_metadata_error",
+            "ct_duplicate_protocol/specs/ct_duplicate_protocol_error",
+            "err_duplicate_add_same_version/specs/err_duplicate_add_same_version_error",
+        ],
+    ),
+    (
+        "Kernel: doesn't reject missing metadata/protocol actions",
+        &[
+            "ct_missing_metadata/specs/ct_missing_metadata_error",
+            "ct_missing_protocol/specs/ct_missing_protocol_error",
+            "log_err_missing_metadata/specs/log_err_missing_metadata_error",
+            "log_err_missing_protocol/specs/log_err_missing_protocol_error",
+        ],
+    ),
+    (
+        "Kernel: snapshot construction succeeds even when data files are missing",
+        &[
+            "ct_missing_data_file/specs/ct_missing_data_file_error",
+            "dv_err_002_missing_file/specs/dv_err_002_missing_file_error",
+        ],
+    ),
+    (
+        "Kernel: doesn't validate DV integrity",
+        &[
+            "dv_err_001_checksum/specs/dv_err_001_checksum_error",
+            "dv_err_003_malformed_path/specs/dv_err_003_malformed_path_error",
+            "err_dv_invalid_storage_type/specs/err_dv_invalid_storage_type_error",
+            "err_add_and_remove_same_path_dv/specs/err_add_and_remove_same_path_dv_error",
+        ],
+    ),
+    (
+        "Kernel: doesn't validate schema integrity",
+        &[
+            "err_schema_empty/specs/err_schema_empty_error",
+            "err_schema_invalid_json/specs/err_schema_invalid_json_error",
+        ],
+    ),
+    (
+        "Kernel: doesn't require version 0 to exist",
+        &["err_missing_version_0/specs/err_missing_version_0_error"],
+    ),
+    (
+        "Kernel: doesn't reject unknown reader features",
+        &["ev_unknown_reader_feature/specs/ev_unknown_reader_feature_error"],
+    ),
+    (
+        "Kernel: doesn't enforce time travel safety",
+        &[
+            "tt_blocked_beyond_retention/specs/tt_blocked_beyond_retention_error",
+            "tt_after_vacuum/specs/tt_after_vacuum_error",
+        ],
+    ),
+    (
+        "Kernel: _metadata.file_path column projection not supported",
+        &["DV-003/specs/DV-003_metadata_file_path"],
+    ),
 ];
 
 /// Check if workload type is unsupported by the harness.

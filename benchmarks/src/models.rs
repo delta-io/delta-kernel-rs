@@ -119,7 +119,7 @@ pub struct ExpectedError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadSuccess {
-    pub row_count: u64,
+    pub row_count: usize,
 }
 
 /// Expected snapshot values using kernel's Protocol and Metadata types.
