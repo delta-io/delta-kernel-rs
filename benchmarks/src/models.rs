@@ -47,7 +47,7 @@ pub struct TableInfo {
     pub protocol: Protocol,
     /// Log-level statistics for the table
     pub log_info: LogInfo,
-    /// Table properties from the Delta metadata
+    /// Table properties from the Delta metadata (e.g. `{"delta.enableDeletionVector": "true", "delta.columnMapping.mode": "none"}`)
     pub properties: HashMap<String, String>,
     /// Physical data layout of the table
     pub data_layout: DataLayout,
