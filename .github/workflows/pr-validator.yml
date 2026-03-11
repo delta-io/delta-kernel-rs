@@ -2,7 +2,7 @@ name: Validate PR Title
 
 on:
   pull_request:
-    types: [opened, edited, reopened, labeled, unlabeled]
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
   workflow_run:
     workflows: ["semver-checks"] # we need this since auto-labels from jobs don't trigger a workflow
     types: [completed]
