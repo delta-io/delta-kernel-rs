@@ -697,73 +697,66 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 // Schema helpers for feature auto-enablement tests (TimestampNTZ, Variant)
 // ---------------------------------------------------------------------------
 
-/// Schema with a top-level TimestampNTZ column: `(id INT, ts TIMESTAMP_NTZ)`.
+/// Schema with one column of the given type: `(id INT, col <dtype>)`.
+pub fn schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col", dtype, true),
+    ]))
+}
+
+/// Schema with the given type nested inside a struct:
+/// `(id INT, nested STRUCT<inner <dtype>>)`.
+pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new(
+            "nested",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "inner", dtype, true,
+            )]))),
+            true,
+        ),
+    ]))
+}
+
+/// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
+pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col1", dtype.clone(), true),
+        StructField::new("col2", dtype, true),
+    ]))
+}
+
+/// Schema with a top-level TimestampNTZ column.
 pub fn top_level_ntz_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-    ]))
+    schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
-/// Schema with a TimestampNTZ nested inside a struct:
-/// `(id INT, nested STRUCT<inner_ts TIMESTAMP_NTZ>)`.
+/// Schema with a TimestampNTZ nested inside a struct.
 pub fn nested_ntz_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new(
-            "nested",
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "inner_ts",
-                DataType::TIMESTAMP_NTZ,
-                true,
-            )]))),
-            true,
-        ),
-    ]))
+    nested_schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
-/// Schema with multiple top-level TimestampNTZ columns:
-/// `(id INT, ts1 TIMESTAMP_NTZ, ts2 TIMESTAMP_NTZ)`.
+/// Schema with multiple top-level TimestampNTZ columns.
 pub fn multiple_ntz_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("ts1", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("ts2", DataType::TIMESTAMP_NTZ, true),
-    ]))
+    multi_schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
-/// Schema with a top-level variant column: `(id INT, v VARIANT)`.
+/// Schema with a top-level variant column.
 pub fn top_level_variant_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("v", DataType::unshredded_variant(), true),
-    ]))
+    schema_with_type(DataType::unshredded_variant())
 }
 
-/// Schema with a variant nested inside a struct:
-/// `(id INT, nested STRUCT<inner_v VARIANT>)`.
+/// Schema with a variant nested inside a struct.
 pub fn nested_variant_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new(
-            "nested",
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "inner_v",
-                DataType::unshredded_variant(),
-                true,
-            )]))),
-            true,
-        ),
-    ]))
+    nested_schema_with_type(DataType::unshredded_variant())
 }
 
-/// Schema with multiple top-level variant columns: `(id INT, v1 VARIANT, v2 VARIANT)`.
+/// Schema with multiple top-level variant columns.
 pub fn multiple_variant_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("v1", DataType::unshredded_variant(), true),
-        StructField::new("v2", DataType::unshredded_variant(), true),
-    ]))
+    multi_schema_with_type(DataType::unshredded_variant())
 }
 
 /// Returns column mapping table properties for the given mode, or empty for `"none"`.
