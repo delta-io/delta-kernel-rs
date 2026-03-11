@@ -1290,16 +1290,91 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_is_feature_supported_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_supported(&TableFeature::unknown("futureFeature")));
+    #[derive(Debug, Clone, Copy)]
+    enum UnknownFeatureShape {
+        NotListed,
+        WriterOnlyListed,
+        ReaderWriterListed,
     }
 
-    #[test]
-    fn test_is_feature_enabled_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
+    fn create_unknown_feature_config(
+        shape: UnknownFeatureShape,
+    ) -> (TableFeature, TableConfiguration) {
+        const UNKNOWN: &str = "futureFeature";
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let reader_features = match shape {
+            UnknownFeatureShape::ReaderWriterListed => vec![UNKNOWN],
+            _ => vec![],
+        };
+        let writer_features = match shape {
+            UnknownFeatureShape::NotListed => vec![],
+            _ => vec![UNKNOWN],
+        };
+        let protocol = Protocol::try_new_modern(reader_features, writer_features).unwrap();
+
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        (TableFeature::unknown(UNKNOWN), tc)
+    }
+
+    #[rstest]
+    #[case(UnknownFeatureShape::NotListed, false)]
+    #[case(UnknownFeatureShape::WriterOnlyListed, false)]
+    #[case(UnknownFeatureShape::ReaderWriterListed, false)]
+    // FIXME: Listed unknown features should be protocol-supported for forward compatibility.
+    fn test_unknown_feature_protocol_support(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_supported: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_supported(&unknown), expected_supported);
+    }
+
+    #[rstest]
+    #[case(UnknownFeatureShape::NotListed, false)]
+    #[case(UnknownFeatureShape::WriterOnlyListed, false)]
+    #[case(UnknownFeatureShape::ReaderWriterListed, false)]
+    // FIXME: Listed unknown features should be protocol-enabled for forward compatibility.
+    fn test_unknown_feature_protocol_enablement(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_enabled: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_enabled(&unknown), expected_enabled);
+    }
+
+    #[rstest]
+    #[case(UnknownFeatureShape::NotListed, Operation::Scan, true)]
+    #[case(UnknownFeatureShape::NotListed, Operation::Cdf, true)]
+    #[case(UnknownFeatureShape::NotListed, Operation::Write, true)]
+    #[case(UnknownFeatureShape::WriterOnlyListed, Operation::Scan, true)]
+    #[case(UnknownFeatureShape::WriterOnlyListed, Operation::Cdf, true)]
+    #[case(UnknownFeatureShape::WriterOnlyListed, Operation::Write, false)]
+    #[case(UnknownFeatureShape::ReaderWriterListed, Operation::Scan, false)]
+    #[case(UnknownFeatureShape::ReaderWriterListed, Operation::Cdf, false)]
+    #[case(UnknownFeatureShape::ReaderWriterListed, Operation::Write, false)]
+    fn test_unknown_feature_capabilities(
+        #[case] shape: UnknownFeatureShape,
+        #[case] operation: Operation,
+        #[case] expected_ok: bool,
+    ) {
+        let (_, config) = create_unknown_feature_config(shape);
+        assert_eq!(
+            config.ensure_operation_supported(operation).is_ok(),
+            expected_ok
+        );
     }
 
     #[test]
