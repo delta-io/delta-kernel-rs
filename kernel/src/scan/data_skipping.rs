@@ -14,6 +14,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
+use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef};
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -140,11 +141,11 @@ impl DataSkippingFilter {
     /// Apply the DataSkippingFilter to an EngineData batch.
     ///
     /// Returns a selection vector indicating which files passed data skipping.
-    /// The number of filtered files is recorded in the provided metrics.
+    /// If metrics are provided, the number of filtered files is recorded.
     pub(crate) fn apply(
         &self,
         batch: &dyn EngineData,
-        metrics: &super::log_replay::ScanMetrics,
+        metrics: Option<&ScanMetrics>,
     ) -> DeltaResult<Vec<bool>> {
         let batch_len = batch.len();
 
@@ -195,7 +196,9 @@ impl DataSkippingFilter {
             info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
         }
 
-        metrics.add_data_skipping_filtered(visitor.num_filtered);
+        if let Some(metrics) = metrics {
+            metrics.add_data_skipping_filtered(visitor.num_filtered);
+        }
         Ok(visitor.selection_vector)
     }
 }

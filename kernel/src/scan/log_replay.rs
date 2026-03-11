@@ -1,13 +1,12 @@
 use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
 use super::data_skipping::DataSkippingFilter;
+use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -293,7 +292,7 @@ impl ScanLogReplayProcessor {
             predicate,
             internal_state_blob,
             seen_file_keys: self.seen_file_keys,
-            checkpoint_info: CheckpointReadInfo::without_stats_parsed(),
+            checkpoint_info: self.checkpoint_info,
         })
     }
 
@@ -353,134 +352,27 @@ impl ScanLogReplayProcessor {
     }
 }
 
-/// Metrics collected from [`ScanLogReplayProcessor`]
-#[internal_api]
-pub(crate) struct ScanMetrics {
-    num_adds: AtomicU64,
-    num_removes: AtomicU64,
-    num_non_file_actions: AtomicU64,
-    hash_set_size: AtomicUsize,
-    data_skipping_filtered: AtomicU64,
-    partition_pruning_filtered: AtomicU64,
-    // Timing metrics (in nanoseconds)
-    dedup_visitor_time_ns: AtomicU64,
-    data_skipping_time_ns: AtomicU64,
-    partition_pruning_time_ns: AtomicU64,
-}
-
-impl Default for ScanMetrics {
-    fn default() -> Self {
-        Self {
-            num_adds: AtomicU64::new(0),
-            num_removes: AtomicU64::new(0),
-            num_non_file_actions: AtomicU64::new(0),
-            hash_set_size: AtomicUsize::new(0),
-            data_skipping_filtered: AtomicU64::new(0),
-            partition_pruning_filtered: AtomicU64::new(0),
-            dedup_visitor_time_ns: AtomicU64::new(0),
-            data_skipping_time_ns: AtomicU64::new(0),
-            partition_pruning_time_ns: AtomicU64::new(0),
-        }
-    }
-}
-
-impl ScanMetrics {
-    pub(crate) fn reset_counters(&self) {
-        // NOTE: We do not reset hash set size because that never decreases. All subsequent uses of
-        // the processor will reuse the same hashset.
-        self.num_adds.store(0, Ordering::SeqCst);
-        self.num_removes.store(0, Ordering::SeqCst);
-        self.num_non_file_actions.store(0, Ordering::SeqCst);
-        self.data_skipping_filtered.store(0, Ordering::SeqCst);
-        self.partition_pruning_filtered.store(0, Ordering::SeqCst);
-        self.dedup_visitor_time_ns.store(0, Ordering::SeqCst);
-        self.data_skipping_time_ns.store(0, Ordering::SeqCst);
-        self.partition_pruning_time_ns.store(0, Ordering::SeqCst);
-    }
-    pub(crate) fn incr_adds(&self) {
-        self.num_adds.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(crate) fn incr_removes(&self) {
-        self.num_removes.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(crate) fn incr_partition_pruning_filtered(&self) {
-        self.partition_pruning_filtered
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    pub(crate) fn incr_non_file_actions(&self) {
-        self.num_non_file_actions.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(crate) fn add_data_skipping_filtered(&self, value: u64) {
-        self.data_skipping_filtered
-            .fetch_add(value, Ordering::Relaxed);
-    }
-    pub(crate) fn set_hash_set(&self, value: usize) {
-        self.hash_set_size.fetch_max(value, Ordering::SeqCst);
-    }
-
-    pub(crate) fn add_dedup_visitor_time_ns(&self, duration_ns: u64) {
-        self.dedup_visitor_time_ns
-            .fetch_add(duration_ns, Ordering::Relaxed);
-    }
-
-    pub(crate) fn add_data_skipping_time_ns(&self, duration_ns: u64) {
-        self.data_skipping_time_ns
-            .fetch_add(duration_ns, Ordering::Relaxed);
-    }
-
-    pub(crate) fn add_partition_pruning_time_ns(&self, duration_ns: u64) {
-        self.partition_pruning_time_ns
-            .fetch_add(duration_ns, Ordering::Relaxed);
-    }
-
-    pub(crate) fn log_with_message(&self, message: impl AsRef<str>) {
-        let num_adds = self.num_adds.load(Ordering::Relaxed);
-        let num_removes = self.num_removes.load(Ordering::Relaxed);
-        let num_non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
-        let hash_set_size = self.hash_set_size.load(Ordering::Relaxed);
-        let data_skipping_filtered = self.data_skipping_filtered.load(Ordering::Relaxed);
-        let partition_pruning_filtered = self.partition_pruning_filtered.load(Ordering::Relaxed);
-        let dedup_visitor_time_ms = self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000;
-        let data_skipping_time_ms = self.data_skipping_time_ns.load(Ordering::Relaxed) / 1_000_000;
-        let partition_pruning_time_ms =
-            self.partition_pruning_time_ns.load(Ordering::Relaxed) / 1_000_000;
-        info!(
-            num_adds,
-            num_removes,
-            num_non_file_actions,
-            hash_set_size,
-            data_skipping_filtered,
-            partition_pruning_filtered,
-            dedup_visitor_time_ms,
-            data_skipping_time_ms,
-            partition_pruning_time_ms,
-            "{}",
-            message.as_ref()
-        );
-    }
-}
-
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<D: Deduplicator> {
+struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
-    metrics: Arc<ScanMetrics>,
+    metrics: &'a ScanMetrics,
 }
 
-impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
+impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
     fn new(
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
-        metrics: Arc<ScanMetrics>,
-    ) -> AddRemoveDedupVisitor<D> {
+        metrics: &'a ScanMetrics,
+    ) -> AddRemoveDedupVisitor<'a, D> {
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
@@ -511,7 +403,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on action type:
         // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
         // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8
@@ -529,9 +421,9 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         };
 
         if is_add {
-            self.metrics.incr_adds()
+            self.metrics.incr_add_actions_seen()
         } else {
-            self.metrics.incr_removes()
+            self.metrics.incr_remove_actions_seen()
         };
 
         // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
@@ -596,7 +488,7 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
     }
 }
 
-impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
+impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
@@ -842,7 +734,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
-            self.metrics.clone(),
+            &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -919,7 +811,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
-            self.metrics.clone(),
+            &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 

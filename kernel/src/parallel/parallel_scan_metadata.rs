@@ -42,13 +42,15 @@ impl SequentialScanMetadata {
             AfterSequential::Done(processor) => {
                 processor
                     .get_metrics()
-                    .log_with_message("Completed sequential scan metadata");
+                    .log_with_message("Sequential scan metadata completed");
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
                 processor
                     .get_metrics()
-                    .log_with_message("Completed sequential scan metadata");
+                    .log_with_message("Sequential scan metadata completed");
+
+                // Reset counters for parallel phase
                 processor.get_metrics().reset_counters();
 
                 Ok(AfterSequentialScanMetadata::Parallel {

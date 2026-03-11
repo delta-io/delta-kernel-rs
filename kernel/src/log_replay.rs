@@ -16,7 +16,7 @@
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::log_replay::ScanMetrics;
+use crate::scan::metrics::ScanMetrics;
 use crate::{DeltaResult, EngineData};
 
 use delta_kernel_derive::internal_api;
@@ -344,7 +344,7 @@ pub(crate) trait LogReplayProcessor: Sized {
         let selection_vector = match self.data_skipping_filter() {
             Some(filter) => {
                 let start = std::time::Instant::now();
-                let result = filter.apply(batch, metrics)?;
+                let result = filter.apply(batch, Some(metrics))?;
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
                 metrics.add_data_skipping_time_ns(elapsed_ns);
                 result
