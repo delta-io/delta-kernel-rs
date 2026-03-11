@@ -33,7 +33,7 @@ pub enum ParallelScan {
 pub struct TableInfo {
     pub name: String,                // Table name used for identifying the table
     pub description: Option<String>, // Human-readable description of the table
-    #[serde(alias = "table_root_path")]
+    #[serde(alias = "table_root_path", alias = "tableRootPath")]
     pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
@@ -245,13 +245,13 @@ mod tests {
         Some(7)
     )]
     #[case(
-        r#"{"type": "snapshot_construction", "version": 5}"#,
+        r#"{"type": "snapshot", "version": 5}"#,
         "snapshot_construction",
         Some(5)
     )]
-    #[case(r#"{"type": "snapshot_construction"}"#, "snapshot_construction", None)]
+    #[case(r#"{"type": "snapshot"}"#, "snapshot_construction", None)]
     #[case(
-        r#"{"type": "snapshot_construction", "version": 7, "extra_field": "should be ignored"}"#,
+        r#"{"type": "snapshot", "version": 7, "extra_field": "should be ignored"}"#,
         "snapshot_construction",
         Some(7)
     )]
