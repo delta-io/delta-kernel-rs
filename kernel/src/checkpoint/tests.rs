@@ -21,7 +21,7 @@ use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 use object_store::local::LocalFileSystem;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
 use test_utils::delta_path_for_version;

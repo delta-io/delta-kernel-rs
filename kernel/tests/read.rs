@@ -20,7 +20,7 @@ use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, St
 use delta_kernel::{Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,

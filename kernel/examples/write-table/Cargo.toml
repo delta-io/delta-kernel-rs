@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow = { version = "57", features = ["prettyprint", "chrono-tz"] }
+arrow = { version = "58", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
 # NB: common depends on 'arrow' (latest) so have to match here
 common = { path = "../common" }

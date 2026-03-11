@@ -11,7 +11,7 @@ use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
+use object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt, PutMode};
 use url::Url;
 
 use super::executor::TaskExecutor;
@@ -260,7 +260,6 @@ async fn open_json_file(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::ops::Range;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
@@ -280,8 +279,8 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::PutMultipartOptions;
     use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
-        PutPayload, PutResult, Result,
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutOptions, PutPayload, PutResult, Result,
     };
     use serde_json::json;
     use tracing::info;
@@ -351,8 +350,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl<T: ObjectStore> ObjectStore for OrderedGetStore<T> {
-        async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-            self.inner.put(location, payload).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: object_store::CopyOptions,
+        ) -> Result<()> {
+            self.inner.copy_opts(from, to, opts).await
         }
 
         async fn put_opts(
@@ -362,10 +366,6 @@ mod tests {
             opts: PutOptions,
         ) -> Result<PutResult> {
             self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
         }
 
         async fn put_multipart_opts(
@@ -380,9 +380,15 @@ mod tests {
         // - if yes, remove the path from the queue and proceed with the GET request, then wake the
         //   next path in order
         // - if no, register the waker and wait
-        async fn get(&self, location: &Path) -> Result<GetResult> {
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
             // Do the actual GET request first, then introduce any artificial ordering delays as needed
-            let result = self.inner.get(location).await;
+            let result = self.inner.get_opts(location, options.clone()).await;
+
+            // As of object_store 0.13 an ObjectStore.head() call _actually_ routes through to
+            // get_opts which can cause some unxpected behavior in our ordering tests
+            if options.head {
+                return result;
+            }
 
             // we implement a future which only resolves once the requested path is next in order
             future::poll_fn(move |cx| {
@@ -438,56 +444,19 @@ mod tests {
             result
         }
 
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-            self.inner.get_range(location, range).await
-        }
-
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-            self.inner.get_ranges(location, ranges).await
-        }
-
-        async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-            self.inner.head(location).await
-        }
-
-        async fn delete(&self, location: &Path) -> Result<()> {
-            self.inner.delete(location).await
-        }
-
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
         }
 
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.rename(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
-        }
-
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.rename_if_not_exists(from, to).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
         }
     }
 

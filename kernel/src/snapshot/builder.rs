@@ -165,7 +165,7 @@ mod tests {
 
     use itertools::Itertools;
     use object_store::memory::InMemory;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
     use serde_json::json;
 
     use super::*;

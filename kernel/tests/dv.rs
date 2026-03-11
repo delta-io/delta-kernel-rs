@@ -13,6 +13,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
+use object_store::ObjectStoreExt;
 use tempfile::tempdir;
 use test_utils::{
     create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,

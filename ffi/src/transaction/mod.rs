@@ -205,7 +205,7 @@ mod tests {
 
     use itertools::Itertools;
     use object_store::path::Path;
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
     use serde_json::json;
     use serde_json::Deserializer;
 

@@ -31,7 +31,7 @@ use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
