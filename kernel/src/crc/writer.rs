@@ -31,8 +31,6 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
 mod tests {
     use std::sync::Arc;
 
-    use object_store::memory::InMemory;
-
     use std::collections::HashMap;
 
     use super::*;
@@ -40,6 +38,7 @@ mod tests {
     use crate::crc::reader::try_read_crc_file;
     use crate::crc::FileStatsValidity;
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 

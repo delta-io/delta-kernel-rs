@@ -1733,7 +1733,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
         // Fallback error with the actual value that failed
         Err(Error::custom(format!(
             "Invalid data type: {}",
-            serde_json::to_string(&value).unwrap_or_else(|_| format!("{:?}", value))
+            serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}"))
         )))
     }
 }
