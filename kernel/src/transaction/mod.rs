@@ -531,31 +531,29 @@ impl<S> Transaction<S> {
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
-    /// Returns `None` if ICT is not enabled on the table.
+    /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
+    /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
+    /// property must also be `true` (`is_feature_enabled`).
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         let has_ict = self
             .read_snapshot
             .table_configuration()
-            .is_feature_supported(&TableFeature::InCommitTimestamp);
+            .is_feature_enabled(&TableFeature::InCommitTimestamp);
 
-        if has_ict && !self.is_create_table() {
-            Ok(self
-                .read_snapshot
-                .get_in_commit_timestamp(engine)?
-                .map(|prev_ict| {
-                    // The Delta protocol requires the timestamp to be "the larger of two values":
-                    // - The time at which the writer attempted the commit (current_time)
-                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
-                    self.commit_timestamp.max(prev_ict + 1)
-                }))
-        } else if has_ict && self.is_create_table() {
-            // ICT is enabled but this is a create-table transaction - not yet supported
-            Err(Error::unsupported(
-                "InCommitTimestamp is not yet supported for create table",
-            ))
-        } else {
-            Ok(None)
+        if !has_ict {
+            return Ok(None);
         }
+
+        if self.is_create_table() {
+            // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
+            return Ok(Some(self.commit_timestamp));
+        }
+
+        // Existing table: enforce monotonicity per the Delta protocol.
+        Ok(self
+            .read_snapshot
+            .get_in_commit_timestamp(engine)?
+            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
