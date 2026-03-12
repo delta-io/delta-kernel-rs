@@ -7,7 +7,7 @@
 
 ### 🚀 Features / new APIs
 
-1. Internal_api proc macro supports `use` now ([#2053]) ([#2106])
+1. internal_api proc macro supports `use` now ([#2106])
 
 ### 🐛 Bug Fixes
 
