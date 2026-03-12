@@ -15,7 +15,7 @@ pub(crate) struct ScanMetrics {
     /// Add files that survived log replay (files to read). includes files that survivd
     /// dataskipping, partition pruning, and add/remove deduplication.
     /// Java equivalent: `activeAddFilesCounter`
-    num_surviving_add_files: AtomicU64,
+    num_active_add_files: AtomicU64,
     /// Remove files seen (from delta/commit files only).
     /// Java equivalent: `removeFilesFromDeltaFilesCounter`
     num_remove_files_seen: AtomicU64,
@@ -35,7 +35,7 @@ impl Default for ScanMetrics {
     fn default() -> Self {
         Self {
             num_add_files_seen: AtomicU64::new(0),
-            num_surviving_add_files: AtomicU64::new(0),
+            num_active_add_files: AtomicU64::new(0),
             num_remove_files_seen: AtomicU64::new(0),
             num_non_file_actions: AtomicU64::new(0),
             num_predicate_filtered: AtomicU64::new(0),
@@ -52,7 +52,7 @@ impl ScanMetrics {
         // NOTE: hash_set_size is not reset since it is the same across different phases of log
         // replay.
         self.num_add_files_seen.store(0, Ordering::Relaxed);
-        self.num_surviving_add_files.store(0, Ordering::Relaxed);
+        self.num_active_add_files.store(0, Ordering::Relaxed);
         self.num_remove_files_seen.store(0, Ordering::Relaxed);
         self.num_non_file_actions.store(0, Ordering::Relaxed);
         self.num_predicate_filtered.store(0, Ordering::Relaxed);
@@ -64,8 +64,8 @@ impl ScanMetrics {
         self.num_add_files_seen.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn incr_surviving_add_files(&self) {
-        self.num_surviving_add_files.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn incr_active_add_files(&self) {
+        self.num_active_add_files.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn incr_remove_files_seen(&self) {
@@ -102,7 +102,7 @@ impl ScanMetrics {
     /// Logs all metrics with a message.
     pub(crate) fn log_with_message(&self, message: impl AsRef<str>) {
         let add_files_seen = self.num_add_files_seen.load(Ordering::Relaxed);
-        let surviving_add_files = self.num_surviving_add_files.load(Ordering::Relaxed);
+        let active_add_files = self.num_active_add_files.load(Ordering::Relaxed);
         let remove_files_seen = self.num_remove_files_seen.load(Ordering::Relaxed);
         let non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
         let predicate_filtered = self.num_predicate_filtered.load(Ordering::Relaxed);
@@ -112,7 +112,7 @@ impl ScanMetrics {
             self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000;
         info!(
             add_files_seen,
-            surviving_add_files,
+            active_add_files,
             remove_files_seen,
             non_file_actions,
             predicate_filtered,

@@ -484,7 +484,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.row_transform_exprs.resize_with(i, Default::default);
             self.row_transform_exprs.push(transform);
         }
-        self.metrics.incr_surviving_add_files();
+        self.metrics.incr_active_add_files();
         Ok(true)
     }
 }

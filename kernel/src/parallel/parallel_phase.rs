@@ -508,7 +508,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct ExpectedMetrics {
         add_files_seen: u64,
-        surviving_add_files: u64,
+        active_add_files: u64,
         remove_files_seen: u64,
         non_file_actions: u64,
         predicate_filtered: u64,
@@ -537,7 +537,7 @@ mod tests {
 
         // Extract and verify counter values from Phase 1
         let add_files_seen = extract_metric(logs, "add_files_seen");
-        let surviving_add_files = extract_metric(logs, "surviving_add_files");
+        let active_add_files = extract_metric(logs, "active_add_files");
         let remove_files_seen = extract_metric(logs, "remove_files_seen");
         let non_file_actions = extract_metric(logs, "non_file_actions");
         let predicate_filtered = extract_metric(logs, "predicate_filtered");
@@ -547,8 +547,8 @@ mod tests {
             "Sequential add_files_seen mismatch"
         );
         assert_eq!(
-            surviving_add_files, sequential_expected.surviving_add_files,
-            "Sequential surviving_add_files mismatch"
+            active_add_files, sequential_expected.active_add_files,
+            "Sequential active_add_files mismatch"
         );
         assert_eq!(
             remove_files_seen, sequential_expected.remove_files_seen,
@@ -571,7 +571,7 @@ mod tests {
         if let Some(expected) = parallel_expected {
             // Accumulate totals across all parallel logs
             let mut total_add_files_seen = 0u64;
-            let mut total_surviving_add_files = 0u64;
+            let mut total_active_add_files = 0u64;
             let mut total_remove_files_seen = 0u64;
             let mut total_non_file_actions = 0u64;
             let mut total_predicate_filtered = 0u64;
@@ -583,7 +583,7 @@ mod tests {
 
                 // Extract and accumulate metrics
                 total_add_files_seen += extract_metric(remaining, "add_files_seen");
-                total_surviving_add_files += extract_metric(remaining, "surviving_add_files");
+                total_active_add_files += extract_metric(remaining, "active_add_files");
                 total_remove_files_seen += extract_metric(remaining, "remove_files_seen");
                 total_non_file_actions += extract_metric(remaining, "non_file_actions");
                 total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
@@ -601,8 +601,8 @@ mod tests {
                 "Parallel add_files_seen mismatch"
             );
             assert_eq!(
-                total_surviving_add_files, expected.surviving_add_files,
-                "Parallel surviving_add_files mismatch"
+                total_active_add_files, expected.active_add_files,
+                "Parallel active_add_files mismatch"
             );
             assert_eq!(
                 total_remove_files_seen, expected.remove_files_seen,
@@ -632,14 +632,14 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 101,
-            surviving_add_files: 101,
+            active_add_files: 101,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -650,14 +650,14 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 101,
-            surviving_add_files: 101,
+            active_add_files: 101,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -671,7 +671,7 @@ mod tests {
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -680,7 +680,7 @@ mod tests {
         // add_files_seen counts files AFTER data skipping
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 97,
-            surviving_add_files: 97,
+            active_add_files: 97,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 4,
@@ -694,7 +694,7 @@ mod tests {
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -702,7 +702,7 @@ mod tests {
         // Data skipping filters 15 files (101 -> 86)
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 86,
-            surviving_add_files: 86,
+            active_add_files: 86,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 15,
@@ -716,7 +716,7 @@ mod tests {
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -724,7 +724,7 @@ mod tests {
         // Data skipping filters 69 files (101 -> 32)
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 32,
-            surviving_add_files: 32,
+            active_add_files: 32,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 69,
@@ -738,7 +738,7 @@ mod tests {
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
@@ -746,7 +746,7 @@ mod tests {
         // Data skipping filters 4 files (101 -> 97)
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 97,
-            surviving_add_files: 97,
+            active_add_files: 97,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 4,
@@ -761,14 +761,14 @@ mod tests {
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 5,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 69,
-            surviving_add_files: 69,
+            active_add_files: 69,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 32,
@@ -779,7 +779,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 3,
-            surviving_add_files: 3,
+            active_add_files: 3,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -791,14 +791,14 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 2,
-            surviving_add_files: 2,
+            active_add_files: 2,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -809,7 +809,7 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 3,
-            surviving_add_files: 3,
+            active_add_files: 3,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
@@ -821,14 +821,14 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 2,
-            surviving_add_files: 2,
+            active_add_files: 2,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -839,14 +839,14 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 4,
-            surviving_add_files: 4,
+            active_add_files: 4,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -857,14 +857,14 @@ mod tests {
         predicate: None,
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
-            surviving_add_files: 0,
+            active_add_files: 0,
             remove_files_seen: 0,
             non_file_actions: 4,
             predicate_filtered: 0,
         },
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 4,
-            surviving_add_files: 4,
+            active_add_files: 4,
             remove_files_seen: 0,
             non_file_actions: 0,
             predicate_filtered: 0,
@@ -876,7 +876,7 @@ mod tests {
         expected_sequential_metrics: ExpectedMetrics {
             // This table has single-part checkpoint, completes in sequential phase
             add_files_seen: 1,
-            surviving_add_files: 1,
+            active_add_files: 1,
             remove_files_seen: 0,
             non_file_actions: 3,
             predicate_filtered: 0,
