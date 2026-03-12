@@ -2208,8 +2208,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass for all-null clustering columns, got: {:?}",
-            result
+            "Stats validation should pass for all-null clustering columns, got: {result:?}",
         );
     }
 
