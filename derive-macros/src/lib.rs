@@ -220,9 +220,9 @@ pub fn internal_api(
 
 fn make_public(mut item: Item) -> Item {
     /// Transforms the passed visibility to be `pub`. We pass the original span that the visibility
-    /// came from, and associate it with the new span. This means that the compiler doesn't see the
-    /// change as "macro generated" and normal lints apply. We want this because it allows us to
-    /// catch "private_in_public" violations that are tricky to notice when just slapping
+    /// came from, and attach it to the newly created pub token. This means that the compiler treats
+    /// it as user-written code and normal lints apply. We want this because it allows us to catch
+    /// "private_in_public" violations that are tricky to notice when just slapping
     /// `#[internal_api]` on something.
     fn set_pub(vis: &mut Visibility, span: Span) -> Result<(), syn::Error> {
         if matches!(vis, Visibility::Public(_)) {
