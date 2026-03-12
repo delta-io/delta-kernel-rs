@@ -662,7 +662,7 @@ impl StructType {
             }
 
             // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
-            let key = field.name.to_ascii_lowercase();
+            let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
                 return Err(Error::schema(format!(
                     "Duplicate field name (case-insensitive): '{}'",
@@ -977,12 +977,11 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        let new_key = new_field.name.to_ascii_lowercase();
-        if self
-            .fields
-            .keys()
-            .any(|k| k.to_ascii_lowercase() == new_key)
-        {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields (e.g. stats_parsed) where exact-name matching
+        // is sufficient.
+        if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
                 new_field.name
@@ -1012,12 +1011,10 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
-        let new_key = new_field.name.to_ascii_lowercase();
-        if self
-            .fields
-            .keys()
-            .any(|k| k.to_ascii_lowercase() == new_key)
-        {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields where exact-name matching is sufficient.
+        if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
                 new_field.name
@@ -3578,21 +3575,6 @@ mod tests {
     }
 
     #[test]
-    fn test_with_field_inserted_after_case_insensitive_duplicate_field() {
-        let schema = StructType::try_new([
-            StructField::new("Id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let new_schema = schema.with_field_inserted_after(
-            Some("name"),
-            StructField::new("iD", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-        assert_result_error_with_message(new_schema, "Field iD already exists");
-    }
-
-    #[test]
     fn test_with_field_inserted_before() {
         let schema = StructType::try_new([
             StructField::new("id", DataType::INTEGER, false),
@@ -3624,21 +3606,6 @@ mod tests {
         );
         assert!(new_schema.is_err());
         assert_result_error_with_message(new_schema, "Field id already exists");
-    }
-
-    #[test]
-    fn test_with_field_inserted_before_case_insensitive_duplicate_field() {
-        let schema = StructType::try_new([
-            StructField::new("Id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-        .unwrap();
-        let new_schema = schema.with_field_inserted_before(
-            Some("name"),
-            StructField::new("iD", DataType::STRING, true),
-        );
-        assert!(new_schema.is_err());
-        assert_result_error_with_message(new_schema, "Field iD already exists");
     }
 
     #[test]

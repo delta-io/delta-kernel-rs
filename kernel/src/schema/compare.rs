@@ -101,7 +101,7 @@ impl SchemaComparison for StructType {
         let lowercase_field_map: HashMap<String, &StructField> = self
             .fields
             .iter()
-            .map(|(name, field)| (name.to_ascii_lowercase(), field))
+            .map(|(name, field)| (name.to_lowercase(), field))
             .collect();
         require!(
             lowercase_field_map.len() == self.fields.len(),
@@ -111,7 +111,7 @@ impl SchemaComparison for StructType {
         let lowercase_read_field_names: HashSet<String> = read_type
             .fields
             .keys()
-            .map(|x| x.to_ascii_lowercase())
+            .map(|x| x.to_lowercase())
             .collect();
         require!(
             lowercase_read_field_names.len() == read_type.fields.len(),
@@ -126,7 +126,7 @@ impl SchemaComparison for StructType {
             return Err(Error::MissingColumn);
         }
         for read_field in read_type.fields() {
-            match lowercase_field_map.get(&read_field.name().to_ascii_lowercase()) {
+            match lowercase_field_map.get(&read_field.name().to_lowercase()) {
                 Some(existing_field) => existing_field.can_read_as(read_field)?,
                 None => {
                     // Note: Delta spark does not perform the following check. Hence it ignores
