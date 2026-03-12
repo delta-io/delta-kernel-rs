@@ -663,7 +663,8 @@ mod tests {
             predicate_filtered: 0,
         }),
     })]
-    #[case::json_sidecars_with_predicate_gt_20(ParallelLogReplayCase {
+    #[case::data_skipping(ParallelLogReplayCase {
+        // Tests data skipping filtering based on column stats (min/max values)
         path: "v2-checkpoints-json-with-sidecars",
         predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
@@ -686,93 +687,25 @@ mod tests {
             predicate_filtered: 4,
         }),
     })]
-    #[case::json_sidecars_with_predicate_gt_80(ParallelLogReplayCase {
-        path: "v2-checkpoints-json-with-sidecars",
+    #[case::partition_pruning(ParallelLogReplayCase {
+        // Tests partition pruning filtering based on partition column values
+        // Table is partitioned by 'letter' with partitions: a, b, c, e, null
+        // Predicate letter='a' prunes 4 files (b, c, e, null), leaving 2 letter=a files
+        path: "basic_partitioned",
         predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(80i64)))
+            Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            add_files_seen: 0,
-            active_add_files: 0,
+            // All 6 files are seen, then partition pruning filters 4
+            add_files_seen: 6,
+            active_add_files: 2,
             remove_files_seen: 0,
-            non_file_actions: 5,
-            predicate_filtered: 0,
-        },
-        // Data skipping filters 15 files (101 -> 86)
-        expected_parallel_metrics: Some(ExpectedMetrics {
-            add_files_seen: 86,
-            active_add_files: 86,
-            remove_files_seen: 0,
-            non_file_actions: 0,
-            predicate_filtered: 15,
-        }),
-    })]
-    #[case::json_sidecars_with_predicate_lt_10(ParallelLogReplayCase {
-        path: "v2-checkpoints-json-with-sidecars",
-        predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::lt(column_expr!("id"), Expr::literal(10i64)))
-        }),
-        expected_sequential_metrics: ExpectedMetrics {
-            add_files_seen: 0,
-            active_add_files: 0,
-            remove_files_seen: 0,
-            non_file_actions: 5,
-            predicate_filtered: 0,
-        },
-        // Data skipping filters 69 files (101 -> 32)
-        expected_parallel_metrics: Some(ExpectedMetrics {
-            add_files_seen: 32,
-            active_add_files: 32,
-            remove_files_seen: 0,
-            non_file_actions: 0,
-            predicate_filtered: 69,
-        }),
-    })]
-    #[case::parquet_sidecars_with_predicate(ParallelLogReplayCase {
-        path: "v2-checkpoints-parquet-with-sidecars",
-        predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
-        }),
-        expected_sequential_metrics: ExpectedMetrics {
-            add_files_seen: 0,
-            active_add_files: 0,
-            remove_files_seen: 0,
-            non_file_actions: 5,
-            predicate_filtered: 0,
-        },
-        // Data skipping filters 4 files (101 -> 97)
-        expected_parallel_metrics: Some(ExpectedMetrics {
-            add_files_seen: 97,
-            active_add_files: 97,
-            remove_files_seen: 0,
-            non_file_actions: 0,
+            non_file_actions: 4,
             predicate_filtered: 4,
-        }),
-    })]
-    #[case::json_sidecars_with_very_selective_predicate(ParallelLogReplayCase {
-        path: "v2-checkpoints-json-with-sidecars",
-        predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            // Highly selective predicate filters 32 files (101 -> 69)
-            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(99i64)))
-        }),
-        expected_sequential_metrics: ExpectedMetrics {
-            add_files_seen: 0,
-            active_add_files: 0,
-            remove_files_seen: 0,
-            non_file_actions: 5,
-            predicate_filtered: 0,
         },
-        expected_parallel_metrics: Some(ExpectedMetrics {
-            add_files_seen: 69,
-            active_add_files: 69,
-            remove_files_seen: 0,
-            non_file_actions: 0,
-            predicate_filtered: 32,
-        }),
+        // No parallel phase (no V2 checkpoint with sidecars)
+        expected_parallel_metrics: None,
     })]
     #[case::json_without_sidecars(ParallelLogReplayCase {
         path: "v2-checkpoints-json-without-sidecars",
@@ -882,6 +815,24 @@ mod tests {
             predicate_filtered: 0,
         },
         // No parallel phase needed
+        expected_parallel_metrics: None,
+    })]
+    #[case::with_removes_deduplication(ParallelLogReplayCase {
+        // This table has removes that filter checkpoint adds, showing add_files_seen > active_add_files
+        path: "with_checkpoint_no_last_checkpoint",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            // Checkpoint 2 contains: add B (surviving state at v2), metadata/protocol
+            // Commit 3 (after checkpoint) has: add C, remove B
+            // Log replay: process commit 3 first (add C active, remove B recorded),
+            //             then checkpoint (add B filtered by remove)
+            // Result: 2 adds seen, 1 active (only C), 1 remove seen, B filtered by dedup
+            add_files_seen: 2,
+            active_add_files: 1,
+            remove_files_seen: 1,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
         expected_parallel_metrics: None,
     })]
     fn test_parallel_workflow_with_metrics(
