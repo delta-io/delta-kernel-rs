@@ -613,7 +613,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
         .is_some());
     assert_domain_metadata(post_commit_snapshot, &NoOpEngine);
 
-    // Case 2: Fresh snapshot loaded from disk, no CRC file => DM loded via log replay (slow path)
+    // Case 2: Fresh snapshot loaded from disk, no CRC file => DM loaded via log replay (slow path)
     let fresh_snapshot_no_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh_snapshot_no_crc
         .get_current_crc_if_loaded_for_testing()
