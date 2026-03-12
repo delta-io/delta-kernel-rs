@@ -24,6 +24,9 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
@@ -31,8 +34,6 @@ use tempfile::TempDir;
 use test_utils::set_json_value;
 
 use itertools::Itertools;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
@@ -3184,7 +3185,7 @@ async fn test_column_mapping_write(
 
     let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3454,7 +3455,7 @@ async fn test_column_mapping_partitioned_write(
     let tmp_dir = tempdir()?;
     copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3532,8 +3533,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     test_utils::copy_directory(source_path, &table_path).unwrap();
 
     let url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
         delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),

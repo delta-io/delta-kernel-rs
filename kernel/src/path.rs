@@ -465,8 +465,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use object_store::memory::InMemory;
     use test_utils::add_commit;
 
     impl ParsedLogPath<FileMeta> {
