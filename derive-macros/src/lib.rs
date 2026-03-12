@@ -219,27 +219,27 @@ pub fn internal_api(
 }
 
 fn make_public(mut item: Item) -> Item {
-    fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
+    fn set_pub(vis: &mut Visibility, span: Span) -> Result<(), syn::Error> {
         if matches!(vis, Visibility::Public(_)) {
             return Err(Error::new(
                 vis.span(),
                 "ineligible for #[internal_api]: item is already public",
             ));
         }
-        *vis = syn::parse_quote!(pub);
+        *vis = Visibility::Public(syn::token::Pub { span });
         Ok(())
     }
 
     let result = match &mut item {
-        Item::Fn(f) => set_pub(&mut f.vis),
-        Item::Struct(s) => set_pub(&mut s.vis),
-        Item::Enum(e) => set_pub(&mut e.vis),
-        Item::Trait(t) => set_pub(&mut t.vis),
-        Item::Type(t) => set_pub(&mut t.vis),
-        Item::Use(m) => set_pub(&mut m.vis),
-        Item::Static(s) => set_pub(&mut s.vis),
-        Item::Const(c) => set_pub(&mut c.vis),
-        Item::Union(u) => set_pub(&mut u.vis),
+        Item::Fn(f) => set_pub(&mut f.vis, f.sig.fn_token.span),
+        Item::Struct(s) => set_pub(&mut s.vis, s.struct_token.span),
+        Item::Enum(e) => set_pub(&mut e.vis, e.enum_token.span),
+        Item::Trait(t) => set_pub(&mut t.vis, t.trait_token.span),
+        Item::Type(t) => set_pub(&mut t.vis, t.type_token.span),
+        Item::Use(u) => set_pub(&mut u.vis, u.use_token.span),
+        Item::Static(s) => set_pub(&mut s.vis, s.static_token.span),
+        Item::Const(c) => set_pub(&mut c.vis, c.const_token.span),
+        Item::Union(u) => set_pub(&mut u.vis, u.union_token.span),
         // foreign mod, impl block, and all others not handled
         _ => Err(Error::new(
             item.span(),
