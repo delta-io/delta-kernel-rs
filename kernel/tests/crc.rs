@@ -547,9 +547,9 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 // ============================================================================
 
 /// Engine that panics if any handler is accessed.
-struct NoOpEngine;
+struct FailingEngine;
 
-impl Engine for NoOpEngine {
+impl Engine for FailingEngine {
     fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
         unimplemented!()
     }
@@ -611,7 +611,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     assert!(post_commit_snapshot
         .get_current_crc_if_loaded_for_testing()
         .is_some());
-    assert_domain_metadata(post_commit_snapshot, &NoOpEngine);
+    assert_domain_metadata(post_commit_snapshot, &FailingEngine);
 
     // Case 2: Fresh snapshot loaded from disk, no CRC file => DM loaded via log replay (slow path)
     let fresh_snapshot_no_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -628,7 +628,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     assert!(fresh_snapshot_with_crc
         .get_current_crc_if_loaded_for_testing()
         .is_some());
-    assert_domain_metadata(&fresh_snapshot_with_crc, &NoOpEngine);
+    assert_domain_metadata(&fresh_snapshot_with_crc, &FailingEngine);
 
     Ok(())
 }
