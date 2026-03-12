@@ -20,6 +20,8 @@ delta_kernel = { path = "../kernel", features = [
   "arrow",
   "internal-api",
 ] }
+delta_kernel_benchmarks = { path = "../benchmarks" }
+chrono = "0.4"
 futures = "0.3"
 itertools = "0.14"
 object_store = "0.12.3" # must 'match' arrow version above
@@ -47,4 +49,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 
 [[test]]
 name = "dat_reader"
+harness = false
+
+[[test]]
+name = "acceptance_workloads_reader"
 harness = false

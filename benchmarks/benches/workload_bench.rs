@@ -53,11 +53,11 @@ fn workload_benchmarks(c: &mut Criterion) {
                     }
                 }
             }
-            Spec::SnapshotConstruction(snapshot_construction_spec) => {
+            Spec::Snapshot(snapshot_spec) => {
                 let runner = SnapshotConstructionRunner::setup(
                     &workload.table_info,
                     &workload.case_name,
-                    snapshot_construction_spec,
+                    snapshot_spec,
                     engine.clone(),
                 )
                 .expect("Failed to create snapshot construction runner");

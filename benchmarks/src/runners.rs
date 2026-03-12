@@ -1,11 +1,12 @@
 //! Benchmark runners for executing Delta table operations.
 //!
-//! Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
-//! so that `execute` measures only the operation itself
-//! Results are discarded for benchmarking purposes
+//! Each runner holds all the state required for its workload (e.g. read metadata needs pre-built
+//! snapshots and a config) so that `execute` measures only the operation itself.
+//! Results are discarded for benchmarking purposes.
 
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+    TimeTravel,
 };
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
@@ -16,8 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use url::Url;
 
-/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
-/// so that `execute` measures only the operation itself
+/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built
+/// snapshots and a config) so that `execute` measures only the operation itself.
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
@@ -42,8 +43,15 @@ impl ReadMetadataRunner {
         let url = try_parse_uri(table_root)?;
 
         let mut builder = Snapshot::builder_for(url);
-        if let Some(version) = read_spec.version {
-            builder = builder.at_version(version);
+        if let Some(ref tt) = read_spec.time_travel {
+            match tt {
+                TimeTravel::Version { version } => {
+                    builder = builder.at_version(*version);
+                }
+                TimeTravel::Timestamp { timestamp: _ } => {
+                    return Err("Timestamp-based time travel not supported in benchmarks".into());
+                }
+            }
         }
 
         let snapshot = builder.build(engine.as_ref())?;
@@ -148,7 +156,7 @@ impl WorkloadRunner for ReadMetadataRunner {
     }
 }
 
-/// Factory function that creates the appropriate read runner for a given operation and config
+/// Factory function that creates the appropriate read runner for a given operation and config.
 pub fn create_read_runner(
     table_info: &TableInfo,
     case_name: &str,
@@ -182,6 +190,14 @@ impl SnapshotConstructionRunner {
         let table_root = table_info.resolved_table_root();
         let url = try_parse_uri(table_root)?;
 
+        let version = match &snapshot_spec.time_travel {
+            Some(TimeTravel::Version { version }) => Some(*version),
+            Some(TimeTravel::Timestamp { timestamp: _ }) => {
+                return Err("Timestamp-based time travel not supported in benchmarks".into());
+            }
+            None => None,
+        };
+
         let name = format!(
             "{}/{}/{}",
             table_info.name,
@@ -191,7 +207,7 @@ impl SnapshotConstructionRunner {
 
         Ok(Self {
             url,
-            version: snapshot_spec.version,
+            version,
             engine,
             name,
         })
@@ -217,7 +233,7 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
+    use crate::models::{ParallelScan, ReadConfig, ReadSpec, SnapshotConstructionSpec, TableInfo};
     use delta_kernel::engine::default::DefaultEngine;
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
@@ -235,7 +251,12 @@ mod tests {
     }
 
     fn test_read_spec() -> ReadSpec {
-        ReadSpec { version: None }
+        ReadSpec {
+            time_travel: None,
+            predicate: None,
+            columns: None,
+            expected: None,
+        }
     }
 
     fn serial_config() -> ReadConfig {
@@ -292,7 +313,10 @@ mod tests {
     }
 
     fn test_snapshot_spec() -> SnapshotConstructionSpec {
-        SnapshotConstructionSpec { version: None }
+        SnapshotConstructionSpec {
+            time_travel: None,
+            expected: None,
+        }
     }
 
     #[test]

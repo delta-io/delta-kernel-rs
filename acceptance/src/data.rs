@@ -1,9 +1,10 @@
 use std::{path::Path, sync::Arc};
 
-use delta_kernel::arrow::array::{Array, RecordBatch};
-use delta_kernel::arrow::compute::{concat_batches, lexsort_to_indices, take, SortColumn};
-use delta_kernel::arrow::datatypes::{DataType, Schema};
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::compute::concat_batches;
+use delta_kernel::arrow::datatypes::Schema;
 
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
@@ -41,72 +42,59 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Rec
     Ok(all_data)
 }
 
-pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
-    // Sort by all columns
-    let mut sort_columns = vec![];
-    for col in batch.columns() {
-        match col.data_type() {
-            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _) => {
-                // can't sort structs, lists, or maps
-            }
-            _ => sort_columns.push(SortColumn {
-                values: col.clone(),
-                options: None,
-            }),
+pub fn assert_data_matches(
+    result: Vec<RecordBatch>,
+    result_schema: &delta_kernel::schema::Schema,
+    expected: RecordBatch,
+    expected_rows: Option<usize>,
+) -> DeltaResult<()> {
+    use delta_kernel::arrow::util::pretty::pretty_format_batches;
+
+    let arrow_schema = Schema::try_from_kernel(result_schema)?;
+    let arrow_schema = std::sync::Arc::new(arrow_schema);
+    let all_data = concat_batches(&arrow_schema, result.iter())?;
+
+    // Format both batches as strings for order-independent comparison
+    let actual_str = pretty_format_batches(std::slice::from_ref(&all_data))
+        .map_err(|e| Error::generic(format!("Failed to format actual: {}", e)))?
+        .to_string();
+    let expected_str = pretty_format_batches(std::slice::from_ref(&expected))
+        .map_err(|e| Error::generic(format!("Failed to format expected: {}", e)))?
+        .to_string();
+
+    let mut actual_lines: Vec<&str> = actual_str.trim().lines().collect();
+    let mut expected_lines: Vec<&str> = expected_str.trim().lines().collect();
+
+    // Sort data lines (skip header at indices 0-1 and footer at last index)
+    let num_actual = actual_lines.len();
+    let num_expected = expected_lines.len();
+    if num_actual > 3 {
+        actual_lines[2..num_actual - 1].sort_unstable();
+    }
+    if num_expected > 3 {
+        expected_lines[2..num_expected - 1].sort_unstable();
+    }
+
+    // Compare sorted lines
+    if actual_lines != expected_lines {
+        return Err(Error::generic(format!(
+            "Data mismatch:\nExpected:\n{}\nActual:\n{}",
+            expected_lines.join("\n"),
+            actual_lines.join("\n")
+        )));
+    }
+
+    // Validate row counts
+    if all_data.num_rows() != expected.num_rows() {
+        return Err(Error::generic_err("Didn't have same number of rows"));
+    }
+    if let Some(expected_row_count) = expected_rows {
+        if all_data.num_rows() != expected_row_count {
+            return Err(Error::generic("Didn't have expected number of rows"));
         }
     }
-    let indices = lexsort_to_indices(&sort_columns, None)?;
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|c| take(c, &indices, None).unwrap())
-        .collect();
-    Ok(RecordBatch::try_new(batch.schema(), columns)?)
-}
 
-// Ensure that two schema have the same field names, and dict_is_ordered
-// We ignore:
-//  - data type: This is checked already in `assert_columns_match`
-//  - nullability: parquet marks many things as nullable that we don't in our schema
-//  - metadata: because that diverges from the real data to the golden tabled data
-fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
-    for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
-        assert!(
-            schema_field.name() == golden_field.name(),
-            "Field names don't match"
-        );
-        assert!(
-            schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
-            "Field dict_is_ordered doesn't match"
-        );
-    }
-}
-
-// some things are equivalent, but don't show up as equivalent for `==`, so we normalize here
-fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
-    if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
-        if **zone == *"+00:00" {
-            let data_type = DataType::Timestamp(*unit, Some("UTC".into()));
-            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to UTC")
-        } else {
-            col
-        }
-    } else {
-        col
-    }
-}
-
-fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) {
-    for (actual, expected) in actual.iter().zip(expected) {
-        let actual = normalize_col(actual.clone());
-        let expected = normalize_col(expected.clone());
-        // note that array equality includes data_type equality
-        // See: https://arrow.apache.org/rust/arrow_data/equal/fn.equal.html
-        assert_eq!(
-            &actual, &expected,
-            "Column data didn't match. Got {actual:?}, expected {expected:?}"
-        );
-    }
+    Ok(())
 }
 
 pub async fn assert_scan_metadata(
@@ -116,28 +104,16 @@ pub async fn assert_scan_metadata(
     let table_root = test_case.table_root()?;
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
-    let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| -> DeltaResult<_> {
             let record_batch = data?.try_into_record_batch()?;
-            if schema.is_none() {
-                schema = Some(record_batch.schema());
-            }
             Ok(record_batch)
         })
         .try_collect()?;
-    let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
-    let all_data = sort_record_batch(all_data)?;
+    let kernel_schema = scan.logical_schema();
     let golden = read_golden(test_case.root_dir(), None).await?;
-    let golden = sort_record_batch(golden)?;
-
-    assert_columns_match(all_data.columns(), golden.columns());
-    assert_schema_fields_match(all_data.schema().as_ref(), golden.schema().as_ref());
-    assert!(
-        all_data.num_rows() == golden.num_rows(),
-        "Didn't have same number of rows"
-    );
+    assert_data_matches(batches, kernel_schema.as_ref(), golden, None)?;
 
     Ok(())
 }
