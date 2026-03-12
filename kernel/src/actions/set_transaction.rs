@@ -33,7 +33,6 @@ impl SetTransactionScanner {
     ///
     /// This performs log replay and populates the `SetTransactionMap` with the latest `txn` action
     /// found for each app_id.
-    #[allow(unused)]
     pub(crate) fn get_all(
         log_segment: &LogSegment,
         engine: &dyn Engine,

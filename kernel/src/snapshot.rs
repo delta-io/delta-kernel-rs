@@ -677,8 +677,7 @@ impl Snapshot {
 
     /// Fetch all non-expired SetTransactions for this snapshot.
     ///
-    /// Uses the CRC fast path when available, falling back to log replay via
-    /// [`SetTransactionScanner::get_all`].
+    /// Uses the CRC fast path when available, falling back to log replay.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_set_transactions(
