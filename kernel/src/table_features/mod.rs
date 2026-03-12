@@ -196,6 +196,7 @@ pub(crate) enum EnablementCheck {
 
 /// Represents the type of operation being performed on a table
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[internal_api]
 pub(crate) enum Operation {
     /// Read operations on regular table data
     Scan,
