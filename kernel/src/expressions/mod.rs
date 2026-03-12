@@ -921,17 +921,21 @@ impl Predicate {
     }
 
     /// Creates a new junction predicate OP(preds...). Normalizes degenerate cases:
-    /// - Empty junction returns the identity element: `AND()` -> true, `OR()` -> false.
-    /// - Single-element junction returns the element directly: `AND(p)` -> p.
+    ///
+    /// - Empty junction returns the identity element (the value that has no effect when
+    ///   combined with other predicates under the same operator):
+    ///   - `AND()` -> `true`, because `true AND p` == `p` for any predicate `p`.
+    ///   - `OR()` -> `false`, because `false OR p` == `p` for any predicate `p`.
+    /// - Single-element junction unwraps the element: `AND(p)` / `OR(p)` -> `p`.
     pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
-        let preds: Vec<_> = preds.into_iter().collect();
-        match <[_; 1]>::try_from(preds) {
-            Ok([pred]) => pred,
-            Err(preds) if preds.is_empty() => match op {
+        let mut preds: Vec<_> = preds.into_iter().collect();
+        match preds.len() {
+            0 => match op {
                 JunctionPredicateOp::And => Self::literal(true),
                 JunctionPredicateOp::Or => Self::literal(false),
             },
-            Err(preds) => Self::Junction(JunctionPredicate { op, preds }),
+            1 => preds.remove(0),
+            _ => Self::Junction(JunctionPredicate { op, preds }),
         }
     }
 

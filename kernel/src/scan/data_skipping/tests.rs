@@ -536,7 +536,6 @@ fn test_timestamp_predicates_dont_data_skip() {
     }
 }
 
-<<<<<<< HEAD
 // Tests for partition-aware data skipping
 
 /// Helper to build a partition columns set with a single "part_col" entry.
