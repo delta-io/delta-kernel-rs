@@ -115,7 +115,7 @@ pub struct Crc {
         deserialize_with = "de_opt_vec_to_opt_map",
         serialize_with = "ser_opt_map_to_opt_vec"
     )]
-    pub(crate) set_transactions: Option<HashMap<String, SetTransaction>>,
+    pub set_transactions: Option<HashMap<String, SetTransaction>>,
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored. `None` = not tracked (field absent in CRC JSON or not
     /// computed). `Some(empty_map)` = tracked, no active domain metadata. `apply()` skips
