@@ -75,13 +75,17 @@ impl<S> Transaction<S> {
 
                 // Step 1: Build output schema - all engine fields first, then any kernel-only
                 // fields that are not already present in the engine schema appended at the end.
-                let mut output_fields: Vec<StructField> =
-                    engine_commit_info_schema.fields().cloned().collect();
-                for kernel_field in kernel_schema.fields() {
-                    if !engine_commit_info_schema.contains(kernel_field.name()) {
-                        output_fields.push(kernel_field.clone());
-                    }
-                }
+                let output_fields: Vec<_> = engine_commit_info_schema
+                    .fields()
+                    .map(|field| kernel_schema.field(field.name()).unwrap_or(field))
+                    .cloned()
+                    .chain(
+                        kernel_schema
+                            .fields()
+                            .filter(|field| !engine_commit_info_schema.contains(field.name()))
+                            .cloned(),
+                    )
+                    .collect();
 
                 let output_schema = StructType::new_unchecked(output_fields);
 
@@ -253,7 +257,7 @@ mod tests {
         Ok((engine, txn))
     }
 
-    /// Case 1: no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
+    /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
     /// outer struct, matching the Delta log action format produced by `get_log_commit_info_schema`.
     #[test]
     fn test_build_commit_info_none_branch() -> DeltaResult<()> {
@@ -271,7 +275,7 @@ mod tests {
         Ok(())
     }
 
-    /// Case 2: engine schema has fields that are fully disjoint from CommitInfo -- all CommitInfo
+    /// engine schema has fields that are fully disjoint from CommitInfo -- all CommitInfo
     /// fields are appended after the engine-only fields, in CommitInfo schema order.
     #[test]
     fn test_build_commit_info_disjoint_schemas() -> DeltaResult<()> {
@@ -316,7 +320,7 @@ mod tests {
         Ok(())
     }
 
-    /// Case 3: engine schema contains every kernel's CommitInfo field.
+    /// engine schema contains every kernel's CommitInfo field.
     /// All overlapping fields must be replaced by kernel values, no new fields added.
     #[test]
     fn test_build_commit_info_full_overlap() -> DeltaResult<()> {
@@ -374,7 +378,7 @@ mod tests {
         Ok(())
     }
 
-    /// Case 4: engine schema has partial overlap -- overlapping fields are replaced, engine-only
+    /// engine schema has partial overlap -- overlapping fields are replaced, engine-only
     /// fields pass through, and remaining CommitInfo fields are appended after the last engine field.
     #[test]
     fn test_build_commit_info_partial_overlap() -> DeltaResult<()> {
@@ -418,7 +422,54 @@ mod tests {
         Ok(())
     }
 
-    /// Case 5: engine schema is empty -- all CommitInfo fields are prepended (which, with no engine
+    /// engine schema has overlapping fields with different DataTypes than kernel expects.
+    /// Kernel replacement must win, so each output field has the kernel's type.
+    #[test]
+    fn test_build_commit_info_type_conflict_replaced_by_kernel() -> DeltaResult<()> {
+        let (data, schema) = make_engine_commit_info(
+            vec![
+                ArrowField::new("timestamp", ArrowDataType::Utf8, true),
+                ArrowField::new("inCommitTimestamp", ArrowDataType::Utf8, true),
+                ArrowField::new("operation", ArrowDataType::Int64, true),
+                ArrowField::new("isBlindAppend", ArrowDataType::Utf8, true),
+                ArrowField::new("myCustomField", ArrowDataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["not-a-timestamp"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["not-a-timestamp"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["not-a-bool"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["keep_me"])) as ArrayRef,
+            ],
+        );
+        let (engine, txn) = make_txn(Some((data, schema)))?;
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), make_kernel_commit_info())?,
+        )?;
+        let ci = commit_info_struct(&result);
+
+        // Each kernel-owned field has the kernel's type, not the engine's.
+        let field_type = |name: &str| {
+            ci.fields()
+                .iter()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("field '{name}' must be present"))
+                .data_type()
+                .clone()
+        };
+        assert_eq!(field_type("timestamp"), ArrowDataType::Int64);
+        assert_eq!(field_type("inCommitTimestamp"), ArrowDataType::Int64);
+        assert_eq!(field_type("operation"), ArrowDataType::Utf8);
+        assert_eq!(field_type("isBlindAppend"), ArrowDataType::Boolean);
+
+        // Engine-only field passes through with its original type and value unchanged.
+        assert_eq!(field_type("myCustomField"), ArrowDataType::Utf8);
+        assert_eq!(get_str(ci, "myCustomField"), "keep_me");
+        Ok(())
+    }
+
+    /// engine schema is empty -- all CommitInfo fields are prepended (which, with no engine
     /// fields preceding them, is equivalent to producing the full CommitInfo schema).
     #[test]
     fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
