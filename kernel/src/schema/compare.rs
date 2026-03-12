@@ -108,11 +108,8 @@ impl SchemaComparison for StructType {
             Error::InvalidSchema
         );
 
-        let lowercase_read_field_names: HashSet<String> = read_type
-            .fields
-            .keys()
-            .map(|x| x.to_lowercase())
-            .collect();
+        let lowercase_read_field_names: HashSet<String> =
+            read_type.fields.keys().map(|x| x.to_lowercase()).collect();
         require!(
             lowercase_read_field_names.len() == read_type.fields.len(),
             Error::InvalidSchema
