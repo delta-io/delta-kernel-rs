@@ -1,7 +1,7 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
@@ -16,7 +16,7 @@ use tracing::warn;
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, CowExt as _};
+use crate::utils::{map_owned_children_or_else, require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
@@ -568,7 +568,7 @@ impl Display for StructField {
                 metadata_str.push_str(", ");
             }
             first = false;
-            metadata_str.push_str(&format!("{}: {:?}", k, v));
+            metadata_str.push_str(&format!("{k}: {v:?}"));
         }
         metadata_str.push('}');
         write!(
@@ -636,12 +636,14 @@ impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
-    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate field names (case-insensitive; Delta column names are
+    ///   case-insensitive per the protocol)
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
+        let mut seen_lowercase_names = HashSet::new();
 
         // Validate each field during insertion
         for (i, field) in fields.into_iter().enumerate() {
@@ -659,10 +661,16 @@ impl StructType {
                 }
             }
 
-            // Check for duplicate field names
-            if let Some(dup) = field_map.insert(field.name.clone(), field) {
-                return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
+            let key = field.name.to_lowercase();
+            if !seen_lowercase_names.insert(key) {
+                return Err(Error::schema(format!(
+                    "Duplicate field name (case-insensitive): '{}'",
+                    field.name
+                )));
             }
+
+            field_map.insert(field.name.clone(), field);
         }
 
         Ok(Self {
@@ -969,6 +977,10 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields (e.g. stats_parsed) where exact-name matching
+        // is sufficient.
         if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
@@ -981,7 +993,7 @@ impl StructType {
                 self.fields
                     .get_index_of(after)
                     .map(|index| index + 1)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))
+                    .ok_or_else(|| Error::generic(format!("Field {after} not found")))
             })
             .unwrap_or_else(|| Ok(self.fields.len()))?;
 
@@ -999,6 +1011,9 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields where exact-name matching is sufficient.
         if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
@@ -1010,7 +1025,7 @@ impl StructType {
             .map(|before| {
                 self.fields
                     .get_index_of(before)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", before)))
+                    .ok_or_else(|| Error::generic(format!("Field {before} not found")))
             })
             .unwrap_or_else(|| Ok(0))?;
 
@@ -1026,7 +1041,8 @@ impl StructType {
         self
     }
 
-    /// Returns a new [`StructType`] containing only the fields for which `predicate` returns `true`.
+    /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
+    /// returns `true`. This does not recurse into nested [`StructType`] fields.
     pub fn with_fields_filtered(
         &self,
         predicate: impl Fn(&StructField) -> bool,
@@ -1044,7 +1060,7 @@ impl StructType {
         let replace_field = self
             .fields
             .get_mut(name)
-            .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
+            .ok_or_else(|| Error::generic(format!("Field {name} not found")))?;
 
         *replace_field = new_field;
         Ok(self)
@@ -1080,7 +1096,7 @@ fn write_struct_type(
         levels.push(is_last);
 
         write_indent(f, levels)?;
-        writeln!(f, "{}", field)?;
+        writeln!(f, "{field}")?;
 
         field.data_type.fmt_recursive(f, levels)?;
 
@@ -1455,7 +1471,7 @@ impl DecimalType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -1480,11 +1496,7 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
-    #[serde(
-        serialize_with = "serialize_decimal",
-        deserialize_with = "deserialize_decimal",
-        untagged
-    )]
+    #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
 
@@ -1527,32 +1539,6 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<DecimalType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let str_value = String::deserialize(deserializer)?;
-    require!(
-        str_value.starts_with("decimal(") && str_value.ends_with(')'),
-        serde::de::Error::custom(format!("Invalid decimal: {str_value}"))
-    );
-
-    let mut parts = str_value[8..str_value.len() - 1].split(',');
-    let precision = parts
-        .next()
-        .and_then(|part| part.trim().parse::<u8>().ok())
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid precision in decimal: {str_value}"))
-        })?;
-    let scale = parts
-        .next()
-        .and_then(|part| part.trim().parse::<u8>().ok())
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid scale in decimal: {str_value}"))
-        })?;
-    DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
-}
-
 fn serialize_variant<S: serde::Serializer>(
     _: &StructType,
     serializer: S,
@@ -1560,21 +1546,60 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
-fn deserialize_variant<'de, D>(deserializer: D) -> Result<Box<StructType>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let str_value = String::deserialize(deserializer)?;
-    require!(
-        str_value == "variant",
-        serde::de::Error::custom(format!("Invalid variant: {str_value}"))
-    );
-    match DataType::unshredded_variant() {
-        DataType::Variant(st) => Ok(st),
-        _ => Err(serde::de::Error::custom(
-            "Issue in DataType::unshredded_variant(). Please raise an issue at ".to_string()
-                + "delta-io/delta-kernel-rs.",
-        )),
+// Custom Deserialize to provide clear error messages for unsupported types.
+// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'interval second'"
+impl<'de> serde::Deserialize<'de> for PrimitiveType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let str_value = String::deserialize(deserializer)?;
+
+        match str_value.as_str() {
+            "string" => Ok(PrimitiveType::String),
+            "long" => Ok(PrimitiveType::Long),
+            "integer" => Ok(PrimitiveType::Integer),
+            "short" => Ok(PrimitiveType::Short),
+            "byte" => Ok(PrimitiveType::Byte),
+            "float" => Ok(PrimitiveType::Float),
+            "double" => Ok(PrimitiveType::Double),
+            "boolean" => Ok(PrimitiveType::Boolean),
+            "binary" => Ok(PrimitiveType::Binary),
+            "date" => Ok(PrimitiveType::Date),
+            "timestamp" => Ok(PrimitiveType::Timestamp),
+            "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
+                // Parse decimal type
+                let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
+                let precision = parts
+                    .next()
+                    .and_then(|part| part.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!(
+                            "Invalid precision in decimal: {decimal_str}"
+                        ))
+                    })?;
+                let scale = parts
+                    .next()
+                    .and_then(|part| part.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!("Invalid scale in decimal: {decimal_str}"))
+                    })?;
+                // Reject extra parts (e.g., decimal(10,2,99))
+                if parts.next().is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "Invalid decimal format (expected 2 parts): {decimal_str}"
+                    )));
+                }
+                DecimalType::try_new(precision, scale)
+                    .map(PrimitiveType::Decimal)
+                    .map_err(serde::de::Error::custom)
+            }
+            unsupported => Err(serde::de::Error::custom(format!(
+                "Unsupported Delta table type: '{unsupported}'"
+            ))),
+        }
     }
 }
 
@@ -1600,7 +1625,7 @@ impl Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
@@ -1615,10 +1640,7 @@ pub enum DataType {
     Map(Box<MapType>),
     /// The Variant data type. The physical representation can be flexible to support shredded
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
-    #[serde(
-        serialize_with = "serialize_variant",
-        deserialize_with = "deserialize_variant"
-    )]
+    #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
 }
 
@@ -1658,6 +1680,61 @@ impl From<ArrayType> for DataType {
 impl From<SchemaRef> for DataType {
     fn from(schema: SchemaRef) -> Self {
         Arc::unwrap_or_clone(schema).into()
+    }
+}
+
+// Custom Deserialize to preserve error messages from PrimitiveType.
+// Serde's untagged enum only reports the last variant's error, discarding PrimitiveType's
+// clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
+// dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
+impl<'de> serde::Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        use serde_json::Value;
+
+        let value = Value::deserialize(deserializer)?;
+
+        // String values are either primitive types or "variant"
+        if let Value::String(s) = &value {
+            if s == "variant" {
+                return match DataType::unshredded_variant() {
+                    DataType::Variant(st) => Ok(DataType::Variant(st)),
+                    _ => Err(Error::custom("Failed to create variant type")),
+                };
+            }
+
+            // Try PrimitiveType - this will give us good error messages for unsupported types
+            return PrimitiveType::deserialize(value.clone())
+                .map(DataType::Primitive)
+                .map_err(|e| Error::custom(e.to_string()));
+        }
+
+        // Object values are complex types - dispatch based on "type" field
+        if let Value::Object(map) = &value {
+            if let Some(Value::String(type_str)) = map.get("type") {
+                return match type_str.as_str() {
+                    "array" => ArrayType::deserialize(value)
+                        .map(|at| DataType::Array(Box::new(at)))
+                        .map_err(|e| Error::custom(e.to_string())),
+                    "struct" => StructType::deserialize(value)
+                        .map(|st| DataType::Struct(Box::new(st)))
+                        .map_err(|e| Error::custom(e.to_string())),
+                    "map" => MapType::deserialize(value)
+                        .map(|mt| DataType::Map(Box::new(mt)))
+                        .map_err(|e| Error::custom(e.to_string())),
+                    _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
+                };
+            }
+        }
+
+        // Fallback error with the actual value that failed
+        Err(Error::custom(format!(
+            "Invalid data type: {}",
+            serde_json::to_string(&value).unwrap_or_else(|_| format!("{:?}", value))
+        )))
     }
 }
 
@@ -1905,28 +1982,8 @@ pub trait SchemaTransform<'a> {
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
     /// update the struct to reference all surviving fields. Otherwise, no-op.
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        use Cow::*;
-        let mut num_borrowed = 0;
-        let fields: Vec<_> = stype
-            .fields()
-            .filter_map(|field| self.transform_struct_field(field))
-            .inspect(|field| {
-                if let Borrowed(_) = field {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if fields.is_empty() {
-            None
-        } else if num_borrowed < stype.fields.len() {
-            // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new_unchecked(
-                fields.into_iter().map(|f| f.into_owned()),
-            )))
-        } else {
-            Some(Borrowed(stype))
-        }
+        let transformed_children = stype.fields().map(|f| self.transform_struct_field(f));
+        map_owned_children_or_else(stype, transformed_children, StructType::new_unchecked)
     }
 
     /// Recursively transforms an array's element type. If the element type changes, update the
@@ -2056,6 +2113,7 @@ mod tests {
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
+    use rstest::rstest;
     use serde_json;
 
     fn example_schema_metadata() -> &'static str {
@@ -2222,6 +2280,135 @@ mod tests {
             }
             _ => panic!("Expected DataType::Variant, got {unshredded_variant_type:?}"),
         }
+    }
+
+    #[rstest]
+    #[case("interval second")]
+    #[case("interval day")]
+    #[case("money")]
+    fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
+        let data = format!(
+            r#"{{
+                "name": "test_field",
+                "type": "{unsupported_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let expected_msg = format!("Unsupported Delta table type: '{unsupported_type}'");
+        assert!(
+            err.to_string().contains(&expected_msg),
+            "Expected error message about unsupported type '{unsupported_type}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case("string", DataType::STRING)]
+    #[case("long", DataType::LONG)]
+    #[case("integer", DataType::INTEGER)]
+    #[case("short", DataType::SHORT)]
+    #[case("byte", DataType::BYTE)]
+    #[case("float", DataType::FLOAT)]
+    #[case("double", DataType::DOUBLE)]
+    #[case("boolean", DataType::BOOLEAN)]
+    #[case("binary", DataType::BINARY)]
+    #[case("date", DataType::DATE)]
+    #[case("timestamp", DataType::TIMESTAMP)]
+    #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
+    fn test_primitive_type_deserialization_still_works(
+        #[case] type_str: &str,
+        #[case] expected_type: DataType,
+    ) {
+        let data = format!(
+            r#"{{
+                "name": "test_field",
+                "type": "{type_str}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let field: StructField = serde_json::from_str(&data).unwrap();
+        assert_eq!(field.data_type, expected_type);
+    }
+
+    #[rstest]
+    #[case(10, 2)]
+    #[case(16, 4)]
+    #[case(38, 10)]
+    fn test_decimal_with_primitive_deserializer(#[case] precision: u8, #[case] scale: u8) {
+        let data = format!(
+            r#"{{
+                "name": "test_decimal",
+                "type": "decimal({precision},{scale})",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let field: StructField = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            field.data_type,
+            DataType::decimal(precision, scale).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case("decimal(invalid)", "Invalid precision in decimal")]
+    #[case("decimal(10)", "Invalid scale in decimal")]
+    #[case("decimal()", "Invalid precision in decimal")]
+    #[case("decimal(10,2,99)", "Invalid decimal format (expected 2 parts)")]
+    fn test_invalid_decimal_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let data = format!(
+            r#"{{
+                "name": "invalid",
+                "type": "{invalid_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case(
+        r#"{"type": "array", "elementType": "integer", "containsNull": false}"#,
+        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)))
+    )]
+    #[case(
+        r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
+        DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("b", DataType::STRING, true),
+        ])))
+    )]
+    #[case(
+        r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
+        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, true)))
+    )]
+    #[case("\"string\"", DataType::STRING)]
+    #[case("\"long\"", DataType::LONG)]
+    #[case("\"integer\"", DataType::INTEGER)]
+    #[case("\"short\"", DataType::SHORT)]
+    #[case("\"byte\"", DataType::BYTE)]
+    #[case("\"float\"", DataType::FLOAT)]
+    #[case("\"double\"", DataType::DOUBLE)]
+    #[case("\"boolean\"", DataType::BOOLEAN)]
+    #[case("\"binary\"", DataType::BINARY)]
+    #[case("\"date\"", DataType::DATE)]
+    #[case("\"timestamp\"", DataType::TIMESTAMP)]
+    #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"variant\"", DataType::unshredded_variant())]
+    fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
+        let data_type: DataType = serde_json::from_str(type_json).unwrap();
+        assert_eq!(data_type, expected);
     }
 
     #[test]
@@ -2791,7 +2978,7 @@ mod tests {
                 1 => assert_eq!(field.name, "required_int"),
                 2 => assert_eq!(field.name, "nullable_bool"),
                 3 => assert_eq!(field.name, "required_long"),
-                _ => panic!("Unexpected field index: {}", index),
+                _ => panic!("Unexpected field index: {index}"),
             }
         }
     }
@@ -3121,6 +3308,26 @@ mod tests {
 
         assert_result_error_with_message(result, "Duplicate metadata column");
         Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_field_name_case_insensitive() {
+        // Delta column names are case-insensitive per protocol; (Value, value) is invalid
+        let result = StructType::try_new([
+            StructField::nullable("Value", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
+    }
+
+    #[test]
+    fn test_duplicate_field_name_exact() {
+        // Exact duplicate (same name twice) is rejected via the case-insensitive check
+        let result = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("id", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
     }
 
     #[test]

@@ -53,15 +53,17 @@ pub(crate) fn column_mapping_mode(
 
 /// Validates that the schema annotations are consistent with the column mapping mode.
 pub(crate) fn validate_column_mapping(tc: &TableConfiguration) -> DeltaResult<()> {
-    validate_schema_column_mapping(&tc.schema(), tc.column_mapping_mode())
+    validate_schema_column_mapping(&tc.logical_schema(), tc.column_mapping_mode())
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id; when not enabled, verify that no fields are annotated.
+/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
+/// value. When not enabled, verifies that no fields are annotated.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
+        seen: HashMap::new(),
         err: None,
     };
     let _ = validator.transform_struct(schema);
@@ -74,6 +76,7 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
+    seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
     err: Option<Error>,
 }
 
@@ -88,9 +91,9 @@ impl<'a> ValidateColumnMappings<'a> {
             let _ = self.transform(data_type);
             self.path.pop();
         }
-        None
+        Some(Cow::Borrowed(data_type))
     }
-    fn check_annotations(&mut self, field: &StructField) {
+    fn check_annotations(&mut self, field: &'a StructField) {
         // The iterator yields `&&str` but `ColumnName::new` needs `&str`
         let column_name = || ColumnName::new(self.path.iter().copied());
         let annotation = "delta.columnMapping.physicalName";
@@ -122,7 +125,14 @@ impl<'a> ValidateColumnMappings<'a> {
         match (self.mode, field.metadata.get(annotation)) {
             // Both Id and Name modes require a field ID annotation; None mode forbids it.
             (ColumnMappingMode::None, None) => {}
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(_))) => {}
+            (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(id))) => {
+                if let Some(prev) = self.seen.insert(*id, &field.name) {
+                    self.err = Some(Error::invalid_column_mapping_mode(format!(
+                        "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                        field.name()
+                    )));
+                }
+            }
             (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
                 self.err = Some(Error::invalid_column_mapping_mode(format!(
                     "The {annotation} annotation on field '{}' must be a number",
@@ -189,8 +199,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
     match properties.get(COLUMN_MAPPING_MODE) {
         Some(mode_str) => mode_str.parse::<ColumnMappingMode>().map_err(|_| {
             Error::generic(format!(
-                "Invalid column mapping mode '{}'. Must be one of: none, name, id",
-                mode_str
+                "Invalid column mapping mode '{mode_str}'. Must be one of: none, name, id"
             ))
         }),
         None => Ok(ColumnMappingMode::None),
@@ -524,6 +533,111 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
     }
 
+    #[test]
+    fn test_annotation_validation_reaches_struct_fields_in_map_value() {
+        let unannotated =
+            StructType::new_unchecked([StructField::new("x", DataType::INTEGER, false)]);
+        let schema = StructType::new_unchecked([make_cm_field(
+            "b",
+            1,
+            MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(unannotated)),
+                false,
+            ),
+        )]);
+        validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
+            .expect_err("missing annotation on struct field inside map value");
+    }
+
+    fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
+        StructField::new(name, data_type, false).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(format!("col-{name}")),
+            ),
+        ])
+    }
+
+    fn cm_schema_same_level_duplicates() -> StructType {
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field("b", 1, DataType::INTEGER),
+        ])
+    }
+
+    fn cm_schema_nested_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([
+            make_cm_field("x", 5, DataType::INTEGER),
+            make_cm_field("y", 5, DataType::INTEGER),
+        ]);
+        StructType::new_unchecked([make_cm_field(
+            "outer",
+            10,
+            DataType::Struct(Box::new(nested)),
+        )])
+    }
+
+    fn cm_schema_cross_level_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([make_cm_field("inner", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field("b", 2, DataType::Struct(Box::new(nested))),
+        ])
+    }
+
+    fn cm_schema_array_duplicates() -> StructType {
+        let element = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field(
+                "b",
+                2,
+                ArrayType::new(DataType::Struct(Box::new(element)), false),
+            ),
+        ])
+    }
+
+    fn cm_schema_map_duplicates() -> StructType {
+        let value = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field(
+                "b",
+                2,
+                MapType::new(DataType::STRING, DataType::Struct(Box::new(value)), false),
+            ),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::same_level(cm_schema_same_level_duplicates())]
+    #[case::nested_struct(cm_schema_nested_duplicates())]
+    #[case::across_nesting_levels(cm_schema_cross_level_duplicates())]
+    #[case::across_array(cm_schema_array_duplicates())]
+    #[case::across_map(cm_schema_map_duplicates())]
+    fn test_duplicate_column_mapping_ids_rejected(#[case] schema: StructType) {
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(&schema, ColumnMappingMode::Id),
+            "Duplicate column mapping ID",
+        );
+    }
+
+    #[test]
+    fn test_duplicate_column_mapping_ids_rejected_in_name_mode() {
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(
+                &cm_schema_same_level_duplicates(),
+                ColumnMappingMode::Name,
+            ),
+            "Duplicate column mapping ID",
+        );
+    }
+
     // =========================================================================
     // Tests for write-side column mapping functions
     // =========================================================================
@@ -612,8 +726,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("already has column mapping metadata"),
-            "Expected error about existing column mapping metadata, got: {}",
-            err_msg
+            "Expected error about existing column mapping metadata, got: {err_msg}"
         );
     }
 
@@ -704,7 +817,7 @@ mod tests {
     fn unwrap_struct<'a>(data_type: &'a DataType, context: &str) -> &'a StructType {
         match data_type {
             DataType::Struct(s) => s,
-            _ => panic!("Expected Struct for {}, got {:?}", context, data_type),
+            _ => panic!("Expected Struct for {context}, got {data_type:?}"),
         }
     }
 

@@ -482,8 +482,7 @@ mod tests {
         all_paths.sort();
         assert_eq!(
             all_paths, expected_paths,
-            "Parallel workflow paths don't match scan_metadata paths for table '{}'",
-            table_name
+            "Parallel workflow paths don't match scan_metadata paths for table '{table_name}'"
         );
 
         Ok(())

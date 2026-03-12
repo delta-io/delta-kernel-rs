@@ -32,7 +32,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
         && !protocol.has_table_feature(&TableFeature::VariantTypePreview)
     {
         let mut uses_variant = UsesVariant::default();
-        let _ = uses_variant.transform_struct(&tc.schema());
+        let _ = uses_variant.transform_struct(&tc.logical_schema());
         require!(
             !uses_variant.found(),
             Error::unsupported(

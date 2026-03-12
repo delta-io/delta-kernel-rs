@@ -79,7 +79,7 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let clustering_columns = snapshot.get_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot.get_clustering_columns_physical(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(expected_cols));
 
     let table_configuration = snapshot.table_configuration();
@@ -129,12 +129,11 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
 
     assert_eq!(
         domain_metadata_count, 1,
-        "domainMetadata should appear exactly once, not {} times (duplicate detected!)",
-        domain_metadata_count
+        "domainMetadata should appear exactly once, not {domain_metadata_count} times (duplicate detected!)"
     );
 
     // Verify clustering columns via snapshot read path
-    let clustering_columns = snapshot.get_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot.get_clustering_columns_physical(engine.as_ref())?;
     assert_eq!(clustering_columns, Some(vec![ColumnName::new(["id"])]));
 
     Ok(())
@@ -146,7 +145,7 @@ async fn test_clustering_stats_columns_within_limit() -> DeltaResult<()> {
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
     let fields: Vec<StructField> = (0..10)
-        .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, true))
+        .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, true))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 
@@ -171,7 +170,7 @@ async fn test_clustering_stats_columns_beyond_limit() -> DeltaResult<()> {
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)
     let fields: Vec<StructField> = (0..40)
-        .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, true))
+        .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, true))
         .collect();
     let schema = Arc::new(StructType::try_new(fields)?);
 

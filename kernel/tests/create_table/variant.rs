@@ -16,49 +16,10 @@ use delta_kernel::table_features::{
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use test_utils::{assert_result_error_with_message, test_table_setup};
-
-/// Schema with a top-level variant column: (id INT, v VARIANT)
-fn top_level_variant_schema() -> Arc<StructType> {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("v", DataType::unshredded_variant(), true),
-    ]))
-}
-
-/// Schema with a variant nested inside a struct: (id INT, nested STRUCT<inner_v VARIANT>)
-fn nested_variant_schema() -> Arc<StructType> {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new(
-            "nested",
-            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                "inner_v",
-                DataType::unshredded_variant(),
-                true,
-            )]))),
-            true,
-        ),
-    ]))
-}
-
-/// Schema with multiple top-level variant columns: (id INT, v1 VARIANT, v2 VARIANT)
-fn multiple_variant_schema() -> Arc<StructType> {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("v1", DataType::unshredded_variant(), true),
-        StructField::new("v2", DataType::unshredded_variant(), true),
-    ]))
-}
-
-/// Returns column mapping table properties for the given mode, or empty for "none".
-fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
-    if mode == "none" {
-        vec![]
-    } else {
-        vec![("delta.columnMapping.mode", mode)]
-    }
-}
+use test_utils::{
+    assert_result_error_with_message, cm_properties, multiple_variant_schema,
+    nested_variant_schema, test_table_setup, top_level_variant_schema,
+};
 
 /// Asserts the snapshot's protocol includes variantType with correct reader/writer versions.
 fn assert_variant_protocol(snapshot: &Snapshot) {
@@ -70,31 +31,24 @@ fn assert_variant_protocol(snapshot: &Snapshot) {
     let protocol = table_config.protocol();
     assert!(
         protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION,
-        "Reader version should be at least {}",
-        TABLE_FEATURES_MIN_READER_VERSION
+        "Reader version should be at least {TABLE_FEATURES_MIN_READER_VERSION}"
     );
     assert!(
         protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION,
-        "Writer version should be at least {}",
-        TABLE_FEATURES_MIN_WRITER_VERSION
+        "Writer version should be at least {TABLE_FEATURES_MIN_WRITER_VERSION}"
     );
 }
 
 /// Variant schema auto-enables variantType across schema shapes and column mapping modes.
 #[rstest::rstest]
-#[case::top_level_no_cm(top_level_variant_schema(), "none")]
-#[case::top_level_cm_name(top_level_variant_schema(), "name")]
-#[case::top_level_cm_id(top_level_variant_schema(), "id")]
-#[case::nested_no_cm(nested_variant_schema(), "none")]
-#[case::nested_cm_name(nested_variant_schema(), "name")]
-#[case::nested_cm_id(nested_variant_schema(), "id")]
-#[case::multiple_no_cm(multiple_variant_schema(), "none")]
-#[case::multiple_cm_name(multiple_variant_schema(), "name")]
-#[case::multiple_cm_id(multiple_variant_schema(), "id")]
-#[test]
 fn test_create_table_with_variant(
-    #[case] schema: Arc<StructType>,
-    #[case] cm_mode: &str,
+    #[values(
+        top_level_variant_schema(),
+        nested_variant_schema(),
+        multiple_variant_schema()
+    )]
+    schema: Arc<StructType>,
+    #[values("none", "name", "id")] cm_mode: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -166,13 +120,8 @@ fn test_create_table_no_variant_no_feature() -> DeltaResult<()> {
 fn test_create_table_variant_clustering_rejected() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("v", DataType::unshredded_variant(), true),
-    ]));
-
-    let result = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::clustered(["v"]))
+    let result = create_table(&table_path, top_level_variant_schema(), "Test/1.0")
+        .with_data_layout(DataLayout::clustered(["col"]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
     assert_result_error_with_message(result, "unsupported type");

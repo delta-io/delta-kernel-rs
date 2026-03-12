@@ -178,7 +178,7 @@ mod tests {
         let creds = uc_client
             .get_credentials(&table_id, Operation::Read)
             .await
-            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+            .map_err(|e| format!("Failed to get credentials: {e}"))?;
 
         let catalog = UCCatalog::new(&uc_commits_client);
 
@@ -233,7 +233,7 @@ mod tests {
         let creds = client
             .get_credentials(&table_id, Operation::ReadWrite)
             .await
-            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+            .map_err(|e| format!("Failed to get credentials: {e}"))?;
 
         let catalog = UCCatalog::new(commits_client.as_ref());
 

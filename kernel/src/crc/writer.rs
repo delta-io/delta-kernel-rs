@@ -2,22 +2,29 @@
 
 use url::Url;
 
-use super::Crc;
-use crate::{DeltaResult, Engine};
+use super::{Crc, FileStatsValidity};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] struct to JSON via serde and writes the raw bytes using the storage
-/// handler. If `overwrite` is false and the file already exists, returns
+/// handler. Returns [`Error::ChecksumWriteUnsupported`] if file stats are not valid (a CRC file
+/// on disk must have correct stats). Per the Delta protocol, writers MUST NOT overwrite existing
+/// CRC files, so this always writes with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
-pub(crate) fn try_write_crc_file(
-    engine: &dyn Engine,
-    path: &Url,
-    crc: &Crc,
-    overwrite: bool,
-) -> DeltaResult<()> {
+pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
+    require!(
+        crc.file_stats_validity == FileStatsValidity::Valid,
+        Error::ChecksumWriteUnsupported(format!(
+            "Cannot write CRC file with {:?} file stats",
+            crc.file_stats_validity
+        ))
+    );
     let data = serde_json::to_vec(crc)?;
-    engine.storage_handler().put(path, data.into(), overwrite)
+    engine
+        .storage_handler()
+        .put(path, data.into(), false /* overwrite */)
 }
 
 #[cfg(test)]
@@ -29,8 +36,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::actions::{DomainMetadata, Metadata, Protocol};
+    use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
+    use crate::crc::FileStatsValidity;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
@@ -57,22 +65,21 @@ mod tests {
                 r#"{"rowIdHighWaterMark":1048576}"#.to_string(),
             ),
         )]);
+        let ict = 1234567890;
+        let app_id = "testAppId".to_string();
+        let set_transactions =
+            HashMap::from([(app_id.clone(), SetTransaction::new(app_id, 1, Some(ict)))]);
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
             num_metadata: 1,
             num_protocol: 1,
-            metadata: Metadata::default(),
             protocol,
             txn_id: None,
-            in_commit_timestamp_opt: Some(1234567890),
-            set_transactions: None,
+            in_commit_timestamp_opt: Some(ict),
+            set_transactions: Some(set_transactions),
             domain_metadata: Some(domain_metadata),
-            file_size_histogram: None,
-            all_files: None,
-            num_deleted_records_opt: None,
-            num_deletion_vectors_opt: None,
-            deleted_record_counts_histogram_opt: None,
+            ..Default::default()
         }
     }
 
@@ -94,7 +101,7 @@ mod tests {
         let read_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
         let crc = test_crc();
 
-        try_write_crc_file(&engine, write_path.location.as_url(), &crc, false).unwrap();
+        try_write_crc_file(&engine, write_path.location.as_url(), &crc).unwrap();
 
         let read_back = try_read_crc_file(&engine, &read_path).unwrap();
         assert_eq!(read_back, crc);
@@ -142,6 +149,13 @@ mod tests {
                     "configuration": "{\"rowIdHighWaterMark\":1048576}",
                     "removed": false
                 }
+            ],
+            "setTransactions": [
+                {
+                    "appId": "testAppId",
+                    "version": 1,
+                    "lastUpdated": 1234567890
+                }
             ]
         });
 
@@ -156,13 +170,32 @@ mod tests {
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
         let crc = test_crc();
 
-        try_write_crc_file(&engine, crc_path.location.as_url(), &crc, false).unwrap();
+        try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
-        // Second write with overwrite=false should fail
-        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc, false);
+        // Second write should fail (never overwrites)
+        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(result.is_err());
+    }
 
-        // Second write with overwrite=true should succeed
-        try_write_crc_file(&engine, crc_path.location.as_url(), &crc, true).unwrap();
+    #[test]
+    fn test_write_rejects_invalid_file_stats_with_checksum_write_unsupported() {
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store).build();
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        for invalid_validity in [
+            FileStatsValidity::RequiresCheckpointRead,
+            FileStatsValidity::Indeterminate,
+            FileStatsValidity::Untrackable,
+        ] {
+            let mut crc = test_crc();
+            crc.file_stats_validity = invalid_validity;
+            let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+            assert!(
+                matches!(result, Err(Error::ChecksumWriteUnsupported(_))),
+                "should reject {invalid_validity:?} with ChecksumWriteUnsupported"
+            );
+        }
     }
 }

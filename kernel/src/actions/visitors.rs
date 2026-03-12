@@ -13,8 +13,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
-use super::domain_metadata::DomainMetadataMap;
 use super::*;
+use crate::log_segment::DomainMetadataMap;
 
 #[derive(Default)]
 #[internal_api]
@@ -1261,7 +1261,7 @@ mod tests {
     fn transform_batch(batch: Box<dyn EngineData>) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
         let expression =
-            Expression::Struct(vec![Arc::new(Expression::Struct(vec![column_expr_ref!(
+            Expression::struct_from([Arc::new(Expression::struct_from([column_expr_ref!(
                 "commitInfo.inCommitTimestamp"
             )]))]);
         engine

@@ -6,11 +6,11 @@ use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int32Type, Int64Type,
     TimestampMicrosecondType,
 };
 use crate::arrow::array::{
-    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, RunArray,
+    Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
     StructArray,
 };
 use crate::arrow::compute::filter_record_batch;
@@ -18,7 +18,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
+use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::{DeltaResult, Error};
@@ -121,73 +121,39 @@ impl From<Box<ArrowEngineData>> for RecordBatch {
     }
 }
 
-impl<OffsetSize> EngineList for GenericListArray<OffsetSize>
-where
-    OffsetSize: OffsetSizeTrait,
-{
-    fn len(&self, row_index: usize) -> usize {
-        self.value(row_index).len()
+impl<O: OffsetSizeTrait> StringArrayAccessor for GenericByteArray<GenericStringType<O>> {
+    fn len(&self) -> usize {
+        Array::len(self)
     }
-
-    fn get(&self, row_index: usize, index: usize) -> String {
-        let arry = self.value(row_index);
-        let sarry = arry.as_string::<i32>();
-        sarry.value(index).to_string()
+    fn value(&self, index: usize) -> &str {
+        self.value(index)
     }
-
-    fn materialize(&self, row_index: usize) -> Vec<String> {
-        (0..EngineList::len(self, row_index))
-            .map(|i| self.get(row_index, i))
-            .collect()
+    fn is_valid(&self, index: usize) -> bool {
+        Array::is_valid(self, index)
     }
 }
 
-impl EngineMap for MapArray {
-    fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
-        // Check if the map element itself is null
-        if self.is_null(row_index) {
-            return None;
-        }
-
-        let offsets = self.offsets();
-        let start_offset = offsets[row_index] as usize;
-        let end_offset = offsets[row_index + 1] as usize;
-        let keys = self.keys().as_string::<i32>();
-        let vals = self.values().as_string::<i32>();
-
-        // Iterate backwards for potential cache locality benefits
-        for idx in (start_offset..end_offset).rev() {
-            let map_key = keys.value(idx);
-            if key == map_key {
-                return vals.is_valid(idx).then(|| vals.value(idx));
-            }
-        }
-        None
+impl StringArrayAccessor for StringViewArray {
+    fn len(&self) -> usize {
+        Array::len(self)
     }
+    fn value(&self, index: usize) -> &str {
+        self.value(index)
+    }
+    fn is_valid(&self, index: usize) -> bool {
+        Array::is_valid(self, index)
+    }
+}
 
-    fn materialize(&self, row_index: usize) -> HashMap<String, String> {
-        // Check if the map element itself is null
-        if self.is_null(row_index) {
-            return HashMap::new();
-        }
-
-        let offsets = self.offsets();
-        let start_offset = offsets[row_index] as usize;
-        let end_offset = offsets[row_index + 1] as usize;
-        let keys = self.keys().as_string::<i32>();
-        let vals = self.values().as_string::<i32>();
-        let mut ret = HashMap::with_capacity(end_offset - start_offset);
-
-        // Use direct array access for better performance vs Arrow's high-level API
-        for idx in start_offset..end_offset {
-            if vals.is_valid(idx) {
-                // Arrow maps always have non-null keys.
-                let key = keys.value(idx);
-                let value = vals.value(idx);
-                ret.insert(key.to_string(), value.to_string());
-            }
-        }
-        ret
+/// Downcast an Arrow array to a [`StringArrayAccessor`], trying Utf8, LargeUtf8, and
+/// Utf8View in order. Returns `None` if the array is not a string type.
+pub(crate) fn as_string_accessor(array: &dyn Array) -> Option<&dyn StringArrayAccessor> {
+    if let Some(a) = array.as_string_opt::<i32>() {
+        Some(a)
+    } else if let Some(a) = array.as_string_opt::<i64>() {
+        Some(a)
+    } else {
+        Some(array.as_string_view_opt()?)
     }
 }
 
@@ -282,8 +248,7 @@ impl EngineData for ArrowEngineData {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
                 _ => {
                     return Err(Error::MissingColumn(format!(
-                        "Column {} not found in the data",
-                        column
+                        "Column {column} not found in the data"
                     )));
                 }
             }
@@ -398,19 +363,32 @@ impl ArrowEngineData {
         data_type: &DataType,
         col: &'a dyn Array,
     ) -> DeltaResult<&'a dyn GetData<'a>> {
-        use ArrowDataType::Utf8;
-        let col_as_list = || {
-            if let Some(array) = col.as_list_opt::<i32>() {
-                (array.value_type() == Utf8).then_some(array as _)
-            } else if let Some(array) = col.as_list_opt::<i64>() {
-                (array.value_type() == Utf8).then_some(array as _)
-            } else {
-                None
+        // TODO: Replace with `ArrowDataType::is_string()` once we bump arrow-schema past 57.2.0
+        let is_string_type = |dt: &ArrowDataType| {
+            matches!(
+                dt,
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+            )
+        };
+        let col_as_list = || -> Option<&'a dyn GetData<'a>> {
+            match col.data_type() {
+                ArrowDataType::List(f)
+                | ArrowDataType::LargeList(f)
+                | ArrowDataType::ListView(f)
+                | ArrowDataType::LargeListView(f)
+                    if is_string_type(f.data_type()) => {}
+                _ => return None,
             }
+            col.as_list_opt::<i32>()
+                .map(|a| a as _)
+                .or_else(|| col.as_list_opt::<i64>().map(|a| a as _))
+                .or_else(|| col.as_list_view_opt::<i32>().map(|a| a as _))
+                .or_else(|| col.as_list_view_opt::<i64>().map(|a| a as _))
         };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
-                (array.key_type() == &Utf8 && array.value_type() == &Utf8).then_some(array as _)
+                (is_string_type(array.key_type()) && is_string_type(array.value_type()))
+                    .then_some(array as _)
             })
         };
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
@@ -423,15 +401,19 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt()
+                col.as_string_opt::<i32>()
                     .map(|a| a as _)
+                    .or_else(|| col.as_string_opt::<i64>().map(|a| a as _))
+                    .or_else(|| col.as_string_view_opt().map(|a| a as _))
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("string")
             }
             &DataType::BINARY => {
                 debug!("Pushing binary array for {}", ColumnName::new(path));
-                col.as_binary_opt()
+                col.as_binary_opt::<i32>()
                     .map(|a| a as _)
+                    .or_else(|| col.as_binary_opt::<i64>().map(|a| a as _))
+                    .or_else(|| col.as_binary_view_opt().map(|a| a as _))
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("binary")
             }
@@ -507,25 +489,27 @@ impl ArrowEngineData {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
-        Array, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch,
-        RunArray, StringArray, StructArray,
+        Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, ListViewArray, MapArray, RecordBatch, RunArray,
+        StringArray, StringViewArray, StructArray,
     };
-    use crate::arrow::buffer::OffsetBuffer;
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::engine_data::{EngineMap, GetData};
+    use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
     use crate::expressions::ArrayData;
-    use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use crate::schema::{ArrayType, ColumnName, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
+    use rstest::rstest;
 
     use super::{extract_record_batch, ArrowEngineData};
 
@@ -898,11 +882,6 @@ mod tests {
 
     #[test]
     fn test_binary_column_extraction() -> DeltaResult<()> {
-        use crate::arrow::array::BinaryArray;
-        use crate::engine_data::{GetData, RowVisitor};
-        use crate::schema::ColumnName;
-        use std::sync::LazyLock;
-
         // Create a RecordBatch with binary data
         let binary_data: Vec<Option<&[u8]>> = vec![
             Some(b"hello"),
@@ -970,10 +949,6 @@ mod tests {
 
     #[test]
     fn test_binary_column_extraction_type_mismatch() -> DeltaResult<()> {
-        use crate::engine_data::{GetData, RowVisitor};
-        use crate::schema::ColumnName;
-        use std::sync::LazyLock;
-
         // Create a RecordBatch with Int32 data (not binary)
         let data: Vec<Option<i32>> = vec![Some(123)];
         let int_array = Int32Array::from(data);
@@ -1032,10 +1007,6 @@ mod tests {
 
     #[test]
     fn test_column_ordering_independence() -> DeltaResult<()> {
-        use crate::arrow::array::StructArray;
-        use crate::engine_data::{GetData, TypedGetData};
-        use crate::schema::ColumnName;
-
         // Schema: field_a, field_b, nested.x, nested.y
         let nested_fields = vec![
             ArrowField::new("x", ArrowDataType::Int32, false),
@@ -1066,7 +1037,6 @@ mod tests {
         )?;
 
         // Column names requested in reverse order (not schema order)
-        use std::sync::LazyLock;
         static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
             vec![
                 ColumnName::new(["nested", "y"]),
@@ -1079,11 +1049,10 @@ mod tests {
         struct Visitor {
             values: Vec<(i32, i32, i32, i32)>,
         }
-        impl crate::engine_data::RowVisitor for Visitor {
+        impl RowVisitor for Visitor {
             fn selected_column_names_and_types(
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
-                use std::sync::LazyLock;
                 static TYPES: LazyLock<Vec<DataType>> =
                     LazyLock::new(|| vec![DataType::INTEGER; 4]);
                 (&REQUESTED_COLUMNS, &TYPES)
@@ -1116,10 +1085,6 @@ mod tests {
 
     #[test]
     fn test_visit_duplicate_column_error() -> DeltaResult<()> {
-        use crate::engine_data::RowVisitor;
-        use crate::schema::ColumnName;
-        use std::sync::LazyLock;
-
         // Create batch with simple columns
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
@@ -1213,10 +1178,6 @@ mod tests {
 
     #[test]
     fn test_run_array_extraction_via_visitor() -> DeltaResult<()> {
-        use crate::engine_data::RowVisitor;
-        use crate::schema::ColumnName;
-        use std::sync::LazyLock;
-
         // Create RunArray columns with pattern: [val1, val1, null, null, val2]
         // Per Arrow spec: nulls are encoded as runs in the values child array
         let run_ends = Int64Array::from(vec![2, 4, 5]);
@@ -1399,6 +1360,15 @@ mod tests {
         .unwrap()
     }
 
+    /// Helper to construct a MapItem from a MapArray for a given row.
+    fn map_item_from<'a>(map: &'a MapArray, row: usize) -> MapItem<'a> {
+        let keys = super::as_string_accessor(map.keys().as_ref()).unwrap();
+        let values = super::as_string_accessor(map.values().as_ref()).unwrap();
+        let start = map.offsets()[row] as usize;
+        let end = map.offsets()[row + 1] as usize;
+        MapItem::new(keys, values, start..end)
+    }
+
     #[test]
     fn test_materialize_matches_get() -> DeltaResult<()> {
         // Create MapArray with various keys
@@ -1408,11 +1378,12 @@ mod tests {
             ("key3", Some("value3")),
         ]]);
 
-        let materialized = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let materialized = item.materialize();
 
         // Verify that get(key) matches materialize()[key] for all keys
         for (key, value) in &materialized {
-            let get_result = map_array.get(0, key);
+            let get_result = item.get(key);
             assert_eq!(get_result, Some(value.as_str()));
         }
 
@@ -1427,7 +1398,8 @@ mod tests {
         let map_array =
             create_map_array(vec![vec![("a", Some("1")), ("b", None), ("c", Some("3"))]]);
 
-        let result = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let result = item.materialize();
 
         // Null values should be excluded from materialized map
         assert_eq!(result.len(), 2);
@@ -1442,7 +1414,8 @@ mod tests {
         // Create MapArray with empty map
         let map_array = create_map_array(vec![vec![]]);
 
-        let result = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let result = item.materialize();
 
         assert_eq!(result.len(), 0);
         Ok(())
@@ -1456,12 +1429,14 @@ mod tests {
             vec![("x", Some("10")), ("y", Some("20"))],
         ]);
 
-        let result0 = map_array.materialize(0);
+        let item0 = map_item_from(&map_array, 0);
+        let result0 = item0.materialize();
         assert_eq!(result0.len(), 2);
         assert_eq!(result0.get("a"), Some(&"1".to_string()));
         assert_eq!(result0.get("b"), Some(&"2".to_string()));
 
-        let result1 = map_array.materialize(1);
+        let item1 = map_item_from(&map_array, 1);
+        let result1 = item1.materialize();
         assert_eq!(result1.len(), 2);
         assert_eq!(result1.get("x"), Some(&"10".to_string()));
         assert_eq!(result1.get("y"), Some(&"20".to_string()));
@@ -1480,7 +1455,8 @@ mod tests {
             ("a", Some("5")), // Another duplicate 'a' - should be final value
         ]]);
 
-        let materialized = map_array.materialize(0);
+        let item = map_item_from(&map_array, 0);
+        let materialized = item.materialize();
 
         // Verify materialize() handles duplicates correctly (last wins)
         assert_eq!(materialized.len(), 3); // Only 3 unique keys
@@ -1489,9 +1465,9 @@ mod tests {
         assert_eq!(materialized.get("c"), Some(&"4".to_string()));
 
         // Verify get() and materialize() return same values
-        assert_eq!(map_array.get(0, "a"), Some("5")); // Matches materialized
-        assert_eq!(map_array.get(0, "b"), Some("2"));
-        assert_eq!(map_array.get(0, "c"), Some("4"));
+        assert_eq!(item.get("a"), Some("5")); // Matches materialized
+        assert_eq!(item.get("b"), Some("2"));
+        assert_eq!(item.get("c"), Some("4"));
 
         Ok(())
     }
@@ -1549,23 +1525,183 @@ mod tests {
         .unwrap();
 
         // First element should have 2 entries
-        let result0 = map_array.materialize(0);
+        let item0 = map_item_from(&map_array, 0);
+        let result0 = item0.materialize();
         assert_eq!(result0.len(), 2);
         assert_eq!(result0.get("a"), Some(&"1".to_string()));
         assert_eq!(result0.get("b"), Some(&"2".to_string()));
 
-        // Second element is null, should return empty HashMap
-        let result1 = map_array.materialize(1);
-        assert_eq!(result1.len(), 0);
-
-        // get() on null element should return None, even for key that exists in underlying data
-        assert_eq!(map_array.get(1, "c"), None); // "c" exists in data but element is null
+        // Second element is null — GetData::get_map returns None for null elements
+        let map_item_1: Option<MapItem<'_>> = map_array.get_map(1, "test")?;
+        assert!(map_item_1.is_none());
 
         // Third element should have 1 entry
-        let result2 = map_array.materialize(2);
+        let item2 = map_item_from(&map_array, 2);
+        let result2 = item2.materialize();
         assert_eq!(result2.len(), 1);
         assert_eq!(result2.get("d"), Some(&"4".to_string()));
 
+        Ok(())
+    }
+
+    /// visit_rows must accept all Arrow string representations (Utf8/StringArray,
+    /// LargeUtf8/LargeStringArray, Utf8View/StringViewArray) when the visitor declares
+    /// DataType::STRING.
+    #[rstest]
+    #[case::utf8(Arc::new(StringArray::from(vec![Some("alice"), None, Some("charlie")])) as ArrayRef)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec![Some("alice"), None, Some("charlie")])) as ArrayRef)]
+    #[case::utf8_view(Arc::new(StringViewArray::from(vec![Some("alice"), None, Some("charlie")])) as ArrayRef)]
+    fn test_visit_rows_string_types(#[case] values: ArrayRef) -> DeltaResult<()> {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "name",
+                values.data_type().clone(),
+                true,
+            )])),
+            vec![values],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Option<String>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["name"])]);
+                static TYPES: &[DataType] = &[DataType::STRING];
+                (&NAMES, TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.values
+                        .push(getters[0].get_str(i, "name")?.map(|s| s.to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["name"])], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![Some("alice".into()), None, Some("charlie".into())]
+        );
+        Ok(())
+    }
+
+    /// visit_rows must accept LargeBinary columns when the visitor declares DataType::BINARY.
+    #[test]
+    fn test_visit_rows_large_binary() -> DeltaResult<()> {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "data",
+                ArrowDataType::LargeBinary,
+                true,
+            )])),
+            vec![Arc::new(LargeBinaryArray::from(vec![
+                Some(b"hello" as &[u8]),
+                None,
+                Some(b"\x00\x01"),
+            ]))],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Option<Vec<u8>>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                static TYPES: &[DataType] = &[DataType::BINARY];
+                (&NAMES, TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.values
+                        .push(getters[0].get_binary(i, "data")?.map(|b| b.to_vec()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![Some(b"hello".to_vec()), None, Some(b"\x00\x01".to_vec())]
+        );
+        Ok(())
+    }
+
+    /// visit_rows must accept ListView columns when the visitor declares a DataType::Array.
+    #[test]
+    fn test_visit_rows_list_view() -> DeltaResult<()> {
+        // Build a ListViewArray with string values: [["a", "b"], ["c"]]
+        let values = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
+        let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
+        let offsets = ScalarBuffer::from(vec![0i32, 2]);
+        let sizes = ScalarBuffer::from(vec![2i32, 1]);
+        let list_view = ListViewArray::new(field.clone(), offsets, sizes, values, None);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "tags",
+                list_view.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(list_view)],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Vec<String>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["tags"])]);
+                static TYPES: LazyLock<Vec<DataType>> =
+                    LazyLock::new(|| vec![ArrayType::new(DataType::STRING, false).into()]);
+                (&NAMES, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let list: ListItem<'_> = getters[0].get(i, "tags")?;
+                    self.values.push(list.materialize());
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["tags"])], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
         Ok(())
     }
 }

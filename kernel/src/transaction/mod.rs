@@ -9,19 +9,17 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_remove_schema,
+    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
-use crate::row_tracking::{
-    RowTrackingDomainMetadata, RowTrackingVisitor, ROW_TRACKING_DOMAIN_NAME,
-};
+use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -53,6 +51,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod domain_metadata;
 mod stats_verifier;
 mod update;
 use stats_verifier::StatsVerifier;
@@ -225,8 +224,9 @@ pub struct Transaction<S = ExistingTable> {
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
-    // enabled. Used for determining which columns require statistics collection.
-    clustering_columns: Option<Vec<ColumnName>>,
+    // enabled. Used for determining which columns require statistics collection. Expected to be
+    // physical column names.
+    clustering_columns_physical: Option<Vec<ColumnName>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -327,9 +327,10 @@ impl<S> Transaction<S> {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
+        let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
-            self.get_in_commit_timestamp(engine)?,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
@@ -360,7 +361,7 @@ impl<S> Transaction<S> {
             self.generate_adds(engine, commit_version)?;
 
         // Step 4b: Generate all domain metadata actions (user and system domains)
-        let domain_metadata_actions =
+        let (domain_metadata_actions, dm_changes) =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
@@ -404,15 +405,21 @@ impl<S> Transaction<S> {
             log_root,
             commit_version,
             self.commit_timestamp,
-            self.read_snapshot.log_segment().max_published_version,
+            self.read_snapshot
+                .log_segment()
+                .listed
+                .max_published_version,
         );
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
-            Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(file_meta)?,
-            )),
+            Ok(CommitResponse::Committed { file_meta }) => {
+                let crc_delta = self.build_crc_delta(in_commit_timestamp, dm_changes)?;
+                Ok(CommitResult::CommittedTransaction(
+                    self.into_committed(file_meta, crc_delta)?,
+                ))
+            }
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
             )),
@@ -558,230 +565,6 @@ impl<S> Transaction<S> {
         // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
         self.read_snapshot.version().wrapping_add(1)
     }
-    /// Validate domain metadata operations for both create-table and existing-table transactions.
-    ///
-    /// Enforces the following rules:
-    /// - DomainMetadata feature must be supported if any domain operations are present
-    /// - System domains (in system_domain_metadata_additions) must correspond to a known feature
-    /// - User domains cannot use the delta.* prefix (system-reserved)
-    /// - Domain removals are not allowed in create-table transactions
-    /// - No duplicate domains within a single transaction (across both user and system)
-    fn validate_domain_metadata_operations(&self) -> DeltaResult<()> {
-        // Feature validation (applies to all transactions with domain operations)
-        let has_domain_ops = !self.system_domain_metadata_additions.is_empty()
-            || !self.user_domain_metadata_additions.is_empty()
-            || !self.user_domain_removals.is_empty();
-
-        // Early return if no domain operations to validate
-        if !has_domain_ops {
-            return Ok(());
-        }
-
-        if !self
-            .read_snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::DomainMetadata)
-        {
-            return Err(Error::unsupported(
-                "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
-            ));
-        }
-
-        let is_create = self.is_create_table();
-        let mut seen_domains = HashSet::with_capacity(
-            self.system_domain_metadata_additions.len()
-                + self.user_domain_metadata_additions.len()
-                + self.user_domain_removals.len(),
-        );
-
-        // Validate SYSTEM domain additions (from transforms, e.g., clustering)
-        // System domains are only populated during create-table
-        for dm in &self.system_domain_metadata_additions {
-            let domain = dm.domain();
-
-            // Validate the system domain corresponds to a known feature
-            self.validate_system_domain_feature(domain)?;
-
-            // Check for duplicates
-            if !seen_domains.insert(domain) {
-                return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
-                )));
-            }
-        }
-
-        // Validate USER domain additions (via with_domain_metadata API)
-        for dm in &self.user_domain_metadata_additions {
-            let domain = dm.domain();
-
-            // Users cannot add system domains via the public API
-            if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(Error::generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled",
-                ));
-            }
-
-            // Check for duplicates (spans both system and user domains)
-            if !seen_domains.insert(domain) {
-                return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
-                )));
-            }
-        }
-
-        // No removals allowed for create-table.
-        // Note: CreateTableTransaction does not expose with_domain_metadata_removed(),
-        // so this is a defensive check. See #1768.
-        if is_create && !self.user_domain_removals.is_empty() {
-            return Err(Error::unsupported(
-                "Domain metadata removals are not supported in create-table transactions",
-            ));
-        }
-
-        // Validate domain removals (for non-create-table)
-        for domain in &self.user_domain_removals {
-            // Cannot remove system domains
-            if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
-                return Err(Error::generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled",
-                ));
-            }
-
-            // Check for duplicates
-            if !seen_domains.insert(domain.as_str()) {
-                return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validate that a system domain corresponds to a known feature and that the feature is supported.
-    ///
-    /// This prevents arbitrary `delta.*` domains from being added during table creation.
-    /// Each known system domain must have its corresponding feature enabled in the protocol.
-    fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
-        let table_config = self.read_snapshot.table_configuration();
-
-        // Map domain to its required feature
-        let required_feature = match domain {
-            ROW_TRACKING_DOMAIN_NAME => Some(TableFeature::RowTracking),
-            // Will be changed to a constant in a follow up clustering create table feature PR
-            "delta.clustering" => Some(TableFeature::ClusteredTable),
-            _ => {
-                return Err(Error::generic(format!(
-                    "Unknown system domain '{}'. Only known system domains are allowed.",
-                    domain
-                )));
-            }
-        };
-
-        // If the domain requires a feature, validate it's supported
-        if let Some(feature) = required_feature {
-            if !table_config.is_feature_supported(&feature) {
-                return Err(Error::generic(format!(
-                    "System domain '{}' requires the '{}' feature to be enabled",
-                    domain, feature
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Generate removal actions for user domain metadata by scanning the log.
-    ///
-    /// This performs an expensive log replay operation to fetch the previous configuration
-    /// value for each domain being removed, as required by the Delta spec for tombstones.
-    /// Returns an empty vector if there are no domain removals.
-    fn generate_user_domain_removal_actions(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Vec<DomainMetadata>> {
-        if self.user_domain_removals.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Scan log to fetch existing configurations for tombstones.
-        // Pass the specific set of domains to remove so that log replay can terminate early
-        // once all target domains have been found, instead of replaying the entire log.
-        let domains: HashSet<&str> = self
-            .user_domain_removals
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let existing_domains = self
-            .read_snapshot
-            .log_segment()
-            .scan_domain_metadatas(Some(&domains), engine)?;
-
-        // Create removal tombstones with pre-image configurations
-        Ok(self
-            .user_domain_removals
-            .iter()
-            .filter_map(|domain| {
-                // If domain doesn't exist in the log, this is a no-op (filter it out)
-                existing_domains.get(domain).map(|existing| {
-                    DomainMetadata::remove(domain.clone(), existing.configuration().to_owned())
-                })
-            })
-            .collect())
-    }
-
-    /// Generate domain metadata actions with validation. Handle both user and system domains.
-    ///
-    /// This function may perform an expensive log replay operation if there are any domain removals.
-    /// The log replay is required to fetch the previous configuration value for the domain to preserve
-    /// in removal tombstones as mandated by the Delta spec.
-    fn generate_domain_metadata_actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
-        row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<EngineDataResultIterator<'a>> {
-        let is_create = self.is_create_table();
-
-        // Validate domain operations (includes feature validation)
-        self.validate_domain_metadata_operations()?;
-
-        // TODO(sanuj) Create-table must not have row tracking or removals
-        // Defensive. Needs to be updated when row tracking support is added.
-        if is_create {
-            if row_tracking_high_watermark.is_some() {
-                return Err(Error::internal_error(
-                    "CREATE TABLE cannot have row tracking domain metadata",
-                ));
-            }
-            // user_domain_removals already validated above, but be explicit
-            debug_assert!(self.user_domain_removals.is_empty());
-        }
-
-        // Generate removal actions (empty for create-table due to validation above)
-        let removal_actions = self.generate_user_domain_removal_actions(engine)?;
-
-        // Generate row tracking domain action (None for create-table)
-        let row_tracking_domain_action = row_tracking_high_watermark
-            .map(DomainMetadata::try_from)
-            .transpose()?
-            .into_iter();
-
-        // Chain all domain actions and convert to EngineData
-        // System domains first, then row tracking, then user domains, then removals
-        Ok(Box::new(
-            self.system_domain_metadata_additions
-                .clone()
-                .into_iter()
-                .chain(row_tracking_domain_action)
-                .chain(self.user_domain_metadata_additions.clone())
-                .chain(removal_actions)
-                .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)),
-        ))
-    }
-
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
     /// a Parquet write operation back to Kernel.
     ///
@@ -832,10 +615,9 @@ impl<S> Transaction<S> {
     /// settings.
     #[allow(unused)]
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let stats_schemas = self
-            .read_snapshot
-            .table_configuration()
-            .build_expected_stats_schemas(self.clustering_columns.as_deref(), None)?;
+        let tc = self.read_snapshot.table_configuration();
+        let stats_schemas =
+            tc.build_expected_stats_schemas(self.clustering_columns_physical.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -854,7 +636,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names_physical(self.clustering_columns.as_deref())
+            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -950,13 +732,13 @@ impl<S> Transaction<S> {
         if add_files.is_empty() {
             return Ok(());
         }
-        if let Some(ref clustering_cols) = self.clustering_columns {
+        if let Some(ref clustering_cols) = self.clustering_columns_physical {
             if !clustering_cols.is_empty() {
-                let schema = self.read_snapshot.schema();
+                let physical_schema = self.read_snapshot.table_configuration().physical_schema();
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
                     .iter()
                     .map(|col| {
-                        let data_type = schema
+                        let data_type = physical_schema
                             .walk_column_fields(col)?
                             .last()
                             .map(|field| field.data_type().clone())
@@ -1107,7 +889,11 @@ impl<S> Transaction<S> {
         }
     }
 
-    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+    fn into_committed(
+        self,
+        file_meta: FileMeta,
+        crc_delta: CrcDelta,
+    ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
         let commit_version = parsed_commit.version;
@@ -1126,8 +912,33 @@ impl<S> Transaction<S> {
             commit_version,
             post_commit_stats,
             post_commit_snapshot: Some(Arc::new(
-                self.read_snapshot.new_post_commit(parsed_commit)?,
+                self.read_snapshot
+                    .new_post_commit(parsed_commit, crc_delta)?,
             )),
+        })
+    }
+
+    /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
+    fn build_crc_delta(
+        &self,
+        in_commit_timestamp: Option<i64>,
+        dm_changes: Vec<DomainMetadata>,
+    ) -> DeltaResult<CrcDelta> {
+        let file_stats = FileStatsDelta::try_compute_for_txn(
+            &self.add_files_metadata,
+            &self.remove_files_metadata,
+        )?;
+        let is_create = self.is_create_table();
+        Ok(CrcDelta {
+            file_stats,
+            protocol: is_create
+                .then(|| self.read_snapshot.table_configuration().protocol().clone()),
+            metadata: is_create
+                .then(|| self.read_snapshot.table_configuration().metadata().clone()),
+            domain_metadata_changes: dm_changes,
+            in_commit_timestamp,
+            operation: self.operation.clone(),
+            has_missing_file_size: false, // writes always have sizes
         })
     }
 
@@ -1377,6 +1188,18 @@ impl<S> CommitResult<S> {
     }
 }
 
+impl<S: std::fmt::Debug> CommitResult<S> {
+    /// Unwraps the [`CommittedTransaction`], panicking if the commit was not successful.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic)]
+    pub fn unwrap_committed(self) -> CommittedTransaction {
+        match self {
+            CommitResult::CommittedTransaction(c) => c,
+            other => panic!("Expected CommittedTransaction, got: {other:?}"),
+        }
+    }
+}
+
 /// This is the result of a successfully committed [Transaction]. One can retrieve the
 /// [post_commit_stats], [commit version], and optionally the [post-commit snapshot] from this struct.
 ///
@@ -1478,7 +1301,7 @@ mod tests {
         /// Set clustering columns for testing purposes without needing a table
         /// with the ClusteredTable feature enabled.
         fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-            self.clustering_columns = Some(columns);
+            self.clustering_columns_physical = Some(columns);
             self
         }
     }
@@ -1536,7 +1359,7 @@ mod tests {
         };
         DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: format!("dv_{}", path_suffix),
+            path_or_inline_dv: format!("dv_{path_suffix}"),
             offset: Some(0),
             size_in_bytes: 100,
             cardinality: 1,
@@ -1722,8 +1545,7 @@ mod tests {
         let expr_str = format!("{}", wc_without.logical_to_physical());
         assert!(
             expr_str.contains("drop letter"),
-            "Partition column 'letter' should be dropped. Expression: {}",
-            expr_str
+            "Partition column 'letter' should be dropped. Expression: {expr_str}"
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
@@ -1742,8 +1564,7 @@ mod tests {
         let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
             !expr_str.contains("drop"),
-            "No columns should be dropped with materializePartitionColumns. Expression: {}",
-            expr_str
+            "No columns should be dropped with materializePartitionColumns. Expression: {expr_str}"
         );
 
         Ok(())
@@ -1791,8 +1612,7 @@ mod tests {
         assert!(
             err_msg.contains("Deletion vector")
                 && (err_msg.contains("require") || err_msg.contains("version")),
-            "Expected protocol error about DV requirements, got: {}",
-            err_msg
+            "Expected protocol error about DV requirements, got: {err_msg}"
         );
         Ok(())
     }
@@ -1817,8 +1637,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
-            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {}",
-            err_msg);
+            "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
         Ok(())
     }
 
@@ -1834,8 +1653,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Empty DV updates should succeed as no-op, got error: {:?}",
-            result
+            "Empty DV updates should succeed as no-op, got error: {result:?}"
         );
 
         Ok(())
@@ -2010,7 +1828,7 @@ mod tests {
     #[test]
     fn test_existing_table_txn_debug() -> DeltaResult<()> {
         let (_engine, txn, _tempdir) = create_existing_table_txn()?;
-        let debug_str = format!("{:?}", txn);
+        let debug_str = format!("{txn:?}");
         // Existing-table transactions should include the snapshot version number
         assert!(
             debug_str.contains("Transaction") && debug_str.contains("read_snapshot version"),
@@ -2209,10 +2027,18 @@ mod tests {
     // Stats validation tests for clustering columns
     // =========================================================================
 
-    /// Creates test add file metadata with configurable stats.
-    /// If `has_stats` is false, the stats struct will be null (indicating no stats).
-    /// If `has_stats` is true, creates full stats with nullCount, minValues, maxValues for "value" column.
-    fn create_test_add_files(paths: Vec<&str>, has_stats: Vec<bool>) -> Box<dyn EngineData> {
+    /// Per-file stats configuration for test add file helpers.
+    enum TestFileStats {
+        /// No stats (null stats struct)
+        None,
+        /// Normal stats with non-null min/max
+        Present,
+        /// All-null column: nullCount == numRecords, null min/max
+        AllNull,
+    }
+
+    /// Creates test add file metadata with configurable stats for the "value" column.
+    fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
         let path_array = StringArray::from(paths.to_vec());
         let size_array = Int64Array::from(vec![1024i64; paths.len()]);
         let mod_time_array = Int64Array::from(vec![1000000i64; paths.len()]);
@@ -2220,48 +2046,55 @@ mod tests {
         // Create stats struct with full structure for "value" column (matches test table schema)
         let value_field = Arc::new(ArrowField::new("value", ArrowDataType::Int64, true));
 
-        // nullCount.value
-        let null_count_values: Vec<Option<i64>> = has_stats
+        let num_records: Vec<Option<i64>> = stats
             .iter()
-            .map(|&h| if h { Some(0) } else { None })
+            .map(|s| match s {
+                TestFileStats::None => Option::None,
+                _ => Some(100),
+            })
             .collect();
+        let null_count_values: Vec<Option<i64>> = stats
+            .iter()
+            .map(|s| match s {
+                TestFileStats::None => Option::None,
+                TestFileStats::Present => Some(0),
+                TestFileStats::AllNull => Some(100),
+            })
+            .collect();
+        let min_values: Vec<Option<i64>> = stats
+            .iter()
+            .map(|s| match s {
+                TestFileStats::Present => Some(1),
+                _ => Option::None,
+            })
+            .collect();
+        let max_values: Vec<Option<i64>> = stats
+            .iter()
+            .map(|s| match s {
+                TestFileStats::Present => Some(100),
+                _ => Option::None,
+            })
+            .collect();
+
+        let num_records_array = Int64Array::from(num_records);
         let null_count_array = Int64Array::from(null_count_values);
         let null_count_struct = StructArray::new(
             Fields::from(vec![value_field.clone()]),
             vec![Arc::new(null_count_array) as ArrayRef],
             None,
         );
-
-        // minValues.value
-        let min_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(1) } else { None })
-            .collect();
         let min_values_array = Int64Array::from(min_values);
         let min_values_struct = StructArray::new(
             Fields::from(vec![value_field.clone()]),
             vec![Arc::new(min_values_array) as ArrayRef],
             None,
         );
-
-        // maxValues.value
-        let max_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(100) } else { None })
-            .collect();
         let max_values_array = Int64Array::from(max_values);
         let max_values_struct = StructArray::new(
             Fields::from(vec![value_field]),
             vec![Arc::new(max_values_array) as ArrayRef],
             None,
         );
-
-        // numRecords
-        let num_records: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(100) } else { None })
-            .collect();
-        let num_records_array = Int64Array::from(num_records);
 
         // Build stats struct fields
         let value_struct_type = ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
@@ -2276,8 +2109,11 @@ mod tests {
             ArrowField::new("maxValues", value_struct_type, true),
         ]);
 
-        // Create validity bitmap - stats struct is null when has_stats is false
-        let stats_validity: Vec<bool> = has_stats.clone();
+        // Create validity bitmap - stats struct is null when stats are absent
+        let stats_validity: Vec<bool> = stats
+            .iter()
+            .map(|s| !matches!(s, TestFileStats::None))
+            .collect();
         let stats_struct = StructArray::new(
             stats_fields.clone(),
             vec![
@@ -2357,6 +2193,25 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_validation_allows_all_null_clustering_column() {
+        let (engine, snapshot) = setup_non_dv_table();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap()
+            .with_operation("WRITE".to_string())
+            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::AllNull]);
+
+        let result = txn.validate_add_files_stats(&[add_files]);
+
+        assert!(
+            result.is_ok(),
+            "Stats validation should pass for all-null clustering columns, got: {result:?}",
+        );
+    }
+
+    #[test]
     fn test_stats_validation_when_clustering_cols_missing_stats() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
@@ -2367,7 +2222,7 @@ mod tests {
             .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
 
         // Add files WITHOUT stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![false]);
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
 
         // Directly test the validation method instead of committing
         let result = txn.validate_add_files_stats(&[add_files]);
@@ -2380,8 +2235,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Stats validation error") || err_msg.contains("no stats"),
-            "Expected stats validation error, got: {}",
-            err_msg
+            "Expected stats validation error, got: {err_msg}"
         );
     }
 
@@ -2396,15 +2250,14 @@ mod tests {
             .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
 
         // Add files WITH stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![true]);
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::Present]);
 
         // Directly test the validation method
         let result = txn.validate_add_files_stats(&[add_files]);
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass when stats are present, got: {:?}",
-            result
+            "Stats validation should pass when stats are present, got: {result:?}"
         );
     }
 
@@ -2418,15 +2271,14 @@ mod tests {
         // No clustering columns set (default)
 
         // Add files WITHOUT stats
-        let add_files = create_test_add_files(vec!["file1.parquet"], vec![false]);
+        let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
 
         // Directly test the validation method - should pass because no clustering
         let result = txn.validate_add_files_stats(&[add_files]);
 
         assert!(
             result.is_ok(),
-            "Stats validation should be skipped without clustering, got: {:?}",
-            result
+            "Stats validation should be skipped without clustering, got: {result:?}"
         );
     }
 }

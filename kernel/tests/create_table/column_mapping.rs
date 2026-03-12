@@ -69,7 +69,7 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
 /// physical names) on any field. Note: whether `ColumnMapping` appears in the protocol
 /// depends on whether the feature flag was explicitly set, so that check is left to the
 /// caller.
-fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: ColumnMappingMode) {
+pub(super) fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: ColumnMappingMode) {
     let table_config = snapshot.table_configuration();
 
     assert_eq!(
@@ -307,7 +307,7 @@ fn test_create_clustered_table_with_column_mapping(
     assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
 
     // Verify clustering domain metadata exists and uses physical column names
-    let clustering_columns = snapshot.get_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot.get_clustering_columns_physical(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(
         columns.len(),
@@ -324,11 +324,7 @@ fn test_create_clustered_table_with_column_mapping(
         let logical_name = clustering_cols[i];
         assert!(
             physical_name.starts_with("col-"),
-            "{}: clustering column {} should use physical name '{}', not logical name '{}'",
-            description,
-            i,
-            physical_name,
-            logical_name
+            "{description}: clustering column {i} should use physical name '{physical_name}', not logical name '{logical_name}'"
         );
     }
 
@@ -388,7 +384,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
             assert_eq!(city.data_type(), &DataType::STRING);
             assert!(city.is_nullable());
         }
-        other => panic!("Expected Struct type for address, got {:?}", other),
+        other => panic!("Expected Struct type for address, got {other:?}"),
     }
 
     Ok(())
@@ -539,7 +535,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
     };
     assert_column_mapping_config(&snapshot, expected_cm_mode);
 
-    let clustering_columns = snapshot.get_clustering_columns(engine.as_ref())?;
+    let clustering_columns = snapshot.get_clustering_columns_physical(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(columns.len(), expected_cols.len());
 

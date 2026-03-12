@@ -1,5 +1,6 @@
 //! Various utility functions/macros used throughout the kernel
 use std::borrow::Cow;
+use std::iter::ExactSizeIterator;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -99,7 +100,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -141,6 +142,40 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
             (Cow::Borrowed(_), Cow::Borrowed(_)) => Cow::Borrowed(s),
             (left, right) => Cow::Owned(f((left.into_owned(), right.into_owned()))),
         }
+    }
+}
+
+/// Rebuilds a parent from transformed children only when needed.
+///
+/// Child transforms may filter nodes by returning `None`. If all children are filtered out, this
+/// returns `None`. If all original children survive as borrowed values, this returns a borrowed
+/// parent. Otherwise, it rebuilds and returns an owned parent.
+pub(crate) fn map_owned_children_or_else<'a, Parent, Child>(
+    parent: &'a Parent,
+    children: impl ExactSizeIterator<Item = Option<Cow<'a, Child>>>,
+    map_owned: impl FnOnce(Vec<Child::Owned>) -> Parent::Owned,
+) -> Option<Cow<'a, Parent>>
+where
+    Parent: ToOwned + ?Sized,
+    Child: ToOwned + ?Sized + 'a,
+{
+    let num_children = children.len();
+    let mut num_borrowed = 0;
+    let mut new_children = Vec::with_capacity(num_children);
+    for child in children.flatten() {
+        if let Cow::Borrowed(_) = child {
+            num_borrowed += 1;
+        }
+        new_children.push(child);
+    }
+
+    if new_children.is_empty() {
+        None
+    } else if num_borrowed < num_children {
+        let owned = new_children.into_iter().map(Cow::into_owned).collect();
+        Some(Cow::Owned(map_owned(owned)))
+    } else {
+        Some(Cow::Borrowed(parent))
     }
 }
 
@@ -352,7 +387,7 @@ pub(crate) mod test_utils {
         struct_type
             .fields()
             .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{}' not found", name))
+            .unwrap_or_else(|| panic!("Field '{name}' not found"))
             .clone()
     }
 
@@ -365,8 +400,7 @@ pub(crate) mod test_utils {
             let field = get_schema_field(schema, field_name);
             assert!(
                 matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{}' should be a struct type",
-                field_name
+                "Field '{field_name}' should be a struct type"
             );
         }
 
@@ -756,7 +790,7 @@ pub(crate) mod test_utils {
                 path.push("tests/data");
                 path.push(table_name);
                 let path = std::fs::canonicalize(path)
-                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {e}")))?;
                 (path, None)
             }
         };
