@@ -31,7 +31,6 @@ pub struct ReadMetadataRunner {
     name: String,
     config: ReadConfig,
     predicate: Option<PredicateRef>,
-    include_stats: bool,
 }
 
 impl ReadMetadataRunner {
@@ -67,28 +66,22 @@ impl ReadMetadataRunner {
             config.name,
         );
 
-        let include_stats = read_spec.include_stats;
-
         Ok(Self {
             snapshot,
             engine,
             name,
             config,
             predicate,
-            include_stats,
         })
     }
 
     fn execute_serial(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut scan_builder = self
+        let scan = self
             .snapshot
             .clone()
             .scan_builder()
-            .with_predicate(self.predicate.clone());
-        if self.include_stats {
-            scan_builder = scan_builder.include_all_stats_columns();
-        }
-        let scan = scan_builder.build()?;
+            .with_predicate(self.predicate.clone())
+            .build()?;
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
             black_box(result?);
@@ -97,15 +90,12 @@ impl ReadMetadataRunner {
     }
 
     fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
-        let mut scan_builder = self
+        let scan = self
             .snapshot
             .clone()
             .scan_builder()
-            .with_predicate(self.predicate.clone());
-        if self.include_stats {
-            scan_builder = scan_builder.include_all_stats_columns();
-        }
-        let scan = scan_builder.build()?;
+            .with_predicate(self.predicate.clone())
+            .build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
         for result in phase1.by_ref() {
@@ -269,7 +259,6 @@ mod tests {
         ReadSpec {
             version: None,
             predicate: None,
-            include_stats: false,
         }
     }
 
@@ -380,6 +369,35 @@ mod tests {
         )
         .expect("create_read_runner should succeed");
         assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_with_valid_predicate() {
+        let mut spec = test_read_spec();
+        spec.predicate = Some("letter = 'a'".to_string());
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_with_invalid_predicate() {
+        let mut spec = test_read_spec();
+        spec.predicate = Some("a LIKE '%foo'".to_string());
+        let result = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_engine(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

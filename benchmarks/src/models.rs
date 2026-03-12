@@ -71,8 +71,6 @@ pub enum Spec {
 pub struct ReadSpec {
     pub version: Option<u64>,      // If version is None, read at latest version
     pub predicate: Option<String>, // SQL WHERE clause expression (e.g. "id < 500")
-    #[serde(default)]
-    pub include_stats: bool, // Whether to include all stats columns in scan metadata
 }
 
 impl ReadSpec {

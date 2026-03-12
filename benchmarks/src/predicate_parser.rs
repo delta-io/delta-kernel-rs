@@ -12,7 +12,9 @@
 //! Unsupported (returns error): `LIKE`, function calls (`HEX`, `size`, `length`),
 //! arithmetic expressions (`a % 100`), typed literals (`TIME '...'`).
 
-use delta_kernel::expressions::{ArrayData, ColumnName, Expression, Predicate, Scalar};
+use delta_kernel::expressions::{
+    ArrayData, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
+};
 use delta_kernel::schema::{ArrayType, DataType};
 
 use sqlparser::ast::{self, Expr, UnaryOperator, Value};
@@ -20,6 +22,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 /// Parses a SQL WHERE clause expression string into a kernel [`Predicate`].
+///
+/// Returns an error if the SQL cannot be parsed or contains unsupported features
+/// (e.g. `LIKE`, function calls, arithmetic expressions, typed literals).
 ///
 /// # Example
 /// ```ignore
@@ -105,11 +110,7 @@ fn convert_in_list(
     let array_data = ArrayData::try_new(ArrayType::new(element_type, false), scalars)?;
     let array_expr = Expression::literal(Scalar::Array(array_data));
 
-    let pred = Predicate::binary(
-        delta_kernel::expressions::BinaryPredicateOp::In,
-        col,
-        array_expr,
-    );
+    let pred = Predicate::binary(BinaryPredicateOp::In, col, array_expr);
     if negated {
         Ok(Predicate::not(pred))
     } else {
@@ -239,23 +240,20 @@ fn convert_value(value: &Value) -> Result<Expression, Box<dyn std::error::Error>
             Ok(Scalar::from(s.clone()).into())
         }
         Value::Boolean(b) => Ok(Scalar::Boolean(*b).into()),
+        // SQL NULL has no inherent type; LONG is an arbitrary default since the kernel
+        // requires a DataType for Scalar::Null and predicates don't carry type context.
         Value::Null => Ok(Scalar::Null(DataType::LONG).into()),
         _ => Err(format!("Unsupported value: {value}").into()),
     }
 }
 
-/// Converts a negated sqlparser [`Value`] into a kernel [`Expression`].
+/// Converts a negated sqlparser [`Value`] into a kernel [`Expression`] by delegating
+/// to [`convert_value`] and negating the resulting numeric scalar.
 fn convert_negative_value(value: &Value) -> Result<Expression, Box<dyn std::error::Error>> {
-    match value {
-        Value::Number(n, _long) => {
-            if let Ok(i) = n.parse::<i64>() {
-                Ok(Scalar::Long(-i).into())
-            } else if let Ok(f) = n.parse::<f64>() {
-                Ok(Scalar::Double(-f).into())
-            } else {
-                Err(format!("Cannot parse negative number: {n}").into())
-            }
-        }
+    let expr = convert_value(value)?;
+    match expr {
+        Expression::Literal(Scalar::Long(n)) => Ok(Scalar::Long(-n).into()),
+        Expression::Literal(Scalar::Double(n)) => Ok(Scalar::Double(-n).into()),
         _ => Err(format!("Unsupported negative value: {value}").into()),
     }
 }
@@ -263,677 +261,288 @@ fn convert_negative_value(value: &Value) -> Result<Expression, Box<dyn std::erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use delta_kernel::expressions::column_name;
+    use delta_kernel::expressions::{column_name, BinaryPredicateOp};
+    use rstest::rstest;
 
-    #[test]
-    fn parse_simple_comparison() {
-        let pred = parse_predicate("id < 500").unwrap();
-        let expected = Predicate::lt(column_name!("id"), Scalar::Long(500));
-        assert_eq!(pred, expected);
+    // Helper to build an IN predicate: `col IN (scalars...)`
+    fn in_list(col: ColumnName, scalars: Vec<Scalar>) -> Predicate {
+        let element_type = scalars
+            .first()
+            .map(|s| s.data_type())
+            .unwrap_or(DataType::LONG);
+        let array = ArrayData::try_new(ArrayType::new(element_type, false), scalars).unwrap();
+        Predicate::binary(
+            BinaryPredicateOp::In,
+            col,
+            Expression::literal(Scalar::Array(array)),
+        )
     }
 
-    #[test]
-    fn parse_and_predicate() {
-        let pred = parse_predicate("id < 500 AND value > 10").unwrap();
-        let expected = Predicate::and(
+    // -- Comparisons --
+    #[rstest]
+    #[case("id < 5", Predicate::lt(column_name!("id"), Scalar::Long(5)))]
+    #[case("id = 999", Predicate::eq(column_name!("id"), Scalar::Long(999)))]
+    #[case("id > 250", Predicate::gt(column_name!("id"), Scalar::Long(250)))]
+    #[case("id <= 2", Predicate::le(column_name!("id"), Scalar::Long(2)))]
+    #[case("id >= 100", Predicate::ge(column_name!("id"), Scalar::Long(100)))]
+    #[case("a <> 1", Predicate::ne(column_name!("a"), Scalar::Long(1)))]
+    #[case("a != 1", Predicate::ne(column_name!("a"), Scalar::Long(1)))]
+    // Literal on the left
+    #[case("1 < a", Predicate::lt(Scalar::Long(1), column_name!("a")))]
+    #[case("1 = a", Predicate::eq(Scalar::Long(1), column_name!("a")))]
+    #[case("1 != a", Predicate::ne(Scalar::Long(1), column_name!("a")))]
+    fn comparison(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
+    }
+
+    // -- Literal types --
+    #[rstest]
+    #[case("name = 'bob'", Predicate::eq(column_name!("name"), Scalar::from("bob".to_string())))]
+    #[case("c3 < 1.5", Predicate::lt(column_name!("c3"), Scalar::Double(1.5)))]
+    #[case("val < -2.5", Predicate::lt(column_name!("val"), Scalar::Double(-2.5)))]
+    #[case("c4 > 5.0", Predicate::gt(column_name!("c4"), Scalar::Double(5.0)))]
+    #[case("flag = true", Predicate::eq(column_name!("flag"), Scalar::Boolean(true)))]
+    #[case("cc9 = false", Predicate::eq(column_name!("cc9"), Scalar::Boolean(false)))]
+    #[case("a = NULL", Predicate::eq(column_name!("a"), Scalar::Null(DataType::LONG)))]
+    #[case("id > -100", Predicate::gt(column_name!("id"), Scalar::Long(-100)))]
+    #[case("value > 1.0E300", Predicate::gt(column_name!("value"), Scalar::Double(1.0E300)))]
+    #[case("a > 2147483647", Predicate::gt(column_name!("a"), Scalar::Long(2147483647)))]
+    #[case("long_val < 50000000000", Predicate::lt(column_name!("long_val"), Scalar::Long(50000000000)))]
+    fn literal_types(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
+    }
+
+    // -- Compound identifiers (nested columns) --
+    #[rstest]
+    #[case("a.b > 1", Predicate::gt(Expression::column(["a", "b"]), Scalar::Long(1)))]
+    #[case("a.b.c = 2", Predicate::eq(Expression::column(["a", "b", "c"]), Scalar::Long(2)))]
+    #[case("b.c.f.i < 0", Predicate::lt(Expression::column(["b", "c", "f", "i"]), Scalar::Long(0)))]
+    #[case("data.value > 150", Predicate::gt(Expression::column(["data", "value"]), Scalar::Long(150)))]
+    fn nested_columns(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
+    }
+
+    // -- Boolean literals --
+    #[rstest]
+    #[case("TRUE", Predicate::literal(true))]
+    #[case("FALSE", Predicate::literal(false))]
+    fn boolean_literals(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
+    }
+
+    // -- IS NULL / IS NOT NULL --
+    #[rstest]
+    #[case("a IS NULL", Predicate::is_null(column_name!("a")))]
+    #[case("a IS NOT NULL", Predicate::is_not_null(column_name!("a")))]
+    #[case("null_v_struct.v IS NULL", Predicate::is_null(Expression::column(["null_v_struct", "v"])))]
+    fn is_null(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
+    }
+
+    // -- NOT --
+    #[rstest]
+    #[case("NOT a = 1", Predicate::not(Predicate::eq(column_name!("a"), Scalar::Long(1))))]
+    #[case("NOT a = NULL", Predicate::not(Predicate::eq(column_name!("a"), Scalar::Null(DataType::LONG))))]
+    #[case(
+        "NOT(a < 1 OR b > 20)",
+        Predicate::not(Predicate::or(
+            Predicate::lt(column_name!("a"), Scalar::Long(1)),
+            Predicate::gt(column_name!("b"), Scalar::Long(20)),
+        ))
+    )]
+    fn not_predicate(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
+    }
+
+    // -- AND / OR --
+    #[rstest]
+    #[case(
+        "id < 500 AND value > 10",
+        Predicate::and(
             Predicate::lt(column_name!("id"), Scalar::Long(500)),
             Predicate::gt(column_name!("value"), Scalar::Long(10)),
-        );
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_or_predicate() {
-        let pred = parse_predicate("id = 1 OR id = 2").unwrap();
-        let expected = Predicate::or(
+        )
+    )]
+    #[case(
+        "id = 1 OR id = 2",
+        Predicate::or(
             Predicate::eq(column_name!("id"), Scalar::Long(1)),
             Predicate::eq(column_name!("id"), Scalar::Long(2)),
-        );
-        assert_eq!(pred, expected);
+        )
+    )]
+    #[case(
+        "a = 0 AND b = 0 AND c = 0",
+        Predicate::and(
+            Predicate::and(
+                Predicate::eq(column_name!("a"), Scalar::Long(0)),
+                Predicate::eq(column_name!("b"), Scalar::Long(0)),
+            ),
+            Predicate::eq(column_name!("c"), Scalar::Long(0)),
+        )
+    )]
+    #[case(
+        "(a < 3 AND b < 3) OR (a > 7 AND b > 7)",
+        Predicate::or(
+            Predicate::and(
+                Predicate::lt(column_name!("a"), Scalar::Long(3)),
+                Predicate::lt(column_name!("b"), Scalar::Long(3)),
+            ),
+            Predicate::and(
+                Predicate::gt(column_name!("a"), Scalar::Long(7)),
+                Predicate::gt(column_name!("b"), Scalar::Long(7)),
+            ),
+        )
+    )]
+    #[case(
+        "(a = 5 OR a = 7) AND b < 5",
+        Predicate::and(
+            Predicate::or(
+                Predicate::eq(column_name!("a"), Scalar::Long(5)),
+                Predicate::eq(column_name!("a"), Scalar::Long(7)),
+            ),
+            Predicate::lt(column_name!("b"), Scalar::Long(5)),
+        )
+    )]
+    fn and_or(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
     }
 
-    #[test]
-    fn parse_string_comparison() {
-        let pred = parse_predicate("version_tag = 'v0'").unwrap();
-        let expected = Predicate::eq(column_name!("version_tag"), Scalar::from("v0".to_string()));
-        assert_eq!(pred, expected);
+    // -- Null-safe equals (<=>)  ->  NOT DISTINCT --
+    #[rstest]
+    #[case("a <=> 1", Predicate::not(Predicate::distinct(column_name!("a"), Scalar::Long(1))))]
+    #[case("a <=> NULL", Predicate::not(Predicate::distinct(column_name!("a"), Scalar::Null(DataType::LONG))))]
+    #[case("1 <=> a", Predicate::not(Predicate::distinct(Scalar::Long(1), column_name!("a"))))]
+    #[case(
+        "NOT a <=> 1",
+        Predicate::not(Predicate::not(Predicate::distinct(column_name!("a"), Scalar::Long(1))))
+    )]
+    fn null_safe_equals(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
     }
 
-    #[test]
-    fn parse_not_predicate() {
-        let pred = parse_predicate("NOT id = 500").unwrap();
-        let expected = Predicate::not(Predicate::eq(column_name!("id"), Scalar::Long(500)));
-        assert_eq!(pred, expected);
+    // -- IN / NOT IN --
+    #[rstest]
+    #[case(
+        "a in (1, 2, 3)",
+        in_list(column_name!("a"), vec![Scalar::Long(1), Scalar::Long(2), Scalar::Long(3)])
+    )]
+    #[case(
+        "a in (1)",
+        in_list(column_name!("a"), vec![Scalar::Long(1)])
+    )]
+    #[case(
+        "value in (300, 787, 239)",
+        in_list(column_name!("value"), vec![Scalar::Long(300), Scalar::Long(787), Scalar::Long(239)])
+    )]
+    #[case(
+        "name in ('alice', 'bob')",
+        in_list(column_name!("name"), vec![Scalar::from("alice".to_string()), Scalar::from("bob".to_string())])
+    )]
+    fn in_predicate(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
     }
 
-    #[test]
-    fn parse_is_null() {
-        let pred = parse_predicate("id IS NULL").unwrap();
-        let expected = Predicate::is_null(column_name!("id"));
-        assert_eq!(pred, expected);
+    #[rstest]
+    #[case(
+        "a NOT IN (1, 2)",
+        Predicate::not(in_list(column_name!("a"), vec![Scalar::Long(1), Scalar::Long(2)]))
+    )]
+    #[case(
+        "a NOT IN (10, 20, 30)",
+        Predicate::not(in_list(column_name!("a"), vec![Scalar::Long(10), Scalar::Long(20), Scalar::Long(30)]))
+    )]
+    fn not_in_predicate(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
     }
 
-    #[test]
-    fn parse_is_not_null() {
-        let pred = parse_predicate("id IS NOT NULL").unwrap();
-        let expected = Predicate::is_not_null(column_name!("id"));
-        assert_eq!(pred, expected);
+    // -- BETWEEN  ->  col >= low AND col <= high --
+    #[rstest]
+    #[case(
+        "id BETWEEN 10 AND 20",
+        Predicate::and(
+            Predicate::ge(column_name!("id"), Scalar::Long(10)),
+            Predicate::le(column_name!("id"), Scalar::Long(20)),
+        )
+    )]
+    #[case(
+        "id BETWEEN -10 AND -1",
+        Predicate::and(
+            Predicate::ge(column_name!("id"), Scalar::Long(-10)),
+            Predicate::le(column_name!("id"), Scalar::Long(-1)),
+        )
+    )]
+    #[case(
+        "id NOT BETWEEN 10 AND 20",
+        Predicate::not(Predicate::and(
+            Predicate::ge(column_name!("id"), Scalar::Long(10)),
+            Predicate::le(column_name!("id"), Scalar::Long(20)),
+        ))
+    )]
+    fn between(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
     }
 
-    #[test]
-    fn parse_nested_expression() {
-        let pred = parse_predicate("(id < 500) AND (value > 10)").unwrap();
-        let expected = Predicate::and(
-            Predicate::lt(column_name!("id"), Scalar::Long(500)),
-            Predicate::gt(column_name!("value"), Scalar::Long(10)),
-        );
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_negative_number() {
-        let pred = parse_predicate("id > -100").unwrap();
-        let expected = Predicate::gt(column_name!("id"), Scalar::Long(-100));
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_complex_predicate() {
-        let pred = parse_predicate("id >= 0 AND id < 1000 AND version_tag = 'v0'").unwrap();
-        let expected = Predicate::and(
+    // -- Complex predicates (multi-feature) --
+    #[rstest]
+    #[case(
+        "id >= 0 AND id < 1000 AND version_tag = 'v0'",
+        Predicate::and(
             Predicate::and(
                 Predicate::ge(column_name!("id"), Scalar::Long(0)),
                 Predicate::lt(column_name!("id"), Scalar::Long(1000)),
             ),
             Predicate::eq(column_name!("version_tag"), Scalar::from("v0".to_string())),
-        );
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_in_list() {
-        let pred = parse_predicate("a in (1, 2, 3)").unwrap();
-        let array = ArrayData::try_new(
-            ArrayType::new(DataType::LONG, false),
-            vec![Scalar::Long(1), Scalar::Long(2), Scalar::Long(3)],
         )
-        .unwrap();
-        let expected = Predicate::binary(
-            delta_kernel::expressions::BinaryPredicateOp::In,
-            column_name!("a"),
-            Expression::literal(Scalar::Array(array)),
-        );
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_not_in_list() {
-        let pred = parse_predicate("a NOT IN (1, 2)").unwrap();
-        let array = ArrayData::try_new(
-            ArrayType::new(DataType::LONG, false),
-            vec![Scalar::Long(1), Scalar::Long(2)],
+    )]
+    #[case(
+        "int_col IS NOT NULL AND str_col IS NOT NULL",
+        Predicate::and(
+            Predicate::is_not_null(column_name!("int_col")),
+            Predicate::is_not_null(column_name!("str_col")),
         )
-        .unwrap();
-        let expected = Predicate::not(Predicate::binary(
-            delta_kernel::expressions::BinaryPredicateOp::In,
-            column_name!("a"),
-            Expression::literal(Scalar::Array(array)),
-        ));
-        assert_eq!(pred, expected);
+    )]
+    #[case(
+        "NOT (a >= 5 AND NOT (b < 5))",
+        Predicate::not(Predicate::and(
+            Predicate::ge(column_name!("a"), Scalar::Long(5)),
+            Predicate::not(Predicate::lt(column_name!("b"), Scalar::Long(5))),
+        ))
+    )]
+    #[case(
+        "partCol = 3 and id > 25",
+        Predicate::and(
+            Predicate::eq(column_name!("partCol"), Scalar::Long(3)),
+            Predicate::gt(column_name!("id"), Scalar::Long(25)),
+        )
+    )]
+    fn complex(#[case] sql: &str, #[case] expected: Predicate) {
+        assert_eq!(parse_predicate(sql).unwrap(), expected);
     }
 
-    #[test]
-    fn parse_between() {
-        let pred = parse_predicate("id BETWEEN 10 AND 20").unwrap();
-        let expected = Predicate::and(
-            Predicate::ge(column_name!("id"), Scalar::Long(10)),
-            Predicate::le(column_name!("id"), Scalar::Long(20)),
-        );
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_null_safe_equals() {
-        let pred = parse_predicate("a <=> 1").unwrap();
-        let expected = Predicate::not(Predicate::distinct(column_name!("a"), Scalar::Long(1)));
-        assert_eq!(pred, expected);
-    }
-
-    #[test]
-    fn parse_null_safe_equals_null() {
-        let pred = parse_predicate("a <=> NULL").unwrap();
-        let expected = Predicate::not(Predicate::distinct(
-            column_name!("a"),
-            Scalar::Null(DataType::LONG),
-        ));
-        assert_eq!(pred, expected);
-    }
-
-    /// Bulk test: every predicate that the parser should handle successfully.
-    /// We don't check the exact output -- just that parsing doesn't error.
-    #[test]
-    fn parse_all_supported_predicates() {
-        let supported = [
-            // Simple comparisons
-            "id < 5",
-            "full_name = 'John Doe'",
-            "squared > 10",
-            "id = 999",
-            "a <=> 1",
-            "a <> 1",
-            "NOT a <=> NULL",
-            "NOT a <=> 1",
-            "FALSE",
-            "a > 1",
-            "a = NULL",
-            "NOT a = 1",
-            "a IS NULL",
-            "a IS NOT NULL",
-            "a = 1",
-            "NOT a = NULL",
-            "TRUE",
-            "a < 1",
-            // NOT IN
-            "a NOT IN (1, 2)",
-            "a NOT IN (10, 20, 30)",
-            "a NOT IN (3)",
-            "a NOT IN (1, 2, 3, 4, 5)",
-            // Simple column comparisons
-            "id = 1",
-            "c7 = '2003-02-02'",
-            "c1 = 1",
-            "c3 < 1.5",
-            "c10 > 1.5",
-            "c6 >= '2001-01-01 01:00:00'",
-            "c4 > 5.0",
-            "c6 >= '2003-01-01 01:00:00'",
-            "c4 > 1.0",
-            "c10 > 2.5",
-            "c3 < 0.5",
-            "c5 >= '2003-01-01 01:00:00'",
-            "c5 >= '2001-01-01 01:00:00'",
-            "c1 = 10",
-            "c7 = '2002-02-02'",
-            "category = '0'",
-            "date = '2024-01-01'",
-            // AND predicates
-            "a = 2 AND b >= '2017-08-30'",
-            "a > 0 AND b = '2017-09-01'",
-            "name IS NOT NULL",
-            "id > 250",
-            "distance = 5.0",
-            "id < 100",
-            "id >= 100",
-            "doubled > 40",
-            // Compound identifiers (nested columns)
-            "a.b.c > 1",
-            "a.b.c < 1",
-            "a.b.c <= 2",
-            "a.b.c = 1",
-            "a.b.c <= 1",
-            "a.b.c >= 0",
-            "a.b.c = 2",
-            "a.b.c >= 1",
-            "id < 50",
-            "part = 1",
-            "part = 0",
-            "a.b >= 0",
-            "a.b = 2",
-            "a.b >= 1",
-            "a.b > 1",
-            "a.b <= 1",
-            "a.b <= 2",
-            "a.b < 1",
-            "a.b = 1",
-            "id > 5",
-            "status = 'inactive'",
-            "count > 30",
-            "status = 'active'",
-            "a < 0",
-            "b < 0",
-            "c < 0",
-            "d < 0",
-            "m < 0",
-            "b.l = 9",
-            "b.c.f.i < 0",
-            "b.l < 0",
-            "b.c.d = 2",
-            "b.c.f.i = 6",
-            "value >= 100",
-            "fruit = 'apple'",
-            "fruit < 'cherry'",
-            "fruit = 'fig'",
-            "fruit > 'cherry'",
-            "fruit = 'banana'",
-            "part = 0",
-            "amount > 1000",
-            "a > 127",
-            "a > 32767",
-            "id > 2",
-            "name = 'bob'",
-            "key > 5",
-            "id < 10",
-            "id >= 20",
-            "value = 1",
-            "id >= 50 AND id < 80",
-            "id >= 1000",
-            "b.c.d < 0",
-            "b.c.e < 0",
-            "b.c.f.g < 0",
-            "b.c.d = 2",
-            "b.c.e = 3",
-            "b.l < 0",
-            "a < 0",
-            "b.c.f.i < 0",
-            "a = 1",
-            "cc2 = '4'",
-            "cc7 = '2002-02-02'",
-            "cc10 > 1.5",
-            "cc5 >= '2003-01-01 01:00:00'",
-            "cc2 = '2'",
-            "cc6 >= '2001-01-01 01:00:00'",
-            "cc1 = 1",
-            "cc3 < 1.5",
-            "cc6 >= '2003-01-01 01:00:00'",
-            "cc3 < 0.5",
-            "cc5 >= '2001-01-01 01:00:00'",
-            "cc1 = 10",
-            "cc7 = '2003-02-02'",
-            "cc4 > 1.0",
-            "cc10 > 2.5",
-            "cc9 = false",
-            "cc9 = true",
-            "cc4 > 5.0",
-            "part = 1",
-            "flag = true",
-            "a <= 1 AND a > -1",
-            "a < 0 AND a > -2",
-            "a > 0 AND a < 3",
-            "id > 3",
-            "int_col IS NULL",
-            "int_col IS NOT NULL AND str_col IS NOT NULL",
-            "int_col IS NOT NULL",
-            "str_col IS NULL",
-            "id = 2",
-            "date_col >= '2024-01-10' AND date_col < '2024-01-20'",
-            "date_col = '2024-01-15'",
-            "id >= 100",
-            "id < 100",
-            "col3 = 200",
-            "col1 = 2",
-            "col2 = 20",
-            "value > 1.0E300",
-            "id = 1",
-            "NOT(a < 1 OR b > 20)",
-            "NOT(a >= 1 OR b <= 20)",
-            "category = 'A'",
-            "code = 'ABCDE'",
-            "id < 5",
-            "a >= 'D'",
-            "a > 'CD'",
-            "a < 'AB'",
-            "a > 'BA'",
-            "a > 'CC'",
-            "amount > 250.0",
-            "amount <= 200.0",
-            "id = 1",
-            "data.count > 2147483647",
-            "id < 10",
-            // OR predicates
-            "a < 0 or b = '2017-09-01'",
-            "a = 2 or b < '2017-08-30'",
-            "a < 2",
-            "domain = 'example.com'",
-            "id > 1",
-            "id < 5",
-            "category = 'B'",
-            "category = 'C'",
-            "category = 'A'",
-            // NOT with AND/OR
-            "NOT(a >= 10 AND b <= 20)",
-            "NOT(a < 10 AND b > 20)",
-            "NOT(a >= 10 AND b >= 10)",
-            "id = 1",
-            "info.age > 27",
-            "id < 0",
-            "value > 1.5",
-            "start_date >= '2024-02-01'",
-            "b.c.e < 0",
-            "m < 0",
-            "b.c.k < 0",
-            "b.c.f.h < 0",
-            "b.c.j < 0",
-            "b.l < 0",
-            "b.c.d < 0",
-            "b.c.f.g < 0",
-            "b.c.f.i < 0",
-            "a < 0",
-            "price > 100",
-            "id = 1",
-            "value > 150",
-            "a > 100",
-            "a <= 10",
-            "a > 10 AND a <= 20",
-            "a <= 15",
-            "a > 20",
-            "a > 15",
-            "a < 0",
-            "id <= 2",
-            "double_col > 1400",
-            "int_col = 50",
-            "long_col >= 900 AND long_col < 950",
-            "test_data < 50",
-            "event_date = '2024-01-15'",
-            "event_hour < 12",
-            "a < 0",
-            "b.c < 0",
-            "b.d < 0",
-            "name = 'ALICE'",
-            "info.age > 27",
-            "id < 5",
-            "i < 0",
-            "a.d < 0",
-            "a.f.g < 0",
-            "a.e < 0",
-            "a.f.g < 10",
-            "a.d > 6",
-            // BETWEEN
-            "id BETWEEN -10 AND -1",
-            "id BETWEEN 100 AND 200",
-            "id BETWEEN 20 AND 30",
-            "id BETWEEN 0 AND 99",
-            "id BETWEEN 50 AND 60",
-            "date_part = '2024-01-01'",
-            "id = 1",
-            "id >= 15",
-            "id = 1",
-            "id = 2",
-            "name IS NOT NULL",
-            "b.c.j < 0",
-            "b.c.f.i = 6",
-            "b.c.k < 0",
-            "b.c.f.i < 0",
-            "b.l < 0",
-            "a < 0",
-            "b.l < 0",
-            "a < 0",
-            "m < 0",
-            "b.c.d < 0",
-            "b.c.f.i < 0",
-            "a = 100",
-            "a = 1000",
-            "c = 100",
-            "x > 3",
-            "NOT (a <=> NULL)",
-            "NOT (a <=> 1)",
-            "a <=> 1",
-            "b <=> NULL",
-            "a <=> NULL",
-            "id < 10",
-            "b.c.k < 0",
-            "b.c.f.i < 0",
-            "b.c.d < 0",
-            "b.c.f.g < 0",
-            "m < 0",
-            "b.l < 0",
-            "b.c.f.h < 0",
-            "b.c.e < 0",
-            "a < 0",
-            "b.c.j < 0",
-            "value < 500",
-            "x < 0",
-            "doubled = 4",
-            "null_v IS NOT NULL",
-            "null_v_struct.v IS NULL",
-            "null_v_struct.v IS NOT NULL",
-            "v IS NOT NULL",
-            "v_struct.v IS NULL",
-            "null_v IS NULL",
-            "v IS NULL",
-            "v_struct.v IS NOT NULL",
-            "a = 1",
-            "NOT a <=> NULL",
-            "a < 1",
-            "a <=> NULL",
-            "a <> 1",
-            "NOT a = NULL",
-            "a > 1",
-            "a IS NOT NULL",
-            "a IS NULL",
-            "NOT a = 1",
-            "NOT a <=> 1",
-            "FALSE",
-            "a = NULL",
-            "TRUE",
-            "a <=> 1",
-            "name = 'two'",
-            "id = 1",
-            "a >= 2 or a < -1",
-            "a > 5 or a < -2",
-            "a > 0 or a < -3",
-            "data.value > 150",
-            "data.category = 5",
-            "value = 'a'",
-            "id > 2",
-            "name = 'alice'",
-            "c10 > 2.5",
-            "c4 > 5.0",
-            "c2 = '2'",
-            "c4 > 1.0",
-            "c6 >= '2003-01-01 01:00:00'",
-            "c5 >= '2001-01-01 01:00:00'",
-            "c6 >= '2001-01-01 01:00:00'",
-            "c10 > 1.5",
-            "c9 = false",
-            "c1 = 1",
-            "c1 = 10",
-            "c7 = '2003-02-02'",
-            "c5 >= '2003-01-01 01:00:00'",
-            "c3 < 1.5",
-            "c2 = '4'",
-            "c3 < 0.5",
-            "c7 = '2002-02-02'",
-            "c9 = true",
-            "cc9 = false",
-            "cc9 = true",
-            // Complex AND/OR
-            "(a < 3 AND b < 3) OR (a > 7 AND b > 7)",
-            "NOT (a >= 5 AND NOT (b < 5))",
-            "a = 0 AND b = 0 AND c = 0",
-            "(a = 5 OR a = 7) AND b < 5",
-            "id <= 3",
-            "part IS NULL",
-            "part = '1'",
-            "name >= 'c' AND name < 'e'",
-            "name = 'cherry'",
-            "price > 25.00",
-            "v IS NOT NULL",
-            "part = 0",
-            "part = 3",
-            "id < 5",
-            "id2 < 100",
-            "part = 5",
-            "part = 0",
-            "part >= 7",
-            "not a < 0",
-            "not a > 0",
-            "flag = true",
-            "part = 0",
-            "part = 1",
-            "part = 0 AND id < 10",
-            "value < 100",
-            "part = 99",
-            "a < 10 OR b > 20",
-            "part = 1",
-            "num > 7",
-            "value > 200",
-            "id >= 1000 AND id <= 1200",
-            "a > 'CD'",
-            "a > 'BA'",
-            "a < 'AA'",
-            "a < 'AB'",
-            "a = false",
-            "false = a",
-            "NOT a",
-            "a <= false",
-            "NOT a = false",
-            "int_val = 25",
-            "long_val < 50000000000",
-            "double_val < 5.0",
-            "int_val > 200",
-            "int_val < 50",
-            "long_val < 0",
-            "value > 1500",
-            "amount >= 50.00 AND amount < 75.00",
-            "amount = 12.30",
-            "category = 'A'",
-            "category = 'B'",
-            "category = 'C'",
-            "dt >= '2024-01-15'",
-            "dt < '2024-01-01'",
-            "dt = '2024-01-15'",
-            "dt < '2024-01-20'",
-            "dt > '2024-12-31'",
-            "a < 1 OR b < 10",
-            "b < 10",
-            "a < 1 OR (a > 10 AND b < 10)",
-            "a < 1 AND b < 10",
-            "a < 1 OR (a >= 1 AND b < 10)",
-            "a <= 0",
-            "1 != a",
-            "2 <= a",
-            "a < 1",
-            "0 <= a",
-            "a <=> 1",
-            "1 < a",
-            "2 >= a",
-            "a >= 0",
-            "a <=> 2",
-            "1 = a",
-            "NOT a <=> 2",
-            "a > 1",
-            "NOT a = 1",
-            "2 <=> a",
-            "0 >= a",
-            "True",
-            "a = 2",
-            "a != 1",
-            "a = 1",
-            "a <= 2",
-            "a >= 1",
-            "1 >= a",
-            "2 = a",
-            "1 > a",
-            "a >= 2",
-            "NOT a <=> 1",
-            "a <= 1",
-            "1 <= a",
-            "1 <=> a",
-            "col1 = 2",
-            // IN lists
-            "a in (4, 5, 6)",
-            "a in (1, 2)",
-            "a in (1)",
-            "a in (1, 2, 3)",
-            "id >= 10",
-            "col00 = 0",
-            "col32 = -1",
-            "col00 = 1",
-            "col32 = 32",
-            "amount > 50",
-            "status = 'active'",
-            "partCol = 3 and id > 25",
-            "id > 25",
-            "partCol = 3",
-            "wrapper.label = 'first'",
-            "s IS NOT NULL",
-            "a > 2147483647",
-            "value in (300, 787, 239)",
-            "_metadata.default_row_commit_version > 1",
-            "id >= 5",
-            // Time-as-string predicates (parsed as plain string comparisons)
-            "start_time < '10:00:00'",
-            "event_time >= '12:00:00'",
-            // Backtick-quoted identifiers (single-component column name containing dots)
-            "`b.c` < 0",
-        ];
-
-        let mut failures = Vec::new();
-        for sql in &supported {
-            if let Err(e) = parse_predicate(sql) {
-                failures.push(format!("  FAIL: {sql:?} -> {e}"));
-            }
-        }
+    #[rstest]
+    // LIKE (no kernel support)
+    #[case("a like 'C%'")]
+    #[case("fruit like 'b%'")]
+    #[case("a > 0 AND b like '2016-%'")]
+    // Function calls
+    #[case("cc8 = HEX('1111')")]
+    #[case("size(items) > 2")]
+    #[case("length(s) < 4")]
+    // Arithmetic expressions
+    #[case("a % 100 < 10 OR b > 20")]
+    #[case("a < 10 AND b % 100 > 20")]
+    // Typed literals (TIME keyword)
+    #[case("time_col >= TIME '00:00:00'")]
+    #[case("time_col < TIME '12:00:00'")]
+    // IS NULL on non-column expressions
+    #[case("(a > 0) IS NULL")]
+    #[case("(a > 0 AND b > 1) IS NULL")]
+    fn unsupported_predicates_fail_gracefully(#[case] sql: &str) {
+        let result = parse_predicate(sql);
         assert!(
-            failures.is_empty(),
-            "Expected all predicates to parse successfully, but {} failed:\n{}",
-            failures.len(),
-            failures.join("\n")
+            result.is_err(),
+            "Expected {sql:?} to fail, but it parsed as: {:?}",
+            result.unwrap()
         );
-    }
-
-    /// Predicates that use SQL features not representable in kernel expressions.
-    /// These should fail gracefully with an error (not panic).
-    #[test]
-    fn unsupported_predicates_fail_gracefully() {
-        let unsupported = [
-            // LIKE (no kernel support)
-            "a like 'C%'",
-            "a like 'A%'",
-            "a.b like '%'",
-            "a.b like 'mic%'",
-            "fruit like 'b%'",
-            "fruit like 'a%'",
-            "fruit like 'z%'",
-            "fruit like '%'",
-            "name LIKE 'b%'",
-            "a > 0 AND b like '2016-%'",
-            "a >= 2 AND b like '2017-08-%'",
-            "a >= 2 or b like '2016-08-%'",
-            "a < 2 or b like '2017-08-%'",
-            "a < 0 or b like '2016-%'",
-            // Function calls
-            "cc8 = HEX('1111')",
-            "cc8 = HEX('3333')",
-            "c8 = HEX('3333')",
-            "c8 = HEX('1111')",
-            "size(items) > 2",
-            "size(tags) > 2",
-            "length(s) < 4",
-            // Arithmetic expressions
-            "a % 100 < 10 OR b > 20",
-            "a % 100 < 10 AND b > 20",
-            "a < 10 OR b % 100 > 20",
-            "a % 100 < 10 AND b % 100 > 20",
-            "a < 10 AND b % 100 > 20",
-            // Typed literals (TIME keyword)
-            "time_col >= TIME '00:00:00'",
-            "time_col >= TIME '10:00:00' AND time_col < TIME '12:00:00'",
-            "time_col > TIME '12:00:00'",
-            "time_col < TIME '12:00:00'",
-            // IS NULL on complex expressions (not a column)
-            "(a < 0) IS NULL",
-            "(a > 0) IS NULL",
-            "(a > 1) IS NULL",
-            "NOT ((a > 0) IS NULL)",
-            "NOT ((a > 1) IS NULL)",
-            "(a > 0 OR b > 1) IS NULL",
-            "(a > 0 AND b > 1) IS NULL",
-            "(a > 1 AND a > 0) IS NULL",
-            "(b > 1 AND a > 0) IS NULL",
-            "(b > 1 OR a < 0) IS NULL",
-            "(a > 1 OR a < 0) IS NULL",
-            "(b > 0) IS NULL",
-            "(b < 0) IS NULL",
-        ];
-
-        for sql in &unsupported {
-            let result = parse_predicate(sql);
-            assert!(
-                result.is_err(),
-                "Expected {sql:?} to fail, but it parsed as: {:?}",
-                result.unwrap()
-            );
-        }
     }
 }
