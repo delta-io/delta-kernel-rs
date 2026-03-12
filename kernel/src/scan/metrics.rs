@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use delta_kernel_derive::internal_api;
 use tracing::info;
 
-/// Metrics collected during scan log replay.
+/// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
+/// to keep updates fast across parallel executing threads.
 #[internal_api]
 pub(crate) struct ScanMetrics {
     /// Add files seen during add remove deduplication. This does not include data skipped add
