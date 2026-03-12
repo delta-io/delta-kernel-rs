@@ -21,9 +21,7 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
-#[cfg(feature = "internal-api")]
-pub use crate::listed_log_files::ListedLogFiles;
-#[cfg(not(feature = "internal-api"))]
+#[internal_api]
 use crate::listed_log_files::ListedLogFiles;
 use crate::schema::compare::SchemaComparison;
 
