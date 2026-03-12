@@ -303,7 +303,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from("_delta_log/00000000000000000000.json");
+        let path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&path, commit0_data.into()).await?;
 
         // Try to build a snapshot and expect a clear error message
