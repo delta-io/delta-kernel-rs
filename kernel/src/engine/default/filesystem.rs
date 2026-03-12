@@ -7,13 +7,13 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore, PutMode};
 use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
 use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
@@ -407,13 +407,13 @@ mod tests {
     use std::time::Duration;
 
     use itertools::Itertools;
-    use object_store::memory::InMemory;
-    use object_store::{local::LocalFileSystem, ObjectStore};
 
     use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
 

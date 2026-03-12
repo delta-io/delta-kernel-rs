@@ -66,12 +66,12 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use object_store::memory::InMemory;
     use url::Url;
 
     use crate::actions::visitors::DomainMetadataVisitor;
     use crate::committer::FileSystemCommitter;
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, StructField, StructType};
     use crate::transaction::create_table::create_table as create_table_txn;
     use crate::{RowVisitor as _, Snapshot};

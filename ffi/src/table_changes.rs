@@ -344,11 +344,13 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::object_store::{memory::InMemory, path::Path, DynObjectStore};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
     use test_utils::{
         actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
@@ -406,7 +408,7 @@ mod tests {
     "#;
 
     async fn commit_add_file(
-        storage: &dyn ObjectStore,
+        storage: &DynObjectStore,
         version: u64,
         file: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -426,7 +428,7 @@ mod tests {
     }
 
     async fn commit_remove_file(
-        storage: &dyn ObjectStore,
+        storage: &DynObjectStore,
         version: u64,
         file: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -446,7 +448,7 @@ mod tests {
     }
 
     async fn put_file(
-        storage: &dyn ObjectStore,
+        storage: &DynObjectStore,
         file: String,
         batch: &RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error>> {

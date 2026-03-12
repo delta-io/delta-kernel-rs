@@ -15,7 +15,7 @@ use delta_kernel_benchmarks::runners::{
 use delta_kernel_benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-    use object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::local::LocalFileSystem;
 
     let store = Arc::new(LocalFileSystem::new());
     let engine = DefaultEngine::builder(store).build();

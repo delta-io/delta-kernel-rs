@@ -125,8 +125,8 @@ mod tests {
     use super::*;
     use delta_kernel::committer::CatalogCommit;
     use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
-    use object_store::local::LocalFileSystem;
     use std::fs;
     use uc_client::error::Result;
 

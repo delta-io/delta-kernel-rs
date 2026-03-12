@@ -1004,9 +1004,9 @@ mod tests {
     };
     use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt as _;
     use serde_json::Value;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, add_commit, TestAction, METADATA,
@@ -1172,7 +1172,7 @@ mod tests {
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
-        use object_store::local::LocalFileSystem;
+        use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
         let tmp_dir = tempdir()?;

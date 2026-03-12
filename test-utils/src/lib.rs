@@ -21,6 +21,10 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::{path::Path, DynObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
@@ -29,9 +33,6 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
@@ -224,7 +225,7 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 // TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
 /// put a commit file into the specified object store.
 pub async fn add_commit(
-    store: &dyn ObjectStore,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -234,7 +235,7 @@ pub async fn add_commit(
 }
 
 pub async fn add_staged_commit(
-    store: &dyn ObjectStore,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
@@ -333,11 +334,11 @@ pub fn engine_store_setup(
     table_name: &str,
     local_directory: Option<&Url>,
 ) -> (
-    Arc<dyn ObjectStore>,
+    Arc<DynObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+    let (storage, url): (Arc<DynObjectStore>, Url) = match local_directory {
         None => (
             Arc::new(InMemory::new()),
             Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
@@ -356,7 +357,7 @@ pub fn engine_store_setup(
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_path: Url,
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -489,7 +490,7 @@ pub async fn setup_test_tables(
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         &'static str,
     )>,
     Box<dyn std::error::Error>,

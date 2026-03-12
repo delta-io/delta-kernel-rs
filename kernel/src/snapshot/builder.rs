@@ -162,17 +162,17 @@ mod tests {
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
-
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use itertools::Itertools;
-    use object_store::memory::InMemory;
-    use object_store::ObjectStore;
     use serde_json::json;
 
     use super::*;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         String,
     ) {
         let table_root = String::from("memory:///");
@@ -182,7 +182,7 @@ mod tests {
     }
 
     // TODO (#1990): update this function to properly store the table at table_root
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: String) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<DynObjectStore>, _table_root: String) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -219,7 +219,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
+        let path = Path::from(format!("_delta_log/{:020}.json", 0).as_str());
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -242,7 +242,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
+        let path = Path::from(format!("_delta_log/{:020}.json", 1).as_str());
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())
@@ -303,7 +303,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from("_delta_log/00000000000000000000.json");
+        let path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&path, commit0_data.into()).await?;
 
         // Try to build a snapshot and expect a clear error message

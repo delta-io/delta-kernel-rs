@@ -15,13 +15,12 @@ use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
+use crate::object_store::local::LocalFileSystem;
+use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
-
-use object_store::local::LocalFileSystem;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
 use test_utils::delta_path_for_version;

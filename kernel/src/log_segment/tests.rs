@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -22,6 +21,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
+use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{

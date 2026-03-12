@@ -13,11 +13,16 @@ version.workspace = true
 [package.metadata.release]
 release = false
 
+[features]
+default = ["arrow"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58"]
+arrow-57 = ["delta_kernel/arrow-57"]
+
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["catalog-managed"] }
 uc-client = { path = "../uc-client" }
 itertools = "0.14"
-object_store = "0.12.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -26,7 +31,6 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
+delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
 uc-client = { path = "../uc-client", features = ["test-utils"] }
-object_store = "0.12"
 tempfile = "3"

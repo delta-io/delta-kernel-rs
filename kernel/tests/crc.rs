@@ -7,12 +7,12 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, FileStatsValidity};
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use object_store::local::LocalFileSystem;
 use rstest::rstest;
 use test_utils::{insert_data, test_table_setup};
 

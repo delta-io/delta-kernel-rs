@@ -9,6 +9,8 @@ use delta_kernel_derive::internal_api;
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
+use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -18,8 +20,6 @@ use crate::parquet::arrow::async_writer::AsyncArrowWriter;
 use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -424,7 +424,7 @@ async fn open_parquet_file(
     let path = Path::from_url_path(file_meta.location.path())?;
 
     let mut reader = {
-        use object_store::ObjectStoreScheme;
+        use crate::object_store::ObjectStoreScheme;
         // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
         // request which isn't supported by Azure. For now we just detect if the URL is
         // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -595,12 +595,11 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DEFAULT_BATCH_SIZE;
+    use crate::object_store::{local::LocalFileSystem, memory::InMemory};
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
-
     use itertools::Itertools;
-    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 
     use crate::utils::current_time_ms;

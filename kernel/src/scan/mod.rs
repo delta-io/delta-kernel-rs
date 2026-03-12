@@ -843,7 +843,7 @@ impl Scan {
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
-    /// # use object_store::local::LocalFileSystem;
+    /// # use crate::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;

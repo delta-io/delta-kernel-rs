@@ -130,6 +130,9 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::parallel::parallel_scan_metadata::AfterSequentialScanMetadata;
     use crate::parallel::parallel_scan_metadata::{ParallelScanMetadata, ParallelState};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -139,9 +142,6 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{load_test_table, parse_json_batch};
     use crate::{PredicateRef, SnapshotRef};
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;

@@ -975,10 +975,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use serde_json::json;
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -993,6 +989,10 @@ mod tests {
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::table_features::{

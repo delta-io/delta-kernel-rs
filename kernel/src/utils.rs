@@ -185,8 +185,6 @@ pub(crate) mod test_utils {
     use std::{path::Path, sync::Arc};
 
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
@@ -201,6 +199,9 @@ pub(crate) mod test_utils {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
@@ -689,7 +690,7 @@ pub(crate) mod test_utils {
             ColumnMappingMode::Id => "id",
             ColumnMappingMode::None => "none",
         };
-        let store = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(InMemory::new());
         let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")

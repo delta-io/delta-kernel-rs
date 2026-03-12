@@ -10,12 +10,16 @@ version.workspace = true
 [package.metadata.release]
 release = false
 
+[features]
+default = ["arrow"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58"]
+arrow-57 = ["delta_kernel/arrow-57"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
-  "arrow",
   "default-engine-rustls",
   "internal-api",
 ] }
-object_store = { version = "0.12.3", features = ["aws", "azure", "gcp", "http"] }
 url = "2"

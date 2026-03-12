@@ -189,6 +189,8 @@ mod tests {
 
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
 
@@ -204,8 +206,6 @@ mod tests {
     use test_utils::{set_json_value, setup_test_tables, test_read};
 
     use itertools::Itertools;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use serde_json::json;
     use serde_json::Deserializer;
 
@@ -276,14 +276,9 @@ mod tests {
 
         // writer must be closed to write footer
         let res = writer.close().unwrap();
-
         let file_size_bytes = std::fs::metadata(&full_path)?.len();
-        create_file_metadata(
-            file_path,
-            file_size_bytes,
-            res.file_metadata().num_rows(),
-            metadata_schema,
-        )
+        let num_rows = res.file_metadata().num_rows();
+        create_file_metadata(file_path, file_size_bytes, num_rows, metadata_schema)
     }
 
     #[tokio::test]

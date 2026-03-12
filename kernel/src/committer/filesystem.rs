@@ -90,10 +90,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
-
-    use object_store::memory::InMemory;
-    use object_store::ObjectStore as _;
     use url::Url;
 
     #[cfg(feature = "catalog-managed")]
@@ -109,7 +109,7 @@ mod tests {
             r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1234567890}}"#,
         ].join("\n");
 
-        let commit_path = object_store::path::Path::from("_delta_log/00000000000000000000.json");
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
         storage.put(&commit_path, actions.into()).await.unwrap();
 
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)

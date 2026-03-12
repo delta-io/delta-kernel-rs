@@ -2,15 +2,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
 
-use object_store::path::Path;
-use object_store::ObjectStore;
 use url::Url;
 
-/// Convert a URL to an object_store::Path
+/// Convert a URL to an delta_kernel::object_store::Path
 fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error>> {
     let path_segments = url
         .path_segments()

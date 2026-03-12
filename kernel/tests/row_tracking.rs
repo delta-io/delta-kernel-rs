@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use url::Url;
@@ -15,6 +14,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
@@ -29,7 +29,7 @@ async fn create_row_tracking_table(
 ) -> DeltaResult<(
     Url,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    Arc<dyn ObjectStore>,
+    Arc<DynObjectStore>,
 )> {
     let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path())
         .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
@@ -118,7 +118,7 @@ where
 
 /// Helper function to verify row tracking-related information in a commit.
 async fn verify_row_tracking_in_commit(
-    store: &Arc<dyn ObjectStore>,
+    store: &Arc<DynObjectStore>,
     table_url: &Url,
     commit_version: u64,
     expected_base_row_ids: Vec<i64>,
