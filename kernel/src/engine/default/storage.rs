@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use url::Url;
 
 use crate::object_store::path::Path;
-use crate::object_store::{parse_url_opts, Error, ObjectStore};
+use crate::object_store::{self, Error, ObjectStore};
 use crate::Error as DeltaError;
 
 /// Alias for convenience
@@ -99,10 +99,10 @@ where
                 .collect();
             handler(url, options)?
         } else {
-            parse_url_opts(url, options)?
+            object_store::parse_url_opts(url, options)?
         }
     } else {
-        parse_url_opts(url, options)?
+        object_store::parse_url_opts(url, options)?
     };
 
     Ok(Arc::new(store))
@@ -112,8 +112,7 @@ where
 mod tests {
     use super::*;
 
-    use crate::object_store::path::Path;
-    use crate::object_store::Error as ObjectStoreError;
+    use crate::object_store::{self, path::Path};
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
@@ -160,7 +159,7 @@ mod tests {
         // to connect to, so the only way to really verify that we got the object store we
         // expected is to inspect the `store` on the error v_v
         match store_from_url_opts(&url, options) {
-            Err(crate::Error::ObjectStore(ObjectStoreError::Generic { store, source: _ })) => {
+            Err(crate::Error::ObjectStore(object_store::Error::Generic { store, source: _ })) => {
                 assert_eq!(store, "HdfsObjectStore");
             }
             Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),

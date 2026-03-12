@@ -14,7 +14,7 @@ use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
-use crate::object_store::{path::Error as ObjectStorePathError, Error as ObjectStoreError};
+use crate::object_store;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -74,16 +74,16 @@ pub enum Error {
     Parquet(#[from] crate::parquet::errors::ParquetError),
 
     /// An error interacting with the object_store crate
-    // We don't use [#from] ObjectStoreError here as our From impl transforms
-    // ObjectStoreError::NotFound into Self::FileNotFound
+    // We don't use [#from] object_store::Error here as our From impl transforms
+    // object_store::Error::NotFound into Self::FileNotFound
     #[cfg(feature = "default-engine-base")]
     #[error("Error interacting with object store: {0}")]
-    ObjectStore(ObjectStoreError),
+    ObjectStore(object_store::Error),
 
     /// An error working with paths from the object_store crate
     #[cfg(feature = "default-engine-base")]
     #[error("Object store path error: {0}")]
-    ObjectStorePath(#[from] ObjectStorePathError),
+    ObjectStorePath(#[from] object_store::path::Error),
 
     #[cfg(feature = "default-engine-base")]
     #[error("Reqwest Error: {0}")]
@@ -355,10 +355,10 @@ impl From<ArrowError> for Error {
 }
 
 #[cfg(feature = "default-engine-base")]
-impl From<ObjectStoreError> for Error {
-    fn from(value: ObjectStoreError) -> Self {
+impl From<object_store::Error> for Error {
+    fn from(value: object_store::Error) -> Self {
         match value {
-            ObjectStoreError::NotFound { path, .. } => Self::file_not_found(path),
+            object_store::Error::NotFound { path, .. } => Self::file_not_found(path),
             err => Self::ObjectStore(err),
         }
     }

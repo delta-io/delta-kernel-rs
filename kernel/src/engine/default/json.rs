@@ -8,7 +8,7 @@ use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, Error as ObjectStoreError, GetResultPayload, PutMode};
+use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -140,7 +140,7 @@ async fn write_json_file_impl(
     let path = Path::from_url_path(path.path())?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
     result.map_err(|e| match e {
-        ObjectStoreError::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
         e => e.into(),
     })?;
     Ok(())
@@ -867,7 +867,7 @@ mod tests {
         let content = store.get(path).await?;
         let file_bytes = content.bytes().await?;
         let file_string =
-            String::from_utf8(file_bytes.to_vec()).map_err(|e| ObjectStoreError::Generic {
+            String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
                 store: "memory",
                 source: Box::new(e),
             })?;

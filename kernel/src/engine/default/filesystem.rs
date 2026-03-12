@@ -13,7 +13,7 @@ use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
 use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStore, PutMode};
+use crate::object_store::{self, DynObjectStore, ObjectStore, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
@@ -280,7 +280,7 @@ async fn copy_atomic_impl(
     }
 
     result.map_err(|e| match e {
-        ObjectStoreError::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
         e => e.into(),
     })?;
     Ok(())
@@ -300,7 +300,7 @@ async fn put_impl(
     };
     let result = store.put_opts(&path, data.into(), put_mode.into()).await;
     result.map_err(|e| match e {
-        ObjectStoreError::AlreadyExists { .. } => Error::FileAlreadyExists(path.into()),
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.into()),
         e => e.into(),
     })?;
     Ok(())
