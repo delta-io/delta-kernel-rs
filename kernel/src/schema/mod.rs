@@ -452,6 +452,8 @@ impl StructField {
     /// Converts logical schema StructField metadata to physical schema metadata
     /// based on the specified `column_mapping_mode`.
     ///
+    /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
+    ///
     /// NOTE: Caller affirms that `self` was already validated by
     /// [`crate::table_features::get_field_column_mapping_info`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
