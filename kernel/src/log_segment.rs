@@ -11,6 +11,7 @@ use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
+use crate::listed_log_files::find_last_checkpoint_before;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
@@ -295,20 +296,77 @@ impl LogSegment {
             .as_ref()
             .and_then(|hint| hint.checkpoint_schema.clone());
 
-        let listed_files = match (checkpoint_hint, time_travel_version) {
-            (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
-            }
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
+        // For now, we treat the last log tail element's version as the max catalog version.
+        // Without a max catalog version (i.e. log_tail is empty), we could list unbounded
+        // and could list unratified commits.
+        // TODO: When max catalog version is implemented, we will use that instead.
+        let max_catalog_version_opt = log_tail.last().map(|f| f.version);
+
+        // time_travel_version takes priority; fall back to catalog bound
+        let effective_end = time_travel_version.or(max_catalog_version_opt);
+
+        // Keep the hint only if it doesn't point past our target version. A stale hint
+        // (cp.version > effective_end) must be discarded and replaced via backward scan.
+        // If there is no upper bound, any hint is acceptable.
+        let usable_hint = checkpoint_hint.filter(|cp| {
+            effective_end.map_or(true, |v| cp.version <= v)
+        });
+
+        // Cases:
+        //
+        // 1. time_travel_version is Some:
+        //    a. hint present, hint.version <= end_version  --> list_with_checkpoint_hint from hint TO end_version (end_version is Some(time_travel_version))
+        //    b. hint present, end_version < hint.version   --> backward-scan for checkpoint, list from that version TO end_version
+        //    c. no hint                                    --> backward-scan for checkpoint, list from that version TO end_version
+        //
+        // 2. no time_travel_version, no hint               --> list from 0 onwards TO max_catalog_version if it exists, otherwise unbounded
+        //
+        // 3. no time_travel_version, hint present:
+        //    a. no max_catalog_version                     --> list_with_checkpoint_hint from hint onwards (unbounded)
+        //    b. hint.version <= max_catalog_version        --> list_with_checkpoint_hint from hint TO max_catalog_version
+        //    c. max_catalog_version < hint.version         --> hint is stale (written past what catalog has ratified);
+        //                                                      backward-scan for checkpoint at/before max_catalog_version,
+        //                                                      list from that version TO max_catalog_version
+
+        let listed_files = match usable_hint {
+            // Case 1a/3a/3b
+            Some(cp) => {
                 ListedLogFiles::list_with_checkpoint_hint(
-                    &cp,
-                    storage,
-                    &log_root,
-                    log_tail,
-                    Some(end_version),
+                    &cp, storage, &log_root, log_tail, effective_end,
                 )?
             }
-            _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
+            None => match effective_end {
+                // Case 1b/1c/3c
+                Some(end) => {
+                    let context = if time_travel_version.is_some() {
+                        format!("time-travel to v{end}")
+                    } else {
+                        format!("catalog-bounded snapshot at v{end}")
+                    };
+                    match find_last_checkpoint_before(
+                        storage,
+                        &log_root,
+                        end.saturating_add(1),
+                    )? {
+                        Some(cp_version) => {
+                            info!("Backward listing found checkpoint at v{cp_version} for {context}");
+                            ListedLogFiles::list(
+                                storage,
+                                &log_root,
+                                log_tail,
+                                Some(cp_version),
+                                Some(end),
+                            )?
+                        }
+                        None => {
+                            warn!("No checkpoint found via backward listing for {context}; listing from version 0");
+                            ListedLogFiles::list(storage, &log_root, log_tail, None, Some(end))?
+                        }
+                    }
+                }
+                // Case 2
+                None => ListedLogFiles::list(storage, &log_root, log_tail, None, None)?,
+            },
         };
 
         LogSegment::try_new(
