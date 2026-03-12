@@ -71,8 +71,6 @@ fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
     Ok(all_data)
 }
 
-// ── Validation ───────────────────────────────────────────────────────────────
-
 /// Validate read results against expected outcome.
 pub fn validate_read_result(
     result: DeltaResult<ReadResult>,
@@ -90,10 +88,7 @@ pub fn validate_read_result(
             )
             .map_err(|e| e.to_string())
         }
-        (Err(e), ReadExpected::Error { error }) => {
-            println!("  Got expected error '{}': {}", error.error_code, e);
-            Ok(())
-        }
+        (Err(_), ReadExpected::Error { error: _ }) => Ok(()),
         (Ok(_), ReadExpected::Error { error }) => Err(format!(
             "Expected error '{}' but succeeded",
             error.error_code

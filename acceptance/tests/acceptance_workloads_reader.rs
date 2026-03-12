@@ -427,7 +427,7 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     // Expected kernel failures: assert kernel DOES fail
     if let Some((reason, _)) = expected_failure {
         match execute_and_validate_workload(engine, &table_root, &spec, &expected_dir) {
-            Err(e) => println!("  Expected kernel failure ({reason}): {e}"),
+            Err(_) => { /* Failure is expected */ }
             Ok(_) => panic!(
                 "Workload '{workload_name}' was expected to fail but succeeded! \
                  Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!"
@@ -436,12 +436,8 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
         return Ok(());
     }
 
-    println!("Running workload: {}", workload_name);
-
     execute_and_validate_workload(engine, &table_root, &spec, &expected_dir)
         .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", workload_name, e));
-
-    println!("  Passed");
     Ok(())
 }
 

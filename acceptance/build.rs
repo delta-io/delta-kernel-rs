@@ -77,8 +77,9 @@ fn extract_acceptance_workloads() {
     let output_dir = dir.join("workloads");
     let done_marker = output_dir.join(".done");
 
-    // Tell Cargo to re-run if the tarball changes
+    // Tell Cargo to re-run if the tarball or done marker changes
     println!("cargo::rerun-if-changed={}", tarball_path.display());
+    println!("cargo::rerun-if-changed={}", done_marker.display());
 
     if done_marker.exists() {
         return;
