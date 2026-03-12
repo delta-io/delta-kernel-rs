@@ -42,13 +42,13 @@ use delta_kernel_derive::internal_api;
 ///   predicate is dropped.
 #[cfg(test)]
 pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(Default::default()).eval(pred)
+    DataSkippingPredicateCreator::new(&Default::default()).eval(pred)
 }
 
 #[cfg(test)]
 pub(crate) fn as_data_skipping_predicate_with_partitions(
     pred: &Pred,
-    partition_columns: HashSet<String>,
+    partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
     DataSkippingPredicateCreator::new(partition_columns).eval(pred)
 }
@@ -59,7 +59,7 @@ fn as_sql_data_skipping_predicate(
     pred: &Pred,
     partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
-    DataSkippingPredicateCreator::new(partition_columns.clone()).eval_sql_where(pred)
+    DataSkippingPredicateCreator::new(partition_columns).eval_sql_where(pred)
 }
 
 #[internal_api]
@@ -182,19 +182,12 @@ impl DataSkippingFilter {
     /// `DataSkippingPredicateCreator`. Partition values are similarly wrapped under
     /// `partitionValues_parsed` when present.
     fn build_unified_schema_and_expr(
-        stats_schema: Option<&SchemaRef>,
+        physical_stats_schema: Option<&SchemaRef>,
         stats_expr: ExpressionRef,
-        partition_schema: Option<&SchemaRef>,
+        physical_partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
-        let has_stats = stats_schema.is_some();
-        let has_partitions = partition_schema.is_some();
-
-        if !has_stats && !has_partitions {
-            return None;
-        }
-
-        let partition_columns: HashSet<String> = partition_schema
+        let partition_columns: HashSet<String> = physical_partition_schema
             .map(|s| s.fields().map(|f| f.name().to_string()).collect())
             .unwrap_or_default();
 
@@ -211,21 +204,24 @@ impl DataSkippingFilter {
             )
         };
 
-        let unified_schema = match (stats_schema, partition_schema) {
+        let unified_schema = match (physical_stats_schema, physical_partition_schema) {
             (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
                 stats_field(stats),
                 partition_field(ps),
             ])),
             (Some(stats), None) => Arc::new(StructType::new_unchecked([stats_field(stats)])),
             (None, Some(ps)) => Arc::new(StructType::new_unchecked([partition_field(ps)])),
-            (None, None) => unreachable!("checked above"),
+            (None, None) => return None,
         };
 
-        let unified_expr = match (has_stats, has_partitions) {
+        let unified_expr = match (
+            physical_stats_schema.is_some(),
+            physical_partition_schema.is_some(),
+        ) {
             (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr])),
             (true, false) => Arc::new(Expr::struct_from([stats_expr])),
             (false, true) => Arc::new(Expr::struct_from([partition_expr])),
-            (false, false) => unreachable!("checked above"),
+            (false, false) => return None,
         };
 
         Some((unified_schema, unified_expr, partition_columns))
@@ -350,14 +346,14 @@ fn collect_junction_preds(
 /// `stats_parsed.nullCount.*`.
 /// For partition columns, rewrites to `partitionValues_parsed.*` since the partition value is
 /// the exact value for every row in the file (serving as both min and max).
-struct DataSkippingPredicateCreator {
+struct DataSkippingPredicateCreator<'a> {
     /// Physical names of partition columns. For these columns, stats come from
     /// `partitionValues.<col>` (exact values) instead of min/max ranges.
-    partition_columns: HashSet<String>,
+    partition_columns: &'a HashSet<String>,
 }
 
-impl DataSkippingPredicateCreator {
-    fn new(partition_columns: HashSet<String>) -> Self {
+impl<'a> DataSkippingPredicateCreator<'a> {
+    fn new(partition_columns: &'a HashSet<String>) -> Self {
         Self { partition_columns }
     }
 
@@ -367,7 +363,7 @@ impl DataSkippingPredicateCreator {
     }
 }
 
-impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
+impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     type Output = Pred;
     type ColumnStat = Expr;
 
