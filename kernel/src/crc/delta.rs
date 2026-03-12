@@ -5,15 +5,15 @@
 //! [`Crc::apply`] advances a CRC forward one commit at a time by applying a delta.
 //!
 //! A CRC tracks two categories of fields, updated differently:
-//! - **Metadata fields** (protocol, metadata, domain metadata, in-commit timestamp, and
-//!   eventually set transactions): always kept up-to-date -- every `apply` unconditionally
-//!   merges these from the delta.
+//! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
+//!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from
+//!   the delta.
 //! - **File stats** (`num_files`, `table_size_bytes`): only updated when the current
 //!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe.
 //!   Once validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a
 //!   missing file size), file stats stop updating for the lifetime of that CRC.
 
-use crate::actions::{DomainMetadata, Metadata, Protocol};
+use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 use super::file_stats::FileStatsDelta;
 use super::{Crc, FileStatsValidity};
@@ -31,6 +31,9 @@ pub(crate) struct CrcDelta {
     /// All DM actions in this commit (additions and removals). `apply()` only processes these
     /// when the base CRC's `domain_metadata` is `Some` (tracked).
     pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
+    /// All SetTransaction actions in this commit. `apply()` only processes these when the base
+    /// CRC's `set_transactions` is `Some` (tracked).
+    pub(crate) set_transaction_changes: Vec<SetTransaction>,
     /// In-commit timestamp, if present in this commit.
     pub(crate) in_commit_timestamp: Option<i64>,
     /// Must be `Some` with an incremental-safe value for file stats to update. `None` or
@@ -59,6 +62,14 @@ impl CrcDelta {
                 .map(|dm| (dm.domain().to_string(), dm))
                 .collect(),
         );
+        // Same reasoning as domain metadata: we always know the full set transaction state
+        // for CREATE TABLE, so this is always `Some`.
+        let set_transactions = Some(
+            self.set_transaction_changes
+                .into_iter()
+                .map(|txn| (txn.app_id.clone(), txn))
+                .collect(),
+        );
         Some(Crc {
             table_size_bytes: self.file_stats.net_bytes,
             num_files: self.file_stats.net_files,
@@ -67,6 +78,7 @@ impl CrcDelta {
             protocol,
             metadata,
             domain_metadata,
+            set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
             ..Default::default()
         })
@@ -103,6 +115,17 @@ impl Crc {
                         let domain = dm.domain().to_string();
                         map.insert(domain, dm);
                     }
+                }
+            }
+        }
+
+        // Set transactions: upsert by app_id. Only update if the base CRC tracks set
+        // transactions (Some). If None ("not tracked"), leave it as None.
+        if !delta.set_transaction_changes.is_empty() {
+            if let Some(map) = &mut self.set_transactions {
+                for txn in delta.set_transaction_changes {
+                    let app_id = txn.app_id.clone();
+                    map.insert(app_id, txn);
                 }
             }
         }
@@ -514,5 +537,90 @@ mod tests {
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
+    }
+
+    // ===== apply: set transaction tests =====
+
+    #[test]
+    fn test_apply_adds_set_transaction_to_tracked_map() {
+        let mut crc = base_crc();
+        crc.set_transactions = Some(HashMap::new());
+        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
+        let delta = CrcDelta {
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        let map = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 1);
+        assert_eq!(map["my-app"].last_updated, Some(1000));
+    }
+
+    #[test]
+    fn test_apply_with_untracked_set_transactions_skips_changes() {
+        let mut crc = base_crc();
+        assert!(crc.set_transactions.is_none()); // Not tracked (default)
+        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
+        let delta = CrcDelta {
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        // set_transactions stays None -- apply() must not create a partial map.
+        assert!(crc.set_transactions.is_none());
+    }
+
+    #[test]
+    fn test_apply_upserts_set_transaction() {
+        let mut crc = base_crc();
+        crc.set_transactions = Some(HashMap::from([(
+            "my-app".to_string(),
+            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
+        )]));
+
+        let txn = SetTransaction::new("my-app".to_string(), 2, Some(2000));
+        let delta = CrcDelta {
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        let map = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 2);
+        assert_eq!(map["my-app"].last_updated, Some(2000));
+    }
+
+    // ===== into_crc_for_version_zero: set transaction tests =====
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_set_transactions() {
+        let txn = SetTransaction::new("my-app".to_string(), 5, Some(3000));
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        let map = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 5);
+        assert_eq!(map["my-app"].last_updated, Some(3000));
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_no_set_transactions() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        // Empty map, not None -- we always know the full state at version zero.
+        assert_eq!(crc.set_transactions, Some(HashMap::new()));
     }
 }
