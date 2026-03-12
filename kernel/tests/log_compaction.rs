@@ -10,7 +10,7 @@ use test_utils::{create_table, engine_store_setup};
 
 use url::Url;
 
-/// Convert a URL to an delta_kernel::object_store::Path
+/// Convert a URL to a `delta_kernel::object_store::Path`
 fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error>> {
     let path_segments = url
         .path_segments()
