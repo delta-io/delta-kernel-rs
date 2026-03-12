@@ -1,7 +1,11 @@
 //! Data models for workload specifications
 
+use delta_kernel::actions::Protocol;
+use delta_kernel::schema::Schema;
 use serde::Deserialize;
+use url::Url;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// ReadConfig represents a specific configuration for a read operation
@@ -28,29 +32,51 @@ pub enum ParallelScan {
 
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    pub name: String,                // Table name used for identifying the table
-    pub description: Option<String>, // Human-readable description of the table
-    pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
+    /// Table name used for identifying the table (part of the final benchmark name) - e.g. 100Adds0Chkpts
+    pub name: String,
+    /// Human-readable description of the table
+    pub description: String,
+    /// URL to the table. Used for remote tables or (rarely) absolute local paths.
+    /// If `None`, the table is assumed to be in the `delta/` subdirectory next to `tableInfo.json`
+    pub table_path: Option<Url>,
+    /// Schema at the latest version of the table
+    pub schema: Schema,
+    /// Delta Protocol struct, containing version requirements and table features at the latest version of the table
+    pub protocol: Protocol,
+    /// Log-level statistics for the table, such as the number of add files, remove files, number of commits, etc.
+    pub log_info: LogInfo,
+    /// Table properties from the Delta metadata (e.g. `{"delta.enableDeletionVector": "true", "delta.columnMapping.mode": "none"}`)
+    pub properties: HashMap<String, String>,
+    /// Physical data layout of the table
+    pub data_layout: DataLayout,
+    /// Tags for filtering which tables are benchmarked via `BENCH_TAGS`
+    pub tags: Vec<String>,
+    /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
-    pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
+    pub table_info_dir: PathBuf,
 }
 
 impl TableInfo {
-    pub fn resolved_table_root(&self) -> String {
-        // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as table_info.json
+    /// Returns true if the table has at least one tag in common with `required`
+    /// Tag matching uses union semantics; any single matching tag is sufficient
+    pub fn matches_tags(&self, required: &[String]) -> bool {
+        required.iter().any(|r| self.tags.contains(r))
+    }
+
+    pub fn resolved_table_root(&self) -> Url {
         self.table_path.clone().unwrap_or_else(|| {
-            self.table_info_dir
-                .join("delta")
-                .to_string_lossy()
-                .to_string()
+            // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as tableInfo.json
+            Url::from_file_path(self.table_info_dir.join("delta"))
+                .expect("table_info_dir must be an absolute path")
         })
     }
 
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
-        //Stores the parent directory of the table info JSON file
+        // Stores the parent directory of the `tableInfo.json` file
         if let Some(parent) = path.as_ref().parent() {
             table_info.table_info_dir = parent.to_path_buf();
         }
@@ -58,10 +84,55 @@ impl TableInfo {
     }
 }
 
+/// Log-level information describing the history and structure of a Delta table
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogInfo {
+    /// Number of active Add file actions in the table
+    pub num_add_files: u64,
+    /// Number of Remove file actions in the table
+    pub num_remove_files: u64,
+    /// Total on-disk size of all data files in bytes
+    pub size_in_bytes: u64,
+    /// Number of commits (JSON log files) in the table history
+    pub num_commits: u64,
+    /// Total number of actions across all commits
+    pub num_actions: u64,
+    /// Version of the most recent checkpoint, if any
+    pub last_checkpoint_version: Option<u64>,
+    /// Version of the most recent CRC file, if any
+    pub last_crc_version: Option<u64>,
+    /// Number of part files in the most recent multi-part checkpoint, if any.
+    /// For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints this is the number of sidecar files
+    /// For workloads that don't have multi-part checkpoints/sidecars, this is `None`
+    pub num_checkpoint_files: Option<u32>,
+}
+
+/// Physical data layout of a Delta table
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DataLayout {
+    Partitioned {
+        /// Number of partition columns
+        #[serde(rename = "numPartitionColumns")]
+        num_partition_columns: u32,
+        /// Number of distinct partition values observed in the table
+        #[serde(rename = "numDistinctPartitions")]
+        num_distinct_partitions: u64,
+    },
+    Clustered {
+        /// Number of clustering columns
+        #[serde(rename = "numClusteringColumns")]
+        num_clustering_columns: u32,
+    },
+    /// No special data organization (default)
+    None {},
+}
+
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 /// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum Spec {
     Read(ReadSpec),
     SnapshotConstruction(SnapshotConstructionSpec),
@@ -69,7 +140,8 @@ pub enum Spec {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReadSpec {
-    pub version: Option<u64>, // If version is None, read at latest version
+    /// Version to read; if `None`, reads the latest version
+    pub version: Option<u64>,
 }
 
 impl ReadSpec {
@@ -80,12 +152,13 @@ impl ReadSpec {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SnapshotConstructionSpec {
-    pub version: Option<u64>, // If version is None, read at latest version
+    /// Version to construct the snapshot at; if `None`, uses the latest version
+    pub version: Option<u64>,
 }
 
 impl SnapshotConstructionSpec {
     pub fn as_str(&self) -> &str {
-        "snapshot_construction"
+        "snapshotConstruction"
     }
 }
 
@@ -116,8 +189,8 @@ pub enum ReadOperation {
 impl ReadOperation {
     pub fn as_str(&self) -> &str {
         match self {
-            ReadOperation::ReadData => "read_data",
-            ReadOperation::ReadMetadata => "read_metadata",
+            ReadOperation::ReadData => "readData",
+            ReadOperation::ReadMetadata => "readMetadata",
         }
     }
 }
@@ -126,7 +199,8 @@ impl ReadOperation {
 #[derive(Clone, Debug)]
 pub struct Workload {
     pub table_info: TableInfo,
-    pub case_name: String, // Name of the spec JSON file
+    /// Spec filename without extension; used as the benchmark case label
+    pub case_name: String,
     pub spec: Spec,
 }
 
@@ -135,37 +209,105 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    fn make_table_info(tags: &[&str]) -> TableInfo {
+        let tags_json = serde_json::to_string(tags).unwrap();
+        let json = format!(
+            r#"{{"name":"t","description":"d","schema":{{"type":"struct","fields":[]}},"protocol":{{"minReaderVersion":1,"minWriterVersion":2}},"logInfo":{{"numAddFiles":0,"numRemoveFiles":0,"sizeInBytes":0,"numCommits":1,"numActions":1}},"properties":{{}},"dataLayout":{{}},"tags":{}}}"#,
+            tags_json
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[rstest]
+    #[case(&["ci", "checkpoints"], &["ci"], true)]
+    #[case(&["ci", "checkpoints"], &["ci", "large"], true)]
+    #[case(&["large"], &["ci", "checkpoints"], false)]
+    #[case(&[], &["ci"], false)]
+    fn test_matches_tags(
+        #[case] table_tags: &[&str],
+        #[case] required: &[&str],
+        #[case] expected: bool,
+    ) {
+        let info = make_table_info(table_tags);
+        let required: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+        assert_eq!(info.matches_tags(&required), expected);
+    }
+
     #[rstest]
     #[case(
-        r#"{"name": "basic_append", "description": "A basic table with two append writes"}"#,
-        "basic_append",
-        Some("A basic table with two append writes")
+        r#"{
+            "name": "test_table",
+            "description": "A test table",
+            "tablePath": "s3://bucket/test_table",
+            "schema": {"type": "struct", "fields": [{"name": "id", "type": "long", "nullable": true, "metadata": {}}]},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 3, "numRemoveFiles": 1, "sizeInBytes": 1535, "numCommits": 100, "numActions": 10000},
+            "properties": {},
+            "dataLayout": {"numPartitionColumns": 2, "numDistinctPartitions": 4},
+            "tags": ["base"]
+        }"#,
+        "test_table",
+        "A test table",
+        Some(Url::parse("s3://bucket/test_table").unwrap()),
+        &["base"]
     )]
     #[case(
-        r#"{"name": "table_without_description"}"#,
-        "table_without_description",
-        None
+        r#"{
+            "name": "no_path_table",
+            "description": "No path specified",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {},
+            "dataLayout": {"numClusteringColumns": 2},
+            "tags": ["base"]
+        }"#,
+        "no_path_table",
+        "No path specified",
+        None,
+        &["base"]
     )]
     #[case(
-       r#"{"name": "table_with_extra_fields", "description": "A table with extra fields", "extra_field": "should be ignored"}"#,
-       "table_with_extra_fields",
-       Some("A table with extra fields")
-   )]
+        r#"{
+            "name": "extra_fields_table",
+            "description": "Has extra fields",
+            "extraField": "should be ignored",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {},
+            "dataLayout": {"numClusteringColumns": 1},
+            "tags": []
+        }"#,
+        "extra_fields_table",
+        "Has extra fields",
+        None,
+        &[]
+    )]
     fn test_deserialize_table_info(
         #[case] json: &str,
         #[case] expected_name: &str,
-        #[case] expected_description: Option<&str>,
+        #[case] expected_description: &str,
+        #[case] expected_table_path: Option<Url>,
+        #[case] expected_tags: &[&str],
     ) {
         let table_info: TableInfo =
             serde_json::from_str(json).expect("Failed to deserialize table info");
 
         assert_eq!(table_info.name, expected_name);
-        assert_eq!(table_info.description.as_deref(), expected_description);
+        assert_eq!(table_info.description, expected_description);
+        assert_eq!(table_info.table_path, expected_table_path);
+        let expected_tags: Vec<String> = expected_tags.iter().map(|s| s.to_string()).collect();
+        assert_eq!(table_info.tags, expected_tags);
     }
 
     #[rstest]
+    #[case(r#"{"description": "missing name"}"#, "missing field")]
     #[case(
-        r#"{"description": "A table missing the required name field"}"#,
+        r#"{"name": "missing_schema", "description": "d",
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {"numClusteringColumns": 1}, "tags": []}"#,
         "missing field"
     )]
     fn test_deserialize_table_info_errors(#[case] json: &str, #[case] expected_msg: &str) {
@@ -177,19 +319,19 @@ mod tests {
     #[case(r#"{"type": "read", "version": 5}"#, "read", Some(5))]
     #[case(r#"{"type": "read"}"#, "read", None)]
     #[case(
-        r#"{"type": "read", "version": 7, "extra_field": "should be ignored"}"#,
+        r#"{"type": "read", "version": 7, "extraField": "should be ignored"}"#,
         "read",
         Some(7)
     )]
     #[case(
-        r#"{"type": "snapshot_construction", "version": 5}"#,
-        "snapshot_construction",
+        r#"{"type": "snapshotConstruction", "version": 5}"#,
+        "snapshotConstruction",
         Some(5)
     )]
-    #[case(r#"{"type": "snapshot_construction"}"#, "snapshot_construction", None)]
+    #[case(r#"{"type": "snapshotConstruction"}"#, "snapshotConstruction", None)]
     #[case(
-        r#"{"type": "snapshot_construction", "version": 7, "extra_field": "should be ignored"}"#,
-        "snapshot_construction",
+        r#"{"type": "snapshotConstruction", "version": 7, "extraField": "should be ignored"}"#,
+        "snapshotConstruction",
         Some(7)
     )]
     fn test_deserialize_spec(
