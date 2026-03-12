@@ -708,7 +708,23 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        // TODO: utilize Checksum
+        // Fast path: serve from CRC if it tracks domain metadata at this version.
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            if let Some(dm_map) = &crc.domain_metadata {
+                return Ok(match domains {
+                    None => dm_map.clone(),
+                    Some(filter) => dm_map
+                        .iter()
+                        .filter(|(k, _)| filter.contains(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                });
+            }
+        }
+        // Fallback: full log replay.
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 

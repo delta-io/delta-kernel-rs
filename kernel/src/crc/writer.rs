@@ -193,8 +193,7 @@ mod tests {
             let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
             assert!(
                 matches!(result, Err(Error::ChecksumWriteUnsupported(_))),
-                "should reject {:?} with ChecksumWriteUnsupported",
-                invalid_validity
+                "should reject {invalid_validity:?} with ChecksumWriteUnsupported"
             );
         }
     }
