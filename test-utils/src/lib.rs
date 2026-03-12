@@ -29,7 +29,7 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -221,6 +221,12 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
+// Resolve a table from a root and relative path
+fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+    let url = try_parse_uri(table_root)?;
+    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+}
+
 /// Put a commit file into the specified object store under `table_root`.
 pub async fn add_commit(
     table_root: impl AsRef<str>,
@@ -228,9 +234,8 @@ pub async fn add_commit(
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_url = url::Url::parse(table_root.as_ref())?;
     let relative_path = delta_path_for_version(version, "json");
-    let table_path = Path::from(table_url.join(relative_path.as_ref())?.path());
+    let table_path = resolve_table_path(table_root, &relative_path)?;
     store.put(&table_path, data.into()).await?;
     Ok(())
 }
@@ -242,9 +247,8 @@ pub async fn add_staged_commit(
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
-    let table_url = url::Url::parse(table_root.as_ref())?;
     let relative_path = staged_commit_path_for_version(version);
-    let table_path = Path::from(table_url.join(relative_path.as_ref())?.path());
+    let table_path = resolve_table_path(table_root, &relative_path)?;
     store.put(&table_path, data.into()).await?;
     Ok(table_path)
 }
