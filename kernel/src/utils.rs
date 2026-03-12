@@ -201,7 +201,7 @@ pub(crate) mod test_utils {
     use crate::engine::sync::SyncEngine;
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
-    use crate::object_store::ObjectStore;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};

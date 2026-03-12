@@ -1006,7 +1006,7 @@ mod tests {
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStore;
+    use delta_kernel::object_store::ObjectStoreExt as _;
     use serde_json::Value;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, add_commit, TestAction, METADATA,

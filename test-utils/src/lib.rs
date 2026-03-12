@@ -23,6 +23,7 @@ use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::{path::Path, DynObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;

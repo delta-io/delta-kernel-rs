@@ -26,7 +26,7 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStore as _};
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;

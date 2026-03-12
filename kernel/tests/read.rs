@@ -12,7 +12,7 @@ use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
+use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};

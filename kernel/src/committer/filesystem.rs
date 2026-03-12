@@ -92,7 +92,7 @@ mod tests {
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore as _;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
     use url::Url;
 

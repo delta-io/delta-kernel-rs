@@ -233,7 +233,7 @@ fn test_version_filtering() {
 async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
     use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+    use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
     use crate::table_features::TableFeature;
     use std::sync::Arc;
 

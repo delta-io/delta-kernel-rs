@@ -12,7 +12,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::CommitResult;
 
 use itertools::Itertools;

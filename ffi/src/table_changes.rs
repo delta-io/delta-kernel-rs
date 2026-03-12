@@ -344,6 +344,8 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::object_store::{memory::InMemory, path::Path, DynObjectStore};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;

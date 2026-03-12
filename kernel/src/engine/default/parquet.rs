@@ -10,7 +10,7 @@ use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStore};
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -595,11 +595,10 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DEFAULT_BATCH_SIZE;
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use crate::object_store::{local::LocalFileSystem, memory::InMemory};
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
-
     use itertools::Itertools;
     use url::Url;
 

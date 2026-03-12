@@ -13,7 +13,7 @@ use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
 use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, ObjectStore, PutMode};
+use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
@@ -412,8 +412,8 @@ mod tests {
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
-    use crate::object_store::{local::LocalFileSystem, ObjectStore};
     use crate::utils::current_time_duration;
     use crate::Engine as _;
 

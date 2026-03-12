@@ -16,9 +16,9 @@ release = false
 
 [features]
 default = ["arrow"]
-arrow = ["arrow-57"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58", "test_utils/arrow-58"]
 arrow-57 = ["delta_kernel/arrow-57", "test_utils/arrow-57"]
-arrow-56 = ["delta_kernel/arrow-56", "test_utils/arrow-56"]
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = [

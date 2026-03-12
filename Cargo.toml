@@ -18,7 +18,7 @@ members = [
 # - read-table-multi-threaded
 # - read-table-single-threaded
 # - write-table
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2021"
@@ -27,5 +27,5 @@ keywords = ["deltalake", "delta", "datalake"]
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.88"
 version = "0.20.0"
