@@ -164,7 +164,7 @@ mod tests {
     };
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
+    use crate::object_store::{DynObjectStore, ObjectStore as _};
     use itertools::Itertools;
     use serde_json::json;
 
@@ -172,7 +172,7 @@ mod tests {
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         String,
     ) {
         let table_root = String::from("memory:///");
@@ -182,7 +182,7 @@ mod tests {
     }
 
     // TODO (#1990): update this function to properly store the table at table_root
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: String) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<DynObjectStore>, _table_root: String) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
