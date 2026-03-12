@@ -430,6 +430,35 @@ mod tests {
     }
 
     #[test]
+    fn type_reinterpretation_integer_to_date() {
+        // Integer -> Date (int32 without DATE logical annotation)
+        assert!(DataType::INTEGER.can_read_as(&DataType::DATE).is_ok());
+
+        // Cannot narrow: Date -> Integer
+        assert!(matches!(
+            DataType::DATE.can_read_as(&DataType::INTEGER),
+            Err(Error::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn type_reinterpretation_long_to_timestamp() {
+        // Long -> Timestamp/TimestampNtz (int64 without TIMESTAMP logical annotation)
+        assert!(DataType::LONG.can_read_as(&DataType::TIMESTAMP).is_ok());
+        assert!(DataType::LONG.can_read_as(&DataType::TIMESTAMP_NTZ).is_ok());
+
+        // Cannot narrow: Timestamp/TimestampNtz -> Long
+        assert!(matches!(
+            DataType::TIMESTAMP.can_read_as(&DataType::LONG),
+            Err(Error::TypeMismatch)
+        ));
+        assert!(matches!(
+            DataType::TIMESTAMP_NTZ.can_read_as(&DataType::LONG),
+            Err(Error::TypeMismatch)
+        ));
+    }
+
+    #[test]
     fn type_widening_float() {
         // float -> double
         assert!(DataType::FLOAT.can_read_as(&DataType::DOUBLE).is_ok());

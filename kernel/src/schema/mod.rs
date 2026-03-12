@@ -1496,9 +1496,18 @@ impl PrimitiveType {
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
-    /// Widening rules (based on Parquet reader behavior):
-    /// - Integer widening: byte → short → int → long
-    /// - Float widening: float → double
+    /// Widening rules:
+    /// - Integer widening: byte -> short -> int -> long
+    /// - Float widening: float -> double
+    /// - Timestamp equivalence: Timestamp <-> TimestampNtz (both are i64 microseconds
+    ///   since epoch, differing only in timezone semantics)
+    ///
+    /// Physical type reinterpretation (for checkpoint interop):
+    /// Some checkpoint writers omit Parquet logical type annotations, producing plain
+    /// integer-typed stats columns. These rules allow reading such columns as their
+    /// intended logical types:
+    /// - Integer -> Date (int32 without DATE annotation)
+    /// - Long -> Timestamp/TimestampNtz (int64 without TIMESTAMP annotation)
     ///
     /// Note: These widening rules assume the parquet reader supports reading narrower types
     /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
@@ -1517,6 +1526,10 @@ impl PrimitiveType {
                 // one as the other is safe at the data layer.
                 | (Timestamp, TimestampNtz)
                 | (TimestampNtz, Timestamp)
+                // Physical type reinterpretation: some checkpoint writers omit the Parquet
+                // logical type annotation, producing plain integer-typed stats columns.
+                | (Integer, Date)
+                | (Long, Timestamp | TimestampNtz)
         )
     }
 }
