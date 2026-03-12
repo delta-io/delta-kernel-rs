@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
@@ -697,7 +697,13 @@ impl<S> Transaction<S> {
             .filter(|f| {
                 materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
             })
-            .map(|f| f.make_physical(column_mapping_mode));
+            .map(|f| {
+                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
+                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
+                    warn!("make_physical failed: {e}");
+                    f.clone()
+                })
+            });
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration

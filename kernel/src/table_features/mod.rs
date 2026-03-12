@@ -12,12 +12,12 @@ use delta_kernel_derive::internal_api;
 
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
-pub(crate) use column_mapping::validate_column_mapping;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
+    get_field_column_mapping_info,
 };
 pub(crate) use timestamp_ntz::{
     schema_contains_timestamp_ntz, validate_timestamp_ntz_feature_support,
