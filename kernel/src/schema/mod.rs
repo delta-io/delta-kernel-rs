@@ -1,7 +1,7 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
@@ -636,12 +636,14 @@ impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
-    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate field names (case-insensitive; Delta column names are
+    ///   case-insensitive per the protocol)
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
+        let mut seen_lowercase_names = HashSet::new();
 
         // Validate each field during insertion
         for (i, field) in fields.into_iter().enumerate() {
@@ -659,10 +661,16 @@ impl StructType {
                 }
             }
 
-            // Check for duplicate field names
-            if let Some(dup) = field_map.insert(field.name.clone(), field) {
-                return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
+            let key = field.name.to_lowercase();
+            if !seen_lowercase_names.insert(key) {
+                return Err(Error::schema(format!(
+                    "Duplicate field name (case-insensitive): '{}'",
+                    field.name
+                )));
             }
+
+            field_map.insert(field.name.clone(), field);
         }
 
         Ok(Self {
@@ -969,6 +977,10 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields (e.g. stats_parsed) where exact-name matching
+        // is sufficient.
         if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
@@ -999,6 +1011,9 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields where exact-name matching is sufficient.
         if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
@@ -3102,6 +3117,26 @@ mod tests {
 
         assert_result_error_with_message(result, "Duplicate metadata column");
         Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_field_name_case_insensitive() {
+        // Delta column names are case-insensitive per protocol; (Value, value) is invalid
+        let result = StructType::try_new([
+            StructField::nullable("Value", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
+    }
+
+    #[test]
+    fn test_duplicate_field_name_exact() {
+        // Exact duplicate (same name twice) is rejected via the case-insensitive check
+        let result = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("id", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
     }
 
     #[test]
