@@ -28,3 +28,5 @@ ffi/examples/visit-expression/build
 /target
 
 /benchmarks/data/workloads/
+*.data
+*.data.old
