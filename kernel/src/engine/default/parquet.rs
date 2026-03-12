@@ -390,12 +390,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 let client = reqwest::Client::new();
                 let response =
                     client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {}", e))
+                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
                     })?;
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
+                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
@@ -1310,7 +1310,7 @@ mod tests {
         match field_id {
             crate::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
             crate::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
-            other => panic!("Expected String or Number, got {:?}", other),
+            other => panic!("Expected String or Number, got {other:?}"),
         }
     }
 

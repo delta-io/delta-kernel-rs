@@ -68,8 +68,7 @@ fn parse_operation(s: &str) -> Result<Operation, String> {
         "WRITE" => Ok(Operation::Write),
         "READ_WRITE" | "READWRITE" => Ok(Operation::ReadWrite),
         _ => Err(format!(
-            "Invalid operation '{}'. Must be READ, WRITE, or READ_WRITE",
-            s
+            "Invalid operation '{s}'. Must be READ, WRITE, or READ_WRITE"
         )),
     }
 }
@@ -99,15 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Execute command
     match cli.command {
         Commands::Table { name } => {
-            println!("Fetching table metadata for: {}", name);
+            println!("Fetching table metadata for: {name}");
 
             match uc_client.get_table(&name).await {
                 Ok(table) => {
                     println!("\n✓ Table metadata retrieved successfully\n");
-                    println!("{}", table);
+                    println!("{table}");
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to get table: {}", e);
+                    eprintln!("✗ Failed to get table: {e}");
                     std::process::exit(1);
                 }
             }
@@ -118,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_version,
             end_version,
         } => {
-            println!("Resolving table: {}", name);
+            println!("Resolving table: {name}");
 
             // First, get the table metadata to obtain table_id and storage_location
             let table = match uc_client.get_table(&name).await {
@@ -131,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     table
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to resolve table: {}", e);
+                    eprintln!("✗ Failed to resolve table: {e}");
                     std::process::exit(1);
                 }
             };
@@ -162,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to get commits: {}", e);
+                    eprintln!("✗ Failed to get commits: {e}");
                     std::process::exit(1);
                 }
             }
@@ -172,10 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             table_id,
             operation,
         } => {
-            println!(
-                "Getting {} credentials for table_id: {}",
-                operation, table_id
-            );
+            println!("Getting {operation} credentials for table_id: {table_id}");
 
             match uc_client.get_credentials(&table_id, operation).await {
                 Ok(creds) => {
@@ -185,12 +181,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .expiration_as_datetime()
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                         .unwrap_or_else(|| format!("Invalid timestamp: {}", creds.expiration_time));
-                    println!("Expires at:       {}", expires_str);
+                    println!("Expires at:       {expires_str}");
 
                     if let Some(time_left) = creds.time_until_expiry() {
                         let hours = time_left.num_hours();
                         let minutes = time_left.num_minutes() % 60;
-                        println!("Time until expiry: {} hours {} minutes", hours, minutes);
+                        println!("Time until expiry: {hours} hours {minutes} minutes");
                     } else {
                         println!("Time until expiry: Unable to calculate");
                     }
@@ -213,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to get credentials: {}", e);
+                    eprintln!("✗ Failed to get credentials: {e}");
                     std::process::exit(1);
                 }
             }

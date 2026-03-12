@@ -1,0 +1,38 @@
+name: Validate PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+  workflow_run:
+    workflows: ["semver-checks"] # we need this since auto-labels from jobs don't trigger a workflow
+    types: [completed]
+
+jobs:
+  validate-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            pr_json=$(gh api --paginate repos/${{ github.repository }}/pulls \
+              --jq ".[] | select(.head.sha == \"${{ github.event.workflow_run.head_sha }}\")")
+            echo "number=$(echo "$pr_json" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+            echo "title=$(echo "$pr_json" | jq -r '.title')" >> "$GITHUB_OUTPUT"
+            echo "labels=$(echo "$pr_json" | jq -c '[.labels[].name]')" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "title=${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
+            echo "labels=$(echo '${{ toJson(github.event.pull_request.labels.*.name) }}' | jq -c '.')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/pr-title-validator
+        with:
+          regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!?(\(.+\))?: .{1,72}$'
+          breaking-change-regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!(\(.+\))?: .{1,72}$'
+          labels: ${{ steps.pr.outputs.labels }}
+          title: ${{ steps.pr.outputs.title }}

@@ -29,7 +29,7 @@ fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
         Ok(_) => panic!("No workloads found"),
-        Err(e) => panic!("Failed to load workloads: {}", e),
+        Err(e) => panic!("Failed to load workloads: {e}"),
     };
 
     let engine = setup_engine();

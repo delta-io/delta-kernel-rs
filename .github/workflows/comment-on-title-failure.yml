@@ -1,0 +1,53 @@
+name: Comment on PR Title Failure
+
+on:
+  workflow_run:
+    workflows: ["Validate PR Title"]
+    types: [completed]
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Find associated PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          pr_json=$(gh api --paginate repos/${{ github.repository }}/pulls \
+            --jq ".[] | select(.head.sha == \"$HEAD_SHA\")")
+          echo "number=$(echo "$pr_json" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+          echo "title=$(echo "$pr_json" | jq -r '.title')" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update failure comment
+        if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+        uses: peter-evans/create-or-update-comment@v4
+        env:
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+        with:
+          issue-number: ${{ steps.pr.outputs.number }}
+          comment-tag: pr-title-validation
+          body: |
+            PR title does not match the required pattern. Please ensure you follow the [conventional commits](https://www.conventionalcommits.org/) spec.
+
+            Your title should start with `feat:`, `fix:`, `chore:`, `docs:`, `perf:`, `refactor:`, `test:`, or `ci:`, and if it's a breaking change that should be suffixed with a `!` (like `feat!:`), and then a 1-72 character brief description of your change.
+
+            **Title:** `${{ env.PR_TITLE }}`
+
+      - name: Find existing comment
+        if: ${{ github.event.workflow_run.conclusion == 'success' }}
+        id: find
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ steps.pr.outputs.number }}
+          comment-tag: pr-title-validation
+
+      - name: Delete comment on success
+        if: ${{ steps.find.outputs.comment-id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ steps.find.outputs.comment-id }} -X DELETE

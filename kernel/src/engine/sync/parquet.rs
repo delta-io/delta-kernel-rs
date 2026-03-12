@@ -93,7 +93,7 @@ impl ParquetHandler for SyncParquetHandler {
         // Convert URL to file path
         let path = location
             .to_file_path()
-            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", location)))?;
+            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {location}")))?;
 
         let mut file = File::create(&path)?;
 
