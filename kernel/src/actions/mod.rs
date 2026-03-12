@@ -31,8 +31,6 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
-pub(crate) mod domain_metadata;
-
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
 pub mod visitors;

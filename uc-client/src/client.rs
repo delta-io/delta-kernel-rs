@@ -38,7 +38,7 @@ impl UCClient {
     /// Resolve the table by name.
     #[instrument(skip(self))]
     pub async fn get_table(&self, table_name: &str) -> Result<TablesResponse> {
-        let url = self.base_url.join(&format!("tables/{}", table_name))?;
+        let url = self.base_url.join(&format!("tables/{table_name}"))?;
 
         let response =
             execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;

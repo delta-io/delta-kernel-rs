@@ -33,7 +33,7 @@ async fn write_parquet_file(
 
     let parquet_data = record_batch_to_bytes(data);
     let parquet_data_len = parquet_data.len();
-    let data_file_path = format!("data_file_{}.parquet", file_suffix);
+    let data_file_path = format!("data_file_{file_suffix}.parquet");
 
     // Construct the full object store path for the parquet file
     let data_url = table_url.join(&data_file_path)?;
