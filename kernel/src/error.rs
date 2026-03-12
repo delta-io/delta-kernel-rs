@@ -192,6 +192,10 @@ pub enum Error {
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
+    /// Cannot write a version checksum (CRC) file for this snapshot
+    #[error("Checksum write unsupported: {0}")]
+    ChecksumWriteUnsupported(String),
+
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),
