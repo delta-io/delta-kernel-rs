@@ -227,7 +227,17 @@ fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResu
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }
 
-/// Put a commit file into the specified object store under `table_root`.
+/// Write a Delta commit JSON file at the given version into `store`.
+///
+/// The commit is written to `_delta_log/{version:020}.json` under `table_root`. The caller is
+/// responsible for ensuring that `data` contains valid Delta actions (e.g. built via
+/// [`actions_to_string`]) and that no commit already exists at `version`.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Commit version number (determines the log file name).
+/// - `data` - JSON-serialized Delta actions to write as the commit body.
 pub async fn add_commit(
     table_root: impl AsRef<str>,
     store: &DynObjectStore,
@@ -240,7 +250,20 @@ pub async fn add_commit(
     Ok(())
 }
 
-/// Put a staged commit file into the specified object store under `table_root`.
+/// Write a staged (uncommitted) Delta commit JSON file at the given version into `store`.
+///
+/// The file is written to `_delta_log/_staged_commits/{version}.{uuid}.json` under
+/// `table_root`. Multiple staged commits may exist for the same version (each gets a unique
+/// UUID). The caller is responsible for ensuring that `data` contains valid Delta actions.
+///
+/// Returns the object-store [`Path`] of the written file so callers can reference it in a
+/// log tail or assertions.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Target commit version number (determines the staged file name prefix).
+/// - `data` - JSON-serialized Delta actions to write as the staged commit body.
 pub async fn add_staged_commit(
     table_root: impl AsRef<str>,
     store: &DynObjectStore,
