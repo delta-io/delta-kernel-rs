@@ -1,14 +1,9 @@
 //! Integration tests for the CreateTable API
 
-#[path = "create_table/clustering.rs"]
 mod clustering;
-#[path = "create_table/column_mapping.rs"]
 mod column_mapping;
-#[path = "create_table/ctas.rs"]
 mod ctas;
-#[path = "create_table/timestamp_ntz.rs"]
 mod timestamp_ntz;
-#[path = "create_table/variant.rs"]
 mod variant;
 
 use std::sync::Arc;
