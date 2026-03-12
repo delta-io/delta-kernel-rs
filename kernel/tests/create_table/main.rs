@@ -3,6 +3,7 @@
 mod clustering;
 mod column_mapping;
 mod ctas;
+mod ict;
 mod timestamp_ntz;
 mod variant;
 
