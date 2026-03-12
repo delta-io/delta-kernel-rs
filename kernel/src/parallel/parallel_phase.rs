@@ -398,6 +398,7 @@ mod tests {
         predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
+        dispatcher: Option<tracing::Dispatch>,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
@@ -442,8 +443,12 @@ mod tests {
                     .map(|partition_files| {
                         let engine = engine.clone();
                         let state = final_state.clone();
+                        let dispatcher = dispatcher.clone();
 
                         thread::spawn(move || -> DeltaResult<Vec<String>> {
+                            // Set the dispatcher in this thread to capture logs
+                            let _guard = dispatcher.map(|d| tracing::dispatcher::set_default(&d));
+
                             assert!(!partition_files.is_empty());
 
                             let mut parallel = ParallelScanMetadata::try_new(
@@ -468,6 +473,9 @@ mod tests {
                     let paths = handle.join().expect("Thread panicked")?;
                     all_paths.extend(paths);
                 }
+
+                // Log metrics after all parallel workers complete
+                final_state.log_parallel_metrics();
             }
         }
 
@@ -480,66 +488,382 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parallel_with_json_sidecars() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                )?;
-            }
-        }
-        Ok(())
+    /// Extract a metric value from logs by searching for "metric_name=value"
+    fn extract_metric(logs: &str, metric_name: &str) -> u64 {
+        let Some(pos) = logs.find(&format!("{}=", metric_name)) else {
+            panic!("Failed to find {} in logs", metric_name);
+        };
+        let after = &logs[pos + metric_name.len() + 1..];
+        let Some(space_pos) = after.find(char::is_whitespace) else {
+            panic!("Failed to find end of {} value", metric_name);
+        };
+        let value_str = &after[..space_pos];
+        value_str
+            .parse()
+            .unwrap_or_else(|_| panic!("Failed to parse {} value: {}", metric_name, value_str))
     }
 
-    #[test]
-    fn test_parallel_with_parquet_sidecars() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-parquet-with-sidecars",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                )?;
-            }
-        }
-        Ok(())
+    /// Expected metric values for a phase (sequential or parallel)
+    #[derive(Debug, Clone)]
+    struct ExpectedMetrics {
+        add_files_seen: u64,
+        active_add_files: u64,
+        remove_files_seen: u64,
+        non_file_actions: u64,
+        predicate_filtered: u64,
     }
 
-    #[test]
-    fn test_no_parallel_phase_needed() -> DeltaResult<()> {
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "table-without-dv-small",
-                    None,
-                    with_serde,
-                    one_file_per_worker,
-                )?;
-            }
-        }
-        Ok(())
+    /// Test case for parallel log replay workflow
+    struct ParallelLogReplayCase {
+        path: &'static str,
+        predicate: Option<PredicateRef>,
+        expected_sequential_metrics: ExpectedMetrics,
+        expected_parallel_metrics: Option<ExpectedMetrics>,
     }
 
-    #[test]
-    fn test_parallel_with_dataskipping_predicate() -> DeltaResult<()> {
-        use crate::expressions::{column_expr, Expression as Expr};
+    fn verify_metrics_in_logs(
+        logs: &str,
+        table_name: &str,
+        sequential_expected: &ExpectedMetrics,
+        parallel_expected: Option<&ExpectedMetrics>,
+    ) {
+        // Verify Sequential metrics were logged
+        assert!(
+            logs.contains("Sequential scan metadata completed"),
+            "Expected Sequential completion log for table '{}'",
+            table_name
+        );
 
-        let predicate = Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)));
-        for with_serde in [false, true] {
-            for one_file_per_worker in [false, true] {
-                verify_parallel_workflow(
-                    "v2-checkpoints-json-with-sidecars",
-                    Some(predicate.clone()),
-                    with_serde,
-                    one_file_per_worker,
-                )?;
+        // Extract and verify counter values from Phase 1
+        let add_files_seen = extract_metric(logs, "add_files_seen");
+        let active_add_files = extract_metric(logs, "active_add_files");
+        let remove_files_seen = extract_metric(logs, "remove_files_seen");
+        let non_file_actions = extract_metric(logs, "non_file_actions");
+        let predicate_filtered = extract_metric(logs, "predicate_filtered");
+
+        assert_eq!(
+            add_files_seen, sequential_expected.add_files_seen,
+            "Sequential add_files_seen mismatch"
+        );
+        assert_eq!(
+            active_add_files, sequential_expected.active_add_files,
+            "Sequential active_add_files mismatch"
+        );
+        assert_eq!(
+            remove_files_seen, sequential_expected.remove_files_seen,
+            "Sequential remove_files_seen mismatch"
+        );
+        assert_eq!(
+            non_file_actions, sequential_expected.non_file_actions,
+            "Sequential non_file_actions mismatch",
+        );
+        assert_eq!(
+            predicate_filtered, sequential_expected.predicate_filtered,
+            "Sequential predicate_filtered mismatch",
+        );
+
+        // Verify timing metrics are present and parseable (values may be 0 for fast operations)
+        let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
+        let _predicate_eval_time = extract_metric(logs, "predicate_eval_time_ms");
+
+        // Verify Parallel metrics if expected
+        if let Some(expected) = parallel_expected {
+            // Accumulate totals across all parallel logs
+            let mut total_add_files_seen = 0u64;
+            let mut total_active_add_files = 0u64;
+            let mut total_remove_files_seen = 0u64;
+            let mut total_non_file_actions = 0u64;
+            let mut total_predicate_filtered = 0u64;
+            let mut search_start = 0;
+
+            while let Some(pos) = logs[search_start..].find("Completed parallel scan metadata") {
+                let absolute_pos = search_start + pos;
+                let remaining = &logs[absolute_pos..];
+
+                // Extract and accumulate metrics
+                total_add_files_seen += extract_metric(remaining, "add_files_seen");
+                total_active_add_files += extract_metric(remaining, "active_add_files");
+                total_remove_files_seen += extract_metric(remaining, "remove_files_seen");
+                total_non_file_actions += extract_metric(remaining, "non_file_actions");
+                total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
+
+                // Verify timing metrics are present and parseable in parallel phase
+                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ms");
+                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ms");
+
+                search_start = absolute_pos + 1;
             }
+
+            // Verify accumulated totals match expected values
+            assert_eq!(
+                total_add_files_seen, expected.add_files_seen,
+                "Parallel add_files_seen mismatch"
+            );
+            assert_eq!(
+                total_active_add_files, expected.active_add_files,
+                "Parallel active_add_files mismatch"
+            );
+            assert_eq!(
+                total_remove_files_seen, expected.remove_files_seen,
+                "Parallel remove_files_seen mismatch"
+            );
+            assert_eq!(
+                total_non_file_actions, expected.non_file_actions,
+                "Parallel non_file_actions mismatch"
+            );
+            assert_eq!(
+                total_predicate_filtered, expected.predicate_filtered,
+                "Parallel predicate_filtered mismatch"
+            );
         }
+    }
+
+    /// Tests parallel workflow with sidecars and verifies metrics logging.
+    ///
+    /// This parameterized test covers both JSON and Parquet checkpoint sidecars,
+    /// with all combinations of serialization and worker configurations.
+    ///
+    /// Note: This test captures logs from spawned threads by sharing the tracing dispatcher.
+    /// If running with other tests in parallel causes flakiness, use `--test-threads=1`.
+    #[rstest::rstest]
+    #[case::json_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 5,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 101,
+            active_add_files: 101,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 0,
+        }),
+    })]
+    #[case::parquet_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-with-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 5,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 101,
+            active_add_files: 101,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 0,
+        }),
+    })]
+    #[case::data_skipping(ParallelLogReplayCase {
+        // Tests data skipping filtering based on column stats (min/max values)
+        path: "v2-checkpoints-json-with-sidecars",
+        predicate: Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+        }),
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 5,
+            predicate_filtered: 0,
+        },
+        // Data skipping predicate filters 4 files (101 -> 97)
+        // add_files_seen counts files AFTER data skipping
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 97,
+            active_add_files: 97,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 4,
+        }),
+    })]
+    #[case::partition_pruning(ParallelLogReplayCase {
+        // Tests partition pruning filtering based on partition column values
+        // Table is partitioned by 'letter' with partitions: a, b, c, e, null
+        // Predicate letter='a' prunes 4 files (b, c, e, null), leaving 2 letter=a files
+        path: "basic_partitioned",
+        predicate: Some({
+            use crate::expressions::{column_expr, Expression as Expr};
+            Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
+        }),
+        expected_sequential_metrics: ExpectedMetrics {
+            // All 6 files are seen, then partition pruning filters 4
+            add_files_seen: 6,
+            active_add_files: 2,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 4,
+        },
+        // No parallel phase (no V2 checkpoint with sidecars)
+        expected_parallel_metrics: None,
+    })]
+    #[case::json_without_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-without-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 3,
+            active_add_files: 3,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: None,
+    })]
+    #[case::json_with_last_checkpoint(ParallelLogReplayCase {
+        path: "v2-checkpoints-json-with-last-checkpoint",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 2,
+            active_add_files: 2,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 0,
+        }),
+    })]
+    #[case::parquet_without_sidecars(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-without-sidecars",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 3,
+            active_add_files: 3,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: None,
+    })]
+    #[case::parquet_with_last_checkpoint(ParallelLogReplayCase {
+        path: "v2-checkpoints-parquet-with-last-checkpoint",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 2,
+            active_add_files: 2,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 0,
+        }),
+    })]
+    #[case::v2_classic_json(ParallelLogReplayCase {
+        path: "v2-classic-checkpoint-json",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 4,
+            active_add_files: 4,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 0,
+        }),
+    })]
+    #[case::v2_classic_parquet(ParallelLogReplayCase {
+        path: "v2-classic-checkpoint-parquet",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            add_files_seen: 0,
+            active_add_files: 0,
+            remove_files_seen: 0,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: Some(ExpectedMetrics {
+            add_files_seen: 4,
+            active_add_files: 4,
+            remove_files_seen: 0,
+            non_file_actions: 0,
+            predicate_filtered: 0,
+        }),
+    })]
+    #[case::no_parallel_needed(ParallelLogReplayCase {
+        path: "table-without-dv-small",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            // This table has single-part checkpoint, completes in sequential phase
+            add_files_seen: 1,
+            active_add_files: 1,
+            remove_files_seen: 0,
+            non_file_actions: 3,
+            predicate_filtered: 0,
+        },
+        // No parallel phase needed
+        expected_parallel_metrics: None,
+    })]
+    #[case::with_removes_deduplication(ParallelLogReplayCase {
+        // This table has removes that filter checkpoint adds, showing add_files_seen > active_add_files
+        path: "with_checkpoint_no_last_checkpoint",
+        predicate: None,
+        expected_sequential_metrics: ExpectedMetrics {
+            // Checkpoint 2 contains: add B (surviving state at v2), metadata/protocol
+            // Commit 3 (after checkpoint) has: add C, remove B
+            // Log replay: process commit 3 first (add C active, remove B recorded),
+            //             then checkpoint (add B filtered by remove)
+            // Result: 2 adds seen, 1 active (only C), 1 remove seen, B filtered by dedup
+            add_files_seen: 2,
+            active_add_files: 1,
+            remove_files_seen: 1,
+            non_file_actions: 4,
+            predicate_filtered: 0,
+        },
+        expected_parallel_metrics: None,
+    })]
+    fn test_parallel_workflow_with_metrics(
+        #[case] test_case: ParallelLogReplayCase,
+        #[values(false, true)] with_serde: bool,
+        #[values(false, true)] one_file_per_worker: bool,
+    ) -> DeltaResult<()> {
+        use test_utils::LoggingTest;
+
+        // Set up log capture
+        let logging_test = LoggingTest::new();
+
+        // Capture the dispatcher to share with spawned threads
+        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
+        verify_parallel_workflow(
+            test_case.path,
+            test_case.predicate,
+            with_serde,
+            one_file_per_worker,
+            Some(dispatcher),
+        )?;
+
+        // Verify metrics were logged
+        let logs = logging_test.logs();
+        verify_metrics_in_logs(
+            &logs,
+            test_case.path,
+            &test_case.expected_sequential_metrics,
+            test_case.expected_parallel_metrics.as_ref(),
+        );
+
         Ok(())
     }
 

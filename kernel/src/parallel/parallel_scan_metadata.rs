@@ -39,8 +39,20 @@ impl SequentialScanMetadata {
 
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterSequentialScanMetadata::Done),
+            AfterSequential::Done(processor) => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Sequential scan metadata completed");
+                Ok(AfterSequentialScanMetadata::Done)
+            }
             AfterSequential::Parallel { processor, files } => {
+                processor
+                    .get_metrics()
+                    .log_with_message("Sequential scan metadata completed");
+
+                // Reset counters for parallel phase
+                processor.get_metrics().reset_counters();
+
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState { inner: processor }),
                     files,
@@ -75,6 +87,16 @@ impl ParallelLogReplayProcessor for Arc<ParallelState> {
 }
 
 impl ParallelState {
+    /// Log the accumulated metrics from parallel processing.
+    ///
+    /// Call this method when parallel processing is complete to log the final
+    /// metrics accumulated across all workers.
+    pub fn log_parallel_metrics(&self) {
+        self.inner
+            .get_metrics()
+            .log_with_message("Completed parallel scan metadata");
+    }
+
     /// Get the schema to use for reading checkpoint files.
     ///
     /// Returns the checkpoint read schema which may have stats excluded

@@ -16,6 +16,7 @@
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::scan::data_skipping::DataSkippingFilter;
+use crate::scan::metrics::ScanMetrics;
 use crate::{DeltaResult, EngineData};
 
 use delta_kernel_derive::internal_api;
@@ -330,15 +331,27 @@ pub(crate) trait LogReplayProcessor: Sized {
     ///
     /// # Parameters
     /// - `batch`: A reference to the batch of actions to be processed.
+    /// - `metrics`: A reference to the accumulated ScanMetrics
     ///
     /// # Returns
     /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be included.
     /// If no filter is provided, all rows are selected.
-    fn build_selection_vector(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        match self.data_skipping_filter() {
-            Some(filter) => filter.apply(batch),
-            None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
-        }
+    fn build_selection_vector(
+        &self,
+        batch: &dyn EngineData,
+        metrics: &ScanMetrics,
+    ) -> DeltaResult<Vec<bool>> {
+        let selection_vector = match self.data_skipping_filter() {
+            Some(filter) => {
+                let start = std::time::Instant::now();
+                let result = filter.apply(batch, Some(metrics))?;
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                metrics.add_predicate_eval_time_ns(elapsed_ns);
+                result
+            }
+            None => vec![true; batch.len()],
+        };
+        Ok(selection_vector)
     }
 
     /// Returns an optional reference to the [`DataSkippingFilter`] used to filter rows

@@ -357,7 +357,7 @@ impl LogReplayScanner {
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.
             let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
+                Some(filter) => filter.apply(actions.as_ref(), None)?,
                 None => vec![true; actions.len()],
             };
 
