@@ -1,5 +1,28 @@
 # Changelog
 
+## [v0.20.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.20.1/) (2026-03-12)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.20.0...v0.20.1)
+
+
+### 🚀 Features / new APIs
+
+1. Internal_api proc macro supports `use` now ([#2053]) ([#2106])
+
+### 🐛 Bug Fixes
+
+1. Remove LazyCrc from Snapshot::new internal-api signature ([#2002])
+
+### 🚜 Refactor
+
+1. Move duplicate ID check to logical schema validation ([#2042])
+
+
+[#2106]: https://github.com/delta-io/delta-kernel-rs/pull/2106
+[#2002]: https://github.com/delta-io/delta-kernel-rs/pull/2002
+[#2042]: https://github.com/delta-io/delta-kernel-rs/pull/2042
+
+
 ## [v0.20.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.20.0/) (2026-02-26)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.19.2...v0.20.0)
