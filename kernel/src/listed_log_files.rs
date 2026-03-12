@@ -12,7 +12,7 @@
 //! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -200,10 +200,7 @@ pub(crate) fn find_last_checkpoint_before(
 ) -> DeltaResult<Option<Version>> {
     let mut upper = version; // exclusive upper bound for the current batch
 
-    loop {
-        if upper == 0 {
-            break;
-        }
+    while upper > 0 {
         let lower = upper.saturating_sub(1000);
         let start_from = log_root.join(&format!("{lower:020}"))?;
 
@@ -219,14 +216,16 @@ pub(crate) fn find_last_checkpoint_before(
             .filter_ok(|p| p.is_checkpoint())
             .try_collect()?;
 
-        // Group by version, find latest complete checkpoint in this batch.
-        let mut by_version: BTreeMap<Version, Vec<ParsedLogPath>> = BTreeMap::new();
-        for cp in checkpoint_files {
-            by_version.entry(cp.version).or_default().push(cp);
-        }
+        // list_from returns files in ascending version order, so group consecutive same-version
+        // parts, then walk highest version first to find the latest complete checkpoint.
+        let groups: Vec<(Version, Vec<ParsedLogPath>)> = checkpoint_files
+            .into_iter()
+            .chunk_by(|p| p.version)
+            .into_iter()
+            .map(|(v, parts)| (v, parts.collect()))
+            .collect();
 
-        // Walk highest version first — return as soon as we find a complete checkpoint.
-        for (cp_version, parts) in by_version.into_iter().rev() {
+        for (cp_version, parts) in groups.into_iter().rev() {
             let grouped = group_checkpoint_parts(parts);
             if grouped
                 .iter()

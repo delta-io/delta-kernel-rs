@@ -296,10 +296,46 @@ impl LogSegment {
             .as_ref()
             .and_then(|hint| hint.checkpoint_schema.clone());
 
+        let max_catalog_version = log_tail.last().map(|f| f.version);
+
         let listed_files = match (checkpoint_hint, time_travel_version) {
-            (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
-            }
+            (Some(cp), None) => match max_catalog_version {
+                // 3c: hint is stale — ignore it, scan backwards from max catalog version
+                Some(max_cat) if cp.version > max_cat => {
+                    match find_last_checkpoint_before(
+                        storage,
+                        &log_root,
+                        max_cat.saturating_add(1),
+                    )? {
+                        Some(cp_version) => {
+                            info!(
+                                "Backward listing found checkpoint at v{cp_version} for catalog-bounded snapshot at v{max_cat}"
+                            );
+                            ListedLogFiles::list(
+                                storage,
+                                &log_root,
+                                log_tail,
+                                Some(cp_version),
+                                None,
+                            )?
+                        }
+                        None => {
+                            warn!(
+                                "No checkpoint found via backward listing; listing from version 0"
+                            );
+                            ListedLogFiles::list(storage, &log_root, log_tail, None, None)?
+                        }
+                    }
+                }
+                // 3a (no catalog) / 3b (hint valid): use hint, cap at catalog version if present
+                _ => ListedLogFiles::list_with_checkpoint_hint(
+                    &cp,
+                    storage,
+                    &log_root,
+                    log_tail,
+                    max_catalog_version,
+                )?,
+            },
             (Some(cp), Some(end_version)) if cp.version <= end_version => {
                 ListedLogFiles::list_with_checkpoint_hint(
                     &cp,
@@ -309,7 +345,7 @@ impl LogSegment {
                     Some(end_version),
                 )?
             }
-            // Hint is stale (cp.version > end_version) or absent — scan backwards.
+            // Hint is stale (cp.version > end_version) or absent — scan backwards. 
             // Mirrors Java: findLastCompleteCheckpointBefore(engine, logPath, versionToLoad + 1)
             (_, Some(end_version)) => {
                 match find_last_checkpoint_before(storage, &log_root, end_version.saturating_add(1))? {
