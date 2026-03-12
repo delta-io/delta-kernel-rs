@@ -988,7 +988,7 @@ mod tests {
     #[case::property_false(&[("delta.enableInCommitTimestamps", "false")], false, true)]
     #[case::property_absent(&[], false, false)]
     #[case::feature_signal(&[("delta.feature.inCommitTimestamp", "supported")], true, false)]
-    fn test_ict_enablement(
+    fn test_ict_support_and_enablement(
         #[case] properties: &[(&str, &str)],
         #[case] expect_in_writer_features: bool,
         #[case] expect_property_preserved: bool,

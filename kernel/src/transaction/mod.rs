@@ -549,7 +549,10 @@ impl<S> Transaction<S> {
             return Ok(Some(self.commit_timestamp));
         }
 
-        // Existing table: enforce monotonicity per the Delta protocol.
+        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
+        // must be the larger of:
+        // - The time at which the writer attempted the commit
+        // - One millisecond later than the previous commit's inCommitTimestamp
         Ok(self
             .read_snapshot
             .get_in_commit_timestamp(engine)?
