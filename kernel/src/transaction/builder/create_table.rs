@@ -29,6 +29,7 @@ use crate::table_features::{
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
+    ENABLE_IN_COMMIT_TIMESTAMPS,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -45,6 +46,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::DomainMetadata,
     // ColumnMapping enables column mapping (name/id mode)
     TableFeature::ColumnMapping,
+    // InCommitTimestamp enables in-commit timestamps (writer-only)
+    TableFeature::InCommitTimestamp,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -61,6 +64,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
 const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
+    // InCommitTimestamp enablement property: triggers ICT auto-enablement
+    ENABLE_IN_COMMIT_TIMESTAMPS,
     // As features are supported, add them here:
     // "delta.enableDeletionVectors",
 ];
@@ -265,6 +270,22 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `inCommitTimestamp` feature to the protocol when
+/// `delta.enableInCommitTimestamps=true` is set in the table properties.
+fn maybe_enable_in_commit_timestamps(validated: &mut ValidatedTableProperties) {
+    let enabled = validated
+        .properties
+        .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+        .is_some_and(|v| v == "true");
+    if enabled {
+        add_feature_to_lists(
+            TableFeature::InCommitTimestamp,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -554,6 +575,9 @@ impl CreateTableTransactionBuilder {
 
         // Auto-enable timestampNtz feature if schema contains TimestampNTZ columns
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+
+        // Auto-enable inCommitTimestamp feature if property is set
+        maybe_enable_in_commit_timestamps(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -956,6 +980,42 @@ mod tests {
             expected_features.len(),
             "Unexpected extra writer features: {:?}",
             validated.writer_features
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::property_true(&[("delta.enableInCommitTimestamps", "true")], true, true)]
+    #[case::property_false(&[("delta.enableInCommitTimestamps", "false")], false, true)]
+    #[case::property_absent(&[], false, false)]
+    #[case::feature_signal(&[("delta.feature.inCommitTimestamp", "supported")], true, false)]
+    fn test_ict_support_and_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expect_in_writer_features: bool,
+        #[case] expect_property_preserved: bool,
+    ) {
+        let properties: HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        maybe_enable_in_commit_timestamps(&mut validated);
+
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            expect_in_writer_features,
+        );
+        assert_eq!(
+            validated
+                .properties
+                .contains_key(ENABLE_IN_COMMIT_TIMESTAMPS),
+            expect_property_preserved,
+        );
+        assert!(
+            validated.reader_features.is_empty(),
+            "InCommitTimestamp is writer-only, reader_features should always be empty"
         );
     }
 }
