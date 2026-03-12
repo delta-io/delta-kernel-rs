@@ -71,6 +71,9 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// Validates a field's column mapping annotations and extracts the physical name and column
 /// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs.
 ///
+/// Metadata columns are not subject to column mapping and must not carry column mapping
+/// annotations. Returns the logical field name and `None` for such fields.
+///
 /// When column mapping is enabled (`Id` or `Name`), the field must have a
 /// `delta.columnMapping.physicalName` (string) and `delta.columnMapping.id` (number) annotation.
 /// Returns the physical name and `Some(id)`.
@@ -86,8 +89,25 @@ pub(crate) fn get_field_column_mapping_info<'a>(
     seen: Option<&mut HashMap<i64, &'a str>>,
 ) -> DeltaResult<(&'a str, Option<i64>)> {
     let field_path = || ColumnName::new(path.iter().copied());
+    let physical_name_meta = field
+        .metadata
+        .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref());
+    let id_meta = field
+        .metadata
+        .get(ColumnMetadataKey::ColumnMappingId.as_ref());
+
+    if field.is_metadata_column() {
+        if physical_name_meta.is_some() || id_meta.is_some() {
+            return Err(Error::internal_error(format!(
+                "Metadata column '{}' must not have column mapping annotations",
+                field.name()
+            )));
+        }
+        return Ok((field.name(), None));
+    }
+
     let annotation = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
-    let physical_name = match (mode, field.metadata.get(annotation)) {
+    let physical_name = match (mode, physical_name_meta) {
         (ColumnMappingMode::None, None) => field.name(),
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(s))) => s,
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
@@ -111,7 +131,7 @@ pub(crate) fn get_field_column_mapping_info<'a>(
     };
 
     let annotation = ColumnMetadataKey::ColumnMappingId.as_ref();
-    let id = match (mode, field.metadata.get(annotation)) {
+    let id = match (mode, id_meta) {
         (ColumnMappingMode::None, None) => None,
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(n))) => {
             Some(*n)
