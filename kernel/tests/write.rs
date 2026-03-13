@@ -3864,9 +3864,7 @@ async fn test_clustered_table_write_has_stats_parsed(
 }
 
 /// Verifies that `DefaultEngineBuilder::with_parquet_writer_config` controls the compression
-/// codec used for all parquet writes, including checkpoints. Connectors can read
-/// `table_props.parquet_writer_config` and pass it to the engine builder to honor table-level
-/// compression settings.
+/// codec used for all parquet writes, including checkpoints.
 #[rstest::rstest]
 #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
 #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]

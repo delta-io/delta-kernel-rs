@@ -143,19 +143,17 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         self
     }
 
-    /// Set a custom task executor for the engine.
-    ///
-    /// See [`executor::TaskExecutor`] for more details.
     /// Set a custom Parquet writer configuration for all writes performed by this engine.
     ///
     /// Controls compression and other write-time settings. Defaults to Zstd compression.
-    /// Connectors can read the table property via [`crate::table_properties::TableProperties::parquet_writer_config`]
-    /// and pass it here to honor table-level compression settings.
     pub fn with_parquet_writer_config(mut self, config: ParquetWriterConfig) -> Self {
         self.writer_config = config;
         self
     }
 
+    /// Set a custom task executor for the engine.
+    ///
+    /// See [`executor::TaskExecutor`] for more details.
     pub fn with_task_executor<F: TaskExecutor>(
         self,
         task_executor: Arc<F>,

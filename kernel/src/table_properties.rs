@@ -12,12 +12,11 @@
 
 use std::collections::HashMap;
 use std::num::NonZero;
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
-use crate::{Error, ParquetWriterConfig, Version};
+use crate::{Error, Version};
 
 use strum::EnumString;
 
@@ -64,7 +63,6 @@ pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
     "delta.inCommitTimestampEnablementTimestamp";
-pub(crate) const PARQUET_COMPRESSION_CODEC: &str = "delta.parquet.compression.codec";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
@@ -217,11 +215,6 @@ pub struct TableProperties {
     /// The timestamp of the table at which in-commit timestamps were enabled. This must be the same
     /// as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
-
-    /// The Parquet writer configuration derived from table properties.
-    ///
-    /// Parsed case-insensitively from the `delta.parquet.compression.codec` table property.
-    pub parquet_writer_config: Option<ParquetWriterConfig>,
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
@@ -389,7 +382,6 @@ mod tests {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
             "delta.inCommitTimestampEnablementTimestamp"
         );
-        assert_eq!(PARQUET_COMPRESSION_CODEC, "delta.parquet.compression.codec");
     }
 
     #[test]
@@ -533,7 +525,6 @@ mod tests {
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
-            parquet_writer_config: None,
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);

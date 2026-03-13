@@ -9,7 +9,6 @@ use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
-use crate::{ParquetCompression, ParquetWriterConfig};
 
 use tracing::warn;
 
@@ -94,11 +93,6 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
-        }
-        PARQUET_COMPRESSION_CODEC => {
-            props.parquet_writer_config = ParquetCompression::from_str(v)
-                .ok()
-                .map(|compression| ParquetWriterConfig { compression })
         }
         _ => return None,
     }
@@ -224,37 +218,6 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table_properties::TableProperties;
-    use rstest::rstest;
-
-    #[rstest]
-    #[case("snappy", ParquetCompression::Snappy)]
-    #[case("SNAPPY", ParquetCompression::Snappy)]
-    #[case("zstd", ParquetCompression::Zstd)]
-    #[case("ZSTD", ParquetCompression::Zstd)]
-    #[case("Zstd", ParquetCompression::Zstd)]
-    fn test_parse_parquet_compression_codec(
-        #[case] input: &str,
-        #[case] expected: ParquetCompression,
-    ) {
-        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, input)]);
-        assert_eq!(
-            props.parquet_writer_config,
-            Some(ParquetWriterConfig {
-                compression: expected
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_parquet_compression_codec_unknown_value() {
-        // Unknown value: field stays None (key consumed, not in unknown_properties)
-        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "gzip")]);
-        assert_eq!(props.parquet_writer_config, None);
-        assert!(!props
-            .unknown_properties
-            .contains_key(PARQUET_COMPRESSION_CODEC));
-    }
 
     #[test]
     fn test_parse_bool() {
