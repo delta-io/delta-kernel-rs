@@ -125,12 +125,22 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ffi:
+              - 'ffi/src/handle.rs'
+              - 'ffi-proc-macros/**'
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: test
-        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs)'
+        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: trybuild tests
+        if: steps.filter.outputs.ffi == 'true'
+        run: cargo test --package delta_kernel_ffi --features --internal-api invalid_handle_code
 
   ffi_test:
     runs-on: ${{ matrix.os }}

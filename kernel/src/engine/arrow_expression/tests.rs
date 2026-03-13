@@ -916,6 +916,41 @@ fn test_null_scalar_map() -> DeltaResult<()> {
 }
 
 #[test]
+fn test_apply_schema_column_count_mismatch() {
+    use super::apply_schema::apply_schema;
+    use crate::schema::StructType;
+
+    // Create a struct array with 3 columns
+    let struct_array = StructArray::from(vec![
+        (
+            Arc::new(Field::new("a", DataType::Int32, false)),
+            create_array!(Int32, [1]) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Int32, false)),
+            create_array!(Int32, [2]) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("c", DataType::Int32, false)),
+            create_array!(Int32, [3]) as ArrayRef,
+        ),
+    ]);
+
+    // Create a schema with only 2 fields (mismatch)
+    let schema = KernelDataType::Struct(Box::new(StructType::new_unchecked([
+        StructField::not_null("a", KernelDataType::INTEGER),
+        StructField::not_null("b", KernelDataType::INTEGER),
+    ])));
+
+    let result = apply_schema(&struct_array, &schema);
+
+    assert_result_error_with_message(
+        result,
+        "Passed struct had 3 columns, but transformed column has 2",
+    );
+}
+
+#[test]
 fn test_to_json_with_struct_array() {
     // Create a test struct array
     let boolean_field = Arc::new(Field::new("bool_field", ArrowDataType::Boolean, true));
@@ -957,14 +992,17 @@ fn test_to_json_with_struct_array() {
     );
     assert_eq!(
         json_array.value(1),
-        r#"{"bool_field":false,"string_field":"world"}"#
+        r#"{"bool_field":false,"int_field":null,"string_field":"world"}"#
     );
     assert_eq!(
         json_array.value(2),
-        r#"{"int_field":84,"string_field":"test"}"#
+        r#"{"bool_field":null,"int_field":84,"string_field":"test"}"#
     );
     // All fields of the struct row are null
-    assert_eq!(json_array.value(3), r#"{}"#);
+    assert_eq!(
+        json_array.value(3),
+        r#"{"bool_field":null,"int_field":null,"string_field":null}"#
+    );
     // The struct row itself is null
     assert!(json_array.is_null(4));
 }
@@ -1068,6 +1106,6 @@ fn test_to_json_with_nested_struct() {
     );
     assert_eq!(
         json_array.value(1),
-        r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
+        r#"{"outer_int":200,"nested_struct":{"inner_int":null,"inner_string":"value"}}"#
     );
 }

@@ -24,6 +24,9 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
@@ -31,8 +34,6 @@ use tempfile::TempDir;
 use test_utils::set_json_value;
 
 use itertools::Itertools;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
@@ -1483,7 +1484,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
         match domain {
             d if d == domain1 => assert_eq!(config, config1),
             d if d == domain2 => assert_eq!(config, config2),
-            _ => panic!("Unexpected domain: {}", domain),
+            _ => panic!("Unexpected domain: {domain}"),
         }
     }
 
@@ -1814,7 +1815,7 @@ async fn get_ict_at_version(
     table_url: &Url,
     version: u64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    let commit_path = table_url.join(&format!("_delta_log/{:020}.json", version))?;
+    let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
     let commit = store.get(&Path::from_url_path(commit_path.path())?).await?;
     let commit_content = String::from_utf8(commit.bytes().await?.to_vec())?;
 
@@ -1826,8 +1827,7 @@ async fn get_ict_at_version(
         .collect();
     assert!(
         !lines.is_empty(),
-        "Commit log at version {} should not be empty",
-        version
+        "Commit log at version {version} should not be empty"
     );
 
     // First line should contain commitInfo with inCommitTimestamp
@@ -1934,8 +1934,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     assert!(
         first_ict > 1612345678,
-        "First commit ICT ({}) should be greater than enablement timestamp (1612345678)",
-        first_ict
+        "First commit ICT ({first_ict}) should be greater than enablement timestamp (1612345678)"
     );
 
     // Second commit
@@ -1980,9 +1979,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // Verify monotonic property: second_ict > first_ict
     assert!(
         second_ict > first_ict,
-        "Second ICT ({}) should be greater than first ICT ({})",
-        second_ict,
-        first_ict
+        "Second ICT ({second_ict}) should be greater than first ICT ({first_ict})"
     );
 
     Ok(())
@@ -2035,8 +2032,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
             let commit_version = committed.commit_version();
 
             // Read the commit log directly to verify remove actions
-            let commit_path =
-                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_path = tmp_table_path.join(format!("_delta_log/{commit_version:020}.json"));
             let commit_content = std::fs::read_to_string(commit_path)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
@@ -2273,8 +2269,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
             let original_stats = original_add.get("stats");
 
             // Read the commit log directly
-            let commit_path =
-                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_path = tmp_table_path.join(format!("_delta_log/{commit_version:020}.json"));
             let commit_content = std::fs::read_to_string(commit_path)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
@@ -2511,7 +2506,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     for (idx, file_path) in file_paths.iter().enumerate() {
         let descriptor = DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: format!("dv_file_{}.bin", idx),
+            path_or_inline_dv: format!("dv_file_{idx}.bin"),
             offset: Some(idx as i32 * 10),
             size_in_bytes: 40 + idx as i32,
             cardinality: idx as i64 + 1,
@@ -2530,7 +2525,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 
             // Read the commit log directly from object store
             let final_commit_path =
-                table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
+                table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
             let commit_content = store
                 .get(&Path::from_url_path(final_commit_path.path())?)
                 .await?
@@ -2566,13 +2561,13 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
                 let remove_action = remove_actions
                     .iter()
                     .find(|action| action["remove"]["path"].as_str() == Some(file_path.as_str()))
-                    .unwrap_or_else(|| panic!("Should find remove action for {}", file_path));
+                    .unwrap_or_else(|| panic!("Should find remove action for {file_path}"));
 
                 // Find the add action for this file
                 let add_action = add_actions
                     .iter()
                     .find(|action| action["add"]["path"].as_str() == Some(file_path.as_str()))
-                    .unwrap_or_else(|| panic!("Should find add action for {}", file_path));
+                    .unwrap_or_else(|| panic!("Should find add action for {file_path}"));
 
                 // Verify remove action does NOT have a DV (since these were newly written files)
                 assert!(
@@ -2585,30 +2580,26 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
                     .as_object()
                     .expect("Add action should have deletionVector");
 
-                let expected_path = format!("dv_file_{}.bin", idx);
+                let expected_path = format!("dv_file_{idx}.bin");
                 assert_eq!(
                     add_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
                     Some(expected_path.as_str()),
-                    "DV path should match for file {}",
-                    file_path
+                    "DV path should match for file {file_path}"
                 );
                 assert_eq!(
                     add_dv.get("offset").and_then(|v| v.as_i64()),
                     Some(idx as i64 * 10),
-                    "DV offset should match for file {}",
-                    file_path
+                    "DV offset should match for file {file_path}"
                 );
                 assert_eq!(
                     add_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
                     Some(40 + idx as i64),
-                    "DV size should match for file {}",
-                    file_path
+                    "DV size should match for file {file_path}"
                 );
                 assert_eq!(
                     add_dv.get("cardinality").and_then(|v| v.as_i64()),
                     Some(idx as i64 + 1),
-                    "DV cardinality should match for file {}",
-                    file_path
+                    "DV cardinality should match for file {file_path}"
                 );
             }
         }
@@ -2739,8 +2730,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 
         assert!(
             initial_file_count >= 3,
-            "Need at least 3 files for this test, got {}",
-            initial_file_count
+            "Need at least 3 files for this test, got {initial_file_count}"
         );
 
         // Create a transaction to remove files in two batches
@@ -3095,7 +3085,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
                 current_snapshot = post_snapshot.clone();
             }
-            _ => panic!("Commit {} should succeed", i),
+            _ => panic!("Commit {i} should succeed"),
         }
     }
 
@@ -3197,7 +3187,7 @@ async fn test_column_mapping_write(
 
     let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3467,7 +3457,7 @@ async fn test_column_mapping_partitioned_write(
     let tmp_dir = tempdir()?;
     copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3545,8 +3535,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     test_utils::copy_directory(source_path, &table_path).unwrap();
 
     let url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
         delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
