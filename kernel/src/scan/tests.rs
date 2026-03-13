@@ -14,6 +14,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
+    PredicateRef,
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -968,6 +969,71 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         scan.build_actions_meta_predicate().is_none(),
         "StaticSkipAll predicate should return None"
     );
+}
+
+/// End-to-end test that mixed supported/unsupported predicates return the correct number of
+/// files. The `parsed-stats` table has 6 files with id ranges [1,100]..[501,600] and ts_col
+/// stats. Timestamp GT uses max stats (unsupported in checkpoint skipping); timestamp LT
+/// uses min stats (supported). File ts_col min values: 1M, 3M, 5M, 7M, 9M, 11M (microseconds).
+#[rstest]
+#[case::bare_ts_gt_returns_all(
+    // ts_col > ...: unsupported (uses max stats), no meta-predicate generated -> no pruning.
+    Arc::new(Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000)))),
+    6,
+)]
+#[case::bare_ts_lt_skips(
+    // ts_col < 3M: supported (uses min stats). Skips files with min_ts >= 3M.
+    Arc::new(Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000)))),
+    1,
+)]
+#[case::and_mixed_supported_unsupported(
+    // AND(id > 400, ts_col > ...): unsupported arm becomes TRUE, id arm skips 4 files.
+    Arc::new(Pred::and(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    )),
+    2,
+)]
+#[case::or_mixed_supported_unsupported(
+    // OR(id > 400, ts_col > ...): unsupported arm becomes TRUE -> OR(..., TRUE) = TRUE,
+    // no pruning.
+    Arc::new(Pred::or(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    )),
+    6,
+)]
+fn test_scan_with_unsupported_predicates(
+    #[case] predicate: PredicateRef,
+    #[case] expected_files: usize,
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, expected_files);
 }
 
 /// Helper to build a parquet file with the nested `add.stats_parsed.*` structure that

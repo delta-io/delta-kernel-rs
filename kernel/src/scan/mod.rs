@@ -808,6 +808,10 @@ impl Scan {
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    ///
+    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
+    /// bare unsupported expression (e.g. Timestamp GT). Junctions with unsupported arms replace
+    /// them with TRUE to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
