@@ -139,7 +139,9 @@ rustc_version = "0.4.1"
 
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["catalog-managed", "test-utils"] }
-test_utils = { path = "../test-utils" }
+# NOTE: test_utils forcibly pulls the default engine and arrow-56. By default it ALSO pulls
+# arrow-57, which takes precedence and would make it impossible to test against arrow-56.
+test_utils = { path = "../test-utils", default-features = false }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.15.0" }
