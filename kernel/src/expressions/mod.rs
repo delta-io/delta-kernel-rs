@@ -889,12 +889,14 @@ impl Predicate {
         Self::or_from([a.into(), b.into()])
     }
 
-    /// Creates a new predicate AND(preds...)
+    /// Creates a new predicate AND(preds...). See [`Self::junction`] for normalization of
+    /// empty and single-element inputs.
     pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
         Self::junction(JunctionPredicateOp::And, preds)
     }
 
-    /// Creates a new predicate OR(preds...)
+    /// Creates a new predicate OR(preds...). See [`Self::junction`] for normalization of
+    /// empty and single-element inputs.
     pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
         Self::junction(JunctionPredicateOp::Or, preds)
     }
@@ -918,10 +920,24 @@ impl Predicate {
         })
     }
 
-    /// Creates a new junction predicate OP(preds...)
+    /// Creates a new junction predicate OP(preds...). Normalizes degenerate cases:
+    ///
+    /// - Empty junction returns the identity element (the value that has no effect when
+    ///   combined with other predicates under the same operator):
+    ///   - `AND()` -> `true`, because `true AND p` == `p` for any predicate `p`.
+    ///   - `OR()` -> `false`, because `false OR p` == `p` for any predicate `p`.
+    /// - Single-element junction unwraps the element: `AND(p)` / `OR(p)` -> `p`.
     pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
-        let preds = preds.into_iter().collect();
-        Self::Junction(JunctionPredicate { op, preds })
+        let mut preds: Vec<_> = preds.into_iter().collect();
+        match preds.len() {
+            0 => match op {
+                JunctionPredicateOp::And => Self::literal(true),
+                JunctionPredicateOp::Or => Self::literal(false),
+            },
+            // A junction of one predicate is just that predicate.
+            1 => preds.remove(0),
+            _ => Self::Junction(JunctionPredicate { op, preds }),
+        }
     }
 
     /// Creates a new opaque predicate
@@ -1684,5 +1700,40 @@ mod tests {
             let result = serde_json::to_string(&pred);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }
+    }
+
+    #[test]
+    fn single_element_and_from_returns_unwrapped_predicate() {
+        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let result = Pred::and_from([inner.clone()]);
+        assert_eq!(result, inner);
+    }
+
+    #[test]
+    fn single_element_or_from_returns_unwrapped_predicate() {
+        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let result = Pred::or_from([inner.clone()]);
+        assert_eq!(result, inner);
+    }
+
+    #[test]
+    fn multi_element_and_from_returns_junction() {
+        let p1 = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let p2 = Pred::lt(column_expr!("x"), Expr::literal(100));
+        let result = Pred::and_from([p1.clone(), p2.clone()]);
+        assert!(matches!(result, Pred::Junction(ref j) if j.preds.len() == 2));
+        assert_eq!(result, Pred::and(p1, p2));
+    }
+
+    #[test]
+    fn empty_and_from_returns_identity_literal() {
+        let result = Pred::and_from(std::iter::empty());
+        assert_eq!(result, Pred::literal(true));
+    }
+
+    #[test]
+    fn empty_or_from_returns_identity_literal() {
+        let result = Pred::or_from(std::iter::empty());
+        assert_eq!(result, Pred::literal(false));
     }
 }
