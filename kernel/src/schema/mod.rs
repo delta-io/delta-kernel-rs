@@ -211,10 +211,10 @@ pub struct StructField {
     /// have a path.
     ///
     /// A nullability mismatch occurs when a non-nullable field contains nulls. Not all mismatches
-    /// should be rejected, because parent nulls can be propagated to children. Two cases are
+    /// are violations of [`StructField::nullable`], because parent nulls can be propagated to children. Two cases are
     /// distinguished:
     ///
-    /// - **False nullability mismatch**: a non-nullable nested field has nulls when its parent
+    /// - **Allowed nullability mismatch**: a non-nullable nested field has nulls when its parent
     ///   is null.
     ///
     ///   Example -- schema: `s: struct<a: int NOT NULL> (nullable)`
@@ -228,7 +228,7 @@ pub struct StructField {
     ///   { "s": null, "s.a": null }  // => acceptable
     ///   ```
     ///
-    /// - **True nullability mismatch**: a non-nullable field has nulls when:
+    /// - **Disallowed nullability mismatch**: a non-nullable field has nulls when:
     ///   1. Its parent is non-null, or
     ///   2. The field is top-level.
     ///
@@ -237,7 +237,7 @@ pub struct StructField {
     ///   // schema
     ///   { "name": "x", "nullable": false, "type": "integer" }
     ///   // data
-    ///   { "x": null }       // => true nullability mismatch
+    ///   { "x": null }       // => disallowed nullability mismatch
     ///   ```
     ///
     ///   Example 2 -- non-nullable nested field under a non-null parent:
@@ -248,11 +248,11 @@ pub struct StructField {
     ///       "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
     ///   }}
     ///   // data
-    ///   { "s": { "a": null } }  // => true nullability mismatch
+    ///   { "s": { "a": null } }  // => disallowed nullability mismatch
     ///   ```
     ///
-    /// False nullability mismatches should be allowed, only true nullability mismatches should
-    /// be rejected.
+    /// Allowed nullability mismatches are benign and should be tolerated. Only disallowed
+    /// nullability mismatches represent violations of [`StructField::nullable`].
     pub nullable: bool,
     /// A JSON map containing information about this column
     pub metadata: HashMap<String, MetadataValue>,
