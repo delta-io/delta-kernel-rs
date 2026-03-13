@@ -5,13 +5,11 @@ mod column_filter;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::{
-    schema::{
-        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
-        SchemaTransform, StructField, StructType,
-    },
-    DeltaResult,
+use crate::schema::{
+    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform,
+    StructField, StructType,
 };
+use crate::{DeltaResult, Error};
 
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
@@ -200,9 +198,7 @@ pub(crate) fn stats_column_names(
 /// This is used to build the schema for parsing JSON stats and for reading stats_parsed
 /// from checkpoints when only a subset of columns is needed (e.g. predicate-referenced columns).
 pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
-    let stats_schema = NullableStatsTransform
-        .transform_struct(referenced_schema)?
-        .into_owned();
+    let stats_schema = nullable_schema(referenced_schema).ok()?;
 
     let nullcount_schema = NullCountStatsTransform
         .transform_struct(&stats_schema)?
@@ -243,6 +239,15 @@ impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
                 metadata: Default::default(),
             }),
         })
+    }
+}
+
+/// Make all fields of a schema nullable.
+/// Used for stats schemas where stats may not be available for all columns.
+pub(crate) fn nullable_schema(schema: &Schema) -> DeltaResult<Schema> {
+    match NullableStatsTransform.transform_struct(schema) {
+        Some(schema) => Ok(schema.into_owned()),
+        None => Err(Error::internal_error("NullableStatsTransform failed")),
     }
 }
 

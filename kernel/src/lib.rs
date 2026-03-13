@@ -175,7 +175,7 @@ pub use snapshot::SnapshotRef;
 
 use expressions::literal_expression_transform;
 use expressions::Scalar;
-use schema::{SchemaTransform, StructField, StructType};
+use schema::{StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine-native-tls",
