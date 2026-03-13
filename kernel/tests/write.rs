@@ -3864,7 +3864,7 @@ async fn test_engine_builder_with_parquet_writer_config(
 ) -> DeltaResult<()> {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().to_str().unwrap().to_string();
-    let store = Arc::new(object_store::local::LocalFileSystem::new());
+    let store = Arc::new(LocalFileSystem::new());
     let rt = tokio::runtime::Handle::current();
     let engine = Arc::new(
         DefaultEngineBuilder::new(store)
