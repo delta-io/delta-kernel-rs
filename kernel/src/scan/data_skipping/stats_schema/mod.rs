@@ -37,12 +37,24 @@ pub(crate) use column_filter::StatsConfig;
 /// column hierarchy. They additionally filter out leaf fields with non-eligible data types
 /// (e.g., Boolean, Binary) via [`is_skipping_eligible_datatype`].
 ///
-/// For columns where statistics are required (e.g. clustering columns), when a column
-/// contains only null values, `minValues` and `maxValues` for that column should be null.
-/// This is the only case where null min/max is valid -- it requires `nullCount == numRecords`
-/// for the file. Engines that implement stats collection must still include the column field
-/// in the `minValues`/`maxValues` struct (with a null value) rather than omitting it entirely,
-/// so that downstream consumers can distinguish "all nulls" from "stats not collected".
+/// ## Stats value rules
+///
+/// Statistics returned to kernel must follow these rules:
+///
+/// - `numRecords`: the total number of rows in the file.
+/// - `nullCount`: the number of null values in the column. Always present for included columns.
+/// - `minValues`/`maxValues`: the smallest/largest non-null value in the column. When a column
+///   contains only null values, there are no non-null values to aggregate, so the column has no
+///   entry in `minValues`/`maxValues`. The `nullCount` entry is still present and equals
+///   `numRecords`.
+/// - String min/max values must be truncated to a prefix no longer than 32 characters. For min
+///   values, simple prefix truncation is valid (the truncated value is always <= the original).
+///   For max values, a tie-breaker character must be appended after truncation to ensure the
+///   result is >= all actual values: ASCII DEL (0x7F) when the truncated character is ASCII,
+///   or U+10FFFF otherwise. If a valid truncation point cannot be found within 64 characters,
+///   the max value is omitted (returning `None`).
+/// - Binary min/max values are not collected (Binary is not eligible for data skipping).
+/// - Boolean values are not eligible for min/max statistics but do have `nullCount`.
 ///
 /// The `tightBounds` field is a boolean indicating whether the min/max statistics are "tight"
 /// (accurate) or "wide" (potentially outdated). When `tightBounds` is `true`, the statistics
@@ -187,7 +199,7 @@ pub(crate) fn stats_column_names(
 /// This is used to build the schema for parsing JSON stats and for reading stats_parsed
 /// from checkpoints when only a subset of columns is needed (e.g. predicate-referenced columns).
 pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
-    let stats_schema = nullable_schema(referenced_schema).ok()?;
+    let stats_schema = schema_with_all_fields_nullable(referenced_schema).ok()?;
 
     let nullcount_schema = NullCountStatsTransform
         .transform_struct(&stats_schema)?
@@ -233,7 +245,7 @@ impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
 
 /// Make all fields of a schema nullable.
 /// Used for stats schemas where stats may not be available for all columns.
-pub(crate) fn nullable_schema(schema: &Schema) -> DeltaResult<Schema> {
+pub(crate) fn schema_with_all_fields_nullable(schema: &Schema) -> DeltaResult<Schema> {
     match NullableStatsTransform.transform_struct(schema) {
         Some(schema) => Ok(schema.into_owned()),
         None => Err(Error::internal_error("NullableStatsTransform failed")),

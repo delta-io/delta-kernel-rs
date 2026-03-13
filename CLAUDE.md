@@ -107,6 +107,17 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   independent and form a cartesian product, prefer `#[values]` over enumerating
   every combination with `#[case]`.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
+  resolves it to an absolute object-store path. The `table_root` must be a proper URL string
+  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the
+  `Url` type directly -- most test helpers and kernel APIs accept `impl AsRef<str>`, so pass
+  URL strings instead. When using local storage, use an un-prefixed store
+  (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
+  `LocalFileSystem::new_with_prefix()` with `add_commit` -- the prefix causes double-nesting
+  because `add_commit` already resolves the full path from the URL. For in-memory tests, use
+  `InMemory::new()` with `"memory:///"`. Always use the same `table_root` URL string for
+  both `add_commit` (writing log files) and `snapshot`/`Snapshot::try_new` (reading the
+  table). Always include a trailing slash in directory URLs to ensure correct path joining.
 
 ## Protocol TLDR
 

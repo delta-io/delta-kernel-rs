@@ -18,11 +18,12 @@ use crate::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
-use crate::transforms::ExpressionTransform as _;
+use crate::transforms::ExpressionTransform;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
+pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
@@ -641,7 +642,7 @@ impl Expression {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_expr(self);
-        references.into_inner()
+        references.0
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -806,7 +807,7 @@ impl Predicate {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_pred(self);
-        references.into_inner()
+        references.0
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
@@ -1170,19 +1171,11 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
 /// Retrieves the set of column names referenced by an expression.
 #[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
-    references: HashSet<&'a ColumnName>,
-}
+struct GetColumnReferences<'a>(HashSet<&'a ColumnName>);
 
-impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
-        self.references
-    }
-}
-
-impl<'a> crate::transforms::ExpressionTransform<'a> for GetColumnReferences<'a> {
+impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        self.references.insert(name);
+        self.0.insert(name);
         Some(Cow::Borrowed(name))
     }
 }

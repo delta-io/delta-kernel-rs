@@ -1231,32 +1231,27 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct InvariantChecker {
-    has_invariants: bool,
-}
+struct InvariantChecker(bool);
 
 impl<'a> SchemaTransform<'a> for InvariantChecker {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         if field.has_invariants() {
-            self.has_invariants = true;
-        } else if !self.has_invariants {
+            self.0 = true;
+        } else if !self.0 {
             let _ = self.recurse_into_struct_field(field);
         }
         Some(Cow::Borrowed(field))
     }
 }
 
-impl InvariantChecker {
-    /// Checks if any column in the schema (including nested columns) has invariants defined.
-    ///
-    /// This traverses the entire schema to check for the presence of the "delta.invariants"
-    /// metadata key.
-    pub(crate) fn has_invariants(schema: &Schema) -> bool {
-        let mut checker = InvariantChecker::default();
-        let _ = checker.transform_struct(schema);
-        checker.has_invariants
-    }
+/// Checks if any column in the schema (including nested columns) has invariants defined.
+///
+/// This traverses the entire schema to check for the presence of the `delta.invariants`
+/// metadata key.
+pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
+    let mut checker = InvariantChecker(false);
+    let _ = checker.transform_struct(schema);
+    checker.0
 }
 
 /// Helper for RowVisitor implementations
@@ -2538,7 +2533,7 @@ mod tests {
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
         ]);
-        assert!(!InvariantChecker::has_invariants(&schema));
+        assert!(!schema_has_invariants(&schema));
 
         // Schema with top-level invariant
         let mut field = StructField::nullable("c", DataType::STRING);
@@ -2549,7 +2544,7 @@ mod tests {
 
         let schema =
             StructType::new_unchecked([StructField::nullable("a", DataType::STRING), field]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in a struct
         let nested_field = StructField::nullable(
@@ -2570,7 +2565,7 @@ mod tests {
             StructField::nullable("b", DataType::INTEGER),
             nested_field,
         ]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in an array of structs
         let array_field = StructField::nullable(
@@ -2594,7 +2589,7 @@ mod tests {
             StructField::nullable("b", DataType::INTEGER),
             array_field,
         ]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        assert!(schema_has_invariants(&schema));
 
         // Schema with nested invariant in a map value that's a struct
         let map_field = StructField::nullable(
@@ -2619,7 +2614,7 @@ mod tests {
             StructField::nullable("b", DataType::INTEGER),
             map_field,
         ]);
-        assert!(InvariantChecker::has_invariants(&schema));
+        assert!(schema_has_invariants(&schema));
     }
 
     #[test]

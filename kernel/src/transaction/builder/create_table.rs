@@ -17,7 +17,7 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
-use crate::schema::variant_utils::UsesVariant;
+use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
@@ -34,7 +34,6 @@ use crate::table_properties::{
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
-use crate::transforms::SchemaTransform;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
 
@@ -252,13 +251,10 @@ fn maybe_enable_clustering(
     }
 }
 
-/// Conditionally adds the `variantType` feature to the protocol when the schema contains
-/// Variant columns. Uses the [`UsesVariant`] schema visitor to detect Variant data types
-/// anywhere in the schema tree (top-level, nested structs, arrays, maps).
+/// Conditionally adds the `variantType` feature to the protocol when the schema contains Variant
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
 fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
-    let mut visitor = UsesVariant::default();
-    let _ = visitor.transform_struct(schema);
-    if visitor.found() {
+    if schema_contains_variant_type(schema) {
         add_feature_to_lists(
             TableFeature::VariantType,
             &mut validated.reader_features,
