@@ -600,19 +600,32 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         None
     }
 
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` →
-    /// ```text
-    /// AND(
-    ///   OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-    ///   OR(minValues.col_b IS NULL, minValues.col_b < 50)
-    /// )
-    /// ```
+    /// Combines sub-predicates with AND/OR for row group filtering in checkpoint/sidecar files.
+    ///
+    /// Unknown (None) sub-predicates -- typically from partition columns that have no stats in
+    /// `stats_parsed` -- are replaced with TRUE rather than a NULL literal. This is safe under
+    /// the SQL WHERE semantics used by `RowGroupFilter::eval_sql_where`:
+    ///
+    ///   - `AND(TRUE, P) = P` -- partition-unknown doesn't block data stats pruning
+    ///   - `OR(TRUE, P) = TRUE` -- conservative keep when the partition outcome is unknown
+    ///
+    /// A NULL literal would be incorrect here because `eval_sql_where` treats NULL as FALSE,
+    /// which would cause `AND(NULL, P)` to always prune the row group regardless of P.
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionPredicateOp,
+        mut op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        if inverted {
+            op = op.invert();
+        }
+        let preds: Vec<_> = preds
+            .map(|p| p.unwrap_or_else(|| Pred::literal(true)))
+            .collect();
+        if preds.is_empty() {
+            return None;
+        }
+        Some(Pred::junction(op, preds))
     }
 }
