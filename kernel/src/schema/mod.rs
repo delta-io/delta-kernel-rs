@@ -204,7 +204,7 @@ pub struct StructField {
     #[serde(rename = "type")]
     pub data_type: DataType,
     /// Whether this field is semantically nullable.
-    /// 
+    ///
     /// It's valid to have a schema with a nullable parent and non-nullable children. For
     /// example, in the checkpoint schema `add` is nullable but `add.path` is non-nullable.
     /// This means a checkpoint may have no add action, but if one is present it must
