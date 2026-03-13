@@ -93,6 +93,15 @@ pub enum CommitResponse {
     Conflict { version: Version },
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl CommitMetadata {
+    /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
+    pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
+        let log_root = crate::path::LogRoot::new(table_root)?;
+        Ok(Self::new(log_root, version, 0, None))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

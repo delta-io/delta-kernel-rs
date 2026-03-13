@@ -41,6 +41,11 @@ impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
+        if commit_metadata.version() == 0 {
+            return Err(DeltaError::unsupported(
+                "UCCommitter does not support version 0 (table creation) commits",
+            ));
+        }
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -123,7 +128,7 @@ impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use delta_kernel::committer::CatalogCommit;
+    use delta_kernel::committer::{CatalogCommit, CommitMetadata};
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::Version;
     use object_store::local::LocalFileSystem;
@@ -136,6 +141,19 @@ mod tests {
         async fn commit(&self, _: CommitRequest) -> Result<()> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn commit_rejects_version_0() {
+        let table_root = url::Url::parse("file:///tmp/test-table/").unwrap();
+        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let result = committer.commit(&engine, Box::new(std::iter::empty()), commit_metadata);
+        assert!(
+            matches!(result, Err(DeltaError::Unsupported(_))),
+            "expected Unsupported error for version 0, got: {result:?}"
+        );
     }
 
     fn staged_commit_url(table_root: &url::Url, version: Version) -> url::Url {
