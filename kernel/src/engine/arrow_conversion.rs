@@ -410,7 +410,7 @@ mod tests {
         }
     }
 
-    impl<'a> crate::transforms::SchemaTransform<'a> for FieldIdCollector {
+    impl<'a> SchemaTransform<'a> for FieldIdCollector {
         fn transform_struct_field(
             &mut self,
             field: &'a StructField,
