@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel_benchmarks::models::{
@@ -14,17 +13,23 @@ use delta_kernel_benchmarks::runners::{
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
 
-fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
+fn setup_engine() -> Arc<DefaultEngine<TokioMultiThreadExecutor>> {
     use object_store::local::LocalFileSystem;
 
     let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngine::builder(store).build();
-
-    Arc::new(engine)
+    let executor = Arc::new(
+        TokioMultiThreadExecutor::new_owned_runtime(None, None)
+            .expect("Failed to create tokio multi-thread executor"),
+    );
+    Arc::new(
+        DefaultEngine::builder(store)
+            .with_task_executor(executor)
+            .build(),
+    )
 }
 
-// Loads all workloads and sets up a shared engine and benchmark group
-// For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.) and execution logic
+// Loads all workloads and sets up a shared engine, then registers each as a top-level benchmark.
+// For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.) and execution logic.
 fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
@@ -33,7 +38,6 @@ fn workload_benchmarks(c: &mut Criterion) {
     };
 
     let engine = setup_engine();
-    let mut group = c.benchmark_group("workload_benchmarks");
 
     for workload in &workloads {
         match &workload.spec {
@@ -49,7 +53,9 @@ fn workload_benchmarks(c: &mut Criterion) {
                             engine.clone(),
                         )
                         .expect("Failed to create read runner");
-                        run_benchmark(&mut group, runner.as_ref());
+                        c.bench_function(runner.name(), |b| {
+                            b.iter(|| runner.execute().expect("Benchmark execution failed"))
+                        });
                     }
                 }
             }
@@ -61,28 +67,21 @@ fn workload_benchmarks(c: &mut Criterion) {
                     engine.clone(),
                 )
                 .expect("Failed to create snapshot construction runner");
-                run_benchmark(&mut group, &runner);
+                c.bench_function(runner.name(), |b| {
+                    b.iter(|| runner.execute().expect("Benchmark execution failed"))
+                });
             }
         }
     }
-
-    group.finish();
-}
-
-// Registers a workload with Criterion under the given group and benchmarks its `execute()` function
-fn run_benchmark(group: &mut BenchmarkGroup<WallTime>, runner: &dyn WorkloadRunner) {
-    group.bench_function(runner.name(), |b| {
-        b.iter(|| runner.execute().expect("Benchmark execution failed"))
-    });
 }
 
 fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
     // Choose which benchmark configurations to run for a given table
     // TODO: This function will take in table info to choose the appropriate configs for a given table
     let mut configs = default_read_configs();
-    if table_name.contains("v2_checkpoint") {
+    if table_name.contains("V2Chkpt") {
         configs.push(ReadConfig {
-            name: "parallel_2".into(),
+            name: "parallel2".into(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         });
     }
