@@ -108,7 +108,7 @@ mod tests {
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
 
         // commit0
         // - domain1: not removed

@@ -1190,7 +1190,10 @@ mod tests {
 
         let tmp_dir = tempdir()?;
         let tmp_path = tmp_dir.path();
-        let storage = Arc::new(LocalFileSystem::new_with_prefix(tmp_path)?);
+        let table_root = tmp_path
+            .to_str()
+            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+        let storage = Arc::new(LocalFileSystem::new());
 
         // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
         // add/remove commits.
@@ -1200,16 +1203,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let table_url = url::Url::from_directory_path(tmp_path).unwrap();
-
         // Use a temporary runtime for async setup, then drop it before FFI calls
         {
             let rt = tokio::runtime::Runtime::new()?;
-            let path = "file:///";
             rt.block_on(async {
-                add_commit(path, storage.as_ref(), 0, protocol_and_metadata).await?;
+                add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
                 add_commit(
-                    path,
+                    &table_root,
                     storage.as_ref(),
                     1,
                     actions_to_string(vec![
@@ -1219,7 +1219,7 @@ mod tests {
                 )
                 .await?;
                 add_commit(
-                    path,
+                    &table_root,
                     storage.as_ref(),
                     2,
                     actions_to_string(vec![
@@ -1233,7 +1233,6 @@ mod tests {
         } // runtime dropped here, before FFI calls
 
         // Build engine using FFI APIs
-        let table_root = table_url.as_str();
         let builder = unsafe {
             ok_or_panic(get_engine_builder(
                 kernel_string_slice!(table_root),
