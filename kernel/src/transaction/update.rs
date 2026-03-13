@@ -19,7 +19,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::committer::Committer;
 use crate::engine_data::{
-    FilteredEngineData, FilteredRowVisitor, GetData, RowEvent, RowIndexIterator, TypedGetData,
+    FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
@@ -574,41 +574,44 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
-        let null_dv = || Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema()));
-        for event in rows.row_events() {
-            match event {
-                RowEvent::Skipped(range) => {
-                    // These rows were deselected — emit nulls to keep new_dv_entries aligned.
-                    self.new_dv_entries.extend(range.map(|_| null_dv()));
-                }
-                RowEvent::Row(row_index) => {
-                    let path_opt: Option<String> =
-                        getters[Self::PATH_INDEX].get_opt(row_index, "path")?;
-                    let Some(path) = path_opt else {
-                        // Null path means a non-add action row (remove, metadata, etc.)
-                        self.new_dv_entries.push(null_dv());
-                        continue;
-                    };
-                    if let Some(dv_result) = self.dv_updates.get(&path) {
-                        self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
-                            DeletionVectorDescriptor::to_schema()
-                                .into_fields()
-                                .collect(),
-                            vec![
-                                Scalar::from(dv_result.storage_type.to_string()),
-                                Scalar::from(dv_result.path_or_inline_dv.clone()),
-                                Scalar::from(dv_result.offset),
-                                Scalar::from(dv_result.size_in_bytes),
-                                Scalar::from(dv_result.cardinality),
-                            ],
-                        )?));
-                        self.matched_file_indexes.push(row_index);
-                    } else {
-                        self.new_dv_entries.push(null_dv());
-                    }
-                }
+        static NULL_DV: LazyLock<Scalar> =
+            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+        static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
+            DeletionVectorDescriptor::to_schema()
+                .into_fields()
+                .collect()
+        });
+        let num_rows = rows.num_rows();
+        self.new_dv_entries.reserve(num_rows);
+        for row_index in rows {
+            // Fill in nulls for any deselected rows before this one.
+            self.new_dv_entries
+                .resize_with(row_index, || NULL_DV.clone());
+            let path_opt: Option<String> = getters[Self::PATH_INDEX].get_opt(row_index, "path")?;
+            let Some(path) = path_opt else {
+                // Null path means a non-add action row (remove, metadata, etc.)
+                self.new_dv_entries.push(NULL_DV.clone());
+                continue;
+            };
+            if let Some(dv_result) = self.dv_updates.get(&path) {
+                self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
+                    DV_SCHEMA_FIELDS.clone(),
+                    vec![
+                        Scalar::from(dv_result.storage_type.to_string()),
+                        Scalar::from(dv_result.path_or_inline_dv.clone()),
+                        Scalar::from(dv_result.offset),
+                        Scalar::from(dv_result.size_in_bytes),
+                        Scalar::from(dv_result.cardinality),
+                    ],
+                )?));
+                self.matched_file_indexes.push(row_index);
+            } else {
+                self.new_dv_entries.push(NULL_DV.clone());
             }
         }
+        // Pad with trailing nulls for any deselected rows at the end.
+        self.new_dv_entries
+            .resize_with(num_rows, || NULL_DV.clone());
         Ok(())
     }
 }

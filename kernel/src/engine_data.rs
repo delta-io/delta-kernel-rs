@@ -1,7 +1,6 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
 use std::collections::HashMap;
-use std::iter::Peekable;
 use std::ops::Range;
 
 use tracing::debug;
@@ -336,21 +335,9 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     }
 }
 
-/// An item yielded by [`RowIndexIterator::row_events`] during filtered iteration.
-#[derive(Debug, PartialEq)]
-pub enum RowEvent {
-    /// A half-open range of consecutive row indices that were filtered out by the selection vector.
-    Skipped(Range<usize>),
-    /// A single selected row index.
-    Row(usize),
-}
-
 /// An iterator over the indices of selected rows in an engine-data batch.
 ///
 /// Each call to [`Iterator::next`] returns the index of the next selected row.
-///
-/// Use [`RowIndexIterator::row_events`] instead when you need to track deselected row
-/// positions — for example to emit `null` values for alignment.
 ///
 /// Constructed internally and passed (alongside the column getters) to
 /// [`FilteredRowVisitor::visit_filtered`].
@@ -369,16 +356,9 @@ impl<'sv> RowIndexIterator<'sv> {
         }
     }
 
-    /// Convert into an iterator that yields [`RowEvent`] items for tracking runs of selected
-    /// and skipped rows. Use when you need to account for deselected row positions — for
-    /// example to emit `null` values for alignment.
-    pub fn row_events(self) -> impl Iterator<Item = RowEvent> + 'sv {
-        let row_count = self.row_count;
-        RowEventIter {
-            inner: self.peekable(),
-            next_expected: 0,
-            row_count,
-        }
+    /// Returns the total number of rows in the batch (selected and deselected).
+    pub fn num_rows(&self) -> usize {
+        self.row_count
     }
 }
 
@@ -397,33 +377,6 @@ impl<'sv> Iterator for RowIndexIterator<'sv> {
     }
 }
 
-/// An iterator that yields [`RowEvent`] items (runs of selected/skipped rows).
-///
-/// Produced by [`RowIndexIterator::row_events`].
-struct RowEventIter<'sv> {
-    inner: Peekable<RowIndexIterator<'sv>>,
-    next_expected: usize,
-    row_count: usize,
-}
-
-impl<'sv> Iterator for RowEventIter<'sv> {
-    type Item = RowEvent;
-
-    fn next(&mut self) -> Option<RowEvent> {
-        // Yield a Skipped event if there's a gap before the next selected index (or end of data).
-        let gap_end = self.inner.peek().copied().unwrap_or(self.row_count);
-        if gap_end > self.next_expected {
-            let range = self.next_expected..gap_end;
-            self.next_expected = gap_end;
-            return Some(RowEvent::Skipped(range));
-        }
-        self.inner.next().map(|idx| {
-            self.next_expected = idx + 1;
-            RowEvent::Row(idx)
-        })
-    }
-}
-
 /// A visitor that processes [`FilteredEngineData`] with automatic row filtering.
 ///
 /// Implementors provide [`visit_filtered`] which receives the column getters and a
@@ -437,9 +390,9 @@ pub trait FilteredRowVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]);
 
     /// Process this batch. `getters` contains one [`GetData`] item per requested column.
-    /// Iterate `rows` to receive the index of each selected row. Call
-    /// [`RowIndexIterator::row_events`] instead if you need to track deselected row positions
-    /// — for example to emit `null` values for alignment.
+    /// Iterate `rows` to receive the index of each selected row. Use
+    /// [`RowIndexIterator::num_rows`] to get the total row count (for padding output
+    /// vectors with null values for deselected rows).
     fn visit_filtered<'a>(
         &mut self,
         getters: &[&'a dyn GetData<'a>],
@@ -448,9 +401,8 @@ pub trait FilteredRowVisitor {
 
     /// Visit the rows of a [`FilteredEngineData`], automatically respecting the selection vector.
     ///
-    /// Selected rows appear as [`RowEvent::Row`] values yielded by the
-    /// [`RowIndexIterator`] handed to [`FilteredRowVisitor::visit_filtered`]; deselected rows appear as
-    /// [`RowEvent::Skipped`].
+    /// Extracts the selection vector and passes a [`RowIndexIterator`] of selected row indices
+    /// to [`FilteredRowVisitor::visit_filtered`].
     fn visit_rows_of(&mut self, data: &FilteredEngineData) -> DeltaResult<()>
     where
         Self: Sized,
@@ -820,12 +772,6 @@ mod tests {
         RowIndexIterator::new(row_count, selection).collect()
     }
 
-    fn collect_events(row_count: usize, selection: &[bool]) -> Vec<RowEvent> {
-        RowIndexIterator::new(row_count, selection)
-            .row_events()
-            .collect()
-    }
-
     #[rstest]
     #[case(0, &[], vec![])]
     #[case(3, &[], vec![0, 1, 2])]
@@ -844,26 +790,5 @@ mod tests {
         #[case] expected: Vec<usize>,
     ) {
         assert_eq!(collect_indices(row_count, selection), expected);
-    }
-
-    #[rstest]
-    #[case(0, &[], vec![])]
-    #[case(3, &[], vec![RowEvent::Row(0), RowEvent::Row(1), RowEvent::Row(2)])]
-    #[case(3, &[true, true, true], vec![RowEvent::Row(0), RowEvent::Row(1), RowEvent::Row(2)])]
-    #[case(3, &[false, false, false], vec![RowEvent::Skipped(0..3)])]
-    #[case(5, &[true, false, false, true, true], vec![RowEvent::Row(0), RowEvent::Skipped(1..3), RowEvent::Row(3), RowEvent::Row(4)])]
-    #[case(4, &[false, false, true, true], vec![RowEvent::Skipped(0..2), RowEvent::Row(2), RowEvent::Row(3)])]
-    #[case(3, &[true, false, false], vec![RowEvent::Row(0), RowEvent::Skipped(1..3)])]
-    #[case(3, &[false, true, false], vec![RowEvent::Skipped(0..1), RowEvent::Row(1), RowEvent::Skipped(2..3)])]
-    // sv shorter than row_count: tail rows implicitly selected
-    #[case(4, &[false, true], vec![RowEvent::Skipped(0..1), RowEvent::Row(1), RowEvent::Row(2), RowEvent::Row(3)])]
-    #[case(4, &[true, false], vec![RowEvent::Row(0), RowEvent::Skipped(1..2), RowEvent::Row(2), RowEvent::Row(3)])]
-    #[case(4, &[false, true, false, true], vec![RowEvent::Skipped(0..1), RowEvent::Row(1), RowEvent::Skipped(2..3), RowEvent::Row(3)])]
-    fn row_event_iter(
-        #[case] row_count: usize,
-        #[case] selection: &[bool],
-        #[case] expected: Vec<RowEvent>,
-    ) {
-        assert_eq!(collect_events(row_count, selection), expected);
     }
 }
