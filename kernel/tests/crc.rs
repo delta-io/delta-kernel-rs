@@ -14,7 +14,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine};
 use rstest::rstest;
-use test_utils::{insert_data, test_table_setup};
+use test_utils::{insert_data, test_table_setup}; // some change
 
 // ============================================================================
 // File stats from CRC on disk
