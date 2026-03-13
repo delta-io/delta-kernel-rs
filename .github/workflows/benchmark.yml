@@ -11,7 +11,10 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # See build.yml top-level comment for why save-if is restricted to main.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: boa-dev/criterion-compare-action@v3
         env:
           BENCH_TAGS: base

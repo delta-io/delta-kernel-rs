@@ -6,6 +6,18 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Swatinem/rust-cache caches the cargo registry and target directory (~450MB per job).
+# save-if restricts cache writes to main pushes only. PRs still read from main's cache
+# (exact key hit when Cargo.lock matches), but don't write their own entries.
+#
+# Why: GHA caches are scoped by ref. A PR's cache entries can only be read by that same
+# PR, never by sibling PRs. This means every byte a PR writes is dead weight that only
+# serves re-runs of that one PR. With 14 jobs x ~450MB per branch, even a handful of
+# active PRs can fill any cache budget (10GB as of 2025, but the math holds at 50GB or
+# 100GB with enough concurrent PRs). LRU then evicts main's shared entries, and all
+# subsequent PRs compile from scratch. More storage only delays the problem. Eliminating
+# PR writes removes it: main's ~6.3GB is the only cache that every PR benefits from.
+
 jobs:
   format:
     runs-on: ubuntu-latest
@@ -25,6 +37,8 @@ jobs:
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-msrv
@@ -41,6 +55,8 @@ jobs:
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-msrv
@@ -66,6 +82,8 @@ jobs:
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: build docs
         run: cargo doc --workspace --all-features --no-deps
 
@@ -105,6 +123,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
@@ -135,6 +155,8 @@ jobs:
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: test
         run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
@@ -177,6 +199,8 @@ jobs:
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
       - name: Build kernel
@@ -225,6 +249,8 @@ jobs:
           rustup override set nightly
           cargo miri setup
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: Test with Miri
         run: |
@@ -240,6 +266,8 @@ jobs:
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage
