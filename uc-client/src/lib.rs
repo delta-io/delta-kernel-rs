@@ -35,15 +35,13 @@ pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use commits_client::InMemoryCommitsClient;
+pub use commits_client::{InMemoryCommitsClient, TableData};
 
 #[doc(hidden)]
 pub mod prelude {
     pub use crate::client::UCClient;
     pub use crate::commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
-    pub use crate::models::{
-        commits::{Commit, CommitsRequest, CommitsResponse},
-        credentials::{Operation, TemporaryTableCredentials},
-        tables::TablesResponse,
-    };
+    pub use crate::models::credentials::{Operation, TemporaryTableCredentials};
+    pub use crate::models::tables::TablesResponse;
+    pub use crate::models::{Commit, CommitsRequest, CommitsResponse};
 }

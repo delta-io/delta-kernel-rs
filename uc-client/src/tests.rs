@@ -1,5 +1,5 @@
-use crate::models::commits::CommitsRequest;
 use crate::models::credentials::Operation;
+use unitycatalog_client_api::CommitsRequest;
 
 #[test]
 fn test_commits_request_builder() {

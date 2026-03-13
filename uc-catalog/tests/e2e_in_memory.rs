@@ -7,8 +7,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use uc_catalog::{UCCatalog, UCCommitter};
-use uc_client::commits_client::{InMemoryCommitsClient, TableData};
-use uc_client::models::commits::Commit;
+use unitycatalog_client_api::{Commit, InMemoryCommitsClient, TableData};
 
 // ============================================================================
 // Test Setup

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
-use uc_client::models::commits::{Commit, CommitRequest};
+use uc_client::models::{Commit, CommitRequest};
 use uc_client::UCCommitClient;
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
@@ -133,7 +133,7 @@ mod tests {
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
     use std::fs;
-    use uc_client::error::Result;
+    use unitycatalog_client_api::error::Result;
 
     struct MockCommitsClient;
 

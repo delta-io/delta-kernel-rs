@@ -13,8 +13,8 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-/// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
-/// Catalog. For now this is a lightweight wrapper around a [UCGetCommitsClient].
+/// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in
+/// Unity Catalog. It is a lightweight wrapper around a [UCGetCommitsClient].
 pub struct UCCatalog<'a, C: UCGetCommitsClient> {
     client: &'a C,
 }
@@ -138,6 +138,8 @@ mod tests {
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
+    use uc_client::models::credentials::Operation;
+    use uc_client::{UCClient, UCCommitsRestClient};
 
     use super::*;
 

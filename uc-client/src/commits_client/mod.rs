@@ -5,35 +5,12 @@ use url::Url;
 use crate::config::ClientConfig;
 use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
+use unitycatalog_client_api::{CommitRequest, CommitsRequest, CommitsResponse};
+
+pub use unitycatalog_client_api::commits_client::{UCCommitClient, UCGetCommitsClient};
 
 #[cfg(any(test, feature = "test-utils"))]
-mod in_memory;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub use in_memory::{InMemoryCommitsClient, TableData};
-
-/// Trait for committing new versions to a UC-managed Delta table.
-///
-/// Implementations of this trait are responsible for performing any necessary retries on transient
-/// failures. This trait is designed to be injected into a `uc_catalog::committer::UCCommitter`,
-/// which itself does not perform any retries and relies on the underlying client implementation to
-/// handle retry logic.
-#[allow(async_fn_in_trait)]
-pub trait UCCommitClient: Send + Sync {
-    /// Commit a new version to the table.
-    async fn commit(&self, request: CommitRequest) -> Result<()>;
-}
-
-/// Trait for retrieving commits from a UC-managed Delta table.
-///
-/// Implementations of this trait are responsible for performing any necessary retries on transient
-/// failures.
-#[allow(async_fn_in_trait)]
-pub trait UCGetCommitsClient: Send + Sync {
-    /// Get the latest commits for the table.
-    async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse>;
-}
+pub use unitycatalog_client_api::{InMemoryCommitsClient, TableData};
 
 /// REST implementation of [UCCommitClient] and [UCGetCommitsClient].
 #[derive(Debug, Clone)]
@@ -61,11 +38,9 @@ impl UCCommitsRestClient {
             config,
         }
     }
-}
 
-impl UCGetCommitsClient for UCCommitsRestClient {
     #[instrument(skip(self))]
-    async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
+    async fn get_commits_impl(&self, request: CommitsRequest) -> Result<CommitsResponse> {
         let url = self.base_url.join("delta/preview/commits")?;
         let response = execute_with_retry(&self.config, || {
             self.http_client
@@ -77,11 +52,9 @@ impl UCGetCommitsClient for UCCommitsRestClient {
 
         handle_response(response).await
     }
-}
 
-impl UCCommitClient for UCCommitsRestClient {
     #[instrument(skip(self))]
-    async fn commit(&self, request: CommitRequest) -> Result<()> {
+    async fn commit_impl(&self, request: CommitRequest) -> Result<()> {
         let url = self.base_url.join("delta/preview/commits")?;
         let response = execute_with_retry(&self.config, || {
             self.http_client
@@ -95,5 +68,26 @@ impl UCCommitClient for UCCommitsRestClient {
         struct EmptyResponse {}
         let _: EmptyResponse = handle_response(response).await?;
         Ok(())
+    }
+}
+
+fn uc_err_to_api_err(e: crate::Error) -> unitycatalog_client_api::Error {
+    unitycatalog_client_api::Error::Generic(e.to_string())
+}
+
+impl UCGetCommitsClient for UCCommitsRestClient {
+    async fn get_commits(
+        &self,
+        request: CommitsRequest,
+    ) -> unitycatalog_client_api::Result<CommitsResponse> {
+        self.get_commits_impl(request)
+            .await
+            .map_err(uc_err_to_api_err)
+    }
+}
+
+impl UCCommitClient for UCCommitsRestClient {
+    async fn commit(&self, request: CommitRequest) -> unitycatalog_client_api::Result<()> {
+        self.commit_impl(request).await.map_err(uc_err_to_api_err)
     }
 }

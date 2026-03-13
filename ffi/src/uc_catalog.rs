@@ -67,7 +67,7 @@ unsafe impl Sync for FfiUCCommitClient {}
 
 impl uc_client::UCCommitClient for FfiUCCommitClient {
     /// Commit a new version to the table.
-    async fn commit(&self, request: ClientCommitRequest) -> uc_client::Result<()> {
+    async fn commit(&self, request: ClientCommitRequest) -> unitycatalog_client_api::Result<()> {
         let table_id = request.table_id;
         let table_uri = request.table_uri;
 
@@ -78,7 +78,7 @@ impl uc_client::UCCommitClient for FfiUCCommitClient {
         // the common code and call it from a scope where the string remains valid until after the
         // closure finishes
 
-        let send_request = |commit_info| -> uc_client::Result<()> {
+        let send_request = |commit_info| -> unitycatalog_client_api::Result<()> {
             let c_commit_request = CommitRequest {
                 table_id: kernel_string_slice!(table_id),
                 table_uri: kernel_string_slice!(table_uri),
@@ -92,9 +92,9 @@ impl uc_client::UCCommitClient for FfiUCCommitClient {
                 OptionalValue::Some(e) => {
                     let boxed_str = unsafe { e.into_inner() }; // get the string back into Box<String>
                     let s: String = *boxed_str; // move back onto the stack
-                    uc_client::Result::Err(uc_client::Error::Generic(s))
+                    Err(unitycatalog_client_api::Error::Generic(s))
                 }
-                OptionalValue::None => uc_client::Result::Ok(()),
+                OptionalValue::None => Ok(()),
             }
         };
 
@@ -340,7 +340,7 @@ pub(crate) mod tests {
             protocol: None,
         };
 
-        let result: uc_client::Result<()> = client_arc.commit(request).await;
+        let result: unitycatalog_client_api::Result<()> = client_arc.commit(request).await;
 
         assert!(result.is_ok());
 
@@ -381,7 +381,7 @@ pub(crate) mod tests {
             protocol: None,
         };
 
-        let result: uc_client::Result<()> = client_arc.commit(request).await;
+        let result: unitycatalog_client_api::Result<()> = client_arc.commit(request).await;
 
         assert!(result.is_err());
 
@@ -390,8 +390,8 @@ pub(crate) mod tests {
         assert!(context.commit_called);
 
         let error = result.unwrap_err();
-        assert!(matches!(error, uc_client::Error::Generic(_)));
-        if let uc_client::Error::Generic(msg) = error {
+        assert!(matches!(error, unitycatalog_client_api::Error::Generic(_)));
+        if let unitycatalog_client_api::Error::Generic(msg) = error {
             assert_eq!(msg, "Test commit failure");
         }
 

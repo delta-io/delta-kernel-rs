@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use uc_client::{
-    models::{commits::Commit, credentials::Operation, CommitsRequest},
+    models::{credentials::Operation, Commit, CommitsRequest},
     UCClient, UCCommitsRestClient, UCGetCommitsClient,
 };
 

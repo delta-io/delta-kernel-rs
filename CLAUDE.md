@@ -43,16 +43,17 @@ cargo fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                  | Directory       | Description                                    |
-|------------------------|-----------------|------------------------------------------------|
-| `delta_kernel`         | `kernel/`       | Core library                                   |
-| `delta_kernel_ffi`     | `ffi/`          | C/C++ FFI bindings                             |
-| `delta_kernel_derive`  | `derive-macros/`| Proc macros                                    |
-| `acceptance`           | `acceptance/`   | Acceptance tests (DAT)                         |
-| `test_utils`           | `test-utils/`   | Shared test utilities                          |
-| `feature_tests`        | `feature-tests/`| Feature flag tests                             |
-| `uc-catalog`           | `uc-catalog/`   | Unity Catalog integration (UCCatalog, UCCommitter) |
-| `uc-client`            | `uc-client/`    | Unity Catalog REST client                      |
+| Crate                       | Directory                   | Description                                        |
+|-----------------------------|-----------------------------|----------------------------------------------------|
+| `delta_kernel`              | `kernel/`                   | Core library                                       |
+| `delta_kernel_ffi`          | `ffi/`                      | C/C++ FFI bindings                                 |
+| `delta_kernel_derive`       | `derive-macros/`            | Proc macros                                        |
+| `acceptance`                | `acceptance/`               | Acceptance tests (DAT)                             |
+| `test_utils`                | `test-utils/`               | Shared test utilities                              |
+| `feature_tests`             | `feature-tests/`            | Feature flag tests                                 |
+| `uc-catalog`                | `uc-catalog/`               | Unity Catalog integration (UCCatalog, UCCommitter) |
+| `uc-client`                 | `uc-client/`                | Unity Catalog REST client                          |
+| `unitycatalog-client-api`   | `unitycatalog-client-api/`  | Unity Catalog client traits and shared models      |
 
 ### Feature Flags
 
