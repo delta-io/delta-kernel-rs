@@ -437,3 +437,41 @@ fn test_get_stat_values() {
         )
     );
 }
+
+// `eval_sql_where` treats NULL boolean literals as false (SQL WHERE semantics). This means
+// callers must not pass NULL literal arms in predicates, because:
+// - AND(true, NULL) -> AND(true, false) -> false -> PRUNED (incorrect if NULL = "unknown")
+// - OR(false, NULL) -> OR(false, false) -> false -> PRUNED (incorrect if NULL = "unknown")
+//
+// This is why `NullGuardedDataSkippingPredicateCreator` handles unsupported arms by dropping
+// them (AND) or bailing (OR), rather than inserting NULL literals.
+#[test]
+fn test_row_group_filter_null_literal_evaluates_to_false() {
+    let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+    let row_group = metadata.metadata().row_group(0);
+
+    // int64 range is [1000000000, 1000000004]
+    let in_range = Predicate::gt(
+        column_pred!("numeric.ints.int64"),
+        Scalar::from(999_999_999i64),
+    );
+    let out_of_range = Predicate::gt(
+        column_pred!("numeric.ints.int64"),
+        Scalar::from(2_000_000_000i64),
+    );
+    let null = Predicate::null_literal();
+
+    // Sanity checks: supported predicates behave as expected
+    assert!(RowGroupFilter::apply(row_group, &in_range));
+    assert!(!RowGroupFilter::apply(row_group, &out_of_range));
+
+    // NULL literal converts to false in all contexts
+    assert!(!RowGroupFilter::apply(row_group, &null));
+    assert!(!RowGroupFilter::apply(row_group, &Predicate::and(in_range.clone(), null.clone())));
+    assert!(!RowGroupFilter::apply(row_group, &Predicate::and(out_of_range.clone(), null.clone())));
+    assert!(RowGroupFilter::apply(row_group, &Predicate::or(in_range, null.clone())));
+    assert!(!RowGroupFilter::apply(row_group, &Predicate::or(out_of_range, null.clone())));
+    assert!(!RowGroupFilter::apply(row_group, &Predicate::and(null.clone(), null.clone())));
+    assert!(!RowGroupFilter::apply(row_group, &Predicate::or(null.clone(), null)));
+}

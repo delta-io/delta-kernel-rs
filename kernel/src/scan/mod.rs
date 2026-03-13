@@ -808,6 +808,10 @@ impl Scan {
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    ///
+    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate cannot
+    /// be converted to data-skipping form (e.g., when all predicate columns have unsupported stat
+    /// types like Timestamp).
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
@@ -820,6 +824,14 @@ impl Scan {
             .metadata()
             .partition_columns();
         let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+
+        // The checkpoint skipping predicate creator drops unsupported arms from junctions
+        // and returns None when no supported arms remain, so the predicate should always
+        // have column references if it exists.
+        debug_assert!(
+            !skipping_pred.references().is_empty(),
+            "checkpoint skipping predicate has no column references: {skipping_pred}"
+        );
 
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),

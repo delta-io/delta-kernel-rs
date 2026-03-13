@@ -600,19 +600,37 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         None
     }
 
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` →
-    /// ```text
-    /// AND(
-    ///   OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-    ///   OR(minValues.col_b IS NULL, minValues.col_b < 50)
-    /// )
-    /// ```
+    /// Combines sub-predicates with AND/OR, handling unsupported (None) arms conservatively:
+    ///
+    /// - AND: drops unsupported arms (weakens the predicate, keeping more row groups).
+    /// - OR: returns None if any arm is unsupported (can't prove the OR false).
+    ///
+    /// This avoids the NULL literal approach used by [`DataSkippingPredicateCreator`], which
+    /// relies on three-valued logic in the Arrow expression evaluator. The parquet
+    /// RowGroupFilter's `eval_sql_where` converts NULL boolean literals to false, which would
+    /// incorrectly prune row groups when mixed with supported arms.
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        let effective_op = if inverted { op.invert() } else { op };
+        match effective_op {
+            JunctionPredicateOp::And => {
+                let supported: Vec<_> = preds.flatten().collect();
+                if supported.is_empty() {
+                    return None;
+                }
+                Some(Pred::junction(effective_op, supported))
+            }
+            JunctionPredicateOp::Or => {
+                let supported: Vec<_> = preds.collect::<Option<Vec<_>>>()?;
+                if supported.is_empty() {
+                    return None;
+                }
+                Some(Pred::junction(effective_op, supported))
+            }
+        }
     }
 }

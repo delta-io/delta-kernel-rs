@@ -796,6 +796,178 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
         expected,
         "part_col='{part_val}' max(data_col)={max_data}"
     );
+/// Tests checkpoint skipping with unsupported predicate arms (timestamp max stats, partition
+/// columns). AND drops unsupported arms (conservative); OR returns None if any arm is
+/// unsupported (can't prove OR false). NOT flips the junction via De Morgan's law.
+#[rstest]
+// Bare unsupported predicates
+#[case::bare_timestamp_gt(
+    Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    &[],
+    true,
+)]
+// All-unsupported junctions
+#[case::and_all_unsupported_timestamp(
+    Pred::and(
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(5_000_000)),
+    ),
+    &[],
+    true,
+)]
+#[case::and_all_unsupported_timestamp_ntz(
+    Pred::and(
+        Pred::gt(column_expr!("ts_col"), Scalar::TimestampNtz(2_000_000)),
+        Pred::gt(column_expr!("ts_col"), Scalar::TimestampNtz(5_000_000)),
+    ),
+    &[],
+    true,
+)]
+#[case::or_all_unsupported_timestamp(
+    Pred::or(
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(5_000_000)),
+    ),
+    &[],
+    true,
+)]
+// Mixed AND: unsupported arm dropped, supported arm retained
+#[case::and_supported_then_unsupported(
+    Pred::and(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    ),
+    &[],
+    false,
+)]
+#[case::and_unsupported_then_supported(
+    Pred::and(
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+    ),
+    &[],
+    false,
+)]
+#[case::and_multiple_supported_one_unsupported(
+    Pred::and(
+        Pred::and(
+            Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+            Pred::lt(column_expr!("id"), Scalar::from(500i64)),
+        ),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    ),
+    &[],
+    false,
+)]
+// Mixed OR: any unsupported arm makes OR unevaluable
+#[case::or_supported_and_unsupported(
+    Pred::or(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    ),
+    &[],
+    true,
+)]
+#[case::or_unsupported_then_supported(
+    Pred::or(
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+    ),
+    &[],
+    true,
+)]
+// NOT(junction) via De Morgan's law with partition columns (always unsupported)
+#[case::not_and_mixed_becomes_or_returns_none(
+    // NOT(AND(supported, partition)) -> effective OR -> partition None -> OR bails
+    Pred::not(Pred::and(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("part_col"), Scalar::from(42i64)),
+    )),
+    &["part_col"],
+    true,
+)]
+#[case::not_or_mixed_becomes_and_drops_unsupported(
+    // NOT(OR(supported, partition)) -> effective AND -> partition dropped -> Some
+    Pred::not(Pred::or(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("part_col"), Scalar::from(42i64)),
+    )),
+    &["part_col"],
+    false,
+)]
+#[case::not_and_all_partition(
+    // NOT(AND(partition, partition)) -> effective OR -> all None -> None
+    Pred::not(Pred::and(
+        Pred::gt(column_expr!("part_col"), Scalar::from(1i64)),
+        Pred::gt(column_expr!("part_col"), Scalar::from(2i64)),
+    )),
+    &["part_col"],
+    true,
+)]
+#[case::not_or_all_partition(
+    // NOT(OR(partition, partition)) -> effective AND -> all dropped -> None
+    Pred::not(Pred::or(
+        Pred::gt(column_expr!("part_col"), Scalar::from(1i64)),
+        Pred::gt(column_expr!("part_col"), Scalar::from(2i64)),
+    )),
+    &["part_col"],
+    true,
+)]
+fn test_checkpoint_skipping_unsupported_predicate(
+    #[case] pred: Pred,
+    #[case] partition_columns: &[&str],
+    #[case] expect_none: bool,
+) {
+    let partition_columns: Vec<String> =
+        partition_columns.iter().map(|s| s.to_string()).collect();
+    let result = as_checkpoint_skipping_predicate(&pred, &partition_columns);
+    if expect_none {
+        assert!(
+            result.is_none(),
+            "expected None for unsupported predicate: {pred:#?}"
+        );
+    } else {
+        let skipping_pred = result.expect("expected Some for predicate with supported arms");
+        assert!(
+            !skipping_pred.references().is_empty(),
+            "should retain references from supported columns: {skipping_pred}"
+        );
+    }
+}
+
+#[test]
+fn test_checkpoint_skipping_deeply_nested_mixed() {
+    // AND(AND(id > 100, ts > ...), id < 500): inner AND drops ts, outer keeps both.
+    let pred = Pred::and(
+        Pred::and(
+            Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+            Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        ),
+        Pred::lt(column_expr!("id"), Scalar::from(500i64)),
+    );
+    assert!(as_checkpoint_skipping_predicate(&pred, &[]).is_some());
+
+    // OR(AND(id > 100, ts > ...), id < 500): inner AND drops ts -> AND(id > 100),
+    // outer OR both arms supported -> keeps OR.
+    let pred = Pred::or(
+        Pred::and(
+            Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+            Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        ),
+        Pred::lt(column_expr!("id"), Scalar::from(500i64)),
+    );
+    assert!(as_checkpoint_skipping_predicate(&pred, &[]).is_some());
+
+    // AND(OR(id > 100, ts > ...), id < 500): inner OR has unsupported arm -> None,
+    // outer AND drops it -> AND(id < 500).
+    let pred = Pred::and(
+        Pred::or(
+            Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+            Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        ),
+        Pred::lt(column_expr!("id"), Scalar::from(500i64)),
+    );
+    assert!(as_checkpoint_skipping_predicate(&pred, &[]).is_some());
 }
 
 // Without normalization, `AND([unknown])` would become `AND([NULL])` via
