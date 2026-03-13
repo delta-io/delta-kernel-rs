@@ -81,8 +81,9 @@ version. From it you build a `Scan` (reads) or `Transaction` (writes).
 assembles commit actions, enforces protocol compliance, delegates atomic commit to a
 `Committer`.
 
-**Engine trait:** four handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
-`EvaluationHandler`). `DefaultEngine` lives in `kernel/src/engine/default/`.
+**Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
+`EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
+`kernel/src/engine/default/`.
 
 **EngineData:** opaque columnar data interface. IMPORTANT: never access `EngineData` columns
 directly -- always use the visitor pattern (`visit_rows` with typed `GetData` accessors).
@@ -158,6 +159,8 @@ Keep this list updated when new protocol features are added to kernel.
 - **Column mapping:** Physical column names can differ from logical names. Always use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
+- **Transforms:** Generic recursive schema and expression transform traits and helpers
+  are in `kernel/src/transforms/`.
 
 ## Code Style / Documentation
 
