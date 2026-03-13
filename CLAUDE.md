@@ -118,6 +118,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   `InMemory::new()` with `"memory:///"`. Always use the same `table_root` URL string for
   both `add_commit` (writing log files) and `snapshot`/`Snapshot::try_new` (reading the
   table). Always include a trailing slash in directory URLs to ensure correct path joining.
+- **Test tables:** see `kernel/tests/README.md` for a full catalog of test data tables,
+  their schemas, features, and which tests use them. Consult this before creating a new
+  test table to check if an existing one can be reused.
 
 ## Protocol TLDR
 

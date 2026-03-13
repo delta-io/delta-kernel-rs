@@ -798,16 +798,59 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
     );
 }
 
-// Without normalization, `AND([unknown])` would become `AND([NULL])` via
-// `collect_junction_preds`, which evaluates to `Some(false)` under `eval_sql_where` and
-// incorrectly prunes all row groups. The junction constructor normalizes `AND([unknown])`
-// to just `unknown`, which correctly returns `None` (no pushdown).
-#[test]
-fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
-    let pred = Pred::and_from([Pred::unknown("unsupported")]);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]);
-    assert!(
-        skipping_pred.is_none(),
-        "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
-    );
+/// Unsupported arms (timestamp max stats, partition columns) are replaced with TRUE in
+/// junctions. Bare unsupported predicates return None. Junctions always return Some.
+#[rstest]
+#[case::bare_unsupported_returns_none(
+    Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    &[],
+    true,
+)]
+#[case::mixed_and_replaces_unsupported_with_true(
+    Pred::and(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    ),
+    &[],
+    false,
+)]
+#[case::mixed_or_replaces_unsupported_with_true(
+    Pred::or(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+    ),
+    &[],
+    false,
+)]
+#[case::all_unsupported_junction_returns_some(
+    Pred::and(
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(5_000_000)),
+    ),
+    &[],
+    false,
+)]
+#[case::partition_column_unsupported_in_junction(
+    Pred::and(
+        Pred::gt(column_expr!("id"), Scalar::from(100i64)),
+        Pred::gt(column_expr!("part_col"), Scalar::from(42i64)),
+    ),
+    &["part_col"],
+    false,
+)]
+fn test_checkpoint_skipping_unsupported_predicate(
+    #[case] pred: Pred,
+    #[case] partition_columns: &[&str],
+    #[case] expect_none: bool,
+) {
+    let partition_columns: Vec<String> = partition_columns.iter().map(|s| s.to_string()).collect();
+    let result = as_checkpoint_skipping_predicate(&pred, &partition_columns);
+    if expect_none {
+        assert!(
+            result.is_none(),
+            "expected None for unsupported predicate: {pred:#?}"
+        );
+    } else {
+        assert!(result.is_some(), "expected Some for predicate: {pred:#?}");
+    }
 }
