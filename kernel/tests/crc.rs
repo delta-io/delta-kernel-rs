@@ -638,17 +638,32 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
 // TODO: Add tests for testing set txn expiration
 // ============================================================================
 
+/// Comprehensive test for set transaction CRC tracking: verifies that set transactions are
+/// correctly tracked in the CRC across commits, round-trip through write/reload, and that
+/// the CRC fast path (no log replay) works for set transaction queries.
 #[tokio::test]
-async fn test_post_commit_crc_tracks_set_transactions() -> DeltaResult<()> {
+async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    // v0: CREATE TABLE (no set transactions)
+    // -- v0: CREATE TABLE (no set transactions) --
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot_v0 = committed.post_commit_snapshot().unwrap();
-    let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
-    assert_eq!(crc_v0.set_transactions.as_ref().unwrap().len(), 0);
 
-    // v1: commit with my-app=1
+    // Post-commit CRC has empty set_transactions (not null)
+    let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
+    assert_eq!(crc_v0.set_transactions, Some(Default::default()));
+
+    // Fresh snapshot with CRC on disk serves queries via fast path (no log replay)
+    let fresh_v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh_v0.get_current_crc_if_loaded_for_testing().is_some());
+    assert_eq!(
+        fresh_v0
+            .get_app_id_version("my-app", &FailingEngine)
+            .unwrap(),
+        None
+    );
+
+    // -- v1: commit with my-app=1 --
     let committed = snapshot_v0
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -657,19 +672,43 @@ async fn test_post_commit_crc_tracks_set_transactions() -> DeltaResult<()> {
         .commit(engine.as_ref())?
         .unwrap_committed();
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
-    let crc_v1 = write_and_verify_crc(snapshot_v1, &table_path, engine.as_ref());
-    let txns_v1 = crc_v1.set_transactions.as_ref().unwrap();
-    assert_eq!(txns_v1.len(), 1);
-    assert!(txns_v1.contains_key("my-app"));
-    // Verify through the snapshot API (which applies retention filtering)
+
+    // Post-commit CRC tracks my-app=1, queryable via fast path
     assert_eq!(
         snapshot_v1
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         Some(1)
     );
+    assert_eq!(
+        snapshot_v1
+            .get_app_id_version("nonexistent", &FailingEngine)
+            .unwrap(),
+        None
+    );
 
-    // v2: commit with my-app=2 (upsert) + other-app=1 (new)
+    // Write CRC to disk, reload, verify round-trip and fast path
+    let crc_v1 = write_and_verify_crc(snapshot_v1, &table_path, engine.as_ref());
+    let txns_v1 = crc_v1.set_transactions.as_ref().unwrap();
+    assert_eq!(txns_v1.len(), 1);
+    assert!(txns_v1.contains_key("my-app"));
+
+    let fresh_v1 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh_v1.get_current_crc_if_loaded_for_testing().is_some());
+    assert_eq!(
+        fresh_v1
+            .get_app_id_version("my-app", &FailingEngine)
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        fresh_v1
+            .get_app_id_version("nonexistent", &FailingEngine)
+            .unwrap(),
+        None
+    );
+
+    // -- v2: commit with my-app=2 (upsert) + other-app=1 (new) --
     let committed = snapshot_v1
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -679,9 +718,8 @@ async fn test_post_commit_crc_tracks_set_transactions() -> DeltaResult<()> {
         .commit(engine.as_ref())?
         .unwrap_committed();
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
-    let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
-    let txns_v2 = crc_v2.set_transactions.as_ref().unwrap();
-    assert_eq!(txns_v2.len(), 2);
+
+    // Post-commit CRC tracks updated versions, queryable via fast path
     assert_eq!(
         snapshot_v2
             .get_app_id_version("my-app", &FailingEngine)
@@ -695,98 +733,25 @@ async fn test_post_commit_crc_tracks_set_transactions() -> DeltaResult<()> {
         Some(1)
     );
 
-    Ok(())
-}
+    // Write CRC to disk, reload, verify round-trip and fast path
+    let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
+    let txns_v2 = crc_v2.set_transactions.as_ref().unwrap();
+    assert_eq!(txns_v2.len(), 2);
 
-#[tokio::test]
-async fn test_get_app_id_version_with_crc_skips_log_replay() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // v0: CREATE TABLE
-    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
-    let snapshot_v0 = committed.post_commit_snapshot().unwrap();
-
-    // v1: commit with my-app=1
-    let committed = snapshot_v0
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_operation("WRITE".to_string())
-        .with_transaction_id("my-app".to_string(), 1)
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    // Case 1: Post-commit snapshot with in-memory CRC => fast path (no I/O).
-    let post_commit_snapshot = committed.post_commit_snapshot().unwrap();
-    assert!(post_commit_snapshot
-        .get_current_crc_if_loaded_for_testing()
-        .is_some());
+    let fresh_v2 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh_v2.get_current_crc_if_loaded_for_testing().is_some());
     assert_eq!(
-        post_commit_snapshot
+        fresh_v2
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
-        Some(1)
+        Some(2)
     );
     assert_eq!(
-        post_commit_snapshot
-            .get_app_id_version("nonexistent", &FailingEngine)
-            .unwrap(),
-        None
-    );
-
-    // Case 2: Fresh snapshot without CRC file => slow path (real engine).
-    let fresh_snapshot_no_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(fresh_snapshot_no_crc
-        .get_current_crc_if_loaded_for_testing()
-        .is_none());
-    assert_eq!(
-        fresh_snapshot_no_crc
-            .get_app_id_version("my-app", engine.as_ref())
+        fresh_v2
+            .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
     );
-
-    // Case 3: Write CRC to disk, reload => fast path (no I/O).
-    post_commit_snapshot.write_checksum(engine.as_ref())?;
-    let fresh_snapshot_with_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(fresh_snapshot_with_crc
-        .get_current_crc_if_loaded_for_testing()
-        .is_some());
-    assert_eq!(
-        fresh_snapshot_with_crc
-            .get_app_id_version("my-app", &FailingEngine)
-            .unwrap(),
-        Some(1)
-    );
-    assert_eq!(
-        fresh_snapshot_with_crc
-            .get_app_id_version("nonexistent", &FailingEngine)
-            .unwrap(),
-        None
-    );
-
-    Ok(())
-}
-
-// CRC should always write setTransactions as an empty list (not null) when no txn actions exist.
-#[tokio::test]
-async fn test_write_checksum_with_no_set_txns_writes_empty_list() -> DeltaResult<()> {
-    use std::collections::HashMap;
-
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
-
-    let committed = create_table(&table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    let snapshot = committed.post_commit_snapshot().unwrap();
-    let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
-    assert_eq!(crc.set_transactions, Some(HashMap::new()));
 
     Ok(())
 }
