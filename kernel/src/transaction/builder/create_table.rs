@@ -251,9 +251,8 @@ fn maybe_enable_clustering(
     }
 }
 
-/// Conditionally adds the `variantType` feature to the protocol when the schema contains
-/// Variant columns.
-/// anywhere in the schema tree (top-level, nested structs, arrays, maps).
+/// Conditionally adds the `variantType` feature to the protocol when the schema contains Variant
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
 fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
     if schema_contains_variant_type(schema) {
         add_feature_to_lists(

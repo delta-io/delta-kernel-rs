@@ -20,7 +20,7 @@ use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::nullable_schema;
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
@@ -1021,7 +1021,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = nullable_schema(get_log_remove_schema())?;
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references

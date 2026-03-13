@@ -22,7 +22,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
-use crate::scan::data_skipping::stats_schema::nullable_schema;
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
@@ -354,7 +354,7 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    nullable_schema(scan_row_schema().as_ref())
+    schema_with_all_fields_nullable(scan_row_schema().as_ref())
         .unwrap_or_else(|_| panic!("Failed to transform scan_row_schema"))
         .into()
 });
@@ -370,7 +370,7 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    nullable_schema(restored_add_schema())
+    schema_with_all_fields_nullable(restored_add_schema())
         .unwrap_or_else(|_| panic!("Failed to transform restored_add_schema"))
         .into()
 });
@@ -386,7 +386,7 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    nullable_schema(get_log_add_schema())
+    schema_with_all_fields_nullable(get_log_add_schema())
         .unwrap_or_else(|_| panic!("Failed to transform nullable_restored_add_schema"))
         .into()
 });
