@@ -3,8 +3,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::object_store::{local::LocalFileSystem, path::Path as ObjectPath, ObjectStore};
 use futures::stream::TryStreamExt;
-use object_store::{self, local::LocalFileSystem, ObjectStore};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -53,9 +53,7 @@ impl TestCaseInfo {
 
         let raw_cases = files.into_iter().filter(|meta| {
             meta.location.filename() == Some("table_version_metadata.json")
-                && !meta
-                    .location
-                    .prefix_matches(&object_store::path::Path::from("latest"))
+                && !meta.location.prefix_matches(&ObjectPath::from("latest"))
         });
 
         let mut cases = Vec::new();

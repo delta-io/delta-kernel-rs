@@ -27,7 +27,7 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStore as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
@@ -118,7 +118,7 @@ async fn create_dv_table_with_files(
     file_paths: &[&str],
 ) -> Result<
     (
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         Arc<dyn delta_kernel::Engine>,
         Url,
         Vec<String>,
@@ -359,7 +359,7 @@ fn check_action_timestamps<'a>(
 
 // list all the files at `path` and check that all parquet files have the same size, and return
 // that size
-async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str) -> u64 {
+async fn get_and_check_all_parquet_sizes(store: Arc<DynObjectStore>, path: &str) -> u64 {
     use futures::stream::StreamExt;
     let files: Vec<_> = store.list(Some(&Path::from(path))).collect().await;
     let parquet_files = files
@@ -1911,7 +1911,7 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
 }
 
 async fn get_ict_at_version(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_url: &Url,
     version: u64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
@@ -3287,7 +3287,7 @@ async fn test_column_mapping_write(
 
     let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3557,7 +3557,7 @@ async fn test_column_mapping_partitioned_write(
     let tmp_dir = tempdir()?;
     copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3635,7 +3635,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     test_utils::copy_directory(source_path, &table_path).unwrap();
 
     let url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
         delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
