@@ -7,6 +7,8 @@
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
+use crate::predicate_parser::parse_predicate;
+use delta_kernel::expressions::PredicateRef;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Snapshot;
 use delta_kernel::{Engine, Error};
@@ -28,6 +30,7 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
+    predicate: Option<PredicateRef>,
 }
 
 impl ReadMetadataRunner {
@@ -47,6 +50,13 @@ impl ReadMetadataRunner {
 
         let snapshot = builder.build(engine.as_ref())?;
 
+        let predicate = read_spec
+            .predicate
+            .as_deref()
+            .map(parse_predicate)
+            .transpose()?
+            .map(Arc::new);
+
         let name = format!(
             "{}/{}/{}/{}",
             table_info.name,
@@ -60,11 +70,17 @@ impl ReadMetadataRunner {
             engine,
             name,
             config,
+            predicate,
         })
     }
 
     fn execute_serial(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let scan = self.snapshot.clone().scan_builder().build()?;
+        let scan = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .build()?;
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
             black_box(result?);
@@ -73,7 +89,12 @@ impl ReadMetadataRunner {
     }
 
     fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
-        let scan = self.snapshot.clone().scan_builder().build()?;
+        let scan = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .build()?;
 
         let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
         for result in phase1.by_ref() {
@@ -235,7 +256,10 @@ mod tests {
     }
 
     fn test_read_spec() -> ReadSpec {
-        ReadSpec { version: None }
+        ReadSpec {
+            version: None,
+            predicate: None,
+        }
     }
 
     fn serial_config() -> ReadConfig {
@@ -345,6 +369,35 @@ mod tests {
         )
         .expect("create_read_runner should succeed");
         assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_with_valid_predicate() {
+        let mut spec = test_read_spec();
+        spec.predicate = Some("letter = 'a'".to_string());
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_with_invalid_predicate() {
+        let mut spec = test_read_spec();
+        spec.predicate = Some("a LIKE '%foo'".to_string());
+        let result = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_engine(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
