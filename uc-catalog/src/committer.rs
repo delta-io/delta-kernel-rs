@@ -145,7 +145,8 @@ mod tests {
 
     #[test]
     fn commit_rejects_version_0() {
-        let table_root = url::Url::parse("file:///tmp/test-table/").unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
