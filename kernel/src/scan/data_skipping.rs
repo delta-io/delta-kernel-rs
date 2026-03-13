@@ -600,37 +600,16 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         None
     }
 
-    /// Combines sub-predicates with AND/OR, handling unsupported (None) arms conservatively:
-    ///
-    /// - AND: drops unsupported arms (weakens the predicate, keeping more row groups).
-    /// - OR: returns None if any arm is unsupported (can't prove the OR false).
-    ///
-    /// This avoids the NULL literal approach used by [`DataSkippingPredicateCreator`], which
-    /// relies on three-valued logic in the Arrow expression evaluator. The parquet
-    /// RowGroupFilter's `eval_sql_where` converts NULL boolean literals to false, which would
-    /// incorrectly prune row groups when mixed with supported arms.
+    /// Replaces unsupported (None) sub-predicates with TRUE instead of NULL. The parquet
+    /// RowGroupFilter's `eval_sql_where` converts NULL to false, which would incorrectly
+    /// prune row groups. TRUE is conservative: AND(TRUE, P) = P, OR(TRUE, P) = TRUE (keep).
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        let effective_op = if inverted { op.invert() } else { op };
-        match effective_op {
-            JunctionPredicateOp::And => {
-                let supported: Vec<_> = preds.flatten().collect();
-                if supported.is_empty() {
-                    return None;
-                }
-                Some(Pred::junction(effective_op, supported))
-            }
-            JunctionPredicateOp::Or => {
-                let supported: Vec<_> = preds.collect::<Option<Vec<_>>>()?;
-                if supported.is_empty() {
-                    return None;
-                }
-                Some(Pred::junction(effective_op, supported))
-            }
-        }
+        let preds = preds.map(|p| p.unwrap_or(Pred::literal(true)));
+        Some(collect_junction_preds(op, &mut preds.map(Some), inverted))
     }
 }
