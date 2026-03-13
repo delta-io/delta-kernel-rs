@@ -1294,16 +1294,92 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_is_feature_supported_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_supported(&TableFeature::unknown("futureFeature")));
+    #[derive(Debug, Clone, Copy)]
+    enum UnknownFeatureShape {
+        NotListed,
+        WriterOnly,
+        ReaderWriter,
     }
 
-    #[test]
-    fn test_is_feature_enabled_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
+    fn create_unknown_feature_config(
+        shape: UnknownFeatureShape,
+    ) -> (TableFeature, TableConfiguration) {
+        const UNKNOWN: &str = "futureFeature";
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let reader_features = match shape {
+            UnknownFeatureShape::ReaderWriter => vec![UNKNOWN],
+            _ => vec![],
+        };
+        let writer_features = match shape {
+            UnknownFeatureShape::NotListed => vec![],
+            _ => vec![UNKNOWN],
+        };
+        let protocol = Protocol::try_new_modern(reader_features, writer_features).unwrap();
+
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        (TableFeature::unknown(UNKNOWN), tc)
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, false)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, false)]
+    #[case(UnknownFeatureShape::ReaderWriter, false)]
+    // FIXME: Listed unknown features should be protocol-supported for forward compatibility.
+    fn test_unknown_feature_protocol_support(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_supported: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_supported(&unknown), expected_supported);
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, false)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, false)]
+    // FIXME: Listed unknown features should be protocol-enabled for forward compatibility.
+    fn test_unknown_feature_protocol_enablement(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_enabled: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_enabled(&unknown), expected_enabled);
+    }
+
+    #[rstest]
+    #[case::not_listed_scan(UnknownFeatureShape::NotListed, Operation::Scan, true)]
+    #[case::not_listed_cdf(UnknownFeatureShape::NotListed, Operation::Cdf, true)]
+    #[case::not_listed_write(UnknownFeatureShape::NotListed, Operation::Write, true)]
+    #[case::writer_only_scan(UnknownFeatureShape::WriterOnly, Operation::Scan, true)]
+    #[case::writer_only_cdf(UnknownFeatureShape::WriterOnly, Operation::Cdf, true)]
+    #[case::writer_only_write(UnknownFeatureShape::WriterOnly, Operation::Write, false)]
+    #[case::reader_writer_scan(UnknownFeatureShape::ReaderWriter, Operation::Scan, false)]
+    #[case::reader_writer_cdf(UnknownFeatureShape::ReaderWriter, Operation::Cdf, false)]
+    #[case::reader_writer_write(UnknownFeatureShape::ReaderWriter, Operation::Write, false)]
+    fn test_unknown_feature_capabilities(
+        #[case] shape: UnknownFeatureShape,
+        #[case] operation: Operation,
+        #[case] expected_ok: bool,
+    ) {
+        let (_, config) = create_unknown_feature_config(shape);
+        assert_eq!(
+            config.ensure_operation_supported(operation).is_ok(),
+            expected_ok
+        );
     }
 
     #[test]

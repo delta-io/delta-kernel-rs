@@ -63,7 +63,6 @@ cargo fmt \
   but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `catalog-managed` -- catalog-managed table support (experimental)
-- `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `test-utils`, `integration-test` -- development only
