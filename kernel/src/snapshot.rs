@@ -633,9 +633,9 @@ impl Snapshot {
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
-    /// txn based on the SetTransactionRetentionDuration property and lastUpdated.
+    /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
-    /// Uses the CRC fast path when available, falling back to log replay.
+    /// Uses the CRC fast path when available else, falls back to log replay.
     #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
         &self,
@@ -654,13 +654,10 @@ impl Snapshot {
                 return Ok(txn_map.get(application_id).and_then(|txn| {
                     // Apply retention filter: if both expiration_timestamp and last_updated
                     // are present and last_updated <= expiration, the txn is expired.
-                    if let Some((exp_ts, last_updated)) = expiration_timestamp.zip(txn.last_updated)
-                    {
-                        if last_updated <= exp_ts {
-                            return None;
-                        }
+                    match (expiration_timestamp, txn.last_updated) {
+                        (Some(exp_ts), Some(last_updated)) if last_updated <= exp_ts => None,
+                        _ => Some(txn.version),
                     }
-                    Some(txn.version)
                 }));
             }
         }
