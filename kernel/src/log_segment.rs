@@ -302,8 +302,7 @@ impl LogSegment {
 
         // Keep the hint only if it doesn't point past our target version
         // If there is no end_version bound, any hint is acceptable
-        let usable_hint =
-            checkpoint_hint.filter(|cp| end_version.map_or(true, |v| cp.version <= v));
+        let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
 
         // Cases:
         //
