@@ -48,6 +48,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::ColumnMapping,
     // InCommitTimestamp enables in-commit timestamps (writer-only)
     TableFeature::InCommitTimestamp,
+    // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
+    TableFeature::VacuumProtocolCheck,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -1014,6 +1016,31 @@ mod tests {
         assert!(
             validated.reader_features.is_empty(),
             "InCommitTimestamp is writer-only, reader_features should always be empty"
+        );
+    }
+
+    #[test]
+    fn test_vacuum_protocol_check_feature_signal() {
+        let properties = HashMap::from([(
+            "delta.feature.vacuumProtocolCheck".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert!(
+            validated.properties.is_empty(),
+            "Feature signal should be removed from properties"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VacuumProtocolCheck),
+            "VacuumProtocolCheck should be in writer_features"
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::VacuumProtocolCheck),
+            "VacuumProtocolCheck should be in reader_features (ReaderWriter feature)"
         );
     }
 }

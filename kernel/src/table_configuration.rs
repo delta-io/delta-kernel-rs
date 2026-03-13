@@ -41,6 +41,7 @@ use tracing::warn;
 /// Wrapped in a struct so it can be extended with a logical-name variant if needed.
 #[allow(unused)]
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) struct ExpectedStatsSchemas {
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,

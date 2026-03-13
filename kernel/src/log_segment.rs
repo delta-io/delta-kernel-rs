@@ -47,6 +47,7 @@ mod tests;
 ///
 /// Returned alongside the actions iterator from checkpoint reading functions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[internal_api]
 pub(crate) struct CheckpointReadInfo {
     /// Whether the checkpoint has compatible pre-parsed stats for data skipping.
     /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
@@ -80,6 +81,7 @@ impl CheckpointReadInfo {
 /// and checkpoint metadata.
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
+#[internal_api]
 pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>>> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,

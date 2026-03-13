@@ -219,27 +219,39 @@ pub fn internal_api(
 }
 
 fn make_public(mut item: Item) -> Item {
-    fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
+    /// Transforms the passed visibility to be `pub`. We pass the original span that the visibility
+    /// came from, and attach it to the newly created pub token. This means that the compiler treats
+    /// it as user-written code and normal lints apply. We want this because it allows us to catch
+    /// "private_in_public" violations that are tricky to notice when just slapping
+    /// `#[internal_api]` on something.
+    fn set_pub(vis: &mut Visibility, span: Span) -> Result<(), syn::Error> {
         if matches!(vis, Visibility::Public(_)) {
             return Err(Error::new(
                 vis.span(),
                 "ineligible for #[internal_api]: item is already public",
             ));
         }
-        *vis = syn::parse_quote!(pub);
+        *vis = Visibility::Public(syn::token::Pub { span });
         Ok(())
     }
 
+    macro_rules! set_vis {
+        ($item:ident) => {{
+            let vis_span = $item.vis.span();
+            set_pub(&mut $item.vis, vis_span)
+        }};
+    }
+
     let result = match &mut item {
-        Item::Fn(f) => set_pub(&mut f.vis),
-        Item::Struct(s) => set_pub(&mut s.vis),
-        Item::Enum(e) => set_pub(&mut e.vis),
-        Item::Trait(t) => set_pub(&mut t.vis),
-        Item::Type(t) => set_pub(&mut t.vis),
-        Item::Use(m) => set_pub(&mut m.vis),
-        Item::Static(s) => set_pub(&mut s.vis),
-        Item::Const(c) => set_pub(&mut c.vis),
-        Item::Union(u) => set_pub(&mut u.vis),
+        Item::Fn(f) => set_vis!(f),
+        Item::Struct(s) => set_vis!(s),
+        Item::Enum(e) => set_vis!(e),
+        Item::Trait(t) => set_vis!(t),
+        Item::Type(t) => set_vis!(t),
+        Item::Use(u) => set_vis!(u),
+        Item::Static(s) => set_vis!(s),
+        Item::Const(c) => set_vis!(c),
+        Item::Union(u) => set_vis!(u),
         // foreign mod, impl block, and all others not handled
         _ => Err(Error::new(
             item.span(),
