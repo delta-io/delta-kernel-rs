@@ -203,7 +203,48 @@ pub struct StructField {
     /// The data type of this field
     #[serde(rename = "type")]
     pub data_type: DataType,
-    /// Denotes whether this Field can be null
+    /// Whether this field is semantically nullable.
+    ///
+    /// A violation occurs when a non-nullable field contains nulls. Not all violations should be
+    /// rejected, because parent nulls can be propagated to children. Two cases are distinguished:
+    ///
+    /// - **False violation**: a non-nullable nested field has nulls when its parent is null.
+    ///
+    ///   Example -- schema: `s: struct<a: int NOT NULL> (nullable)`
+    ///   ```json
+    ///   // schema
+    ///   { "name": "s", "nullable": true, "type": {
+    ///       "type": "struct",
+    ///       "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
+    ///   }}
+    ///   // data
+    ///   { "s": null, "s.a": null }  // => acceptable
+    ///   ```
+    ///
+    /// - **True violation**: a non-nullable field has nulls when:
+    ///   1. Its parent is non-null, or
+    ///   2. The field is top-level.
+    ///
+    ///   Example 1 -- top-level non-nullable field:
+    ///   ```json
+    ///   // schema
+    ///   { "name": "x", "nullable": false, "type": "integer" }
+    ///   // data
+    ///   { "x": null }       // => true violation
+    ///   ```
+    ///
+    ///   Example 2 -- non-nullable nested field under a non-null parent:
+    ///   ```json
+    ///   // schema
+    ///   { "name": "s", "nullable": false, "type": {
+    ///       "type": "struct",
+    ///       "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
+    ///   }}
+    ///   // data
+    ///   { "s": { "a": null } }  // => true violation
+    ///   ```
+    ///
+    /// False violations should be allowed, while true violations should be rejected.
     pub nullable: bool,
     /// A JSON map containing information about this column
     pub metadata: HashMap<String, MetadataValue>,
