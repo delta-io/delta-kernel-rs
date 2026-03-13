@@ -345,6 +345,10 @@ fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
         table_config.is_feature_supported(&TableFeature::VacuumProtocolCheck),
         "vacuumProtocolCheck should be supported"
     );
+    assert!(
+        table_config.is_feature_enabled(&TableFeature::VacuumProtocolCheck),
+        "vacuumProtocolCheck should be enabled (AlwaysIfSupported)"
+    );
     let protocol = table_config.protocol();
     assert!(
         protocol
