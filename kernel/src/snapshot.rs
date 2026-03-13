@@ -1641,7 +1641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_domain_metadata() -> DeltaResult<()> {
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1856,7 +1856,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_enablement_version_in_future() -> DeltaResult<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1907,7 +1907,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_missing_ict_when_enabled() -> DeltaResult<()> {
         // Test missing ICT when it should be present - should error
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1994,7 +1994,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> DeltaResult<()> {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -2066,7 +2066,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit
@@ -2185,7 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits

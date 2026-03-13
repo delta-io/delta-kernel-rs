@@ -1049,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
         add_commit(
             table_root,
             storage.as_ref(),
@@ -1265,7 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
 
         add_commit(
             table_root,
@@ -1334,7 +1334,7 @@ mod tests {
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
         use test_utils::add_staged_commit;
         let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///";
+        let table_root = "memory:///test_table/";
 
         add_commit(
             table_root,
