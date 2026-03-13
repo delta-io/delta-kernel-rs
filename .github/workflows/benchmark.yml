@@ -1,5 +1,11 @@
 on: [pull_request_target]
 name: Benchmarking PR performance
+
+env:
+  # See build.yml top-level comment for why we use both sccache and Swatinem/rust-cache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
 jobs:
   runBenchmark:
     name: Run benchmarks
@@ -11,6 +17,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - uses: boa-dev/criterion-compare-action@v3
         env:
@@ -20,3 +27,6 @@ jobs:
           branchName: ${{ github.base_ref }}
           cwd: benchmarks
           benchName: workload_bench
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats

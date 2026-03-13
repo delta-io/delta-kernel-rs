@@ -5,10 +5,20 @@ on: [push, pull_request, merge_group]
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # sccache caches individual rustc outputs keyed by source content + compiler flags
+  # (content-addressed), not by Cargo.lock hash. This means unchanged crates still hit
+  # cache even after lockfile changes or GHA cache evictions that would invalidate the
+  # Swatinem/rust-cache target directory. Both layers together: Swatinem for fast
+  # target-dir + registry restore on warm caches, sccache as per-crate fallback when
+  # the target-dir cache is stale or evicted.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   format:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: ""  # no compilation; sccache binary is not installed in this job
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable with rustfmt
@@ -24,6 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -34,12 +45,16 @@ jobs:
           cargo msrv --path derive-macros/ verify --all-features
           cargo msrv --path ffi/ verify --all-features
           cargo msrv --path ffi-proc-macros/ verify --all-features
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
   msrv-run-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -57,6 +72,9 @@ jobs:
           pushd kernel
           echo "Testing with $(cargo msrv show --output-format minimal)"
           cargo +$(cargo msrv show --output-format minimal) nextest run
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
   docs:
     runs-on: ubuntu-latest
     env:
@@ -65,9 +83,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: build docs
         run: cargo doc --workspace --all-features --no-deps
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
   # ensure that we can build the kernel without any features enabled. Unfortunately, due to how
@@ -104,6 +126,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
@@ -115,6 +138,9 @@ jobs:
         run: cargo build -p feature_tests --features default-engine-native-tls
       - name: check kernel builds with default-engine-rustls
         run: cargo build -p feature_tests --features default-engine-rustls
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -134,6 +160,7 @@ jobs:
               - 'ffi-proc-macros/**'
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: test
@@ -141,6 +168,9 @@ jobs:
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --package delta_kernel_ffi --features --internal-api invalid_handle_code
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -176,6 +206,7 @@ jobs:
           tools: "apache-arrow apache-arrow-glib"
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
@@ -211,9 +242,17 @@ jobs:
           cmake ..
           make
           make test
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest
+    env:
+      # Miri uses nightly, which rotates daily. Each new nightly = new compiler hash =
+      # new sccache entries that rapidly fill the 10GB GHA cache budget. Skip sccache
+      # here and rely on Swatinem/rust-cache for the target directory instead.
+      RUSTC_WRAPPER: ""
     strategy:
       matrix:
         partition: [1, 2, 3]
@@ -239,6 +278,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -251,3 +291,6 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats

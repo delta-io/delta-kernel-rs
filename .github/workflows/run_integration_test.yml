@@ -2,6 +2,14 @@ name: Run tests to ensure we can compile across arrow versions
 
 on: [workflow_dispatch, push, pull_request, merge_group]
 
+env:
+  # The arrow integration test script runs `cargo clean` between each arrow version,
+  # wiping the target directory. sccache survives this because it caches individual rustc
+  # outputs externally. Without sccache, each arrow version rebuild starts from scratch;
+  # with it, only the arrow crates themselves recompile while all other deps hit cache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
 jobs:
   arrow_integration_test:
     runs-on: ${{ matrix.os }}
@@ -23,7 +31,12 @@ jobs:
       - name: Setup rust toolchain
         if: ${{ !matrix.skip }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        if: ${{ !matrix.skip }}
       - name: Run integration tests
         if: ${{ !matrix.skip }}
         shell: bash
         run: pushd integration-tests && ./test-all-arrow-versions.sh
+      - name: sccache stats
+        if: ${{ !matrix.skip && always() }}
+        run: sccache --show-stats
