@@ -7,7 +7,7 @@ pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 
 // Extension trait for Cow<'_, T>
 pub(crate) trait CowExt<T: ToOwned + ?Sized> {
-    /// The owned type that corresopnds to Self
+    /// The owned type that corresponds to Self
     type Owned;
 
     /// Propagate the results of nested transforms. If the nested transform made no change (borrowed
