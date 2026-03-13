@@ -1,7 +1,7 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
@@ -678,12 +678,11 @@ impl Snapshot {
     /// Fetch all non-expired SetTransactions for this snapshot.
     ///
     /// Uses the CRC fast path when available, falling back to log replay.
-    #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_all_set_transactions(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<std::collections::HashMap<String, crate::actions::SetTransaction>> {
+    ) -> DeltaResult<HashMap<String, SetTransaction>> {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
