@@ -23,6 +23,8 @@ jobs:
       - name: Setup rust toolchain
         if: ${{ !matrix.skip }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - name: Run integration tests
         if: ${{ !matrix.skip }}
         shell: bash

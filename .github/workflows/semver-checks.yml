@@ -30,6 +30,8 @@ jobs:
                 || github.event.pull_request.head.sha }}
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - name: Install cargo-semver-checks
         shell: bash
         run: |
