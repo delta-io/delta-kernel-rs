@@ -239,7 +239,7 @@ fn make_public(mut item: Item) -> Item {
         ($item:ident) => {{
             let vis_span = $item.vis.span();
             set_pub(&mut $item.vis, vis_span)
-        }}
+        }};
     }
 
     let result = match &mut item {
