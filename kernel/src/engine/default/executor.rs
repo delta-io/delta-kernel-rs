@@ -61,11 +61,26 @@ pub mod tokio {
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
+    ///
+    /// On drop, the background thread is joined to ensure the runtime is fully
+    /// shut down before the executor is destroyed.
     #[derive(Debug)]
     pub struct TokioBackgroundExecutor {
-        sender: tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>,
+        sender: Option<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
         handle: Handle,
-        _thread: std::thread::JoinHandle<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TokioBackgroundExecutor {
+        fn drop(&mut self) {
+            // Drop sender first to close the channel, signaling the background
+            // thread to exit its recv loop.
+            drop(self.sender.take());
+            // Join the thread so that runtime shutdown completes before we return.
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     impl Default for TokioBackgroundExecutor {
@@ -93,20 +108,24 @@ pub mod tokio {
             });
             let handle = handle_receiver.recv().unwrap();
             Self {
-                sender,
+                sender: Some(sender),
                 handle,
-                _thread: thread,
+                thread: Some(thread),
             }
         }
     }
 
     impl TokioBackgroundExecutor {
         fn send_future(&self, fut: BoxFuture<'static, ()>) {
+            let sender = self
+                .sender
+                .as_ref()
+                .expect("sender should be present (not yet dropped)");
             // We cannot call `blocking_send()` because that calls `block_on`
             // internally and panics if called within an async context. 🤦
             let mut fut = Some(fut);
             loop {
-                match self.sender.try_send(fut.take().unwrap()) {
+                match sender.try_send(fut.take().unwrap()) {
                     Ok(()) => break,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(original)) => {
                         std::thread::yield_now();
