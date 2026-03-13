@@ -371,6 +371,18 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 
+    /// Create a new `ParsedLogPath<Url>` for a version checksum (CRC) file.
+    pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
+        let filename = format!("{version:020}.crc");
+        let path = Self::create_path(table_root, filename)?;
+        if !matches!(path.file_type, LogPathFileType::Crc) {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_crc created a non-CRC path",
+            ));
+        }
+        Ok(path)
+    }
+
     /// Create a new ParsedLogPath<Url> for a log compaction file
     pub(crate) fn new_log_compaction(
         table_root: &Url,
@@ -453,8 +465,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use object_store::memory::InMemory;
     use test_utils::add_commit;
 
     impl ParsedLogPath<FileMeta> {

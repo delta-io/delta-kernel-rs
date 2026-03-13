@@ -22,7 +22,7 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
+    column_mapping_mode, get_any_level_column_physical_name,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
@@ -124,10 +124,7 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = match column_mapping_mode {
-            ColumnMappingMode::None => logical_schema.clone(),
-            _ => Arc::new(logical_schema.make_physical(column_mapping_mode)),
-        };
+        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
 
         let table_config = Self {
             logical_schema,
@@ -141,7 +138,6 @@ impl TableConfiguration {
         };
 
         // Validate schema against protocol features now that we have a TC instance.
-        validate_column_mapping(&table_config)?;
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
 
@@ -1673,7 +1669,7 @@ mod test {
 
         // Verify that make_physical on the same schema DOES produce ParquetFieldId (sanity check)
         let data_schema = schema_with_column_mapping();
-        let physical_data = data_schema.make_physical(ColumnMappingMode::Id);
+        let physical_data = data_schema.make_physical(ColumnMappingMode::Id).unwrap();
         let data_field = physical_data.field("phys_col_a").unwrap();
         assert!(
             matches!(

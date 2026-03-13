@@ -14,7 +14,7 @@ use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
-use object_store;
+use crate::object_store;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -191,6 +191,10 @@ pub enum Error {
     /// Some functionality is currently unsupported
     #[error("Unsupported: {0}")]
     Unsupported(String),
+
+    /// Cannot write a version checksum (CRC) file for this snapshot
+    #[error("Checksum write unsupported: {0}")]
+    ChecksumWriteUnsupported(String),
 
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]

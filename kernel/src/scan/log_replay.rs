@@ -203,9 +203,11 @@ impl ScanLogReplayProcessor {
                         engine,
                         // these are all cheap arc clones
                         physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                        physical_stats_schema.clone(),
-                        output_schema.clone(),
+                        Some(physical_stats_schema),
                         column_expr_ref!("stats_parsed"),
+                        None, // no partition schema yet
+                        column_expr_ref!("partitionValues_parsed"),
+                        output_schema.clone(),
                     )
                 })
         };

@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
@@ -531,31 +531,32 @@ impl<S> Transaction<S> {
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
-    /// Returns `None` if ICT is not enabled on the table.
+    /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
+    /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
+    /// property must also be `true` (`is_feature_enabled`).
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         let has_ict = self
             .read_snapshot
             .table_configuration()
-            .is_feature_supported(&TableFeature::InCommitTimestamp);
+            .is_feature_enabled(&TableFeature::InCommitTimestamp);
 
-        if has_ict && !self.is_create_table() {
-            Ok(self
-                .read_snapshot
-                .get_in_commit_timestamp(engine)?
-                .map(|prev_ict| {
-                    // The Delta protocol requires the timestamp to be "the larger of two values":
-                    // - The time at which the writer attempted the commit (current_time)
-                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
-                    self.commit_timestamp.max(prev_ict + 1)
-                }))
-        } else if has_ict && self.is_create_table() {
-            // ICT is enabled but this is a create-table transaction - not yet supported
-            Err(Error::unsupported(
-                "InCommitTimestamp is not yet supported for create table",
-            ))
-        } else {
-            Ok(None)
+        if !has_ict {
+            return Ok(None);
         }
+
+        if self.is_create_table() {
+            // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
+            return Ok(Some(self.commit_timestamp));
+        }
+
+        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
+        // must be the larger of:
+        // - The time at which the writer attempted the commit
+        // - One millisecond later than the previous commit's inCommitTimestamp
+        Ok(self
+            .read_snapshot
+            .get_in_commit_timestamp(engine)?
+            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
@@ -696,7 +697,13 @@ impl<S> Transaction<S> {
             .filter(|f| {
                 materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
             })
-            .map(|f| f.make_physical(column_mapping_mode));
+            .map(|f| {
+                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
+                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
+                    warn!("make_physical failed: {e}");
+                    f.clone()
+                })
+            });
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
@@ -1285,6 +1292,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
@@ -1738,7 +1746,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
+        let store = Arc::new(LocalFileSystem::new());
         let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
@@ -2207,8 +2215,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass for all-null clustering columns, got: {:?}",
-            result
+            "Stats validation should pass for all-null clustering columns, got: {result:?}",
         );
     }
 

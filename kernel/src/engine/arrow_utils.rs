@@ -1553,8 +1553,15 @@ mod tests {
     }
 
     /// Generates the column mapping metadata for a logical struct field given the field id.
-    fn column_mapping_metadata(field_id: i64) -> HashMap<String, MetadataValue> {
-        kernel_fid_and_name(field_id, physical_name(field_id))
+    /// Returns empty metadata for `None` mode, since no annotations should be present.
+    fn column_mapping_metadata(
+        field_id: i64,
+        mode: ColumnMappingMode,
+    ) -> HashMap<String, MetadataValue> {
+        match mode {
+            ColumnMappingMode::None => HashMap::new(),
+            _ => kernel_fid_and_name(field_id, physical_name(field_id)),
+        }
     }
 
     /// Generates metadata for a parquet field with id `field_id`.
@@ -1714,13 +1721,14 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -1891,11 +1899,12 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -1911,11 +1920,12 @@ mod tests {
 
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false),
@@ -1936,8 +1946,9 @@ mod tests {
                 logical_name(0),
                 MapType::new(DataType::INTEGER, DataType::STRING, false),
             )
-            .with_metadata(column_mapping_metadata(0))])
+            .with_metadata(column_mapping_metadata(0, mode))])
             .make_physical(mode)
+            .unwrap()
             .into();
 
             // The key and value may have field ids not present in the delta schema
@@ -1964,13 +1975,14 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
@@ -1998,13 +2010,14 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -2041,6 +2054,7 @@ mod tests {
                 .with_metadata(kernel_fid_and_name(3, "i2_physical")),
         ])
         .make_physical(ColumnMappingMode::Id)
+        .unwrap()
         .into();
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("not-i", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
@@ -2074,6 +2088,7 @@ mod tests {
                 .with_metadata(kernel_fid_and_name(3, "i2_physical")),
         ])
         .make_physical(ColumnMappingMode::Id)
+        .unwrap()
         .into();
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i_logical", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
@@ -2426,21 +2441,22 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(3),
                     StructType::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4, mode)),
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5, mode)),
                     ]),
                 )
-                .with_metadata(column_mapping_metadata(3)),
+                .with_metadata(column_mapping_metadata(3, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
@@ -2466,18 +2482,19 @@ mod tests {
                     logical_name(3),
                     StructType::new_unchecked([
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5, mode)),
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4, mode)),
                     ]),
                 )
-                .with_metadata(column_mapping_metadata(3)),
+                .with_metadata(column_mapping_metadata(3, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
@@ -2501,20 +2518,21 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(3),
                     StructType::new_unchecked([StructField::not_null(
                         logical_name(4),
                         DataType::INTEGER,
                     )
-                    .with_metadata(column_mapping_metadata(4))]),
+                    .with_metadata(column_mapping_metadata(4, mode))]),
                 )
-                .with_metadata(column_mapping_metadata(3)),
+                .with_metadata(column_mapping_metadata(3, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
@@ -2535,13 +2553,14 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2579,8 +2598,9 @@ mod tests {
                 logical_name(1),
                 ArrayType::new(DataType::INTEGER, false),
             )
-            .with_metadata(column_mapping_metadata(1))])
+            .with_metadata(column_mapping_metadata(1, mode))])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -2609,25 +2629,26 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
                         StructType::new_unchecked([
                             StructField::not_null(logical_name(3), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(3)),
+                                .with_metadata(column_mapping_metadata(3, mode)),
                             StructField::not_null(logical_name(4), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(4)),
+                                .with_metadata(column_mapping_metadata(4, mode)),
                         ])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(1)),
+                .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -2674,11 +2695,12 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2718,7 +2740,7 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
@@ -2726,16 +2748,17 @@ mod tests {
                             logical_name(4),
                             DataType::INTEGER,
                         )
-                        .with_metadata(column_mapping_metadata(4))])
+                        .with_metadata(column_mapping_metadata(4, mode))])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2)),
+                .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2779,25 +2802,26 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
                         StructType::new_unchecked([
                             StructField::not_null(logical_name(6), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(6)),
+                                .with_metadata(column_mapping_metadata(6, mode)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(5)),
+                                .with_metadata(column_mapping_metadata(5, mode)),
                         ])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2)),
+                .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2846,21 +2870,22 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(2),
                     StructType::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4, mode)),
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5, mode)),
                     ]),
                 )
-                .with_metadata(column_mapping_metadata(2)),
+                .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(
@@ -3190,11 +3215,12 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let nots_field =
                 ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));

@@ -17,7 +17,7 @@ use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::crc::Crc;
-use crate::crc::{CrcDelta, LazyCrc};
+use crate::crc::{try_write_crc_file, CrcDelta, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
@@ -44,6 +44,16 @@ pub type SnapshotRef = Arc<Snapshot>;
 #[allow(unused)]
 #[internal_api]
 pub(crate) type FileStats = crate::crc::FileStats;
+
+/// Result of attempting to write a version checksum (CRC) file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumWriteResult {
+    /// A CRC file already exists at this version. Per the Delta protocol, writers MUST NOT
+    /// overwrite existing version checksum files.
+    AlreadyExists,
+    /// The CRC file was successfully written to storage.
+    Written,
+}
 
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
@@ -698,7 +708,23 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        // TODO: utilize Checksum
+        // Fast path: serve from CRC if it tracks domain metadata at this version.
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            if let Some(dm_map) = &crc.domain_metadata {
+                return Ok(match domains {
+                    None => dm_map.clone(),
+                    Some(filter) => dm_map
+                        .iter()
+                        .filter(|(k, _)| filter.contains(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                });
+            }
+        }
+        // Fallback: full log replay.
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
@@ -724,6 +750,77 @@ impl Snapshot {
             return None;
         }
         self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
+    }
+
+    /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
+    /// every commit because checksums enable faster snapshot loading and table state validation.
+    ///
+    /// Currently only supports writing from a post-commit snapshot that has pre-computed CRC
+    /// information in memory (i.e. the snapshot returned by
+    /// [`CommittedTransaction::post_commit_snapshot`]).
+    ///
+    /// Returns [`ChecksumWriteResult::AlreadyExists`] if a checksum already exists at this
+    /// version (safe for concurrent writers). Returns [`ChecksumWriteResult::Written`] on
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this
+    ///   snapshot's version (e.g. a snapshot loaded from disk that has no CRC file), or if
+    ///   the CRC's file stats are not valid. File stats can be invalid for two reasons:
+    ///   (a) a non-incremental operation like ANALYZE STATS was encountered, which is
+    ///   recoverable with a full state reconstruction in the future; (b) a file action had a
+    ///   missing size (e.g. `remove.size` is null), which is permanently unrecoverable.
+    /// - I/O errors from the engine's storage handler if the write fails.
+    ///
+    /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
+    #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
+    pub fn write_checksum(&self, engine: &dyn Engine) -> DeltaResult<ChecksumWriteResult> {
+        let has_crc_on_disk = self
+            .log_segment
+            .listed
+            .latest_crc_file
+            .as_ref()
+            .is_some_and(|f| f.version == self.version());
+
+        if has_crc_on_disk {
+            info!(
+                "CRC file already exists on disk at version {}",
+                self.version()
+            );
+            return Ok(ChecksumWriteResult::AlreadyExists);
+        }
+
+        let crc = self
+            .lazy_crc
+            .get_if_loaded_at_version(self.version())
+            .ok_or_else(|| {
+                Error::ChecksumWriteUnsupported(
+                    "No in-memory CRC available at this snapshot version.".to_string(),
+                )
+            })?;
+
+        let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
+
+        // TODO: Would be nice to update LogSegment.listed.latest_crc_file here, but that probably
+        //       requires changing it to a OnceLock, which is a bit of an invasive change. Perhaps,
+        //       return an updated Snapshot instead.
+
+        // Note: try_write_crc_file validates file stats validity before writing.
+        match try_write_crc_file(engine, &crc_path.location, crc) {
+            Ok(()) => {
+                info!("Wrote CRC file at {}", crc_path.location);
+                Ok(ChecksumWriteResult::Written)
+            }
+            Err(Error::FileAlreadyExists(_)) => {
+                info!(
+                    "Another writer beat us to writing CRC file at {}",
+                    crc_path.location
+                );
+                Ok(ChecksumWriteResult::AlreadyExists)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed
@@ -834,6 +931,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[internal_api]
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
@@ -894,10 +992,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use serde_json::json;
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -912,6 +1006,10 @@ mod tests {
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStore;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::table_features::{

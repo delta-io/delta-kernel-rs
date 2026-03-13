@@ -13,6 +13,9 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
@@ -21,8 +24,6 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
-use object_store::path::Path;
-use object_store::ObjectStore;
 use url::Url;
 
 use test_utils::{
@@ -201,7 +202,7 @@ async fn run_ctas_test(
 
     let (_src_tmp, src_table_path, _) = test_table_setup()?;
     let src_url = Url::from_directory_path(&src_table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
