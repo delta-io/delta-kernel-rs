@@ -902,7 +902,6 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     engine: Handle<SharedExternEngine>,
     log_paths: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
         ExternResult::Ok(ptr) => ptr,
         ExternResult::Err(e) => return ExternResult::Err(e),
@@ -1176,6 +1175,7 @@ impl<T> Default for ReferenceSet<T> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::error::{EngineError, KernelError};

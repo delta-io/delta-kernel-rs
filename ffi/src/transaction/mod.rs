@@ -178,6 +178,7 @@ pub unsafe extern "C" fn commit(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
 
