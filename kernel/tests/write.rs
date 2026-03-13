@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::Error as KernelError;
@@ -89,6 +90,23 @@ fn validate_txn_id(commit_info: &serde_json::Value) {
         .as_str()
         .expect("txnId should be present in commitInfo");
     Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
+}
+
+fn validate_timestamp(commit_info: &serde_json::Value) {
+    let timestamp = commit_info["timestamp"]
+        .as_i64()
+        .expect("timestamp should be present in commitInfo");
+    let current_ts: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let two_days_ms = Duration::from_secs(2 * 24 * 60 * 60).as_millis() as i64;
+    assert!(
+        (timestamp <= current_ts && timestamp > current_ts - two_days_ms),
+        "commit timestamp should be at most 2 days behind current system time: got {timestamp}, now {current_ts}"
+    );
 }
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -467,6 +485,90 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         })];
 
         assert_eq!(parsed_commits, expected_commit);
+    }
+    Ok(())
+}
+
+/// Verifies that when `engine_commit_info` is provided (the `Some` branch of `build_commit_info`):
+/// - The written JSON is correctly wrapped in a top-level `"commitInfo"` key.
+/// - Engine-only fields (not in `CommitInfo::to_schema()`) pass through to the log unchanged.
+/// - Fields that overlap with kernel-managed CommitInfo fields are overridden by kernel values,
+/// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`)
+///   are present with correct values.
+#[tokio::test]
+async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
+        // Build engine_commit_info with:
+        //   - "myApp"    : engine-only field, must pass through unchanged.
+        //   - "myVersion": engine-only field, must pass through unchanged.
+        //   - "operation": overlapping with CommitInfo; kernel must override with "WRITE".
+        let arrow_schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
+            Field::new("myApp", ArrowDataType::Utf8, false),
+            Field::new("myVersion", ArrowDataType::Utf8, false),
+            Field::new("operation", ArrowDataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["spark"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["3.5.0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
+            ],
+        )?;
+        let engine_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("myApp", DataType::STRING),
+            StructField::not_null("myVersion", DataType::STRING),
+            StructField::nullable("operation", DataType::STRING),
+        ]));
+
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_operation("WRITE".to_string())
+            .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
+
+        let _ = txn.commit(&engine)?;
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let mut parsed_commits: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
+        validate_timestamp(&parsed_commits[0]["commitInfo"]);
+
+        // Zero out non-deterministic fields for stable comparison.
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+
+        // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
+        // omitted from the JSON — consistent with how the Delta log serializes optional fields.
+        let expected_commits = vec![json!({
+            "commitInfo": {
+                // Engine-only fields pass through unchanged.
+                "myApp": "spark",
+                "myVersion": "3.5.0",
+                // Kernel overrides the engine's stale "STALE_OP" with the real operation.
+                "operation": "WRITE",
+                // Remaining kernel-managed non-null fields are appended.
+                "operationParameters": {},
+                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "txnId": ZERO_UUID,
+                "timestamp": 0,
+            }
+        })];
+
+        assert_eq!(parsed_commits, expected_commits);
     }
     Ok(())
 }

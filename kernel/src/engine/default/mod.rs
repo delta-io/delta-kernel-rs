@@ -106,7 +106,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
 /// # use std::sync::Arc;
 /// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-/// # use crate::object_store::local::LocalFileSystem;
+/// # use delta_kernel::object_store::local::LocalFileSystem;
 /// // Build a DefaultEngine with default executor
 /// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
 ///     .build();
