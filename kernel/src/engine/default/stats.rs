@@ -9,8 +9,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
-    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
+    PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
 use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
 use crate::arrow::datatypes::{
@@ -427,11 +427,10 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
-            let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
             Ok(ColumnStats {
                 null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: Some(compute_leaf_agg(column, Agg::Min)?.unwrap_or_else(&null_fallback)),
-                max_value: Some(compute_leaf_agg(column, Agg::Max)?.unwrap_or_else(null_fallback)),
+                min_value: compute_leaf_agg(column, Agg::Min)?,
+                max_value: compute_leaf_agg(column, Agg::Max)?,
             })
         }
     }
@@ -475,9 +474,15 @@ impl StatsAccumulator {
 /// Returns a StructArray with the following fields:
 /// - `numRecords`: total row count
 /// - `nullCount`: nested struct with null counts per column
-/// - `minValues`: nested struct with min values per column (null when all values are null)
-/// - `maxValues`: nested struct with max values per column (null when all values are null)
+/// - `minValues`: nested struct with min values per column (columns with all-null values are
+///   omitted)
+/// - `maxValues`: nested struct with max values per column (columns with all-null values are
+///   omitted)
 /// - `tightBounds`: always true for new file writes
+///
+/// String min/max values are truncated to a 32-character prefix with appropriate tie-breaker
+/// characters for max values. See the `stats_schema` module documentation for the full stats
+/// value rules.
 ///
 /// # Arguments
 /// * `batch` - The RecordBatch to collect statistics from
@@ -757,41 +762,15 @@ mod tests {
             .unwrap();
         assert_eq!(value_null_count.value(0), 3);
 
-        // minValues/maxValues should have "value" field present but with a null value
-        let min_values = stats
-            .column_by_name("minValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        let min_col = min_values.column_by_name("value").unwrap();
-        assert!(min_col.is_null(0));
-
-        let max_values = stats
-            .column_by_name("maxValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        let max_col = max_values.column_by_name("value").unwrap();
-        assert!(max_col.is_null(0));
-
-        // Verify the JSON serialization includes null min/max with explicit null values,
-        // matching Delta Spark behavior (e.g. "minValues":{"value":null}).
-        let json_array = to_json(&stats).unwrap();
-        let json_str = json_array.as_string::<i32>().value(0);
-        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        assert_eq!(json["nullCount"]["value"], 3);
+        // All-null columns are omitted from minValues/maxValues entirely
         assert!(
-            json["minValues"].get("value").is_some(),
-            "Expected 'value' to be present in minValues JSON"
+            stats.column_by_name("minValues").is_none(),
+            "minValues should be absent when all stats columns are all-null"
         );
-        assert!(json["minValues"]["value"].is_null());
         assert!(
-            json["maxValues"].get("value").is_some(),
-            "Expected 'value' to be present in maxValues JSON"
+            stats.column_by_name("maxValues").is_none(),
+            "maxValues should be absent when all stats columns are all-null"
         );
-        assert!(json["maxValues"]["value"].is_null());
     }
 
     #[test]
