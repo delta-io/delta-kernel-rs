@@ -204,11 +204,18 @@ pub struct StructField {
     #[serde(rename = "type")]
     pub data_type: DataType,
     /// Whether this field is semantically nullable.
+    /// 
+    /// It's valid to have a schema with a nullable parent and non-nullable children. For
+    /// example, in the checkpoint schema `add` is nullable but `add.path` is non-nullable.
+    /// This means a checkpoint may have no add action, but if one is present it must
+    /// have a path.
     ///
-    /// A violation occurs when a non-nullable field contains nulls. Not all violations should be
-    /// rejected, because parent nulls can be propagated to children. Two cases are distinguished:
+    /// A nullability mismatch occurs when a non-nullable field contains nulls. Not all mismatches
+    /// should be rejected, because parent nulls can be propagated to children. Two cases are
+    /// distinguished:
     ///
-    /// - **False violation**: a non-nullable nested field has nulls when its parent is null.
+    /// - **False nullability mismatch**: a non-nullable nested field has nulls when its parent
+    ///   is null.
     ///
     ///   Example -- schema: `s: struct<a: int NOT NULL> (nullable)`
     ///   ```json
@@ -221,7 +228,7 @@ pub struct StructField {
     ///   { "s": null, "s.a": null }  // => acceptable
     ///   ```
     ///
-    /// - **True violation**: a non-nullable field has nulls when:
+    /// - **True nullability mismatch**: a non-nullable field has nulls when:
     ///   1. Its parent is non-null, or
     ///   2. The field is top-level.
     ///
@@ -230,7 +237,7 @@ pub struct StructField {
     ///   // schema
     ///   { "name": "x", "nullable": false, "type": "integer" }
     ///   // data
-    ///   { "x": null }       // => true violation
+    ///   { "x": null }       // => true nullability mismatch
     ///   ```
     ///
     ///   Example 2 -- non-nullable nested field under a non-null parent:
@@ -241,10 +248,11 @@ pub struct StructField {
     ///       "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
     ///   }}
     ///   // data
-    ///   { "s": { "a": null } }  // => true violation
+    ///   { "s": { "a": null } }  // => true nullability mismatch
     ///   ```
     ///
-    /// False violations should be allowed, while true violations should be rejected.
+    /// False nullability mismatches should be allowed, only true nullability mismatches should
+    /// be rejected.
     pub nullable: bool,
     /// A JSON map containing information about this column
     pub metadata: HashMap<String, MetadataValue>,
