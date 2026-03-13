@@ -1,9 +1,9 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
-use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::{DeltaResult, Snapshot};
 

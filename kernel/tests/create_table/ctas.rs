@@ -15,7 +15,7 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
@@ -43,7 +43,7 @@ const VERIFIED_PATHS: &[&[&str]] = &[&["row_number"], &["address", "street"]];
 async fn verify_column_names_in_metadata(
     snapshot: &Snapshot,
     engine: &impl Engine,
-    store: &dyn ObjectStore,
+    store: &DynObjectStore,
     table_url: &Url,
     cm_mode: ColumnMappingMode,
     clustered: bool,
@@ -142,7 +142,7 @@ fn verify_column_names_in_clustering_metadata(
 async fn verify_column_names_in_parquet_footer(
     snapshot: &Snapshot,
     engine: &impl Engine,
-    store: &dyn ObjectStore,
+    store: &DynObjectStore,
     table_url: &Url,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -202,7 +202,7 @@ async fn run_ctas_test(
 
     let (_src_tmp, src_table_path, _) = test_table_setup()?;
     let src_url = Url::from_directory_path(&src_table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
