@@ -435,7 +435,7 @@ mod tests {
                         "size": 0,
                         "modificationTime": 0,
                         "dataChange": false,
-                        "stats": "{\"numRecords\":5,\"nullCount\":null,\"minValues\":null,\"maxValues\":null,\"tightBounds\":null}"
+                        "stats": "{\"numRecords\":5}"
                     }
                 }),
             ];
