@@ -169,6 +169,127 @@ pub mod tokio {
         }
     }
 
+    /// A [`TaskExecutor`] that runs a single-threaded tokio runtime on a background
+    /// thread. Unlike [`TokioBackgroundExecutor`], this executor **joins** the background
+    /// thread on drop instead of detaching it, ensuring all runtime cleanup (task
+    /// cancellation, capture drops) completes before the executor is destroyed.
+    #[derive(Debug)]
+    pub struct JoiningBackgroundExecutor {
+        sender: Option<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
+        handle: Handle,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for JoiningBackgroundExecutor {
+        fn drop(&mut self) {
+            // Drop sender first to close the channel, signaling the background
+            // thread to exit its recv loop.
+            drop(self.sender.take());
+            // Join the thread so that runtime cleanup completes before we return.
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Default for JoiningBackgroundExecutor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl JoiningBackgroundExecutor {
+        pub fn new() -> Self {
+            let (handle_sender, handle_receiver) = std::sync::mpsc::channel::<Handle>();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<BoxFuture<'_, ()>>(50);
+            let thread = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let handle = rt.handle().clone();
+                handle_sender.send(handle).unwrap();
+                rt.block_on(async move {
+                    while let Some(task) = receiver.recv().await {
+                        tokio::task::spawn(task);
+                    }
+                });
+            });
+            let handle = handle_receiver.recv().unwrap();
+            Self {
+                sender: Some(sender),
+                handle,
+                thread: Some(thread),
+            }
+        }
+
+        fn send_future(&self, fut: BoxFuture<'static, ()>) {
+            let sender = self
+                .sender
+                .as_ref()
+                .expect("sender should be present (not yet dropped)");
+            let mut fut = Some(fut);
+            loop {
+                match sender.try_send(fut.take().unwrap()) {
+                    Ok(()) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(original)) => {
+                        std::thread::yield_now();
+                        fut.replace(original);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        panic!("JoiningBackgroundExecutor channel closed")
+                    }
+                };
+            }
+        }
+    }
+
+    impl TaskExecutor for JoiningBackgroundExecutor {
+        type Guard<'a> = EnterGuard<'a>;
+
+        fn block_on<T>(&self, task: T) -> T::Output
+        where
+            T: Future + Send + 'static,
+            T::Output: Send + 'static,
+        {
+            let (sender, receiver) = channel::<T::Output>();
+
+            let fut = Box::pin(async move {
+                let task_output = task.await;
+                tokio::task::spawn_blocking(move || {
+                    sender.send(task_output).ok();
+                })
+                .await
+                .unwrap();
+            });
+
+            self.send_future(fut);
+
+            receiver
+                .recv()
+                .expect("JoiningBackgroundExecutor has crashed")
+        }
+
+        fn spawn<F>(&self, task: F)
+        where
+            F: Future<Output = ()> + Send + 'static,
+        {
+            self.send_future(Box::pin(task));
+        }
+
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        where
+            T: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            Box::pin(tokio::task::spawn_blocking(task).map_err(Error::join_failure))
+        }
+
+        fn enter(&self) -> EnterGuard<'_> {
+            self.handle.enter()
+        }
+    }
+
     /// A [`TaskExecutor`] that uses the tokio multi-threaded runtime.
     ///
     /// You can create one based on a handle to an existing runtime (to share
@@ -328,6 +449,12 @@ pub mod tokio {
             test_executor(executor).await;
         }
 
+        #[tokio::test]
+        async fn test_joining_background_executor() {
+            let executor = JoiningBackgroundExecutor::new();
+            test_executor(executor).await;
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
         async fn test_tokio_multi_thread_executor() {
             let executor = TokioMultiThreadExecutor::new(tokio::runtime::Handle::current());
@@ -457,6 +584,7 @@ pub mod tokio {
             TokioMultiThreadExecutor::new_owned_runtime(None, None).expect("Couldn't create multithreaded executor")
         )]
         #[case::background(TokioBackgroundExecutor::new())]
+        #[case::joining_background(JoiningBackgroundExecutor::new())]
         fn can_enter_a_runtime<T: TaskExecutor>(#[case] executor: T) {
             // Verify we're not inside a Tokio runtime
             assert!(
