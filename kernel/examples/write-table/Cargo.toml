@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-# NB: common depends on 'arrow' (latest) so have to match here
 common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow",

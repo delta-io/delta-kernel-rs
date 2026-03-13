@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-# common pulls in arrow latest so we have to keep all these in sync here
 common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow",
