@@ -708,7 +708,23 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        // TODO: utilize Checksum
+        // Fast path: serve from CRC if it tracks domain metadata at this version.
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            if let Some(dm_map) = &crc.domain_metadata {
+                return Ok(match domains {
+                    None => dm_map.clone(),
+                    Some(filter) => dm_map
+                        .iter()
+                        .filter(|(k, _)| filter.contains(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                });
+            }
+        }
+        // Fallback: full log replay.
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
@@ -915,6 +931,7 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
+    #[internal_api]
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
@@ -975,10 +992,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use serde_json::json;
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -993,6 +1006,10 @@ mod tests {
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStore;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::table_features::{

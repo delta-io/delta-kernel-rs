@@ -3,6 +3,7 @@
 mod clustering;
 mod column_mapping;
 mod ctas;
+mod ict;
 mod timestamp_ntz;
 mod variant;
 
@@ -325,5 +326,42 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
         debug_str.contains("Transaction") && debug_str.contains("create_table"),
         "Debug output should contain Transaction info: {debug_str}"
     );
+    Ok(())
+}
+
+#[test]
+fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([("delta.feature.vacuumProtocolCheck", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let table_config = snapshot.table_configuration();
+
+    assert!(
+        table_config.is_feature_supported(&TableFeature::VacuumProtocolCheck),
+        "vacuumProtocolCheck should be supported"
+    );
+    assert!(
+        table_config.is_feature_enabled(&TableFeature::VacuumProtocolCheck),
+        "vacuumProtocolCheck should be enabled (AlwaysIfSupported)"
+    );
+    let protocol = table_config.protocol();
+    assert!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
+        "vacuumProtocolCheck should be in writer features"
+    );
+    assert!(
+        protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
+        "vacuumProtocolCheck should be in reader features"
+    );
+
     Ok(())
 }

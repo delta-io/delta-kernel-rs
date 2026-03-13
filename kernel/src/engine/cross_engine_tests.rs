@@ -8,7 +8,6 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use object_store::local::LocalFileSystem;
 use rstest::rstest;
 use tempfile::tempdir;
 use url::Url;
@@ -21,6 +20,7 @@ use crate::engine::default::json::DefaultJsonHandler;
 use crate::engine::default::parquet::DefaultParquetHandler;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncParquetHandler;
+use crate::object_store::local::LocalFileSystem;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::ARROW_SCHEMA_META_KEY;

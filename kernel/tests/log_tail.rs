@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use object_store::memory::InMemory;
-use object_store::path::Path;
 use url::Url;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::{FileMeta, LogPath, Snapshot};
 
 use test_utils::{

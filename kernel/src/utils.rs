@@ -185,8 +185,6 @@ pub(crate) mod test_utils {
     use std::{path::Path, sync::Arc};
 
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
@@ -201,6 +199,9 @@ pub(crate) mod test_utils {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::ObjectStore;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
@@ -678,6 +679,31 @@ pub(crate) mod test_utils {
         ]))
     }
 
+    /// Deeply nested schema: struct -> array -> struct -> map(value) -> struct.
+    ///
+    /// The leaf struct field is intentionally **not** annotated with column mapping metadata,
+    /// so this schema can be used to test error paths when column mapping is enabled.
+    pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
+        let leaf_struct =
+            StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
+        let map_type = MapType::new(
+            KernelDataType::STRING,
+            KernelDataType::Struct(Box::new(leaf_struct)),
+            true,
+        );
+        let mid_struct = StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("mid_field", map_type),
+            2,
+            "phys_mid_field",
+        )]);
+        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
+        StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("top", array_type),
+            1,
+            "phys_top",
+        )])
+    }
+
     /// Build a create-table transaction with the given schema and column mapping mode.
     /// Returns the engine and uncommitted transaction.
     pub(crate) fn setup_column_mapping_txn(
@@ -689,7 +715,7 @@ pub(crate) mod test_utils {
             ColumnMappingMode::Id => "id",
             ColumnMappingMode::None => "none",
         };
-        let store = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(InMemory::new());
         let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")
