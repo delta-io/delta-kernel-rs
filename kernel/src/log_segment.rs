@@ -9,7 +9,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
 use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::listed_log_files::find_last_complete_checkpoint_before;
+use crate::listed_log_files::list_with_backward_checkpoint_scan;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
@@ -307,9 +307,11 @@ impl LogSegment {
         // Cases:
         //
         // 1. usable_hint present, end_version is Some  --> list_with_checkpoint_hint from hint.version TO end_version
-        // 2. no usable_hint,      end_version is Some  --> backward-scan for checkpoint before end_version,
-        //                                                  list from that checkpoint TO end_version
-        //                                                  (falls back to v0 if no checkpoint found)
+        // 2. no usable_hint,      end_version is Some  --> scan last 1000 versions for a checkpoint;
+        //                                                  if found, build ListedLogFiles directly (1 listing).
+        //                                                  if not, backward-scan below that window, then
+        //                                                  list from discovered checkpoint TO end_version
+        //                                                  (falls back to v0 if no checkpoint found anywhere)
         // 3. no usable_hint,      end_version is None  --> list from v0 unbounded
         // 4. usable_hint present, end_version is None  --> list_with_checkpoint_hint from hint.version unbounded
 
@@ -324,24 +326,7 @@ impl LogSegment {
             )?,
             None => match end_version {
                 // Case 2
-                Some(end) => {
-                    match find_last_complete_checkpoint_before(
-                        storage,
-                        &log_root,
-                        end.saturating_add(1),
-                    )? {
-                        Some(cp_version) => ListedLogFiles::list(
-                            storage,
-                            &log_root,
-                            log_tail,
-                            Some(cp_version),
-                            Some(end),
-                        )?,
-                        None => {
-                            ListedLogFiles::list(storage, &log_root, log_tail, None, Some(end))?
-                        }
-                    }
-                }
+                Some(end) => list_with_backward_checkpoint_scan(storage, &log_root, log_tail, end)?,
                 // Case 3
                 None => ListedLogFiles::list(storage, &log_root, log_tail, None, None)?,
             },
