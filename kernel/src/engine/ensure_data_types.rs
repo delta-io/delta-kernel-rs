@@ -207,7 +207,9 @@ fn check_cast_compat(
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
-        // as plain integers without Parquet logical type annotations.
+        // as plain integers without Parquet logical type annotations. While this only arises
+        // from checkpoint files in practice, the cast is safe for any read path because a
+        // schema mismatch (Int32 where Date32 is expected) would not occur in normal data files.
         (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
@@ -586,7 +588,6 @@ mod tests {
 
     #[test]
     fn ensure_int64_to_timestamp_reinterpretation() {
-        use crate::arrow::datatypes::TimeUnit;
         // Int64 -> Timestamp (with UTC timezone, i.e. kernel `timestamp`)
         let ts_utc = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         assert_eq!(
@@ -601,7 +602,11 @@ mod tests {
         );
         // Reverse is not supported
         assert_result_error_with_message(
-            ensure_data_types(&DataType::LONG, &ArrowDataType::Timestamp(TimeUnit::Microsecond, None), false),
+            ensure_data_types(
+                &DataType::LONG,
+                &ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
             "Incorrect datatype",
         );
     }
