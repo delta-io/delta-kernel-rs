@@ -1,5 +1,4 @@
-use std::borrow::Cow;
-use std::borrow::ToOwned;
+use std::borrow::{Cow, ToOwned};
 
 mod expression;
 mod schema;
