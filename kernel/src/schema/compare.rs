@@ -178,7 +178,7 @@ impl SchemaComparison for DataType {
 #[cfg(test)]
 mod tests {
     use crate::schema::compare::{Error, SchemaComparison};
-    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 
     #[test]
     fn can_read_is_reflexive() {
@@ -431,7 +431,6 @@ mod tests {
 
     #[test]
     fn stats_type_reinterpretation_integer_to_date() {
-        use crate::schema::PrimitiveType;
         // Integer -> Date is allowed for stats_parsed (int32 without DATE logical annotation)
         assert!(PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::Date));
 
@@ -446,7 +445,6 @@ mod tests {
 
     #[test]
     fn stats_type_reinterpretation_long_to_timestamp() {
-        use crate::schema::PrimitiveType;
         // Long -> Timestamp/TimestampNtz is allowed for stats_parsed (int64 without TIMESTAMP annotation)
         assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
         assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
@@ -467,12 +465,25 @@ mod tests {
 
     #[test]
     fn stats_type_reinterpretation_cross_type_rejected() {
-        use crate::schema::PrimitiveType;
         // Reinterpretation rules are narrowly scoped: cross-type combinations are rejected
         assert!(!PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Date));
         assert!(!PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
         assert!(!PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
         assert!(!PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Date));
+    }
+
+    #[test]
+    fn stats_type_identity_and_widening() {
+        // Identity: any type is compatible with itself
+        assert!(PrimitiveType::Date.is_stats_type_compatible_with(&PrimitiveType::Date));
+        assert!(PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
+        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Long));
+
+        // is_stats_type_compatible_with is a superset of can_widen_to
+        assert!(PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Long));
+        assert!(PrimitiveType::Short.is_stats_type_compatible_with(&PrimitiveType::Integer));
+        assert!(PrimitiveType::Float.is_stats_type_compatible_with(&PrimitiveType::Double));
+        assert!(PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
     }
 
     #[test]

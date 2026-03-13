@@ -1496,11 +1496,12 @@ impl PrimitiveType {
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
-    /// Widening rules follow the Delta protocol type widening feature:
-    /// - Integer widening: byte -> short -> int -> long
-    /// - Float widening: float -> double
-    /// - Timestamp equivalence: Timestamp <-> TimestampNtz (both are i64 microseconds
-    ///   since epoch, differing only in timezone semantics)
+    /// Widening rules:
+    /// - Integer widening: byte -> short -> int -> long (Delta protocol type widening)
+    /// - Float widening: float -> double (Delta protocol type widening)
+    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
+    ///   since epoch, differing only in timezone semantics; this is a physical read
+    ///   accommodation, not a Delta protocol type widening rule)
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(

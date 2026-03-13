@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
 };
 
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
@@ -209,7 +209,7 @@ fn check_cast_compat(
         // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
         // as plain integers without Parquet logical type annotations.
         (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int64, Timestamp(_, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
@@ -567,6 +567,42 @@ mod tests {
         assert_eq!(
             ensure_data_types(&DataType::BINARY, &ArrowDataType::LargeBinary, true).unwrap(),
             DataTypeCompat::Identical
+        );
+    }
+
+    #[test]
+    fn ensure_int32_to_date_reinterpretation() {
+        // Int32 -> Date32: checkpoint writers may omit the DATE logical type annotation
+        assert_eq!(
+            ensure_data_types(&DataType::DATE, &ArrowDataType::Int32, false).unwrap(),
+            DataTypeCompat::NeedsCast(ArrowDataType::Date32)
+        );
+        // Reverse is not supported: Date32 -> Int32
+        assert_result_error_with_message(
+            ensure_data_types(&DataType::INTEGER, &ArrowDataType::Date32, false),
+            "Incorrect datatype",
+        );
+    }
+
+    #[test]
+    fn ensure_int64_to_timestamp_reinterpretation() {
+        use crate::arrow::datatypes::TimeUnit;
+        // Int64 -> Timestamp (with UTC timezone, i.e. kernel `timestamp`)
+        let ts_utc = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(
+            ensure_data_types(&DataType::TIMESTAMP, &ArrowDataType::Int64, false).unwrap(),
+            DataTypeCompat::NeedsCast(ts_utc)
+        );
+        // Int64 -> TimestampNtz (no timezone, i.e. kernel `timestamp_ntz`)
+        let ts_ntz = ArrowDataType::Timestamp(TimeUnit::Microsecond, None);
+        assert_eq!(
+            ensure_data_types(&DataType::TIMESTAMP_NTZ, &ArrowDataType::Int64, false).unwrap(),
+            DataTypeCompat::NeedsCast(ts_ntz)
+        );
+        // Reverse is not supported
+        assert_result_error_with_message(
+            ensure_data_types(&DataType::LONG, &ArrowDataType::Timestamp(TimeUnit::Microsecond, None), false),
+            "Incorrect datatype",
         );
     }
 }
