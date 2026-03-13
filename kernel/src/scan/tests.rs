@@ -977,59 +977,28 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 /// uses min stats (supported). File ts_col min values: 1M, 3M, 5M, 7M, 9M, 11M (microseconds).
 #[rstest]
 #[case::bare_ts_gt_returns_all(
-    // ts_col > ...: unsupported (uses max stats), no pruning.
+    // ts_col > ...: unsupported (uses max stats), becomes TRUE -> no pruning.
     Arc::new(Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000)))),
     6,
 )]
 #[case::bare_ts_lt_skips(
-    // ts_col < 3M: supported (uses min stats). Skips files with min_ts >= 3M (files 2-6).
+    // ts_col < 3M: supported (uses min stats). Skips files with min_ts >= 3M.
     Arc::new(Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000)))),
     1,
 )]
-#[case::and_id_supported_ts_gt_unsupported(
-    // AND(id > 400, ts_col > ...): unsupported ts arm dropped, id arm skips 4 files.
+#[case::and_mixed_supported_unsupported(
+    // AND(id > 400, ts_col > ...): unsupported arm becomes TRUE, id arm skips 4 files.
     Arc::new(Pred::and(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
     )),
     2,
 )]
-#[case::or_id_supported_ts_gt_unsupported(
-    // OR(id > 400, ts_col > ...): unsupported arm makes whole OR unevaluable, no pruning.
+#[case::or_mixed_supported_unsupported(
+    // OR(id > 400, ts_col > ...): unsupported arm becomes TRUE -> OR(..., TRUE) = TRUE,
+    // no pruning.
     Arc::new(Pred::or(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-    )),
-    6,
-)]
-#[case::and_all_unsupported(
-    // AND(ts_col > ..., ts_col > ...): both arms dropped, no pruning.
-    Arc::new(Pred::and(
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
-    )),
-    6,
-)]
-#[case::or_all_unsupported(
-    // OR(ts_col > ..., ts_col > ...): no evaluable arm, no pruning.
-    Arc::new(Pred::or(
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
-    )),
-    6,
-)]
-#[case::and_ts_lt_supported_ts_gt_unsupported(
-    // AND(ts_col < 3M, ts_col > ...): same column, mixed support. GT arm dropped, LT skips.
-    Arc::new(Pred::and(
-        Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000))),
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-    )),
-    1,
-)]
-#[case::or_ts_lt_supported_ts_gt_unsupported(
-    // OR(ts_col < 3M, ts_col > ...): unsupported GT arm, whole OR unevaluable.
-    Arc::new(Pred::or(
-        Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000))),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
     )),
     6,

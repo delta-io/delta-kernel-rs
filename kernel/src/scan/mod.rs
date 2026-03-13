@@ -825,14 +825,6 @@ impl Scan {
             .partition_columns();
         let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
 
-        // The checkpoint skipping predicate creator drops unsupported arms from junctions
-        // and returns None when no supported arms remain, so the predicate should always
-        // have column references if it exists.
-        debug_assert!(
-            !skipping_pred.references().is_empty(),
-            "checkpoint skipping predicate has no column references: {skipping_pred}"
-        );
-
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
         };

@@ -443,8 +443,8 @@ fn test_get_stat_values() {
 // - AND(true, NULL) -> AND(true, false) -> false -> PRUNED (incorrect if NULL = "unknown")
 // - OR(false, NULL) -> OR(false, false) -> false -> PRUNED (incorrect if NULL = "unknown")
 //
-// This is why `NullGuardedDataSkippingPredicateCreator` handles unsupported arms by dropping
-// them (AND) or bailing (OR), rather than inserting NULL literals.
+// This is why `NullGuardedDataSkippingPredicateCreator` replaces unsupported arms with TRUE
+// instead of NULL. TRUE is safe: AND(TRUE, P) = P, OR(TRUE, P) = TRUE (conservative keep).
 #[test]
 fn test_row_group_filter_null_literal_evaluates_to_false() {
     let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
