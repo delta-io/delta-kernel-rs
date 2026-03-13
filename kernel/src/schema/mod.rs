@@ -214,7 +214,7 @@ pub struct StructField {
     /// are violations of [`StructField::nullable`], because parent nulls can be propagated to children. Two cases are
     /// distinguished:
     ///
-    /// - **Allowed nullability mismatch**: a non-nullable nested field has nulls when its parent
+    /// - **Inherited nullability mismatch**: a non-nullable nested field has nulls when its parent
     ///   is null.
     ///
     ///   Example -- schema: `s: struct<a: int NOT NULL> (nullable)`
@@ -228,7 +228,7 @@ pub struct StructField {
     ///   { "s": null, "s.a": null }  // => acceptable
     ///   ```
     ///
-    /// - **Disallowed nullability mismatch**: a non-nullable field has nulls when:
+    /// - **Genuine nullability mismatch**: a non-nullable field has nulls when:
     ///   1. Its parent is non-null, or
     ///   2. The field is top-level.
     ///
@@ -237,7 +237,7 @@ pub struct StructField {
     ///   // schema
     ///   { "name": "x", "nullable": false, "type": "integer" }
     ///   // data
-    ///   { "x": null }       // => disallowed nullability mismatch
+    ///   { "x": null }       // => genuine nullability mismatch
     ///   ```
     ///
     ///   Example 2 -- non-nullable nested field under a non-null parent:
@@ -248,10 +248,10 @@ pub struct StructField {
     ///       "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
     ///   }}
     ///   // data
-    ///   { "s": { "a": null } }  // => disallowed nullability mismatch
+    ///   { "s": { "a": null } }  // => genuine nullability mismatch
     ///   ```
     ///
-    /// Allowed nullability mismatches are benign. Only disallowed
+    /// Inherited nullability mismatches are benign. Only genuine
     /// nullability mismatches represent violations of [`StructField::nullable`].
     pub nullable: bool,
     /// A JSON map containing information about this column
