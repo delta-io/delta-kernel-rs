@@ -605,11 +605,14 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     /// prune row groups. TRUE is conservative: AND(TRUE, P) = P, OR(TRUE, P) = TRUE (keep).
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionPredicateOp,
+        mut op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        let preds = preds.map(|p| p.unwrap_or(Pred::literal(true)));
-        Some(collect_junction_preds(op, &mut preds.map(Some), inverted))
+        if inverted {
+            op = op.invert();
+        }
+        let preds: Vec<_> = preds.map(|p| p.unwrap_or(Pred::literal(true))).collect();
+        Some(Pred::junction(op, preds))
     }
 }

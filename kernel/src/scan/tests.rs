@@ -977,7 +977,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 /// uses min stats (supported). File ts_col min values: 1M, 3M, 5M, 7M, 9M, 11M (microseconds).
 #[rstest]
 #[case::bare_ts_gt_returns_all(
-    // ts_col > ...: unsupported (uses max stats), becomes TRUE -> no pruning.
+    // ts_col > ...: unsupported (uses max stats), no meta-predicate generated -> no pruning.
     Arc::new(Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000)))),
     6,
 )]
