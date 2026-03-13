@@ -206,6 +206,10 @@ fn check_cast_compat(
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
+        // as plain integers without Parquet logical type annotations.
+        (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (Int64, Timestamp(_, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
