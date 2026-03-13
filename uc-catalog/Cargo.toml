@@ -17,7 +17,6 @@ release = false
 delta_kernel = { path = "../kernel", features = ["catalog-managed"] }
 uc-client = { path = "../uc-client" }
 itertools = "0.14"
-object_store = "0.12.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -28,5 +27,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
 uc-client = { path = "../uc-client", features = ["test-utils"] }
-object_store = "0.12"
 tempfile = "3"

@@ -424,11 +424,11 @@ impl LogSegmentFiles {
 mod list_log_files_with_log_tail_tests {
     use std::sync::Arc;
 
-    use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
     use url::Url;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
+    use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
     use crate::FileMeta;
 
     use super::*;
@@ -477,7 +477,7 @@ mod list_log_files_with_log_tail_tests {
                     format!("_delta_log/{version:020}.{hi:020}.compacted.json")
                 }
                 LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
-                    panic!("Unsupported file type in test: {:?}", file_type)
+                    panic!("Unsupported file type in test: {file_type:?}")
                 }
             };
             let data = match source {

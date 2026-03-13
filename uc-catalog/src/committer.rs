@@ -125,8 +125,8 @@ mod tests {
     use super::*;
     use delta_kernel::committer::CatalogCommit;
     use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
-    use object_store::local::LocalFileSystem;
     use std::fs;
     use uc_client::error::Result;
 
@@ -141,15 +141,14 @@ mod tests {
     fn staged_commit_url(table_root: &url::Url, version: Version) -> url::Url {
         table_root
             .join(&format!(
-                "_delta_log/_staged_commits/{:020}.uuid.json",
-                version
+                "_delta_log/_staged_commits/{version:020}.uuid.json"
             ))
             .unwrap()
     }
 
     fn published_commit_url(table_root: &url::Url, version: Version) -> url::Url {
         table_root
-            .join(&format!("_delta_log/{:020}.json", version))
+            .join(&format!("_delta_log/{version:020}.json"))
             .unwrap()
     }
 
@@ -197,10 +196,7 @@ mod tests {
         for v in versions {
             let path = published_commit_url(&table_root, v).to_file_path().unwrap();
             assert!(path.exists());
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                format!("version: {}", v)
-            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("version: {v}"));
         }
     }
 }

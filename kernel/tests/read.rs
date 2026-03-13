@@ -12,6 +12,7 @@ use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
 use delta_kernel::log_segment::LogSegment;
+use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
@@ -20,7 +21,6 @@ use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, St
 use delta_kernel::{Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
@@ -1520,7 +1520,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         // Verify the file path column contains the expected file name
         let file_path_array = batch.column(1);
         let expected_file_name = expected_files[file_count];
-        let expected_path = format!("{}{}", location, expected_file_name);
+        let expected_path = format!("{location}{expected_file_name}");
 
         // The file path array should be a plain StringArray with the path repeated for each row.
         let string_array = file_path_array
@@ -1539,8 +1539,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             string_array
                 .iter()
                 .all(|v| v == Some(expected_path.as_str())),
-            "All rows should contain file path '{}'",
-            expected_path
+            "All rows should contain file path '{expected_path}'"
         );
 
         file_count += 1;

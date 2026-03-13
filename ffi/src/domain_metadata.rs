@@ -94,8 +94,8 @@ mod tests {
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
-    use object_store::memory::InMemory;
     use serde_json::json;
     use std::collections::HashMap;
     use std::ptr::NonNull;

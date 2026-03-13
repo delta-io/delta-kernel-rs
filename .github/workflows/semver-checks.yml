@@ -34,6 +34,20 @@ jobs:
         shell: bash
         run: |
           cargo install cargo-semver-checks --locked
+      - name: Compute baseline revision
+        id: baseline
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "rev=${{ github.event.merge_group.base_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            # Use the merge-base instead of the PR base SHA. The base SHA is the tip of
+            # the target branch when the webhook fires, which can differ from where the PR
+            # actually diverged. Using merge-base avoids false positives when the PR branch
+            # is behind the target branch.
+            MERGE_BASE=$(git merge-base ${{ github.event.pull_request.head.sha }} ${{ github.event.pull_request.base.sha }})
+            echo "rev=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run check
         id: check
         continue-on-error: true
@@ -43,9 +57,7 @@ jobs:
         # delta_kernel_derive etc.
         run: |
           cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
-            --baseline-rev ${{ github.event_name == 'merge_group'
-                && github.event.merge_group.base_sha
-                || github.event.pull_request.base.sha }}
+            --baseline-rev ${{ steps.baseline.outputs.rev }}
       - name: On Failure
         id: set_failure
         if: ${{ steps.check.outcome == 'failure' }}

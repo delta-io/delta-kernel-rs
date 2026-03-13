@@ -17,13 +17,13 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::DeltaResult;
 use delta_kernel::Snapshot;
 
-use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use serde_json::json;
 use test_utils::{insert_data, read_scan, write_batch_to_table};
 use url::Url;
@@ -35,7 +35,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 
 /// Writes a JSON commit file to the store.
 async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> DeltaResult<()> {
-    let path = Path::from(format!("_delta_log/{version:020}.json", version = version));
+    let path = Path::from(format!("_delta_log/{version:020}.json"));
     store.put(&path, content.to_string().into()).await?;
     Ok(())
 }
@@ -75,7 +75,7 @@ fn build_commit(
                 "writerFeatures": []
             }
         });
-        format!("{}\n{}", protocol, metadata)
+        format!("{protocol}\n{metadata}")
     } else {
         metadata.to_string()
     }
@@ -454,7 +454,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
             "createdTime": 1587968585495i64
         }
     });
-    write_commit(&store, &format!("{}\n{}", protocol, metadata), 0).await?;
+    write_commit(&store, &format!("{protocol}\n{metadata}"), 0).await?;
 
     // Version 1: write data for partition category=books
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;

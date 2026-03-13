@@ -162,17 +162,17 @@ mod tests {
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
-
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::{DynObjectStore, ObjectStore as _};
     use itertools::Itertools;
-    use object_store::memory::InMemory;
-    use object_store::ObjectStore;
     use serde_json::json;
 
     use super::*;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         String,
     ) {
         let table_root = String::from("memory:///");
@@ -182,7 +182,7 @@ mod tests {
     }
 
     // TODO (#1990): update this function to properly store the table at table_root
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: String) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<DynObjectStore>, _table_root: String) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -219,7 +219,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
+        let path = Path::from(format!("_delta_log/{:020}.json", 0).as_str());
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -242,7 +242,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
+        let path = Path::from(format!("_delta_log/{:020}.json", 1).as_str());
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())
@@ -261,6 +261,61 @@ mod tests {
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_snapshot_with_unsupported_type() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let engine = engine.as_ref();
+
+        // Create a table with an unsupported type in the schema
+        let protocol = json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2,
+        });
+
+        let metadata = json!({
+            "id": "test-table-id",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval second\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        });
+
+        let commit0 = [
+            json!({
+                "protocol": protocol
+            }),
+            json!({
+                "metaData": metadata
+            }),
+        ];
+
+        let commit0_data = commit0
+            .iter()
+            .map(ToString::to_string)
+            .collect_vec()
+            .join("\n");
+
+        let path = Path::from("_delta_log/00000000000000000000.json");
+        store.put(&path, commit0_data.into()).await?;
+
+        // Try to build a snapshot and expect a clear error message
+        let result = SnapshotBuilder::new_for(table_root.clone()).build(engine);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Unsupported Delta table type: 'interval second'"),
+            "Expected clear error message about unsupported type, got: {err_msg}"
+        );
 
         Ok(())
     }

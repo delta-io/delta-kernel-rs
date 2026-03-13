@@ -15,7 +15,7 @@ use delta_kernel_benchmarks::runners::{
 use delta_kernel_benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-    use object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::local::LocalFileSystem;
 
     let store = Arc::new(LocalFileSystem::new());
     let engine = DefaultEngine::builder(store).build();
@@ -29,7 +29,7 @@ fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
         Ok(_) => panic!("No workloads found"),
-        Err(e) => panic!("Failed to load workloads: {}", e),
+        Err(e) => panic!("Failed to load workloads: {e}"),
     };
 
     let engine = setup_engine();

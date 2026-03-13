@@ -189,6 +189,8 @@ mod tests {
 
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStore;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
 
@@ -204,8 +206,6 @@ mod tests {
     use test_utils::{set_json_value, setup_test_tables, test_read};
 
     use itertools::Itertools;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use serde_json::json;
     use serde_json::Deserializer;
 
@@ -434,7 +434,7 @@ mod tests {
                         "size": 0,
                         "modificationTime": 0,
                         "dataChange": false,
-                        "stats": "{\"numRecords\":5}"
+                        "stats": "{\"numRecords\":5,\"nullCount\":null,\"minValues\":null,\"maxValues\":null,\"tightBounds\":null}"
                     }
                 }),
             ];
@@ -611,7 +611,7 @@ mod tests {
 
             // Read the staged commit
             let staged_commit_url = table_url
-                .join(&format!("_delta_log/_staged_commits/{}", staged_file_name))
+                .join(&format!("_delta_log/_staged_commits/{staged_file_name}"))
                 .unwrap();
             let staged_commit = store
                 .get(&Path::from_url_path(staged_commit_url.path()).unwrap())
