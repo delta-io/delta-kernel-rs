@@ -251,7 +251,7 @@ pub struct StructField {
     ///   { "s": { "a": null } }  // => disallowed nullability mismatch
     ///   ```
     ///
-    /// Allowed nullability mismatches are benign and should be tolerated. Only disallowed
+    /// Allowed nullability mismatches are benign. Only disallowed
     /// nullability mismatches represent violations of [`StructField::nullable`].
     pub nullable: bool,
     /// A JSON map containing information about this column
