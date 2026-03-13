@@ -1,5 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ pub use self::column_names::{
     ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
-use self::transforms::{ExpressionTransform as _, GetColumnReferences};
+use self::transforms::ExpressionTransform;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
@@ -22,6 +23,7 @@ use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
+pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 pub mod transforms;
 
@@ -635,7 +637,7 @@ impl Expression {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_expr(self);
-        references.into_inner()
+        references.0
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -800,7 +802,7 @@ impl Predicate {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_pred(self);
-        references.into_inner()
+        references.0
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
@@ -1159,6 +1161,17 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
     fn div(self, rhs: R) -> Self {
         Self::binary(BinaryExpressionOp::Divide, self, rhs)
+    }
+}
+
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+struct GetColumnReferences<'a>(HashSet<&'a ColumnName>);
+
+impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        self.0.insert(name);
+        Some(Cow::Borrowed(name))
     }
 }
 

@@ -1,5 +1,4 @@
 use std::borrow::{Cow, ToOwned};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::expressions::{
@@ -393,25 +392,6 @@ pub trait ExpressionTransform<'a> {
     }
 }
 
-/// Retrieves the set of column names referenced by an expression.
-#[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
-    references: HashSet<&'a ColumnName>,
-}
-
-impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
-        self.references
-    }
-}
-
-impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        self.references.insert(name);
-        Some(Cow::Borrowed(name))
-    }
-}
-
 /// An expression "transform" that doesn't actually change the expression at all. Instead, it
 /// measures the maximum depth of a expression, with a depth limit to prevent stack overflow. Useful
 /// for verifying that a expression has reasonable depth before attempting to work with it.
@@ -619,6 +599,17 @@ mod tests {
     struct NoopTransform;
     impl ExpressionTransform<'_> for NoopTransform {}
 
+    struct ColumnReplacer;
+    impl<'a> ExpressionTransform<'a> for ColumnReplacer {
+        fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+            if name.len() == 1 && name[0] == "old_col" {
+                Some(Cow::Owned(ColumnName::new(["new_col"])))
+            } else {
+                Some(Cow::Borrowed(name))
+            }
+        }
+    }
+
     #[test]
     fn test_transform_expr_variadic_noop() {
         // Test default no-op behavior - should return Cow::Borrowed
@@ -652,20 +643,6 @@ mod tests {
     #[test]
     fn test_transform_expr_variadic_child_transformation() {
         // Test transformation of child expressions - should return Cow::Owned
-        struct ColumnReplacer;
-        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                if name.len() == 1 && name[0] == "old_col" {
-                    Some(Cow::Owned(ColumnName::new(["new_col"])))
-                } else {
-                    Some(Cow::Borrowed(name))
-                }
-            }
-        }
-
         let variadic_expr = VariadicExpression::new(
             Coalesce,
             vec![
@@ -866,22 +843,8 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_child_transformation() {
         // Test transformation of child expression - should return Cow::Owned
-        struct ColumnReplacer;
-        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                if name.len() == 1 && name[0] == "old_json_col" {
-                    Some(Cow::Owned(ColumnName::new(["new_json_col"])))
-                } else {
-                    Some(Cow::Borrowed(name))
-                }
-            }
-        }
-
         let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("old_json_col"), test_output_schema());
+            ParseJsonExpression::new(column_expr!("old_col"), test_output_schema());
 
         let mut transform = ColumnReplacer;
         let result = transform.transform_expr_parse_json(&parse_json_expr);
@@ -891,7 +854,7 @@ mod tests {
             // Check that the column was replaced
             if let Expr::Column(col) = result_expr.json_expr.as_ref() {
                 assert_eq!(col.len(), 1);
-                assert_eq!(col[0], "new_json_col");
+                assert_eq!(col[0], "new_col");
             } else {
                 panic!("Expected column expression");
             }
@@ -903,27 +866,13 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_child_unchanged() {
         // Test when child column doesn't match replacement criteria - should return Cow::Borrowed
-        struct ColumnReplacer;
-        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                if name.len() == 1 && name[0] == "other_col" {
-                    Some(Cow::Owned(ColumnName::new(["replaced"])))
-                } else {
-                    Some(Cow::Borrowed(name))
-                }
-            }
-        }
-
         let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+            ParseJsonExpression::new(column_expr!("unchanged_col"), test_output_schema());
 
         let mut transform = ColumnReplacer;
         let result = transform.transform_expr_parse_json(&parse_json_expr);
 
-        // Since "json_col" doesn't match "other_col", nothing changes
+        // Since "unchanged_col" doesn't match "old_col", nothing changes
         assert!(matches!(result, Some(Cow::Borrowed(_))));
     }
 

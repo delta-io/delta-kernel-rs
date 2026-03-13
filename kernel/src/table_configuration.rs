@@ -19,8 +19,10 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
+pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
+use crate::schema::{
+    schema_has_invariants, SchemaRef, SchemaTransform as _, StructField, StructType,
+};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
@@ -581,7 +583,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.logical_schema.as_ref())
+            && schema_has_invariants(self.logical_schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
