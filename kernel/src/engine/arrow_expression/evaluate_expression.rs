@@ -16,7 +16,7 @@ use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -381,6 +381,56 @@ pub fn evaluate_expression(
     }
 }
 
+/// this function is used for evaluate_predicate conversion, currently does not support nested conversion.
+/// it support limited conversion, e.g only convert from ArrayList<Utf8View> to ArrayList<Utf8>
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+    match vals.data_type() {
+        ArrowDataType::List(field) => {
+            let from_type = field.data_type();
+            let to_type = match from_type {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(vals),
+            };
+            let new_field = field.as_ref().clone().with_data_type(to_type);
+            return Ok(cast(&vals, &ArrowDataType::List(Arc::new(new_field)))?);
+        }
+        ArrowDataType::LargeList(field) => {
+            let from_type = field.data_type();
+            let to_type = match from_type {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(vals),
+            };
+            let new_field = field.as_ref().clone().with_data_type(to_type);
+            return Ok(cast(&vals, &ArrowDataType::LargeList(Arc::new(new_field)))?);
+        }
+        ArrowDataType::ListView(field) => {
+            let from_type = field.data_type();
+            let to_type = match from_type {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(cast(&vals, &ArrowDataType::List(field.clone()))?),
+            };
+            let new_field = field.as_ref().clone().with_data_type(to_type);
+            return Ok(cast(&vals, &ArrowDataType::List(Arc::new(new_field)))?);
+        }
+        ArrowDataType::LargeListView(field) => {
+            let from_type = field.data_type();
+            let to_type = match from_type {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(cast(&vals, &ArrowDataType::LargeList(field.clone()))?),
+            };
+            let new_field = field.as_ref().clone().with_data_type(to_type);
+            return Ok(cast(&vals, &ArrowDataType::LargeList(Arc::new(new_field)))?);
+        }
+        ArrowDataType::Utf8View => return Ok(cast(&vals, &ArrowDataType::Utf8)?),
+        ArrowDataType::BinaryView => return Ok(cast(&vals, &ArrowDataType::Binary)?),
+        _ => Ok(vals),
+    }
+}
+
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub fn evaluate_predicate(
     predicate: &Predicate,
@@ -425,11 +475,16 @@ pub fn evaluate_predicate(
             let eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
                     let left = evaluate_expression(left, batch, None)?;
+                    let left = arrow_convert_to_non_view_type(left)?;
+
                     let right = evaluate_expression(right, batch, None)?;
+                    let right = arrow_convert_to_non_view_type(right)?;
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            let result = in_list_utf8(string_arr, list_arr)?;
-                            return Ok(result);
+                            if list_arr.value_type() == ArrowDataType::Utf8 {
+                                let result = in_list_utf8(string_arr, list_arr)?;
+                                return Ok(result);
+                            }
                         }
                     }
 
@@ -490,7 +545,10 @@ pub fn evaluate_predicate(
             };
 
             let left = evaluate_expression(left, batch, None)?;
+            let left = arrow_convert_to_non_view_type(left)?;
+
             let right = evaluate_expression(right, batch, None)?;
+            let right = arrow_convert_to_non_view_type(right)?;
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {

@@ -89,6 +89,204 @@ fn test_bad_right_type_array() {
 }
 
 #[test]
+fn test_in_predicate_with_utf8view_list_column() {
+    use crate::arrow::array::StringViewArray;
+
+    let values = StringViewArray::from(vec!["hello", "world", "foo", "bar", "hello", "baz"]);
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3, 6]));
+    let item_field = Arc::new(Field::new("item", DataType::Utf8View, true));
+    let list_field = Arc::new(Field::new(
+        "items",
+        DataType::List(item_field.clone()),
+        true,
+    ));
+    let schema = Schema::new([list_field]);
+    let list_array = ListArray::new(item_field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
+
+    let in_pred = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal("hello"),
+        column_expr!("items"),
+    );
+
+    let expected = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(
+        evaluate_predicate(&in_pred, &batch, false).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn test_in_predicate_with_list_view_column() {
+    use crate::arrow::array::ListViewArray;
+
+    // Three rows: [0,1,2], [3,4,5], [6,7,8]
+    let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let offsets = ScalarBuffer::from(vec![0i32, 3, 6]);
+    let sizes = ScalarBuffer::from(vec![3i32, 3, 3]);
+    let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let list_field = Arc::new(Field::new(
+        "items",
+        DataType::ListView(item_field.clone()),
+        true,
+    ));
+    let schema = Schema::new([list_field]);
+    let list_view_array = ListViewArray::new(item_field, offsets, sizes, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_view_array)]).unwrap();
+
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(5),
+        column_expr!("items"),
+    );
+    let not_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(5),
+        column_expr!("items"),
+    ));
+
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    let expected_in = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result, expected_in);
+
+    let result = evaluate_predicate(&not_op, &batch, false).unwrap();
+    let expected_not_in = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(result, expected_not_in);
+
+    // Test inversion
+    let result = evaluate_predicate(&in_op, &batch, true).unwrap();
+    assert_eq!(result, expected_not_in);
+
+    let result = evaluate_predicate(&not_op, &batch, true).unwrap();
+    assert_eq!(result, expected_in);
+}
+
+#[test]
+fn test_binary_predicate_with_view_column() {
+    // Test all BinaryPredicateOps where the column is of Utf8View type
+    use crate::arrow::array::StringViewArray;
+    let list_array = StringViewArray::from(vec![None, Some("apple"), Some("hello"), Some("zebra")]);
+    let schema = Schema::new([Arc::new(Field::new("name", DataType::Utf8View, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
+    let column = column_expr!("name");
+
+    let predicate_lt = column.clone().lt(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
+    let expected_lt = BooleanArray::from(vec![None, Some(true), Some(false), Some(false)]);
+    assert_eq!(results, expected_lt);
+
+    let predicate_le = column.clone().le(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
+    let expected_le = BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]);
+    assert_eq!(results, expected_le);
+
+    let predicate_gt = column.clone().gt(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
+    let expected_gt = BooleanArray::from(vec![None, Some(false), Some(false), Some(true)]);
+    assert_eq!(results, expected_gt);
+
+    let predicate_ge = column.clone().ge(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
+    let expected_ge = BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]);
+    assert_eq!(results, expected_ge);
+
+    let predicate_eq = column.clone().eq(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
+    let expected_eq = BooleanArray::from(vec![None, Some(false), Some(true), Some(false)]);
+    assert_eq!(results, expected_eq);
+
+    let predicate_ne = column.clone().ne(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
+    let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
+    assert_eq!(results, expected_ne);
+
+    // Test inversion
+    let results = evaluate_predicate(&predicate_lt, &batch, true).unwrap();
+    assert_eq!(results, expected_ge);
+
+    let results = evaluate_predicate(&predicate_le, &batch, true).unwrap();
+    assert_eq!(results, expected_gt);
+
+    let results = evaluate_predicate(&predicate_gt, &batch, true).unwrap();
+    assert_eq!(results, expected_le);
+
+    let results = evaluate_predicate(&predicate_ge, &batch, true).unwrap();
+    assert_eq!(results, expected_lt);
+
+    let results = evaluate_predicate(&predicate_eq, &batch, true).unwrap();
+    assert_eq!(results, expected_ne);
+
+    let results = evaluate_predicate(&predicate_ne, &batch, true).unwrap();
+    assert_eq!(results, expected_eq);
+}
+
+#[test]
+fn test_binary_predicate_with_binary_view_column() {
+    // Test all BinaryPredicateOps where the column is of BinaryView type
+    use crate::arrow::array::BinaryViewArray;
+    let list_array = BinaryViewArray::from(vec![
+        None,
+        Some(b"apple".as_ref()),
+        Some(b"hello"),
+        Some(b"zebra"),
+    ]);
+    let schema = Schema::new([Arc::new(Field::new("data", DataType::BinaryView, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
+    let column = column_expr!("data");
+    let lit = Expr::literal(b"hello".as_ref());
+
+    let predicate_lt = column.clone().lt(lit.clone());
+    let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
+    let expected_lt = BooleanArray::from(vec![None, Some(true), Some(false), Some(false)]);
+    assert_eq!(results, expected_lt);
+
+    let predicate_le = column.clone().le(lit.clone());
+    let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
+    let expected_le = BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]);
+    assert_eq!(results, expected_le);
+
+    let predicate_gt = column.clone().gt(lit.clone());
+    let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
+    let expected_gt = BooleanArray::from(vec![None, Some(false), Some(false), Some(true)]);
+    assert_eq!(results, expected_gt);
+
+    let predicate_ge = column.clone().ge(lit.clone());
+    let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
+    let expected_ge = BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]);
+    assert_eq!(results, expected_ge);
+
+    let predicate_eq = column.clone().eq(lit.clone());
+    let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
+    let expected_eq = BooleanArray::from(vec![None, Some(false), Some(true), Some(false)]);
+    assert_eq!(results, expected_eq);
+
+    let predicate_ne = column.clone().ne(lit.clone());
+    let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
+    let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
+    assert_eq!(results, expected_ne);
+
+    // Test inversion
+    let results = evaluate_predicate(&predicate_lt, &batch, true).unwrap();
+    assert_eq!(results, expected_ge);
+
+    let results = evaluate_predicate(&predicate_le, &batch, true).unwrap();
+    assert_eq!(results, expected_gt);
+
+    let results = evaluate_predicate(&predicate_gt, &batch, true).unwrap();
+    assert_eq!(results, expected_le);
+
+    let results = evaluate_predicate(&predicate_ge, &batch, true).unwrap();
+    assert_eq!(results, expected_lt);
+
+    let results = evaluate_predicate(&predicate_eq, &batch, true).unwrap();
+    assert_eq!(results, expected_ne);
+
+    let results = evaluate_predicate(&predicate_ne, &batch, true).unwrap();
+    assert_eq!(results, expected_eq);
+}
+
+#[test]
 fn test_literal_type_array() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
