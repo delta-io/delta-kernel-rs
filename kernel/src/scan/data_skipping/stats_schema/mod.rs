@@ -307,6 +307,7 @@ impl<'col> BaseStatsTransform<'col> {
 }
 
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
+    // Always traverse struct fields -- only primitive leaf values count against the column limit
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.filter.enter_field(field.name());
         let data_type = self.transform(&field.data_type);
@@ -318,9 +319,10 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
         if !self.filter.should_include_for_table() {
             return None;
         }
-        // Count this column toward table-level limits.
+
+        // The n_columns limit is based on schema order, so we count all leaf columns that pass the
+        // table filter, but then we only generate stats for requested columns.
         self.filter.record_included();
-        // Requested-columns filtering should not affect table-level counting.
         self.filter
             .should_include_for_requested()
             .then_some(Cow::Borrowed(ptype))
