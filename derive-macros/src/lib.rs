@@ -235,16 +235,23 @@ fn make_public(mut item: Item) -> Item {
         Ok(())
     }
 
+    macro_rules! set_vis {
+        ($item:ident) => {{
+            let vis_span = $item.vis.span();
+            set_pub(&mut $item.vis, vis_span)
+        }}
+    }
+
     let result = match &mut item {
-        Item::Fn(f) => set_pub(&mut f.vis, f.sig.fn_token.span),
-        Item::Struct(s) => set_pub(&mut s.vis, s.struct_token.span),
-        Item::Enum(e) => set_pub(&mut e.vis, e.enum_token.span),
-        Item::Trait(t) => set_pub(&mut t.vis, t.trait_token.span),
-        Item::Type(t) => set_pub(&mut t.vis, t.type_token.span),
-        Item::Use(u) => set_pub(&mut u.vis, u.use_token.span),
-        Item::Static(s) => set_pub(&mut s.vis, s.static_token.span),
-        Item::Const(c) => set_pub(&mut c.vis, c.const_token.span),
-        Item::Union(u) => set_pub(&mut u.vis, u.union_token.span),
+        Item::Fn(f) => set_vis!(f),
+        Item::Struct(s) => set_vis!(s),
+        Item::Enum(e) => set_vis!(e),
+        Item::Trait(t) => set_vis!(t),
+        Item::Type(t) => set_vis!(t),
+        Item::Use(u) => set_vis!(u),
+        Item::Static(s) => set_vis!(s),
+        Item::Const(c) => set_vis!(c),
+        Item::Union(u) => set_vis!(u),
         // foreign mod, impl block, and all others not handled
         _ => Err(Error::new(
             item.span(),
