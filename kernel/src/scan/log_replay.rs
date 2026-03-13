@@ -39,8 +39,6 @@ struct InternalScanState {
     column_mapping_mode: ColumnMappingMode,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
-    /// Logical stats schema for the file statistics.
-    logical_stats_schema: Option<SchemaRef>,
     #[serde(default)]
     skip_stats: bool,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
@@ -205,9 +203,11 @@ impl ScanLogReplayProcessor {
                         engine,
                         // these are all cheap arc clones
                         physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                        physical_stats_schema.clone(),
-                        output_schema.clone(),
+                        Some(physical_stats_schema),
                         column_expr_ref!("stats_parsed"),
+                        None, // no partition schema yet
+                        column_expr_ref!("partitionValues_parsed"),
+                        output_schema.clone(),
                     )
                 })
         };
@@ -263,7 +263,6 @@ impl ScanLogReplayProcessor {
             transform_spec,
             column_mapping_mode,
             physical_stats_schema,
-            logical_stats_schema,
             physical_partition_schema,
         } = self.state_info.as_ref().clone();
 
@@ -281,12 +280,11 @@ impl ScanLogReplayProcessor {
             predicate_schema,
             column_mapping_mode,
             physical_stats_schema,
-            logical_stats_schema,
             skip_stats: self.skip_stats,
             physical_partition_schema,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
-            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
 
         Ok(SerializableScanState {
             predicate,
@@ -339,7 +337,6 @@ impl ScanLogReplayProcessor {
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schema: internal_state.physical_stats_schema,
-            logical_stats_schema: internal_state.logical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
         });
 
@@ -585,8 +582,7 @@ fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaR
 ///   raw stats JSON string from checkpoint parquet files.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
-/// Stats are output using physical column names. Engines can use `Scan::logical_stats_schema()`
-/// to map physical names back to logical names when column mapping is enabled.
+/// Stats are output using physical column names.
 fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
@@ -953,7 +949,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             physical_partition_schema: None,
         });
         let iter = scan_action_iter(
@@ -1282,7 +1277,6 @@ mod tests {
                 transform_spec: None,
                 column_mapping_mode: mode,
                 physical_stats_schema: None,
-                logical_stats_schema: None,
                 physical_partition_schema: None,
             });
             let checkpoint_info = test_checkpoint_info();
@@ -1315,7 +1309,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             physical_partition_schema: None,
         });
         let processor =
@@ -1360,7 +1353,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
         };
@@ -1393,7 +1385,6 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
         };

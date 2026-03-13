@@ -107,7 +107,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{get_any_level_columns_logical_names, TableFeature};
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
@@ -269,25 +269,13 @@ impl CheckpointWriter {
         let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        // Translate from physical to logical since build_expected_stats_schemas operates on
-        // the logical data schema.
         let tc = self.snapshot.table_configuration();
         let clustering_columns_physical = self.snapshot.get_clustering_columns_physical(engine)?;
-        let clustering_columns_logical = clustering_columns_physical
-            .as_deref()
-            .map(|cols| {
-                get_any_level_columns_logical_names(
-                    &tc.logical_schema(),
-                    cols,
-                    tc.column_mapping_mode(),
-                )
-            })
-            .transpose()?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
         let stats_schema = tc
-            .build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?
+            .build_expected_stats_schemas(clustering_columns_physical.as_deref(), None)?
             .physical;
 
         // Select schema based on V2 checkpoint support

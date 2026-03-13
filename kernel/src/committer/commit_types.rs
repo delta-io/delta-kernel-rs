@@ -132,13 +132,11 @@ mod tests {
             staged_path_str.starts_with(
                 "s3://my-bucket/path/to/table/_delta_log/_staged_commits/00000000000000000042."
             ),
-            "Staged path should start with the correct prefix, got: {}",
-            staged_path_str
+            "Staged path should start with the correct prefix, got: {staged_path_str}"
         );
         assert!(
             staged_path_str.ends_with(".json"),
-            "Staged path should end with .json, got: {}",
-            staged_path_str
+            "Staged path should end with .json, got: {staged_path_str}"
         );
         let uuid_str = staged_path_str
             .strip_prefix(

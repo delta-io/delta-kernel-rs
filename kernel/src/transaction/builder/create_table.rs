@@ -23,11 +23,13 @@ use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, ColumnMappingMode, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
+    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
+    ENABLE_IN_COMMIT_TIMESTAMPS,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -44,6 +46,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::DomainMetadata,
     // ColumnMapping enables column mapping (name/id mode)
     TableFeature::ColumnMapping,
+    // InCommitTimestamp enables in-commit timestamps (writer-only)
+    TableFeature::InCommitTimestamp,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -60,6 +64,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
 const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // ColumnMapping mode property: triggers column mapping transform
     COLUMN_MAPPING_MODE,
+    // InCommitTimestamp enablement property: triggers ICT auto-enablement
+    ENABLE_IN_COMMIT_TIMESTAMPS,
     // As features are supported, add them here:
     // "delta.enableDeletionVectors",
 ];
@@ -91,8 +97,7 @@ fn ensure_table_does_not_exist(
             // - None means empty iterator -> OK for new table
             match files.next() {
                 Some(Ok(_)) => Err(Error::generic(format!(
-                    "Table already exists at path: {}",
-                    table_path
+                    "Table already exists at path: {table_path}"
                 ))),
                 Some(Err(Error::FileNotFound(_))) | None => {
                     // Path doesn't exist or empty - OK for new table
@@ -259,6 +264,34 @@ fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableP
     }
 }
 
+/// Conditionally adds the `timestampNtz` feature to the protocol when the schema contains
+/// TimestampNTZ columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_timestamp_ntz(schema) {
+        add_feature_to_lists(
+            TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `inCommitTimestamp` feature to the protocol when
+/// `delta.enableInCommitTimestamps=true` is set in the table properties.
+fn maybe_enable_in_commit_timestamps(validated: &mut ValidatedTableProperties) {
+    let enabled = validated
+        .properties
+        .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+        .is_some_and(|v| v == "true");
+    if enabled {
+        add_feature_to_lists(
+            TableFeature::InCommitTimestamp,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -341,8 +374,7 @@ fn validate_extract_table_features_and_properties(
         // Validate that the value is "supported"
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
             return Err(Error::generic(format!(
-                "Invalid value '{}' for '{}'. Only '{}' is allowed.",
-                value, key, SET_TABLE_FEATURE_SUPPORTED_VALUE
+                "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
             )));
         }
 
@@ -353,8 +385,7 @@ fn validate_extract_table_features_and_properties(
 
         if !ALLOWED_DELTA_FEATURES.contains(&feature) {
             return Err(Error::generic(format!(
-                "Enabling feature '{}' via '{}' is not supported during CREATE TABLE",
-                feature_name, key
+                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             )));
         }
 
@@ -368,8 +399,7 @@ fn validate_extract_table_features_and_properties(
             && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
         {
             return Err(Error::generic(format!(
-                "Setting delta property '{}' is not supported during CREATE TABLE",
-                key
+                "Setting delta property '{key}' is not supported during CREATE TABLE"
             )));
         }
     }
@@ -542,6 +572,12 @@ impl CreateTableTransactionBuilder {
 
         // Auto-enable variantType feature if schema contains Variant columns
         maybe_enable_variant_type(&effective_schema, &mut validated);
+
+        // Auto-enable timestampNtz feature if schema contains TimestampNTZ columns
+        maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+
+        // Auto-enable inCommitTimestamp feature if property is set
+        maybe_enable_in_commit_timestamps(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -857,57 +893,63 @@ mod tests {
         assert!(builder.data_layout.is_clustered());
     }
 
-    #[test]
-    fn test_variant_auto_enabled_from_schema() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
+    #[rstest::rstest]
+    #[case::variant_top_level(
+        Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("v", DataType::unshredded_variant(), true),
-        ]));
-        let mut validated = ValidatedTableProperties {
-            properties: HashMap::new(),
-            reader_features: vec![],
-            writer_features: vec![],
-        };
-
-        maybe_enable_variant_type(&schema, &mut validated);
-
-        assert!(validated
-            .reader_features
-            .contains(&TableFeature::VariantType));
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::VariantType));
-    }
-
-    #[test]
-    fn test_variant_not_enabled_without_variant_columns() {
-        let schema = test_schema();
-        let mut validated = ValidatedTableProperties {
-            properties: HashMap::new(),
-            reader_features: vec![],
-            writer_features: vec![],
-        };
-
-        maybe_enable_variant_type(&schema, &mut validated);
-
-        assert!(validated.reader_features.is_empty());
-        assert!(validated.writer_features.is_empty());
-    }
-
-    #[test]
-    fn test_variant_auto_enabled_nested() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
+        ])),
+        &[TableFeature::VariantType],
+    )]
+    #[case::variant_nested(
+        Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
-                    "inner_v",
-                    DataType::unshredded_variant(),
-                    true,
-                )]))),
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                    StructField::new("inner_v", DataType::unshredded_variant(), true),
+                ]))),
                 true,
             ),
-        ]));
+        ])),
+        &[TableFeature::VariantType],
+    )]
+    #[case::ntz_top_level(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
+        ])),
+        &[TableFeature::TimestampWithoutTimezone],
+    )]
+    #[case::ntz_nested(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(
+                "nested",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                    StructField::new("inner_ts", DataType::TIMESTAMP_NTZ, true),
+                ]))),
+                true,
+            ),
+        ])),
+        &[TableFeature::TimestampWithoutTimezone],
+    )]
+    #[case::both_variant_and_ntz(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("v", DataType::unshredded_variant(), true),
+            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
+        ])),
+        &[TableFeature::VariantType, TableFeature::TimestampWithoutTimezone],
+    )]
+    #[case::no_special_types(
+        test_schema(),
+        &[],
+    )]
+    fn test_schema_driven_feature_auto_enablement(
+        #[case] schema: SchemaRef,
+        #[case] expected_features: &[TableFeature],
+    ) {
         let mut validated = ValidatedTableProperties {
             properties: HashMap::new(),
             reader_features: vec![],
@@ -915,12 +957,65 @@ mod tests {
         };
 
         maybe_enable_variant_type(&schema, &mut validated);
+        maybe_enable_timestamp_ntz(&schema, &mut validated);
 
-        assert!(validated
-            .reader_features
-            .contains(&TableFeature::VariantType));
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::VariantType));
+        for feature in expected_features {
+            assert!(
+                validated.reader_features.contains(feature),
+                "Expected {feature:?} in reader_features"
+            );
+            assert!(
+                validated.writer_features.contains(feature),
+                "Expected {feature:?} in writer_features"
+            );
+        }
+        assert_eq!(
+            validated.reader_features.len(),
+            expected_features.len(),
+            "Unexpected extra reader features: {:?}",
+            validated.reader_features
+        );
+        assert_eq!(
+            validated.writer_features.len(),
+            expected_features.len(),
+            "Unexpected extra writer features: {:?}",
+            validated.writer_features
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::property_true(&[("delta.enableInCommitTimestamps", "true")], true, true)]
+    #[case::property_false(&[("delta.enableInCommitTimestamps", "false")], false, true)]
+    #[case::property_absent(&[], false, false)]
+    #[case::feature_signal(&[("delta.feature.inCommitTimestamp", "supported")], true, false)]
+    fn test_ict_support_and_enablement(
+        #[case] properties: &[(&str, &str)],
+        #[case] expect_in_writer_features: bool,
+        #[case] expect_property_preserved: bool,
+    ) {
+        let properties: HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        maybe_enable_in_commit_timestamps(&mut validated);
+
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            expect_in_writer_features,
+        );
+        assert_eq!(
+            validated
+                .properties
+                .contains_key(ENABLE_IN_COMMIT_TIMESTAMPS),
+            expect_property_preserved,
+        );
+        assert!(
+            validated.reader_features.is_empty(),
+            "InCommitTimestamp is writer-only, reader_features should always be empty"
+        );
     }
 }
