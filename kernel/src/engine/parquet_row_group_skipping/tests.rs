@@ -468,10 +468,28 @@ fn test_row_group_filter_null_literal_evaluates_to_false() {
 
     // NULL literal converts to false in all contexts
     assert!(!RowGroupFilter::apply(row_group, &null));
-    assert!(!RowGroupFilter::apply(row_group, &Predicate::and(in_range.clone(), null.clone())));
-    assert!(!RowGroupFilter::apply(row_group, &Predicate::and(out_of_range.clone(), null.clone())));
-    assert!(RowGroupFilter::apply(row_group, &Predicate::or(in_range, null.clone())));
-    assert!(!RowGroupFilter::apply(row_group, &Predicate::or(out_of_range, null.clone())));
-    assert!(!RowGroupFilter::apply(row_group, &Predicate::and(null.clone(), null.clone())));
-    assert!(!RowGroupFilter::apply(row_group, &Predicate::or(null.clone(), null)));
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::and(in_range.clone(), null.clone())
+    ));
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::and(out_of_range.clone(), null.clone())
+    ));
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::or(in_range, null.clone())
+    ));
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::or(out_of_range, null.clone())
+    ));
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::and(null.clone(), null.clone())
+    ));
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::or(null.clone(), null)
+    ));
 }

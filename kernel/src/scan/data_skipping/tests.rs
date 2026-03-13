@@ -843,8 +843,7 @@ fn test_checkpoint_skipping_unsupported_predicate(
     #[case] partition_columns: &[&str],
     #[case] expect_none: bool,
 ) {
-    let partition_columns: Vec<String> =
-        partition_columns.iter().map(|s| s.to_string()).collect();
+    let partition_columns: Vec<String> = partition_columns.iter().map(|s| s.to_string()).collect();
     let result = as_checkpoint_skipping_predicate(&pred, &partition_columns);
     if expect_none {
         assert!(
@@ -852,9 +851,6 @@ fn test_checkpoint_skipping_unsupported_predicate(
             "expected None for unsupported predicate: {pred:#?}"
         );
     } else {
-        assert!(
-            result.is_some(),
-            "expected Some for predicate: {pred:#?}"
-        );
+        assert!(result.is_some(), "expected Some for predicate: {pred:#?}");
     }
 }
