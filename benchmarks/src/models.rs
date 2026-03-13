@@ -26,12 +26,19 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
+/// Info needed to access a table via Unity Catalog credential vending
+#[derive(Clone, Debug, Deserialize)]
+pub struct CatalogManagedInfo {
+    pub table_name: String, // UC fully-qualified name: "catalog.schema.table"
+}
+
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 pub struct TableInfo {
     pub name: String,                // Table name used for identifying the table
     pub description: Option<String>, // Human-readable description of the table
     pub table_path: Option<String>, // URL to the table (for remote tables); also used to override the default local table path
+    pub catalog_managed_info: Option<CatalogManagedInfo>, // UC credential vending info for remote tables
     #[serde(skip, default)]
     pub table_info_dir: PathBuf, // Path to the directory containing the table info JSON file
 }
@@ -161,6 +168,34 @@ mod tests {
 
         assert_eq!(table_info.name, expected_name);
         assert_eq!(table_info.description.as_deref(), expected_description);
+    }
+
+    #[rstest]
+    #[case(
+        r#"{"name": "uc_table", "catalog_managed_info": {"table_name": "main.schema.table"}}"#,
+        "uc_table",
+        Some("main.schema.table")
+    )]
+    #[case(
+        r#"{"name": "local_table"}"#,
+        "local_table",
+        None
+    )]
+    fn test_deserialize_catalog_managed_info(
+        #[case] json: &str,
+        #[case] expected_name: &str,
+        #[case] expected_uc_table: Option<&str>,
+    ) {
+        let table_info: TableInfo =
+            serde_json::from_str(json).expect("Failed to deserialize table info");
+        assert_eq!(table_info.name, expected_name);
+        assert_eq!(
+            table_info
+                .catalog_managed_info
+                .as_ref()
+                .map(|c| c.table_name.as_str()),
+            expected_uc_table
+        );
     }
 
     #[rstest]
