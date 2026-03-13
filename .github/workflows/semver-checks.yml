@@ -12,6 +12,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # See build.yml top-level comment for why we use both sccache and Swatinem/rust-cache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   check_if_pr_breaks_semver:
@@ -30,6 +33,7 @@ jobs:
                 || github.event.pull_request.head.sha }}
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-semver-checks
         shell: bash
         run: |
@@ -70,6 +74,9 @@ jobs:
         run: |
           echo "Checks succeed"
           echo "check_status=success" >> $GITHUB_OUTPUT
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
     outputs:
       check_status: ${{ steps.set_failure.outputs.check_status || steps.set_success.outputs.check_status }}
   update_label_if_needed:
