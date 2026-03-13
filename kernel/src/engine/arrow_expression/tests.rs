@@ -992,14 +992,17 @@ fn test_to_json_with_struct_array() {
     );
     assert_eq!(
         json_array.value(1),
-        r#"{"bool_field":false,"string_field":"world"}"#
+        r#"{"bool_field":false,"int_field":null,"string_field":"world"}"#
     );
     assert_eq!(
         json_array.value(2),
-        r#"{"int_field":84,"string_field":"test"}"#
+        r#"{"bool_field":null,"int_field":84,"string_field":"test"}"#
     );
     // All fields of the struct row are null
-    assert_eq!(json_array.value(3), r#"{}"#);
+    assert_eq!(
+        json_array.value(3),
+        r#"{"bool_field":null,"int_field":null,"string_field":null}"#
+    );
     // The struct row itself is null
     assert!(json_array.is_null(4));
 }
@@ -1103,6 +1106,6 @@ fn test_to_json_with_nested_struct() {
     );
     assert_eq!(
         json_array.value(1),
-        r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
+        r#"{"outer_int":200,"nested_struct":{"inner_int":null,"inner_string":"value"}}"#
     );
 }

@@ -5,7 +5,6 @@ use crate::utils::test_utils::string_array_to_engine_data;
 use itertools::Itertools;
 use std::sync::Arc;
 
-use crate::actions::get_log_add_schema;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
 use crate::{
@@ -21,8 +20,8 @@ use crate::{
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
+use crate::scan::transform_spec::TransformSpec;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::TransformSpec;
 
 // Generates a batch of sidecar actions with the given paths.
 // The schema is provided as null columns affect equality checks.
@@ -149,12 +148,9 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         transform_spec,
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schema: None,
-        logical_stats_schema: None,
+        physical_partition_schema: None,
     });
-    let checkpoint_info = CheckpointReadInfo {
-        has_stats_parsed: false,
-        checkpoint_read_schema: get_log_add_schema().clone(),
-    };
+    let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let iter = scan_action_iter(
         &SyncEngine::new(),
         batch

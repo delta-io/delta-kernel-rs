@@ -1,13 +1,16 @@
+use std::ops::Range;
+
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     types::{
         Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
         Int32Type, Int64Type, TimestampMicrosecondType,
     },
-    Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
-    PrimitiveArray, RunArray,
+    Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray,
 };
 
+use crate::engine::arrow_data::as_string_accessor;
 use crate::{
     engine_data::{GetData, ListItem, MapItem},
     DeltaResult, Error,
@@ -69,32 +72,108 @@ impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i32>> {
     }
 }
 
+impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i64>> {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a str>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl<'a> GetData<'a> for StringViewArray {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a str>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
 impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i32>> {
     fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
 
-impl<'a, OffsetSize> GetData<'a> for GenericListArray<OffsetSize>
-where
-    OffsetSize: OffsetSizeTrait,
-{
-    fn get_list(
-        &'a self,
-        row_index: usize,
-        _field_name: &str,
-    ) -> DeltaResult<Option<ListItem<'a>>> {
-        Ok(self
-            .is_valid(row_index)
-            .then(|| ListItem::new(self, row_index)))
+impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i64>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl<'a> GetData<'a> for BinaryViewArray {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+/// Uniform access to list-like Arrow arrays (List, LargeList, ListView, LargeListView),
+/// abstracting away differences in how each type computes per-row offsets.
+trait ListLikeArray: Array {
+    fn list_values(&self) -> &dyn Array;
+    fn row_offsets(&self, row: usize) -> Range<usize>;
+}
+
+impl<O: OffsetSizeTrait> ListLikeArray for GenericListArray<O> {
+    fn list_values(&self) -> &dyn Array {
+        self.values().as_ref()
+    }
+    fn row_offsets(&self, row: usize) -> Range<usize> {
+        self.offsets()[row].as_usize()..self.offsets()[row + 1].as_usize()
+    }
+}
+
+impl<O: OffsetSizeTrait> ListLikeArray for GenericListViewArray<O> {
+    fn list_values(&self) -> &dyn Array {
+        self.values().as_ref()
+    }
+    fn row_offsets(&self, row: usize) -> Range<usize> {
+        let start = self.offsets()[row].as_usize();
+        start..start + self.sizes()[row].as_usize()
+    }
+}
+
+fn get_list_item<'a>(
+    list: &'a impl ListLikeArray,
+    row_index: usize,
+    field_name: &str,
+) -> DeltaResult<Option<ListItem<'a>>> {
+    if !list.is_valid(row_index) {
+        return Ok(None);
+    }
+    let values = as_string_accessor(list.list_values()).ok_or_else(|| {
+        Error::unexpected_column_type(format!(
+            "{field_name}: list values are not a supported string type"
+        ))
+    })?;
+    Ok(Some(ListItem::new(values, list.row_offsets(row_index))))
+}
+
+impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListArray<OffsetSize> {
+    fn get_list(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<ListItem<'a>>> {
+        get_list_item(self, row_index, field_name)
+    }
+}
+
+impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListViewArray<OffsetSize> {
+    fn get_list(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<ListItem<'a>>> {
+        get_list_item(self, row_index, field_name)
     }
 }
 
 impl<'a> GetData<'a> for MapArray {
-    fn get_map(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<MapItem<'a>>> {
-        Ok(self
-            .is_valid(row_index)
-            .then(|| MapItem::new(self, row_index)))
+    fn get_map(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<MapItem<'a>>> {
+        if !self.is_valid(row_index) {
+            return Ok(None);
+        }
+        let keys = as_string_accessor(self.keys().as_ref()).ok_or_else(|| {
+            Error::unexpected_column_type(format!(
+                "{field_name}: map keys are not a supported string type"
+            ))
+        })?;
+        let values = as_string_accessor(self.values().as_ref()).ok_or_else(|| {
+            Error::unexpected_column_type(format!(
+                "{field_name}: map values are not a supported string type"
+            ))
+        })?;
+        let start = self.offsets()[row_index] as usize;
+        let end = self.offsets()[row_index + 1] as usize;
+        Ok(Some(MapItem::new(keys, values, start..end)))
     }
 }
 
@@ -110,8 +189,7 @@ fn validate_and_get_physical_index(
 ) -> DeltaResult<usize> {
     if row_index >= run_array.len() {
         return Err(Error::generic(format!(
-            "Row index {} out of bounds for field '{}'",
-            row_index, field_name
+            "Row index {row_index} out of bounds for field '{field_name}'"
         )));
     }
 
@@ -204,7 +282,8 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
 mod tests {
     use super::*;
     use crate::arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray,
+        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, PrimitiveArray,
     };
     use crate::engine_data::GetData;
 
@@ -310,6 +389,44 @@ mod tests {
         assert_eq!(array.get_decimal(0, "f").unwrap(), Some(12345));
         assert_eq!(array.get_decimal(1, "f").unwrap(), Some(-99999));
         assert_eq!(array.get_decimal(2, "f").unwrap(), None);
+    }
+
+    // =========================================================================
+    // Alternative Arrow representations for STRING and BINARY:
+    //   STRING -> LargeUtf8 (LargeStringArray), Utf8View (StringViewArray)
+    //   BINARY -> LargeBinary (LargeBinaryArray), BinaryView (BinaryViewArray)
+    // =========================================================================
+
+    #[test]
+    fn test_get_str_large_string() {
+        let array = LargeStringArray::from(vec![Some("hello"), Some("world"), None]);
+        assert_eq!(array.get_str(0, "f").unwrap(), Some("hello"));
+        assert_eq!(array.get_str(1, "f").unwrap(), Some("world"));
+        assert_eq!(array.get_str(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_str_string_view() {
+        let array = StringViewArray::from(vec![Some("hello"), Some("world"), None]);
+        assert_eq!(array.get_str(0, "f").unwrap(), Some("hello"));
+        assert_eq!(array.get_str(1, "f").unwrap(), Some("world"));
+        assert_eq!(array.get_str(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_binary_large_binary() {
+        let array = LargeBinaryArray::from(vec![Some(b"abc" as &[u8]), Some(b"xyz"), None]);
+        assert_eq!(array.get_binary(0, "f").unwrap(), Some(b"abc" as &[u8]));
+        assert_eq!(array.get_binary(1, "f").unwrap(), Some(b"xyz" as &[u8]));
+        assert_eq!(array.get_binary(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_binary_binary_view() {
+        let array = BinaryViewArray::from(vec![Some(b"abc" as &[u8]), Some(b"xyz"), None]);
+        assert_eq!(array.get_binary(0, "f").unwrap(), Some(b"abc" as &[u8]));
+        assert_eq!(array.get_binary(1, "f").unwrap(), Some(b"xyz" as &[u8]));
+        assert_eq!(array.get_binary(2, "f").unwrap(), None);
     }
 
     // =========================================================================

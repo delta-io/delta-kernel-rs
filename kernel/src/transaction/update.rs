@@ -62,7 +62,7 @@ impl Transaction {
             .ensure_operation_supported(Operation::Write)?;
 
         // Read clustering columns from snapshot (returns None if clustering not enabled)
-        let clustering_columns = read_snapshot.get_clustering_columns(engine)?;
+        let clustering_columns = read_snapshot.get_clustering_columns_physical(engine)?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -88,7 +88,7 @@ impl Transaction {
             data_change: true,
             is_blind_append: false,
             dv_matched_files: vec![],
-            clustering_columns,
+            clustering_columns_physical: clustering_columns,
             _state: PhantomData,
         })
     }

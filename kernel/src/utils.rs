@@ -1,5 +1,6 @@
 //! Various utility functions/macros used throughout the kernel
 use std::borrow::Cow;
+use std::iter::ExactSizeIterator;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -99,7 +100,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
@@ -144,14 +145,46 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
     }
 }
 
+/// Rebuilds a parent from transformed children only when needed.
+///
+/// Child transforms may filter nodes by returning `None`. If all children are filtered out, this
+/// returns `None`. If all original children survive as borrowed values, this returns a borrowed
+/// parent. Otherwise, it rebuilds and returns an owned parent.
+pub(crate) fn map_owned_children_or_else<'a, Parent, Child>(
+    parent: &'a Parent,
+    children: impl ExactSizeIterator<Item = Option<Cow<'a, Child>>>,
+    map_owned: impl FnOnce(Vec<Child::Owned>) -> Parent::Owned,
+) -> Option<Cow<'a, Parent>>
+where
+    Parent: ToOwned + ?Sized,
+    Child: ToOwned + ?Sized + 'a,
+{
+    let num_children = children.len();
+    let mut num_borrowed = 0;
+    let mut new_children = Vec::with_capacity(num_children);
+    for child in children.flatten() {
+        if let Cow::Borrowed(_) = child {
+            num_borrowed += 1;
+        }
+        new_children.push(child);
+    }
+
+    if new_children.is_empty() {
+        None
+    } else if num_borrowed < num_children {
+        let owned = new_children.into_iter().map(Cow::into_owned).collect();
+        Some(Cow::Owned(map_owned(owned)))
+    } else {
+        Some(Cow::Borrowed(parent))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_utils {
     use std::path::PathBuf;
     use std::{path::Path, sync::Arc};
 
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
@@ -166,6 +199,9 @@ pub(crate) mod test_utils {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::ObjectStore;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
@@ -352,7 +388,7 @@ pub(crate) mod test_utils {
         struct_type
             .fields()
             .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{}' not found", name))
+            .unwrap_or_else(|| panic!("Field '{name}' not found"))
             .clone()
     }
 
@@ -365,8 +401,7 @@ pub(crate) mod test_utils {
             let field = get_schema_field(schema, field_name);
             assert!(
                 matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{}' should be a struct type",
-                field_name
+                "Field '{field_name}' should be a struct type"
             );
         }
 
@@ -644,6 +679,31 @@ pub(crate) mod test_utils {
         ]))
     }
 
+    /// Deeply nested schema: struct -> array -> struct -> map(value) -> struct.
+    ///
+    /// The leaf struct field is intentionally **not** annotated with column mapping metadata,
+    /// so this schema can be used to test error paths when column mapping is enabled.
+    pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
+        let leaf_struct =
+            StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
+        let map_type = MapType::new(
+            KernelDataType::STRING,
+            KernelDataType::Struct(Box::new(leaf_struct)),
+            true,
+        );
+        let mid_struct = StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("mid_field", map_type),
+            2,
+            "phys_mid_field",
+        )]);
+        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
+        StructType::new_unchecked([with_column_mapping(
+            StructField::nullable("top", array_type),
+            1,
+            "phys_top",
+        )])
+    }
+
     /// Build a create-table transaction with the given schema and column mapping mode.
     /// Returns the engine and uncommitted transaction.
     pub(crate) fn setup_column_mapping_txn(
@@ -655,7 +715,7 @@ pub(crate) mod test_utils {
             ColumnMappingMode::Id => "id",
             ColumnMappingMode::None => "none",
         };
-        let store = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(InMemory::new());
         let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")
@@ -756,7 +816,7 @@ pub(crate) mod test_utils {
                 path.push("tests/data");
                 path.push(table_name);
                 let path = std::fs::canonicalize(path)
-                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {e}")))?;
                 (path, None)
             }
         };

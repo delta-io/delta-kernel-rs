@@ -7,7 +7,7 @@ use crate::expressions::{
     MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
     Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
 };
-use crate::utils::CowExt as _;
+use crate::utils::{map_owned_children_or_else, CowExt as _};
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -184,9 +184,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Predicate(p) => self
                 .transform_expr_pred(p)?
                 .map_owned_or_else(expr, Expression::from),
-            Expression::Struct(s) => self
+            Expression::Struct(s, nullability) => self
                 .transform_expr_struct(s)?
-                .map_owned_or_else(expr, Expression::Struct),
+                .map_owned_or_else(expr, |exprs| Expression::Struct(exprs, nullability.clone())),
             Expression::Transform(t) => self
                 .transform_expr_transform(t)?
                 .map_owned_or_else(expr, Expression::Transform),
@@ -250,10 +250,11 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         fields: &'a [ExpressionRef],
     ) -> Option<Cow<'a, [ExpressionRef]>> {
-        recurse_into_children(fields, |f| {
-            self.transform_expr(f)
-                .map(|cow| cow.map_owned_or_else(f, Arc::new))
-        })
+        let transformed_children = fields.iter().map(|f| {
+            let transformed = self.transform_expr(f)?;
+            Some(transformed.map_owned_or_else(f, Arc::new))
+        });
+        map_owned_children_or_else(fields, transformed_children, |fields| fields)
     }
 
     /// Recursively transforms the child expression of a [`ParseJsonExpression`]. The schema is
@@ -287,8 +288,9 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         o: &'a OpaqueExpression,
     ) -> Option<Cow<'a, OpaqueExpression>> {
-        let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
-        Some(nested_result.map_owned_or_else(o, |exprs| OpaqueExpression::new(o.op.clone(), exprs)))
+        let transformed_children = o.exprs.iter().map(|e| self.transform_expr(e));
+        let map_owned = |exprs| OpaqueExpression::new(o.op.clone(), exprs);
+        map_owned_children_or_else(o, transformed_children, map_owned)
     }
 
     /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
@@ -358,8 +360,9 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         v: &'a VariadicExpression,
     ) -> Option<Cow<'a, VariadicExpression>> {
-        let nested_result = recurse_into_children(&v.exprs, |e| self.transform_expr(e))?;
-        Some(nested_result.map_owned_or_else(v, |exprs| VariadicExpression::new(v.op, exprs)))
+        let transformed_children = v.exprs.iter().map(|e| self.transform_expr(e));
+        let map_owned = |exprs| VariadicExpression::new(v.op, exprs);
+        map_owned_children_or_else(v, transformed_children, map_owned)
     }
 
     /// Recursively transforms a junction predicate's children. Returns `None` if all children were
@@ -369,8 +372,9 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         j: &'a JunctionPredicate,
     ) -> Option<Cow<'a, JunctionPredicate>> {
-        let nested_result = recurse_into_children(&j.preds, |p| self.transform_pred(p))?;
-        Some(nested_result.map_owned_or_else(j, |preds| JunctionPredicate::new(j.op, preds)))
+        let transformed_children = j.preds.iter().map(|p| self.transform_pred(p));
+        let map_owned = |preds| JunctionPredicate::new(j.op, preds);
+        map_owned_children_or_else(j, transformed_children, map_owned)
     }
 
     /// Recursively transforms the children of an [`OpaquePredicate`]. Returns `None` if all
@@ -380,35 +384,9 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         o: &'a OpaquePredicate,
     ) -> Option<Cow<'a, OpaquePredicate>> {
-        let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
-        Some(nested_result.map_owned_or_else(o, |exprs| OpaquePredicate::new(o.op.clone(), exprs)))
-    }
-}
-
-/// Used to recurse into the children of an `Expression::Struct` or `Predicate::Junction`.
-fn recurse_into_children<'a, T: Clone>(
-    children: &'a [T],
-    recurse_fn: impl FnMut(&'a T) -> Option<Cow<'a, T>>,
-) -> Option<Cow<'a, [T]>> {
-    let mut num_borrowed = 0;
-    let new_children: Vec<_> = children
-        .iter()
-        .filter_map(recurse_fn)
-        .inspect(|f| {
-            if matches!(f, Cow::Borrowed(_)) {
-                num_borrowed += 1;
-            }
-        })
-        .collect();
-
-    if new_children.is_empty() {
-        None // all children filtered out
-    } else if num_borrowed < children.len() {
-        // At least one child was changed or removed, so make a new child list
-        let children = new_children.into_iter().map(Cow::into_owned).collect();
-        Some(Cow::Owned(children))
-    } else {
-        Some(Cow::Borrowed(children))
+        let transformed_children = o.exprs.iter().map(|e| self.transform_expr(e));
+        let map_owned = |exprs| OpaquePredicate::new(o.op.clone(), exprs);
+        map_owned_children_or_else(o, transformed_children, map_owned)
     }
 }
 

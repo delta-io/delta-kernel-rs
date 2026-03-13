@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use url::Url;
@@ -15,6 +14,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
@@ -124,7 +124,7 @@ async fn verify_row_tracking_in_commit(
     expected_base_row_ids: Vec<i64>,
     expected_row_id_high_water_mark: i64,
 ) -> DeltaResult<()> {
-    let commit_url = table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
+    let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
     let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
 
     let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)

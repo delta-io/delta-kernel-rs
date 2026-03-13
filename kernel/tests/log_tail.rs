@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use object_store::memory::InMemory;
-use object_store::path::Path;
 use url::Url;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::{FileMeta, LogPath, Snapshot};
 
 use test_utils::{
@@ -63,20 +63,26 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 2);
     let log_segment = snapshot.log_segment();
-    assert_eq!(log_segment.ascending_commit_files.len(), 3);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 3);
     // version 0 is commit
     assert_eq!(
-        log_segment.ascending_commit_files[0].location.location,
+        log_segment.listed.ascending_commit_files[0]
+            .location
+            .location,
         table_root.join(delta_path_for_version(0, "json").as_ref())?
     );
     // version 1 is (the right) staged commit
     assert_eq!(
-        log_segment.ascending_commit_files[1].location.location,
+        log_segment.listed.ascending_commit_files[1]
+            .location
+            .location,
         table_root.join(path1.as_ref())?
     );
     // version 2 is staged commit
     assert_eq!(
-        log_segment.ascending_commit_files[2].location.location,
+        log_segment.listed.ascending_commit_files[2]
+            .location
+            .location,
         table_root.join(path2.as_ref())?
     );
 
@@ -87,15 +93,19 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
-    assert_eq!(log_segment.ascending_commit_files.len(), 2);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 2);
     // version 0 is commit
     assert_eq!(
-        log_segment.ascending_commit_files[0].location.location,
+        log_segment.listed.ascending_commit_files[0]
+            .location
+            .location,
         table_root.join(delta_path_for_version(0, "json").as_ref())?
     );
     // version 1 is (the right) staged commit
     assert_eq!(
-        log_segment.ascending_commit_files[1].location.location,
+        log_segment.listed.ascending_commit_files[1]
+            .location
+            .location,
         table_root.join(path1.as_ref())?
     );
 
@@ -106,15 +116,19 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
-    assert_eq!(log_segment.ascending_commit_files.len(), 2);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 2);
     // version 0 is commit
     assert_eq!(
-        log_segment.ascending_commit_files[0].location.location,
+        log_segment.listed.ascending_commit_files[0]
+            .location
+            .location,
         table_root.join(delta_path_for_version(0, "json").as_ref())?
     );
     // version 1 is (the right) staged commit
     assert_eq!(
-        log_segment.ascending_commit_files[1].location.location,
+        log_segment.listed.ascending_commit_files[1]
+            .location
+            .location,
         table_root.join(path1.as_ref())?
     );
 
@@ -122,10 +136,12 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
     let log_segment = snapshot.log_segment();
-    assert_eq!(log_segment.ascending_commit_files.len(), 1);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 1);
     // version 0 is commit
     assert_eq!(
-        log_segment.ascending_commit_files[0].location.location,
+        log_segment.listed.ascending_commit_files[0]
+            .location
+            .location,
         table_root.join(delta_path_for_version(0, "json").as_ref())?
     );
 
@@ -140,10 +156,12 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
 
     assert_eq!(snapshot.version(), 0);
     let log_segment = snapshot.log_segment();
-    assert_eq!(log_segment.ascending_commit_files.len(), 1);
+    assert_eq!(log_segment.listed.ascending_commit_files.len(), 1);
     // version 0 is commit
     assert_eq!(
-        log_segment.ascending_commit_files[0].location.location,
+        log_segment.listed.ascending_commit_files[0]
+            .location
+            .location,
         table_root.join(delta_path_for_version(0, "json").as_ref())?
     );
 

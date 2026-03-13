@@ -7,10 +7,9 @@
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
 };
-use delta_kernel::parallel::parallel_phase::ParallelPhase;
-use delta_kernel::parallel::sequential_phase::AfterSequential;
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{try_parse_uri, Engine, Error};
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::Snapshot;
+use delta_kernel::{Engine, Error};
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -39,8 +38,7 @@ impl ReadMetadataRunner {
         config: ReadConfig,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = table_info.resolved_table_root();
-        let url = try_parse_uri(table_root)?;
+        let url = table_info.resolved_table_root();
 
         let mut builder = Snapshot::builder_for(url);
         if let Some(version) = read_spec.version {
@@ -83,8 +81,8 @@ impl ReadMetadataRunner {
         }
 
         match phase1.finish()? {
-            AfterSequential::Done(_) => {}
-            AfterSequential::Parallel { processor, files } => {
+            AfterSequentialScanMetadata::Done => {}
+            AfterSequentialScanMetadata::Parallel { state, files } => {
                 if num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
@@ -95,13 +93,13 @@ impl ReadMetadataRunner {
                     .map(|chunk| chunk.to_vec())
                     .collect();
 
-                let processor = Arc::new(processor);
+                let state = Arc::new(*state);
 
                 let handles: Vec<_> = partitions
                     .into_iter()
                     .map(|partition_files| {
                         let engine = self.engine.clone();
-                        let processor = processor.clone();
+                        let state = state.clone();
 
                         thread::spawn(move || -> Result<(), Error> {
                             if partition_files.is_empty() {
@@ -109,7 +107,7 @@ impl ReadMetadataRunner {
                             }
 
                             let parallel =
-                                ParallelPhase::try_new(engine, processor, partition_files)?;
+                                ParallelScanMetadata::try_new(engine, state, partition_files)?;
                             for result in parallel {
                                 black_box(result?);
                             }
@@ -180,8 +178,7 @@ impl SnapshotConstructionRunner {
         snapshot_spec: &SnapshotConstructionSpec,
         engine: Arc<dyn Engine>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let table_root = table_info.resolved_table_root();
-        let url = try_parse_uri(table_root)?;
+        let url = table_info.resolved_table_root();
 
         let name = format!(
             "{}/{}/{}",
@@ -224,13 +221,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_table_info() -> TableInfo {
+        let path = format!(
+            "{}/../kernel/tests/data/basic_partitioned",
+            env!("CARGO_MANIFEST_DIR")
+        );
         TableInfo {
             name: "basic_partitioned".to_string(),
-            description: None,
-            table_path: Some(format!(
-                "{}/../kernel/tests/data/basic_partitioned",
-                env!("CARGO_MANIFEST_DIR")
-            )),
+            description: "basic partitioned table for testing".to_string(),
+            table_path: Some(Url::from_file_path(path).unwrap()),
+            tags: vec![],
             table_info_dir: PathBuf::new(),
         }
     }

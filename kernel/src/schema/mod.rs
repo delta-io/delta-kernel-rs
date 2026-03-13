@@ -1,7 +1,7 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
@@ -15,8 +15,9 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
+use crate::table_features::get_field_column_mapping_info;
 use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, CowExt as _};
+use crate::utils::{map_owned_children_or_else, require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
@@ -430,67 +431,17 @@ impl StructField {
     /// `Id` or `Name`, this is specified in [`ColumnMetadataKey::ColumnMappingPhysicalName`].
     /// Otherwise, the field's logical name is used.
     ///
-    /// If the `column_mapping_mode` is `None`, then all column mapping metadata is removed.
-    /// If the `column_mapping_mode` is `Name`, then all Id mode column mapping metadata is
-    /// removed.
-    ///
-    /// NOTE: The caller must ensure that the schema has been validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`] to ensure that annotations are
-    /// present only when column mapping mode is enabled.
+    /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
+    /// missing when column mapping is enabled, present when disabled, or wrong type), or if a
+    /// metadata column is encountered (metadata columns should not participate in column mapping).
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
-    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
-        struct MakePhysical {
-            column_mapping_mode: ColumnMappingMode,
-        }
-        impl<'a> SchemaTransform<'a> for MakePhysical {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                let field = self.recurse_into_struct_field(field)?;
-
-                let metadata = field.logical_to_physical_metadata(self.column_mapping_mode);
-                let name = match self.column_mapping_mode {
-                    ColumnMappingMode::None => field.name().to_owned(),
-                    ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                        // Assert that the physical name is present
-                        match field.is_metadata_column() {
-                            true => {
-                                debug_assert!(
-                                    false,
-                                    "Metadata column should not have a physical name"
-                                );
-                            }
-                            false => {
-                                debug_assert!(field
-                                    .metadata
-                                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                                    .is_some_and(|x| matches!(x, MetadataValue::String(_))));
-                            }
-                        }
-                        field.physical_name(self.column_mapping_mode).to_owned()
-                    }
-                };
-
-                Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
-            }
-
-            fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-                // There is no column mapping metadata inside the struct fields of a variant, so
-                // we do not recurse into the variant fields
-                Some(Cow::Borrowed(stype))
-            }
-        }
-        // NOTE: unwrap is safe because the transformer is incapable of returning None
-        #[allow(clippy::unwrap_used)]
-        MakePhysical {
-            column_mapping_mode,
-        }
-        .transform_struct_field(self)
-        .unwrap()
-        .into_owned()
+    pub(crate) fn make_physical(
+        &self,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        MakePhysical::new(column_mapping_mode).run_field(self)
     }
 
     fn has_invariants(&self) -> bool {
@@ -501,8 +452,10 @@ impl StructField {
     /// Converts logical schema StructField metadata to physical schema metadata
     /// based on the specified `column_mapping_mode`.
     ///
-    /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_column_mapping`], to ensure that annotations are
+    /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
+    ///
+    /// NOTE: Caller affirms that `self` was already validated by
+    /// [`crate::table_features::get_field_column_mapping_info`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     fn logical_to_physical_metadata(
         &self,
@@ -516,7 +469,7 @@ impl StructField {
         match column_mapping_mode {
             ColumnMappingMode::Id => {
                 let Some(MetadataValue::Number(fid)) = field_id else {
-                    // `validate_column_mapping` should have verified that this has a field Id
+                    // `get_field_column_mapping_info` should have verified that this has a field Id
                     warn!("StructField with name {} is missing field id in the Id column mapping mode", self.name());
                     debug_assert!(false);
                     return base_metadata;
@@ -568,7 +521,7 @@ impl Display for StructField {
                 metadata_str.push_str(", ");
             }
             first = false;
-            metadata_str.push_str(&format!("{}: {:?}", k, v));
+            metadata_str.push_str(&format!("{k}: {v:?}"));
         }
         metadata_str.push('}');
         write!(
@@ -636,12 +589,14 @@ impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
-    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate field names (case-insensitive; Delta column names are
+    ///   case-insensitive per the protocol)
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
+        let mut seen_lowercase_names = HashSet::new();
 
         // Validate each field during insertion
         for (i, field) in fields.into_iter().enumerate() {
@@ -659,10 +614,16 @@ impl StructType {
                 }
             }
 
-            // Check for duplicate field names
-            if let Some(dup) = field_map.insert(field.name.clone(), field) {
-                return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
+            let key = field.name.to_lowercase();
+            if !seen_lowercase_names.insert(key) {
+                return Err(Error::schema(format!(
+                    "Duplicate field name (case-insensitive): '{}'",
+                    field.name
+                )));
             }
+
+            field_map.insert(field.name.clone(), field);
         }
 
         Ok(Self {
@@ -903,16 +864,19 @@ impl StructType {
     /// [`ColumnMappingMode::Id`], then each StructField will have its parquet field id in the
     /// [`ColumnMetadataKey::ParquetFieldId`] metadata field.
     ///
-    /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
-    #[allow(unused)]
+    /// Uses a single transformer so duplicate column mapping IDs are detected across all
+    /// fields in this struct, not just within each field's subtree.
     #[internal_api]
-    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
-        let fields = self
+    pub(crate) fn make_physical(
+        &self,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        let mut transformer = MakePhysical::new(column_mapping_mode);
+        let fields: Vec<StructField> = self
             .fields()
-            .map(|field| field.make_physical(column_mapping_mode));
-        Self::new_unchecked(fields)
+            .map(|field| transformer.run_field(field))
+            .try_collect()?;
+        Self::try_new(fields)
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -969,6 +933,10 @@ impl StructType {
         after: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields (e.g. stats_parsed) where exact-name matching
+        // is sufficient.
         if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
@@ -981,7 +949,7 @@ impl StructType {
                 self.fields
                     .get_index_of(after)
                     .map(|index| index + 1)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", after)))
+                    .ok_or_else(|| Error::generic(format!("Field {after} not found")))
             })
             .unwrap_or_else(|| Ok(self.fields.len()))?;
 
@@ -999,6 +967,9 @@ impl StructType {
         before: Option<&str>,
         new_field: StructField,
     ) -> DeltaResult<Self> {
+        // TODO: Upgrade to a case-insensitive duplicate check when this method is used for
+        // user-facing operations like ALTER TABLE ADD COLUMN. Currently only used internally
+        // for inserting protocol-defined fields where exact-name matching is sufficient.
         if self.fields.contains_key(&new_field.name) {
             return Err(Error::generic(format!(
                 "Field {} already exists",
@@ -1010,7 +981,7 @@ impl StructType {
             .map(|before| {
                 self.fields
                     .get_index_of(before)
-                    .ok_or_else(|| Error::generic(format!("Field {} not found", before)))
+                    .ok_or_else(|| Error::generic(format!("Field {before} not found")))
             })
             .unwrap_or_else(|| Ok(0))?;
 
@@ -1026,7 +997,8 @@ impl StructType {
         self
     }
 
-    /// Returns a new [`StructType`] containing only the fields for which `predicate` returns `true`.
+    /// Returns a new [`StructType`] containing only the top-level fields for which `predicate`
+    /// returns `true`. This does not recurse into nested [`StructType`] fields.
     pub fn with_fields_filtered(
         &self,
         predicate: impl Fn(&StructField) -> bool,
@@ -1044,7 +1016,7 @@ impl StructType {
         let replace_field = self
             .fields
             .get_mut(name)
-            .ok_or_else(|| Error::generic(format!("Field {} not found", name)))?;
+            .ok_or_else(|| Error::generic(format!("Field {name} not found")))?;
 
         *replace_field = new_field;
         Ok(self)
@@ -1080,7 +1052,7 @@ fn write_struct_type(
         levels.push(is_last);
 
         write_indent(f, levels)?;
-        writeln!(f, "{}", field)?;
+        writeln!(f, "{field}")?;
 
         field.data_type.fmt_recursive(f, levels)?;
 
@@ -1455,7 +1427,7 @@ impl DecimalType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -1480,11 +1452,7 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
-    #[serde(
-        serialize_with = "serialize_decimal",
-        deserialize_with = "deserialize_decimal",
-        untagged
-    )]
+    #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
 
@@ -1527,32 +1495,6 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<DecimalType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let str_value = String::deserialize(deserializer)?;
-    require!(
-        str_value.starts_with("decimal(") && str_value.ends_with(')'),
-        serde::de::Error::custom(format!("Invalid decimal: {str_value}"))
-    );
-
-    let mut parts = str_value[8..str_value.len() - 1].split(',');
-    let precision = parts
-        .next()
-        .and_then(|part| part.trim().parse::<u8>().ok())
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid precision in decimal: {str_value}"))
-        })?;
-    let scale = parts
-        .next()
-        .and_then(|part| part.trim().parse::<u8>().ok())
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid scale in decimal: {str_value}"))
-        })?;
-    DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
-}
-
 fn serialize_variant<S: serde::Serializer>(
     _: &StructType,
     serializer: S,
@@ -1560,21 +1502,60 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
-fn deserialize_variant<'de, D>(deserializer: D) -> Result<Box<StructType>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let str_value = String::deserialize(deserializer)?;
-    require!(
-        str_value == "variant",
-        serde::de::Error::custom(format!("Invalid variant: {str_value}"))
-    );
-    match DataType::unshredded_variant() {
-        DataType::Variant(st) => Ok(st),
-        _ => Err(serde::de::Error::custom(
-            "Issue in DataType::unshredded_variant(). Please raise an issue at ".to_string()
-                + "delta-io/delta-kernel-rs.",
-        )),
+// Custom Deserialize to provide clear error messages for unsupported types.
+// The derived impl would produce: "unknown variant `interval second`, expected one of ..."
+// This impl produces: "Unsupported Delta table type: 'interval second'"
+impl<'de> serde::Deserialize<'de> for PrimitiveType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let str_value = String::deserialize(deserializer)?;
+
+        match str_value.as_str() {
+            "string" => Ok(PrimitiveType::String),
+            "long" => Ok(PrimitiveType::Long),
+            "integer" => Ok(PrimitiveType::Integer),
+            "short" => Ok(PrimitiveType::Short),
+            "byte" => Ok(PrimitiveType::Byte),
+            "float" => Ok(PrimitiveType::Float),
+            "double" => Ok(PrimitiveType::Double),
+            "boolean" => Ok(PrimitiveType::Boolean),
+            "binary" => Ok(PrimitiveType::Binary),
+            "date" => Ok(PrimitiveType::Date),
+            "timestamp" => Ok(PrimitiveType::Timestamp),
+            "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
+                // Parse decimal type
+                let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
+                let precision = parts
+                    .next()
+                    .and_then(|part| part.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!(
+                            "Invalid precision in decimal: {decimal_str}"
+                        ))
+                    })?;
+                let scale = parts
+                    .next()
+                    .and_then(|part| part.trim().parse::<u8>().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!("Invalid scale in decimal: {decimal_str}"))
+                    })?;
+                // Reject extra parts (e.g., decimal(10,2,99))
+                if parts.next().is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "Invalid decimal format (expected 2 parts): {decimal_str}"
+                    )));
+                }
+                DecimalType::try_new(precision, scale)
+                    .map(PrimitiveType::Decimal)
+                    .map_err(serde::de::Error::custom)
+            }
+            unsupported => Err(serde::de::Error::custom(format!(
+                "Unsupported Delta table type: '{unsupported}'"
+            ))),
+        }
     }
 }
 
@@ -1600,7 +1581,7 @@ impl Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
@@ -1615,10 +1596,7 @@ pub enum DataType {
     Map(Box<MapType>),
     /// The Variant data type. The physical representation can be flexible to support shredded
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
-    #[serde(
-        serialize_with = "serialize_variant",
-        deserialize_with = "deserialize_variant"
-    )]
+    #[serde(serialize_with = "serialize_variant")]
     Variant(Box<StructType>),
 }
 
@@ -1658,6 +1636,61 @@ impl From<ArrayType> for DataType {
 impl From<SchemaRef> for DataType {
     fn from(schema: SchemaRef) -> Self {
         Arc::unwrap_or_clone(schema).into()
+    }
+}
+
+// Custom Deserialize to preserve error messages from PrimitiveType.
+// Serde's untagged enum only reports the last variant's error, discarding PrimitiveType's
+// clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
+// dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
+impl<'de> serde::Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        use serde_json::Value;
+
+        let value = Value::deserialize(deserializer)?;
+
+        // String values are either primitive types or "variant"
+        if let Value::String(s) = &value {
+            if s == "variant" {
+                return match DataType::unshredded_variant() {
+                    DataType::Variant(st) => Ok(DataType::Variant(st)),
+                    _ => Err(Error::custom("Failed to create variant type")),
+                };
+            }
+
+            // Try PrimitiveType - this will give us good error messages for unsupported types
+            return PrimitiveType::deserialize(value.clone())
+                .map(DataType::Primitive)
+                .map_err(|e| Error::custom(e.to_string()));
+        }
+
+        // Object values are complex types - dispatch based on "type" field
+        if let Value::Object(map) = &value {
+            if let Some(Value::String(type_str)) = map.get("type") {
+                return match type_str.as_str() {
+                    "array" => ArrayType::deserialize(value)
+                        .map(|at| DataType::Array(Box::new(at)))
+                        .map_err(|e| Error::custom(e.to_string())),
+                    "struct" => StructType::deserialize(value)
+                        .map(|st| DataType::Struct(Box::new(st)))
+                        .map_err(|e| Error::custom(e.to_string())),
+                    "map" => MapType::deserialize(value)
+                        .map(|mt| DataType::Map(Box::new(mt)))
+                        .map_err(|e| Error::custom(e.to_string())),
+                    _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
+                };
+            }
+        }
+
+        // Fallback error with the actual value that failed
+        Err(Error::custom(format!(
+            "Invalid data type: {}",
+            serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}"))
+        )))
     }
 }
 
@@ -1905,28 +1938,8 @@ pub trait SchemaTransform<'a> {
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
     /// update the struct to reference all surviving fields. Otherwise, no-op.
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        use Cow::*;
-        let mut num_borrowed = 0;
-        let fields: Vec<_> = stype
-            .fields()
-            .filter_map(|field| self.transform_struct_field(field))
-            .inspect(|field| {
-                if let Borrowed(_) = field {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if fields.is_empty() {
-            None
-        } else if num_borrowed < stype.fields.len() {
-            // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new_unchecked(
-                fields.into_iter().map(|f| f.into_owned()),
-            )))
-        } else {
-            Some(Borrowed(stype))
-        }
+        let transformed_children = stype.fields().map(|f| self.transform_struct_field(f));
+        map_owned_children_or_else(stype, transformed_children, StructType::new_unchecked)
     }
 
     /// Recursively transforms an array's element type. If the element type changes, update the
@@ -2050,12 +2063,100 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
     }
 }
 
+struct MakePhysical<'a> {
+    column_mapping_mode: ColumnMappingMode,
+    path: Vec<&'a str>,
+    seen: HashMap<i64, &'a str>,
+    err: Option<Error>,
+}
+impl<'a> MakePhysical<'a> {
+    fn new(column_mapping_mode: ColumnMappingMode) -> Self {
+        Self {
+            column_mapping_mode,
+            path: vec![],
+            seen: HashMap::new(),
+            err: None,
+        }
+    }
+
+    /// Transforms a single [`StructField`] from logical to physical. Returns the physical
+    /// field on success, or the first error encountered during the recursive transformation.
+    fn run_field(&mut self, field: &'a StructField) -> DeltaResult<StructField> {
+        let result = self.transform_struct_field(field);
+        match (self.err.take(), result) {
+            (Some(err), _) => Err(err),
+            // Theoretically impossible: MakePhysical only returns None when it sets an error
+            (None, None) => Err(Error::internal_error(
+                "make_physical: transform returned None without setting an error",
+            )),
+            (None, Some(field)) => Ok(field.into_owned()),
+        }
+    }
+
+    fn transform_inner<T>(
+        &mut self,
+        field_name: &'a str,
+        transform: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        if self.err.is_some() {
+            return None;
+        }
+        self.path.push(field_name);
+        let result = transform(self);
+        self.path.pop();
+        result
+    }
+}
+impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
+    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.transform_inner("<array element>", |this| this.transform(etype))
+    }
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.transform_inner("<map key>", |this| this.transform(ktype))
+    }
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.transform_inner("<map value>", |this| this.transform(vtype))
+    }
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        self.transform_inner(field.name(), |this| {
+            let (physical_name, _id) = get_field_column_mapping_info(
+                field,
+                this.column_mapping_mode,
+                &this.path,
+                Some(&mut this.seen),
+            )
+            .map_err(|e| this.err = Some(e))
+            .ok()?;
+
+            if field.is_metadata_column() {
+                return Some(Cow::Borrowed(field));
+            }
+
+            let field = this.recurse_into_struct_field(field)?;
+
+            let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
+            let name = physical_name.to_owned();
+
+            Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+        })
+    }
+
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        // There is no column mapping metadata inside the struct fields of a variant, so
+        // we do not recurse into the variant fields
+        Some(Cow::Borrowed(stype))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
+    };
 
     use super::*;
+    use rstest::rstest;
     use serde_json;
 
     fn example_schema_metadata() -> &'static str {
@@ -2224,25 +2325,153 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case("interval second")]
+    #[case("interval day")]
+    #[case("money")]
+    fn test_unsupported_type_error_message(#[case] unsupported_type: &str) {
+        let data = format!(
+            r#"{{
+                "name": "test_field",
+                "type": "{unsupported_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let expected_msg = format!("Unsupported Delta table type: '{unsupported_type}'");
+        assert!(
+            err.to_string().contains(&expected_msg),
+            "Expected error message about unsupported type '{unsupported_type}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case("string", DataType::STRING)]
+    #[case("long", DataType::LONG)]
+    #[case("integer", DataType::INTEGER)]
+    #[case("short", DataType::SHORT)]
+    #[case("byte", DataType::BYTE)]
+    #[case("float", DataType::FLOAT)]
+    #[case("double", DataType::DOUBLE)]
+    #[case("boolean", DataType::BOOLEAN)]
+    #[case("binary", DataType::BINARY)]
+    #[case("date", DataType::DATE)]
+    #[case("timestamp", DataType::TIMESTAMP)]
+    #[case("timestamp_ntz", DataType::TIMESTAMP_NTZ)]
+    fn test_primitive_type_deserialization_still_works(
+        #[case] type_str: &str,
+        #[case] expected_type: DataType,
+    ) {
+        let data = format!(
+            r#"{{
+                "name": "test_field",
+                "type": "{type_str}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let field: StructField = serde_json::from_str(&data).unwrap();
+        assert_eq!(field.data_type, expected_type);
+    }
+
+    #[rstest]
+    #[case(10, 2)]
+    #[case(16, 4)]
+    #[case(38, 10)]
+    fn test_decimal_with_primitive_deserializer(#[case] precision: u8, #[case] scale: u8) {
+        let data = format!(
+            r#"{{
+                "name": "test_decimal",
+                "type": "decimal({precision},{scale})",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let field: StructField = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            field.data_type,
+            DataType::decimal(precision, scale).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case("decimal(invalid)", "Invalid precision in decimal")]
+    #[case("decimal(10)", "Invalid scale in decimal")]
+    #[case("decimal()", "Invalid precision in decimal")]
+    #[case("decimal(10,2,99)", "Invalid decimal format (expected 2 parts)")]
+    fn test_invalid_decimal_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let data = format!(
+            r#"{{
+                "name": "invalid",
+                "type": "{invalid_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case(
+        r#"{"type": "array", "elementType": "integer", "containsNull": false}"#,
+        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false)))
+    )]
+    #[case(
+        r#"{"type": "struct", "fields": [{"name": "a", "type": "integer", "nullable": false, "metadata": {}}, {"name": "b", "type": "string", "nullable": true, "metadata": {}}]}"#,
+        DataType::Struct(Box::new(StructType::new_unchecked([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("b", DataType::STRING, true),
+        ])))
+    )]
+    #[case(
+        r#"{"type": "map", "keyType": "string", "valueType": "integer", "valueContainsNull": true}"#,
+        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, true)))
+    )]
+    #[case("\"string\"", DataType::STRING)]
+    #[case("\"long\"", DataType::LONG)]
+    #[case("\"integer\"", DataType::INTEGER)]
+    #[case("\"short\"", DataType::SHORT)]
+    #[case("\"byte\"", DataType::BYTE)]
+    #[case("\"float\"", DataType::FLOAT)]
+    #[case("\"double\"", DataType::DOUBLE)]
+    #[case("\"boolean\"", DataType::BOOLEAN)]
+    #[case("\"binary\"", DataType::BINARY)]
+    #[case("\"date\"", DataType::DATE)]
+    #[case("\"timestamp\"", DataType::TIMESTAMP)]
+    #[case("\"timestamp_ntz\"", DataType::TIMESTAMP_NTZ)]
+    #[case("\"variant\"", DataType::unshredded_variant())]
+    fn test_data_type_deserialization(#[case] type_json: &str, #[case] expected: DataType) {
+        let data_type: DataType = serde_json::from_str(type_json).unwrap();
+        assert_eq!(data_type, expected);
+    }
+
     #[test]
     fn test_make_physical_no_column_mapping() {
-        let data = example_schema_metadata();
-        let field: StructField = serde_json::from_str(data).unwrap();
-        let physical_field = field.make_physical(ColumnMappingMode::None);
+        let field = StructField::nullable(
+            "e",
+            ArrayType::new(
+                StructType::new_unchecked([StructField::not_null("d", DataType::INTEGER)]).into(),
+                true,
+            ),
+        );
+        let physical_field = field.make_physical(ColumnMappingMode::None).unwrap();
 
-        let assert_field_metadata_is_wiped = |field: &StructField| {
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                .is_none());
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-                .is_none());
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ParquetFieldId)
-                .is_none());
-        };
         assert_eq!(physical_field.name, "e");
-        assert_field_metadata_is_wiped(&physical_field);
+        assert!(physical_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+            .is_none());
+        assert!(physical_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_none());
 
         let DataType::Array(atype) = physical_field.data_type else {
             panic!("Expected an Array");
@@ -2252,7 +2481,63 @@ mod tests {
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(struct_field.name, "d");
-        assert_field_metadata_is_wiped(struct_field);
+    }
+
+    #[test]
+    fn test_make_physical_rejects_annotated_fields_when_column_mapping_disabled() {
+        let data = example_schema_metadata();
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert!(field.make_physical(ColumnMappingMode::None).is_err());
+    }
+
+    #[test]
+    fn test_make_physical_rejects_unannotated_leaf_in_deep_nesting() {
+        let schema = test_deep_nested_schema_missing_leaf_cm();
+        let field = schema.fields().next().unwrap();
+        let err = field
+            .make_physical(ColumnMappingMode::Name)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
+            "Expected full nested path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_make_physical_rejects_duplicate_column_mapping_ids() {
+        use crate::schema::ColumnMetadataKey;
+
+        fn cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
+            StructField::not_null(name, data_type).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(id),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String(format!("col-{name}")),
+                ),
+            ])
+        }
+
+        let inner = StructType::new_unchecked([
+            cm_field("x", 3, DataType::INTEGER),
+            cm_field("y", 4, DataType::STRING),
+        ]);
+        let schema = StructType::new_unchecked([
+            cm_field("a", 1, DataType::INTEGER),
+            cm_field(
+                "b",
+                2,
+                ArrayType::new(DataType::Struct(Box::new(inner)), true),
+            ),
+            cm_field("c", 3, DataType::STRING),
+        ]);
+        assert_result_error_with_message(
+            schema.make_physical(ColumnMappingMode::Id),
+            "Duplicate column mapping ID",
+        );
     }
 
     #[test]
@@ -2276,7 +2561,7 @@ mod tests {
                     field.physical_name(mode),
                     "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
                 );
-                let physical_field = field.make_physical(mode);
+                let physical_field = field.make_physical(mode).unwrap();
 
                 // Parquet field id should only be present in id column mapping mode
                 match mode {
@@ -2346,6 +2631,39 @@ mod tests {
                     ColumnMappingMode::None => panic!("unexpected column mapping mode"),
                 }
             });
+    }
+
+    #[test]
+    fn test_make_physical_passes_metadata_column_through() {
+        let field = StructField::create_metadata_column(
+            "_metadata.row_index",
+            MetadataColumnSpec::RowIndex,
+        );
+        for mode in [
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id,
+        ] {
+            let physical = field.make_physical(mode).unwrap();
+            assert_eq!(physical.name(), "_metadata.row_index");
+            assert!(physical.is_metadata_column());
+        }
+    }
+
+    #[test]
+    fn test_make_physical_rejects_metadata_column_with_cm_annotations() {
+        let field = StructField::create_metadata_column(
+            "_metadata.row_index",
+            MetadataColumnSpec::RowIndex,
+        )
+        .add_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            MetadataValue::String("phys".to_string()),
+        )]);
+        assert_result_error_with_message(
+            field.make_physical(ColumnMappingMode::Name),
+            "must not have column mapping annotations",
+        );
     }
 
     #[test]
@@ -2791,7 +3109,7 @@ mod tests {
                 1 => assert_eq!(field.name, "required_int"),
                 2 => assert_eq!(field.name, "nullable_bool"),
                 3 => assert_eq!(field.name, "required_long"),
-                _ => panic!("Unexpected field index: {}", index),
+                _ => panic!("Unexpected field index: {index}"),
             }
         }
     }
@@ -3121,6 +3439,26 @@ mod tests {
 
         assert_result_error_with_message(result, "Duplicate metadata column");
         Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_field_name_case_insensitive() {
+        // Delta column names are case-insensitive per protocol; (Value, value) is invalid
+        let result = StructType::try_new([
+            StructField::nullable("Value", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
+    }
+
+    #[test]
+    fn test_duplicate_field_name_exact() {
+        // Exact duplicate (same name twice) is rejected via the case-insensitive check
+        let result = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("id", DataType::STRING),
+        ]);
+        assert_result_error_with_message(result, "Duplicate field name (case-insensitive)");
     }
 
     #[test]

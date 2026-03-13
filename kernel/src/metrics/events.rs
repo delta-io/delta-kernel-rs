@@ -91,16 +91,14 @@ impl fmt::Display for MetricEvent {
                 num_compaction_files,
             } => write!(
                 f,
-                "LogSegmentLoaded(id={}, duration={:?}, commits={}, checkpoints={}, compactions={})",
-                operation_id, duration, num_commit_files, num_checkpoint_files, num_compaction_files
+                "LogSegmentLoaded(id={operation_id}, duration={duration:?}, commits={num_commit_files}, checkpoints={num_checkpoint_files}, compactions={num_compaction_files})"
             ),
             MetricEvent::ProtocolMetadataLoaded {
                 operation_id,
                 duration,
             } => write!(
                 f,
-                "ProtocolMetadataLoaded(id={}, duration={:?})",
-                operation_id, duration
+                "ProtocolMetadataLoaded(id={operation_id}, duration={duration:?})"
             ),
             MetricEvent::SnapshotCompleted {
                 operation_id,
@@ -108,24 +106,21 @@ impl fmt::Display for MetricEvent {
                 total_duration,
             } => write!(
                 f,
-                "SnapshotCompleted(id={}, version={}, duration={:?})",
-                operation_id, version, total_duration
+                "SnapshotCompleted(id={operation_id}, version={version}, duration={total_duration:?})"
             ),
             MetricEvent::SnapshotFailed {
                 operation_id,
                 duration,
             } => write!(
                 f,
-                "SnapshotFailed(id={}, duration={:?})",
-                operation_id, duration
+                "SnapshotFailed(id={operation_id}, duration={duration:?})"
             ),
             MetricEvent::StorageListCompleted {
                 duration,
                 num_files,
             } => write!(
                 f,
-                "StorageListCompleted(duration={:?}, files={})",
-                duration, num_files
+                "StorageListCompleted(duration={duration:?}, files={num_files})"
             ),
             MetricEvent::StorageReadCompleted {
                 duration,
@@ -133,13 +128,11 @@ impl fmt::Display for MetricEvent {
                 bytes_read,
             } => write!(
                 f,
-                "StorageReadCompleted(duration={:?}, files={}, bytes={})",
-                duration, num_files, bytes_read
+                "StorageReadCompleted(duration={duration:?}, files={num_files}, bytes={bytes_read})"
             ),
             MetricEvent::StorageCopyCompleted { duration } => write!(
                 f,
-                "StorageCopyCompleted(duration={:?})",
-                duration
+                "StorageCopyCompleted(duration={duration:?})"
             ),
         }
     }

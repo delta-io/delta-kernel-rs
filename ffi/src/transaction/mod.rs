@@ -243,6 +243,7 @@ mod tests {
 
     fn create_file_metadata(
         path: &str,
+        file_size_bytes: u64,
         num_rows: i64,
         metadata_schema: ArrowSchema,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
@@ -252,7 +253,7 @@ mod tests {
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "stats": {{"numRecords": {num_rows}}}}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {file_size_bytes}, "modificationTime": {current_time}, "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
         create_arrow_ffi_from_json(metadata_schema, file_metadata.as_str())
@@ -276,7 +277,13 @@ mod tests {
         // writer must be closed to write footer
         let res = writer.close().unwrap();
 
-        create_file_metadata(file_path, res.file_metadata().num_rows(), metadata_schema)
+        let file_size_bytes = std::fs::metadata(&full_path)?.len();
+        create_file_metadata(
+            file_path,
+            file_size_bytes,
+            res.file_metadata().num_rows(),
+            metadata_schema,
+        )
     }
 
     #[tokio::test]
@@ -427,7 +434,7 @@ mod tests {
                         "size": 0,
                         "modificationTime": 0,
                         "dataChange": false,
-                        "stats": "{\"numRecords\":5}"
+                        "stats": "{\"numRecords\":5,\"nullCount\":null,\"minValues\":null,\"maxValues\":null,\"tightBounds\":null}"
                     }
                 }),
             ];
@@ -604,7 +611,7 @@ mod tests {
 
             // Read the staged commit
             let staged_commit_url = table_url
-                .join(&format!("_delta_log/_staged_commits/{}", staged_file_name))
+                .join(&format!("_delta_log/_staged_commits/{staged_file_name}"))
                 .unwrap();
             let staged_commit = store
                 .get(&Path::from_url_path(staged_commit_url.path()).unwrap())
