@@ -222,25 +222,15 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
 pub(crate) struct StripFieldMetadataTransform;
 impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if field.metadata.is_empty() {
-            // Recurse into children but don't allocate if this field has no metadata
-            match self.transform(&field.data_type)? {
-                Cow::Borrowed(_) => Some(Cow::Borrowed(field)),
-                data_type => Some(Cow::Owned(StructField {
-                    name: field.name.clone(),
-                    data_type: data_type.into_owned(),
-                    nullable: field.is_nullable(),
-                    metadata: Default::default(),
-                })),
-            }
-        } else {
-            Some(Cow::Owned(StructField {
+        Some(match self.transform(&field.data_type)? {
+            Cow::Borrowed(_) if field.metadata.is_empty() => Cow::Borrowed(field),
+            data_type => Cow::Owned(StructField {
                 name: field.name.clone(),
-                data_type: self.transform(&field.data_type)?.into_owned(),
+                data_type: data_type.into_owned(),
                 nullable: field.is_nullable(),
                 metadata: Default::default(),
-            }))
-        }
+            }),
+        })
     }
 }
 
@@ -249,17 +239,24 @@ impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
 pub(crate) struct NullableStatsTransform;
 impl<'a> SchemaTransform<'a> for NullableStatsTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) if field.is_nullable() => Borrowed(field),
-            data_type => Owned(StructField {
-                name: field.name.clone(),
-                data_type: data_type.into_owned(),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            }),
-        };
-        Some(field)
+        let data_type = self.transform(&field.data_type)?;
+        Some(make_nullable_field(field, data_type))
+    }
+}
+
+// helper used by both NullableStatsTransform and BaseStatsTransform
+fn make_nullable_field<'a>(
+    field: &'a StructField,
+    data_type: Cow<'a, DataType>,
+) -> Cow<'a, StructField> {
+    match data_type {
+        Cow::Borrowed(_) if field.is_nullable() => Cow::Borrowed(field),
+        data_type => Cow::Owned(StructField {
+            name: field.name.clone(),
+            data_type: data_type.into_owned(),
+            nullable: true,
+            metadata: field.metadata.clone(),
+        }),
     }
 }
 
@@ -313,63 +310,37 @@ impl<'col> BaseStatsTransform<'col> {
 }
 
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
+    // Always traverse struct fields -- only primitive leaf values count against the column limit
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-
         self.filter.enter_field(field.name());
-        let data_type = field.data_type();
+        let data_type = self.transform(&field.data_type);
+        self.filter.exit_field();
+        Some(make_nullable_field(field, data_type?))
+    }
 
-        // Map, Array, and Variant types are not eligible for statistics - skip entirely.
-        if matches!(
-            data_type,
-            DataType::Map(_) | DataType::Array(_) | DataType::Variant(_)
-        ) {
-            self.filter.exit_field();
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        if !self.filter.should_include_for_table() {
             return None;
         }
 
-        // We always traverse struct fields (they don't count against the column limit),
-        // but we only include leaf fields if they qualify based on table properties.
-        // The n_columns limit is based on schema order, so we count columns that pass
-        // the table filter regardless of requested_columns.
-        if !matches!(data_type, DataType::Struct(_)) {
-            if !self.filter.should_include_for_table() {
-                self.filter.exit_field();
-                return None;
-            }
-            // Count this column toward the n_columns limit
-            self.filter.record_included();
+        // The n_columns limit is based on schema order, so we count all leaf columns that pass the
+        // table filter, but then we only generate stats for requested columns.
+        self.filter.record_included();
+        self.filter
+            .should_include_for_requested()
+            .then_some(Cow::Borrowed(ptype))
+    }
 
-            // After recording the column for counting purposes, check if it passes the
-            // requested columns filter. This does not affect the column count.
-            if !self.filter.should_include_for_requested() {
-                self.filter.exit_field();
-                return None;
-            }
-        }
+    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        None // not stats-eligible
+    }
 
-        let field = match self.transform(&field.data_type) {
-            Some(Borrowed(_)) if field.is_nullable() => Borrowed(field),
-            Some(data_type) => Owned(StructField {
-                name: field.name.clone(),
-                data_type: data_type.into_owned(),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            }),
-            None => {
-                self.filter.exit_field();
-                return None;
-            }
-        };
+    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
+        None // not stats-eligible
+    }
 
-        self.filter.exit_field();
-
-        // exclude struct fields with no children
-        if matches!(field.data_type(), DataType::Struct(dt) if dt.fields().len() == 0) {
-            None
-        } else {
-            Some(field)
-        }
+    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None // not stats-eligible
     }
 }
 
