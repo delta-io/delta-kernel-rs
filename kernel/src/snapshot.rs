@@ -1,7 +1,7 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
@@ -670,40 +670,6 @@ impl Snapshot {
             expiration_timestamp,
         )?;
         Ok(txn.map(|t| t.version))
-    }
-
-    /// Fetch all non-expired SetTransactions for this snapshot.
-    ///
-    /// Uses the CRC fast path when available, falling back to log replay.
-    #[internal_api]
-    pub(crate) fn get_all_set_transactions(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<HashMap<String, SetTransaction>> {
-        let expiration_timestamp =
-            calculate_transaction_expiration_timestamp(self.table_properties())?;
-
-        // Fast path: serve from CRC if it tracks set transactions at this version.
-        if let Some(crc) = self
-            .lazy_crc
-            .get_or_load_if_at_version(engine, self.version())
-        {
-            if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map
-                    .iter()
-                    .filter(|(_, txn)| {
-                        !matches!(
-                            expiration_timestamp.zip(txn.last_updated),
-                            Some((exp_ts, last_updated)) if last_updated <= exp_ts
-                        )
-                    })
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect());
-            }
-        }
-
-        // Fallback: full log replay.
-        SetTransactionScanner::get_all(self.log_segment(), engine, expiration_timestamp)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
