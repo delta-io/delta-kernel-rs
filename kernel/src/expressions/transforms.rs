@@ -231,10 +231,8 @@ pub trait ExpressionTransform<'a> {
                 .transform_pred_binary(b)?
                 .map_owned_or_else(pred, Predicate::Binary),
             // Route through the constructor to normalize in case the transform removed children.
-            // For example, a data skipping transform may convert unsupported predicates to `None`,
-            // reducing `AND(supported, unsupported)` to `AND(supported)`, which normalizes to just
-            // `supported`. Without normalization, a single-element `AND([unknown])` would evaluate
-            // to false under junction semantics and incorrectly skip files that should be kept.
+            // A transform can drop children (by returning `None`), which may reduce the junction
+            // to one or zero elements. The constructor normalizes these degenerate cases.
             Predicate::Junction(j) => self
                 .transform_pred_junction(j)?
                 .map_owned_or_else(pred, |j| Predicate::junction(j.op, j.preds)),
