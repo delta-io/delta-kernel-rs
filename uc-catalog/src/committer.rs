@@ -81,20 +81,24 @@ impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
                 })
                 .transpose()?,
         );
+        let commit_version = commit_metadata.version();
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
-        tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                self.commits_client
-                    .commit(commit_req)
-                    .await
-                    .map_err(|e| DeltaError::Generic(format!("UC commit error: {e}")))
-            })
-        })?;
-        Ok(CommitResponse::Committed {
-            file_meta: committed,
-        })
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(async move { self.commits_client.commit(commit_req).await })
+        });
+        match result {
+            Ok(()) => Ok(CommitResponse::Committed {
+                file_meta: committed,
+            }),
+            Err(uc_client::error::Error::ApiError { status: 409, .. }) => {
+                Ok(CommitResponse::Conflict {
+                    version: commit_version,
+                })
+            }
+            Err(e) => Err(DeltaError::Generic(format!("UC commit error: {e}"))),
+        }
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -130,11 +134,31 @@ mod tests {
     use std::fs;
     use uc_client::error::Result;
 
-    struct MockCommitsClient;
+    struct MockCommitsClient {
+        commit_result: std::sync::Mutex<Option<Result<()>>>,
+    }
+
+    impl MockCommitsClient {
+        fn always_unimplemented() -> Self {
+            Self {
+                commit_result: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn with_commit_result(result: Result<()>) -> Self {
+            Self {
+                commit_result: std::sync::Mutex::new(Some(result)),
+            }
+        }
+    }
 
     impl UCCommitClient for MockCommitsClient {
         async fn commit(&self, _: CommitRequest) -> Result<()> {
-            unimplemented!()
+            self.commit_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("MockCommitsClient::commit called but no result was configured")
         }
     }
 
@@ -150,6 +174,74 @@ mod tests {
         table_root
             .join(&format!("_delta_log/{version:020}.json"))
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_commit_conflict_on_409() {
+        use delta_kernel::schema::{DataType, StructField, StructType};
+        use delta_kernel::transaction::create_table::create_table;
+        use delta_kernel::transaction::CommitResult;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_path = tmp_dir.path().to_str().unwrap();
+
+        let mock_client = MockCommitsClient::with_commit_result(Err(
+            uc_client::error::Error::ApiError {
+                status: 409,
+                message: "Commit version already accepted. Current table version is 0".into(),
+            },
+        ));
+        let committer = UCCommitter::new(Arc::new(mock_client), "test_table_id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+        );
+        let result = create_table(table_path, schema, "test_engine")
+            .build(&engine, Box::new(committer))
+            .unwrap()
+            .commit(&engine)
+            .unwrap();
+
+        assert!(
+            matches!(result, CommitResult::ConflictedTransaction(_)),
+            "Expected ConflictedTransaction, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_commit_non_conflict_error_propagates() {
+        use delta_kernel::schema::{DataType, StructField, StructType};
+        use delta_kernel::transaction::create_table::create_table;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_path = tmp_dir.path().to_str().unwrap();
+
+        let mock_client = MockCommitsClient::with_commit_result(Err(
+            uc_client::error::Error::ApiError {
+                status: 500,
+                message: "Internal server error".into(),
+            },
+        ));
+        let committer = UCCommitter::new(Arc::new(mock_client), "test_table_id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+        );
+        let result = create_table(table_path, schema, "test_engine")
+            .build(&engine, Box::new(committer))
+            .unwrap()
+            .commit(&engine);
+
+        assert!(result.is_err(), "Expected error for non-409 API error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("UC commit error"),
+            "Error should contain 'UC commit error', got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -188,7 +280,8 @@ mod tests {
 
         // ===== WHEN =====
         let publish_metadata = PublishMetadata::try_new(12, catalog_commits).unwrap();
-        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "testUcTableId");
+        let committer =
+            UCCommitter::new(Arc::new(MockCommitsClient::always_unimplemented()), "test_table_id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         committer.publish(&engine, publish_metadata).unwrap();
 
