@@ -1153,7 +1153,23 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Non-struct types: use can_read_as for type compatibility
+                // Primitive types: use stats-specific compatibility which covers both Delta
+                // protocol type widening and Parquet physical type reinterpretation for
+                // checkpoints that omit logical type annotations.
+                (DataType::Primitive(avail_prim), DataType::Primitive(need_prim)) => {
+                    if !avail_prim.is_stats_type_compatible_with(need_prim) {
+                        debug!(
+                            "stats_parsed not compatible: incompatible type for '{}' in {}: \
+                             checkpoint has {:?}, stats schema needs {:?}",
+                            needed_field.name(),
+                            context,
+                            avail_prim,
+                            need_prim
+                        );
+                        return false;
+                    }
+                }
+                // Other non-struct types (arrays, maps): use standard schema compatibility
                 (avail_type, need_type) => {
                     if avail_type.can_read_as(need_type).is_err() {
                         debug!(

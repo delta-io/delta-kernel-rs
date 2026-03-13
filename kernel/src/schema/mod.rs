@@ -1496,21 +1496,11 @@ impl PrimitiveType {
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
-    /// Widening rules:
+    /// Widening rules follow the Delta protocol type widening feature:
     /// - Integer widening: byte -> short -> int -> long
     /// - Float widening: float -> double
     /// - Timestamp equivalence: Timestamp <-> TimestampNtz (both are i64 microseconds
     ///   since epoch, differing only in timezone semantics)
-    ///
-    /// Physical type reinterpretation (for checkpoint interop):
-    /// Some checkpoint writers omit Parquet logical type annotations, producing plain
-    /// integer-typed stats columns. These rules allow reading such columns as their
-    /// intended logical types:
-    /// - Integer -> Date (int32 without DATE annotation)
-    /// - Long -> Timestamp/TimestampNtz (int64 without TIMESTAMP annotation)
-    ///
-    /// Note: These widening rules assume the parquet reader supports reading narrower types
-    /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
@@ -1526,11 +1516,32 @@ impl PrimitiveType {
                 // one as the other is safe at the data layer.
                 | (Timestamp, TimestampNtz)
                 | (TimestampNtz, Timestamp)
-                // Physical type reinterpretation: some checkpoint writers omit the Parquet
-                // logical type annotation, producing plain integer-typed stats columns.
-                | (Integer, Date)
-                | (Long, Timestamp | TimestampNtz)
         )
+    }
+
+    /// Returns `true` if this primitive type is compatible with `target` for reading
+    /// `stats_parsed` columns from checkpoint parquet files.
+    ///
+    /// This is a superset of [`can_widen_to`]: it includes all Delta protocol type widening
+    /// rules plus physical Parquet encoding accommodations for checkpoint interop. Some
+    /// external checkpoint writers omit Parquet logical type annotations, producing plain
+    /// integer-typed columns for logically date or timestamp values:
+    /// - Integer -> Date (int32 stored without DATE annotation)
+    /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
+    ///
+    /// These reinterpretation cases are intentionally not part of [`can_widen_to`] because
+    /// they are not Delta protocol type widening rules and should not apply to general
+    /// schema compatibility checks.
+    ///
+    /// [`can_widen_to`]: PrimitiveType::can_widen_to
+    pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
+        use PrimitiveType::*;
+        self == target
+            || self.can_widen_to(target)
+            || matches!(
+                (self, target),
+                (Integer, Date) | (Long, Timestamp | TimestampNtz)
+            )
     }
 }
 
