@@ -1536,12 +1536,11 @@ impl PrimitiveType {
     ///
     /// [`can_widen_to`]: PrimitiveType::can_widen_to
     pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
-        use PrimitiveType::*;
         self == target
             || self.can_widen_to(target)
             || matches!(
                 (self, target),
-                (Integer, Date) | (Long, Timestamp | TimestampNtz)
+                (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
             )
     }
 }

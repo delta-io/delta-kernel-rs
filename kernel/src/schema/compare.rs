@@ -483,7 +483,9 @@ mod tests {
         assert!(PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Long));
         assert!(PrimitiveType::Short.is_stats_type_compatible_with(&PrimitiveType::Integer));
         assert!(PrimitiveType::Float.is_stats_type_compatible_with(&PrimitiveType::Double));
-        assert!(PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
+        assert!(
+            PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz)
+        );
     }
 
     #[test]

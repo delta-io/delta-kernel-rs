@@ -1123,9 +1123,10 @@ impl LogSegment {
         true
     }
 
-    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    /// Recursively checks if two struct types have compatible field types.
     ///
-    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
+    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
+    /// For each field in `needed`, if it exists in `available` (checkpoint):
     /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
     ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
