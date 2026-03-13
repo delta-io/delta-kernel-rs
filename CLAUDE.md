@@ -34,6 +34,10 @@ cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
+# Workspace no-default-features lint for crates that depend on kernel's Arrow APIs
+cargo clippy --workspace --no-default-features --features arrow \
+  --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+
 # Quick pre-push check (mimics CI)
 cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
@@ -62,11 +66,12 @@ cargo fmt \
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
   but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
+- `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only
+- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
 
 ## Architecture at a Glance
 
