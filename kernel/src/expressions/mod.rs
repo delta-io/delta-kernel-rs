@@ -934,6 +934,7 @@ impl Predicate {
                 JunctionPredicateOp::And => Self::literal(true),
                 JunctionPredicateOp::Or => Self::literal(false),
             },
+            // A junction of one predicate is just that predicate.
             1 => preds.remove(0),
             _ => Self::Junction(JunctionPredicate { op, preds }),
         }

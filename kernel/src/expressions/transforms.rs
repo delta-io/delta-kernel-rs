@@ -231,8 +231,8 @@ pub trait ExpressionTransform<'a> {
                 .transform_pred_binary(b)?
                 .map_owned_or_else(pred, Predicate::Binary),
             // Route through the constructor to normalize in case the transform removed children.
-            // A transform can drop children (by returning `None`), which may reduce the junction
-            // to one or zero elements. The constructor normalizes these degenerate cases.
+            // When `transform_pred` returns `None` for a child, it is filtered out, which may
+            // reduce the junction to one or zero elements. The constructor normalizes these.
             Predicate::Junction(j) => self
                 .transform_pred_junction(j)?
                 .map_owned_or_else(pred, |j| Predicate::junction(j.op, j.preds)),
