@@ -100,7 +100,6 @@ pub enum CommitResponse {
     Conflict { version: Version },
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
