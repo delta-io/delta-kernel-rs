@@ -16,7 +16,7 @@ use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::listed_log_files::{find_last_checkpoint_before, ListedLogFilesBuilder};
+use crate::listed_log_files::{find_last_complete_checkpoint_before, ListedLogFilesBuilder};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::parquet::arrow::ArrowWriter;
@@ -815,6 +815,148 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     assert_eq!(log_segment.checkpoint_parts[0].version, 3);
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
     assert_eq!(log_segment.ascending_commit_files[0].version, 4);
+}
+
+#[rstest::rstest]
+#[case::no_hint(None)]
+#[case::stale_hint(Some(LastCheckpointHint {
+    version: 10, // stale: 10 > end_version 5, so it is discarded
+    size: 10,
+    parts: None,
+    size_in_bytes: None,
+    num_of_add_files: None,
+    checkpoint_schema: None,
+    checksum: None,
+    tags: None,
+}))]
+#[tokio::test]
+async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
+    #[case] hint: Option<LastCheckpointHint>,
+) {
+    let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 0);
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+        ],
+        None,
+    )
+    .await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 5);
+    assert_eq!(commit_files.len(), 0);
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_returns_none_when_version_is_zero() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&[], None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 0).unwrap();
+    assert_eq!(result, None);
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_returns_none_when_no_checkpoints_exist() {
+    let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap();
+    assert_eq!(result, None);
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_finds_single_part_checkpoint() {
+    let mut paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    paths.push(delta_path_for_version(3, "checkpoint.parquet"));
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap();
+    assert_eq!(result, Some(3));
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_returns_highest_versioned_checkpoint_when_multiple_exist() {
+    let mut paths: Vec<Path> = (0..=10)
+        .map(|v| delta_path_for_version(v, "json"))
+        .collect();
+    paths.push(delta_path_for_version(3, "checkpoint.parquet"));
+    paths.push(delta_path_for_version(7, "checkpoint.parquet"));
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 11).unwrap();
+    assert_eq!(result, Some(7));
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_excludes_checkpoint_at_upper_bound() {
+    let mut paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    paths.push(delta_path_for_version(2, "checkpoint.parquet"));
+    paths.push(delta_path_for_version(5, "checkpoint.parquet"));
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 5).unwrap();
+    assert_eq!(result, Some(2));
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_skips_incomplete_multipart_and_finds_lower_complete_checkpoint(
+) {
+    let mut paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    paths.push(delta_path_for_multipart_checkpoint(4, 1, 2));
+    paths.push(delta_path_for_version(2, "checkpoint.parquet"));
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap();
+    assert_eq!(result, Some(2));
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_finds_complete_multipart_checkpoint() {
+    let mut paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    paths.push(delta_path_for_multipart_checkpoint(4, 1, 2));
+    paths.push(delta_path_for_multipart_checkpoint(4, 2, 2));
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap();
+    assert_eq!(result, Some(4));
+}
+
+#[tokio::test]
+async fn find_last_checkpoint_before_searches_across_1000_version_windows() {
+    let mut paths = vec![delta_path_for_version(5, "checkpoint.parquet")];
+    for v in 6..=1005 {
+        paths.push(delta_path_for_version(v, "json"));
+    }
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let result = find_last_complete_checkpoint_before(storage.as_ref(), &log_root, 1006).unwrap();
+    assert_eq!(result, Some(5));
 }
 
 #[tokio::test]
@@ -3236,671 +3378,4 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         case.through_compactions
     );
     assert_eq!(through.checkpoint_version, case.checkpoint);
-}
-
-// ─── find_last_checkpoint_before tests ────────────────────────────────────────
-
-#[tokio::test]
-async fn find_last_checkpoint_before_basic() {
-    // Log with checkpoints at v1, v3, v5, v10 plus some commit files
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(10, "checkpoint.parquet"),
-        ],
-        None,
-    )
-    .await;
-
-    // version=6 (exclusive) → last checkpoint at or before v5
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap(),
-        Some(5)
-    );
-    // version=5 (exclusive) → last checkpoint at or before v4 → v3
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 5).unwrap(),
-        Some(3)
-    );
-    // version=1 (exclusive) → no checkpoints before v1
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 1).unwrap(),
-        None
-    );
-    // version=0 → always None (upper==0 breaks immediately)
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 0).unwrap(),
-        None
-    );
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_multi_batch() {
-    // Checkpoint at v10, then 1005 commits (v11..=v1015), no more checkpoints.
-    // find_last_checkpoint_before(..., 1016) must scan two batches to find v10.
-    let mut paths: Vec<Path> = Vec::new();
-    paths.push(delta_path_for_version(10, "checkpoint.parquet"));
-    for v in 11..=1015_u64 {
-        paths.push(delta_path_for_version(v, "json"));
-    }
-
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-
-    // First batch covers [16, 1016) — no checkpoint there.
-    // Second batch covers [0, 16) — finds checkpoint at v10.
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 1016).unwrap(),
-        Some(10)
-    );
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_multi_part() {
-    // Multi-part checkpoint at v5 (2 parts) and single-part at v3.
-    // find_last_checkpoint_before(..., 6) should prefer the latest complete checkpoint = v5.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_multipart_checkpoint(5, 1, 2),
-            delta_path_for_multipart_checkpoint(5, 2, 2),
-        ],
-        None,
-    )
-    .await;
-
-    // v5 multi-part checkpoint (both parts present) is complete → prefer it
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap(),
-        Some(5)
-    );
-
-    // Exclusive upper bound = 5 → only see v3
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 5).unwrap(),
-        Some(3)
-    );
-}
-
-// ─── for_snapshot_impl dispatch tests ─────────────────────────────────────────
-//
-// One test function per scenario from scenarios.md. Cases map to the match arms
-// in `for_snapshot_impl`:
-//
-//   1a  – hint present, hint.version <= time_travel_version
-//   1b  – hint present, hint.version >  time_travel_version (stale hint)
-//   1c  – no hint, time_travel_version present
-//   2   – no time_travel, no hint
-//   3a  – no time_travel, hint present, no max_catalog (empty log_tail)
-//   3b  – no time_travel, hint present, hint.version <= max_catalog
-//   3c  – no time_travel, hint present, hint.version >  max_catalog (stale hint)
-//
-// Each case also has a fallback variant where backward scan returns None and
-// listing falls back to version 0.
-
-fn make_hint(version: u64) -> LastCheckpointHint {
-    LastCheckpointHint {
-        version,
-        size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
-    }
-}
-
-// ── Case 1a ──────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_1a_hint_at_or_before_time_travel_uses_hint() {
-    // hint(v3) <= time_travel(v5): list_with_checkpoint_hint path, capped at v5.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        Some(make_hint(3)),
-        Some(5),
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4, 5]);
-}
-
-#[tokio::test]
-async fn for_snapshot_case_1a_hint_equal_to_time_travel_uses_hint() {
-    // hint(v5) == time_travel(v5): the `cp.version <= end_version` guard is true,
-    // so we take the hint path — not the backward-scan path.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        Some(make_hint(5)),
-        Some(5),
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 5);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, Vec::<u64>::new());
-}
-
-// ── Case 1b ──────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_1b_stale_hint_triggers_backward_scan_finds_checkpoint() {
-    // hint(v6) > time_travel(v5): hint is stale (just past end_version).
-    // Backward scan finds v3; lists v3..=v5.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "checkpoint.parquet"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        Some(make_hint(6)),
-        Some(5),
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4, 5]);
-}
-
-#[tokio::test]
-async fn for_snapshot_case_1b_stale_hint_no_checkpoint_found_falls_back_to_version_0() {
-    // hint(v6) > time_travel(v5), no checkpoints anywhere.
-    // Backward scan returns None; lists from v0 to v5.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        Some(make_hint(6)),
-        Some(5),
-    )
-    .unwrap();
-
-    assert!(log_segment.checkpoint_parts.is_empty());
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
-}
-
-// ── Case 1c ──────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_1c_no_hint_time_travel_backward_scan_finds_checkpoint() {
-    // No hint, time_travel(v5): falls into `(_, Some(end_version))` arm.
-    // Backward scan finds v3; lists v3..=v5.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "checkpoint.parquet"),
-            delta_path_for_version(8, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        None,
-        Some(5),
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4, 5]);
-}
-
-#[tokio::test]
-async fn for_snapshot_case_1c_no_hint_time_travel_no_checkpoint_found_falls_back_to_version_0() {
-    // No hint, time_travel(v2), no checkpoints.
-    // Backward scan returns None; lists from v0 to v2.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        None,
-        Some(2),
-    )
-    .unwrap();
-
-    assert!(log_segment.checkpoint_parts.is_empty());
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![0, 1, 2]);
-}
-
-// ── Case 2 ───────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_2_no_hint_no_time_travel_empty_log_tail_lists_all() {
-    // No hint, no time_travel, empty log_tail → no max_catalog bound.
-    // Lists everything; checkpoint at v3 is found during forward scan.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        None,
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4, 5]);
-}
-
-#[tokio::test]
-async fn for_snapshot_case_2_no_hint_no_time_travel_log_tail_caps_listing_at_max_catalog() {
-    // No hint, no time_travel, log_tail has v4 → max_catalog=v4.
-    // v5 exists in storage but must not appear in the result.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_tail = vec![create_log_path(&format!("memory:///_delta_log/{:020}.json", 4))];
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        log_tail,
-        None,
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4]);
-}
-
-// ── Case 3a ──────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_3a_hint_present_empty_log_tail_lists_unbounded_from_hint() {
-    // hint(v3), no time_travel, empty log_tail → no max_catalog.
-    // list_with_checkpoint_hint is called with no upper bound; picks up all commits after v3.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        vec![],
-        Some(make_hint(3)),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4, 5]);
-}
-
-// ── Case 3b ──────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_3b_hint_before_max_catalog_uses_hint_capped_at_max_catalog() {
-    // hint(v3) < max_catalog(v5): list_with_checkpoint_hint, capped at v5.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_tail = vec![create_log_path(&format!("memory:///_delta_log/{:020}.json", 5))];
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        log_tail,
-        Some(make_hint(3)),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 3);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![4, 5]);
-}
-
-#[tokio::test]
-async fn for_snapshot_case_3b_hint_equal_to_max_catalog_uses_hint_not_backward_scan() {
-    // hint(v5) == max_catalog(v5): the guard `max_catalog_version < cp.version` is false,
-    // so we take the hint path (3b), NOT the backward-scan path (3c).
-    // A v7 checkpoint exists in storage; if 3c ran it would surface — catching the regression.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "checkpoint.parquet"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_tail = vec![create_log_path(&format!("memory:///_delta_log/{:020}.json", 5))];
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        log_tail,
-        Some(make_hint(5)),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 5);
-    // v5.json from log_tail is at the same version as the checkpoint, so no delta commits remain
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, Vec::<u64>::new());
-}
-
-// ── Case 3c ──────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn for_snapshot_case_3c_stale_hint_past_max_catalog_backward_scan_finds_checkpoint() {
-    // hint(v7) > max_catalog(v6): hint is stale. Backward scan finds v5; lists v5..=v6.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_tail = vec![create_log_path(&format!("memory:///_delta_log/{:020}.json", 6))];
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        log_tail,
-        Some(make_hint(7)),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(log_segment.checkpoint_parts.len(), 1);
-    assert_eq!(log_segment.checkpoint_parts[0].version, 5);
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![6]);
-}
-
-#[tokio::test]
-async fn for_snapshot_case_3c_stale_hint_no_checkpoint_found_falls_back_to_version_0() {
-    // hint(v5) > max_catalog(v3), no checkpoints anywhere.
-    // Backward scan returns None; falls back to listing from v0 to max_catalog (v3).
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    let log_tail = vec![create_log_path(&format!("memory:///_delta_log/{:020}.json", 3))];
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
-        log_root,
-        log_tail,
-        Some(make_hint(5)),
-        None,
-    )
-    .unwrap();
-
-    assert!(log_segment.checkpoint_parts.is_empty());
-    let versions: Vec<u64> = log_segment.ascending_commit_files.iter().map(|f| f.version).collect();
-    assert_eq!(versions, vec![0, 1, 2, 3]);
-}
-
-// ─── Additional find_last_checkpoint_before tests ─────────────────────────────
-
-#[tokio::test]
-async fn find_last_checkpoint_before_incomplete_multipart_falls_back_to_earlier_checkpoint() {
-    // v5 has only part 1 of 2 — incomplete. Should fall back to v3.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_multipart_checkpoint(5, 1, 2),
-        ],
-        None,
-    )
-    .await;
-
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap(),
-        Some(3)
-    );
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_only_commits_returns_none() {
-    // No checkpoints anywhere — exhausts all batches and returns None.
-    let paths: Vec<_> = (0_u64..=20).map(|v| delta_path_for_version(v, "json")).collect();
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 21).unwrap(),
-        None
-    );
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_checkpoint_at_version_zero() {
-    // version=1 (exclusive) → window [0, 1) contains v0 checkpoint.
-    // version=0 → while-loop never runs → always None.
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "checkpoint.parquet"),
-            delta_path_for_version(1, "json"),
-        ],
-        None,
-    )
-    .await;
-
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 1).unwrap(),
-        Some(0)
-    );
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 0).unwrap(),
-        None
-    );
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_multiple_checkpoints_in_same_batch_returns_highest_below_bound() {
-    // Checkpoints at v5, v8, v15 all in window [0, 1000).
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(8, "checkpoint.parquet"),
-            delta_path_for_version(15, "checkpoint.parquet"),
-        ],
-        None,
-    )
-    .await;
-
-    assert_eq!(find_last_checkpoint_before(storage.as_ref(), &log_root, 16).unwrap(), Some(15));
-    assert_eq!(find_last_checkpoint_before(storage.as_ref(), &log_root, 15).unwrap(), Some(8));
-    assert_eq!(find_last_checkpoint_before(storage.as_ref(), &log_root, 8).unwrap(), Some(5));
-    assert_eq!(find_last_checkpoint_before(storage.as_ref(), &log_root, 5).unwrap(), None);
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_three_batches_needed_to_find_checkpoint() {
-    // Checkpoint at v5, then commits v6..=2009. Version 2010 requires scanning
-    // windows [1010,2010), [10,1010), [0,10) before finding v5.
-    let mut paths = vec![delta_path_for_version(5, "checkpoint.parquet")];
-    for v in 6_u64..=2009 {
-        paths.push(delta_path_for_version(v, "json"));
-    }
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-
-    assert_eq!(
-        find_last_checkpoint_before(storage.as_ref(), &log_root, 2010).unwrap(),
-        Some(5)
-    );
-}
-
-#[tokio::test]
-async fn find_last_checkpoint_before_uuid_checkpoint_is_treated_as_complete() {
-    // UUID checkpoint at v5: LogPathFileType::UuidCheckpoint maps to the num_parts=1
-    // bucket in group_checkpoint_parts, making it unconditionally complete.
-    let uuid_path = Path::from(
-        "_delta_log/00000000000000000005.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet",
-    );
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[delta_path_for_version(0, "json"), uuid_path, delta_path_for_version(6, "json")],
-        None,
-    )
-    .await;
-
-    assert_eq!(find_last_checkpoint_before(storage.as_ref(), &log_root, 6).unwrap(), Some(5));
-    assert_eq!(find_last_checkpoint_before(storage.as_ref(), &log_root, 5).unwrap(), None);
 }

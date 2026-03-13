@@ -189,32 +189,39 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
     checkpoints
 }
 
-/// Find the last complete checkpoint at or before `version - 1` (i.e., `version` is the exclusive
-/// upper bound), searching backwards in batches of 1000 versions.
-pub(crate) fn find_last_checkpoint_before(
+/// Locates the most recent complete checkpoint whose version is strictly less than `version`,
+/// searching backward from `version` toward version 0. Returns `None` if no complete checkpoint
+/// exists before `version`.
+pub(crate) fn find_last_complete_checkpoint_before(
     storage: &dyn StorageHandler,
     log_root: &Url,
     version: Version,
 ) -> DeltaResult<Option<Version>> {
+    // `upper` is the exclusive upper bound of the current search batch. It starts at the target
+    // version and walks backward in steps of 1000 until a complete checkpoint is found or we exhaust all versions
     let mut upper = version;
 
     while upper > 0 {
+        // Each batch covers [lower, upper). saturating_sub prevents underflow when upper < 1000,
+        // so that lower is always >= 0 and the final batch covers up to the first version (v0)
         let lower = upper.saturating_sub(1000);
         let start_from = log_root.join(&format!("{lower:020}"))?;
 
-        // Collect only checkpoint files in [lower, upper)
+        // List files in [lower, upper) keeping only non-empty checkpoint files
         let checkpoint_files: Vec<ParsedLogPath> = storage
             .list_from(&start_from)?
             .map(|meta| ParsedLogPath::try_from(meta?))
-            .filter_map_ok(|opt| opt) // skip non-delta-log paths
+            .filter_map_ok(|opt| opt)
             .take_while(|res| match res {
-                Ok(p) => p.version < upper, // stop at the batch upper bound
-                Err(_) => true,             // propagate errors
+                Ok(p) => p.version < upper,
+                Err(_) => true,
             })
-            .filter_ok(|p| p.is_checkpoint())
+            .filter_ok(|p| p.is_checkpoint() && p.location.size > 0)
             .try_collect()?;
 
-        // list_from returns files in ascending version order, so group consecutive same-version parts
+        // Group files by version; storage lists in lexicographic order, and since all Delta log
+        // filenames are zero-padded to 20 digits, lexicographic == version order
+        // So we can use chunk_by to create one group per version
         let groups: Vec<(Version, Vec<ParsedLogPath>)> = checkpoint_files
             .into_iter()
             .chunk_by(|p| p.version)
@@ -222,7 +229,8 @@ pub(crate) fn find_last_checkpoint_before(
             .map(|(v, parts)| (v, parts.collect()))
             .collect();
 
-        // walk highest version first to find the latest complete checkpoint
+        // Walk from highest to lowest version within this batch and group checkpoint parts
+        // Return the version of the first complete checkpoint found
         for (cp_version, parts) in groups.into_iter().rev() {
             let grouped = group_checkpoint_parts(parts);
             if grouped
@@ -233,12 +241,12 @@ pub(crate) fn find_last_checkpoint_before(
             }
         }
 
-        upper = lower; 
+        // No complete checkpoint in this batch, expand the search window backward
+        upper = lower;
     }
 
     Ok(None)
 }
-
 
 impl ListedLogFiles {
     #[allow(clippy::type_complexity)] // It's the most readable way to destructure

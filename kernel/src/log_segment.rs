@@ -9,7 +9,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{schema_contains_file_actions, Sidecar, SIDECAR_NAME};
 use crate::committer::CatalogCommit;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::listed_log_files::find_last_checkpoint_before;
+use crate::listed_log_files::find_last_complete_checkpoint_before;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
@@ -325,7 +325,11 @@ impl LogSegment {
             None => match end_version {
                 // Case 2
                 Some(end) => {
-                    match find_last_checkpoint_before(storage, &log_root, end.saturating_add(1))? {
+                    match find_last_complete_checkpoint_before(
+                        storage,
+                        &log_root,
+                        end.saturating_add(1),
+                    )? {
                         Some(cp_version) => ListedLogFiles::list(
                             storage,
                             &log_root,
