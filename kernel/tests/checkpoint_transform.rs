@@ -12,8 +12,10 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
+#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
+use delta_kernel::arrow::datatypes::TimestampMicrosecondType;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -42,6 +44,7 @@ async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> Del
 
 const NON_PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
+#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
 const PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"binary","nullable":true,"metadata":{}}]}"#;
 
 /// Builds a JSON commit string with optional protocol, metadata, and stats config.
