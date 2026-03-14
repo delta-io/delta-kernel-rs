@@ -6,9 +6,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::schema::{
-    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform,
-    StructField, StructType,
+    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
+    StructType,
 };
+use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
 
 use column_filter::StatsColumnFilter;
