@@ -6,7 +6,7 @@ use crate::expressions::{
     MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
     Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
 };
-use crate::utils::{map_owned_children_or_else, CowExt as _};
+use crate::transforms::{map_owned_children_or_else, CowExt as _};
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -536,8 +536,9 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
-        ParseJsonExpression, Predicate as Pred, ScalarExpressionEvaluator,
+        column_expr, column_pred, Expression, Expression as Expr, OpaqueExpressionOp,
+        OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
+        ScalarExpressionEvaluator, VariadicExpression,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -545,6 +546,7 @@ mod tests {
     };
     use crate::schema::{DataType, StructField, StructType};
     use crate::DeltaResult;
+    use std::sync::Arc;
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
