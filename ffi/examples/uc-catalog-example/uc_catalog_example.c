@@ -168,7 +168,13 @@ int main(int argc, char* argv[])
 
     SharedExternEngine* engine = engine_res.ok;
 
-    ExternResultHandleSharedSnapshot snapshot_res = snapshot(table_path_slice, engine);
+    ExternResultFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
+    if (snapshot_builder_res.tag != OkFfiSnapshotBuilder) {
+      print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
+      free_error((Error*)snapshot_builder_res.err);
+      return -1;
+    }
+    ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
       free_error((Error*)snapshot_res.err);
