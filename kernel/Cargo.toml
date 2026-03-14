@@ -69,7 +69,7 @@ object_store_12 = { package = "object_store", version = "0.12.3", optional = tru
 [dependencies.arrow_56]
 package = "arrow"
 version = "56"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
+features = ["chrono-tz", "ffi", "json"]
 optional = true
 [dependencies.parquet_56]
 package = "parquet"
@@ -81,7 +81,7 @@ optional = true
 [dependencies.arrow_57]
 package = "arrow"
 version = "57"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
+features = ["chrono-tz", "ffi", "json"]
 optional = true
 [dependencies.parquet_57]
 package = "parquet"
@@ -94,8 +94,10 @@ optional = true
 default = []
 # internal-api will make everything marked #[internal_api] public
 internal-api = []
+# prettyprint enables Arrow pretty-print helpers (test/example oriented).
+prettyprint = ["arrow_56?/prettyprint", "arrow_57?/prettyprint"]
 # test-utils exposes test-only constructors for downstream crate tests
-test-utils = []
+test-utils = ["prettyprint"]
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
@@ -136,8 +138,10 @@ default-engine-rustls = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "default-engine-rustls", "internal-api", "test-utils"] }
-test_utils = { path = "../test-utils" }
+delta_kernel = { path = ".", features = ["catalog-managed", "test-utils"] }
+# NOTE: test_utils forcibly pulls the default engine and arrow-56. By default it ALSO pulls
+# arrow-57, which takes precedence and would make it impossible to test against arrow-56.
+test_utils = { path = "../test-utils", default-features = false }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.15.0" }

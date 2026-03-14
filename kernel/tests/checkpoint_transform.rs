@@ -12,8 +12,10 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
+#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
+use delta_kernel::arrow::datatypes::TimestampMicrosecondType;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -42,6 +44,7 @@ async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> Del
 
 const NON_PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
+#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
 const PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"binary","nullable":true,"metadata":{}}]}"#;
 
 /// Builds a JSON commit string with optional protocol, metadata, and stats config.
@@ -216,6 +219,9 @@ async fn test_checkpoint_stats_config_with_real_data(
 ///   - `tag` (binary): "hello" → raw bytes
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Arrow 56's JSON reader rejects Binary typed fields. This test exercises checkpoint
+// JSON paths that include a binary partition column (`tag`), so we have to disable it.
+#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
 async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] json1: bool,
     #[values(true, false)] struct1: bool,

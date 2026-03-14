@@ -13,8 +13,12 @@ version.workspace = true
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow"] }
+delta_kernel = { path = "../kernel" }
 
 [features]
+default = ["arrow"]
+arrow = ["arrow-57"]
+arrow-57 = ["delta_kernel/arrow-57"]
+arrow-56 = ["delta_kernel/arrow-56"]
 default-engine-native-tls= [ "delta_kernel/default-engine-native-tls" ]
 default-engine-rustls = [ "delta_kernel/default-engine-rustls" ]

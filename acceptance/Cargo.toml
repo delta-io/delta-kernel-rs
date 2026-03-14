@@ -14,10 +14,15 @@ rust-version.workspace = true
 [package.metadata.release]
 release = false
 
+[features]
+default = ["arrow"]
+arrow = ["arrow-57"]
+arrow-57 = ["delta_kernel/arrow-57", "test_utils/arrow-57"]
+arrow-56 = ["delta_kernel/arrow-56", "test_utils/arrow-56"]
+
 [dependencies]
 delta_kernel = { path = "../kernel", features = [
   "default-engine-rustls",
-  "arrow",
   "internal-api",
 ] }
 futures = "0.3"
@@ -35,7 +40,7 @@ tar = "0.4"
 [dev-dependencies]
 datatest-stable = "0.3"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
-test_utils = { path = "../test-utils" }
+test_utils = { path = "../test-utils", default-features = false }
 tempfile = "3"
 test-case = { version = "3.3.1" }
 tokio = { version = "1.47" }
