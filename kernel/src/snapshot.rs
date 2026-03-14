@@ -632,10 +632,10 @@ impl Snapshot {
         Transaction::try_new_existing_table(self, committer, engine)
     }
 
-    /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
+    /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
+    /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
-    /// Note that this method performs log replay (fetches and processes metadata from storage).
-    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    /// Uses the CRC fast path when available else, falls back to log replay.
     #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
         &self,
@@ -644,6 +644,25 @@ impl Snapshot {
     ) -> DeltaResult<Option<i64>> {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
+
+        // Fast path: serve from CRC if it tracks set transactions at this version.
+        if let Some(crc) = self
+            .lazy_crc
+            .get_or_load_if_at_version(engine, self.version())
+        {
+            if let Some(txn_map) = &crc.set_transactions {
+                return Ok(txn_map.get(application_id).and_then(|txn| {
+                    // Apply retention filter: if both expiration_timestamp and last_updated
+                    // are present and last_updated <= expiration, the txn is expired.
+                    match (expiration_timestamp, txn.last_updated) {
+                        (Some(exp_ts), Some(last_updated)) if last_updated <= exp_ts => None,
+                        _ => Some(txn.version),
+                    }
+                }));
+            }
+        }
+
+        // Fallback: full log replay.
         let txn = SetTransactionScanner::get_one(
             self.log_segment(),
             application_id,
