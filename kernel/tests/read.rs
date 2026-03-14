@@ -686,18 +686,18 @@ fn predicate_on_letter(
 }
 
 #[rstest::rstest]
-#[case::or_no_pruning(
+#[case::or_with_pruning(
     Pred::or(
-        // No pruning power
         column_expr!("letter").gt(Expr::literal("a")),
         column_expr!("number").gt(Expr::literal(3i64)),
     ),
+    // Unified data skipping evaluates partition + data predicates in a single pass.
+    // File a/1 (letter='a', max(number)=1): OR('a'>'a', 1>3) = FALSE -> pruned
     vec![
         "+--------+--------+",
         "| letter | number |",
         "+--------+--------+",
         "|        | 6      |",
-        "| a      | 1      |",
         "| a      | 4      |",
         "| b      | 2      |",
         "| c      | 3      |",
@@ -719,22 +719,222 @@ fn predicate_on_letter(
     Pred::and(
         column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
         Pred::or(
-            // No pruning power
             column_expr!("letter").eq(Expr::literal("c")),
             column_expr!("number").eq(Expr::literal(3i64)),
         ),
     ),
-    table_for_letters(&['b', 'c', 'e'])
+    // Unified data skipping evaluates the full expression:
+    // b/2: AND(TRUE, OR(FALSE, FALSE)) = FALSE -> pruned
+    // c/3: AND(TRUE, OR(TRUE, TRUE)) = TRUE -> kept
+    // e/5: AND(TRUE, OR(FALSE, FALSE)) = FALSE -> pruned
+    table_for_letters(&['c'])
 )]
 fn predicate_on_letter_and_number(
     #[case] pred: Pred,
     #[case] expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Partition skipping and file skipping are currently implemented separately. Mixing them in an
-    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
+    // Unified data skipping evaluates partition + data predicates together in a single
+    // columnar pass, enabling pruning for mixed predicates including OR expressions.
     read_table_data(
         "./tests/data/basic_partitioned",
         Some(&["letter", "number"]),
+        Some(pred),
+        expected,
+    )?;
+    Ok(())
+}
+
+/// Test partition pruning on a table with a checkpoint containing `partitionValues_parsed`.
+/// This exercises the checkpoint code path where typed partition values are read directly
+/// from the parquet column rather than parsed from the string map via `MapToStruct`.
+///
+/// Table: app-txn-checkpoint (checkpoint at v1, partition column: `modified` (string))
+///   - 2 files with modified=2021-02-01 (value 4-11, 8 rows each)
+///   - 2 files with modified=2021-02-02 (value 1-3, 3 rows each)
+#[rstest::rstest]
+#[case::partition_only_prunes_one_partition(
+    // Partition-only predicate: modified = '2021-02-02' should prune 2021-02-01 files
+    column_expr!("modified").eq(Expr::literal("2021-02-02")),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| B  | 2021-02-02 | 2     |",
+        "| B  | 2021-02-02 | 2     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::partition_prunes_other_partition(
+    // modified = '2021-02-01' should prune 2021-02-02 files, keeping all 2021-02-01 rows
+    column_expr!("modified").eq(Expr::literal("2021-02-01")),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-01 | 9     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+fn partition_pruning_with_checkpoint_parsed_values(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/app-txn-checkpoint",
+        Some(&["id", "modified", "value"]),
+        Some(pred),
+        expected,
+    )?;
+    Ok(())
+}
+
+/// Test mixed predicates (partition + data stats) on a checkpoint with both `partitionValues_parsed`
+/// and `stats_parsed`. This exercises the unified columnar data skipping pass that evaluates
+/// both partition values and data column statistics together.
+///
+/// Table: app-txn-checkpoint (checkpoint at v1, partition column: `modified` (string))
+///   - 2 files: modified=2021-02-02 -- 3 rows each, value in [1, 3]
+///   - 2 files: modified=2021-02-01 -- 8 rows each, value in [4, 11]
+#[rstest::rstest]
+#[case::and_keeps_partition_matched_files(
+    // Data skipping keeps 2021-02-01 files (partition matches, max(value)=11 > 9) and
+    // prunes 2021-02-02 files (partition mismatch). All rows from kept files are returned
+    // since kernel does not apply row-level predicate filtering.
+    Pred::and(
+        column_expr!("modified").eq(Expr::literal("2021-02-01")),
+        column_expr!("value").gt(Expr::literal(9i32)),
+    ),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-01 | 9     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::and_prunes_all_files(
+    // 2021-02-02: partition matches but data stats fail (max value=3, NOT > 3).
+    // 2021-02-01: partition mismatch. All 4 files pruned.
+    Pred::and(
+        column_expr!("modified").eq(Expr::literal("2021-02-02")),
+        column_expr!("value").gt(Expr::literal(3i32)),
+    ),
+    vec![]
+)]
+#[case::or_prunes_by_both_partition_and_stats(
+    // 2021-02-01 pruned: partition mismatch AND max(value)=11 NOT > 11.
+    // 2021-02-02 kept by partition match. Only 2021-02-02 rows returned.
+    Pred::or(
+        column_expr!("modified").eq(Expr::literal("2021-02-02")),
+        column_expr!("value").gt(Expr::literal(11i32)),
+    ),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| B  | 2021-02-02 | 2     |",
+        "| B  | 2021-02-02 | 2     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::or_keeps_all_files(
+    // 2021-02-02 kept by partition match, 2021-02-01 kept by data stats (max=11 > 9).
+    // All rows from all 4 files are returned.
+    Pred::or(
+        column_expr!("modified").eq(Expr::literal("2021-02-02")),
+        column_expr!("value").gt(Expr::literal(9i32)),
+    ),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-02 | 2     |",
+        "| B  | 2021-02-02 | 2     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+fn mixed_predicate_with_checkpoint_parsed_columns(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Exercises the unified data skipping path that reads both `partitionValues_parsed` and
+    // `stats_parsed` from the checkpoint parquet file in a single columnar pass.
+    read_table_data(
+        "./tests/data/app-txn-checkpoint",
+        Some(&["id", "modified", "value"]),
         Some(pred),
         expected,
     )?;
