@@ -6,7 +6,7 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
-use uc_catalog::{UCCatalog, UCCommitter};
+use delta_kernel_unity_catalog::{UCCommitter, UCKernelClient};
 use unitycatalog_client_api::{Commit, InMemoryCommitsClient, TableData};
 
 // ============================================================================
@@ -67,7 +67,7 @@ async fn setup() -> Result<TestSetup, TestError> {
         .with_task_executor(executor)
         .build();
     let table_uri = url::Url::from_directory_path(tmp_dir.path()).map_err(|_| "invalid path")?;
-    let snapshot = UCCatalog::new(commits_client.as_ref())
+    let snapshot = UCKernelClient::new(commits_client.as_ref())
         .load_snapshot_at(TABLE_ID, table_uri.as_str(), 2, &engine)
         .await?;
 

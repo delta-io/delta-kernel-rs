@@ -1,5 +1,5 @@
 [package]
-name = "uc-catalog"
+name = "delta-kernel-unity-catalog"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -15,7 +15,6 @@ release = false
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["catalog-managed"] }
-uc-client = { path = "../uc-client" }
 unitycatalog-client-api = { path = "../unitycatalog-client-api" }
 itertools = "0.14"
 serde = { version = "1.0", features = ["derive"] }

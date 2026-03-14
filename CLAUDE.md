@@ -43,17 +43,17 @@ cargo fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                       | Directory                   | Description                                        |
-|-----------------------------|-----------------------------|----------------------------------------------------|
-| `delta_kernel`              | `kernel/`                   | Core library                                       |
-| `delta_kernel_ffi`          | `ffi/`                      | C/C++ FFI bindings                                 |
-| `delta_kernel_derive`       | `derive-macros/`            | Proc macros                                        |
-| `acceptance`                | `acceptance/`               | Acceptance tests (DAT)                             |
-| `test_utils`                | `test-utils/`               | Shared test utilities                              |
-| `feature_tests`             | `feature-tests/`            | Feature flag tests                                 |
-| `uc-catalog`                | `uc-catalog/`               | Unity Catalog integration (UCCatalog, UCCommitter) |
-| `uc-client`                 | `uc-client/`                | Unity Catalog REST client                          |
-| `unitycatalog-client-api`   | `unitycatalog-client-api/`  | Unity Catalog client traits and shared models      |
+| Crate                           | Directory                        | Description                                             |
+|---------------------------------|----------------------------------|---------------------------------------------------------|
+| `delta_kernel`                  | `kernel/`                        | Core library                                            |
+| `delta_kernel_ffi`              | `ffi/`                           | C/C++ FFI bindings                                      |
+| `delta_kernel_derive`           | `derive-macros/`                 | Proc macros                                             |
+| `acceptance`                    | `acceptance/`                    | Acceptance tests (DAT)                                  |
+| `test_utils`                    | `test-utils/`                    | Shared test utilities                                   |
+| `feature_tests`                 | `feature-tests/`                 | Feature flag tests                                      |
+| `delta-kernel-unity-catalog`    | `delta-kernel-unity-catalog/`    | Unity Catalog integration (UCKernelClient, UCCommitter) |
+| `unitycatalog-client-api`       | `unitycatalog-client-api/`       | Unity Catalog client traits and shared models           |
+| `unitycatalog-client-rest-impl` | `unitycatalog-client-rest-impl/` | Unity Catalog REST client                               |
 
 ### Feature Flags
 

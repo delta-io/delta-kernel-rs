@@ -1,4 +1,4 @@
-//! UCCatalog implements a high-level interface for interacting with Delta Tables in Unity Catalog.
+//! UCKernelClient implements a high-level interface for interacting with Delta Tables in Unity Catalog.
 
 mod committer;
 pub use committer::UCCommitter;
@@ -7,22 +7,22 @@ use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
 
-use uc_client::prelude::*;
+use unitycatalog_client_api::{CommitsRequest, UCGetCommitsClient};
 
 use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-/// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in
+/// The [UCKernelClient] provides a high-level interface to interact with Delta Tables stored in
 /// Unity Catalog. It is a lightweight wrapper around a [UCGetCommitsClient].
-pub struct UCCatalog<'a, C: UCGetCommitsClient> {
+pub struct UCKernelClient<'a, C: UCGetCommitsClient> {
     client: &'a C,
 }
 
-impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
-    /// Create a new [UCCatalog] instance with the provided client.
+impl<'a, C: UCGetCommitsClient> UCKernelClient<'a, C> {
+    /// Create a new [UCKernelClient] instance with the provided client.
     pub fn new(client: &'a C) -> Self {
-        UCCatalog { client }
+        UCKernelClient { client }
     }
 
     /// Load the latest snapshot of a Delta Table identified by `table_id` and `table_uri` in Unity
@@ -183,7 +183,7 @@ mod tests {
             .await
             .map_err(|e| format!("Failed to get credentials: {e}"))?;
 
-        let catalog = UCCatalog::new(&uc_commits_client);
+        let catalog = UCKernelClient::new(&uc_commits_client);
 
         // TODO: support non-AWS
         let creds = creds
@@ -238,7 +238,7 @@ mod tests {
             .await
             .map_err(|e| format!("Failed to get credentials: {e}"))?;
 
-        let catalog = UCCatalog::new(commits_client.as_ref());
+        let catalog = UCKernelClient::new(commits_client.as_ref());
 
         // TODO: support non-AWS
         let creds = creds

@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
-use uc_client::models::{Commit, CommitRequest};
-use uc_client::UCCommitClient;
+use unitycatalog_client_api::{Commit, CommitRequest, UCCommitClient};
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.

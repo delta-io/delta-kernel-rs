@@ -17,8 +17,7 @@ use delta_kernel_ffi::{
 use delta_kernel_ffi_macros::handle_descriptor;
 use uc_catalog::UCCommitter;
 
-use uc_client::models::CommitRequest as ClientCommitRequest;
-use uc_client::UCCommitClient;
+use unitycatalog_client_api::{CommitRequest as ClientCommitRequest, UCCommitClient};
 
 use tracing::debug;
 
@@ -65,7 +64,7 @@ pub struct FfiUCCommitClient {
 unsafe impl Send for FfiUCCommitClient {}
 unsafe impl Sync for FfiUCCommitClient {}
 
-impl uc_client::UCCommitClient for FfiUCCommitClient {
+impl UCCommitClient for FfiUCCommitClient {
     /// Commit a new version to the table.
     async fn commit(&self, request: ClientCommitRequest) -> unitycatalog_client_api::Result<()> {
         let table_id = request.table_id;
@@ -245,8 +244,7 @@ pub(crate) mod tests {
     use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::Arc;
-    use uc_client::models::Commit as ClientCommit;
-    use uc_client::UCCommitClient;
+    use unitycatalog_client_api::{Commit as ClientCommit, UCCommitClient};
 
     pub(crate) struct TestContext {
         pub(crate) commit_called: bool,
