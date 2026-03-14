@@ -177,7 +177,7 @@ impl SchemaComparison for DataType {
 #[cfg(test)]
 mod tests {
     use crate::schema::compare::{Error, SchemaComparison};
-    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 
     #[test]
     fn can_read_is_reflexive() {
@@ -426,6 +426,65 @@ mod tests {
             DataType::SHORT.can_read_as(&DataType::BYTE),
             Err(Error::TypeMismatch)
         ));
+    }
+
+    #[test]
+    fn stats_type_reinterpretation_integer_to_date() {
+        // Integer -> Date is allowed for stats_parsed (int32 without DATE logical annotation)
+        assert!(PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::Date));
+
+        // Not a general schema widening rule: can_read_as rejects this
+        assert!(matches!(
+            DataType::INTEGER.can_read_as(&DataType::DATE),
+            Err(Error::TypeMismatch)
+        ));
+        // Cannot narrow: Date -> Integer
+        assert!(!PrimitiveType::Date.is_stats_type_compatible_with(&PrimitiveType::Integer));
+    }
+
+    #[test]
+    fn stats_type_reinterpretation_long_to_timestamp() {
+        // Long -> Timestamp/TimestampNtz is allowed for stats_parsed (int64 without TIMESTAMP annotation)
+        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
+        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
+
+        // Not a general schema widening rule: can_read_as rejects these
+        assert!(matches!(
+            DataType::LONG.can_read_as(&DataType::TIMESTAMP),
+            Err(Error::TypeMismatch)
+        ));
+        assert!(matches!(
+            DataType::LONG.can_read_as(&DataType::TIMESTAMP_NTZ),
+            Err(Error::TypeMismatch)
+        ));
+        // Cannot narrow: Timestamp/TimestampNtz -> Long
+        assert!(!PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::Long));
+        assert!(!PrimitiveType::TimestampNtz.is_stats_type_compatible_with(&PrimitiveType::Long));
+    }
+
+    #[test]
+    fn stats_type_reinterpretation_cross_type_rejected() {
+        // Reinterpretation rules are narrowly scoped: cross-type combinations are rejected
+        assert!(!PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Date));
+        assert!(!PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
+        assert!(!PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
+        assert!(!PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Date));
+    }
+
+    #[test]
+    fn stats_type_identity_and_widening() {
+        // Identity: any type is compatible with itself
+        assert!(PrimitiveType::Date.is_stats_type_compatible_with(&PrimitiveType::Date));
+        assert!(PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
+        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Long));
+
+        // is_stats_type_compatible_with is a superset of can_widen_to
+        assert!(PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Long));
+        assert!(PrimitiveType::Short.is_stats_type_compatible_with(&PrimitiveType::Integer));
+        assert!(PrimitiveType::Float.is_stats_type_compatible_with(&PrimitiveType::Double));
+        assert!(
+            PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz)
+        );
     }
 
     #[test]

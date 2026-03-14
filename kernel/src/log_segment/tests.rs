@@ -3142,6 +3142,83 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     ));
 }
 
+#[test]
+fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
+    // Checkpoint stores timestamp stats as Int64 (no logical type annotation)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("ts_ntz_col", DataType::LONG),
+    ]);
+
+    // Stats schema expects Timestamp and TimestampNtz types
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("ts_ntz_col", DataType::TIMESTAMP_NTZ),
+    ]);
+
+    // Long -> Timestamp/TimestampNtz reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_timestamp_to_long_rejected() {
+    // Checkpoint has Timestamp-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "ts_col",
+            DataType::TIMESTAMP,
+        )]);
+
+    // Stats schema expects Long -- narrowing should be rejected
+    let stats_schema = create_stats_schema(vec![StructField::nullable("ts_col", DataType::LONG)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_integer_to_date() {
+    // Checkpoint stores date stats as Int32 (no DATE logical annotation)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::INTEGER,
+        )]);
+
+    // Stats schema expects Date type
+    let stats_schema = create_stats_schema(vec![StructField::nullable("date_col", DataType::DATE)]);
+
+    // Integer -> Date reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_date_to_integer_rejected() {
+    // Checkpoint has Date-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::DATE,
+        )]);
+
+    // Stats schema expects Integer -- narrowing should be rejected
+    let stats_schema =
+        create_stats_schema(vec![StructField::nullable("date_col", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
 // ============================================================================
 // create_checkpoint_stream: partitionValues_parsed schema augmentation tests
 // ============================================================================

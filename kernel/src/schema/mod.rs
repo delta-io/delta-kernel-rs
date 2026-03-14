@@ -1459,12 +1459,12 @@ impl PrimitiveType {
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
-    /// Widening rules (based on Parquet reader behavior):
-    /// - Integer widening: byte → short → int → long
-    /// - Float widening: float → double
-    ///
-    /// Note: These widening rules assume the parquet reader supports reading narrower types
-    /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
+    /// Widening rules:
+    /// - Integer widening: byte -> short -> int -> long (Delta protocol type widening)
+    /// - Float widening: float -> double (Delta protocol type widening)
+    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
+    ///   since epoch, differing only in timezone semantics; this is a physical read
+    ///   accommodation, not a Delta protocol type widening rule)
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
@@ -1481,6 +1481,30 @@ impl PrimitiveType {
                 | (Timestamp, TimestampNtz)
                 | (TimestampNtz, Timestamp)
         )
+    }
+
+    /// Returns `true` if this primitive type is compatible with `target` for reading
+    /// `stats_parsed` columns from checkpoint parquet files.
+    ///
+    /// This is a superset of [`can_widen_to`]: it includes all Delta protocol type widening
+    /// rules plus physical Parquet encoding accommodations for checkpoint interop. Some
+    /// external checkpoint writers omit Parquet logical type annotations, producing plain
+    /// integer-typed columns for logically date or timestamp values:
+    /// - Integer -> Date (int32 stored without DATE annotation)
+    /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
+    ///
+    /// These reinterpretation cases are intentionally not part of [`can_widen_to`] because
+    /// they are not Delta protocol type widening rules and should not apply to general
+    /// schema compatibility checks.
+    ///
+    /// [`can_widen_to`]: PrimitiveType::can_widen_to
+    pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
+        self == target
+            || self.can_widen_to(target)
+            || matches!(
+                (self, target),
+                (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
+            )
     }
 }
 
