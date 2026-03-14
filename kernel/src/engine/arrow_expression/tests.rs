@@ -20,7 +20,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
-use crate::EvaluationHandlerExtension as _;
+use crate::{EvaluationHandler as _, EvaluationHandlerExtension as _};
 
 use super::*;
 
@@ -1105,4 +1105,149 @@ fn test_to_json_with_nested_struct() {
         json_array.value(1),
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
+}
+
+// helper to build a RecordBatch via `create_many` and assert it equals `expected`
+fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
+    let handler = ArrowEvaluationHandler;
+    let actual = handler.create_many(schema, rows).unwrap();
+    let actual_rb = actual.try_into_record_batch().unwrap();
+    assert_eq!(actual_rb, expected);
+}
+
+#[test]
+fn test_create_many_multiple_rows() {
+    let row1: &[Scalar] = &[1.into(), "A".into()];
+    let row2: &[Scalar] = &[2.into(), "B".into()];
+    let row3: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), "C".into()];
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", KernelDataType::INTEGER),
+        StructField::nullable("name", KernelDataType::STRING),
+    ]));
+    let expected_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let expected = RecordBatch::try_new(
+        expected_schema,
+        vec![
+            create_array!(Int32, [Some(1), Some(2), None]),
+            create_array!(Utf8, ["A", "B", "C"]),
+        ],
+    )
+    .unwrap();
+    assert_create_many(&[row1, row2, row3], schema, expected);
+}
+
+#[test]
+fn test_create_many_empty_rows_returns_zero_row_batch() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+    ]));
+    let handler = ArrowEvaluationHandler;
+    let result = handler.create_many(schema.clone(), &[]).unwrap();
+    assert_eq!(result.len(), 0);
+    let rb = result.try_into_record_batch().unwrap();
+    assert_eq!(rb.num_rows(), 0);
+    assert_eq!(rb.num_columns(), 2);
+}
+
+#[test]
+fn test_create_many_wrong_field_count_returns_error() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+    ]));
+    // Row has 3 scalars but schema has 2 fields
+    let bad_row: &[Scalar] = &[1.into(), "x".into(), 99.into()];
+    let handler = ArrowEvaluationHandler;
+    assert_result_error_with_message(
+        handler.create_many(schema, &[bad_row]),
+        "Row 0 has 3 scalars but schema has 2 fields",
+    );
+}
+
+#[test]
+fn test_create_many_single_row_matches_create_one() {
+    // create_many with one row should produce the same result as create_one
+    let values: &[Scalar] = &[
+        1.into(),
+        "hello".into(),
+        Scalar::Null(KernelDataType::INTEGER),
+    ];
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+        StructField::nullable("c", KernelDataType::INTEGER),
+    ]));
+    let handler = ArrowEvaluationHandler;
+    let from_one = handler
+        .create_one(schema.clone(), values)
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+    let from_many = handler
+        .create_many(schema, &[values])
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+    assert_eq!(from_one, from_many);
+}
+
+#[test]
+fn test_create_many_nested_struct() {
+    // Schema: outer { inner: Struct { x: INT, y: STRING }, flag: BOOLEAN }
+    let inner_type = KernelDataType::struct_type_unchecked([
+        StructField::nullable("x", KernelDataType::INTEGER),
+        StructField::nullable("y", KernelDataType::STRING),
+    ]);
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("inner", inner_type.clone()),
+        StructField::nullable("flag", KernelDataType::BOOLEAN),
+    ]));
+
+    // Row 1: inner = Struct { x: 10, y: "hello" }, flag = true
+    let row1: &[Scalar] = &[
+        Scalar::Struct(
+            crate::expressions::StructData::try_new(
+                vec![
+                    StructField::nullable("x", KernelDataType::INTEGER),
+                    StructField::nullable("y", KernelDataType::STRING),
+                ],
+                vec![10.into(), "hello".into()],
+            )
+            .unwrap(),
+        ),
+        true.into(),
+    ];
+    // Row 2: inner = null struct, flag = false
+    let row2: &[Scalar] = &[Scalar::Null(inner_type), false.into()];
+
+    let arrow_inner_fields: Fields = vec![
+        Field::new("x", DataType::Int32, true),
+        Field::new("y", DataType::Utf8, true),
+    ]
+    .into();
+    let expected_schema = Arc::new(Schema::new(vec![
+        Field::new("inner", DataType::Struct(arrow_inner_fields.clone()), true),
+        Field::new("flag", DataType::Boolean, true),
+    ]));
+
+    // Build expected inner struct column: row 1 has values, row 2 is null
+    let inner_col = Arc::new(StructArray::new(
+        arrow_inner_fields.clone(),
+        vec![
+            create_array!(Int32, [Some(10), None]) as ArrayRef,
+            create_array!(Utf8, [Some("hello"), None]) as ArrayRef,
+        ],
+        // null buffer: row 0 valid, row 1 null
+        Some(NullBuffer::from(BooleanBuffer::from(vec![true, false]))),
+    ));
+    let expected = RecordBatch::try_new(
+        expected_schema,
+        vec![inner_col, create_array!(Boolean, [true, false])],
+    )
+    .unwrap();
+    assert_create_many(&[row1, row2], schema, expected);
 }

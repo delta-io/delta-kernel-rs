@@ -472,6 +472,31 @@ pub trait EvaluationHandler: AsAny {
     // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
     // future.
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
+    ///
+    /// Each element in `rows` represents one row of data, where each row is a slice of structured
+    /// scalar values (one scalar per top-level field in the schema).
+    ///
+    /// # Parameters
+    ///
+    /// - `schema`: Schema describing the structure of each row.
+    /// - `rows`: Slice of rows, where each row contains one structured scalar per top-level schema
+    ///   field.
+    ///
+    /// # Returns
+    ///
+    /// A multi-row `EngineData` containing all rows.
+    ///
+    /// # Example
+    ///
+    /// For a schema with fields `[add: Struct, remove: Struct]`, each row should contain exactly 2
+    /// scalars: one for the `add` field and one for the `remove` field.
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: &[&[Scalar]],
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Internal trait to allow us to have a private `create_one` API that's implemented for all
