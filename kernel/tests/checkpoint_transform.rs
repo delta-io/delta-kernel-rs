@@ -216,19 +216,15 @@ async fn test_checkpoint_stats_config_with_real_data(
 ///   - `tag` (binary): "hello" → raw bytes
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Arrow 56's JSON reader rejects Binary typed fields. This test exercises checkpoint
+// JSON paths that include a binary partition column (`tag`), so we have to disable it.
+#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
 async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] json1: bool,
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Arrow 56's JSON reader rejects Binary typed fields. This test exercises checkpoint
-    // JSON paths that include a binary partition column (`tag`) when json2=true, so
-    // those combinations are only valid under Arrow 57.
-    if cfg!(all(feature = "arrow-56", not(feature = "arrow-57"))) && json2 {
-        return Ok(());
-    }
-
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
