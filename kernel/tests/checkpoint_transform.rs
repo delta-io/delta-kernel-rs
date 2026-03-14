@@ -222,6 +222,13 @@ async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Arrow 56's JSON reader rejects Binary typed fields. This test exercises checkpoint
+    // JSON paths that include a binary partition column (`tag`) when json2=true, so
+    // those combinations are only valid under Arrow 57.
+    if cfg!(all(feature = "arrow-56", not(feature = "arrow-57"))) && json2 {
+        return Ok(());
+    }
+
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
