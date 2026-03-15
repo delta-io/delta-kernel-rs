@@ -142,15 +142,8 @@ jobs:
         with:
           cache: false
           components: clippy
-      # The build and test jobs compile the same dependency tree with --all-features on the
-      # same OS matrix. shared-key replaces the job name component in the cache key,
-      # collapsing two cache entries per OS into one. The full key format is:
-      #   {prefix-key}-{shared-key}-{os.type()}-{os.arch()}-{envHash}-{lockHash}
-      # e.g. v0-rust-all-features-Linux-x64-a1b2c3d4-e5f6g7h8
-      # OS and arch are always appended by rust-cache, so cross-OS separation is automatic.
-      # On main pushes, whichever job finishes first saves the cache; the other's save is a
-      # no-op (GitHub caches are immutable per exact key). Both jobs benefit from cached
-      # dependency compilation on subsequent runs.
+      # Shared with the test job below. Both compile --all-features on the same OS matrix,
+      # so shared-key collapses two cache entries per OS into one (~1.3GB saved).
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: all-features
