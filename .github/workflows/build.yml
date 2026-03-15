@@ -142,8 +142,18 @@ jobs:
         with:
           cache: false
           components: clippy
+      # The build and test jobs compile the same dependency tree with --all-features on the
+      # same OS matrix. shared-key replaces the job name component in the cache key,
+      # collapsing two cache entries per OS into one. The full key format is:
+      #   {prefix-key}-{shared-key}-{os.type()}-{os.arch()}-{envHash}-{lockHash}
+      # e.g. v0-rust-all-features-Linux-x64-a1b2c3d4-e5f6g7h8
+      # OS and arch are always appended by rust-cache, so cross-OS separation is automatic.
+      # On main pushes, whichever job finishes first saves the cache; the other's save is a
+      # no-op (GitHub caches are immutable per exact key). Both jobs benefit from cached
+      # dependency compilation on subsequent runs.
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: all-features
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
@@ -176,8 +186,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+      # Shares cache with the build job. See the build job's rust-cache step for details.
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: all-features
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: test
