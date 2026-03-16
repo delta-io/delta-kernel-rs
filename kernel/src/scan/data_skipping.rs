@@ -600,19 +600,17 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         None
     }
 
-    /// Replaces unsupported (None) sub-predicates with TRUE instead of NULL. The parquet
-    /// RowGroupFilter's `eval_sql_where` converts NULL to false, which would incorrectly
-    /// prune row groups. TRUE is conservative: AND(TRUE, P) = P, OR(TRUE, P) = TRUE (keep).
+    /// Remaps unsupported (None) sub-predicates to TRUE before delegating to
+    /// [`collect_junction_preds`]. The parquet RowGroupFilter's `eval_sql_where` converts NULL
+    /// to false, which would incorrectly prune row groups. TRUE is conservative:
+    /// AND(TRUE, P) = P, OR(TRUE, P) = TRUE (keep).
     fn finish_eval_pred_junction(
         &self,
-        mut op: JunctionPredicateOp,
+        op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        if inverted {
-            op = op.invert();
-        }
-        let preds: Vec<_> = preds.map(|p| p.unwrap_or(Pred::literal(true))).collect();
-        Some(Pred::junction(op, preds))
+        let mut preds = preds.map(|p| p.or(Some(Pred::literal(true))));
+        Some(collect_junction_preds(op, &mut preds, inverted))
     }
 }
