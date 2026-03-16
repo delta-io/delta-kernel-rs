@@ -105,12 +105,14 @@ impl Snapshot {
     /// version.
     ///
     /// We implement a simple heuristic:
-    /// 1. if the new version == existing version, just return the existing snapshot
+    /// 1. if the caller explicitly requests the existing version, just return the existing
+    ///    snapshot
     /// 2. if the new version < existing version, error: there is no optimization to do here
     /// 3. list from (existing checkpoint version + 1) onward (or just existing snapshot version if
     ///    no checkpoint)
-    /// 4. a. if new checkpoint is found: just create a new snapshot from that checkpoint (and
-    ///    commits after it)
+    /// 4. a. if a newer or newly discovered checkpoint is found while refreshing to the latest
+    ///    version, create a new snapshot from that checkpoint (and commits after it), even if the
+    ///    table version itself did not advance
     ///    b. if no new checkpoint is found: do lightweight P+M replay on the latest commits (after
     ///    ensuring we only retain commits > any checkpoints)
     ///
@@ -230,11 +232,6 @@ impl Snapshot {
             return Err(Error::Generic(format!(
                 "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
         }
-        if new_end_version == old_version {
-            // No new commits, just return the same snapshot
-            return Ok(existing_snapshot.clone());
-        }
-
         if new_log_segment.checkpoint_version.is_some() {
             // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
             let snapshot = Self::try_new_from_log_segment_impl(
@@ -244,6 +241,11 @@ impl Snapshot {
                 operation_id,
             );
             return Ok(Arc::new(snapshot?));
+        }
+
+        if new_end_version == old_version {
+            // No new commits and no newly discovered checkpoint, just return the same snapshot
+            return Ok(existing_snapshot.clone());
         }
 
         // after this point, we incrementally update the snapshot with the new log segment.
@@ -999,7 +1001,9 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::executor::tokio::{
+        TokioBackgroundExecutor, TokioMultiThreadExecutor,
+    };
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
@@ -2276,6 +2280,39 @@ mod tests {
                 content.into(),
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
+    ) -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(executor)
+            .build();
+
+        setup_test_table_with_commits(&store, 2).await?;
+
+        let snapshot_v1 = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+        assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+
+        snapshot_v1.clone().checkpoint(&engine)?;
+
+        let fresh = Snapshot::builder_for(url.clone()).build(&engine)?;
+        assert_eq!(fresh.version(), 1);
+        assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
+
+        let updated = Snapshot::builder_from(snapshot_v1).build(&engine)?;
+        assert_eq!(updated.version(), 1);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(updated, fresh);
+
         Ok(())
     }
 
