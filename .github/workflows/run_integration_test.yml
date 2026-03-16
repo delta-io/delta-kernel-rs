@@ -23,6 +23,13 @@ jobs:
       - name: Setup rust toolchain
         if: ${{ !matrix.skip }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      # See build.yml top-level comment for why save-if is restricted to main.
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.skip }}
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Run integration tests
         if: ${{ !matrix.skip }}
         shell: bash

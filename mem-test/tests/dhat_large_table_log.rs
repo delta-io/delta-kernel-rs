@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::Snapshot;
-use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
 use tracing::info;

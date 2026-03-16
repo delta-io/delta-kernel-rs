@@ -1143,14 +1143,20 @@ mod tests {
     }
 
     // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
-    // Also make this function take in the path of the delta table (currently only can commit to tables at the root directory).
-    async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
+    async fn commit(
+        table_root: impl AsRef<str>,
+        store: &InMemory,
+        version: Version,
+        commit: Vec<serde_json::Value>,
+    ) {
         let commit_data = commit
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<String>>()
             .join("\n");
-        add_commit(store, version, commit_data).await.unwrap();
+        add_commit(table_root, store, version, commit_data)
+            .await
+            .unwrap();
     }
 
     // interesting cases for testing Snapshot::new_from:
@@ -1202,15 +1208,15 @@ mod tests {
         //
         // in each test we will modify versions 1 and 2 to test different scenarios
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
-            let url = Url::parse("memory:///")?;
+            let table_root = "memory:///";
             let engine = DefaultEngineBuilder::new(store).build();
-            let base_snapshot = Snapshot::builder_for(url.clone())
+            let base_snapshot = Snapshot::builder_for(table_root)
                 .at_version(0)
                 .build(&engine)?;
             let snapshot = Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
                 .build(&engine)?;
-            let expected = Snapshot::builder_for(url.clone())
+            let expected = Snapshot::builder_for(table_root)
                 .at_version(1)
                 .build(&engine)?;
             assert_eq!(snapshot, expected);
@@ -1249,16 +1255,16 @@ mod tests {
                 }
             }),
         ];
-        commit(store.as_ref(), 0, commit0.clone()).await;
+        let table_root = "memory:///";
+        commit(table_root, store.as_ref(), 0, commit0.clone()).await;
         // 3. new version > existing version
         // a. no new log segment
-        let url = Url::parse("memory:///")?;
         let engine = DefaultEngineBuilder::new(Arc::new(store.fork())).build();
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
         let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
-        let expected = Snapshot::builder_for(url.clone())
+        let expected = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
         assert_eq!(snapshot, expected);
@@ -1271,7 +1277,7 @@ mod tests {
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
         let store_3a = store.fork();
         let mut checkpoint1 = commit0.clone();
-        commit(&store_3a, 1, commit0.clone()).await;
+        commit(table_root, &store_3a, 1, commit0.clone()).await;
         checkpoint1[1] = json!({
             "protocol": {
                 "minReaderVersion": 2,
@@ -1321,13 +1327,12 @@ mod tests {
             }
         });
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
-        commit(store_3c_i.as_ref(), 1, commit1).await;
+        commit(table_root, store_3c_i.as_ref(), 1, commit1).await;
         test_new_from(store_3c_i.clone())?;
 
         // new commits AND request version > end of log
-        let url = Url::parse("memory:///")?;
         let engine = DefaultEngineBuilder::new(store_3c_i).build();
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
         assert!(matches!(
@@ -1345,7 +1350,7 @@ mod tests {
             }
         });
         commit1.remove(2); // remove metadata
-        commit(&store_3c_ii, 1, commit1).await;
+        commit(table_root, &store_3c_ii, 1, commit1).await;
         test_new_from(store_3c_ii.into())?;
 
         // iii. commits have (no protocol, new metadata)
@@ -1353,13 +1358,13 @@ mod tests {
         let mut commit1 = commit0.clone();
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
         commit1.remove(1); // remove protocol
-        commit(&store_3c_iii, 1, commit1).await;
+        commit(table_root, &store_3c_iii, 1, commit1).await;
         test_new_from(store_3c_iii.into())?;
 
         // iv. commits have (no protocol, no metadata)
         let store_3c_iv = store.fork();
         let commit1 = vec![commit0[0].clone()];
-        commit(&store_3c_iv, 1, commit1).await;
+        commit(table_root, &store_3c_iv, 1, commit1).await;
         test_new_from(store_3c_iv.into())?;
 
         Ok(())
@@ -1369,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
         let protocol = |reader_version, writer_version| {
             json!({
@@ -1417,8 +1422,8 @@ mod tests {
         ];
 
         // commit 0 and 1 jsons
-        commit(&store, 0, commit0.clone()).await;
-        commit(&store, 1, commit1).await;
+        commit(table_root, &store, 0, commit0.clone()).await;
+        commit(table_root, &store, 1, commit1).await;
 
         // a) CRC: old one has 0.crc, no new one (expect 0.crc)
         // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
@@ -1436,7 +1441,7 @@ mod tests {
         store.put(&path, crc.to_string().into()).await?;
 
         // base snapshot is at version 0
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
 
@@ -1444,7 +1449,7 @@ mod tests {
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
-        let expected = Snapshot::builder_for(url.clone())
+        let expected = Snapshot::builder_for(table_root)
             .at_version(1)
             .build(&engine)?;
         assert_eq!(snapshot, expected);
@@ -1474,7 +1479,7 @@ mod tests {
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
-        let expected = Snapshot::builder_for(url.clone())
+        let expected = Snapshot::builder_for(table_root)
             .at_version(1)
             .build(&engine)?;
         assert_eq!(snapshot, expected);
@@ -1640,7 +1645,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_domain_metadata() -> DeltaResult<()> {
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1688,7 +1693,9 @@ mod tests {
         ]
         .map(|json| json.to_string())
         .join("\n");
-        add_commit(store.clone().as_ref(), 0, commit).await.unwrap();
+        add_commit(table_root, store.clone().as_ref(), 0, commit)
+            .await
+            .unwrap();
 
         // commit1
         // - domain1: removed
@@ -1719,9 +1726,11 @@ mod tests {
         ]
         .map(|json| json.to_string())
         .join("\n");
-        add_commit(store.as_ref(), 1, commit).await.unwrap();
+        add_commit(table_root, store.as_ref(), 1, commit)
+            .await
+            .unwrap();
 
-        let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
         // Test get_domain_metadata
 
@@ -1790,14 +1799,14 @@ mod tests {
     #[tokio::test]
     async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
-        let url = url::Url::parse("memory://test/")?;
+        let table_root = "memory://test/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
-        add_commit(store.as_ref(), 0, commit0).await?;
+        add_commit(table_root, store.as_ref(), 0, commit0).await?;
 
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
         // When ICT is disabled, get_timestamp should return None
         let result = snapshot.get_in_commit_timestamp(&engine)?;
@@ -1810,27 +1819,27 @@ mod tests {
     async fn test_timestamp_with_ict_enablement_timeline() -> Result<(), Box<dyn std::error::Error>>
     {
         let store = Arc::new(InMemory::new());
-        let url = url::Url::parse("memory://test/")?;
+        let table_root = "memory://test/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
-        add_commit(store.as_ref(), 0, commit0).await?;
+        add_commit(table_root, store.as_ref(), 0, commit0).await?;
 
         // Create commit that enables ICT (version 1 = enablement version)
         let commit1 =
             create_basic_commit(true, Some(("1".to_string(), "1587968586154".to_string())));
-        add_commit(store.as_ref(), 1, commit1).await?;
+        add_commit(table_root, store.as_ref(), 1, commit1).await?;
 
         // Create commit with ICT enabled
         let expected_timestamp = 1587968586200i64;
         let commit2 = format!(
             r#"{{"commitInfo":{{"timestamp":1587968586154,"inCommitTimestamp":{expected_timestamp},"operation":"WRITE"}}}}"#,
         );
-        add_commit(store.as_ref(), 2, commit2.to_string()).await?;
+        add_commit(table_root, store.as_ref(), 2, commit2.to_string()).await?;
 
         // Read snapshot at version 0 (before ICT enablement)
-        let snapshot_v0 = Snapshot::builder_for(url.clone())
+        let snapshot_v0 = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
         // This snapshot version predates ICT enablement, so ICT is not available
@@ -1838,7 +1847,9 @@ mod tests {
         assert_eq!(result_v0, None);
 
         // Read snapshot at version 2 (after ICT enabled)
-        let snapshot_v2 = Snapshot::builder_for(url).at_version(2).build(&engine)?;
+        let snapshot_v2 = Snapshot::builder_for(table_root)
+            .at_version(2)
+            .build(&engine)?;
         // When ICT is enabled and available, timestamp() should return inCommitTimestamp
         let result_v2 = snapshot_v2.get_in_commit_timestamp(&engine)?;
         assert_eq!(result_v2, Some(expected_timestamp));
@@ -1849,7 +1860,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_enablement_version_in_future() -> DeltaResult<()> {
         // Test invalid state where snapshot has enablement version in the future - should error
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1877,13 +1888,15 @@ mod tests {
                 }
             }),
         ];
-        commit(store.as_ref(), 0, commit_data.to_vec()).await;
+        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await;
 
         // Create commit that predates ICT enablement (no inCommitTimestamp)
         let commit_predates = [create_commit_info(1234567890, None)];
-        commit(store.as_ref(), 1, commit_predates.to_vec()).await;
+        commit(table_root, store.as_ref(), 1, commit_predates.to_vec()).await;
 
-        let snapshot_predates = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+        let snapshot_predates = Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(&engine)?;
         let result_predates = snapshot_predates.get_in_commit_timestamp(&engine);
 
         // Version 1 with enablement at version 5 is invalid - should error
@@ -1898,7 +1911,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_missing_ict_when_enabled() -> DeltaResult<()> {
         // Test missing ICT when it should be present - should error
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1912,13 +1925,15 @@ mod tests {
                 false,
             ),
         ];
-        commit(store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+        commit(table_root, store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
 
         // Create commit without ICT despite being enabled (corrupt case)
         let commit_missing_ict = [create_commit_info(1234567890, None)];
-        commit(store.as_ref(), 1, commit_missing_ict.to_vec()).await;
+        commit(table_root, store.as_ref(), 1, commit_missing_ict.to_vec()).await;
 
-        let snapshot_missing = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+        let snapshot_missing = Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(&engine)?;
         let result = snapshot_missing.get_in_commit_timestamp(&engine);
         assert_result_error_with_message(result, "In-Commit Timestamp not found");
 
@@ -1945,10 +1960,10 @@ mod tests {
                 false,
             ),
         ];
-        commit(store.as_ref(), 0, commit_data.to_vec()).await;
+        commit(url.as_str(), store.as_ref(), 0, commit_data.to_vec()).await;
 
         // Build snapshot to get table configuration
-        let snapshot = Snapshot::builder_for(url.clone())
+        let snapshot = Snapshot::builder_for(url.as_str())
             .at_version(0)
             .build(&engine)?;
 
@@ -1983,7 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_timestamp_with_checkpoint_and_commit_same_version() -> DeltaResult<()> {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
@@ -1999,7 +2014,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(store.as_ref(), 0, commit0_data.to_vec()).await;
+        commit(table_root, store.as_ref(), 0, commit0_data.to_vec()).await;
 
         // Create 00000000000000000001.checkpoint.parquet
         let checkpoint_data = [
@@ -2038,10 +2053,12 @@ mod tests {
         // Create 00000000000000000001.json with ICT
         let expected_ict = 1587968586200i64;
         let commit1_data = [create_commit_info(1587968586200, Some(expected_ict))];
-        commit(store.as_ref(), 1, commit1_data.to_vec()).await;
+        commit(table_root, store.as_ref(), 1, commit1_data.to_vec()).await;
 
         // Build snapshot - LogSegment will filter out the commit file because checkpoint exists at same version
-        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+        let snapshot = Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(&engine)?;
 
         // We should successfully read ICT by falling back to storage
         let timestamp = snapshot.get_in_commit_timestamp(&engine)?;
@@ -2053,7 +2070,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///test_table/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit
@@ -2075,9 +2092,9 @@ mod tests {
                 }
             }),
         ];
-        commit(store.as_ref(), 0, commit0).await;
+        commit(table_root, store.as_ref(), 0, commit0).await;
 
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
 
@@ -2109,21 +2126,23 @@ mod tests {
             }),
         ];
 
-        commit(store.as_ref(), 0, base_commit.clone()).await;
+        commit(url.as_str(), store.as_ref(), 0, base_commit.clone()).await;
         commit(
+            url.as_str(),
             store.as_ref(),
             1,
             vec![json!({"commitInfo": {"timestamp": 1234}})],
         )
         .await;
         commit(
+            url.as_str(),
             store.as_ref(),
             2,
             vec![json!({"commitInfo": {"timestamp": 5678}})],
         )
         .await;
 
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = Snapshot::builder_for(url.as_str())
             .at_version(1)
             .build(&engine)?;
 
@@ -2170,7 +2189,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///test_table/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits
@@ -2188,15 +2207,16 @@ mod tests {
             }),
         ];
 
-        commit(store.as_ref(), 0, base_commit).await;
+        commit(table_root, store.as_ref(), 0, base_commit).await;
         commit(
+            table_root,
             store.as_ref(),
             1,
             vec![json!({"commitInfo": {"timestamp": 1234}})],
         )
         .await;
 
-        let base_snapshot = Snapshot::builder_for(url.clone())
+        let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(1)
             .build(&engine)?;
 
@@ -2237,7 +2257,11 @@ mod tests {
     }
 
     // Helper: create a minimal test table with commits 0-N
-    async fn setup_test_table_with_commits(store: &InMemory, num_commits: u64) -> DeltaResult<()> {
+    async fn setup_test_table_with_commits(
+        table_root: impl AsRef<str>,
+        store: &InMemory,
+        num_commits: u64,
+    ) -> DeltaResult<()> {
         // Commit 0: protocol + metadata + first file
         let commit0 = vec![
             json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
@@ -2253,7 +2277,7 @@ mod tests {
             }),
             json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
         ];
-        commit(store, 0, commit0).await;
+        commit(table_root.as_ref(), store, 0, commit0).await;
 
         // Additional commits with just add actions
         for i in 1..num_commits {
@@ -2266,7 +2290,7 @@ mod tests {
                     "dataChange": true
                 }
             })];
-            commit(store, i, commit_i).await;
+            commit(table_root.as_ref(), store, i, commit_i).await;
         }
         Ok(())
     }
@@ -2322,16 +2346,16 @@ mod tests {
     #[tokio::test]
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits 0-3 and compaction files (1,1) and (1,2)
-        setup_test_table_with_commits(&store, 3).await?;
+        setup_test_table_with_commits(table_root, &store, 3).await?;
         write_compaction_file(&store, 1, 1).await?;
         write_compaction_file(&store, 1, 2).await?;
 
         // Build snapshot at v2 (includes both compaction files)
-        let snapshot_v2 = Snapshot::builder_for(url.clone())
+        let snapshot_v2 = Snapshot::builder_for(table_root)
             .at_version(2)
             .build(&engine)?;
         assert_eq!(
@@ -2345,6 +2369,7 @@ mod tests {
 
         // Add commit 3
         commit(
+            table_root,
             &store,
             3,
             vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
@@ -2376,16 +2401,16 @@ mod tests {
     #[tokio::test]
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
+        let table_root = "memory:///";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits 0-3 and compaction files (1,2) and (2,2)
-        setup_test_table_with_commits(&store, 4).await?;
+        setup_test_table_with_commits(table_root, &store, 4).await?;
         write_compaction_file(&store, 1, 2).await?;
         write_compaction_file(&store, 2, 2).await?;
 
         // Build snapshot at v2
-        let snapshot_v2 = Snapshot::builder_for(url.clone())
+        let snapshot_v2 = Snapshot::builder_for(table_root)
             .at_version(2)
             .build(&engine)?;
         assert_eq!(

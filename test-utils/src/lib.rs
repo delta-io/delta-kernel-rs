@@ -21,17 +21,17 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::{path::Path, DynObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
@@ -221,26 +221,59 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
-// TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
-/// put a commit file into the specified object store.
+// Resolve a table from a root and relative path
+fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+    let url = try_parse_uri(table_root)?;
+    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+}
+
+/// Write a Delta commit JSON file at the given version into `store`.
+///
+/// The commit is written to `_delta_log/{version:020}.json` under `table_root`. The caller is
+/// responsible for ensuring that `data` contains valid Delta actions (e.g. built via
+/// [`actions_to_string`]) and that no commit already exists at `version`.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Commit version number (determines the log file name).
+/// - `data` - JSON-serialized Delta actions to write as the commit body.
 pub async fn add_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = delta_path_for_version(version, "json");
-    store.put(&path, data.into()).await?;
+    let relative_path = delta_path_for_version(version, "json");
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
     Ok(())
 }
 
+/// Write a staged (uncommitted) Delta commit JSON file at the given version into `store`.
+///
+/// The file is written to `_delta_log/_staged_commits/{version}.{uuid}.json` under
+/// `table_root`. Multiple staged commits may exist for the same version (each gets a unique
+/// UUID). The caller is responsible for ensuring that `data` contains valid Delta actions.
+///
+/// Returns the object-store [`Path`] of the written file so callers can reference it in a
+/// log tail or assertions.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Target commit version number (determines the staged file name prefix).
+/// - `data` - JSON-serialized Delta actions to write as the staged commit body.
 pub async fn add_staged_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
-    let path = staged_commit_path_for_version(version);
-    store.put(&path, data.into()).await?;
-    Ok(path)
+    let relative_path = staged_commit_path_for_version(version);
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
+    Ok(table_path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
@@ -333,11 +366,11 @@ pub fn engine_store_setup(
     table_name: &str,
     local_directory: Option<&Url>,
 ) -> (
-    Arc<dyn ObjectStore>,
+    Arc<DynObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+    let (storage, url): (Arc<DynObjectStore>, Url) = match local_directory {
         None => (
             Arc::new(InMemory::new()),
             Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
@@ -356,7 +389,7 @@ pub fn engine_store_setup(
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_path: Url,
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -489,7 +522,7 @@ pub async fn setup_test_tables(
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         &'static str,
     )>,
     Box<dyn std::error::Error>,

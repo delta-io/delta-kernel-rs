@@ -9,8 +9,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_remove_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::crc::{CrcDelta, FileStatsDelta};
@@ -20,7 +20,7 @@ use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
@@ -32,7 +32,7 @@ use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
+    RowVisitor, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -51,6 +51,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod commit_info;
 mod domain_metadata;
 mod stats_verifier;
 mod update;
@@ -195,6 +196,7 @@ pub struct Transaction<S = ExistingTable> {
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
@@ -328,15 +330,14 @@ impl<S> Transaction<S> {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let commit_info = CommitInfo::new(
+        let kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
         );
-        let commit_info_action =
-            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
+        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions for create-table
         let (protocol_action, metadata_action) = if self.is_create_table() {
@@ -460,6 +461,26 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Set the content of the commitInfo action for this transaction. Note that kernel will _always_ write a commitInfo,
+    /// this function simply allows engines to add their own data into that action if they wish.
+    /// Note that the following fields in `engine_commit_info` will be overridden by kernel if they are set (meaning you should not set them):
+    /// - timestamp
+    /// - inCommitTimestamp
+    /// - operation
+    /// - operationParameters
+    /// - kernelVersion
+    /// - isBlindAppend
+    /// - engineInfo
+    /// - txnId
+    pub fn with_commit_info(
+        mut self,
+        engine_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self
+    }
+
     /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
     /// `last_updated` timestamp).
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
@@ -566,6 +587,7 @@ impl<S> Transaction<S> {
         // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
         self.read_snapshot.version().wrapping_add(1)
     }
+
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
     /// a Parquet write operation back to Kernel.
     ///
@@ -999,10 +1021,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = NullableStatsTransform
-            .transform_struct(get_log_remove_schema())
-            .ok_or_else(|| Error::generic("Failed to transform remove schema"))?
-            .into_owned();
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references
@@ -1049,7 +1068,7 @@ impl<S> Transaction<S> {
         let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
             expr.clone(),
-            target_schema.clone().into(),
+            target_schema.into(),
         )?);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
@@ -1279,6 +1298,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::CommitInfo;
     use crate::arrow::array::{
         ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
     };
