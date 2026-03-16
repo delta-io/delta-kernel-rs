@@ -176,6 +176,8 @@ impl SchemaComparison for DataType {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use crate::schema::compare::{Error, SchemaComparison};
     use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 
@@ -428,62 +430,38 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stats_type_reinterpretation_integer_to_date() {
-        // Integer -> Date is allowed for stats_parsed (int32 without DATE logical annotation)
-        assert!(PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::Date));
-
-        // Not a general schema widening rule: can_read_as rejects this
-        assert!(matches!(
-            DataType::INTEGER.can_read_as(&DataType::DATE),
-            Err(Error::TypeMismatch)
-        ));
-        // Cannot narrow: Date -> Integer
-        assert!(!PrimitiveType::Date.is_stats_type_compatible_with(&PrimitiveType::Integer));
-    }
-
-    #[test]
-    fn stats_type_reinterpretation_long_to_timestamp() {
-        // Long -> Timestamp/TimestampNtz is allowed for stats_parsed (int64 without TIMESTAMP annotation)
-        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
-        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
-
-        // Not a general schema widening rule: can_read_as rejects these
-        assert!(matches!(
-            DataType::LONG.can_read_as(&DataType::TIMESTAMP),
-            Err(Error::TypeMismatch)
-        ));
-        assert!(matches!(
-            DataType::LONG.can_read_as(&DataType::TIMESTAMP_NTZ),
-            Err(Error::TypeMismatch)
-        ));
-        // Cannot narrow: Timestamp/TimestampNtz -> Long
-        assert!(!PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::Long));
-        assert!(!PrimitiveType::TimestampNtz.is_stats_type_compatible_with(&PrimitiveType::Long));
-    }
-
-    #[test]
-    fn stats_type_reinterpretation_cross_type_rejected() {
-        // Reinterpretation rules are narrowly scoped: cross-type combinations are rejected
-        assert!(!PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Date));
-        assert!(!PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
-        assert!(!PrimitiveType::Integer.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz));
-        assert!(!PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Date));
-    }
-
-    #[test]
-    fn stats_type_identity_and_widening() {
-        // Identity: any type is compatible with itself
-        assert!(PrimitiveType::Date.is_stats_type_compatible_with(&PrimitiveType::Date));
-        assert!(PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::Timestamp));
-        assert!(PrimitiveType::Long.is_stats_type_compatible_with(&PrimitiveType::Long));
-
-        // is_stats_type_compatible_with is a superset of can_widen_to
-        assert!(PrimitiveType::Byte.is_stats_type_compatible_with(&PrimitiveType::Long));
-        assert!(PrimitiveType::Short.is_stats_type_compatible_with(&PrimitiveType::Integer));
-        assert!(PrimitiveType::Float.is_stats_type_compatible_with(&PrimitiveType::Double));
-        assert!(
-            PrimitiveType::Timestamp.is_stats_type_compatible_with(&PrimitiveType::TimestampNtz)
+    #[rstest]
+    // Physical type reinterpretation (not general widening -- can_read_as rejects these)
+    #[case::integer_to_date(PrimitiveType::Integer, PrimitiveType::Date, true)]
+    #[case::long_to_timestamp(PrimitiveType::Long, PrimitiveType::Timestamp, true)]
+    #[case::long_to_timestamp_ntz(PrimitiveType::Long, PrimitiveType::TimestampNtz, true)]
+    // Reverse (narrowing) is rejected
+    #[case::date_to_integer(PrimitiveType::Date, PrimitiveType::Integer, false)]
+    #[case::timestamp_to_long(PrimitiveType::Timestamp, PrimitiveType::Long, false)]
+    #[case::timestamp_ntz_to_long(PrimitiveType::TimestampNtz, PrimitiveType::Long, false)]
+    // Cross-type combinations are rejected
+    #[case::long_to_date(PrimitiveType::Long, PrimitiveType::Date, false)]
+    #[case::integer_to_timestamp(PrimitiveType::Integer, PrimitiveType::Timestamp, false)]
+    #[case::integer_to_timestamp_ntz(PrimitiveType::Integer, PrimitiveType::TimestampNtz, false)]
+    #[case::byte_to_date(PrimitiveType::Byte, PrimitiveType::Date, false)]
+    // Identity
+    #[case::date_identity(PrimitiveType::Date, PrimitiveType::Date, true)]
+    #[case::timestamp_identity(PrimitiveType::Timestamp, PrimitiveType::Timestamp, true)]
+    #[case::long_identity(PrimitiveType::Long, PrimitiveType::Long, true)]
+    // Widening (superset of can_widen_to)
+    #[case::byte_to_long(PrimitiveType::Byte, PrimitiveType::Long, true)]
+    #[case::short_to_integer(PrimitiveType::Short, PrimitiveType::Integer, true)]
+    #[case::float_to_double(PrimitiveType::Float, PrimitiveType::Double, true)]
+    #[case::timestamp_to_ntz(PrimitiveType::Timestamp, PrimitiveType::TimestampNtz, true)]
+    fn stats_type_compatibility(
+        #[case] source: PrimitiveType,
+        #[case] target: PrimitiveType,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            source.is_stats_type_compatible_with(&target),
+            expected,
+            "{source:?} -> {target:?} should be {expected}"
         );
     }
 

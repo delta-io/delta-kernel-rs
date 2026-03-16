@@ -207,9 +207,12 @@ fn check_cast_compat(
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         // Physical type reinterpretation: some checkpoint writers store date/timestamp columns
-        // as plain integers without Parquet logical type annotations. While this only arises
-        // from checkpoint files in practice, the cast is safe for any read path because a
-        // schema mismatch (Int32 where Date32 is expected) would not occur in normal data files.
+        // as plain integers without Parquet logical type annotations. The Delta protocol
+        // guarantees data files conform to the table schema, so a schema mismatch (e.g. Int32
+        // where Date32 is expected) would not occur in normal data files.
+        //
+        // NOTE: The kernel-type equivalent lives in `PrimitiveType::is_stats_type_compatible_with`
+        // in `schema/mod.rs`. Changes here must be mirrored there.
         (Int32, Date32) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int64, Timestamp(TimeUnit::Microsecond, _)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(

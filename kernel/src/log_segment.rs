@@ -1157,32 +1157,23 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Primitive types: use stats-specific compatibility which covers both Delta
-                // protocol type widening and Parquet physical type reinterpretation for
-                // checkpoints that omit logical type annotations.
-                (DataType::Primitive(avail_prim), DataType::Primitive(need_prim)) => {
-                    if !avail_prim.is_stats_type_compatible_with(need_prim) {
+                // Non-struct types: use stats-specific rules for primitives and standard
+                // schema rules otherwise.
+                _ => {
+                    let compatible = match (available_field.data_type(), needed_field.data_type()) {
+                        (DataType::Primitive(a), DataType::Primitive(b)) => {
+                            a.is_stats_type_compatible_with(b)
+                        }
+                        (a, b) => a.can_read_as(b).is_ok(),
+                    };
+                    if !compatible {
                         debug!(
                             "stats_parsed not compatible: incompatible type for '{}' in {}: \
                              checkpoint has {:?}, stats schema needs {:?}",
                             needed_field.name(),
                             context,
-                            avail_prim,
-                            need_prim
-                        );
-                        return false;
-                    }
-                }
-                // Other non-struct types (arrays, maps): use standard schema compatibility
-                (avail_type, need_type) => {
-                    if avail_type.can_read_as(need_type).is_err() {
-                        debug!(
-                            "stats_parsed not compatible: incompatible type for '{}' in {}: \
-                             checkpoint has {:?}, stats schema needs {:?}",
-                            needed_field.name(),
-                            context,
-                            avail_type,
-                            need_type
+                            available_field.data_type(),
+                            needed_field.data_type()
                         );
                         return false;
                     }

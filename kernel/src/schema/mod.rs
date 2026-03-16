@@ -1501,6 +1501,9 @@ impl PrimitiveType {
     /// they are not Delta protocol type widening rules and should not apply to general
     /// schema compatibility checks.
     ///
+    /// NOTE: The Arrow-level equivalent lives in `check_cast_compat` in
+    /// `engine/ensure_data_types.rs`. Changes here must be mirrored there.
+    ///
     /// [`can_widen_to`]: PrimitiveType::can_widen_to
     pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
         self == target
