@@ -69,8 +69,10 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     }
 }
 
-/// Physical schema variants for a table. The `full` schema includes all columns from logical schema; the
-/// `without_partition` schema lazily excludes partition columns.
+/// Physical schema variants for a table.
+///
+/// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
+/// - `without_partition`: lazily computed variant that excludes partition columns.
 #[derive(Debug, Clone)]
 struct PhysicalSchemas {
     full: SchemaRef,
