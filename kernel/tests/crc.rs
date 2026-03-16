@@ -635,7 +635,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
 
 // ============================================================================
 // Set transaction CRC tracking
-// TODO: Add tests for testing set txn expiration
+// TODO(#2141): Add tests for testing set txn expiration
 // ============================================================================
 
 /// Comprehensive test for set transaction CRC tracking: verifies that set transactions are
