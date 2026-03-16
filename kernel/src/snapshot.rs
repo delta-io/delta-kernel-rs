@@ -636,7 +636,7 @@ impl Snapshot {
     /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
     /// Uses the CRC fast path when available, otherwise falls back to log replay.
-    /// TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
         &self,

@@ -62,8 +62,8 @@ impl CrcDelta {
                 .map(|dm| (dm.domain().to_string(), dm))
                 .collect(),
         );
-        // Same reasoning as domain metadata: we always know the full set transaction state
-        // for CREATE TABLE, so this is always `Some`.
+        // CREATE TABLE starts with a known-complete set of transactions (possibly empty),
+        // so we always track them.
         let set_transactions = Some(
             self.set_transaction_changes
                 .into_iter()
