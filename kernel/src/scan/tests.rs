@@ -48,14 +48,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -987,7 +987,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     1,
 )]
 #[case::and_mixed_supported_unsupported(
-    // AND(id > 400, ts_col > ...): unsupported arm becomes TRUE, id arm skips 4 files.
+    // AND(id > 400, ts_col > ...): unsupported arm becomes NULL (unknown), id arm skips 4 files.
     Arc::new(Pred::and(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
@@ -995,8 +995,8 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     2,
 )]
 #[case::or_mixed_supported_unsupported(
-    // OR(id > 400, ts_col > ...): unsupported arm becomes TRUE -> OR(..., TRUE) = TRUE,
-    // no pruning.
+    // OR(id > 400, ts_col > ...): unsupported arm becomes NULL (unknown) -> OR(..., NULL)
+    // is unknown -> no pruning.
     Arc::new(Pred::or(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
@@ -1004,7 +1004,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     6,
 )]
 #[case::and_all_unsupported_returns_all(
-    // AND(ts_col > ..., ts_col > ...): both unsupported -> both become TRUE -> no pruning.
+    // AND(ts_col > ..., ts_col > ...): both unsupported -> all NULL (unknown) -> no pruning.
     Arc::new(Pred::and(
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
@@ -1012,7 +1012,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     6,
 )]
 #[case::or_all_unsupported_returns_all(
-    // OR(ts_col > ..., ts_col > ...): both unsupported -> both become TRUE -> no pruning.
+    // OR(ts_col > ..., ts_col > ...): both unsupported -> all NULL (unknown) -> no pruning.
     Arc::new(Pred::or(
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),

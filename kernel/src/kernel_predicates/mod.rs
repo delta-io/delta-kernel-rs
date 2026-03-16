@@ -456,10 +456,6 @@ pub trait KernelPredicateEvaluator {
                 .into_iter();
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
             }
-            BooleanExpression(Expr::Literal(val)) if val.is_null() => {
-                // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
-                self.eval_pred_scalar(&Scalar::from(false), false)
-            }
             BooleanExpression(Expr::Predicate(pred)) => self.eval_pred_sql_where(pred, inverted),
             // Process all remaining predicates normally, because they are not proven safe. Indeed,
             // predicates like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
