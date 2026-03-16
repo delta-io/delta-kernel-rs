@@ -121,13 +121,13 @@ impl Crc {
 
         // Set transactions: upsert by app_id. Only update if the base CRC tracks set
         // transactions (Some). If None ("not tracked"), leave it as None.
-        if !delta.set_transaction_changes.is_empty() {
-            if let Some(map) = &mut self.set_transactions {
-                for txn in delta.set_transaction_changes {
-                    let app_id = txn.app_id.clone();
-                    map.insert(app_id, txn);
-                }
-            }
+        if let Some(map) = &mut self.set_transactions {
+            map.extend(
+                delta
+                    .set_transaction_changes
+                    .into_iter()
+                    .map(|txn| (txn.app_id.clone(), txn)),
+            );
         }
 
         // In-commit timestamp: unconditional replace (not guarded by `if let Some`).

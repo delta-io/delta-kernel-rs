@@ -106,7 +106,9 @@ pub struct Crc {
     pub txn_id: Option<String>,
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub in_commit_timestamp_opt: Option<i64>,
-    /// Live transaction identifier ([`SetTransaction`]) actions at this version.
+    /// Live transaction identifier ([`SetTransaction`]) actions at this version. `None` = not
+    /// tracked (field absent in CRC JSON or not computed). `Some(empty_map)` = tracked, no
+    /// active set transactions. `apply()` skips updates when `None`.
     ///
     /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
     /// a Vec, which is converted via custom serde deserialization.
