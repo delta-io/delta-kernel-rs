@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use uc_client::{ClientConfig, UCCommitsRestClient, UCGetCommitsClient, models::CommitsRequest};
+//! use unitycatalog_client_rest_impl::{ClientConfig, UCCommitsRestClient, UCGetCommitsClient, models::CommitsRequest};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {

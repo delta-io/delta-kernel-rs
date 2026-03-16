@@ -1,5 +1,5 @@
 [package]
-name = "uc-client"
+name = "unitycatalog-client-rest-impl"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true

@@ -92,7 +92,7 @@ impl<'a, C: UCGetCommitsClient> UCKernelClient<'a, C> {
             },
         };
 
-        // consume uc-client's Commit and hand back a delta_kernel LogPath
+        // consume the UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
         // add trailing slash
         if !table_url.path().ends_with('/') {
@@ -138,13 +138,13 @@ mod tests {
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
-    use uc_client::models::credentials::Operation;
-    use uc_client::{UCClient, UCCommitsRestClient};
+    use unitycatalog_client_rest_impl::models::credentials::Operation;
+    use unitycatalog_client_rest_impl::{UCClient, UCCommitsRestClient};
 
     use super::*;
 
     // We could just re-export UCClient's get_table to not require consumers to directly import
-    // uc_client themselves.
+    // unitycatalog_client_rest_impl themselves.
     async fn get_table(
         client: &UCClient,
         table_name: &str,
@@ -171,7 +171,8 @@ mod tests {
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
         // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let config =
+            unitycatalog_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let uc_client = UCClient::new(config.clone())?;
@@ -226,7 +227,8 @@ mod tests {
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
         // build shared config
-        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+        let config =
+            unitycatalog_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let client = UCClient::new(config.clone())?;

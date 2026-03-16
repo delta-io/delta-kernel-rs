@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use uc_client::{
-    models::{credentials::Operation, Commit, CommitsRequest},
+use unitycatalog_client_rest_impl::{
+    models::{Commit, credentials::Operation, CommitsRequest},
     UCClient, UCCommitsRestClient, UCGetCommitsClient,
 };
 
@@ -85,13 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Create shared config
-    let config = uc_client::ClientConfig::build(&cli.workspace_url, &cli.token)
+    let config = unitycatalog_client_rest_impl::ClientConfig::build(&cli.workspace_url, &cli.token)
         .with_timeout(Duration::from_secs(60))
         .with_max_retries(3)
         .build()?;
 
     // Create shared HTTP client and UC clients
-    let http_client = uc_client::http::build_http_client(&config)?;
+    let http_client = unitycatalog_client_rest_impl::http::build_http_client(&config)?;
     let uc_client = UCClient::with_http_client(http_client.clone(), config.clone());
     let uc_commits_client = UCCommitsRestClient::with_http_client(http_client, config);
 
