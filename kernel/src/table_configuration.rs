@@ -10,7 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use url::Url;
 
@@ -69,6 +69,35 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     }
 }
 
+/// Physical schema variants for a table. The `full` schema includes all columns from logical schema; the
+/// `without_partition` schema lazily excludes partition columns.
+#[derive(Debug, Clone)]
+struct PhysicalSchemas {
+    full: SchemaRef,
+    without_partition: OnceLock<SchemaRef>,
+}
+
+impl PhysicalSchemas {
+    fn new(full: SchemaRef) -> Self {
+        Self {
+            full,
+            without_partition: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for PhysicalSchemas {
+    fn eq(&self, other: &Self) -> bool {
+        // `without_partition` is deterministically derived from `full` and partition columns
+        // (compared via `metadata` in TableConfiguration's PartialEq), so comparing it is
+        // redundant. Two PhysicalSchemas with the same `full` are considered equal even if
+        // one has `without_partition` initialized and the other does not.
+        self.full == other.full
+    }
+}
+
+impl Eq for PhysicalSchemas {}
+
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
 /// to check whether a table supports a feature or has it enabled. For example, deletion vector
@@ -86,9 +115,7 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
-    /// Physical schema: field names are the physical column names (same as logical when
-    /// `ColumnMappingMode::None`, otherwise derived from column mapping metadata).
-    physical_schema: SchemaRef,
+    physical_schemas: PhysicalSchemas,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -127,10 +154,11 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let physical_schemas = PhysicalSchemas::new(physical_schema);
 
         let table_config = Self {
             logical_schema,
-            physical_schema,
+            physical_schemas,
             metadata,
             protocol,
             table_properties,
@@ -303,23 +331,27 @@ impl TableConfiguration {
     }
 
     /// Returns the physical data schema excluding partition columns.
-    fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
-        let partition_columns: HashSet<&str> = self
-            .partition_columns()
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        // Safety: subset of an already-valid schema.
-        let schema = StructType::new_unchecked(
-            self.logical_schema()
-                .fields()
-                .zip(self.physical_schema().fields())
-                .filter(|(logical_field, _)| {
-                    !partition_columns.contains(logical_field.name().as_str())
-                })
-                .map(|(_, physical_field)| physical_field.clone()),
-        );
-        Arc::new(schema)
+    pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
+        self.physical_schemas
+            .without_partition
+            .get_or_init(|| {
+                let partition_columns: HashSet<&str> = self
+                    .partition_columns()
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                // Safety: subset of an already-valid schema.
+                Arc::new(StructType::new_unchecked(
+                    self.logical_schema()
+                        .fields()
+                        .zip(self.physical_schemas.full.fields())
+                        .filter(|(logical_field, _)| {
+                            !partition_columns.contains(logical_field.name().as_str())
+                        })
+                        .map(|(_, physical_field)| physical_field.clone()),
+                ))
+            })
+            .clone()
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
@@ -377,7 +409,7 @@ impl TableConfiguration {
     /// mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
-        self.physical_schema.clone()
+        self.physical_schemas.full.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
