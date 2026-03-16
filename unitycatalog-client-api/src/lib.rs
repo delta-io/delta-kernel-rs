@@ -22,10 +22,16 @@
 pub mod commits_client;
 pub mod error;
 pub mod models;
+pub mod staging_client;
+pub mod table_client;
 
 pub use commits_client::{UCCommitClient, UCGetCommitsClient};
 pub use error::{Error, Result};
 pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+pub use staging_client::{
+    AwsTempCredentials, Operation, TemporaryTableCredentials, UCGetStagingTableClient,
+};
+pub use table_client::{GetTableClient, TableInfo};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use commits_client::{InMemoryCommitsClient, TableData};

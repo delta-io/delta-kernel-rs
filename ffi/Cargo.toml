@@ -26,7 +26,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.20.0" }
-uc-catalog = { package = "delta-kernel-unity-catalog", path = "../uc-catalog", optional = true }
+uc-catalog = { package = "delta-kernel-unity-catalog", path = "../delta-kernel-unity-catalog", optional = true }
 unitycatalog-client-api = { path = "../unitycatalog-client-api", optional = true }
 
 [build-dependencies]

@@ -33,6 +33,7 @@ pub use client::UCClient;
 pub use commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
+pub use unitycatalog_client_api::{GetTableClient, UCGetStagingTableClient};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use commits_client::{InMemoryCommitsClient, TableData};
@@ -41,7 +42,7 @@ pub use commits_client::{InMemoryCommitsClient, TableData};
 pub mod prelude {
     pub use crate::client::UCClient;
     pub use crate::commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
-    pub use crate::models::credentials::{Operation, TemporaryTableCredentials};
+    pub use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
     pub use crate::models::tables::TablesResponse;
     pub use crate::models::{Commit, CommitsRequest, CommitsResponse};
 }

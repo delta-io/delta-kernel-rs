@@ -53,7 +53,7 @@ impl From<Error> for unitycatalog_client_api::Error {
                 unitycatalog_client_api::Error::MaxUnpublishedCommitsExceeded(max)
             }
             Error::Generic(msg) => unitycatalog_client_api::Error::Generic(msg),
-            e => unitycatalog_client_api::Error::Generic(e.to_string()),
+            e => unitycatalog_client_api::Error::Generic(e.to_string())
         }
     }
 }
