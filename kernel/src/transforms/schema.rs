@@ -13,64 +13,80 @@ use crate::transforms::{map_owned_children_or_else, CowExt as _};
 /// (e.g. [`Self::transform_struct`] to start with [`StructType`]), or it can start from the generic
 /// [`Self::transform`].
 ///
-/// The provided `transform_xxx` methods all default to no-op, and implementations should
-/// selectively override specific `transform_xxx` methods as needed for the task at hand.
+/// The provided `transform_xxx` methods all default to no-op (usually by invoking the corresponding
+/// recursive helper method), and implementations should selectively override specific
+/// `transform_xxx` methods as needed for the task at hand.
+///
+/// # Recursive helper methods
 ///
 /// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
-/// child schema elements of each schema element. Implementations can call these as needed but will
-/// generally not need to override them.
+/// child schema elements of each schema element. Except as specifically noted otherwise, these
+/// recursive helpers all behave uniformly, based on the number of children the schema element has:
+///
+/// * Leaf (no children) - Leaf `transform_xxx` methods simply return their argument unchanged, and
+///   no corresponding `recurse_into_xxx` method is provided.
+///
+/// * Unary (single child) - If the child was filtered out, filter out the parent. If the child
+///   changed, build a new parent around it. Otherwise, return the parent unchanged.
+///
+/// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
+///   one child changed, build a new parent around them. Othwerwise, return the parent unchanged.
+///
+/// * Variadic (0+ children) - If no children remain (all filtered out), filter out the
+///   parent. Otherwise, if at least one child changed or was filtered out, build a new parent around
+///   the children. Otherwise, return the parent unchanged.
+///
+/// Implementations can call these as needed, but will generally not need to override them.
 pub trait SchemaTransform<'a> {
-    /// Called for each primitive encountered during the schema traversal.
+    /// Called for each primitive encountered during the traversal (leaf).
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         Some(Cow::Borrowed(ptype))
     }
 
-    /// Called for each struct encountered during the schema traversal. Implementations can call
-    /// [`Self::recurse_into_struct`] if they wish to recursively transform the struct's fields.
+    /// Called for each struct encountered during the traversal. The provided implementation just
+    /// forwards to [`Self::recurse_into_struct`].
     fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.recurse_into_struct(stype)
     }
 
-    /// Called for each struct field encountered during the schema traversal. Implementations can
-    /// call [`Self::recurse_into_struct_field`] if they wish to recursively transform the field's
-    /// data type.
+    /// Called for each struct field encountered during the traversal. The provided implementation
+    /// forwards to [`Self::recurse_into_struct_field`].
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.recurse_into_struct_field(field)
     }
 
-    /// Called for each array encountered during the schema traversal. Implementations can call
-    /// [`Self::recurse_into_array`] if they wish to recursively transform the array's element type.
+    /// Called for each array encountered during the traversal. The provided implementation just
+    /// forwards to [`Self::recurse_into_array`].
     fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         self.recurse_into_array(atype)
     }
 
-    /// Called for each array element encountered during the schema traversal. Implementations can
-    /// call [`Self::transform`] if they wish to recursively transform the array element type.
+    /// Called for each array element type encountered during the traversal. The provided
+    /// implementation forwards to [`Self::transform`].
     fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
         self.transform(etype)
     }
 
-    /// Called for each map encountered during the schema traversal. Implementations can call
-    /// [`Self::recurse_into_map`] if they wish to recursively transform the map's key and/or value
-    /// types.
+    /// Called for each map encountered during the traversal. The provided implementation just
+    /// forwards to [`Self::recurse_into_map`].
     fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
         self.recurse_into_map(mtype)
     }
 
-    /// Called for each map key encountered during the schema traversal. Implementations can call
-    /// [`Self::transform`] if they wish to recursively transform the map key type.
+    /// Called for each map key encountered during the traversal. The provided implementation
+    /// forwards to [`Self::transform`].
     fn transform_map_key(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
         self.transform(etype)
     }
 
-    /// Called for each map value encountered during the schema traversal. Implementations can call
-    /// [`Self::transform`] if they wish to recursively transform the map value type.
+    /// Called for each map value encountered during the traversal. The provided implementation
+    /// forwards to [`Self::transform`].
     fn transform_map_value(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
         self.transform(etype)
     }
 
-    /// Called for each variant value encountered. By default, recurses into the fields of the
-    /// variant struct type.
+    /// Called for each variant value encountered. The provided implementation just
+    /// forwards to [`Self::recurse_into_struct`].
     fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.recurse_into_struct(stype)
     }
@@ -99,8 +115,7 @@ pub trait SchemaTransform<'a> {
         Some(result)
     }
 
-    /// Recursively transforms a struct field's data type. If the data type changes, update the
-    /// field to reference it. Otherwise, no-op.
+    /// Recursively transforms a struct field's data type (unary).
     fn recurse_into_struct_field(
         &mut self,
         field: &'a StructField,
@@ -115,15 +130,13 @@ pub trait SchemaTransform<'a> {
         Some(result.map_owned_or_else(field, f))
     }
 
-    /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
-    /// update the struct to reference all surviving fields. Otherwise, no-op.
+    /// Recursively transforms a struct's fields (variadic).
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         let transformed_children = stype.fields().map(|f| self.transform_struct_field(f));
         map_owned_children_or_else(stype, transformed_children, StructType::new_unchecked)
     }
 
-    /// Recursively transforms an array's element type. If the element type changes, update the
-    /// array to reference it. Otherwise, no-op.
+    /// Recursively transforms an array's element type (unary).
     fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         let result = self.transform_array_element(&atype.element_type)?;
         let f = |element_type| ArrayType {
@@ -134,8 +147,7 @@ pub trait SchemaTransform<'a> {
         Some(result.map_owned_or_else(atype, f))
     }
 
-    /// Recursively transforms a map's key and value types. If either one changes, update the map to
-    /// reference them. If either one is removed, remove the map as well. Otherwise, no-op.
+    /// Recursively transforms a map's key and value types (binary).
     fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
         let key_type = self.transform_map_key(&mtype.key_type)?;
         let value_type = self.transform_map_value(&mtype.value_type)?;
