@@ -54,6 +54,7 @@ pub mod tokio {
     use super::TaskExecutor;
     use futures::TryFutureExt;
     use futures::{future::BoxFuture, Future};
+    use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
@@ -66,16 +67,17 @@ pub mod tokio {
     /// shut down before the executor is destroyed.
     #[derive(Debug)]
     pub struct TokioBackgroundExecutor {
-        sender: Option<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
+        sender: ManuallyDrop<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
         handle: Handle,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Drop for TokioBackgroundExecutor {
         fn drop(&mut self) {
+            // SAFETY: The inner `Sender` has not been dropped yet because this is the only drop site and `Drop::drop` runs exactly once.
             // Drop sender first to close the channel, signaling the background
             // thread to exit its recv loop.
-            drop(self.sender.take());
+            unsafe { ManuallyDrop::drop(&mut self.sender) };
             // Join the thread so that runtime shutdown completes before we return.
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -108,7 +110,7 @@ pub mod tokio {
             });
             let handle = handle_receiver.recv().unwrap();
             Self {
-                sender: Some(sender),
+                sender: ManuallyDrop::new(sender),
                 handle,
                 thread: Some(thread),
             }
@@ -117,15 +119,11 @@ pub mod tokio {
 
     impl TokioBackgroundExecutor {
         fn send_future(&self, fut: BoxFuture<'static, ()>) {
-            let sender = self
-                .sender
-                .as_ref()
-                .expect("sender should be present (not yet dropped)");
             // We cannot call `blocking_send()` because that calls `block_on`
             // internally and panics if called within an async context. 🤦
             let mut fut = Some(fut);
             loop {
-                match sender.try_send(fut.take().unwrap()) {
+                match self.sender.try_send(fut.take().unwrap()) {
                     Ok(()) => break,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(original)) => {
                         std::thread::yield_now();
