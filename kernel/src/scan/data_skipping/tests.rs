@@ -822,8 +822,16 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
     &[],
     false,
 )]
-#[case::all_unsupported_junction_returns_some(
+#[case::all_unsupported_and_junction_returns_some(
     Pred::and(
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
+        Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(5_000_000)),
+    ),
+    &[],
+    false,
+)]
+#[case::all_unsupported_or_junction_returns_some(
+    Pred::or(
         Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(2_000_000)),
         Pred::gt(column_expr!("ts_col"), Scalar::Timestamp(5_000_000)),
     ),

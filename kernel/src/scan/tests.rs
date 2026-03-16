@@ -1003,6 +1003,22 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     )),
     6,
 )]
+#[case::and_all_unsupported_returns_all(
+    // AND(ts_col > ..., ts_col > ...): both unsupported -> both become TRUE -> no pruning.
+    Arc::new(Pred::and(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    )),
+    6,
+)]
+#[case::or_all_unsupported_returns_all(
+    // OR(ts_col > ..., ts_col > ...): both unsupported -> both become TRUE -> no pruning.
+    Arc::new(Pred::or(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    )),
+    6,
+)]
 fn test_scan_with_unsupported_predicates(
     #[case] predicate: PredicateRef,
     #[case] expected_files: usize,
