@@ -355,52 +355,86 @@ pub fn evaluate_expression(
     }
 }
 
-/// this function is used for evaluate_predicate conversion, currently does not support nested conversion.
-/// it support limited conversion, e.g only convert from ArrayList<Utf8View> to ArrayList<Utf8>
+fn cast_list_elements_to_view(
+    vals: &Arc<dyn Array>,
+    field: &Arc<ArrowField>,
+) -> DeltaResult<Arc<dyn Array>> {
+    let to_type = match field.data_type() {
+        ArrowDataType::Utf8 => ArrowDataType::Utf8View,
+        ArrowDataType::Binary => ArrowDataType::BinaryView,
+        _ => return Ok(vals.clone()),
+    };
+    let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
+    let container = match vals.data_type() {
+        ArrowDataType::List(_) => ArrowDataType::List(new_field),
+        ArrowDataType::LargeList(_) => ArrowDataType::LargeList(new_field),
+        ArrowDataType::ListView(_) => ArrowDataType::ListView(new_field),
+        ArrowDataType::LargeListView(_) => ArrowDataType::LargeListView(new_field),
+        dt => {
+            return Err(Error::generic(format!(
+                "cast_list_elements_to_view: expected a list type, got {dt:?}"
+            )))
+        }
+    };
+    Ok(cast(vals, &container)?)
+}
+
+fn cast_list_elements_to_non_view(
+    vals: &Arc<dyn Array>,
+    field: &Arc<ArrowField>,
+) -> DeltaResult<Arc<dyn Array>> {
+    let to_type = match field.data_type() {
+        ArrowDataType::Utf8View => ArrowDataType::Utf8,
+        ArrowDataType::BinaryView => ArrowDataType::Binary,
+        other => {
+            if !matches!(
+                vals.data_type(),
+                ArrowDataType::ListView(_) | ArrowDataType::LargeListView(_)
+            ) {
+                return Ok(vals.clone());
+            }
+            other.clone()
+        }
+    };
+    let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
+    let container = match vals.data_type() {
+        ArrowDataType::List(_) => ArrowDataType::List(new_field),
+        ArrowDataType::LargeList(_) => ArrowDataType::LargeList(new_field),
+        ArrowDataType::ListView(_) => ArrowDataType::List(new_field),
+        ArrowDataType::LargeListView(_) => ArrowDataType::LargeList(new_field),
+        dt => {
+            return Err(Error::generic(format!(
+                "cast_list_elements_to_non_view: expected a list type, got {dt:?}"
+            )))
+        }
+    };
+    Ok(cast(vals, &container)?)
+}
+
+/// This function convert the ArrowView type to Arrow non-view type. This is used for evaluate_predicate conversion,
+/// currently does not support nested conversion. it support limited conversion, e.g only convert from ArrayList<Utf8View> to ArrayList<Utf8>
 fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
-        ArrowDataType::List(field) => {
-            let from_type = field.data_type();
-            let to_type = match from_type {
-                ArrowDataType::Utf8View => ArrowDataType::Utf8,
-                ArrowDataType::BinaryView => ArrowDataType::Binary,
-                _ => return Ok(vals),
-            };
-            let new_field = field.as_ref().clone().with_data_type(to_type);
-            return Ok(cast(&vals, &ArrowDataType::List(Arc::new(new_field)))?);
-        }
-        ArrowDataType::LargeList(field) => {
-            let from_type = field.data_type();
-            let to_type = match from_type {
-                ArrowDataType::Utf8View => ArrowDataType::Utf8,
-                ArrowDataType::BinaryView => ArrowDataType::Binary,
-                _ => return Ok(vals),
-            };
-            let new_field = field.as_ref().clone().with_data_type(to_type);
-            return Ok(cast(&vals, &ArrowDataType::LargeList(Arc::new(new_field)))?);
-        }
-        ArrowDataType::ListView(field) => {
-            let from_type = field.data_type();
-            let to_type = match from_type {
-                ArrowDataType::Utf8View => ArrowDataType::Utf8,
-                ArrowDataType::BinaryView => ArrowDataType::Binary,
-                _ => return Ok(cast(&vals, &ArrowDataType::List(field.clone()))?),
-            };
-            let new_field = field.as_ref().clone().with_data_type(to_type);
-            return Ok(cast(&vals, &ArrowDataType::List(Arc::new(new_field)))?);
-        }
-        ArrowDataType::LargeListView(field) => {
-            let from_type = field.data_type();
-            let to_type = match from_type {
-                ArrowDataType::Utf8View => ArrowDataType::Utf8,
-                ArrowDataType::BinaryView => ArrowDataType::Binary,
-                _ => return Ok(cast(&vals, &ArrowDataType::LargeList(field.clone()))?),
-            };
-            let new_field = field.as_ref().clone().with_data_type(to_type);
-            return Ok(cast(&vals, &ArrowDataType::LargeList(Arc::new(new_field)))?);
-        }
-        ArrowDataType::Utf8View => return Ok(cast(&vals, &ArrowDataType::Utf8)?),
-        ArrowDataType::BinaryView => return Ok(cast(&vals, &ArrowDataType::Binary)?),
+        ArrowDataType::List(field) => cast_list_elements_to_non_view(&vals, field),
+        ArrowDataType::LargeList(field) => cast_list_elements_to_non_view(&vals, field),
+        ArrowDataType::ListView(field) => cast_list_elements_to_non_view(&vals, field),
+        ArrowDataType::LargeListView(field) => cast_list_elements_to_non_view(&vals, field),
+        ArrowDataType::Utf8View => Ok(cast(&vals, &ArrowDataType::Utf8)?),
+        ArrowDataType::BinaryView => Ok(cast(&vals, &ArrowDataType::Binary)?),
+        _ => Ok(vals),
+    }
+}
+
+/// This function convert the Arrow Non View type to Arrow View type. This function is used for evaluate_predicate conversion, currently does not support nested conversion.
+/// it support limited conversion, e.g only convert from ArrayList<Utf8> to ArrayList<Utf8View>
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+    match vals.data_type() {
+        ArrowDataType::List(field) => cast_list_elements_to_view(&vals, field),
+        ArrowDataType::LargeList(field) => cast_list_elements_to_view(&vals, field),
+        ArrowDataType::ListView(field) => cast_list_elements_to_view(&vals, field),
+        ArrowDataType::LargeListView(field) => cast_list_elements_to_view(&vals, field),
+        ArrowDataType::Utf8 => Ok(cast(&vals, &ArrowDataType::Utf8View)?),
+        ArrowDataType::Binary => Ok(cast(&vals, &ArrowDataType::BinaryView)?),
         _ => Ok(vals),
     }
 }
@@ -519,11 +553,22 @@ pub fn evaluate_predicate(
             };
 
             let left = evaluate_expression(left, batch, None)?;
-            let left = arrow_convert_to_non_view_type(left)?;
-
             let right = evaluate_expression(right, batch, None)?;
-            let right = arrow_convert_to_non_view_type(right)?;
-            Ok(eval_fn(&left, &right)?)
+
+            match op {
+                LessThan | GreaterThan | Equal | Distinct => {
+                    let (left, right) = if left.data_type() == right.data_type() {
+                        (left, right)
+                    } else {
+                        (
+                            arrow_convert_to_view_type(left)?,
+                            arrow_convert_to_view_type(right)?,
+                        )
+                    };
+                    Ok(eval_fn(&left, &right)?)
+                }
+                In => Ok(eval_fn(&left, &right)?),
+            }
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):

@@ -1,8 +1,9 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray,
+    create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
+    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
+    StringBuilder, StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -90,8 +91,6 @@ fn test_bad_right_type_array() {
 
 #[test]
 fn test_in_predicate_with_utf8view_list_column() {
-    use crate::arrow::array::StringViewArray;
-
     let values = StringViewArray::from(vec!["hello", "world", "foo", "bar", "hello", "baz"]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3, 6]));
     let item_field = Arc::new(Field::new("item", DataType::Utf8View, true));
@@ -119,8 +118,6 @@ fn test_in_predicate_with_utf8view_list_column() {
 
 #[test]
 fn test_in_predicate_with_list_view_column() {
-    use crate::arrow::array::ListViewArray;
-
     // Three rows: [0,1,2], [3,4,5], [6,7,8]
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = ScalarBuffer::from(vec![0i32, 3, 6]);
@@ -165,7 +162,6 @@ fn test_in_predicate_with_list_view_column() {
 #[test]
 fn test_binary_predicate_with_view_column() {
     // Test all BinaryPredicateOps where the column is of Utf8View type
-    use crate::arrow::array::StringViewArray;
     let list_array = StringViewArray::from(vec![None, Some("apple"), Some("hello"), Some("zebra")]);
     let schema = Schema::new([Arc::new(Field::new("name", DataType::Utf8View, true))]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)]).unwrap();
@@ -224,7 +220,6 @@ fn test_binary_predicate_with_view_column() {
 #[test]
 fn test_binary_predicate_with_binary_view_column() {
     // Test all BinaryPredicateOps where the column is of BinaryView type
-    use crate::arrow::array::BinaryViewArray;
     let list_array = BinaryViewArray::from(vec![
         None,
         Some(b"apple".as_ref()),
