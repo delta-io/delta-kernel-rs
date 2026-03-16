@@ -134,42 +134,7 @@ Then commit the updated archive and delete the `.done` file so it is re-extracte
 
 ### `TableInfo`
 
-Deserialized from `tableInfo.json`. Describes the Delta table being benchmarked. All JSON keys use camelCase. All fields are required except `tablePath`.
-
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `name` | String | yes | Short identifier used as a path component in the benchmark name (e.g. `100Adds0Chkpts`) |
-| `description` | String | yes | Human-readable description of the table |
-| `tablePath` | String (URL) | no | Explicit URL to the table, for remote tables (e.g. S3) or absolute local paths. If absent, the table is assumed to be in the `delta/` subdirectory next to `tableInfo.json` |
-| `schema` | Object | yes | Schema at the latest version, deserialized into `delta_kernel::schema::Schema`. Uses Delta protocol JSON format: `{"type": "struct", "fields": [...]}` |
-| `protocol` | Object | yes | Delta protocol requirements at the latest version, deserialized into `delta_kernel::actions::Protocol`. Format: `{"minReaderVersion": N, "minWriterVersion": N, ...}` |
-| `logInfo` | Object | yes | Log-level statistics giving a quick overview of the table without requiring a full log replay; see [`logInfo`](#loginfo) below |
-| `properties` | Object | yes | Delta table properties from the `metadata` action (string key-value pairs). Use `{}` if none. Example: `{"delta.enableDeletionVector": "true", "delta.columnMapping.mode": "none"}` |
-| `dataLayout` | Object | yes | Physical data organization; see [`dataLayout`](#datalayout) below |
-| `tags` | Array[String] | yes | Tags for filtering benchmarks via `BENCH_TAGS` (see [By tag](#by-tag-bench_tags)). Use `[]` if none. Built-in tag: `base` (run in CI) |
-
-#### `logInfo`
-
-| Field | Type | Required | Description |
-|-------|------|:--------:|-------------|
-| `numAddFiles` | u64 | yes | Number of active `add` file actions (live data files in the table) |
-| `numRemoveFiles` | u64 | yes | Number of `remove` file actions in the log |
-| `sizeInBytes` | u64 | yes | Total on-disk size of all data files in bytes |
-| `numCommits` | u64 | yes | Number of commits (JSON log files) in the table history |
-| `numActions` | u64 | yes | Total number of actions across all commits |
-| `lastCheckpointVersion` | Option\<u64\> | no | Version of the most recent checkpoint, if any |
-| `lastCrcVersion` | Option\<u64\> | no | Version of the most recent CRC (version checksum) file, if any |
-| `numParallelCheckpointFiles` | Option\<u32\> | no | Number of part files in the most recent multi-part checkpoint, if any. For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints this is the number of sidecar files. `None` if the table has no multi-part checkpoints or sidecars |
-
-#### `dataLayout`
-
-Describes how data is physically organized in the table:
-
-| Value | Description |
-|-------|-------------|
-| `{}` | No special organization (unpartitioned, unclustered) |
-| `{"numPartitionColumns": N, "numDistinctPartitions": M}` | Partitioned table with `N` partition columns and `M` distinct partition values. Two tables with the same `N` can differ significantly in cardinality (e.g. 1 partition column with 100 distinct values vs. 10000), so both are tracked |
-| `{"numClusteringColumns": N}` | Clustered table with `N` clustering columns |
+Deserialized from `tableInfo.json`. Captures the table's identity (`name`, `description`), Delta schema and protocol, log statistics (`logInfo`), physical data layout, table properties, and benchmark tags. See [`src/models.rs`](src/models.rs) for field-level documentation.
 
 #### Example
 

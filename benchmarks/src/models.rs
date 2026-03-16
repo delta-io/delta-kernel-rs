@@ -34,24 +34,34 @@ pub enum ParallelScan {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    /// Table name used for identifying the table (part of the final benchmark name) - e.g. 100Adds0Chkpts
+    /// Table name is a short identifier for the table (part of the final benchmark name), e.g. 100Adds0Chkpts
     pub name: String,
-    /// Human-readable description of the table
+    /// Human-readable description of the table. Use this to capture context that the name alone
+    /// doesn't convey (e.g. "A table with 1 commit with 1M add actions. This includes a commit file
+    /// in the delta log, but no actual Parquet data files and no CRC files").
+    /// The description is a free-form more verbose description for human readers.
     pub description: String,
-    /// URL to the table. Used for remote tables or (rarely) absolute local paths.
-    /// If `None`, the table is assumed to be in the `delta/` subdirectory next to `tableInfo.json`
+    /// URL to the table. Used for remote tables (e.g. `s3://my-bucket/my-table`) or (rarely)
+    /// absolute local paths. If `None`, the table is assumed to be in the `delta/` subdirectory
+    /// next to `tableInfo.json`.
     pub table_path: Option<Url>,
-    /// Schema at the latest version of the table
+    /// Schema at the latest version of the table, in Delta protocol JSON format
+    /// e.g. `{"type": "struct", "fields": [...]}`
     pub schema: Schema,
-    /// Delta Protocol struct, containing version requirements and table features at the latest version of the table
+    /// Delta protocol requirements at the latest version of the table
+    /// e.g. `{"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": [], "writerFeatures": []}`
     pub protocol: Protocol,
-    /// Log-level statistics for the table, such as the number of add files, remove files, number of commits, etc.
+    /// Log-level statistics giving a quick overview of the table without requiring a full log
+    /// replay. See [`LogInfo`] for field details.
     pub log_info: LogInfo,
-    /// Table properties from the Delta metadata (e.g. `{"delta.enableDeletionVector": "true", "delta.columnMapping.mode": "none"}`)
+    /// Table properties from the Delta metadata action (string key-value pairs). Use `{}` if
+    /// none. e.g. `{"delta.enableDeletionVector": "true", "delta.columnMapping.mode": "none"}`
     pub properties: HashMap<String, String>,
-    /// Physical data layout of the table
+    /// Physical data layout of the table. Use `{}` for unpartitioned/unclustered tables.
+    /// See [`DataLayout`] for partitioned and clustered variants.
     pub data_layout: DataLayout,
-    /// Tags for filtering which tables are benchmarked via `BENCH_TAGS`
+    /// Tags for filtering which tables are benchmarked via `BENCH_TAGS`. Use `[]` if none.
+    /// Built-in tag: `base` (run in CI). e.g. `["base", "my-feature"]`
     pub tags: Vec<String>,
     /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
@@ -112,6 +122,9 @@ pub struct LogInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum DataLayout {
+    /// Partitioned table. Two tables with the same number of partition columns can differ
+    /// significantly in cardinality (e.g. 1 column with 100 distinct values vs. 10000), so both
+    /// are tracked. e.g. `{"numPartitionColumns": 2, "numDistinctPartitions": 100}`
     Partitioned {
         /// Number of partition columns
         #[serde(rename = "numPartitionColumns")]
@@ -120,12 +133,13 @@ pub enum DataLayout {
         #[serde(rename = "numDistinctPartitions")]
         num_distinct_partitions: u64,
     },
+    /// Clustered table, e.g. `{"numClusteringColumns": 1}`
     Clustered {
         /// Number of clustering columns
         #[serde(rename = "numClusteringColumns")]
         num_clustering_columns: u32,
     },
-    /// No special data organization (default)
+    /// No special data organization (unpartitioned, unclustered). Serializes as `{}`
     None {},
 }
 
