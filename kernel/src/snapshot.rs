@@ -2319,7 +2319,7 @@ mod tests {
             .with_task_executor(executor)
             .build();
 
-        setup_test_table_with_commits(&store, 2).await?;
+        setup_test_table_with_commits(url.as_str(), &store, 2).await?;
 
         let snapshot_v1 = Snapshot::builder_for(url.clone())
             .at_version(1)
