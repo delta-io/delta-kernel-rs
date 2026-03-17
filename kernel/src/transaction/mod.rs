@@ -343,8 +343,9 @@ impl<S> Transaction<S> {
         let (protocol_action, metadata_action) = if self.is_create_table() {
             let table_config = self.read_snapshot.table_configuration();
 
-            // Validate column mapping metadata integrity before committing: ensures no duplicate
-            // column IDs or physical names were introduced during schema construction.
+            // Guard against duplicate column IDs or physical names reaching the transaction log.
+            // Without this, an invalid schema committed here would cause Parquet read failures or
+            // be rejected later by Spark's equivalent commit-time check.
             let column_mapping_mode = table_config.column_mapping_mode();
             if column_mapping_mode != ColumnMappingMode::None {
                 validate_schema_column_mapping(

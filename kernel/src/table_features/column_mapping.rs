@@ -174,9 +174,9 @@ pub(crate) fn get_field_column_mapping_info<'a>(
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
-    physical_path: Vec<String>,
+    physical_path: Vec<String>, // physical names of ancestor fields; used to build full paths
     seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
-    seen_physical_names: HashSet<String>, // full physical path -> duplicate detection
+    seen_physical_names: HashSet<String>, // full physical path (ancestors + field) -> seen
     err: Option<Error>,
 }
 
@@ -220,7 +220,10 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
                 } else {
                     format!("{}.{}", this.physical_path.join("."), physical_name)
                 };
-                if !this.seen_physical_names.insert(full_physical_path.clone()) {
+                if this
+                    .seen_physical_names
+                    .contains(full_physical_path.as_str())
+                {
                     this.err = Some(Error::schema(format!(
                         "Duplicate physical name '{}' assigned to field '{}'",
                         physical_name,
@@ -228,6 +231,7 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
                     )));
                     return None;
                 }
+                this.seen_physical_names.insert(full_physical_path);
                 this.physical_path.push(physical_name.to_owned());
                 this.recurse_into_struct_field(field);
                 this.physical_path.pop();
@@ -704,7 +708,6 @@ mod tests {
         );
     }
 
-    /// Build a field with a specific physical name, independent of the logical name.
     fn make_cm_field_with_phys(
         name: &str,
         id: i64,
@@ -723,21 +726,25 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn duplicate_physical_names_at_same_level_rejected() {
+    #[rstest::rstest]
+    #[case::name_mode(ColumnMappingMode::Name)]
+    #[case::id_mode(ColumnMappingMode::Id)]
+    fn duplicate_physical_names_at_same_level_rejected(#[case] mode: ColumnMappingMode) {
         // Two sibling fields share the same physical name; column IDs are distinct.
         let schema = StructType::new_unchecked([
             make_cm_field_with_phys("a", 1, "shared-phys", DataType::INTEGER),
             make_cm_field_with_phys("b", 2, "shared-phys", DataType::INTEGER),
         ]);
         crate::utils::test_utils::assert_result_error_with_message(
-            validate_schema_column_mapping(&schema, ColumnMappingMode::Name),
+            validate_schema_column_mapping(&schema, mode),
             "Duplicate physical name",
         );
     }
 
-    #[test]
-    fn duplicate_physical_names_in_nested_struct_rejected() {
+    #[rstest::rstest]
+    #[case::name_mode(ColumnMappingMode::Name)]
+    #[case::id_mode(ColumnMappingMode::Id)]
+    fn duplicate_physical_names_in_nested_struct_rejected(#[case] mode: ColumnMappingMode) {
         // Sibling fields inside a nested struct share a physical name.
         let inner = StructType::new_unchecked([
             make_cm_field_with_phys("x", 2, "dup-phys", DataType::INTEGER),
@@ -750,14 +757,13 @@ mod tests {
             DataType::Struct(Box::new(inner)),
         )]);
         crate::utils::test_utils::assert_result_error_with_message(
-            validate_schema_column_mapping(&schema, ColumnMappingMode::Name),
+            validate_schema_column_mapping(&schema, mode),
             "Duplicate physical name",
         );
     }
 
     #[test]
     fn unique_physical_names_accepted() {
-        // Distinct physical names at the same level must not be rejected.
         let schema = StructType::new_unchecked([
             make_cm_field_with_phys("a", 1, "phys-a", DataType::INTEGER),
             make_cm_field_with_phys("b", 2, "phys-b", DataType::INTEGER),
