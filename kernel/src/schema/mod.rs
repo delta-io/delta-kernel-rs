@@ -772,6 +772,18 @@ impl StructType {
         Ok(fields)
     }
 
+    /// Resolves a column path through nested structs, returning a reference to the leaf field.
+    ///
+    /// This is a convenience wrapper around [`Self::walk_column_fields`] that returns only the
+    /// final field in the path.
+    ///
+    /// Returns `None` if the column path is empty, a field is not found, or an intermediate
+    /// field is not a struct type.
+    #[internal_api]
+    pub(crate) fn resolve_column(&self, col: &ColumnName) -> Option<&StructField> {
+        self.walk_column_fields(col).ok()?.into_iter().last()
+    }
+
     /// Gets the field with the given name and its index.
     pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
         self.fields
@@ -1482,6 +1494,7 @@ impl PrimitiveType {
     /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
     ///   since epoch, differing only in timezone semantics; this is a physical read
     ///   accommodation, not a Delta protocol type widening rule)
+    #[internal_api]
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
@@ -3798,5 +3811,29 @@ mod tests {
         let schema = walk_test_schema();
         let result = schema.walk_column_fields(&ColumnName::new(col_path.iter().copied()));
         assert_result_error_with_message(result, expected_error);
+    }
+
+    #[test]
+    fn resolve_column_returns_leaf_field_for_nested_path() {
+        let schema = walk_test_schema();
+
+        // Top-level field
+        let field = schema.resolve_column(&ColumnName::new(["a"]));
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name(), "a");
+
+        // Nested field: a.b.c
+        let field = schema.resolve_column(&ColumnName::new(["a", "b", "c"]));
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name(), "c");
+        assert_eq!(field.unwrap().data_type(), &DataType::DOUBLE);
+
+        // Non-existent field returns None
+        let field = schema.resolve_column(&ColumnName::new(["nonexistent"]));
+        assert!(field.is_none());
+
+        // Empty path returns None
+        let field = schema.resolve_column(&ColumnName::new(std::iter::empty::<&str>()));
+        assert!(field.is_none());
     }
 }

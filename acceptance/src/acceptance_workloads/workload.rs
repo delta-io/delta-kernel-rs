@@ -63,20 +63,22 @@ pub fn execute_read_workload(
     table_root: &Url,
     read_spec: &ReadSpec,
 ) -> DeltaResult<ReadResult> {
-    // Parse predicate if present
-    let predicate = read_spec
-        .predicate
-        .as_deref()
-        .map(|p| parse_predicate(p))
-        .transpose()
-        .map_err(|e| Error::generic(format!("Failed to parse predicate: {e}")))?;
-
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
 
     let table_schema = snapshot.schema();
 
-    // Build scan with column projection (no predicate pushdown - we filter after)
+    // Build scan with optional predicate and column projection
     let mut scan_builder = snapshot.scan_builder();
+
+    // Extract and parse the predicate if one is present
+    let predicate = if let Some(ref predicate_string) = read_spec.predicate {
+        let predicate = parse_predicate(predicate_string, &table_schema).map_err(Error::generic)?;
+        scan_builder = scan_builder.with_predicate(Arc::new(predicate.clone()));
+        Some(predicate)
+    } else {
+        None
+    };
+
     if let Some(ref cols) = read_spec.columns {
         let projected_schema = table_schema.project(cols)?;
         scan_builder = scan_builder.with_schema(projected_schema);
@@ -85,14 +87,25 @@ pub fn execute_read_workload(
 
     let schema = scan.logical_schema();
 
-    // Execute scan to get all batches
+    // Execute scan
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
 
-    // Filter batches using the predicate if present
-    let batches = filter_batches_with_predicate(batches, predicate.as_ref())?;
+    // Apply row-level filtering if predicate is present
+    // (kernel only does data skipping, not row filtering)
+    let batches = if let Some(ref pred) = predicate {
+        batches
+            .into_iter()
+            .map(|batch| {
+                let mask = evaluate_predicate(pred, &batch, false)?;
+                filter_record_batch(&batch, &mask).map_err(Error::from)
+            })
+            .try_collect()?
+    } else {
+        batches
+    };
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -102,27 +115,6 @@ pub fn execute_read_workload(
         schema: schema.clone(),
         row_count,
     })
-}
-
-/// Filter record batches using a predicate expression.
-fn filter_batches_with_predicate(
-    batches: Vec<RecordBatch>,
-    predicate: Option<&Predicate>,
-) -> DeltaResult<Vec<RecordBatch>> {
-    let Some(predicate) = predicate else {
-        return Ok(batches);
-    };
-
-    batches
-        .into_iter()
-        .map(|batch| {
-            // Evaluate predicate to get boolean selection array
-            let selection = evaluate_predicate(predicate, &batch, false)?;
-            // Filter the batch using the selection
-            let filtered = filter_record_batch(&batch, &selection)?;
-            Ok(filtered)
-        })
-        .collect()
 }
 
 /// Execute a snapshot workload (for metadata validation).
