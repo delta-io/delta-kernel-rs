@@ -230,19 +230,8 @@ enum LogTailLowerBound {
 }
 
 impl LogSegmentFiles {
-    /// Assembles a [`LogSegmentFiles`] from two sources: `fs_files` (an iterator of files
-    /// listed from storage) and `log_tail` (catalog-provided commits). The two sources are
-    /// processed in three phases:
-    ///
-    /// 1. Stream `fs_files` in ascending version order, grouping files by version.
-    ///    At each version boundary, flush the group: if a complete checkpoint is found,
-    ///    discard all earlier commits and compaction files (they are superseded by the
-    ///    checkpoint). Filesystem commits at versions covered by `log_tail` are skipped
-    ///    because `log_tail` is authoritative for those commits; non-commit files (CRC,
-    ///    checkpoints, compactions) are always taken from the filesystem.
-    /// 2. Resolve the `log_tail` lower-bound version from `lower_bound`.
-    /// 3. Stream the filtered `log_tail` commits in ascending version order, applying the
-    ///    same checkpoint-grouping logic, then flush the final group.
+    /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
+    /// listed from storage) and `log_tail` (catalog-provided commits)
     ///
     /// `lower_bound` controls how the log_tail is filtered:
     /// - [`LogTailLowerBound::Explicit`]: include entries at version >= v
