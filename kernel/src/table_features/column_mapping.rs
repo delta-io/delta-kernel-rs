@@ -52,9 +52,15 @@ pub(crate) fn column_mapping_mode(
     }
 }
 
-/// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
-/// value. When not enabled, verifies that no fields are annotated.
+/// Verify that column mapping annotations in `schema` are consistent with `mode`.
+///
+/// When column mapping is enabled (`Name` or `Id` mode), checks that:
+/// - Every field has a `delta.columnMapping.physicalName` annotation
+/// - Every field has a `delta.columnMapping.id` annotation
+/// - No two fields share the same column mapping ID
+/// - No two fields share the same full physical path (parent physical names + field physical name)
+///
+/// When column mapping is disabled (`None` mode), checks that no fields carry those annotations.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
