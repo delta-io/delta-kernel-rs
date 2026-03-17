@@ -235,6 +235,20 @@ fn make_public(mut item: Item) -> Item {
         Ok(())
     }
 
+    fn add_macro_export(m: &mut syn::ItemMacro) -> Result<(), syn::Error> {
+        if m.attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("macro_export"))
+        {
+            return Err(Error::new(
+                m.span(),
+                "ineligible for #[internal_api]: macro is already #[macro_export]",
+            ));
+        }
+        m.attrs.push(syn::parse_quote!(#[macro_export]));
+        Ok(())
+    }
+
     macro_rules! set_vis {
         ($item:ident) => {{
             let vis_span = $item.vis.span();
@@ -252,6 +266,7 @@ fn make_public(mut item: Item) -> Item {
         Item::Static(s) => set_vis!(s),
         Item::Const(c) => set_vis!(c),
         Item::Union(u) => set_vis!(u),
+        Item::Macro(m) if m.mac.path.is_ident("macro_rules") => add_macro_export(m),
         // foreign mod, impl block, and all others not handled
         _ => Err(Error::new(
             item.span(),

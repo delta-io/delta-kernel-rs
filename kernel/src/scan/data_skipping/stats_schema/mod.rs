@@ -9,8 +9,8 @@ use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType,
 };
-use crate::transforms::SchemaTransform;
-use crate::{DeltaResult, Error};
+use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::DeltaResult;
 
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
@@ -150,12 +150,11 @@ pub(crate) fn expected_stats_schema(
 
         // convert all leaf fields to data type LONG for null count
         let mut null_count_transform = NullCountStatsTransform;
-        if let Some(null_count_schema) = null_count_transform.transform_struct(&base_schema) {
-            fields.push(StructField::nullable(
-                "nullCount",
-                null_count_schema.into_owned(),
-            ));
-        };
+        let null_count_schema = null_count_transform.transform_struct(&base_schema);
+        fields.push(StructField::nullable(
+            "nullCount",
+            null_count_schema.into_owned(),
+        ));
 
         // include only min/max skipping eligible fields (data types)
         let mut min_max_transform = MinMaxStatsTransform;
@@ -199,10 +198,10 @@ pub(crate) fn stats_column_names(
 /// This is used to build the schema for parsing JSON stats and for reading stats_parsed
 /// from checkpoints when only a subset of columns is needed (e.g. predicate-referenced columns).
 pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
-    let stats_schema = schema_with_all_fields_nullable(referenced_schema).ok()?;
+    let stats_schema = schema_with_all_fields_nullable(referenced_schema);
 
     let nullcount_schema = NullCountStatsTransform
-        .transform_struct(&stats_schema)?
+        .transform_struct(&stats_schema)
         .into_owned();
 
     let schema = StructType::new_unchecked([
@@ -214,12 +213,8 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
 
     // Strip field metadata. The stats types are derived from the table schema, but the metadata on
     // the fields should not be included in the stats fields
-    let schema = StripFieldMetadataTransform
-        .transform_struct(&schema)
-        .map(|s| s.into_owned())
-        .unwrap_or(schema);
-
-    Some(Arc::new(schema))
+    let schema = StripFieldMetadataTransform.transform_struct(&schema);
+    Some(Arc::new(schema.into_owned()))
 }
 
 /// Strips all field metadata from a schema.
@@ -230,8 +225,10 @@ pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<Schem
 /// changed.
 pub(crate) struct StripFieldMetadataTransform;
 impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        Some(match self.transform(&field.data_type)? {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        match self.transform(&field.data_type) {
             Cow::Borrowed(_) if field.metadata.is_empty() => Cow::Borrowed(field),
             data_type => Cow::Owned(StructField {
                 name: field.name.clone(),
@@ -239,26 +236,25 @@ impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
                 nullable: field.is_nullable(),
                 metadata: Default::default(),
             }),
-        })
+        }
     }
 }
 
 /// Make all fields of a schema nullable.
 /// Used for stats schemas where stats may not be available for all columns.
-pub(crate) fn schema_with_all_fields_nullable(schema: &Schema) -> DeltaResult<Schema> {
-    match NullableStatsTransform.transform_struct(schema) {
-        Some(schema) => Ok(schema.into_owned()),
-        None => Err(Error::internal_error("NullableStatsTransform failed")),
-    }
+pub(crate) fn schema_with_all_fields_nullable(schema: &Schema) -> Schema {
+    NullableStatsTransform.transform_struct(schema).into_owned()
 }
 
 /// Transforms a schema to make all fields nullable.
 /// Used for stats schemas where stats may not be available for all columns.
 pub(crate) struct NullableStatsTransform;
 impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let data_type = self.transform(&field.data_type)?;
-        Some(make_nullable_field(field, data_type))
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        let data_type = self.transform(&field.data_type);
+        make_nullable_field(field, data_type)
     }
 }
 
@@ -287,16 +283,18 @@ fn make_nullable_field<'a>(
 /// is preserved for all fields.
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
         // Only recurse into struct fields; convert all other types (leaf fields) to LONG
         match &field.data_type {
             DataType::Struct(_) => self.recurse_into_struct_field(field),
-            _ => Some(Cow::Owned(StructField {
+            _ => Cow::Owned(StructField {
                 name: field.name.clone(),
                 data_type: DataType::LONG,
                 nullable: true,
                 metadata: field.metadata.clone(),
-            })),
+            }),
         }
     }
 }
@@ -328,6 +326,8 @@ impl<'col> BaseStatsTransform<'col> {
 }
 
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Always traverse struct fields -- only primitive leaf values count against the column limit
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.filter.enter_field(field.name());
@@ -369,6 +369,8 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Array, Map, and Variant fields are filtered out by BaseStatsTransform, so these methods
     // are typically not called. They're kept as a safety net in case the transform is used
     // independently or the filtering logic changes.
@@ -479,11 +481,9 @@ mod tests {
         // but make all fields nullable
         let expected_min_max = NullableStatsTransform
             .transform_struct(&file_schema)
-            .unwrap()
             .into_owned();
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_min_max)
-            .unwrap()
             .into_owned();
 
         let expected = expected_stats(null_count, expected_min_max);
@@ -582,7 +582,6 @@ mod tests {
         )]);
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
-            .unwrap()
             .into_owned();
 
         let expected = expected_stats(null_count, expected_fields);
@@ -615,7 +614,6 @@ mod tests {
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
         let null_count = NullCountStatsTransform
             .transform_struct(&expected_fields)
-            .unwrap()
             .into_owned();
 
         let expected = expected_stats(null_count, expected_fields);
