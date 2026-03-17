@@ -32,7 +32,7 @@ use Expression as Expr;
 use Predicate as Pred;
 
 #[test]
-fn test_array_column() {
+fn literal_in_list_column_evaluates_membership_per_row() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
     let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -72,7 +72,7 @@ fn test_array_column() {
 }
 
 #[test]
-fn test_bad_right_type_array() {
+fn in_predicate_errors_when_right_side_is_not_array_type() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
@@ -243,7 +243,7 @@ fn test_binary_predicate_with_view_types(
 }
 
 #[test]
-fn test_literal_type_array() {
+fn literal_in_literal_array_returns_single_boolean() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
@@ -268,6 +268,93 @@ fn test_literal_type_array() {
     let result = evaluate_predicate(&not_in_op, &batch, true).unwrap();
     let in_expected = BooleanArray::from(vec![false]);
     assert_eq!(result, in_expected);
+}
+
+#[test]
+fn column_in_literal_array_evaluates_membership_for_each_row() {
+    // Create a column with integer values
+    let col_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    let field = Arc::new(Field::new("x", DataType::Int32, false));
+    let schema = Schema::new([field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(col_array)]).unwrap();
+
+    // Create IN predicate: x IN (2, 4, 6)
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        column_expr!("x"),
+        Scalar::Array(
+            ArrayData::try_new(
+                ArrayType::new(KernelDataType::INTEGER, false),
+                vec![Scalar::Integer(2), Scalar::Integer(4), Scalar::Integer(6)],
+            )
+            .unwrap(),
+        ),
+    );
+
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    // Row values: [1, 2, 3, 4, 5], IN set: {2, 4, 6}
+    // Expected:   [F, T, F, T, F]
+    let expected = BooleanArray::from(vec![false, true, false, true, false]);
+    assert_eq!(result, expected);
+
+    // Test NOT IN via inversion
+    let result = evaluate_predicate(&in_op, &batch, true).unwrap();
+    let expected_not_in = BooleanArray::from(vec![true, false, true, false, true]);
+    assert_eq!(result, expected_not_in);
+}
+
+#[test]
+fn column_in_empty_literal_array_returns_all_false() {
+    let col_array = Int32Array::from(vec![1, 2, 3]);
+    let field = Arc::new(Field::new("x", DataType::Int32, false));
+    let schema = Schema::new([field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(col_array)]).unwrap();
+
+    // x IN () - empty array
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        column_expr!("x"),
+        Scalar::Array(
+            ArrayData::try_new(
+                ArrayType::new(KernelDataType::INTEGER, false),
+                Vec::<Scalar>::new(),
+            )
+            .unwrap(),
+        ),
+    );
+
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    // Empty IN list: nothing matches
+    let expected = BooleanArray::from(vec![false, false, false]);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn column_in_literal_array_with_nulls_uses_sql_null_semantics() {
+    // Column with some NULL values
+    let col_array = Int32Array::from(vec![Some(1), None, Some(3), Some(4)]);
+    let field = Arc::new(Field::new("x", DataType::Int32, true));
+    let schema = Schema::new([field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(col_array)]).unwrap();
+
+    // x IN (1, 3)
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        column_expr!("x"),
+        Scalar::Array(
+            ArrayData::try_new(
+                ArrayType::new(KernelDataType::INTEGER, false),
+                vec![Scalar::Integer(1), Scalar::Integer(3)],
+            )
+            .unwrap(),
+        ),
+    );
+
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    // Row values: [1, NULL, 3, 4]
+    // x IN (1, 3): [T, NULL, T, F] - NULL comparison yields NULL
+    let expected = BooleanArray::from(vec![Some(true), None, Some(true), Some(false)]);
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -397,7 +484,7 @@ fn test_literal_complex_type_array() {
 }
 
 #[test]
-fn test_invalid_array_sides() {
+fn in_predicate_errors_when_both_sides_are_columns() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
     let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -420,7 +507,7 @@ fn test_invalid_array_sides() {
 }
 
 #[test]
-fn test_str_arrays() {
+fn string_literal_in_string_list_column_evaluates_correctly() {
     let values = GenericStringArray::<i32>::from(vec![
         "hi", "bye", "hi", "hi", "bye", "bye", "hi", "bye", "hi",
     ]);
