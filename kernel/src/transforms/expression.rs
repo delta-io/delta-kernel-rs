@@ -37,7 +37,7 @@ use crate::transforms::{map_owned_children_or_else, CowExt as _};
 ///   changed, build a new parent around it. Otherwise, return the parent unchanged.
 ///
 /// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
-///   one child changed, build a new parent around them. Othwerwise, return the parent unchanged.
+///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
 ///
 /// * Variadic (0+ children) - If no children remain (all filtered out), filter out the
 ///   parent. Otherwise, if at least one child changed or was filtered out, build a new parent around
@@ -301,7 +301,7 @@ pub trait ExpressionTransform<'a> {
         map_owned_children_or_else(o, transformed_children, map_owned)
     }
 
-    /// Recursively transforms the child of an predicate expression (unary).
+    /// Recursively transforms the child of a predicate expression (unary).
     fn recurse_into_expr_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         self.transform_pred(pred)
     }
