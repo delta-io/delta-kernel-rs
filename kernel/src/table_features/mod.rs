@@ -808,19 +808,25 @@ mod tests {
     #[test]
     fn catalog_managed_requires_in_commit_timestamp_and_vacuum_protocol_check() {
         let reqs = TableFeature::CatalogManaged.info().feature_requirements;
-        let has_ict = reqs.iter().any(|r| {
+        let has_in_commit_timestamp = reqs.iter().any(|r| {
             matches!(
                 r,
                 FeatureRequirement::Supported(TableFeature::InCommitTimestamp)
             )
         });
-        let has_vpc = reqs.iter().any(|r| {
+        let has_vacuum_protocol_check = reqs.iter().any(|r| {
             matches!(
                 r,
                 FeatureRequirement::Supported(TableFeature::VacuumProtocolCheck)
             )
         });
-        assert!(has_ict, "catalogManaged must require inCommitTimestamp");
-        assert!(has_vpc, "catalogManaged must require vacuumProtocolCheck");
+        assert!(
+            has_in_commit_timestamp,
+            "catalogManaged must require inCommitTimestamp"
+        );
+        assert!(
+            has_vacuum_protocol_check,
+            "catalogManaged must require vacuumProtocolCheck"
+        );
     }
 }
