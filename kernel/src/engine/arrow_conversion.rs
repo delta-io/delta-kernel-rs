@@ -398,16 +398,9 @@ mod tests {
     }
 
     /// Helper visitor to collect all field IDs from a kernel StructType
+    #[derive(Default)]
     struct FieldIdCollector {
         field_ids: Vec<(String, String)>, // (field_name, field_id)
-    }
-
-    impl FieldIdCollector {
-        fn new() -> Self {
-            Self {
-                field_ids: Vec::new(),
-            }
-        }
     }
 
     impl<'a> SchemaTransform<'a> for FieldIdCollector {
@@ -457,13 +450,11 @@ mod tests {
                 ArrowDataType::Struct(fields) => {
                     collect_from_fields(fields, metadata_key, field_ids);
                 }
-                ArrowDataType::List(element)
-                | ArrowDataType::LargeList(element)
-                | ArrowDataType::FixedSizeList(element, _) => {
-                    collect_from_field(element, metadata_key, field_ids);
-                }
-                ArrowDataType::Map(entry_field, _) => {
-                    collect_from_field(entry_field, metadata_key, field_ids);
+                ArrowDataType::List(entry)
+                | ArrowDataType::LargeList(entry)
+                | ArrowDataType::FixedSizeList(entry, _)
+                | ArrowDataType::Map(entry, _) => {
+                    collect_from_field(entry, metadata_key, field_ids);
                 }
                 _ => {}
             }
@@ -596,8 +587,8 @@ mod tests {
 
         // Test round-trip: Arrow -> Kernel, field IDs should be preserved unchanged
         let kernel_struct = StructType::try_from_arrow(&arrow_schema)?;
-        let mut collector = FieldIdCollector::new();
-        let _ = collector.transform_struct(&kernel_struct);
+        let mut collector = FieldIdCollector::default();
+        collector.transform_struct(&kernel_struct);
         let kernel_field_ids: HashMap<String, String> = collector.field_ids.into_iter().collect();
         assert_eq!(
             kernel_field_ids, arrow_field_ids,

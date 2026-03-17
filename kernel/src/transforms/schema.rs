@@ -186,7 +186,7 @@ impl SchemaDepthChecker {
             current_depth: 0,
             call_count: 0,
         };
-        checker.transform(data_type);
+        let _ = checker.transform(data_type);
         (checker.max_depth_seen, checker.call_count)
     }
 

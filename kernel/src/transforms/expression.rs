@@ -410,14 +410,14 @@ impl ExpressionDepthChecker {
     // Exposed for testing
     fn check_expr_with_call_count(expr: &Expression, depth_limit: usize) -> (usize, usize) {
         let mut checker = Self::new(depth_limit);
-        checker.transform_expr(expr);
+        let _ = checker.transform_expr(expr);
         (checker.max_depth_seen, checker.call_count)
     }
 
     // Exposed for testing
     fn check_pred_with_call_count(pred: &Predicate, depth_limit: usize) -> (usize, usize) {
         let mut checker = Self::new(depth_limit);
-        checker.transform_pred(pred);
+        let _ = checker.transform_pred(pred);
         (checker.max_depth_seen, checker.call_count)
     }
 
@@ -645,8 +645,7 @@ mod tests {
             ],
         );
 
-        let mut transform = ColumnReplacer;
-        let result = transform.transform_expr_variadic(&variadic_expr);
+        let result = ColumnReplacer.transform_expr_variadic(&variadic_expr);
 
         assert!(matches!(result, Some(Cow::Owned(_))));
         if let Some(Cow::Owned(result_expr)) = result {
@@ -838,8 +837,7 @@ mod tests {
         let parse_json_expr =
             ParseJsonExpression::new(column_expr!("old_col"), test_output_schema());
 
-        let mut transform = ColumnReplacer;
-        let result = transform.transform_expr_parse_json(&parse_json_expr);
+        let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
 
         assert!(matches!(result, Some(Cow::Owned(_))));
         if let Some(Cow::Owned(result_expr)) = result {
@@ -861,8 +859,7 @@ mod tests {
         let parse_json_expr =
             ParseJsonExpression::new(column_expr!("unchanged_col"), test_output_schema());
 
-        let mut transform = ColumnReplacer;
-        let result = transform.transform_expr_parse_json(&parse_json_expr);
+        let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
 
         // Since "unchanged_col" doesn't match "old_col", nothing changes
         assert!(matches!(result, Some(Cow::Borrowed(_))));
