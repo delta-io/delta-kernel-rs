@@ -213,9 +213,9 @@ impl ScanLogReplayProcessor {
             DataSkippingFilter::new(
                 engine,
                 physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                state_info.physical_stats_schema.as_ref(),
+                stats_schema_for_transform.as_ref(),
                 column_expr_ref!("stats_parsed"),
-                state_info.physical_partition_schema.as_ref(),
+                partition_schema_for_transform.as_ref(),
                 column_expr_ref!("partitionValues_parsed"),
                 output_schema.clone(),
                 Some(metrics.clone()),
@@ -817,10 +817,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             is_log_batch,
         } = actions_batch;
 
-        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
+        // Step 1: Apply transform FIRST (outputs stats_parsed and partitionValues_parsed).
         // Use the correct transform based on batch type:
-        // - Log batches: use ParseJson (no stats_parsed in JSON commit files)
-        // - Checkpoint batches: use coalesce(stats_parsed, ParseJson) when available
+        // - Log batches: parse JSON for stats, MapToStruct for partition values
+        // - Checkpoint batches: read pre-parsed columns directly when available
         let transform = if is_log_batch {
             &self.log_transform
         } else {
@@ -894,7 +894,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Non-selected rows _must_ be ignored.
 ///
 /// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
-/// data skipping is disabled.
+/// predicate-based pruning is disabled (no data skipping or partition pruning).
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
@@ -1560,5 +1560,71 @@ mod tests {
             found_add = true;
         }
         assert!(found_add);
+    }
+
+    /// Verify that Remove actions are not pruned by data skipping. The transform reads from
+    /// `add.*` columns, so Remove rows produce null `stats_parsed` and `partitionValues_parsed`
+    /// (Remove actions have their own `remove.partitionValues` and `remove.stats`, but those
+    /// are not read by the transform). The data skipping filter must evaluate to NULL (unknown)
+    /// for these null columns and conservatively keep the row. If a Remove were pruned, it would
+    /// not be recorded in `seen_file_keys`, and a subsequent Add for the same path could
+    /// incorrectly survive deduplication.
+    #[test]
+    fn data_skipping_does_not_prune_remove_actions() {
+        use std::collections::HashMap;
+
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "value",
+            DataType::INTEGER,
+            true,
+        )]));
+        // Predicate on `value` activates data skipping via stats
+        let predicate = Arc::new(Expr::column(["value"]).gt(Expr::literal(5i32)));
+        let state_info = get_state_info(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+        )
+        .unwrap();
+
+        // Batch: [Remove c001, Add c001, Add c000, Metadata]
+        // Both adds have stats min=0, max=9 so they pass the value>5 filter.
+        // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
+        let batch = vec![add_batch_with_remove(get_commit_schema().clone())];
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            false,
+        )
+        .unwrap();
+
+        let mut add_paths: Vec<String> = Vec::new();
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let paths = scan_metadata
+                .visit_scan_files(
+                    Vec::new(),
+                    |paths: &mut Vec<String>, scan_file: ScanFile| {
+                        paths.push(scan_file.path.to_string());
+                    },
+                )
+                .unwrap();
+            add_paths.extend(paths);
+        }
+
+        // Only c000 should survive: Remove suppressed c001, c000 passed data skipping
+        assert_eq!(add_paths.len(), 1, "Expected exactly one add to survive");
+        assert!(
+            add_paths[0].contains("c000"),
+            "Expected c000 add to survive, got: {}",
+            add_paths[0]
+        );
     }
 }

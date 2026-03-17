@@ -1580,7 +1580,7 @@ fn test_mixed_predicate_checkpoint_file_selection() {
             .count()
     };
 
-    // AND(modified='2021-02-01', value>9): 2021-02-01 files match both → 2 files kept
+    // AND(modified='2021-02-01', value>9): 2021-02-01 files match both -> 2 files kept
     assert_eq!(
         count_selected_files(Arc::new(Pred::and(
             column_expr!("modified").eq(Expr::literal("2021-02-01")),
@@ -1591,7 +1591,7 @@ fn test_mixed_predicate_checkpoint_file_selection() {
     );
 
     // AND(modified='2021-02-02', value>3): 2021-02-02 files match partition but data stats fail
-    // (max=3, NOT > 3), 2021-02-01 partition mismatch → all 4 pruned
+    // (max=3, NOT > 3), 2021-02-01 partition mismatch -> all 4 pruned
     assert_eq!(
         count_selected_files(Arc::new(Pred::and(
             column_expr!("modified").eq(Expr::literal("2021-02-02")),

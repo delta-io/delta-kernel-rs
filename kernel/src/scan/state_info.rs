@@ -119,6 +119,27 @@ fn build_data_skipping_schemas(
     table_configuration: &TableConfiguration,
     table_partition_schema: Option<SchemaRef>,
 ) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
+    // Filter partition schema to only predicate-referenced columns. The DataSkippingFilter
+    // only needs partition columns that appear in the predicate, and the transform output
+    // should not include unused partition columns.
+    let predicate_partition_schema = match (&table_partition_schema, physical_predicate) {
+        (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
+            // Partition values extracted from the string map via ELEMENT_AT are always
+            // nullable (map lookup can return null), so we force all partition fields nullable.
+            let fields: Vec<StructField> = ref_schema
+                .fields()
+                .filter(|f| tps.field(f.name()).is_some())
+                .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+                .collect();
+            if fields.is_empty() {
+                None
+            } else {
+                Some(Arc::new(StructType::new_unchecked(fields)))
+            }
+        }
+        _ => None,
+    };
+
     match (stats_output_mode, physical_predicate) {
         // Output all table stats columns in stats_parsed. The DataSkippingFilter
         // reads stats_parsed from the transformed batch, which uses this schema.
@@ -127,7 +148,7 @@ fn build_data_skipping_schemas(
                 table_configuration.build_expected_stats_schemas(None, None)?;
             Ok((
                 Some(expected_stats_schemas.physical),
-                table_partition_schema,
+                predicate_partition_schema,
             ))
         }
         // Non-empty requested columns -- include predicate-referenced columns
@@ -158,7 +179,7 @@ fn build_data_skipping_schemas(
                 .build_expected_stats_schemas(None, Some(&all_needed_physical))?;
             Ok((
                 Some(expected_stats_schemas.physical),
-                table_partition_schema,
+                predicate_partition_schema,
             ))
         }
         // Columns(empty) or Skip with a physical predicate -- build stats directly
@@ -167,37 +188,19 @@ fn build_data_skipping_schemas(
         // Split referenced columns into data columns and partition columns.
         // Data columns get min/max/nullCount stats; partition columns get exact values.
         (_, PhysicalPredicate::Some(_, schema)) => {
-            let is_partition = |name: &str| {
-                table_partition_schema
-                    .as_ref()
-                    .is_some_and(|ps| ps.field(name).is_some())
-            };
             let data_fields: Vec<StructField> = schema
                 .fields()
-                .filter(|f| !is_partition(f.name()))
+                .filter(|f| {
+                    predicate_partition_schema
+                        .as_ref()
+                        .is_none_or(|ps| ps.field(f.name()).is_none())
+                })
                 .cloned()
-                .collect();
-            // Partition values extracted from the string map via ELEMENT_AT
-            // are always nullable (map lookup can return null), so we make
-            // all partition fields nullable in the stats schema.
-            let partition_fields: Vec<StructField> = schema
-                .fields()
-                .filter(|f| is_partition(f.name()))
-                .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
                 .collect();
 
             let data_schema = StructType::new_unchecked(data_fields);
-            let partition_schema = if partition_fields.is_empty() {
-                None
-            } else {
-                Some(Arc::new(StructType::new_unchecked(partition_fields)))
-            };
-
-            // physical_stats_schema is data-only (used for JSON parsing in the transform).
-            // The unified schema (data stats + partition values) is built in
-            // ScanLogReplayProcessor for the DataSkippingFilter.
             let data_stats = build_stats_schema(&data_schema);
-            Ok((data_stats, partition_schema))
+            Ok((data_stats, predicate_partition_schema))
         }
         // No stats output and no predicate
         (_, _) => Ok((None, None)),
