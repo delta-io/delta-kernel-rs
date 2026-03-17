@@ -69,12 +69,15 @@ pub mod tokio {
     pub struct TokioBackgroundExecutor {
         sender: ManuallyDrop<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
         handle: Handle,
+        /// `Option` because `join` takes ownership; we `take` it in `Drop` to move the
+        /// handle out. Never `None` outside of `Drop`.
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Drop for TokioBackgroundExecutor {
         fn drop(&mut self) {
-            // SAFETY: The inner `Sender` has not been dropped yet because this is the only drop site and `Drop::drop` runs exactly once.
+            // SAFETY: The inner `Sender` has not been dropped yet because this is
+            // the only drop site and `Drop::drop` runs exactly once.
             // Drop sender first to close the channel, signaling the background
             // thread to exit its recv loop.
             unsafe { ManuallyDrop::drop(&mut self.sender) };
