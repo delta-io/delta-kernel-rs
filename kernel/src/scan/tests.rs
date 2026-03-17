@@ -653,10 +653,7 @@ fn assert_stats_struct_matches_json(
             assert_eq!(
                 json_val.as_i64().unwrap(),
                 int_col.value(row_idx),
-                "{}.{} mismatch at row {}",
-                field_name,
-                col_name,
-                row_idx
+                "{field_name}.{col_name} mismatch at row {row_idx}"
             );
         }
     }

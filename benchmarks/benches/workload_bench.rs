@@ -15,7 +15,7 @@ use delta_kernel_benchmarks::runners::{
 use delta_kernel_benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-    use object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::local::LocalFileSystem;
 
     let store = Arc::new(LocalFileSystem::new());
     let engine = DefaultEngine::builder(store).build();
@@ -29,11 +29,11 @@ fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
         Ok(_) => panic!("No workloads found"),
-        Err(e) => panic!("Failed to load workloads: {}", e),
+        Err(e) => panic!("Failed to load workloads: {e}"),
     };
 
     let engine = setup_engine();
-    let mut group = c.benchmark_group("workload_benchmarks");
+    let mut group = c.benchmark_group("workloadBenchmarks");
 
     for workload in &workloads {
         match &workload.spec {
@@ -80,9 +80,9 @@ fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
     // Choose which benchmark configurations to run for a given table
     // TODO: This function will take in table info to choose the appropriate configs for a given table
     let mut configs = default_read_configs();
-    if table_name.contains("v2_checkpoint") {
+    if table_name.contains("V2Checkpoint") {
         configs.push(ReadConfig {
-            name: "parallel_2".into(),
+            name: "parallel2".into(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         });
     }

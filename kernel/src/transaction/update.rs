@@ -22,14 +22,14 @@ use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
-use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::current_time_ms;
-use crate::{DataType, DeltaResult, Engine, Expression, RowVisitor, SchemaTransform};
+use crate::{DataType, DeltaResult, Engine, Expression, RowVisitor};
 use delta_kernel_derive::internal_api;
 
 use super::Transaction;
@@ -85,6 +85,7 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
+            engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
             clustering_columns_physical: clustering_columns,
@@ -353,10 +354,8 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    NullableStatsTransform
-        .transform_struct(scan_row_schema().as_ref())
-        .unwrap_or_else(|| panic!("Failed to transform scan_row_schema"))
-        .into_owned()
+    schema_with_all_fields_nullable(scan_row_schema().as_ref())
+        .unwrap_or_else(|_| panic!("Failed to transform scan_row_schema"))
         .into()
 });
 
@@ -371,10 +370,8 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    NullableStatsTransform
-        .transform_struct(restored_add_schema())
-        .unwrap_or_else(|| panic!("Failed to transform restored_add_schema"))
-        .into_owned()
+    schema_with_all_fields_nullable(restored_add_schema())
+        .unwrap_or_else(|_| panic!("Failed to transform restored_add_schema"))
         .into()
 });
 
@@ -389,10 +386,8 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 // If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    NullableStatsTransform
-        .transform_struct(get_log_add_schema())
-        .unwrap_or_else(|| panic!("Failed to transform nullable_restored_add_schema"))
-        .into_owned()
+    schema_with_all_fields_nullable(get_log_add_schema())
+        .unwrap_or_else(|_| panic!("Failed to transform nullable_restored_add_schema"))
         .into()
 });
 
