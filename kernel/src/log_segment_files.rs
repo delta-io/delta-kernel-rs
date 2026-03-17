@@ -293,9 +293,7 @@ impl LogSegmentFiles {
         }
 
         // Phase 2: resolve upper bound from end version and resolve log_tail lower bound
-        let resolved_lower = match lower_bound {
-            LogTailLowerBound::Explicit(v) => v,
-        };
+        let LogTailLowerBound::Explicit(resolved_lower) = lower_bound;
         let upper = end_version.unwrap_or(Version::MAX);
 
         // Phase 3: Process log_tail entries. We do this after Phase 1 because log_tail commits
