@@ -432,7 +432,10 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[
+        FeatureRequirement::Supported(TableFeature::InCommitTimestamp),
+        FeatureRequirement::Supported(TableFeature::VacuumProtocolCheck),
+    ],
     #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
@@ -800,5 +803,25 @@ mod tests {
             let deserialized: TableFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
         }
+    }
+
+    #[test]
+    fn catalog_managed_requires_in_commit_timestamp_and_vacuum_protocol_check() {
+        let info = TableFeature::CatalogManaged.info();
+        assert_eq!(info.feature_requirements.len(), 2);
+        assert!(
+            matches!(
+                &info.feature_requirements[0],
+                FeatureRequirement::Supported(TableFeature::InCommitTimestamp)
+            ),
+            "First requirement should be InCommitTimestamp"
+        );
+        assert!(
+            matches!(
+                &info.feature_requirements[1],
+                FeatureRequirement::Supported(TableFeature::VacuumProtocolCheck)
+            ),
+            "Second requirement should be VacuumProtocolCheck"
+        );
     }
 }
