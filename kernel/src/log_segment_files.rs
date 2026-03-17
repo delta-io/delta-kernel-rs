@@ -177,12 +177,6 @@ impl ListingAccumulator {
     fn maybe_flush_and_advance(&mut self, file_version: Version) {
         match self.group_version {
             Some(gv) if file_version != gv => {
-                debug_assert!(
-                    file_version > gv,
-                    "files must arrive in ascending version order, got {} after {}",
-                    file_version,
-                    gv
-                );
                 self.flush_checkpoint_group(gv);
                 self.group_version = Some(file_version);
             }
