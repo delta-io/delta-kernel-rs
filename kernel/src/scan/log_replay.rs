@@ -1,5 +1,5 @@
 use std::clone::Clone;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -14,7 +14,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
 };
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
@@ -105,7 +104,6 @@ pub struct SerializableScanState {
 /// to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
-    partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     /// Transform for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
@@ -225,7 +223,6 @@ impl ScanLogReplayProcessor {
         };
 
         Ok(Self {
-            partition_filter: physical_predicate.as_ref().map(|(p, _)| p.clone()),
             data_skipping_filter,
             // Log transform: parse JSON for stats, MapToStruct for partition values
             log_transform: engine.evaluation_handler().new_expression_evaluator(
@@ -386,7 +383,6 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
-    partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     metrics: &'a ScanMetrics,
 }
@@ -396,35 +392,15 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
-        partition_filter: Option<PredicateRef>,
         metrics: &'a ScanMetrics,
     ) -> AddRemoveDedupVisitor<'a, D> {
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
             state_info,
-            partition_filter,
             row_transform_exprs: Vec::new(),
             metrics,
         }
-    }
-
-    fn is_file_partition_pruned(
-        &self,
-        partition_values: &HashMap<usize, (String, Scalar)>,
-    ) -> bool {
-        if partition_values.is_empty() {
-            return false;
-        }
-        let Some(partition_filter) = &self.partition_filter else {
-            return false;
-        };
-        let partition_values: HashMap<_, _> = partition_values
-            .values()
-            .map(|(k, v)| (ColumnName::new([k]), v.clone()))
-            .collect();
-        let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
-        evaluator.eval_sql_where(partition_filter) == Some(false)
     }
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
@@ -452,34 +428,21 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.metrics.incr_remove_files_seen()
         };
 
-        // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
-        // tracking pruned files. Removes don't get pruned and we'll still have to track them.
-        //
-        // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
-        // removes), because they are needed to suppress earlier incompatible adds we might
-        // encounter if the table's schema was replaced after the most recent checkpoint.
+        // Parse partition values for building the per-row transform expression.
+        // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
+        // so we only need to parse values here for the transform.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let start = std::time::Instant::now();
 
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
+                parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
                     &partition_values,
                     self.state_info.column_mapping_mode,
-                )?;
-
-                let is_pruned = self.is_file_partition_pruned(&partition_values);
-                self.metrics
-                    .add_predicate_eval_time_ns(start.elapsed().as_nanos() as u64);
-
-                if is_pruned {
-                    self.metrics.incr_predicate_filtered();
-                    return Ok(false);
-                }
-                partition_values
+                )?
             }
             _ => Default::default(),
         };
@@ -790,7 +753,6 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             deduplicator,
             selection_vector,
             self.state_info.clone(),
-            self.partition_filter.clone(),
             &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
@@ -872,7 +834,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             deduplicator,
             selection_vector,
             self.state_info.clone(),
-            self.partition_filter.clone(),
             &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
