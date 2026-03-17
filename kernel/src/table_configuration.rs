@@ -709,7 +709,7 @@ impl TableConfiguration {
 
                 reader_supported && writer_supported
             }
-            FeatureType::Unknown => false,
+            FeatureType::Unknown => Self::has_feature(self.protocol.writer_features(), feature),
         }
     }
 
