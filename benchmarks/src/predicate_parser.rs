@@ -59,11 +59,14 @@ fn convert_expr_to_predicate(expr: &Expr) -> Result<Predicate, Box<dyn std::erro
             Ok(Predicate::is_not_null(inner))
         }
         Expr::Nested(inner) => convert_expr_to_predicate(inner),
+        // Only boolean literals are valid in predicate position (e.g. `TRUE`, `FALSE`).
+        // Other literals like numbers or strings are not valid standalone predicates.
         Expr::Value(value) => match &value.value {
             Value::Boolean(b) => Ok(Predicate::literal(*b)),
             _ => Err(format!("Unsupported literal in predicate position: {value}").into()),
         },
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            // Delegate to convert_expr_to_expression to keep identifier conversion in one place
             let col_expr = convert_expr_to_expression(expr)?;
             Ok(Predicate::from_expr(col_expr))
         }
@@ -94,11 +97,10 @@ fn convert_in_list(
     let scalars: Vec<Scalar> = list
         .iter()
         .map(|e| {
-            let expr = convert_expr_to_expression(e)?;
-            match expr {
-                Expression::Literal(s) => Ok(s),
-                _ => Err(format!("IN list elements must be literals, got: {e}").into()),
-            }
+            let Expression::Literal(s) = convert_expr_to_expression(e)? else {
+                return Err(format!("IN list elements must be literals, got: {e}").into());
+            };
+            Ok(s)
         })
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
 

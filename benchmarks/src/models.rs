@@ -159,9 +159,6 @@ pub struct ReadSpec {
     /// SQL WHERE clause expression (e.g. "id < 500"). Parsed into a kernel `Predicate`
     /// and passed to the scan builder for data skipping.
     pub predicate: Option<String>,
-    /// Whether to include all stats columns in scan metadata
-    #[serde(default)]
-    pub include_stats: bool,
 }
 
 impl ReadSpec {

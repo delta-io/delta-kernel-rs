@@ -279,7 +279,6 @@ mod tests {
         ReadSpec {
             version: None,
             predicate: None,
-            include_stats: false,
         }
     }
 
