@@ -181,6 +181,17 @@ Or with a specific version:
 }
 ```
 
+With a predicate for data skipping (SQL WHERE clause syntax):
+
+```json
+{
+  "type": "read",
+  "predicate": "id < 500 AND value > 10"
+}
+```
+
+The `predicate` field accepts a SQL WHERE clause expression that is parsed into a kernel `Predicate` and passed to the scan builder. See [`src/predicate_parser.rs`](src/predicate_parser.rs) for the full list of supported SQL features.
+
 Snapshot construction specs:
 ```json
 {
@@ -214,6 +225,7 @@ Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so t
 | File | Purpose |
 |------|---------|
 | `src/models.rs` | Data types: `TableInfo`, `Spec`, `Workload`, `ReadConfig`, `ReadOperation` |
+| `src/predicate_parser.rs` | SQL WHERE clause to kernel `Predicate` parser |
 | `src/runners.rs` | `WorkloadRunner` trait and implementations: `ReadMetadataRunner`, `SnapshotConstructionRunner` |
 | `src/utils.rs` | Workload loading: extracts the tarball and deserializes all workloads |
 | `benches/workload_bench.rs` | Criterion entry point — loads workloads, builds runners, drives benchmarks |
