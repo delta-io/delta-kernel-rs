@@ -51,7 +51,7 @@ struct CapabilityExpect {
 /// IS listed in a modern (3,7) protocol.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Error variant will be used by features with validation (ICT pairing, etc.)
-enum PropCase {
+enum TablePropertyExpectation {
     /// TC construction succeeds, feature is enabled.
     Enabled(&'static [&'static str]),
     /// TC construction succeeds, feature is NOT enabled.
@@ -60,10 +60,11 @@ enum PropCase {
     Error(&'static [&'static str]),
 }
 
-impl PropCase {
+impl TablePropertyExpectation {
     fn props(&self) -> &[&'static str] {
+        use TablePropertyExpectation::*;
         match self {
-            PropCase::Enabled(p) | PropCase::Disabled(p) | PropCase::Error(p) => p,
+            Enabled(p) | Disabled(p) | Error(p) => p,
         }
     }
 }
@@ -110,7 +111,7 @@ struct FeatureFixture {
     /// be supported but not enabled; its (non-)existence is also used to identify features whose
     /// disabled/enabled status is controlled by table properties and/or schema presence. Any
     /// additional cases are used to exercise corner cases (both positive and negative).
-    prop_cases: &'static [PropCase],
+    prop_cases: &'static [TablePropertyExpectation],
     /// Expected outcome when presence metadata exists but the feature is NOT in the protocol.
     /// `OpExpect::Err` for features with active orphan detection.
     /// `OpExpect::Ok` for features without orphan detection yet.
@@ -128,11 +129,6 @@ impl FeatureFixture {
     /// Parse the feature name to a TableFeature. Unknown features become TableFeature::Unknown.
     fn table_feature(&self) -> TableFeature {
         self.name.into_table_feature()
-    }
-
-    /// Is this feature known to the kernel (has a non-Unknown enum variant)?
-    fn is_feature_known(&self) -> bool {
-        !matches!(self.table_feature(), TableFeature::Unknown(_))
     }
 }
 
@@ -235,12 +231,12 @@ fn run_battery(fixture: &FeatureFixture) {
     let enabled_schema = fixture.enabled_schema.as_ref();
     let disabled_schema = fixture.disabled_schema.as_ref();
     let enabled_props = fixture.prop_cases.iter().find_map(|c| match c {
-        PropCase::Enabled(p) => Some(*p),
+        TablePropertyExpectation::Enabled(p) => Some(*p),
         _ => None,
     });
     let enabled_props = enabled_props.unwrap_or(&[]);
     let disabled_props = fixture.prop_cases.iter().find_map(|c| match c {
-        PropCase::Disabled(p) => Some(*p),
+        TablePropertyExpectation::Disabled(p) => Some(*p),
         _ => None,
     });
 
@@ -249,13 +245,13 @@ fn run_battery(fixture: &FeatureFixture) {
     // ============================================================================================
     for (i, case) in fixture.prop_cases.iter().enumerate() {
         let schema = match case {
-            PropCase::Enabled(_) | PropCase::Error(_) => enabled_schema,
-            PropCase::Disabled(_) => disabled_schema,
+            TablePropertyExpectation::Disabled(_) => disabled_schema,
+            _ => enabled_schema,
         };
         let result = try_create_table_config(&all_feature_names, case.props(), schema, 3, 7);
 
         match case {
-            PropCase::Enabled(_) => {
+            TablePropertyExpectation::Enabled(_) => {
                 let tc = result.unwrap_or_else(|e| {
                     panic!("{name}: prop_case[{i}] Enabled: expected TC construction to succeed, got: {e}")
                 });
@@ -268,7 +264,7 @@ fn run_battery(fixture: &FeatureFixture) {
                     "{name}: prop_case[{i}] Enabled: expected is_feature_enabled = true"
                 );
             }
-            PropCase::Disabled(_) => {
+            TablePropertyExpectation::Disabled(_) => {
                 let tc = result.unwrap_or_else(|e| {
                     panic!("{name}: prop_case[{i}] Disabled: expected TC construction to succeed, got: {e}")
                 });
@@ -281,7 +277,7 @@ fn run_battery(fixture: &FeatureFixture) {
                     "{name}: prop_case[{i}] Disabled: expected is_feature_enabled = false"
                 );
             }
-            PropCase::Error(_) => {
+            TablePropertyExpectation::Error(_) => {
                 assert!(
                     result.is_err(),
                     "{name}: prop_case[{i}] Error: expected TC construction to fail, but it succeeded"
@@ -291,50 +287,33 @@ fn run_battery(fixture: &FeatureFixture) {
     }
 
     // ============================================================================================
-    // B. Auto-generated: listed feature (modern 3,7), supported vs. enabled
+    // B. Auto-generated: listed feature (modern 3,7), supported => enabled for no-toggle features
     // ============================================================================================
-    if fixture.is_feature_known() {
-        if let Some(disabled_props) = disabled_props {
-            // Feature has a toggle -- verify supported but NOT enabled with disabled props.
-            let tc = create_table_config(&all_feature_names, disabled_props, disabled_schema, 3, 7);
-            assert!(
-                tc.is_feature_supported(&feature),
-                "{name}: listed + disabled: expected is_feature_supported = true"
-            );
-            assert!(
-                !tc.is_feature_enabled(&feature),
-                "{name}: listed + disabled: expected is_feature_enabled = false"
-            );
-        } else {
-            // No toggle -- supported implies enabled (AlwaysIfSupported or EnabledIfPresent).
-            let tc = create_table_config(&all_feature_names, enabled_props, enabled_schema, 3, 7);
-            assert!(
-                tc.is_feature_supported(&feature),
-                "{name}: listed: expected is_feature_supported = true"
-            );
-            assert!(
-                tc.is_feature_enabled(&feature),
-                "{name}: listed: expected is_feature_enabled = true"
-            );
-        }
+    if disabled_props.is_none() {
+        // No toggle -- supported implies enabled (AlwaysIfSupported or EnabledIfPresent).
+        let tc = create_table_config(&all_feature_names, enabled_props, enabled_schema, 3, 7);
+        assert!(
+            tc.is_feature_supported(&feature),
+            "{name}: listed: expected is_feature_supported = true"
+        );
+        assert!(
+            tc.is_feature_enabled(&feature),
+            "{name}: listed: expected is_feature_enabled = true"
+        );
     }
 
     // ============================================================================================
     // C. Auto-generated: empty props + NOT listed (modern 3,7)
     // ============================================================================================
-    if fixture.is_feature_known() {
-        // Only test for known features -- unknown features have no FeatureInfo and
-        // is_feature_supported always returns false anyway
-        let tc = create_table_config(&[], &[], None, 3, 7);
-        assert!(
-            !tc.is_feature_supported(&feature),
-            "{name}: empty props + not listed: expected is_feature_supported = false"
-        );
-        assert!(
-            !tc.is_feature_enabled(&feature),
-            "{name}: empty props + not listed: expected is_feature_enabled = false"
-        );
-    }
+    let tc = create_table_config(&[], &[], None, 3, 7);
+    assert!(
+        !tc.is_feature_supported(&feature),
+        "{name}: empty props + not listed: expected is_feature_supported = false"
+    );
+    assert!(
+        !tc.is_feature_enabled(&feature),
+        "{name}: empty props + not listed: expected is_feature_enabled = false"
+    );
 
     // ============================================================================================
     // D. Orphan test: presence metadata + feature NOT in protocol
@@ -346,7 +325,7 @@ fn run_battery(fixture: &FeatureFixture) {
             .prop_cases
             .iter()
             .filter_map(|c| match c {
-                PropCase::Enabled(p) => Some(*p),
+                TablePropertyExpectation::Enabled(p) => Some(*p),
                 _ => None,
             })
             .collect();
@@ -409,7 +388,7 @@ fn run_battery(fixture: &FeatureFixture) {
             // Orphan check: same insufficient version, but with each Enabled prop case.
             // Legacy protocol analogue to Section D.
             for (i, case) in fixture.prop_cases.iter().enumerate() {
-                let PropCase::Enabled(props) = case else {
+                let TablePropertyExpectation::Enabled(props) = case else {
                     continue;
                 };
                 let result =
@@ -454,7 +433,7 @@ fn run_battery(fixture: &FeatureFixture) {
             // Iterates all Enabled cases (e.g. CM mode=name and mode=id) rather than
             // just the first, so each mode gets legacy coverage.
             for (i, case) in fixture.prop_cases.iter().enumerate() {
-                if let PropCase::Enabled(props) = case {
+                if let TablePropertyExpectation::Enabled(props) = case {
                     let tc = create_table_config(
                         &[],
                         props,
@@ -676,8 +655,8 @@ fn test_append_only() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.appendOnly=true"]),
-            PropCase::Disabled(&["delta.appendOnly=false"]),
+            TablePropertyExpectation::Enabled(&["delta.appendOnly=true"]),
+            TablePropertyExpectation::Disabled(&["delta.appendOnly=false"]),
         ],
         // TODO: reject metadata presence when feature not in protocol
         expected_orphan: OpExpect::Ok,
@@ -725,8 +704,8 @@ fn test_check_constraints() {
         anti_deps: &[],
         // No toggle property. Enabled when delta.constraints.* table properties are present.
         prop_cases: &[
-            PropCase::Enabled(&["delta.constraints.valueInRange=value > 0"]),
-            PropCase::Enabled(&[]), // TODO: Should be Disabled
+            TablePropertyExpectation::Enabled(&["delta.constraints.valueInRange=value > 0"]),
+            TablePropertyExpectation::Enabled(&[]), // TODO: Should be Disabled
         ],
         expected_orphan: OpExpect::Ok,
         capability: READS_ONLY,
@@ -746,8 +725,8 @@ fn test_change_data_feed() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.enableChangeDataFeed=true"]),
-            PropCase::Disabled(&["delta.enableChangeDataFeed=false"]),
+            TablePropertyExpectation::Enabled(&["delta.enableChangeDataFeed=true"]),
+            TablePropertyExpectation::Disabled(&["delta.enableChangeDataFeed=false"]),
         ],
         // TODO: reject metadata presence when feature not in protocol
         expected_orphan: OpExpect::Ok,
@@ -799,11 +778,11 @@ fn test_column_mapping() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.columnMapping.mode=name"]),
-            PropCase::Enabled(&["delta.columnMapping.mode=id"]),
-            PropCase::Disabled(&["delta.columnMapping.mode=none"]),
-            PropCase::Disabled(&[]),
-            PropCase::Error(&[]), // NOTE: orphaned schema (error cases use enabled_schema)
+            TablePropertyExpectation::Enabled(&["delta.columnMapping.mode=name"]),
+            TablePropertyExpectation::Enabled(&["delta.columnMapping.mode=id"]),
+            TablePropertyExpectation::Disabled(&["delta.columnMapping.mode=none"]),
+            TablePropertyExpectation::Disabled(&[]),
+            TablePropertyExpectation::Error(&[]), // due to orphaned CM annotations in schema
         ],
         expected_orphan: OpExpect::Err,
         capability: ALL_SUPPORTED,
@@ -851,8 +830,8 @@ fn test_deletion_vectors() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.enableDeletionVectors=true"]),
-            PropCase::Disabled(&["delta.enableDeletionVectors=false"]),
+            TablePropertyExpectation::Enabled(&["delta.enableDeletionVectors=true"]),
+            TablePropertyExpectation::Disabled(&["delta.enableDeletionVectors=false"]),
         ],
         // TODO: reject metadata presence when feature not in protocol
         expected_orphan: OpExpect::Ok,
@@ -872,18 +851,18 @@ fn test_row_tracking() {
         required_deps: &["domainMetadata"],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableRowTracking=true",
                 "delta.rowTracking.materializedRowIdColumnName=_row-id",
                 "delta.rowTracking.materializedRowCommitVersionColumnName=_row-cv",
             ]),
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableRowTracking=false",
                 "delta.rowTracking.materializedRowIdColumnName=_row-id",
                 "delta.rowTracking.materializedRowCommitVersionColumnName=_row-cv",
             ]),
             // Suspended with enabled=false: valid, not enabled.
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableRowTracking=false",
                 "delta.rowTrackingSuspended=true",
                 "delta.rowTracking.materializedRowIdColumnName=_row-id",
@@ -891,7 +870,7 @@ fn test_row_tracking() {
             ]),
             // TODO: should be Error (spec forbids both enabled and suspended = true),
             // but kernel does not currently reject this combination at construction time.
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableRowTracking=true",
                 "delta.rowTrackingSuspended=true",
                 "delta.rowTracking.materializedRowIdColumnName=_row-id",
@@ -959,8 +938,8 @@ fn test_v2_checkpoint() {
         anti_deps: &[],
         // delta.checkpointPolicy is an optional config (not a toggle)
         prop_cases: &[
-            PropCase::Enabled(&["delta.checkpointPolicy=v2"]),
-            PropCase::Enabled(&[]),
+            TablePropertyExpectation::Enabled(&["delta.checkpointPolicy=v2"]),
+            TablePropertyExpectation::Enabled(&[]),
         ],
         // TODO: reject metadata presence when feature not in protocol
         expected_orphan: OpExpect::Ok,
@@ -983,19 +962,19 @@ fn test_iceberg_compat_v1() {
         required_deps: &["columnMapping"],
         anti_deps: &["deletionVectors"],
         prop_cases: &[
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableIcebergCompatV1=true",
                 "delta.columnMapping.mode=name",
             ]),
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableIcebergCompatV1=true",
                 "delta.columnMapping.mode=id",
             ]),
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableIcebergCompatV1=false",
                 "delta.columnMapping.mode=name",
             ]),
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableIcebergCompatV1=false",
                 "delta.columnMapping.mode=id",
             ]),
@@ -1021,19 +1000,19 @@ fn test_iceberg_compat_v2() {
         required_deps: &["columnMapping"],
         anti_deps: &["icebergCompatV1", "deletionVectors"],
         prop_cases: &[
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableIcebergCompatV2=true",
                 "delta.columnMapping.mode=name",
             ]),
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableIcebergCompatV2=true",
                 "delta.columnMapping.mode=id",
             ]),
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableIcebergCompatV2=false",
                 "delta.columnMapping.mode=name",
             ]),
-            PropCase::Disabled(&[
+            TablePropertyExpectation::Disabled(&[
                 "delta.enableIcebergCompatV2=false",
                 "delta.columnMapping.mode=id",
             ]),
@@ -1092,17 +1071,17 @@ fn test_in_commit_timestamp() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.enableInCommitTimestamps=true"]),
-            PropCase::Disabled(&["delta.enableInCommitTimestamps=false"]),
+            TablePropertyExpectation::Enabled(&["delta.enableInCommitTimestamps=true"]),
+            TablePropertyExpectation::Disabled(&["delta.enableInCommitTimestamps=false"]),
             // Valid: both auxiliary properties present.
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableInCommitTimestamps=true",
                 "delta.inCommitTimestampEnablementVersion=1",
                 "delta.inCommitTimestampEnablementTimestamp=12345",
             ]),
             // TODO: should be Error (unpaired aux property), but pairing is not
             // currently validated at construction time -- only at query time.
-            PropCase::Enabled(&[
+            TablePropertyExpectation::Enabled(&[
                 "delta.enableInCommitTimestamps=true",
                 "delta.inCommitTimestampEnablementVersion=1",
             ]),
@@ -1202,8 +1181,8 @@ fn test_type_widening() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.enableTypeWidening=true"]),
-            PropCase::Disabled(&["delta.enableTypeWidening=false"]),
+            TablePropertyExpectation::Enabled(&["delta.enableTypeWidening=true"]),
+            TablePropertyExpectation::Disabled(&["delta.enableTypeWidening=false"]),
         ],
         // TODO: reject metadata presence when feature not in protocol
         expected_orphan: OpExpect::Ok,
@@ -1223,8 +1202,8 @@ fn test_type_widening_preview() {
         required_deps: &[],
         anti_deps: &[],
         prop_cases: &[
-            PropCase::Enabled(&["delta.enableTypeWidening=true"]),
-            PropCase::Disabled(&["delta.enableTypeWidening=false"]),
+            TablePropertyExpectation::Enabled(&["delta.enableTypeWidening=true"]),
+            TablePropertyExpectation::Disabled(&["delta.enableTypeWidening=false"]),
         ],
         // TODO: reject metadata presence when feature not in protocol
         expected_orphan: OpExpect::Ok,
