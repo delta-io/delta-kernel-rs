@@ -700,12 +700,7 @@ impl<S> Transaction<S> {
         let table_config = self.read_snapshot.table_configuration();
         let column_mapping_mode = table_config.column_mapping_mode();
 
-        let physical_schema =
-            if table_config.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
-                table_config.physical_schema()
-            } else {
-                table_config.physical_data_schema_without_partition_columns()
-            };
+        let physical_schema = table_config.physical_write_schema();
 
         // Get stats columns from table configuration
         let stats_columns = self.stats_columns();

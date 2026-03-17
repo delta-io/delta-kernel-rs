@@ -73,7 +73,7 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 ///
 /// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
 /// - `without_partition`: lazily computed variant that excludes partition columns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq)]
 struct PhysicalSchemas {
     full: SchemaRef,
     without_partition: OnceLock<SchemaRef>,
@@ -97,8 +97,6 @@ impl PartialEq for PhysicalSchemas {
         self.full == other.full
     }
 }
-
-impl Eq for PhysicalSchemas {}
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
@@ -412,6 +410,21 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
         self.physical_schemas.full.clone()
+    }
+
+    /// The physical schema for writing data files.
+    ///
+    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
+    /// (partition columns are materialized in data files). Otherwise, returns the physical
+    /// schema with partition columns excluded.
+    ///
+    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    pub(crate) fn physical_write_schema(&self) -> SchemaRef {
+        if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
+            self.physical_schema()
+        } else {
+            self.physical_data_schema_without_partition_columns()
+        }
     }
 
     /// The [`TableProperties`] of this table at this version.
