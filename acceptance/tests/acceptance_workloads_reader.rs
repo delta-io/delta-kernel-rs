@@ -318,8 +318,11 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
 fn unsupported_workload_reason(spec: &Spec) -> Option<&'static str> {
     match spec {
         Spec::Read(read_spec) => {
+            // TODO: Predicate support is implemented but type resolution is incomplete.
+            // The predicate parser produces Int64 literals which fail when compared against
+            // Int32 columns. Enable once type coercion is improved.
             if read_spec.predicate.is_some() {
-                return Some("Predicates not yet supported");
+                return Some("Predicates have incomplete type resolution");
             }
             match &read_spec.time_travel {
                 Some(TimeTravel::Timestamp { .. }) => {

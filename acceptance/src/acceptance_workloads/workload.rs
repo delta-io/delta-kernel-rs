@@ -10,6 +10,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
 use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
+use delta_kernel_benchmarks::predicate_parser::parse_predicate;
 use itertools::Itertools;
 use url::Url;
 
@@ -49,9 +50,13 @@ pub fn execute_read_workload(
         None => None,
     };
 
-    if let Some(_predicate_str) = &read_spec.predicate {
-        return Err(Error::generic("Workload predicates are not yet supported"));
-    }
+    // Parse predicate if present
+    let predicate = read_spec
+        .predicate
+        .as_deref()
+        .map(|p| parse_predicate(p).map(Arc::new))
+        .transpose()
+        .map_err(|e| Error::generic(format!("Failed to parse predicate: {e}")))?;
 
     // Build snapshot
     let mut builder = Snapshot::builder_for(table_root.clone());
@@ -62,8 +67,11 @@ pub fn execute_read_workload(
 
     let table_schema = snapshot.schema();
 
-    // Build scan with optional column projection
+    // Build scan with optional predicate and column projection
     let mut scan_builder = snapshot.scan_builder();
+    if let Some(pred) = predicate {
+        scan_builder = scan_builder.with_predicate(pred);
+    }
     if let Some(ref cols) = read_spec.columns {
         let projected_schema = table_schema.project(cols)?;
         scan_builder = scan_builder.with_schema(projected_schema);
