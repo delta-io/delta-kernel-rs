@@ -27,4 +27,4 @@ ffi/examples/visit-expression/build
 /kernel/target
 /target
 
-/benchmarks/data/workloads/
+/benchmarks/workloads/

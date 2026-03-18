@@ -1,36 +1,25 @@
 //! Utility functions for loading workload specifications
 
 use crate::models::{Spec, TableInfo, Workload};
-use flate2::read::GzDecoder;
-use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use tar::Archive;
 
 // Environment variable used to filter benchmarks by tag (e.g. `BENCH_TAGS=base,feature_x`).
 pub const BENCH_TAGS_ENV_VAR: &str = "BENCH_TAGS";
 
-// Workload extraction configuration
-const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads.tar.gz");
-const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads");
-const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads/.done");
+const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/workloads");
 const TABLE_INFO_FILE_NAME: &str = "tableInfo.json";
 const SPECS_DIR_NAME: &str = "specs";
 const BENCHMARKS_DIR_NAME: &str = "benchmarks";
 const DELTA_DIR_NAME: &str = "delta";
 
-/// Loads all workload specifications from `OUTPUT_FOLDER`, optionally filtered by `BENCH_TAGS`
+/// Loads all workload specifications from `OUTPUT_FOLDER`, optionally filtered by `BENCH_TAGS`.
 ///
-/// On first run, extracts from `WORKLOAD_TAR` if it exists.
-/// Uses a .done file to avoid re-extracting on subsequent runs
+/// Workloads are downloaded and extracted at build time by `build.rs`.
 ///
 /// If the `BENCH_TAGS` environment variable is set (e.g. `BENCH_TAGS=base`),
-/// only workloads whose `table_info.json` has at least one matching tag are returned
-/// If `BENCH_TAGS` is unset or empty, all workloads are returned
+/// only workloads whose `table_info.json` has at least one matching tag are returned.
+/// If `BENCH_TAGS` is unset or empty, all workloads are returned.
 pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
-    if !workload_specs_exist() {
-        extract_workload_specs()?;
-    }
-
     let spec_dir = PathBuf::from(OUTPUT_FOLDER);
     let benchmarks_dir = spec_dir.join(BENCHMARKS_DIR_NAME);
     let table_directories = find_table_directories(&benchmarks_dir)?;
@@ -52,57 +41,6 @@ fn get_required_tags() -> Option<Vec<String>> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
-}
-
-/// Checks if workload specs have already been extracted by looking for the .done file
-/// If the .done file exists, we don't need to extract the workload specs again
-///
-/// TODO(#1939): the usage of this function is a naive check;
-/// currently, the .done file must be manually deleted to force re-extraction of workload specs
-fn workload_specs_exist() -> bool {
-    Path::new(DONE_FILE).exists()
-}
-
-/// Extracts workload specs from `WORKLOAD_TAR` into `OUTPUT_FOLDER` and writes a .done file on success
-fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
-    let tar_path = Path::new(WORKLOAD_TAR);
-
-    if !tar_path.exists() {
-        return Err(format!("Workload tarball not found at {WORKLOAD_TAR}").into());
-    }
-
-    extract_tarball(tar_path)?;
-    write_done_file()?;
-
-    Ok(())
-}
-
-/// Extracts a tarball at `path` into `OUTPUT_FOLDER`
-/// This is used to extract `WORKLOAD_TAR` into `OUTPUT_FOLDER`
-fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let tarball = GzDecoder::new(BufReader::new(file));
-    let mut archive = Archive::new(tarball);
-
-    std::fs::create_dir_all(OUTPUT_FOLDER)
-        .map_err(|e| format!("Failed to create output directory: {e}"))?;
-
-    archive
-        .unpack(OUTPUT_FOLDER)
-        .map_err(|e| format!("Failed to unpack tarball: {e}"))?;
-
-    Ok(())
-}
-
-/// Writes `DONE_FILE` to mark that workload specs have been successfully extracted
-/// See TODO(#1939) for `workload_specs_exist` above; this file must be manually deleted to force re-extraction
-fn write_done_file() -> Result<(), Box<dyn std::error::Error>> {
-    let mut done_file = std::fs::File::create(DONE_FILE)
-        .map_err(|e| format!("Failed to create .done file: {e}"))?;
-
-    write!(done_file, "done").map_err(|e| format!("Failed to write .done file: {e}"))?;
-
-    Ok(())
 }
 
 /// Returns all subdirectories of `base_dir`. In practice this is called with `base_dir` = `OUTPUT_FOLDER`/`BENCHMARKS_DIR_NAME`,
