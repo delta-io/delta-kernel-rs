@@ -9,8 +9,8 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 use ureq::{Agent, Proxy};
 
-const VERSION: &str = "0.04-preview";
-const WORKLOADS_VERSION: &str = "0.0.4";
+const VERSION: &str = "0.04-preview"; // release tag
+const WORKLOADS_VERSION: &str = "0.0.4"; // version in filename
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
