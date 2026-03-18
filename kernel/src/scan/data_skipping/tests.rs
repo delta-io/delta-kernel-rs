@@ -337,10 +337,13 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
-    // NULL inside AND allows static skipping under SQL semantics
+    // NULL literal is treated as unknown (not false) under eval_sql_where, so it does not
+    // force static skipping on its own. With present-but-all-null stats, the comparison arm
+    // still evaluates to false (null-safe check fails), so AND(unknown, false) = false.
+    // With missing stats, both arms are unknown, so AND(unknown, unknown) = unknown.
     let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
-    do_test(ALL_NULL, pred, MISSING, None, Some(false));
+    do_test(ALL_NULL, pred, MISSING, None, None);
 
     // Comparison inside AND inside AND works
     let pred = &Pred::and(TRUE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));

@@ -7,9 +7,8 @@ use std::ops::Deref as _;
 use tracing::debug;
 
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
-};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use crate::transforms::SchemaTransform;
 use crate::DeltaResult;
 
 /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values

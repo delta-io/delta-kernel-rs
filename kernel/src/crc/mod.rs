@@ -106,7 +106,9 @@ pub struct Crc {
     pub txn_id: Option<String>,
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub in_commit_timestamp_opt: Option<i64>,
-    /// Live transaction identifier ([`SetTransaction`]) actions at this version.
+    /// Live transaction identifier ([`SetTransaction`]) actions at this version. `None` = not
+    /// tracked (field absent in CRC JSON or not computed). `Some(empty_map)` = tracked, no
+    /// active set transactions. `apply()` skips updates when `None`.
     ///
     /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
     /// a Vec, which is converted via custom serde deserialization.
@@ -115,7 +117,7 @@ pub struct Crc {
         deserialize_with = "de_opt_vec_to_opt_map",
         serialize_with = "ser_opt_map_to_opt_vec"
     )]
-    pub(crate) set_transactions: Option<HashMap<String, SetTransaction>>,
+    pub set_transactions: Option<HashMap<String, SetTransaction>>,
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored. `None` = not tracked (field absent in CRC JSON or not
     /// computed). `Some(empty_map)` = tracked, no active domain metadata. `apply()` skips

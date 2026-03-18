@@ -965,6 +965,7 @@ impl<S> Transaction<S> {
             metadata: is_create
                 .then(|| self.read_snapshot.table_configuration().metadata().clone()),
             domain_metadata_changes: dm_changes,
+            set_transaction_changes: self.set_transactions.clone(),
             in_commit_timestamp,
             operation: self.operation.clone(),
             has_missing_file_size: false, // writes always have sizes

@@ -33,7 +33,7 @@ fn workload_benchmarks(c: &mut Criterion) {
     };
 
     let engine = setup_engine();
-    let mut group = c.benchmark_group("workload_benchmarks");
+    let mut group = c.benchmark_group("workloadBenchmarks");
 
     for workload in &workloads {
         match &workload.spec {
@@ -80,9 +80,9 @@ fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
     // Choose which benchmark configurations to run for a given table
     // TODO: This function will take in table info to choose the appropriate configs for a given table
     let mut configs = default_read_configs();
-    if table_name.contains("v2_checkpoint") {
+    if table_name.contains("V2Checkpoint") {
         configs.push(ReadConfig {
-            name: "parallel_2".into(),
+            name: "parallel2".into(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
         });
     }

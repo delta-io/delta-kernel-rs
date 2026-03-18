@@ -16,7 +16,6 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
@@ -27,10 +26,11 @@ use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
+use crate::transforms::{ExpressionTransform, SchemaTransform};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -808,6 +808,10 @@ impl Scan {
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    ///
+    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
+    /// bare unsupported expression (e.g. Timestamp GT). Junctions with unsupported arms replace
+    /// them with TRUE to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;

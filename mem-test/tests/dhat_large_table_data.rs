@@ -11,11 +11,11 @@ use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::Snapshot;
 
-use delta_kernel::object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
