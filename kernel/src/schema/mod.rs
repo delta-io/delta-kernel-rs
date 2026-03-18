@@ -857,7 +857,7 @@ impl StructType {
     #[internal_api]
     pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
-        let _ = get_leaves.transform_struct(self);
+        get_leaves.transform_struct(self);
         (get_leaves.names, get_leaves.types).into()
     }
 
@@ -1838,7 +1838,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     fn transform_struct_field(&mut self, field: &StructField) -> Option<Cow<'a, StructField>> {
         self.path.push(field.name.clone());
         if let DataType::Struct(_) = field.data_type {
-            let _ = self.recurse_into_struct_field(field);
+            self.recurse_into_struct_field(field);
         } else {
             self.names.push(ColumnName::new(&self.path));
             self.types.push(field.data_type.clone());

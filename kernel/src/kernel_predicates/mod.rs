@@ -326,6 +326,10 @@ pub trait KernelPredicateEvaluator {
 
     /// Evaluates a (possibly inverted) predicate with SQL WHERE semantics.
     ///
+    /// NOTE: A NULL literal in a boolean position is treated as unknown (not false), because
+    /// callers like `build_actions_meta_predicate` use NULL as a sentinel for unsupported arms.
+    /// Treating it as false would let `AND(supported, NULL)` incorrectly prune files.
+    ///
     /// By default, [`Self::eval_pred`] behaves badly for comparisons involving NULL columns
     /// (e.g. `a < 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but
     /// NULL values are interpreted as "stats missing" (= cannot skip). This ambiguity can "poison"
@@ -455,10 +459,6 @@ pub trait KernelPredicateEvaluator {
                 ]
                 .into_iter();
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
-            }
-            BooleanExpression(Expr::Literal(val)) if val.is_null() => {
-                // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
-                self.eval_pred_scalar(&Scalar::from(false), false)
             }
             BooleanExpression(Expr::Predicate(pred)) => self.eval_pred_sql_where(pred, inverted),
             // Process all remaining predicates normally, because they are not proven safe. Indeed,
