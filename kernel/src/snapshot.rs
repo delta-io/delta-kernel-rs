@@ -113,7 +113,9 @@ impl Snapshot {
     /// 4. a. if a newer or newly discovered checkpoint is found while refreshing to the latest
     ///    version, create a new snapshot from that checkpoint (and commits after it), even if the
     ///    table version itself did not advance
-    ///    b. if no new checkpoint is found: do lightweight P+M replay on the latest commits (after
+    ///    b. if no new checkpoint is found and the table version did not advance, return the
+    ///       existing snapshot
+    ///    c. if no new checkpoint is found: do lightweight P+M replay on the latest commits (after
     ///    ensuring we only retain commits > any checkpoints)
     ///
     /// # Parameters
@@ -2321,14 +2323,14 @@ mod tests {
 
         setup_test_table_with_commits(url.as_str(), &store, 2).await?;
 
-        let snapshot_v1 = Snapshot::builder_for(url.clone())
+        let snapshot_v1 = Snapshot::builder_for(url.as_str())
             .at_version(1)
             .build(&engine)?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
         snapshot_v1.clone().checkpoint(&engine)?;
 
-        let fresh = Snapshot::builder_for(url.clone()).build(&engine)?;
+        let fresh = Snapshot::builder_for(url.as_str()).build(&engine)?;
         assert_eq!(fresh.version(), 1);
         assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
 
