@@ -19,8 +19,8 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
+pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
+use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
@@ -29,6 +29,7 @@ use crate::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
+use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
@@ -39,6 +40,7 @@ use tracing::warn;
 /// Wrapped in a struct so it can be extended with a logical-name variant if needed.
 #[allow(unused)]
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) struct ExpectedStatsSchemas {
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,
@@ -580,7 +582,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.logical_schema.as_ref())
+            && schema_has_invariants(self.logical_schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",

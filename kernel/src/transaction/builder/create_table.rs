@@ -17,8 +17,8 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
-use crate::schema::variant_utils::UsesVariant;
-use crate::schema::{SchemaRef, SchemaTransform};
+use crate::schema::variant_utils::schema_contains_variant_type;
+use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -48,6 +48,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::ColumnMapping,
     // InCommitTimestamp enables in-commit timestamps (writer-only)
     TableFeature::InCommitTimestamp,
+    // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
+    TableFeature::VacuumProtocolCheck,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -249,13 +251,10 @@ fn maybe_enable_clustering(
     }
 }
 
-/// Conditionally adds the `variantType` feature to the protocol when the schema contains
-/// Variant columns. Uses the [`UsesVariant`] schema visitor to detect Variant data types
-/// anywhere in the schema tree (top-level, nested structs, arrays, maps).
+/// Conditionally adds the `variantType` feature to the protocol when the schema contains Variant
+/// columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
 fn maybe_enable_variant_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
-    let mut visitor = UsesVariant::default();
-    let _ = visitor.transform_struct(schema);
-    if visitor.found() {
+    if schema_contains_variant_type(schema) {
         add_feature_to_lists(
             TableFeature::VariantType,
             &mut validated.reader_features,
@@ -1016,6 +1015,31 @@ mod tests {
         assert!(
             validated.reader_features.is_empty(),
             "InCommitTimestamp is writer-only, reader_features should always be empty"
+        );
+    }
+
+    #[test]
+    fn test_vacuum_protocol_check_feature_signal() {
+        let properties = HashMap::from([(
+            "delta.feature.vacuumProtocolCheck".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert!(
+            validated.properties.is_empty(),
+            "Feature signal should be removed from properties"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VacuumProtocolCheck),
+            "VacuumProtocolCheck should be in writer_features"
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::VacuumProtocolCheck),
+            "VacuumProtocolCheck should be in reader_features (ReaderWriter feature)"
         );
     }
 }

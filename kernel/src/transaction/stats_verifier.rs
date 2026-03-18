@@ -16,8 +16,9 @@ use crate::DeltaResult;
 
 /// Verifies that add file statistics contain required columns.
 ///
-/// For each required column, validates that `nullCount`, `minValues`, and `maxValues`
-/// entries are present (non-null) in every add file's statistics.
+/// For each required column, validates that `nullCount` is present (non-null) and that
+/// `minValues` and `maxValues` are present unless the column is all-null
+/// (`nullCount == numRecords`).
 pub(crate) struct StatsVerifier {
     required_columns: Vec<(ColumnName, DataType)>,
 }
@@ -618,13 +619,10 @@ mod tests {
         verifier.verify(&[engine_data]).unwrap();
     }
 
-    /// Round-trip test: collect_stats produces stats that pass verification, including for
-    /// all-null columns where min/max should be null but the column field must still exist.
-    #[rstest]
-    #[case::non_null_values(Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef)]
-    #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
-    #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
-    fn test_collected_stats_pass_verification(#[case] values: ArrayRef) {
+    /// Round-trip test: collect_stats produces stats that pass verification for non-null data.
+    #[test]
+    fn test_collected_stats_pass_verification() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)]));
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "col",
             values.data_type().clone(),
@@ -652,5 +650,41 @@ mod tests {
 
         let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
         verifier.verify(&[engine_data]).unwrap();
+    }
+
+    /// Verify collect_stats produces correct stats shape for all-null and empty batches.
+    /// These cases omit the column from minValues/maxValues entirely.
+    #[rstest]
+    #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
+    #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
+    fn test_collected_stats_shape_for_all_null_and_empty(#[case] values: ArrayRef) {
+        let num_rows = values.len();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "col",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
+
+        // numRecords should match row count
+        let num_records = stats
+            .column_by_name("numRecords")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(num_records.value(0), num_rows as i64);
+
+        // All-null/empty columns are omitted from minValues/maxValues
+        assert!(
+            stats.column_by_name("minValues").is_none(),
+            "minValues should be absent when all stats columns are all-null"
+        );
+        assert!(
+            stats.column_by_name("maxValues").is_none(),
+            "maxValues should be absent when all stats columns are all-null"
+        );
     }
 }

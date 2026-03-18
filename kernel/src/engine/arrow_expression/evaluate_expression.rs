@@ -547,9 +547,7 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
                 struct_array.fields().iter().cloned().collect_vec(),
                 true,
             ));
-            let options = EncoderOptions::default()
-                .with_struct_mode(StructMode::ObjectOnly)
-                .with_explicit_nulls(true);
+            let options = EncoderOptions::default().with_struct_mode(StructMode::ObjectOnly);
             let mut encoder = make_encoder(&field, struct_array, &options)?;
 
             // Pre-allocate the various buffers

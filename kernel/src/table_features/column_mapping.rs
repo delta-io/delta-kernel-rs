@@ -7,10 +7,11 @@ use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, Schema,
-    SchemaTransform, StructField, StructType,
+    StructField, StructType,
 };
 
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
+use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;

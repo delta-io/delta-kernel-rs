@@ -34,6 +34,10 @@ cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
+# Workspace no-default-features lint for crates that depend on kernel's Arrow APIs
+cargo clippy --workspace --no-default-features --features arrow \
+  --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+
 # Quick pre-push check (mimics CI)
 cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
@@ -62,11 +66,12 @@ cargo fmt \
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
   but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
+- `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only
+- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
 
 ## Architecture at a Glance
 
@@ -81,8 +86,9 @@ version. From it you build a `Scan` (reads) or `Transaction` (writes).
 assembles commit actions, enforces protocol compliance, delegates atomic commit to a
 `Committer`.
 
-**Engine trait:** four handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
-`EvaluationHandler`). `DefaultEngine` lives in `kernel/src/engine/default/`.
+**Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
+`EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
+`kernel/src/engine/default/`.
 
 **EngineData:** opaque columnar data interface. IMPORTANT: never access `EngineData` columns
 directly -- always use the visitor pattern (`visit_rows` with typed `GetData` accessors).
@@ -107,6 +113,17 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   independent and form a cartesian product, prefer `#[values]` over enumerating
   every combination with `#[case]`.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
+  resolves it to an absolute object-store path. The `table_root` must be a proper URL string
+  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the
+  `Url` type directly -- most test helpers and kernel APIs accept `impl AsRef<str>`, so pass
+  URL strings instead. When using local storage, use an un-prefixed store
+  (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
+  `LocalFileSystem::new_with_prefix()` with `add_commit` -- the prefix causes double-nesting
+  because `add_commit` already resolves the full path from the URL. For in-memory tests, use
+  `InMemory::new()` with `"memory:///"`. Always use the same `table_root` URL string for
+  both `add_commit` (writing log files) and `snapshot`/`Snapshot::try_new` (reading the
+  table). Always include a trailing slash in directory URLs to ensure correct path joining.
 
 ## Protocol TLDR
 
@@ -147,6 +164,8 @@ Keep this list updated when new protocol features are added to kernel.
 - **Column mapping:** Physical column names can differ from logical names. Always use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
+- **Transforms:** Generic recursive schema and expression transform traits and helpers
+  are in `kernel/src/transforms/`.
 
 ## Code Style / Documentation
 
