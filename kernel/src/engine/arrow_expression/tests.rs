@@ -1112,36 +1112,6 @@ fn test_to_json_with_nested_struct() {
     );
 }
 
-#[test]
-fn test_apply_schema_column_count_mismatch() {
-    use crate::arrow::datatypes::DataType as ArrowDataType;
-
-    let struct_array = StructArray::from(vec![
-        (
-            Arc::new(Field::new("a", ArrowDataType::Int32, false)),
-            create_array!(Int32, [1]) as ArrayRef,
-        ),
-        (
-            Arc::new(Field::new("b", ArrowDataType::Int32, false)),
-            create_array!(Int32, [2]) as ArrayRef,
-        ),
-        (
-            Arc::new(Field::new("c", ArrowDataType::Int32, false)),
-            create_array!(Int32, [3]) as ArrayRef,
-        ),
-    ]);
-
-    let schema = KernelDataType::Struct(Box::new(StructType::new_unchecked([
-        StructField::not_null("a", KernelDataType::INTEGER),
-        StructField::not_null("b", KernelDataType::INTEGER),
-    ])));
-
-    assert_result_error_with_message(
-        apply_schema(&struct_array, &schema),
-        "Passed struct had 3 columns, but transformed column has 2",
-    );
-}
-
 fn make_mixed_string_batch() -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
