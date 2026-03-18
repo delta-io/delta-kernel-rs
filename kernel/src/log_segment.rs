@@ -297,20 +297,38 @@ impl LogSegment {
             .as_ref()
             .and_then(|hint| hint.checkpoint_schema.clone());
 
-        let listed_files = match (checkpoint_hint, time_travel_version) {
-            (Some(cp), None) => {
-                LogSegmentFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
-            }
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                LogSegmentFiles::list_with_checkpoint_hint(
-                    &cp,
-                    storage,
-                    &log_root,
-                    log_tail,
-                    Some(end_version),
-                )?
-            }
-            _ => LogSegmentFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
+        // The end_version is the time_travel_version, if present
+        // TODO: When max catalog version is implemented, we would use that as end_version if time_travel_version is not present
+        let end_version = time_travel_version;
+
+        // Keep the hint only if it doesn't point past end_version
+        // If there is no end_version bound, any hint is acceptable
+        let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
+
+        // Cases:
+        //
+        // 1. usable_hint present, end_version is Some  --> list_with_checkpoint_hint from hint.version TO end_version
+        // 2. usable_hint present, end_version is None  --> list_with_checkpoint_hint from hint.version unbounded
+        // 3. no usable_hint,      end_version is Some  --> backward-scan for checkpoint before end_version,
+        //                                                  list from that checkpoint TO end_version
+        //                                                  (falls back to v0 if no checkpoint found)
+        // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
+
+        let listed_files = match (usable_hint, end_version) {
+            // Cases 1 and 2
+            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
+                &cp,
+                storage,
+                &log_root,
+                log_tail,
+                end_version,
+            )?,
+            // Case 3
+            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
+                storage, &log_root, log_tail, end,
+            )?,
+            // Case 4
+            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
         LogSegment::try_new(

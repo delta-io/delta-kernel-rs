@@ -829,6 +829,62 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     assert_eq!(log_segment.listed.ascending_commit_files[0].version, 4);
 }
 
+#[rstest::rstest]
+#[case::no_hint(None)]
+#[case::stale_hint(Some(LastCheckpointHint {
+    version: 10, // stale: 10 > end_version 5, so it is discarded
+    size: 10,
+    parts: None,
+    size_in_bytes: None,
+    num_of_add_files: None,
+    checkpoint_schema: None,
+    checksum: None,
+    tags: None,
+}))]
+#[tokio::test]
+async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
+    #[case] hint: Option<LastCheckpointHint>,
+) {
+    let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 0);
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+        ],
+        None,
+    )
+    .await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 5);
+    assert_eq!(commit_files.len(), 0);
+}
+
 #[tokio::test]
 async fn build_table_changes_with_commit_versions() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
