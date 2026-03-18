@@ -1,5 +1,5 @@
-use unitycatalog_client_api::Operation;
 use unitycatalog_client_api::CommitsRequest;
+use unitycatalog_client_api::Operation;
 
 #[test]
 fn test_commits_request_builder() {

@@ -20,14 +20,14 @@
 //! ```
 
 pub mod commits_client;
+pub mod credentials;
 pub mod error;
 pub mod models;
-pub mod credentials;
 
 pub use commits_client::{UCCommitClient, UCGetCommitsClient};
+pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 pub use error::{Error, Result};
 pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
-pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use commits_client::{InMemoryCommitsClient, TableData};

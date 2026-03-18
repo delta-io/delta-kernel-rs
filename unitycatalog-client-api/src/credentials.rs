@@ -50,4 +50,3 @@ pub struct AwsTempCredentials {
     pub secret_access_key: String,
     pub session_token: String,
 }
-

@@ -41,7 +41,7 @@ pub use commits_client::{InMemoryCommitsClient, TableData};
 pub mod prelude {
     pub use crate::client::UCClient;
     pub use crate::commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
-    pub use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
     pub use crate::models::tables::TablesResponse;
     pub use crate::models::{Commit, CommitsRequest, CommitsResponse};
+    pub use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
 }
