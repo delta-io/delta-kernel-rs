@@ -218,6 +218,9 @@ pub struct TableProperties {
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
+
+    // hack for Java FFM's table_properties
+    pub original_table_properties: HashMap<String, String>,
 }
 
 impl TableProperties {
@@ -428,6 +431,7 @@ mod tests {
         let unknown_properties = HashMap::from([(APPEND_ONLY.to_string(), "wack".to_string())]);
         let expected = TableProperties {
             unknown_properties,
+            original_table_properties: properties,
             ..Default::default()
         };
         assert_eq!(table_properties, expected);
@@ -435,10 +439,12 @@ mod tests {
 
     #[test]
     fn allow_unknown_keys() {
-        let properties = [("unknown_properties".to_string(), "two words".to_string())];
+        let properties =
+            HashMap::from([("unknown_properties".to_string(), "two words".to_string())]);
         let actual = TableProperties::from(properties.clone().into_iter());
         let expected = TableProperties {
-            unknown_properties: HashMap::from(properties),
+            unknown_properties: properties.clone(),
+            original_table_properties: properties,
             ..Default::default()
         };
         assert_eq!(actual, expected);
@@ -490,6 +496,10 @@ mod tests {
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
         ];
+        let expected_original_table_properties = properties
+            .iter()
+            .map(|(x, y)| (x.to_string(), y.to_string()))
+            .collect::<HashMap<_, _>>();
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
             append_only: Some(true),
@@ -526,6 +536,7 @@ mod tests {
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
             unknown_properties: HashMap::new(),
+            original_table_properties: expected_original_table_properties,
         };
         assert_eq!(actual, expected);
     }
