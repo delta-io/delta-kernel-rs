@@ -46,8 +46,7 @@ impl FromStr for DeletionVectorStorageType {
             "i" => Ok(Self::Inline),
             "p" => Ok(Self::PersistedAbsolute),
             _ => Err(Error::internal_error(format!(
-                "Unsupported deletion vector format option: {}",
-                s
+                "Unsupported deletion vector format option: {s}"
             ))),
         }
     }

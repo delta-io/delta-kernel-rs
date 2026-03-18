@@ -56,8 +56,7 @@ impl<S> Transaction<S> {
             // Check for duplicates
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
+                    "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
         }
@@ -76,8 +75,7 @@ impl<S> Transaction<S> {
             // Check for duplicates (spans both system and user domains)
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
+                    "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
         }
@@ -103,8 +101,7 @@ impl<S> Transaction<S> {
             // Check for duplicates
             if !seen_domains.insert(domain.as_str()) {
                 return Err(Error::generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    domain
+                    "Metadata for domain {domain} already specified in this transaction"
                 )));
             }
         }
@@ -126,8 +123,7 @@ impl<S> Transaction<S> {
             "delta.clustering" => Some(TableFeature::ClusteredTable),
             _ => {
                 return Err(Error::generic(format!(
-                    "Unknown system domain '{}'. Only known system domains are allowed.",
-                    domain
+                    "Unknown system domain '{domain}'. Only known system domains are allowed."
                 )));
             }
         };
@@ -136,8 +132,7 @@ impl<S> Transaction<S> {
         if let Some(feature) = required_feature {
             if !table_config.is_feature_supported(&feature) {
                 return Err(Error::generic(format!(
-                    "System domain '{}' requires the '{}' feature to be enabled",
-                    domain, feature
+                    "System domain '{domain}' requires the '{feature}' feature to be enabled"
                 )));
             }
         }
@@ -168,8 +163,7 @@ impl<S> Transaction<S> {
             .collect();
         let existing_domains = self
             .read_snapshot
-            .log_segment()
-            .scan_domain_metadatas(Some(&domains), engine)?;
+            .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
         Ok(self
@@ -186,6 +180,12 @@ impl<S> Transaction<S> {
 
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     ///
+    /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
+    /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
+    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta),
+    ///   which feeds the post-commit snapshot with the domain metadata written in this transaction
+    ///   and powers CRC file writes.
+    ///
     /// This function may perform an expensive log replay operation if there are any domain removals.
     /// The log replay is required to fetch the previous configuration value for the domain to preserve
     /// in removal tombstones as mandated by the Delta spec.
@@ -193,7 +193,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<EngineDataResultIterator<'a>> {
+    ) -> DeltaResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
         let is_create = self.is_create_table();
 
         // Validate domain operations (includes feature validation)
@@ -220,16 +220,24 @@ impl<S> Transaction<S> {
             .transpose()?
             .into_iter();
 
-        // Chain all domain actions and convert to EngineData
-        // System domains first, then row tracking, then user domains, then removals
-        Ok(Box::new(
-            self.system_domain_metadata_additions
-                .clone()
-                .into_iter()
-                .chain(row_tracking_domain_action)
-                .chain(self.user_domain_metadata_additions.clone())
-                .chain(removal_actions)
-                .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)),
-        ))
+        // Chain all domain actions: system domains, row tracking, user domains, removals
+        let dm_actions_vec: Vec<DomainMetadata> = self
+            .system_domain_metadata_additions
+            .iter()
+            .cloned()
+            .chain(row_tracking_domain_action)
+            .chain(self.user_domain_metadata_additions.iter().cloned())
+            .chain(removal_actions)
+            .collect();
+
+        let schema = get_log_domain_metadata_schema().clone();
+
+        let dm_actions_iter: Vec<_> = dm_actions_vec
+            .iter()
+            .cloned()
+            .map(|dm| dm.into_engine_data(schema.clone(), engine))
+            .collect();
+
+        Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))
     }
 }

@@ -543,8 +543,7 @@ fn create_variant_data_type(
         state.elements.take(struct_type_id).map(|f| f.data_type)
     else {
         return Err(Error::generic(format!(
-            "Invalid variant struct ID {} - must be DataType::Struct",
-            struct_type_id
+            "Invalid variant struct ID {struct_type_id} - must be DataType::Struct"
         )));
     };
     Ok(DataType::Variant(variant_struct))

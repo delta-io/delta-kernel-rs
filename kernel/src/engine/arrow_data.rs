@@ -248,8 +248,7 @@ impl EngineData for ArrowEngineData {
                 Some(ColumnState::HasGetter(getter)) => getters.push(*getter),
                 _ => {
                     return Err(Error::MissingColumn(format!(
-                        "Column {} not found in the data",
-                        column
+                        "Column {column} not found in the data"
                     )));
                 }
             }

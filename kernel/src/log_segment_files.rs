@@ -477,7 +477,7 @@ mod list_log_files_with_log_tail_tests {
                     format!("_delta_log/{version:020}.{hi:020}.compacted.json")
                 }
                 LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
-                    panic!("Unsupported file type in test: {:?}", file_type)
+                    panic!("Unsupported file type in test: {file_type:?}")
                 }
             };
             let data = match source {
