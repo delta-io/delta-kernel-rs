@@ -230,13 +230,12 @@ impl Snapshot {
             return Err(Error::Generic(format!(
                 "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
         }
-        if new_end_version == old_version {
-            // No new commits, just return the same snapshot
-            return Ok(existing_snapshot.clone());
-        }
-
         if new_log_segment.checkpoint_version.is_some() {
-            // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
+            // We have a checkpoint in the new LogSegment, just construct a new snapshot from that.
+            // This must be checked before the version equality check below, because a sole writer
+            // can write a checkpoint at the current version. In that case, new_end_version ==
+            // old_version, but we still need to rebase onto the new checkpoint to trim the
+            // accumulated commit files in the LogSegment.
             let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
@@ -244,6 +243,11 @@ impl Snapshot {
                 operation_id,
             );
             return Ok(Arc::new(snapshot?));
+        }
+
+        if new_end_version == old_version {
+            // No new commits and no new checkpoint, just return the same snapshot
+            return Ok(existing_snapshot.clone());
         }
 
         // after this point, we incrementally update the snapshot with the new log segment.
@@ -2436,6 +2440,115 @@ mod tests {
             })
             .collect();
         assert_eq!(versions_and_his, vec![(1, 2), (2, 2)]);
+
+        Ok(())
+    }
+
+    /// Helper: write a minimal checkpoint parquet file at the given version. The checkpoint
+    /// contains the protocol, metadata, and add actions needed for a valid table state.
+    async fn write_checkpoint(
+        store: &InMemory,
+        engine: &dyn Engine,
+        version: u64,
+    ) -> DeltaResult<()> {
+        let checkpoint_actions = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+            json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
+        ];
+        let json_strings: StringArray = checkpoint_actions
+            .into_iter()
+            .map(|json| json.to_string())
+            .collect::<Vec<_>>()
+            .into();
+        let parsed = engine
+            .json_handler()
+            .parse_json(
+                string_array_to_engine_data(json_strings),
+                crate::actions::get_commit_schema().clone(),
+            )
+            .unwrap();
+        let checkpoint = ArrowEngineData::try_from_engine_data(parsed).unwrap();
+        let checkpoint: RecordBatch = checkpoint.into();
+
+        let mut buffer = vec![];
+        let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
+        writer.write(&checkpoint)?;
+        writer.close()?;
+
+        store
+            .put(
+                &delta_path_for_version(version, "checkpoint.parquet"),
+                buffer.into(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// When a sole writer commits version N, caches the snapshot, then writes a checkpoint,
+    /// the next call to `builder_from(snapshot_at_N).build()` should rebase onto the new
+    /// checkpoint even though the version hasn't changed. Before the fix, the version equality
+    /// check short-circuited before the checkpoint rebase check, causing commit files to
+    /// accumulate unboundedly.
+    #[tokio::test]
+    async fn test_builder_from_rebases_onto_checkpoint_at_same_version() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create a table with commits 0 through 5 (no checkpoint)
+        setup_test_table_with_commits(table_root, &store, 6).await?;
+
+        // Build a snapshot at version 5. This accumulates all commit files.
+        let snapshot_v5 = Snapshot::builder_for(table_root)
+            .at_version(5)
+            .build(&engine)?;
+        assert_eq!(snapshot_v5.version(), 5);
+        assert!(snapshot_v5.log_segment().checkpoint_version.is_none());
+        let num_commits_before = snapshot_v5
+            .log_segment()
+            .listed
+            .ascending_commit_files
+            .len();
+        assert!(num_commits_before > 0, "should have accumulated commit files");
+
+        // Write a checkpoint at version 4 (not the latest). This validates that the rebase
+        // picks up the checkpoint AND preserves the commit file for version 5 on top of it.
+        write_checkpoint(&store, &engine, 4).await?;
+
+        // Rebuild from the existing snapshot. Version is still 5, but a checkpoint now exists.
+        let rebased = Snapshot::builder_from(snapshot_v5).build(&engine)?;
+
+        assert_eq!(rebased.version(), 5);
+        assert_eq!(rebased.log_segment().checkpoint_version, Some(4));
+        // Only commit 5 should remain (on top of the checkpoint at 4), trimming commits 0-4.
+        assert_eq!(
+            rebased
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .len(),
+            1,
+            "only the commit after the checkpoint should remain"
+        );
+        assert!(
+            rebased
+                .log_segment()
+                .listed
+                .ascending_commit_files
+                .len()
+                < num_commits_before,
+            "commit files should be trimmed after rebasing onto the checkpoint"
+        );
 
         Ok(())
     }
