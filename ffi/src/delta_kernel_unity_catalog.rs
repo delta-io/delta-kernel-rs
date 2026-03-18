@@ -15,7 +15,7 @@ use delta_kernel_ffi::{
     handle::Handle, kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
-use uc_catalog::UCCommitter;
+use delta_kernel_unity_catalog::UCCommitter;
 
 use unitycatalog_client_api::{CommitRequest as ClientCommitRequest, UCCommitClient};
 

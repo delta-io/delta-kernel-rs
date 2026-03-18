@@ -1,11 +1,11 @@
-# uc-client
+# unitycatalog-client-rest-impl
 
 An experimental/under-construction rust client for Unity Catalog. This crate is not intended for
 production use.
 
 ## Example CLI
 This crate provides a command-line interface (CLI) to interact with Unity Catalog APIs, see
-`uc-client/examples/uc-cli.rs`.
+`unitycatalog-client-rest-impl/examples/uc-cli.rs`.
 
 ```bash
 # set environment variables for UC url/token

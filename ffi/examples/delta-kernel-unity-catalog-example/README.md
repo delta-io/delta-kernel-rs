@@ -1,7 +1,7 @@
 uc catalog example
 ==========
 
-Simple example to show how to use the uc-catalog ffi features
+Simple example to show how to use the delta-kernel-unity-catalog ffi features
 
 # Building
 

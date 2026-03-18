@@ -23,6 +23,6 @@ endif()
 
 # Testing
 include(CTest)
-set(ExprTestRunner "../../../tests/test-uc-catalog-ffi/run_test.sh")
-set(ExprExpectedPath "../../../tests/test-uc-catalog-ffi/expected.txt")
+set(ExprTestRunner "../../../tests/test-delta-kernel-unity-catalog-ffi/run_test.sh")
+set(ExprExpectedPath "../../../tests/test-delta-kernel-unity-catalog-ffi/expected.txt")
 add_test(NAME test_uc_catalog_ffi COMMAND ${ExprTestRunner} ${ExprExpectedPath})

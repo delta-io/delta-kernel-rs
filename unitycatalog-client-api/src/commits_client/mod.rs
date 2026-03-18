@@ -11,8 +11,9 @@ pub use in_memory::{InMemoryCommitsClient, TableData};
 ///
 /// Implementations of this trait are responsible for performing any necessary
 /// retries on transient failures. This trait is designed to be injected into a
-/// `UCCommitter` (in `uc-catalog`), which itself does not perform any retries and relies
-/// on the underlying client implementation to handle retry logic.
+/// `UCCommitter` (in `delta-kernel-unity-catalog`), which itself does not
+/// perform any retries and relies on the underlying client implementation to
+/// handle retry logic.
 #[allow(async_fn_in_trait)]
 pub trait UCCommitClient: Send + Sync {
     /// Commit a new version to the table.

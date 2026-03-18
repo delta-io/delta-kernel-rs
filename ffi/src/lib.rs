@@ -54,8 +54,8 @@ pub mod log_path;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
-#[cfg(feature = "uc-catalog")]
-pub mod uc_catalog;
+#[cfg(feature = "delta-kernel-unity-catalog")]
+pub mod delta_kernel_unity_catalog;
 
 #[cfg(test)]
 mod ffi_test_utils;
