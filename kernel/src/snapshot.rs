@@ -652,14 +652,10 @@ impl Snapshot {
             .get_or_load_if_at_version(engine, self.version())
         {
             if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map.get(application_id).and_then(|txn| {
-                    // Apply retention filter: if both expiration_timestamp and last_updated
-                    // are present and last_updated <= expiration, the txn is expired.
-                    match (expiration_timestamp, txn.last_updated) {
-                        (Some(exp_ts), Some(last_updated)) if last_updated <= exp_ts => None,
-                        _ => Some(txn.version),
-                    }
-                }));
+                return Ok(txn_map
+                    .get(application_id)
+                    .filter(|txn| !txn.is_expired(expiration_timestamp))
+                    .map(|txn| txn.version));
             }
         }
 

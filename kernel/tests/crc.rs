@@ -635,7 +635,6 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
 
 // ============================================================================
 // Set transaction CRC tracking
-// TODO(#2141): Add tests for testing set txn expiration
 // ============================================================================
 
 /// Comprehensive test for set transaction CRC tracking: verifies that set transactions are
@@ -751,6 +750,135 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
             .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Set transaction CRC expiration
+// ============================================================================
+
+/// Helper to write raw commit files and a CRC file for testing set transaction expiration via
+/// the CRC fast path.
+///
+/// Writes v0 (protocol + metadata with optional retention) and v1 (txn for "my-app" with
+/// `lastUpdated` set to `now`), plus a v1 CRC file. Returns the snapshot loaded from disk.
+async fn create_table_with_txn_retention_and_crc(
+    table_path: &str,
+    engine: &dyn Engine,
+    retention: Option<&str>,
+) -> DeltaResult<Arc<Snapshot>> {
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStore;
+    use test_utils::add_commit;
+
+    let store = Arc::new(LocalFileSystem::new());
+
+    let config = match retention {
+        Some(r) => format!(r#""delta.setTransactionRetentionDuration":"{}""#, r),
+        None => String::new(),
+    };
+    let metadata_json = format!(
+        r#"{{"id":"test-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[{{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{{}}}}]}}","partitionColumns":[],"createdTime":0,"configuration":{{{config}}}}}"#,
+    );
+    let protocol_json = r#"{"minReaderVersion":1,"minWriterVersion":2}"#;
+    let v0 = format!(
+        r#"{{"protocol":{protocol_json}}}
+{{"metaData":{metadata_json}}}"#,
+    );
+    add_commit(table_path, store.as_ref(), 0, v0).await.unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let txn_json = format!(r#"{{"appId":"my-app","version":1,"lastUpdated":{now_ms}}}"#,);
+    let v1 = format!(r#"{{"txn":{txn_json}}}"#);
+    add_commit(table_path, store.as_ref(), 1, v1).await.unwrap();
+
+    // Write a CRC file at v1 so the snapshot's CRC fast path kicks in
+    let crc_json = format!(
+        r#"{{"tableSizeBytes":0,"numFiles":0,"numMetadata":1,"numProtocol":1,"metadata":{metadata_json},"protocol":{protocol_json},"setTransactions":[{txn_json}]}}"#,
+    );
+    let crc_path = std::path::Path::new(table_path)
+        .join("_delta_log")
+        .join("00000000000000000001.crc");
+    let crc_path = Path::from_absolute_path(&crc_path).unwrap();
+    store.put(&crc_path, crc_json.into()).await.unwrap();
+
+    let snapshot = Snapshot::builder_for(table_path).build(engine)?;
+    assert_eq!(snapshot.version(), 1);
+    Ok(snapshot)
+}
+
+/// Tests the CRC fast path for set transaction expiration filtering. Since `lastUpdated` is set
+/// to now, "interval 0 seconds" yields `expiration_timestamp = now`, so `last_updated <= now`
+/// holds and the txn expires. A large retention or no retention should keep the txn visible.
+#[rstest]
+#[case::zero_retention_expires(Some("interval 0 seconds"), None)]
+#[case::large_retention_not_expired(Some("interval 365 days"), Some(1))]
+#[case::no_retention_no_filtering(None, Some(1))]
+#[tokio::test]
+async fn test_set_txn_expiration_via_crc_fast_path(
+    #[case] retention: Option<&str>,
+    #[case] expected: Option<i64>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_with_txn_retention_and_crc(&table_path, engine.as_ref(), retention).await?;
+
+    // Verify CRC was loaded from disk
+    assert!(snapshot.get_current_crc_if_loaded_for_testing().is_some());
+
+    // FailingEngine proves the CRC fast path is used (no log replay)
+    assert_eq!(
+        snapshot
+            .get_app_id_version("my-app", &FailingEngine)
+            .unwrap(),
+        expected
+    );
+
+    Ok(())
+}
+
+/// Verifies that a set transaction with null `last_updated` never expires, even with the most
+/// aggressive retention ("interval 0 seconds"). Uses `add_commit` to write a raw txn action
+/// that omits `lastUpdated`, then verifies via log replay (CRC won't cover this commit since
+/// the CRC is written at v0).
+#[tokio::test]
+async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaResult<()> {
+    use test_utils::add_commit;
+
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let store = Arc::new(LocalFileSystem::new());
+
+    // v0: create table with aggressive retention
+    let v0 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"createdTime":0,"configuration":{"delta.setTransactionRetentionDuration":"interval 0 seconds"}}}"#;
+    add_commit(&table_path, store.as_ref(), 0, v0.to_string())
+        .await
+        .unwrap();
+
+    // v1: raw commit with txn action that omits lastUpdated
+    add_commit(
+        &table_path,
+        store.as_ref(),
+        1,
+        r#"{"txn":{"appId":"null-app","version":42}}"#.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Reload fresh snapshot at v1 -- no CRC covers v1, so log replay is used
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 1);
+
+    // Despite aggressive retention, null last_updated means the txn never expires
+    assert_eq!(
+        fresh.get_app_id_version("null-app", engine.as_ref())?,
+        Some(42)
     );
 
     Ok(())
