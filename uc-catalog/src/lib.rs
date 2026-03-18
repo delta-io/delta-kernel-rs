@@ -14,12 +14,12 @@ use tracing::debug;
 use url::Url;
 
 /// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
-/// Catalog. For now this is a lightweight wrapper around a [UCCommitsClient].
-pub struct UCCatalog<'a, C: UCCommitsClient> {
+/// Catalog. For now this is a lightweight wrapper around a [UCGetCommitsClient].
+pub struct UCCatalog<'a, C: UCGetCommitsClient> {
     client: &'a C,
 }
 
-impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
+impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
     /// Create a new [UCCatalog] instance with the provided client.
     pub fn new(client: &'a C) -> Self {
         UCCatalog { client }
@@ -134,6 +134,7 @@ mod tests {
     use std::env;
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::object_store;
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
@@ -178,7 +179,7 @@ mod tests {
         let creds = uc_client
             .get_credentials(&table_id, Operation::Read)
             .await
-            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+            .map_err(|e| format!("Failed to get credentials: {e}"))?;
 
         let catalog = UCCatalog::new(&uc_commits_client);
 
@@ -233,7 +234,7 @@ mod tests {
         let creds = client
             .get_credentials(&table_id, Operation::ReadWrite)
             .await
-            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+            .map_err(|e| format!("Failed to get credentials: {e}"))?;
 
         let catalog = UCCatalog::new(commits_client.as_ref());
 
@@ -251,7 +252,7 @@ mod tests {
 
         let table_url = Url::parse(&table_uri)?;
         let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
-        let store: Arc<dyn object_store::ObjectStore> = store.into();
+        let store = Arc::new(store);
 
         let engine = DefaultEngineBuilder::new(store.clone()).build();
         let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));

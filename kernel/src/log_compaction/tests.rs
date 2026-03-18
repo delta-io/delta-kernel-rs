@@ -91,7 +91,7 @@ fn test_writer_debug_impl() {
     let snapshot = create_mock_snapshot();
     let writer = LogCompactionWriter::try_new(snapshot, 1, 5).unwrap();
 
-    let debug_str = format!("{:?}", writer);
+    let debug_str = format!("{writer:?}");
     assert!(debug_str.contains("LogCompactionWriter"));
 }
 
@@ -112,7 +112,7 @@ fn test_compaction_data() {
     assert_eq!(state.add_actions_count(), 0);
 
     // Test debug implementation
-    let debug_str = format!("{:?}", iterator);
+    let debug_str = format!("{iterator:?}");
     assert!(debug_str.contains("ActionReconciliationIterator"));
     assert!(debug_str.contains("actions_count"));
     assert!(debug_str.contains("add_actions_count"));
@@ -201,9 +201,7 @@ fn test_compaction_paths() {
         let path = writer.compaction_path();
         assert!(
             path.to_string().ends_with(expected_suffix),
-            "Path {} doesn't end with {}",
-            path,
-            expected_suffix
+            "Path {path} doesn't end with {expected_suffix}"
         );
     }
 }
@@ -235,7 +233,8 @@ fn test_version_filtering() {
 async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
     use crate::engine::default::DefaultEngineBuilder;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+    use crate::table_features::TableFeature;
     use std::sync::Arc;
 
     // Set up in-memory store
@@ -262,7 +261,7 @@ async fn test_no_compaction_staged_commits() {
         .unwrap(),
     );
     let protocol = Action::Protocol(
-        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+        Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap(),
     );
 
     let metadata_action = serde_json::to_string(&metadata).unwrap();
@@ -273,7 +272,7 @@ async fn test_no_compaction_staged_commits() {
     store
         .put(
             &commit_0_path,
-            format!("{}\n{}", metadata_action, protocol_action).into(),
+            format!("{metadata_action}\n{protocol_action}").into(),
         )
         .await
         .unwrap();

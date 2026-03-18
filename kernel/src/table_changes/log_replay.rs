@@ -12,7 +12,7 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression};
+use crate::expressions::{column_expr, column_expr_ref, column_name, ColumnName, Expression};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::data_skipping::DataSkippingFilter;
@@ -62,6 +62,7 @@ pub(crate) fn table_changes_action_iter(
     let filter = physical_predicate
         .and_then(|(predicate, ref_schema)| {
             let stats_schema = build_stats_schema(&ref_schema)?;
+
             // Parse JSON stats from the raw action batch's `add.stats` column. Unlike the scan
             // path (which transforms first and reads pre-parsed stats), table_changes must
             // resolve deletion vector pairs before filtering, so it operates on raw batches.
@@ -72,9 +73,11 @@ pub(crate) fn table_changes_action_iter(
             DataSkippingFilter::new(
                 engine.as_ref(),
                 Some(predicate),
-                stats_schema,
-                get_log_add_schema().clone(),
+                Some(&stats_schema),
                 stats_expr,
+                None, // no partition columns for table changes (partition_expr unused)
+                column_expr_ref!("partitionValues_parsed"),
+                get_log_add_schema().clone(),
             )
         })
         .map(Arc::new);
@@ -251,7 +254,7 @@ impl LogReplayScanner {
                 info!(
                     version = commit_file.version,
                     id = table_configuration.metadata().id(),
-                    //Writer features is always a superset of reader features, so writer features is logged to trace the full set of table features
+                    // Writer features are always a superset of reader features, so we log writer features to trace the full set of table features.
                     writerFeatures = %writer_features_str,
                     minReaderVersion = table_configuration.protocol().min_reader_version(),
                     minWriterVersion = table_configuration.protocol().min_writer_version(),

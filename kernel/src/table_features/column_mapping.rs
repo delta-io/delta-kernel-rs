@@ -7,9 +7,11 @@ use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, Schema,
-    SchemaTransform, StructField, StructType,
+    StructField, StructType,
 };
+
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
+use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
@@ -51,11 +53,13 @@ pub(crate) fn column_mapping_mode(
 }
 
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id; when not enabled, verify that no fields are annotated.
+/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
+/// value. When not enabled, verifies that no fields are annotated.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
+        seen: HashMap::new(),
         err: None,
     };
     let _ = validator.transform_struct(schema);
@@ -65,76 +69,119 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     }
 }
 
+/// Validates a field's column mapping annotations and extracts the physical name and column
+/// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs.
+///
+/// Metadata columns are not subject to column mapping and must not carry column mapping
+/// annotations. Returns the logical field name and `None` for such fields.
+///
+/// When column mapping is enabled (`Id` or `Name`), the field must have a
+/// `delta.columnMapping.physicalName` (string) and `delta.columnMapping.id` (number) annotation.
+/// Returns the physical name and `Some(id)`.
+///
+/// When disabled (`None`), neither annotation should be present. Returns the logical field name
+/// and `None`.
+///
+/// `path` identifies the field in error messages (e.g. `&["a", "b"]` renders as `a.b`).
+pub(crate) fn get_field_column_mapping_info<'a>(
+    field: &'a StructField,
+    mode: ColumnMappingMode,
+    path: &[&str],
+    seen: Option<&mut HashMap<i64, &'a str>>,
+) -> DeltaResult<(&'a str, Option<i64>)> {
+    let field_path = || ColumnName::new(path.iter().copied());
+    let physical_name_meta = field
+        .metadata
+        .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref());
+    let id_meta = field
+        .metadata
+        .get(ColumnMetadataKey::ColumnMappingId.as_ref());
+
+    if field.is_metadata_column() {
+        if physical_name_meta.is_some() || id_meta.is_some() {
+            return Err(Error::internal_error(format!(
+                "Metadata column '{}' must not have column mapping annotations",
+                field.name()
+            )));
+        }
+        return Ok((field.name(), None));
+    }
+
+    let annotation = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
+    let physical_name = match (mode, physical_name_meta) {
+        (ColumnMappingMode::None, None) => field.name(),
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(s))) => s,
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
+            return Err(Error::schema(format!(
+                "The {annotation} annotation on field '{}' must be a string",
+                field_path(),
+            )));
+        }
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
+            return Err(Error::schema(format!(
+                "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
+                field_path(),
+            )));
+        }
+        (ColumnMappingMode::None, Some(_)) => {
+            return Err(Error::schema(format!(
+                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                field_path(),
+            )));
+        }
+    };
+
+    let annotation = ColumnMetadataKey::ColumnMappingId.as_ref();
+    let id = match (mode, id_meta) {
+        (ColumnMappingMode::None, None) => None,
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(n))) => {
+            Some(*n)
+        }
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
+            return Err(Error::schema(format!(
+                "The {annotation} annotation on field '{}' must be a number",
+                field_path(),
+            )));
+        }
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
+            return Err(Error::schema(format!(
+                "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
+                field_path(),
+            )));
+        }
+        (ColumnMappingMode::None, Some(_)) => {
+            return Err(Error::schema(format!(
+                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                field_path(),
+            )));
+        }
+    };
+
+    if let (Some(id), Some(seen)) = (id, seen) {
+        seen.insert(id, field.name()).map_or(Ok(()), |prev| {
+            Err(Error::schema(format!(
+                "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                field.name()
+            )))
+        })?;
+    }
+
+    Ok((physical_name, id))
+}
+
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
+    seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
     err: Option<Error>,
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner_type(
-        &mut self,
-        data_type: &'a DataType,
-        name: &'a str,
-    ) -> Option<Cow<'a, DataType>> {
+    fn transform_inner<R>(&mut self, field_name: &'a str, validate: impl FnOnce(&mut Self) -> R) {
         if self.err.is_none() {
-            self.path.push(name);
-            let _ = self.transform(data_type);
+            self.path.push(field_name);
+            let _ = validate(self);
             self.path.pop();
-        }
-        None
-    }
-    fn check_annotations(&mut self, field: &StructField) {
-        // The iterator yields `&&str` but `ColumnName::new` needs `&str`
-        let column_name = || ColumnName::new(self.path.iter().copied());
-        let annotation = "delta.columnMapping.physicalName";
-        match (self.mode, field.metadata.get(annotation)) {
-            // Both Id and Name modes require a physical name annotation; None mode forbids it.
-            (ColumnMappingMode::None, None) => {}
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(_))) => {}
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
-                self.err = Some(Error::invalid_column_mapping_mode(format!(
-                    "The {annotation} annotation on field '{}' must be a string",
-                    column_name()
-                )));
-            }
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
-                self.err = Some(Error::invalid_column_mapping_mode(format!(
-                    "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
-                    column_name()
-                )));
-            }
-            (ColumnMappingMode::None, Some(_)) => {
-                self.err = Some(Error::invalid_column_mapping_mode(format!(
-                    "Column mapping is not enabled but field '{annotation}' is annotated with {}",
-                    column_name()
-                )));
-            }
-        }
-
-        let annotation = "delta.columnMapping.id";
-        match (self.mode, field.metadata.get(annotation)) {
-            // Both Id and Name modes require a field ID annotation; None mode forbids it.
-            (ColumnMappingMode::None, None) => {}
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(_))) => {}
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
-                self.err = Some(Error::invalid_column_mapping_mode(format!(
-                    "The {annotation} annotation on field '{}' must be a number",
-                    column_name()
-                )));
-            }
-            (ColumnMappingMode::Name | ColumnMappingMode::Id, None) => {
-                self.err = Some(Error::invalid_column_mapping_mode(format!(
-                    "Column mapping is enabled but field '{}' lacks the {annotation} annotation",
-                    column_name()
-                )));
-            }
-            (ColumnMappingMode::None, Some(_)) => {
-                self.err = Some(Error::invalid_column_mapping_mode(format!(
-                    "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                    column_name()
-                )));
-            }
         }
     }
 }
@@ -142,21 +189,24 @@ impl<'a> ValidateColumnMappings<'a> {
 impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     // Override array element and map key/value for better error messages
     fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(etype, "<array element>")
+        self.transform_inner("<array element>", |this| this.transform(etype));
+        Some(Cow::Borrowed(etype))
     }
     fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(ktype, "<map key>")
+        self.transform_inner("<map key>", |this| this.transform(ktype));
+        Some(Cow::Borrowed(ktype))
     }
     fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner_type(vtype, "<map value>")
+        self.transform_inner("<map value>", |this| this.transform(vtype));
+        Some(Cow::Borrowed(vtype))
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if self.err.is_none() {
-            self.path.push(&field.name);
-            self.check_annotations(field);
-            let _ = self.recurse_into_struct_field(field);
-            self.path.pop();
-        }
+        self.transform_inner(field.name(), |this| {
+            get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
+                .map_err(|e| this.err = Some(e))
+                .ok()?;
+            this.recurse_into_struct_field(field)
+        });
         None
     }
     fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
@@ -183,8 +233,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
     match properties.get(COLUMN_MAPPING_MODE) {
         Some(mode_str) => mode_str.parse::<ColumnMappingMode>().map_err(|_| {
             Error::generic(format!(
-                "Invalid column mapping mode '{}'. Must be one of: none, name, id",
-                mode_str
+                "Invalid column mapping mode '{mode_str}'. Must be one of: none, name, id"
             ))
         }),
         None => Ok(ColumnMappingMode::None),
@@ -296,121 +345,129 @@ fn process_nested_data_type(data_type: &DataType, max_id: &mut i64) -> DeltaResu
     }
 }
 
-/// Resolves a clustering column's logical name to its physical name using column mapping metadata.
+/// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
 ///
-/// Uses [`StructField::physical_name`] to resolve the name based on the column mapping mode.
-/// When column mapping is disabled (mode = None), returns the logical name. When enabled,
-/// returns the physical name from the field's metadata.
+/// Uses `StructType::walk_column_fields` to walk the column path through nested structs,
+/// then maps each field to its physical name based on the column mapping mode.
 ///
-/// This function only handles top-level columns. Note: the top-level restriction for
-/// clustering columns is an opinionated choice (matching delta-spark behavior), not a
-/// requirement of the Delta protocol itself.
-pub(crate) fn get_top_level_column_physical_name(
-    logical_name: &str,
+/// Returns an error if the column name cannot be resolved in the schema, or if column mapping is
+/// enabled but any field in the path lacks the required
+/// [`ColumnMetadataKey::ColumnMappingPhysicalName`] or [`ColumnMetadataKey::ColumnMappingId`]
+/// annotations.
+#[delta_kernel_derive::internal_api]
+pub(crate) fn get_any_level_column_physical_name(
     schema: &StructType,
-    mode: ColumnMappingMode,
-) -> DeltaResult<String> {
-    let field = schema
-        .field(logical_name)
-        .ok_or_else(|| Error::generic(format!("Column '{}' not found in schema", logical_name)))?;
+    col_name: &ColumnName,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<ColumnName> {
+    let fields = schema.walk_column_fields(col_name)?;
+    let physical_path: Vec<String> = fields
+        .iter()
+        .map(|field| -> DeltaResult<String> {
+            if column_mapping_mode != ColumnMappingMode::None {
+                if !field.has_physical_name_annotation() {
+                    return Err(Error::Schema(format!(
+                        "Column mapping is enabled but field '{}' lacks the {} annotation",
+                        field.name,
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
+                    )));
+                }
+                if !field.has_id_annotation() {
+                    return Err(Error::Schema(format!(
+                        "Column mapping is enabled but field '{}' lacks the {} annotation",
+                        field.name,
+                        ColumnMetadataKey::ColumnMappingId.as_ref()
+                    )));
+                }
+            }
 
-    Ok(field.physical_name(mode).to_string())
+            Ok(field.physical_name(column_mapping_mode).to_string())
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(ColumnName::new(physical_path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::StructType;
+    use crate::expressions::ColumnName;
+    use crate::schema::{DataType, StructType};
+    use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
+
+    use crate::utils::test_utils::test_deep_nested_schema_missing_leaf_cm;
 
     #[test]
     fn test_column_mapping_mode() {
-        let table_properties: HashMap<_, _> =
-            [("delta.columnMapping.mode".to_string(), "id".to_string())]
-                .into_iter()
-                .collect();
-        let table_properties = TableProperties::from(table_properties.iter());
-        let empty_table_properties = TableProperties::from([] as [(String, String); 0]);
+        let annotated = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+        let plain = create_schema(None, None, None, None);
+        let cmm_id = HashMap::from([("delta.columnMapping.mode".to_string(), "id".to_string())]);
+        let no_props = HashMap::new();
 
-        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        // v2 legacy + mode=id => Id (annotated schema required)
+        let tc = make_test_tc(
+            annotated.clone(),
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            cmm_id.clone(),
+        )
+        .unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
+        // v2 legacy + no mode => None
+        let tc = make_test_tc(
+            plain.clone(),
+            Protocol::try_new_legacy(2, 5).unwrap(),
+            no_props.clone(),
+        )
+        .unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
-        let empty_features = Some::<[String; 0]>([]);
+        // v3 + empty features + mode=id => None (mode ignored without CM feature)
         let protocol =
-            Protocol::try_new(3, 7, empty_features.clone(), empty_features.clone()).unwrap();
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::None
-        );
+        // v3 + empty features + no mode => None
+        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
+        // v3 + CM feature + mode=id => Id
+        let protocol =
+            Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
+                .unwrap();
+        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::ColumnMapping]),
-            Some([TableFeature::ColumnMapping]),
+        // v3 + CM feature + no mode => None
+        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
+
+        // v3 + DV feature (no CM) + mode=id => None (mode ignored)
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors],
         )
         .unwrap();
+        let tc = make_test_tc(plain.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
+        // v3 + DV feature + no mode => None
+        let tc = make_test_tc(plain.clone(), protocol, no_props.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors]),
-            Some([TableFeature::DeletionVectors]),
+        // v3 + DV + CM features + mode=id => Id
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
         )
         .unwrap();
+        let tc = make_test_tc(annotated.clone(), protocol.clone(), cmm_id.clone()).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::Id);
 
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::None
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &table_properties),
-            ColumnMappingMode::Id
-        );
-
-        assert_eq!(
-            column_mapping_mode(&protocol, &empty_table_properties),
-            ColumnMappingMode::None
-        );
+        // v3 + DV + CM features + no mode => None
+        let tc = make_test_tc(plain.clone(), protocol, no_props).unwrap();
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
     }
 
     // Creates optional schema field annotations for column mapping id and physical name, as a string.
@@ -512,6 +569,111 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
     }
 
+    #[test]
+    fn test_annotation_validation_reaches_struct_fields_in_map_value() {
+        let unannotated =
+            StructType::new_unchecked([StructField::new("x", DataType::INTEGER, false)]);
+        let schema = StructType::new_unchecked([make_cm_field(
+            "b",
+            1,
+            MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(unannotated)),
+                false,
+            ),
+        )]);
+        validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
+            .expect_err("missing annotation on struct field inside map value");
+    }
+
+    fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {
+        StructField::new(name, data_type, false).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(format!("col-{name}")),
+            ),
+        ])
+    }
+
+    fn cm_schema_same_level_duplicates() -> StructType {
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field("b", 1, DataType::INTEGER),
+        ])
+    }
+
+    fn cm_schema_nested_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([
+            make_cm_field("x", 5, DataType::INTEGER),
+            make_cm_field("y", 5, DataType::INTEGER),
+        ]);
+        StructType::new_unchecked([make_cm_field(
+            "outer",
+            10,
+            DataType::Struct(Box::new(nested)),
+        )])
+    }
+
+    fn cm_schema_cross_level_duplicates() -> StructType {
+        let nested = StructType::new_unchecked([make_cm_field("inner", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field("b", 2, DataType::Struct(Box::new(nested))),
+        ])
+    }
+
+    fn cm_schema_array_duplicates() -> StructType {
+        let element = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field(
+                "b",
+                2,
+                ArrayType::new(DataType::Struct(Box::new(element)), false),
+            ),
+        ])
+    }
+
+    fn cm_schema_map_duplicates() -> StructType {
+        let value = StructType::new_unchecked([make_cm_field("x", 1, DataType::INTEGER)]);
+        StructType::new_unchecked([
+            make_cm_field("a", 1, DataType::INTEGER),
+            make_cm_field(
+                "b",
+                2,
+                MapType::new(DataType::STRING, DataType::Struct(Box::new(value)), false),
+            ),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::same_level(cm_schema_same_level_duplicates())]
+    #[case::nested_struct(cm_schema_nested_duplicates())]
+    #[case::across_nesting_levels(cm_schema_cross_level_duplicates())]
+    #[case::across_array(cm_schema_array_duplicates())]
+    #[case::across_map(cm_schema_map_duplicates())]
+    fn test_duplicate_column_mapping_ids_rejected(#[case] schema: StructType) {
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(&schema, ColumnMappingMode::Id),
+            "Duplicate column mapping ID",
+        );
+    }
+
+    #[test]
+    fn test_duplicate_column_mapping_ids_rejected_in_name_mode() {
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(
+                &cm_schema_same_level_duplicates(),
+                ColumnMappingMode::Name,
+            ),
+            "Duplicate column mapping ID",
+        );
+    }
+
     // =========================================================================
     // Tests for write-side column mapping functions
     // =========================================================================
@@ -541,8 +703,6 @@ mod tests {
 
     #[test]
     fn test_assign_column_mapping_metadata_simple() {
-        use crate::schema::DataType;
-
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::STRING, true),
@@ -580,8 +740,6 @@ mod tests {
 
     #[test]
     fn test_assign_column_mapping_metadata_rejects_existing_id() {
-        use crate::schema::DataType;
-
         // Schema with pre-existing column mapping metadata should be rejected
         let schema = StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false).add_metadata([
@@ -604,15 +762,12 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("already has column mapping metadata"),
-            "Expected error about existing column mapping metadata, got: {}",
-            err_msg
+            "Expected error about existing column mapping metadata, got: {err_msg}"
         );
     }
 
     #[test]
     fn test_assign_column_mapping_metadata_nested_struct() {
-        use crate::schema::DataType;
-
         let inner = StructType::new_unchecked([
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::STRING, true),
@@ -698,7 +853,7 @@ mod tests {
     fn unwrap_struct<'a>(data_type: &'a DataType, context: &str) -> &'a StructType {
         match data_type {
             DataType::Struct(s) => s,
-            _ => panic!("Expected Struct for {}, got {:?}", context, data_type),
+            _ => panic!("Expected Struct for {context}, got {data_type:?}"),
         }
     }
 
@@ -706,7 +861,6 @@ mod tests {
     fn test_assign_column_mapping_metadata_map_with_struct_key_and_value() {
         // Test: map<struct<k: int>, struct<v: int>>
         // Both key and value are structs that need column mapping metadata
-        use crate::schema::DataType;
 
         let key_struct =
             StructType::new_unchecked([StructField::new("k", DataType::INTEGER, false)]);
@@ -759,7 +913,6 @@ mod tests {
     #[test]
     fn test_assign_column_mapping_metadata_array_with_struct_element() {
         // Test: array<struct<elem: int>>
-        use crate::schema::DataType;
 
         let elem_struct =
             StructType::new_unchecked([StructField::new("elem", DataType::INTEGER, false)]);
@@ -801,7 +954,6 @@ mod tests {
     #[test]
     fn test_assign_column_mapping_metadata_double_nested_array() {
         // Test: array<array<struct<deep: int>>>
-        use crate::schema::DataType;
 
         let deep_struct =
             StructType::new_unchecked([StructField::new("deep", DataType::INTEGER, false)]);
@@ -847,7 +999,6 @@ mod tests {
     fn test_assign_column_mapping_metadata_array_map_array_struct_nesting() {
         // Test: array<map<array<struct<k: int>>, array<struct<v: int>>>>
         // Deeply nested array-map-array-struct combination
-        use crate::schema::DataType;
 
         let key_struct =
             StructType::new_unchecked([StructField::new("k", DataType::INTEGER, false)]);
@@ -914,70 +1065,152 @@ mod tests {
     }
 
     #[test]
-    fn test_get_top_level_column_physical_name_no_mapping() {
-        use crate::schema::DataType;
-
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::STRING, true),
-        ]);
-
-        let result =
-            get_top_level_column_physical_name("a", &schema, ColumnMappingMode::None).unwrap();
-
-        // Should return logical name as-is when column mapping is disabled
-        assert_eq!(result, "a");
-    }
-
-    #[test]
-    fn test_get_top_level_column_physical_name_with_mapping() {
-        use crate::schema::DataType;
-
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false).add_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(1),
-                ),
+    fn test_get_any_level_column_physical_name_success() {
+        let inner = StructType::new_unchecked([StructField::new("y", DataType::INTEGER, false)
+            .add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-abc123".to_string()),
+                    MetadataValue::String("col-inner-y".to_string()),
                 ),
-            ]),
-            StructField::new("b", DataType::STRING, true).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
                     MetadataValue::Number(2),
                 ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-def456".to_string()),
-                ),
-            ]),
-        ]);
+            ])]);
 
-        let result =
-            get_top_level_column_physical_name("a", &schema, ColumnMappingMode::Name).unwrap();
+        let schema = StructType::new_unchecked([StructField::new(
+            "a",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-outer-a".to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+        ])]);
 
-        // Should return physical name
-        assert_eq!(result, "col-abc123");
+        // Top-level column
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a"]),
+            ColumnMappingMode::Name,
+        )
+        .unwrap();
+        assert_eq!(result, ColumnName::new(["col-outer-a"]));
+        assert_eq!(result.path().len(), 1);
+
+        // Nested column
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "y"]),
+            ColumnMappingMode::Name,
+        )
+        .unwrap();
+        assert_eq!(result, ColumnName::new(["col-outer-a", "col-inner-y"]));
+        assert_eq!(result.path().len(), 2);
+
+        // No mapping mode returns logical names (annotations are ignored)
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "y"]),
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert_eq!(result, ColumnName::new(["a", "y"]));
+        assert_eq!(result.path().len(), 2);
     }
 
     #[test]
-    fn test_get_top_level_column_physical_name_not_found() {
-        use crate::schema::DataType;
-
+    fn test_get_any_level_column_physical_name_errors() {
         let schema = StructType::new_unchecked([StructField::new("a", DataType::INTEGER, false)]);
 
-        let result =
-            get_top_level_column_physical_name("nonexistent", &schema, ColumnMappingMode::Name);
-
+        // Non-existent top-level column
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["nonexistent"]),
+            ColumnMappingMode::None,
+        );
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+
+        // Nested path on a non-struct field
+        let result = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "b"]),
+            ColumnMappingMode::None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest::rstest]
+    // physicalName present, id missing → id error
+    #[case::missing_id(true, false, "delta.columnMapping.id")]
+    // id present, physicalName missing → physicalName error
+    #[case::missing_physical_name(false, true, "delta.columnMapping.physicalName")]
+    // both missing → physicalName checked first, so physicalName error
+    #[case::missing_both(false, false, "delta.columnMapping.physicalName")]
+    fn test_get_any_level_column_physical_name_missing_annotations(
+        #[case] has_physical_name: bool,
+        #[case] has_id: bool,
+        #[case] expected_err: &str,
+    ) {
+        let mut inner_field = StructField::new("y", DataType::INTEGER, false);
+        if has_physical_name {
+            inner_field = inner_field.add_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-inner-y".to_string()),
+            )]);
+        }
+        if has_id {
+            inner_field = inner_field.add_metadata([(
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(2),
+            )]);
+        }
+
+        let inner = StructType::new_unchecked([inner_field]);
+        let schema = StructType::new_unchecked([StructField::new(
+            "a",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )
+        .add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-outer-a".to_string()),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+        ])]);
+
+        let err = get_any_level_column_physical_name(
+            &schema,
+            &ColumnName::new(["a", "y"]),
+            ColumnMappingMode::Name,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
-            err_msg.contains("not found in schema"),
-            "Expected 'not found in schema' error, got: {}",
-            err_msg
+            err.contains(expected_err),
+            "Expected error containing '{expected_err}', got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_schema_column_mapping_error_includes_full_path() {
+        let schema = test_deep_nested_schema_missing_leaf_cm();
+        let err = validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
+            "Expected full nested path in error, got: {err}"
         );
     }
 }

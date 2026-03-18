@@ -3,10 +3,10 @@ use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
+use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use tracing::{info, instrument};
-use url::Url;
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -32,16 +32,16 @@ use url::Url;
 // types/add type state.
 #[derive(Debug)]
 pub struct SnapshotBuilder {
-    table_root: Option<Url>,
+    table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new_for(table_root: Url) -> Self {
+    pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
-            table_root: Some(table_root),
+            table_root: Some(table_root.as_ref().to_string()),
             existing_snapshot: None,
             version: None,
             log_tail: Vec::new(),
@@ -101,9 +101,10 @@ impl SnapshotBuilder {
         let reporter = engine.get_metrics_reporter();
 
         if let Some(table_root) = self.table_root {
+            let table_url = try_parse_uri(table_root)?;
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
-                table_root.join("_delta_log/")?,
+                table_url.join("_delta_log/")?,
                 log_tail,
                 self.version,
                 reporter.as_ref(),
@@ -111,7 +112,7 @@ impl SnapshotBuilder {
             )?;
 
             Ok(Snapshot::try_new_from_log_segment(
-                table_root,
+                table_url,
                 log_segment,
                 engine,
                 Some(operation_id),
@@ -138,8 +139,7 @@ impl SnapshotBuilder {
 
     fn table_path(&self) -> &str {
         self.table_root
-            .as_ref()
-            .map(|u| u.as_str())
+            .as_deref()
             .or_else(|| {
                 self.existing_snapshot
                     .as_ref()
@@ -162,26 +162,27 @@ mod tests {
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
-
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::{DynObjectStore, ObjectStore as _};
     use itertools::Itertools;
-    use object_store::memory::InMemory;
-    use object_store::ObjectStore;
     use serde_json::json;
 
     use super::*;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<dyn ObjectStore>,
-        Url,
+        Arc<DynObjectStore>,
+        String,
     ) {
-        let table_root = Url::parse("memory:///test_table").unwrap();
+        let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
         let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
         (engine, store, table_root)
     }
 
-    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &Url) -> DeltaResult<()> {
+    // TODO (#1990): update this function to properly store the table at table_root
+    async fn create_table(store: &Arc<DynObjectStore>, _table_root: String) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -218,7 +219,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
+        let path = Path::from(format!("_delta_log/{:020}.json", 0).as_str());
         store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
@@ -241,7 +242,7 @@ mod tests {
             .collect_vec()
             .join("\n");
 
-        let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
+        let path = Path::from(format!("_delta_log/{:020}.json", 1).as_str());
         store.put(&path, commit1_data.into()).await?;
 
         Ok(())
@@ -251,7 +252,7 @@ mod tests {
     async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();
-        create_table(&store, &table_root).await?;
+        create_table(&store, table_root.clone()).await?;
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
         assert_eq!(snapshot.version(), 1);
@@ -260,6 +261,61 @@ mod tests {
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_snapshot_with_unsupported_type() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let engine = engine.as_ref();
+
+        // Create a table with an unsupported type in the schema
+        let protocol = json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2,
+        });
+
+        let metadata = json!({
+            "id": "test-table-id",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval second\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        });
+
+        let commit0 = [
+            json!({
+                "protocol": protocol
+            }),
+            json!({
+                "metaData": metadata
+            }),
+        ];
+
+        let commit0_data = commit0
+            .iter()
+            .map(ToString::to_string)
+            .collect_vec()
+            .join("\n");
+
+        let path = Path::from("_delta_log/00000000000000000000.json");
+        store.put(&path, commit0_data.into()).await?;
+
+        // Try to build a snapshot and expect a clear error message
+        let result = SnapshotBuilder::new_for(table_root.clone()).build(engine);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Unsupported Delta table type: 'interval second'"),
+            "Expected clear error message about unsupported type, got: {err_msg}"
+        );
 
         Ok(())
     }

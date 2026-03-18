@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
     PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -116,7 +118,7 @@ fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
             UTF8_MAX_CHAR
         };
 
-        return Some(Cow::Owned(format!("{}{}", truncated, tie_breaker)));
+        return Some(Cow::Owned(format!("{truncated}{tie_breaker}")));
     }
 
     // Could not find a valid truncation point within expansion limit
@@ -472,14 +474,21 @@ impl StatsAccumulator {
 /// Returns a StructArray with the following fields:
 /// - `numRecords`: total row count
 /// - `nullCount`: nested struct with null counts per column
-/// - `minValues`: nested struct with min values per column
-/// - `maxValues`: nested struct with max values per column
+/// - `minValues`: nested struct with min values per column (columns with all-null values are
+///   omitted)
+/// - `maxValues`: nested struct with max values per column (columns with all-null values are
+///   omitted)
 /// - `tightBounds`: always true for new file writes
+///
+/// String min/max values are truncated to a 32-character prefix with appropriate tie-breaker
+/// characters for max values. See the `stats_schema` module documentation for the full stats
+/// value rules.
 ///
 /// # Arguments
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist).
 ///   Only these columns will appear in nullCount/minValues/maxValues.
+#[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
@@ -753,11 +762,15 @@ mod tests {
             .unwrap();
         assert_eq!(value_null_count.value(0), 3);
 
-        // minValues/maxValues should not have "value" field (all nulls)
-        if let Some(min_values) = stats.column_by_name("minValues") {
-            let min_struct = min_values.as_any().downcast_ref::<StructArray>().unwrap();
-            assert!(min_struct.column_by_name("value").is_none());
-        }
+        // All-null columns are omitted from minValues/maxValues entirely
+        assert!(
+            stats.column_by_name("minValues").is_none(),
+            "minValues should be absent when all stats columns are all-null"
+        );
+        assert!(
+            stats.column_by_name("maxValues").is_none(),
+            "maxValues should be absent when all stats columns are all-null"
+        );
     }
 
     #[test]

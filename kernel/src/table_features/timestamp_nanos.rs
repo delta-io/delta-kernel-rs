@@ -1,24 +1,21 @@
 //! Validation for TIMESTAMP_NANOS feature support
 
 use super::TableFeature;
-use crate::actions::Protocol;
-use crate::schema::{PrimitiveType, Schema, SchemaTransform};
+use crate::schema::{PrimitiveType, Schema};
+use crate::table_configuration::TableConfiguration;
+use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
 
 /// Validates that if a table schema contains TIMESTAMP_NANOS columns, the table must have the
-/// NanosecondTimestamp feature in both reader and writer features.
-pub(crate) fn validate_timestamp_nanos_feature_support(
-    schema: &Schema,
-    protocol: &Protocol,
-) -> DeltaResult<()> {
+/// TimestampNanos feature in both reader and writer features.
+pub(crate) fn validate_timestamp_nanos_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
+    let protocol = tc.protocol();
     if !protocol.has_table_feature(&TableFeature::TimestampNanos) {
-        let mut uses_nanosecond_timestamp = UsesNanosecondTimestamp(false);
-        let _ = uses_nanosecond_timestamp.transform_struct(schema);
         require!(
-            !uses_nanosecond_timestamp.0,
+            !schema_contains_timestamp_nanos(&tc.logical_schema()),
             Error::unsupported(
                 "Table contains TIMESTAMP_NANOS columns but does not have the required 'timestampNanos' feature in reader and writer features"
             )
@@ -27,10 +24,17 @@ pub(crate) fn validate_timestamp_nanos_feature_support(
     Ok(())
 }
 
-/// Schema visitor that checks if any column in the schema uses TIMESTAMP_NANOS type
-struct UsesNanosecondTimestamp(bool);
+/// Checks if any column in the schema (including nested structs, arrays, maps) uses
+/// the TIMESTAMP_NANOS primitive type.
+pub(crate) fn schema_contains_timestamp_nanos(schema: &Schema) -> bool {
+    let mut uses_timestamp_nanos = UsesTimestampNanos(false);
+    let _ = uses_timestamp_nanos.transform_struct(schema);
+    uses_timestamp_nanos.0
+}
 
-impl<'a> SchemaTransform<'a> for UsesNanosecondTimestamp {
+struct UsesTimestampNanos(bool);
+
+impl<'a> SchemaTransform<'a> for UsesTimestampNanos {
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         if *ptype == PrimitiveType::TimestampNanos {
             self.0 = true;
@@ -41,11 +45,10 @@ impl<'a> SchemaTransform<'a> for UsesNanosecondTimestamp {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::assert_schema_feature_validation;
 
     #[test]
     fn test_timestamp_nanos_feature_validation() {
@@ -61,6 +64,19 @@ mod tests {
         let schema_without_timestamp_nanos = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("name", DataType::STRING, true),
+        ]);
+
+        let nested_schema_with = StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(
+                "nested",
+                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
+                    "inner_nanos",
+                    DataType::Primitive(PrimitiveType::TimestampNanos),
+                    true,
+                )]))),
+                true,
+            ),
         ]);
 
         // Protocol with NanosecondTimestamp features
@@ -81,52 +97,13 @@ mod tests {
         )
         .unwrap();
 
-        // Schema with TIMESTAMP_NANOS + Protocol with features = OK
-        validate_timestamp_nanos_feature_support(
+        assert_schema_feature_validation(
             &schema_with_timestamp_nanos,
-            &protocol_with_features,
-        )
-        .expect("Should succeed when features are present");
-
-        // Schema without TIMESTAMP_NANOS + Protocol without features = OK
-        validate_timestamp_nanos_feature_support(
-            &schema_without_timestamp_nanos,
-            &protocol_without_features,
-        )
-        .expect("Should succeed when no TIMESTAMP_NANOS columns are present");
-
-        // Schema without TIMESTAMP_NANOS + Protocol with features = OK
-        validate_timestamp_nanos_feature_support(
             &schema_without_timestamp_nanos,
             &protocol_with_features,
-        )
-        .expect("Should succeed when no TIMESTAMP_NANOS columns are present, even with features");
-
-        // Schema with TIMESTAMP_NANOS + Protocol without features = ERROR
-        let result = validate_timestamp_nanos_feature_support(
-            &schema_with_timestamp_nanos,
             &protocol_without_features,
+            &[&nested_schema_with],
+            "Table contains TIMESTAMP_NANOS columns but does not have the required 'timestampNanos' feature in reader and writer features",
         );
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NANOS columns but does not have the required 'timestampNanos' feature in reader and writer features");
-
-        // Nested schema with TIMESTAMP_NANOS
-        let nested_schema_with_timestamp_nanos = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
-                    "inner_ts",
-                    DataType::Primitive(PrimitiveType::TimestampNanos),
-                    true,
-                )]))),
-                true,
-            ),
-        ]);
-
-        let result = validate_timestamp_nanos_feature_support(
-            &nested_schema_with_timestamp_nanos,
-            &protocol_without_features,
-        );
-        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NANOS columns but does not have the required 'timestampNanos' feature in reader and writer features");
     }
 }

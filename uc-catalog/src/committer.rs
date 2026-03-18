@@ -3,7 +3,7 @@ use std::sync::Arc;
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use uc_client::models::commits::{Commit, CommitRequest};
-use uc_client::UCCommitsClient;
+use uc_client::UCCommitClient;
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
@@ -13,12 +13,12 @@ use uc_client::UCCommitsClient;
 /// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
-pub struct UCCommitter<C: UCCommitsClient> {
+pub struct UCCommitter<C: UCCommitClient> {
     commits_client: Arc<C>,
     table_id: String,
 }
 
-impl<C: UCCommitsClient> UCCommitter<C> {
+impl<C: UCCommitClient> UCCommitter<C> {
     /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the given
     /// `table_id`.
     pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
@@ -29,7 +29,7 @@ impl<C: UCCommitsClient> UCCommitter<C> {
     }
 }
 
-impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
+impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC. UC's committer elects to write out a
     /// staged commit for the actions then call the UC commit API to 'finalize' (ratify) the staged
     /// commit. Note that this will accumulate staged commits, and separately clients are expected
@@ -41,6 +41,11 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
+        if commit_metadata.version() == 0 {
+            return Err(DeltaError::unsupported(
+                "UCCommitter does not support version 0 (table creation) commits",
+            ));
+        }
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -123,37 +128,46 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use delta_kernel::committer::CatalogCommit;
+    use delta_kernel::committer::{CatalogCommit, CommitMetadata};
     use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
-    use object_store::local::LocalFileSystem;
     use std::fs;
     use uc_client::error::Result;
-    use uc_client::models::commits::{CommitsRequest, CommitsResponse};
 
     struct MockCommitsClient;
 
-    impl UCCommitsClient for MockCommitsClient {
-        async fn get_commits(&self, _: CommitsRequest) -> Result<CommitsResponse> {
-            unimplemented!()
-        }
+    impl UCCommitClient for MockCommitsClient {
         async fn commit(&self, _: CommitRequest) -> Result<()> {
             unimplemented!()
         }
     }
 
+    #[test]
+    fn commit_rejects_version_0() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let result = committer.commit(&engine, Box::new(std::iter::empty()), commit_metadata);
+        assert!(
+            matches!(result, Err(DeltaError::Unsupported(_))),
+            "expected Unsupported error for version 0, got: {result:?}"
+        );
+    }
+
     fn staged_commit_url(table_root: &url::Url, version: Version) -> url::Url {
         table_root
             .join(&format!(
-                "_delta_log/_staged_commits/{:020}.uuid.json",
-                version
+                "_delta_log/_staged_commits/{version:020}.uuid.json"
             ))
             .unwrap()
     }
 
     fn published_commit_url(table_root: &url::Url, version: Version) -> url::Url {
         table_root
-            .join(&format!("_delta_log/{:020}.json", version))
+            .join(&format!("_delta_log/{version:020}.json"))
             .unwrap()
     }
 
@@ -201,10 +215,7 @@ mod tests {
         for v in versions {
             let path = published_commit_url(&table_root, v).to_file_path().unwrap();
             assert!(path.exists());
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                format!("version: {}", v)
-            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("version: {v}"));
         }
     }
 }

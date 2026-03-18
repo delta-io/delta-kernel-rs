@@ -11,7 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
-use object_store::DynObjectStore;
+use itertools::Itertools as _;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -22,10 +22,12 @@ use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::metrics::MetricsReporter;
+use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
+    StorageHandler,
 };
 
 pub mod executor;
@@ -88,6 +90,7 @@ const DEFAULT_BATCH_SIZE: usize = 1000;
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
+    task_executor: Arc<E>,
     storage: Arc<ObjectStoreStorageHandler<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
@@ -103,7 +106,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
 /// # use std::sync::Arc;
 /// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-/// # use object_store::local::LocalFileSystem;
+/// # use delta_kernel::object_store::local::LocalFileSystem;
 /// // Build a DefaultEngine with default executor
 /// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
 ///     .build();
@@ -189,24 +192,60 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(
                 object_store.clone(),
-                task_executor,
+                task_executor.clone(),
             )),
             object_store,
+            task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
             metrics_reporter,
         }
+    }
+
+    /// Enter the runtime context of the executor associated with this engine.
+    ///
+    /// # Panics
+    ///
+    /// When calling `enter` multiple times, the returned guards **must** be dropped in the reverse
+    /// order that they were acquired.  Failure to do so will result in a panic and possible memory
+    /// leaks.
+    pub fn enter(&self) -> <E as TaskExecutor>::Guard<'_> {
+        self.task_executor.enter()
     }
 
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.object_store.clone())
     }
 
+    /// Write `data` as a parquet file using the provided `write_context`.
+    ///
+    /// The `partition_values` keys should use **logical** column names. They will be
+    /// automatically translated to physical names using the column mapping mode from
+    /// `write_context`.
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        // Validate partition columns exist in the schema and translate logical names to physical names.
+        let physical_partition_values: HashMap<String, String> = partition_values
+            .into_iter()
+            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
+                let field = write_context
+                    .logical_schema()
+                    .field(&logical_name)
+                    .ok_or_else(|| {
+                        Error::generic(format!(
+                            "Partition column '{logical_name}' not found in table schema"
+                        ))
+                    })?;
+                let physical_name = field
+                    .physical_name(write_context.column_mapping_mode())
+                    .to_string();
+                Ok((physical_name, value))
+            })
+            .try_collect()?;
+
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.physical_schema();
@@ -220,7 +259,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .write_parquet_file(
                 write_context.target_dir(),
                 physical_data,
-                partition_values,
+                physical_partition_values,
                 Some(write_context.stats_columns()),
             )
             .await
@@ -283,7 +322,7 @@ mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use crate::metrics::MetricEvent;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     #[derive(Debug)]
     struct TestMetricsReporter;

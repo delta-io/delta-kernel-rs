@@ -92,7 +92,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     }
 }
 
-impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
+impl Deduplicator for FileActionDeduplicator<'_> {
     /// Checks if log replay already processed this logical file (in which case the current action
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it

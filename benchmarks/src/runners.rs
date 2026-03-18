@@ -1,0 +1,435 @@
+//! Benchmark runners for executing Delta table operations.
+//!
+//! Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
+//! so that `execute` measures only the operation itself
+//! Results are discarded for benchmarking purposes
+
+use crate::models::{
+    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+};
+use crate::predicate_parser::parse_predicate;
+use delta_kernel::expressions::PredicateRef;
+use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
+use delta_kernel::Snapshot;
+use delta_kernel::{Engine, Error};
+
+use std::hint::black_box;
+use std::sync::Arc;
+use std::thread;
+use url::Url;
+
+/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
+/// so that `execute` measures only the operation itself
+pub trait WorkloadRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
+    fn name(&self) -> &str;
+}
+
+pub struct ReadMetadataRunner {
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+    name: String,
+    config: ReadConfig,
+    predicate: Option<PredicateRef>,
+}
+
+impl ReadMetadataRunner {
+    pub fn setup(
+        table_info: &TableInfo,
+        case_name: &str,
+        read_spec: &ReadSpec,
+        config: ReadConfig,
+        engine: Arc<dyn Engine>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let url = table_info.resolved_table_root();
+
+        let mut builder = Snapshot::builder_for(url);
+        if let Some(version) = read_spec.version {
+            builder = builder.at_version(version);
+        }
+
+        let snapshot = builder.build(engine.as_ref())?;
+
+        let predicate = read_spec
+            .predicate
+            .as_deref()
+            .map(parse_predicate)
+            .transpose()?
+            .map(Arc::new);
+
+        let name = format!(
+            "{}/{}/{}/{}",
+            table_info.name,
+            case_name,
+            ReadOperation::ReadMetadata.as_str(),
+            config.name,
+        );
+
+        Ok(Self {
+            snapshot,
+            engine,
+            name,
+            config,
+            predicate,
+        })
+    }
+
+    fn execute_serial(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let scan = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .build()?;
+        let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
+        for result in metadata_iter {
+            black_box(result?);
+        }
+        Ok(())
+    }
+
+    fn execute_parallel(&self, num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let scan = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .build()?;
+
+        let mut phase1 = scan.parallel_scan_metadata(self.engine.clone())?;
+        for result in phase1.by_ref() {
+            black_box(result?);
+        }
+
+        match phase1.finish()? {
+            AfterSequentialScanMetadata::Done => {}
+            AfterSequentialScanMetadata::Parallel { state, files } => {
+                if num_threads == 0 {
+                    return Err("num_threads in ReadConfig must be greater than 0".into());
+                }
+                let files_per_worker = files.len().div_ceil(num_threads);
+
+                let partitions: Vec<_> = files
+                    .chunks(files_per_worker)
+                    .map(|chunk| chunk.to_vec())
+                    .collect();
+
+                let state = Arc::new(*state);
+
+                let handles: Vec<_> = partitions
+                    .into_iter()
+                    .map(|partition_files| {
+                        let engine = self.engine.clone();
+                        let state = state.clone();
+
+                        thread::spawn(move || -> Result<(), Error> {
+                            if partition_files.is_empty() {
+                                return Ok(());
+                            }
+
+                            let parallel =
+                                ParallelScanMetadata::try_new(engine, state, partition_files)?;
+                            for result in parallel {
+                                black_box(result?);
+                            }
+
+                            Ok(())
+                        })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    handle.join().map_err(|_| -> Box<dyn std::error::Error> {
+                        "Worker thread panicked".into()
+                    })??;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WorkloadRunner for ReadMetadataRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.config.parallel_scan {
+            ParallelScan::Disabled => {
+                self.execute_serial()?;
+            }
+            ParallelScan::Enabled { num_threads } => {
+                self.execute_parallel(*num_threads)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Factory function that creates the appropriate read runner for a given operation and config
+pub fn create_read_runner(
+    table_info: &TableInfo,
+    case_name: &str,
+    read_spec: &ReadSpec,
+    operation: ReadOperation,
+    config: ReadConfig,
+    engine: Arc<dyn Engine>,
+) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
+    match operation {
+        ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
+            table_info, case_name, read_spec, config, engine,
+        )?)),
+        ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
+    }
+}
+
+pub struct SnapshotConstructionRunner {
+    url: Url,
+    version: Option<u64>,
+    engine: Arc<dyn Engine>,
+    name: String,
+}
+
+impl SnapshotConstructionRunner {
+    pub fn setup(
+        table_info: &TableInfo,
+        case_name: &str,
+        snapshot_spec: &SnapshotConstructionSpec,
+        engine: Arc<dyn Engine>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let url = table_info.resolved_table_root();
+
+        let name = format!(
+            "{}/{}/{}",
+            table_info.name,
+            case_name,
+            snapshot_spec.as_str()
+        );
+
+        Ok(Self {
+            url,
+            version: snapshot_spec.version,
+            engine,
+            name,
+        })
+    }
+}
+
+impl WorkloadRunner for SnapshotConstructionRunner {
+    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut builder = Snapshot::builder_for(self.url.clone());
+        if let Some(version) = self.version {
+            builder = builder.at_version(version);
+        }
+        black_box(builder.build(self.engine.as_ref())?);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
+    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::object_store::local::LocalFileSystem;
+
+    fn test_table_info() -> TableInfo {
+        let path = format!(
+            "{}/../kernel/tests/data/basic_partitioned",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let json = format!(
+            r#"{{
+                "name": "basic_partitioned",
+                "description": "basic partitioned table for testing",
+                "tablePath": "{}",
+                "schema": {{
+                    "type": "struct",
+                    "fields": [
+                        {{"name": "letter",  "type": "string", "nullable": true, "metadata": {{}}}},
+                        {{"name": "number",  "type": "long",   "nullable": true, "metadata": {{}}}},
+                        {{"name": "a_float", "type": "double", "nullable": true, "metadata": {{}}}}
+                    ]
+                }},
+                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 2}},
+                "logInfo": {{
+                    "numAddFiles": 6,
+                    "numRemoveFiles": 0,
+                    "sizeInBytes": 4505,
+                    "numCommits": 2,
+                    "numActions": 10
+                }},
+                "properties": {{}},
+                "dataLayout": {{"numPartitionColumns": 1, "numDistinctPartitions": 5}},
+                "tags": []
+            }}"#,
+            Url::from_file_path(path).unwrap()
+        );
+        serde_json::from_str(&json).expect("failed to build test TableInfo")
+    }
+
+    fn test_read_spec() -> ReadSpec {
+        ReadSpec {
+            version: None,
+            predicate: None,
+        }
+    }
+
+    fn serial_config() -> ReadConfig {
+        ReadConfig {
+            name: "serial".to_string(),
+            parallel_scan: ParallelScan::Disabled,
+        }
+    }
+
+    fn parallel_config() -> ReadConfig {
+        ReadConfig {
+            name: "parallel2".to_string(),
+            parallel_scan: ParallelScan::Enabled { num_threads: 2 },
+        }
+    }
+
+    fn test_engine() -> Arc<dyn Engine> {
+        let store = Arc::new(LocalFileSystem::new());
+        Arc::new(DefaultEngine::builder(store).build())
+    }
+
+    #[test]
+    fn test_read_metadata_runner_serial() {
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "testCase",
+            &test_read_spec(),
+            serial_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/testCase/readMetadata/serial"
+        );
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_parallel() {
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "testCase",
+            &test_read_spec(),
+            parallel_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/testCase/readMetadata/parallel2"
+        );
+        assert!(runner.execute().is_ok());
+    }
+
+    fn test_snapshot_spec() -> SnapshotConstructionSpec {
+        SnapshotConstructionSpec { version: None }
+    }
+
+    #[test]
+    fn test_snapshot_construction_runner_setup() {
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "testCase",
+            &test_snapshot_spec(),
+            test_engine(),
+        );
+        assert!(runner.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_construction_runner_name() {
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "testCase",
+            &test_snapshot_spec(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert_eq!(
+            runner.name(),
+            "basic_partitioned/testCase/snapshotConstruction"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_construction_runner_execute() {
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "testCase",
+            &test_snapshot_spec(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_create_read_runner_read_metadata() {
+        let runner = create_read_runner(
+            &test_table_info(),
+            "testCase",
+            &test_read_spec(),
+            ReadOperation::ReadMetadata,
+            serial_config(),
+            test_engine(),
+        )
+        .expect("create_read_runner should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_with_valid_predicate() {
+        let mut spec = test_read_spec();
+        spec.predicate = Some("letter = 'a'".to_string());
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_engine(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn test_read_metadata_runner_with_invalid_predicate() {
+        let mut spec = test_read_spec();
+        spec.predicate = Some("a LIKE '%foo'".to_string());
+        let result = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_engine(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_read_runner_read_data_unimplemented() {
+        let result = create_read_runner(
+            &test_table_info(),
+            "testCase",
+            &test_read_spec(),
+            ReadOperation::ReadData,
+            serial_config(),
+            test_engine(),
+        );
+        assert!(result.is_err());
+    }
+}
