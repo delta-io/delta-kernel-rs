@@ -95,7 +95,8 @@ mod tests {
             "unexpected: {api_err:?}"
         );
 
-        let api_err = unitycatalog_client_api::Error::from(Error::InvalidConfiguration("bad".into()));
+        let api_err =
+            unitycatalog_client_api::Error::from(Error::InvalidConfiguration("bad".into()));
         assert!(
             matches!(api_err, unitycatalog_client_api::Error::Generic(ref msg) if msg == "Invalid configuration: bad"),
             "unexpected: {api_err:?}"
