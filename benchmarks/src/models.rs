@@ -103,7 +103,7 @@ pub struct LogInfo {
     /// Number of Remove file actions in the table
     pub num_remove_files: u64,
     /// Total on-disk size of all data files in bytes
-    pub size_in_bytes: u64,
+    pub size_in_bytes: Option<u64>,
     /// Number of commits (JSON log files) in the table history
     pub num_commits: u64,
     /// Total number of actions across all commits
