@@ -71,23 +71,17 @@ impl UCCommitsRestClient {
     }
 }
 
-fn uc_err_to_api_err(e: crate::Error) -> unitycatalog_client_api::Error {
-    unitycatalog_client_api::Error::Generic(e.to_string())
-}
-
 impl UCGetCommitsClient for UCCommitsRestClient {
     async fn get_commits(
         &self,
         request: CommitsRequest,
     ) -> unitycatalog_client_api::Result<CommitsResponse> {
-        self.get_commits_impl(request)
-            .await
-            .map_err(uc_err_to_api_err)
+        self.get_commits_impl(request).await.map_err(Into::into)
     }
 }
 
 impl UCCommitClient for UCCommitsRestClient {
     async fn commit(&self, request: CommitRequest) -> unitycatalog_client_api::Result<()> {
-        self.commit_impl(request).await.map_err(uc_err_to_api_err)
+        self.commit_impl(request).await.map_err(Into::into)
     }
 }
