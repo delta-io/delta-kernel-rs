@@ -529,36 +529,34 @@ mod tests {
         StructType::new_unchecked([serde_json::from_str(&schema).unwrap()])
     }
 
-    #[test]
-    fn test_column_mapping_enabled() {
-        [ColumnMappingMode::Name, ColumnMappingMode::Id]
-            .into_iter()
-            .for_each(|mode| {
-                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).unwrap();
+    #[rstest::rstest]
+    #[case::name(ColumnMappingMode::Name)]
+    #[case::id(ColumnMappingMode::Id)]
+    fn test_column_mapping_enabled(#[case] mode: ColumnMappingMode) {
+        let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).unwrap();
 
-                // missing annotation
-                let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
-                let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
-                let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
-                let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
-                validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
+        // missing annotation
+        let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
+        let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
+        let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
+        let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
+        validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
 
-                // wrong-type field id annotation (string instead of int)
-                let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
-                let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
+        // wrong-type field id annotation (string instead of int)
+        let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
+        let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
 
-                // wrong-type field name annotation (int instead of string)
-                let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
-                validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
-                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
-                validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
-            });
+        // wrong-type field name annotation (int instead of string)
+        let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
+        validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
+        let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
+        validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
     }
 
     #[test]
@@ -721,17 +719,17 @@ mod tests {
     }
 
     /// v3 + CM feature: mode=id/name without annotations → rejected (missing annotations).
-    #[test]
-    fn test_cm_v3_supported_mode_set_but_no_annotations() {
+    #[rstest::rstest]
+    #[case::id(ColumnMappingMode::Id)]
+    #[case::name(ColumnMappingMode::Name)]
+    fn test_cm_v3_supported_mode_set_but_no_annotations(#[case] mode: ColumnMappingMode) {
         let protocol =
             Protocol::try_new_modern([TableFeature::ColumnMapping], [TableFeature::ColumnMapping])
                 .unwrap();
-        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
-            assert!(
-                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
-                "v3+feat, mode={mode:?}, no annotations: should fail"
-            );
-        }
+        assert!(
+            make_cm_tc(plain_schema(), protocol, Some(mode)).is_err(),
+            "v3+feat, mode={mode:?}, no annotations: should fail"
+        );
     }
 
     /// v3 + CM feature: mode=none with annotations → rejected (orphaned annotations).
@@ -748,21 +746,23 @@ mod tests {
 
     /// v3 + no CM feature: mode=id/name without annotations → silently downgrades to None.
     /// The mode property is ignored per spec when the feature is not supported.
-    #[test]
-    fn test_cm_v3_not_supported_mode_set_no_annotations() {
+    #[rstest::rstest]
+    #[case::id(ColumnMappingMode::Id)]
+    #[case::name(ColumnMappingMode::Name)]
+    fn test_cm_v3_not_supported_mode_set_no_annotations(#[case] mode: ColumnMappingMode) {
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
-        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
-            let tc = make_cm_tc(plain_schema(), protocol.clone(), Some(mode))
-                .unwrap_or_else(|e| panic!("v3-feat, mode={mode:?}, no annotations: {e}"));
-            assert!(!tc.is_feature_supported(&TableFeature::ColumnMapping));
-            assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
-        }
+        let tc = make_cm_tc(plain_schema(), protocol, Some(mode))
+            .unwrap_or_else(|e| panic!("v3-feat, mode={mode:?}, no annotations: {e}"));
+        assert!(!tc.is_feature_supported(&TableFeature::ColumnMapping));
+        assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
     }
 
     /// Mixed protocol (2,7): CM listed in writer features and reader=2 should support CM.
-    #[test]
-    fn test_cm_mixed_2_7_listed_reader_sufficient() {
+    #[rstest::rstest]
+    #[case::id(ColumnMappingMode::Id)]
+    #[case::name(ColumnMappingMode::Name)]
+    fn test_cm_mixed_2_7_listed_reader_sufficient(#[case] mode: ColumnMappingMode) {
         let protocol = Protocol::try_new(
             2,
             7,
@@ -771,24 +771,26 @@ mod tests {
         )
         .unwrap();
 
-        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
-            let tc = make_cm_tc(annotated_schema(), protocol.clone(), Some(mode))
-                .unwrap_or_else(|e| panic!("mixed (2,7), mode={mode:?}: {e}"));
-            assert!(
-                tc.is_feature_supported(&TableFeature::ColumnMapping),
-                "mixed (2,7), mode={mode:?}: CM should be supported"
-            );
-            assert_eq!(
-                tc.column_mapping_mode(),
-                mode,
-                "mixed (2,7), mode={mode:?}: expected active CM mode"
-            );
-        }
+        let tc = make_cm_tc(annotated_schema(), protocol, Some(mode))
+            .unwrap_or_else(|e| panic!("mixed (2,7), mode={mode:?}: {e}"));
+        assert!(
+            tc.is_feature_supported(&TableFeature::ColumnMapping),
+            "mixed (2,7), mode={mode:?}: CM should be supported"
+        );
+        assert_eq!(
+            tc.column_mapping_mode(),
+            mode,
+            "mixed (2,7), mode={mode:?}: expected active CM mode"
+        );
     }
 
     /// Mixed protocol (2,7): CM listed and mode=id/name still requires schema annotations.
-    #[test]
-    fn test_cm_mixed_2_7_listed_reader_sufficient_no_annotations_rejected() {
+    #[rstest::rstest]
+    #[case::id(ColumnMappingMode::Id)]
+    #[case::name(ColumnMappingMode::Name)]
+    fn test_cm_mixed_2_7_listed_reader_sufficient_no_annotations_rejected(
+        #[case] mode: ColumnMappingMode,
+    ) {
         let protocol = Protocol::try_new(
             2,
             7,
@@ -797,36 +799,34 @@ mod tests {
         )
         .unwrap();
 
-        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
-            assert!(
-                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
-                "mixed (2,7), mode={mode:?}, no annotations: should fail"
-            );
-        }
+        assert!(
+            make_cm_tc(plain_schema(), protocol, Some(mode)).is_err(),
+            "mixed (2,7), mode={mode:?}, no annotations: should fail"
+        );
     }
 
     /// Legacy protocol (2,5): mode=id/name is supported but still requires schema annotations.
-    #[test]
-    fn test_cm_legacy_2_5_mode_set_requires_annotations() {
+    #[rstest::rstest]
+    #[case::id(ColumnMappingMode::Id)]
+    #[case::name(ColumnMappingMode::Name)]
+    fn test_cm_legacy_2_5_mode_set_requires_annotations(#[case] mode: ColumnMappingMode) {
         let protocol = Protocol::try_new_legacy(2, 5).unwrap();
 
-        for mode in [ColumnMappingMode::Id, ColumnMappingMode::Name] {
-            let tc = make_cm_tc(annotated_schema(), protocol.clone(), Some(mode))
-                .unwrap_or_else(|e| panic!("legacy (2,5), mode={mode:?}, annotated: {e}"));
-            assert!(
-                tc.is_feature_supported(&TableFeature::ColumnMapping),
-                "legacy (2,5), mode={mode:?}: CM should be supported"
-            );
-            assert_eq!(
-                tc.column_mapping_mode(),
-                mode,
-                "legacy (2,5), mode={mode:?}: expected active CM mode"
-            );
-            assert!(
-                make_cm_tc(plain_schema(), protocol.clone(), Some(mode)).is_err(),
-                "legacy (2,5), mode={mode:?}, no annotations: should fail"
-            );
-        }
+        let tc = make_cm_tc(annotated_schema(), protocol.clone(), Some(mode))
+            .unwrap_or_else(|e| panic!("legacy (2,5), mode={mode:?}, annotated: {e}"));
+        assert!(
+            tc.is_feature_supported(&TableFeature::ColumnMapping),
+            "legacy (2,5), mode={mode:?}: CM should be supported"
+        );
+        assert_eq!(
+            tc.column_mapping_mode(),
+            mode,
+            "legacy (2,5), mode={mode:?}: expected active CM mode"
+        );
+        assert!(
+            make_cm_tc(plain_schema(), protocol, Some(mode)).is_err(),
+            "legacy (2,5), mode={mode:?}, no annotations: should fail"
+        );
     }
 
     /// Mixed protocol with reader=1 and CM listed should be rejected by protocol validation.
@@ -849,59 +849,59 @@ mod tests {
 
     /// Mixed protocol dependency bridge: modern iceberg writer-only features can coexist with CM
     /// in (2,7), and missing CM should fail write support checks.
-    #[test]
-    fn test_cm_mixed_2_7_iceberg_dependency_bridge() {
-        for iceberg_feature in [TableFeature::IcebergCompatV1, TableFeature::IcebergCompatV2] {
-            // Valid bridge shape: (2,7) with both iceberg feature and columnMapping listed.
-            let protocol_with_cm = Protocol::try_new(
-                2,
-                7,
-                TableFeature::NO_LIST,
-                Some(vec![iceberg_feature.clone(), TableFeature::ColumnMapping]),
-            )
-            .unwrap();
+    #[rstest::rstest]
+    #[case::iceberg_v1(TableFeature::IcebergCompatV1)]
+    #[case::iceberg_v2(TableFeature::IcebergCompatV2)]
+    fn test_cm_mixed_2_7_iceberg_dependency_bridge(#[case] iceberg_feature: TableFeature) {
+        // Valid bridge shape: (2,7) with both iceberg feature and columnMapping listed.
+        let protocol_with_cm = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![iceberg_feature.clone(), TableFeature::ColumnMapping]),
+        )
+        .unwrap();
 
-            let tc = make_cm_tc(
-                annotated_schema(),
-                protocol_with_cm,
-                Some(ColumnMappingMode::Name), // CM must be enabled for iceberg dependency
-            )
-            .unwrap();
-            assert!(
-                tc.is_feature_supported(&TableFeature::ColumnMapping),
-                "mixed bridge (2,7), feature={iceberg_feature}: CM should be supported"
-            );
-            assert!(
-                tc.is_feature_supported(&iceberg_feature),
-                "mixed bridge (2,7), feature={iceberg_feature}: feature should be supported"
-            );
-            // Kernel support for iceberg writes remains unsupported on this branch.
-            assert!(tc.ensure_operation_supported(Operation::Write).is_err());
+        let tc = make_cm_tc(
+            annotated_schema(),
+            protocol_with_cm,
+            Some(ColumnMappingMode::Name), // CM must be enabled for iceberg dependency
+        )
+        .unwrap();
+        assert!(
+            tc.is_feature_supported(&TableFeature::ColumnMapping),
+            "mixed bridge (2,7), feature={iceberg_feature}: CM should be supported"
+        );
+        assert!(
+            tc.is_feature_supported(&iceberg_feature),
+            "mixed bridge (2,7), feature={iceberg_feature}: feature should be supported"
+        );
+        // Kernel support for iceberg writes remains unsupported on this branch.
+        assert!(tc.ensure_operation_supported(Operation::Write).is_err());
 
-            // Missing CM from writer list should fail write support checks.
-            let protocol_missing_cm = Protocol::try_new(
-                2,
-                7,
-                TableFeature::NO_LIST,
-                Some(vec![iceberg_feature.clone()]),
-            )
-            .unwrap();
-            let tc_missing_cm = make_cm_tc(
-                annotated_schema(),
-                protocol_missing_cm,
-                Some(ColumnMappingMode::Name),
-            )
-            .unwrap();
-            assert!(
-                !tc_missing_cm.is_feature_supported(&TableFeature::ColumnMapping),
-                "mixed bridge (2,7), feature={iceberg_feature}: CM should not be supported when unlisted"
-            );
-            let write_check = tc_missing_cm.ensure_operation_supported(Operation::Write);
-            assert!(
-                write_check.is_err(),
-                "mixed bridge (2,7), feature={iceberg_feature}: missing CM should fail write support"
-            );
-        }
+        // Missing CM from writer list should fail write support checks.
+        let protocol_missing_cm = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![iceberg_feature.clone()]),
+        )
+        .unwrap();
+        let tc_missing_cm = make_cm_tc(
+            annotated_schema(),
+            protocol_missing_cm,
+            Some(ColumnMappingMode::Name),
+        )
+        .unwrap();
+        assert!(
+            !tc_missing_cm.is_feature_supported(&TableFeature::ColumnMapping),
+            "mixed bridge (2,7), feature={iceberg_feature}: CM should not be supported when unlisted"
+        );
+        let write_check = tc_missing_cm.ensure_operation_supported(Operation::Write);
+        assert!(
+            write_check.is_err(),
+            "mixed bridge (2,7), feature={iceberg_feature}: missing CM should fail write support"
+        );
     }
 
     // =========================================================================
