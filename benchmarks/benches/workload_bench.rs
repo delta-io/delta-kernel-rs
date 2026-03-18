@@ -3,8 +3,9 @@ use std::sync::Arc;
 use criterion::measurement::WallTime;
 use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::local::LocalFileSystem;
 
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
@@ -14,13 +15,17 @@ use delta_kernel_benchmarks::runners::{
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
 
-fn setup_engine() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-    use delta_kernel::object_store::local::LocalFileSystem;
-
+fn setup_engine() -> Arc<DefaultEngine<TokioMultiThreadExecutor>> {
     let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngine::builder(store).build();
-
-    Arc::new(engine)
+    let executor = Arc::new(
+        TokioMultiThreadExecutor::new_owned_runtime(None, None)
+            .expect("Failed to create tokio multi-thread executor"),
+    );
+    Arc::new(
+        DefaultEngine::builder(store)
+            .with_task_executor(executor)
+            .build(),
+    )
 }
 
 // Loads all workloads and sets up a shared engine and benchmark group
