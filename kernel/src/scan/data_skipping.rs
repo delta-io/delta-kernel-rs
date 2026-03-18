@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use tracing::{debug, error, info};
 
@@ -14,6 +15,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
+use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -73,6 +75,8 @@ pub(crate) struct DataSkippingFilter {
     stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
+    /// Metrics to record data skipping statistics.
+    metrics: Option<Arc<ScanMetrics>>,
 }
 
 impl DataSkippingFilter {
@@ -97,6 +101,8 @@ impl DataSkippingFilter {
     ///   `partitionValues` string map into a typed struct. Only used when `partition_schema` is
     ///   `Some`.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
+    /// - `metrics`: Optional metrics to record data skipping statistics.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         engine: &dyn Engine,
         predicate: Option<PredicateRef>,
@@ -105,6 +111,7 @@ impl DataSkippingFilter {
         partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
         input_schema: SchemaRef,
+        metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
@@ -167,6 +174,7 @@ impl DataSkippingFilter {
             stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
+            metrics,
         })
     }
 
@@ -230,6 +238,7 @@ impl DataSkippingFilter {
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
     pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        let start_time = Instant::now();
         let batch_len = batch.len();
 
         let file_stats = self.stats_evaluator.evaluate(batch)?;
@@ -277,6 +286,11 @@ impl DataSkippingFilter {
             .count();
         if skipped > 0 {
             info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
+        }
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.add_predicate_filtered(visitor.num_filtered);
+            metrics.add_predicate_eval_time_ns(start_time.elapsed().as_nanos() as u64)
         }
 
         Ok(visitor.selection_vector)
