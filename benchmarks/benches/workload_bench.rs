@@ -5,6 +5,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::local::LocalFileSystem;
 
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
@@ -15,8 +16,6 @@ use delta_kernel_benchmarks::runners::{
 use delta_kernel_benchmarks::utils::load_all_workloads;
 
 fn setup_engine() -> Arc<DefaultEngine<TokioMultiThreadExecutor>> {
-    use delta_kernel::object_store::local::LocalFileSystem;
-
     let store = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
         TokioMultiThreadExecutor::new_owned_runtime(None, None)
