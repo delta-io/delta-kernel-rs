@@ -49,4 +49,10 @@ cargo build -p delta_kernel_ffi --release
 # Headers written to target/ffi-headers/
 ```
 
-Feature flags: `default-engine-rustls` (default), `default-engine-native-tls`, `catalog-managed`, `tracing`.
+Feature flags:
+- `default-engine-rustls` (default)
+- `default-engine-native-tls`
+- `arrow` (default; currently maps to `arrow-57`)
+- `arrow-57`, `arrow-56`
+- `catalog-managed`
+- `tracing`

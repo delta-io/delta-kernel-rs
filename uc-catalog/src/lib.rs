@@ -134,6 +134,7 @@ mod tests {
     use std::env;
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::object_store;
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
@@ -251,7 +252,7 @@ mod tests {
 
         let table_url = Url::parse(&table_uri)?;
         let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
-        let store: Arc<dyn object_store::ObjectStore> = store.into();
+        let store = Arc::new(store);
 
         let engine = DefaultEngineBuilder::new(store.clone()).build();
         let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));

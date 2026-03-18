@@ -10,7 +10,7 @@ use delta_kernel::{
     SnapshotRef,
 };
 
-use object_store::{
+use delta_kernel::object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
     DynObjectStore, ObjectStoreScheme,
 };

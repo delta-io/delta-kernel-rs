@@ -12,6 +12,7 @@ use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
 use delta_kernel::log_segment::LogSegment;
+use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
@@ -20,7 +21,6 @@ use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, St
 use delta_kernel::{Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
@@ -52,9 +52,11 @@ fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let parquet_bytes = record_batch_to_bytes(&batch);
     let file_size = parquet_bytes.len() as u64;
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -77,13 +79,12 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
@@ -101,9 +102,11 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let parquet_bytes = record_batch_to_bytes(&batch);
     let file_size = parquet_bytes.len() as u64;
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -113,6 +116,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     add_commit(
+        table_root,
         storage.as_ref(),
         1,
         actions_to_string(vec![TestAction::AddWithSize(
@@ -134,13 +138,12 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
@@ -159,9 +162,11 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let parquet_bytes = record_batch_to_bytes(&batch);
     let file_size = parquet_bytes.len() as u64;
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -171,6 +176,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     add_commit(
+        table_root,
         storage.as_ref(),
         1,
         actions_to_string(vec![TestAction::AddWithSize(
@@ -180,6 +186,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     add_commit(
+        table_root,
         storage.as_ref(),
         2,
         actions_to_string(vec![TestAction::RemoveWithSize(
@@ -195,13 +202,12 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
@@ -238,8 +244,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     // valid commit with min/max (0, 2)
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -250,6 +258,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
     add_commit(
+        table_root,
         storage.as_ref(),
         1,
         generate_commit2(vec![TestAction::AddWithSize(
@@ -273,9 +282,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let location = Url::parse("memory:///").unwrap();
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -1025,6 +1033,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     let batch = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
 
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[\"id\"]"},"isBlindAppend":true}}"#.to_string(),
@@ -1033,7 +1042,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         format!(r#"{{"add":{{"path":"id=2/{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":0,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
     ];
 
-    add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
             &Path::from("id=1").child(PARQUET_FILE1),
@@ -1047,10 +1056,8 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
-
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
@@ -1078,6 +1085,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     let batch_2 = generate_batch(vec![("val", vec!["d", "e", "f"].into_array())])?;
 
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
@@ -1092,7 +1100,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         .set_statistics_enabled(EnabledStatistics::None)
         .build();
 
-    add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
             &Path::from(PARQUET_FILE1),
@@ -1106,10 +1114,8 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
-
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot
@@ -1361,7 +1367,9 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let file_size3 = record_batch_to_bytes(&batch3).len() as u64;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1386,7 +1394,6 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes a row index metadata column
@@ -1396,7 +1403,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         StructField::nullable("value", DataType::STRING),
     ])?);
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     let mut file_count = 0;
@@ -1458,7 +1465,9 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1478,7 +1487,6 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes the file path metadata column
@@ -1488,7 +1496,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         StructField::nullable("value", DataType::STRING),
     ])?);
 
-    let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     let mut file_count = 0;
@@ -1520,7 +1528,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         // Verify the file path column contains the expected file name
         let file_path_array = batch.column(1);
         let expected_file_name = expected_files[file_count];
-        let expected_path = format!("{location}{expected_file_name}");
+        let expected_path = format!("{table_root}{expected_file_name}");
 
         // The file path array should be a plain StringArray with the path repeated for each row.
         let string_array = file_path_array
@@ -1554,7 +1562,9 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
     // Prepare an in-memory table with some data
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1570,7 +1580,6 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Test that unsupported metadata columns fail with appropriate errors
@@ -1588,7 +1597,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
     ];
 
     for (column_name, metadata_spec, error_text) in test_cases {
-        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         let schema = Arc::new(StructType::try_new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::create_metadata_column(column_name, metadata_spec),
@@ -1613,7 +1622,9 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1636,7 +1647,6 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     let invalid_files = [
@@ -1700,7 +1710,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
     for invalid_file in invalid_files.iter() {
         let invalid_path = Path::from(*invalid_file);
         storage.put(&invalid_path, vec![1u8].into()).await?;
-        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
         storage.delete(&invalid_path).await?;
     }
@@ -1710,7 +1720,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         let invalid_path = Path::from(*invalid_file);
         storage.put(&invalid_path, vec![1u8].into()).await?;
     }
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
 
     Ok(())
