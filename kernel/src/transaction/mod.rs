@@ -1300,13 +1300,8 @@ mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
-    use crate::arrow::array::{
-        ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
-    };
-    use crate::arrow::buffer::OffsetBuffer;
-    use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
-    };
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::arrow_conversion::TryIntoArrow;
