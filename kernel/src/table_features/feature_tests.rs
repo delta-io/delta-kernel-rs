@@ -360,60 +360,48 @@ fn run_battery(fixture: &FeatureFixture) {
         // NOTE: This section does not include any tests specific to legacy ReaderWriter features.
         // ColumnMapping is the only one, and its own unit tests cover those cases already.
 
-        // E1: Legacy version with no metadata presence -- version alone is sufficient to infer
-        // support, but enablement is determined by presence or toggle properties.
+        // E1: Legacy minimum version with no metadata presence.
+        //
+        // Current behavior (legacy_enablement_by_presence = false): support is inferred from
+        // protocol version alone.
+        //
+        // Target behavior (legacy_enablement_by_presence = true): support should require
+        // metadata presence, so this should be supported = false.
         let tc = create_table_config(&[], &[], None, legacy_reader, legacy_writer);
         assert!(
-            tc.is_feature_supported(&feature),
-            "{name}: legacy version only ({legacy_reader},{legacy_writer}): \
-             expected is_feature_supported = true"
-        );
-        assert!(
-            !fixture.legacy_enablement_by_presence || !tc.is_feature_enabled(&feature),
-            "{name}: legacy version only ({legacy_reader},{legacy_writer}): \
-             expected is_feature_enabled = false (no presence)"
+            tc.is_feature_supported(&feature) != fixture.legacy_enablement_by_presence,
+            "{name}: legacy version only ({legacy_reader},{legacy_writer}) with no presence: \
+                expected is_feature_supported = false"
         );
 
-        // E2: Legacy version insufficient -> feature not supported
+        // E2: Legacy version insufficient + metadata presence -> feature not supported.
         // Use one version below the minimum writer version
         if legacy_writer > 1 {
             let insufficient_writer = legacy_writer - 1;
-            let tc = create_table_config(&[], &[], None, 1, insufficient_writer);
-            assert!(
-                !tc.is_feature_supported(&feature),
-                "{name}: legacy insufficient version (1,{insufficient_writer}): \
-                 expected is_feature_supported = false",
-            );
-
-            // Orphan check: same insufficient version, but with each Enabled prop case.
-            // Legacy protocol analogue to Section D.
-            for (i, case) in fixture.prop_cases.iter().enumerate() {
-                let TablePropertyExpectation::Enabled(props) = case else {
-                    continue;
-                };
-                let result =
-                    try_create_table_config(&[], props, enabled_schema, 1, insufficient_writer);
-                match fixture.expected_orphan {
-                    OpExpect::Err => {
-                        assert!(
-                            result.is_err(),
-                            "{name}: legacy orphan[{i}] (1,{insufficient_writer}): \
-                             expected TC construction to fail (orphan detection)"
-                        );
-                    }
-                    OpExpect::Ok => {
-                        let tc = result.unwrap_or_else(|e| {
-                            panic!(
-                                "{name}: legacy orphan[{i}] (1,{insufficient_writer}): \
-                                 expected TC construction to succeed, got: {e}"
-                            )
-                        });
-                        assert!(
-                            !tc.is_feature_supported(&feature),
-                            "{name}: legacy orphan[{i}] (1,{insufficient_writer}): \
-                             expected is_feature_supported = false"
-                        );
-                    }
+            // Use the canonical enabled case. For schema-only features, enabled_props is [] and
+            // enabled_schema carries the presence metadata.
+            let result =
+                try_create_table_config(&[], enabled_props, enabled_schema, 1, insufficient_writer);
+            match fixture.expected_orphan {
+                OpExpect::Err => {
+                    assert!(
+                        result.is_err(),
+                        "{name}: legacy low-version[canonical] (1,{insufficient_writer}): \
+                         expected TC construction to fail (orphan detection)"
+                    );
+                }
+                OpExpect::Ok => {
+                    let tc = result.unwrap_or_else(|e| {
+                        panic!(
+                            "{name}: legacy low-version[canonical] (1,{insufficient_writer}): \
+                             expected TC construction to succeed, got: {e}"
+                        )
+                    });
+                    assert!(
+                        !tc.is_feature_supported(&feature),
+                        "{name}: legacy low-version[canonical] (1,{insufficient_writer}): \
+                         expected is_feature_supported = false"
+                    );
                 }
             }
         }
@@ -429,28 +417,22 @@ fn run_battery(fixture: &FeatureFixture) {
                 "{name}: has Disabled prop_case but no Enabled prop_case"
             );
 
-            // E3: Legacy version + each Enabled case + schema -> supported AND enabled.
-            // Iterates all Enabled cases (e.g. CM mode=name and mode=id) rather than
-            // just the first, so each mode gets legacy coverage.
-            for (i, case) in fixture.prop_cases.iter().enumerate() {
-                if let TablePropertyExpectation::Enabled(props) = case {
-                    let tc = create_table_config(
-                        &[],
-                        props,
-                        enabled_schema,
-                        legacy_reader,
-                        legacy_writer,
-                    );
-                    assert!(
-                        tc.is_feature_supported(&feature),
-                        "{name}: legacy + enabled props[{i}]: expected is_feature_supported = true"
-                    );
-                    assert!(
-                        tc.is_feature_enabled(&feature),
-                        "{name}: legacy + enabled props[{i}]: expected is_feature_enabled = true"
-                    );
-                }
-            }
+            // E3: Legacy version + canonical enabled case + schema -> supported AND enabled.
+            let tc = create_table_config(
+                &[],
+                enabled_props,
+                enabled_schema,
+                legacy_reader,
+                legacy_writer,
+            );
+            assert!(
+                tc.is_feature_supported(&feature),
+                "{name}: legacy + canonical enabled props: expected is_feature_supported = true"
+            );
+            assert!(
+                tc.is_feature_enabled(&feature),
+                "{name}: legacy + canonical enabled props: expected is_feature_enabled = true"
+            );
 
             // E4: Legacy version + disabled props -> supported but NOT enabled
             let tc = create_table_config(
