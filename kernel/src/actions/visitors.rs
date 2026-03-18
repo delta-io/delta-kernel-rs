@@ -699,7 +699,10 @@ impl RowVisitor for InCommitTimestampVisitor {
 mod tests {
     use super::*;
 
-    use crate::arrow::array::StringArray;
+    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
 
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
@@ -1306,17 +1309,8 @@ mod tests {
 
     // Helper to create a boolean batch for SelectionVectorVisitor tests
     fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
-        use crate::arrow::array::BooleanArray;
-        use crate::arrow::datatypes::{Field, Schema as ArrowSchema};
-        use crate::arrow::record_batch::RecordBatch;
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let array = BooleanArray::from(values);
-        let arrow_schema = ArrowSchema::new(vec![Field::new(
-            "output",
-            crate::arrow::datatypes::DataType::Boolean,
-            false,
-        )]);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("output", DataType::Boolean, false)]);
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
         Box::new(ArrowEngineData::new(batch))
     }
