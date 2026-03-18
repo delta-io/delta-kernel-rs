@@ -2077,8 +2077,16 @@ mod tests {
                             )
                         };
                         let (null_count, min, max) = match stat {
-                            TestFileStats::Present => (value_struct(Some(0)), value_struct(Some(1)), value_struct(Some(100))),
-                            _ => (value_struct(Some(100)), value_struct(None), value_struct(None)),
+                            TestFileStats::Present => (
+                                value_struct(Some(0)),
+                                value_struct(Some(1)),
+                                value_struct(Some(100)),
+                            ),
+                            _ => (
+                                value_struct(Some(100)),
+                                value_struct(None),
+                                value_struct(None),
+                            ),
                         };
                         Scalar::Struct(
                             StructData::try_new(
@@ -2099,7 +2107,9 @@ mod tests {
             })
             .collect();
         let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
-        ArrowEvaluationHandler.create_many(schema, &row_refs).unwrap()
+        ArrowEvaluationHandler
+            .create_many(schema, &row_refs)
+            .unwrap()
     }
 
     #[test]
