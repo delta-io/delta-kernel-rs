@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use unitycatalog_client_rest_impl::{
-    models::{Commit, credentials::Operation, CommitsRequest},
+    models::{credentials::Operation, Commit, CommitsRequest},
     UCClient, UCCommitsRestClient, UCGetCommitsClient,
 };
 
