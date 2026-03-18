@@ -1523,6 +1523,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "date" => Ok(PrimitiveType::Date),
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            "timestamp_nanos" => Ok(PrimitiveType::TimestampNanos),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');

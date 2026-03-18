@@ -386,7 +386,9 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
             match data_type {
-                &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
+                &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ | &DataType::TIMESTAMP_NANOS => {
+                    None
+                }
                 _ => Some(Expr::from(column_name!("stats_parsed.maxValues").join(col))),
             }
         }
@@ -508,7 +510,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
             return None;
         }
         match data_type {
-            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
+            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ | &DataType::TIMESTAMP_NANOS => None,
             _ => Some(joined_column_expr!("maxValues", col)),
         }
     }

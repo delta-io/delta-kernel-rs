@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int32Type, Int64Type,
-    TimestampMicrosecondType,
+    TimestampMicrosecondType, TimestampNanosecondType,
 };
 use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
@@ -452,6 +452,12 @@ impl ArrowEngineData {
             &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
                 debug!("Pushing timestamp array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<TimestampMicrosecondType>()
+                    .map(|a| a as _)
+                    .ok_or("timestamp")
+            }
+            &DataType::TIMESTAMP_NANOS => {
+                debug!("Pushing timestamp array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<TimestampNanosecondType>()
                     .map(|a| a as _)
                     .ok_or("timestamp")
             }

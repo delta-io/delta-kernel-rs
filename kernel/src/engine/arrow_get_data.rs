@@ -4,7 +4,7 @@ use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     types::{
         Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
-        Int32Type, Int64Type, TimestampMicrosecondType,
+        Int32Type, Int64Type, TimestampMicrosecondType, TimestampNanosecondType,
     },
     Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray,
@@ -55,6 +55,12 @@ impl GetData<'_> for PrimitiveArray<Date32Type> {
 }
 
 impl GetData<'_> for PrimitiveArray<TimestampMicrosecondType> {
+    fn get_timestamp(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<TimestampNanosecondType> {
     fn get_timestamp(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
