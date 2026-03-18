@@ -33,7 +33,6 @@ pub use client::UCClient;
 pub use commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
-pub use unitycatalog_client_api::{GetTableClient, UCGetStagingTableClient};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use commits_client::{InMemoryCommitsClient, TableData};

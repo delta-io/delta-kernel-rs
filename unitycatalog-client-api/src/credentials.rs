@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Operation {
@@ -53,11 +51,3 @@ pub struct AwsTempCredentials {
     pub session_token: String,
 }
 
-#[allow(async_fn_in_trait)]
-pub trait UCGetStagingTableClient: Send + Sync {
-    async fn get_credentials(
-        &self,
-        table_id: &str,
-        operation: Operation,
-    ) -> Result<TemporaryTableCredentials>;
-}

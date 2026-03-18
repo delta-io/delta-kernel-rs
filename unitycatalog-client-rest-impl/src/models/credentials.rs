@@ -1,5 +1,5 @@
 use serde::Serialize;
-pub use unitycatalog_client_api::Operation;
+use unitycatalog_client_api::Operation;
 
 /// The HTTP request body for the temporary credentials endpoint.
 #[derive(Debug, Clone, Serialize)]

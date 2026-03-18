@@ -138,7 +138,7 @@ mod tests {
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
-    use unitycatalog_client_rest_impl::models::credentials::Operation;
+    use unitycatalog_client_api::Operation;
     use unitycatalog_client_rest_impl::{UCClient, UCCommitsRestClient};
 
     use super::*;

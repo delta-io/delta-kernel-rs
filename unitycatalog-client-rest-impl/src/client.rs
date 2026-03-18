@@ -2,13 +2,11 @@ use reqwest::StatusCode;
 use tracing::instrument;
 use url::Url;
 
-use unitycatalog_client_api::{GetTableClient, TableInfo, UCGetStagingTableClient};
+use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
 
 use crate::config::ClientConfig;
 use crate::error::{Error, Result};
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
-
 use crate::models::credentials::CredentialsRequest;
 use crate::models::tables::TablesResponse;
 
@@ -75,26 +73,3 @@ impl UCClient {
     }
 }
 
-impl GetTableClient for UCClient {
-    async fn get_table(&self, table_name: &str) -> unitycatalog_client_api::Result<TableInfo> {
-        UCClient::get_table(self, table_name)
-            .await
-            .map_err(unitycatalog_client_api::Error::from)
-            .map(|resp| TableInfo {
-                table_id: resp.table_id,
-                storage_location: resp.storage_location,
-            })
-    }
-}
-
-impl UCGetStagingTableClient for UCClient {
-    async fn get_credentials(
-        &self,
-        table_id: &str,
-        operation: unitycatalog_client_api::Operation,
-    ) -> unitycatalog_client_api::Result<unitycatalog_client_api::TemporaryTableCredentials> {
-        UCClient::get_credentials(self, table_id, operation)
-            .await
-            .map_err(unitycatalog_client_api::Error::from)
-    }
-}

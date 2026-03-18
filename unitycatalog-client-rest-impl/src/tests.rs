@@ -1,4 +1,4 @@
-use crate::models::credentials::Operation;
+use unitycatalog_client_api::Operation;
 use unitycatalog_client_api::CommitsRequest;
 
 #[test]
