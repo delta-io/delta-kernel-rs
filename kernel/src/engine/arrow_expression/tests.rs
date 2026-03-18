@@ -919,9 +919,6 @@ fn test_null_scalar_map() -> DeltaResult<()> {
 
 #[test]
 fn test_apply_schema_column_count_mismatch() {
-    use super::apply_schema::apply_schema;
-    use crate::schema::StructType;
-
     // Create a struct array with 3 columns
     let struct_array = StructArray::from(vec![
         (
