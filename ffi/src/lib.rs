@@ -46,6 +46,8 @@ pub mod error;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
+#[cfg(feature = "delta-kernel-unity-catalog")]
+pub mod delta_kernel_unity_catalog;
 pub mod expressions;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
@@ -54,8 +56,6 @@ pub mod log_path;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
-#[cfg(feature = "delta-kernel-unity-catalog")]
-pub mod delta_kernel_unity_catalog;
 
 #[cfg(test)]
 mod ffi_test_utils;
