@@ -290,11 +290,9 @@ impl DataSkippingFilter {
 
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.add_predicate_filtered(visitor.num_filtered);
+            metrics.add_predicate_eval_time_ns(start_time.elapsed().as_nanos() as u64)
         }
-        let elapsed_ns = start_time.elapsed().as_nanos() as u64;
-        self.metrics
-            .as_ref()
-            .inspect(|metrics| metrics.add_predicate_eval_time_ns(elapsed_ns));
+
         Ok(visitor.selection_vector)
     }
 }

@@ -36,9 +36,9 @@ pub struct SequentialScanMetadata {
 
 impl SequentialScanMetadata {
     pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
-        // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
         Self {
             sequential,
+            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
             span: info_span!("sequential_scan_metadata"),
         }
     }
@@ -197,9 +197,9 @@ impl ParallelScanMetadata {
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
         let read_schema = state.file_read_schema();
-        // TODO: Associate the same scan ID from sequential phase to correlate phases
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         })
     }
@@ -208,9 +208,9 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
-        // TODO: Associate the same scan ID from sequential phase to correlate phases
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
+            // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         }
     }

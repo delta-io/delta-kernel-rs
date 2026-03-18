@@ -457,15 +457,13 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                 )?;
 
                 let is_pruned = self.is_file_partition_pruned(&partition_values);
-
-                let elapsed_ns = start.elapsed().as_nanos() as u64;
-                self.metrics.add_predicate_eval_time_ns(elapsed_ns);
+                self.metrics
+                    .add_predicate_eval_time_ns(start.elapsed().as_nanos() as u64);
 
                 if is_pruned {
                     self.metrics.incr_predicate_filtered();
                     return Ok(false);
                 }
-
                 partition_values
             }
             _ => Default::default(),
@@ -552,8 +550,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             }
         }
 
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
-        self.metrics.add_dedup_visitor_time_ns(elapsed_ns);
+        self.metrics
+            .add_dedup_visitor_time_ns(start.elapsed().as_nanos() as u64);
 
         Ok(())
     }
@@ -667,7 +665,6 @@ fn get_add_transform_expr(
 // deletion vector update transformations.
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
-    use crate::expressions::column_expr_ref;
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
         Arc::new(Expression::struct_from([Arc::new(
             Expression::struct_from([
