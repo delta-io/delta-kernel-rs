@@ -10,11 +10,11 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
 };
-use delta_kernel_benchmarks::reporting::CountingReporter;
 use delta_kernel_benchmarks::runners::{
     create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
+use test_utils::CountingReporter;
 
 fn setup_engine() -> (
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,

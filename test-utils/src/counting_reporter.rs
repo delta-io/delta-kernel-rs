@@ -1,12 +1,8 @@
-//! Benchmark reporting utilities for collecting and displaying operation metrics.
+//! A [`MetricsReporter`] implementation that accumulates operation counts via atomic counters.
 //!
-//! [`CountingReporter`] implements [`MetricsReporter`] using atomic counters to accumulate
-//! storage-level and operation-level metrics. Attach it to a `DefaultEngine` via
-//! `DefaultEngineBuilder::with_metrics_reporter`, then after each Criterion timing pass:
-//!
-//! 1. Call [`CountingReporter::reset`] to zero all counters.
-//! 2. Call `runner.execute()` once to collect a single-iteration sample.
-//! 3. Call [`CountingReporter::print_summary`] to display the IO profile.
+//! Useful in tests to assert exact IO costs and in benchmarks to print per-call IO profiles.
+//! Attach it to a `DefaultEngine` via `DefaultEngineBuilder::with_metrics_reporter`, then
+//! inspect the counters or call [`CountingReporter::print_summary`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -70,7 +66,7 @@ impl CountingReporter {
 
     /// Reset all counters to zero.
     ///
-    /// Call this immediately before a single profiling iteration to get per-call counts.
+    /// Useful before a single profiling iteration to get per-call counts.
     pub fn reset(&self) {
         self.list_calls.store(0, Ordering::Relaxed);
         self.list_files_seen.store(0, Ordering::Relaxed);
@@ -91,10 +87,11 @@ impl CountingReporter {
         self.compaction_files.store(0, Ordering::Relaxed);
     }
 
-    /// Print a human-readable IO and operation summary for one profiling iteration.
+    /// Print a human-readable IO and operation summary.
     ///
-    /// Intended to be called after [`reset`][Self::reset] and one `execute()` call,
-    /// so values reflect a single operation's cost.
+    /// Intended to be called after [`reset`][Self::reset] and one operation so values
+    /// reflect a single call's cost. Output goes to stdout and is visible with
+    /// `cargo test -- --nocapture` or `cargo nextest run -- --no-capture`.
     pub fn print_summary(&self, label: &str) {
         let list_calls = self.list_calls.load(Ordering::Relaxed);
         let list_files = self.list_files_seen.load(Ordering::Relaxed);

@@ -16,6 +16,7 @@ arrow-56 = ["delta_kernel/arrow-56"]
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api"] }
+test_utils = { path = "../test-utils" }
 flate2 = "1"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
