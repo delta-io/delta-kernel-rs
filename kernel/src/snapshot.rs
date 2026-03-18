@@ -2519,7 +2519,10 @@ mod tests {
             .listed
             .ascending_commit_files
             .len();
-        assert!(num_commits_before > 0, "should have accumulated commit files");
+        assert!(
+            num_commits_before > 0,
+            "should have accumulated commit files"
+        );
 
         // Write a checkpoint at version 4 (not the latest). This validates that the rebase
         // picks up the checkpoint AND preserves the commit file for version 5 on top of it.
@@ -2532,21 +2535,12 @@ mod tests {
         assert_eq!(rebased.log_segment().checkpoint_version, Some(4));
         // Only commit 5 should remain (on top of the checkpoint at 4), trimming commits 0-4.
         assert_eq!(
-            rebased
-                .log_segment()
-                .listed
-                .ascending_commit_files
-                .len(),
+            rebased.log_segment().listed.ascending_commit_files.len(),
             1,
             "only the commit after the checkpoint should remain"
         );
         assert!(
-            rebased
-                .log_segment()
-                .listed
-                .ascending_commit_files
-                .len()
-                < num_commits_before,
+            rebased.log_segment().listed.ascending_commit_files.len() < num_commits_before,
             "commit files should be trimmed after rebasing onto the checkpoint"
         );
 
