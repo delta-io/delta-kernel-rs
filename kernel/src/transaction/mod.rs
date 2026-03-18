@@ -1237,20 +1237,15 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::arrow::array::{
-        ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
-    };
-    use crate::arrow::buffer::OffsetBuffer;
-    use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
-    };
+    use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
-    use crate::schema::MapType;
+    use crate::expressions::{MapData, Scalar, StructData};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
@@ -1841,75 +1836,36 @@ mod tests {
         Ok(())
     }
 
-    /// Builds a RecordBatch with logical field names matching [`test_schema_nested`].
-    fn build_test_record_batch() -> DeltaResult<RecordBatch> {
-        let arrow_schema: ArrowSchema = test_schema_nested().as_ref().try_into_arrow()?;
-
-        let id_arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2]));
-
-        // info struct fields
-        let name_arr: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob"]));
-        let age_arr: ArrayRef = Arc::new(Int32Array::from(vec![30, 25]));
-
-        // info.tags: Map<String, String>
-        let keys = StringArray::from(vec!["k1", "k2"]);
-        let vals = StringArray::from(vec!["v1", "v2"]);
-        let entries_field = ArrowField::new(
-            "key_value",
-            ArrowDataType::Struct(
-                vec![
-                    ArrowField::new("key", ArrowDataType::Utf8, false),
-                    ArrowField::new("value", ArrowDataType::Utf8, true),
-                ]
-                .into(),
-            ),
-            false,
-        );
-        let entries = StructArray::try_new(
-            vec![
-                ArrowField::new("key", ArrowDataType::Utf8, false),
-                ArrowField::new("value", ArrowDataType::Utf8, true),
-            ]
-            .into(),
-            vec![Arc::new(keys), Arc::new(vals)],
-            None,
-        )?;
-        let map_offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
-        let tags_arr: ArrayRef = Arc::new(MapArray::new(
-            Arc::new(entries_field),
-            map_offsets,
-            entries,
-            None,
-            false,
-        ));
-
-        // info.scores: Array<Int>
-        let score_values = Int32Array::from(vec![10, 20, 30]);
-        let offsets = crate::arrow::buffer::OffsetBuffer::new(vec![0i32, 2, 3].into());
-        let scores_arr: ArrayRef = Arc::new(ListArray::try_new(
-            Arc::new(ArrowField::new("element", ArrowDataType::Int32, true)),
-            offsets,
-            Arc::new(score_values),
-            None,
-        )?);
-
-        // info struct
+    /// Builds two-row [`EngineData`] with logical field names matching [`test_schema_nested`].
+    fn build_test_record_batch() -> DeltaResult<Box<dyn EngineData>> {
+        let schema = test_schema_nested();
+        let tag_type = MapType::new(DataType::STRING, DataType::STRING, true);
+        let score_type = ArrayType::new(DataType::INTEGER, true);
         let info_fields = vec![
-            ArrowField::new("name", ArrowDataType::Utf8, true),
-            ArrowField::new("age", ArrowDataType::Int32, true),
-            ArrowField::new("tags", tags_arr.data_type().clone(), true),
-            ArrowField::new("scores", scores_arr.data_type().clone(), true),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+            StructField::nullable("tags", tag_type.clone()),
+            StructField::nullable("scores", score_type.clone()),
         ];
-        let info_arr: ArrayRef = Arc::new(StructArray::try_new(
-            info_fields.into(),
-            vec![name_arr, age_arr, tags_arr, scores_arr],
-            None,
+        let info1 = Scalar::Struct(StructData::try_new(
+            info_fields.clone(),
+            vec![
+                "alice".into(),
+                30i32.into(),
+                Scalar::Map(MapData::try_new(tag_type.clone(), [("k1", "v1")])?),
+                Scalar::Array(ArrayData::try_new(score_type.clone(), [10i32, 20i32])?),
+            ],
         )?);
-
-        Ok(RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![id_arr, info_arr],
-        )?)
+        let info2 = Scalar::Struct(StructData::try_new(
+            info_fields,
+            vec![
+                "bob".into(),
+                25i32.into(),
+                Scalar::Map(MapData::try_new(tag_type, [("k2", "v2")])?),
+                Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
+            ],
+        )?);
+        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
     }
 
     /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting levels.
@@ -1930,7 +1886,7 @@ mod tests {
             );
         }
 
-        let batch = build_test_record_batch()?;
+        let data = build_test_record_batch()?;
 
         // Evaluate the logical_to_physical expression
         let input_schema: SchemaRef = logical_schema.clone();
@@ -1940,7 +1896,7 @@ mod tests {
             logical_to_physical_expression.clone(),
             physical_schema.clone().into(),
         )?;
-        let result = evaluator.evaluate(&ArrowEngineData::new(batch))?;
+        let result = evaluator.evaluate(data.as_ref())?;
         let result = ArrowEngineData::try_from_engine_data(result)?;
         let result_batch = result.record_batch();
 
@@ -2001,147 +1957,72 @@ mod tests {
     /// If `has_stats` is false, the stats struct will be null (indicating no stats).
     /// If `has_stats` is true, creates full stats with nullCount, minValues, maxValues for "value" column.
     fn create_test_add_files(paths: Vec<&str>, has_stats: Vec<bool>) -> Box<dyn EngineData> {
-        let path_array = StringArray::from(paths.to_vec());
-        let size_array = Int64Array::from(vec![1024i64; paths.len()]);
-        let mod_time_array = Int64Array::from(vec![1000000i64; paths.len()]);
-
-        // Create stats struct with full structure for "value" column (matches test table schema)
-        let value_field = Arc::new(ArrowField::new("value", ArrowDataType::Int64, true));
-
-        // nullCount.value
-        let null_count_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(0) } else { None })
-            .collect();
-        let null_count_array = Int64Array::from(null_count_values);
-        let null_count_struct = StructArray::new(
-            Fields::from(vec![value_field.clone()]),
-            vec![Arc::new(null_count_array) as ArrayRef],
-            None,
-        );
-
-        // minValues.value
-        let min_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(1) } else { None })
-            .collect();
-        let min_values_array = Int64Array::from(min_values);
-        let min_values_struct = StructArray::new(
-            Fields::from(vec![value_field.clone()]),
-            vec![Arc::new(min_values_array) as ArrayRef],
-            None,
-        );
-
-        // maxValues.value
-        let max_values: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(100) } else { None })
-            .collect();
-        let max_values_array = Int64Array::from(max_values);
-        let max_values_struct = StructArray::new(
-            Fields::from(vec![value_field]),
-            vec![Arc::new(max_values_array) as ArrayRef],
-            None,
-        );
-
-        // numRecords
-        let num_records: Vec<Option<i64>> = has_stats
-            .iter()
-            .map(|&h| if h { Some(100) } else { None })
-            .collect();
-        let num_records_array = Int64Array::from(num_records);
-
-        // Build stats struct fields
-        let value_struct_type = ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Int64,
-            true,
-        )]));
-        let stats_fields = Fields::from(vec![
-            ArrowField::new("numRecords", ArrowDataType::Int64, true),
-            ArrowField::new("nullCount", value_struct_type.clone(), true),
-            ArrowField::new("minValues", value_struct_type.clone(), true),
-            ArrowField::new("maxValues", value_struct_type, true),
+        let value_fields = vec![StructField::nullable("value", DataType::LONG)];
+        let value_struct_type = DataType::struct_type_unchecked(value_fields.clone());
+        let stats_type = DataType::struct_type_unchecked(vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", value_struct_type.clone()),
+            StructField::nullable("minValues", value_struct_type.clone()),
+            StructField::nullable("maxValues", value_struct_type.clone()),
         ]);
-
-        // Create validity bitmap - stats struct is null when has_stats is false
-        let stats_validity: Vec<bool> = has_stats.clone();
-        let stats_struct = StructArray::new(
-            stats_fields.clone(),
-            vec![
-                Arc::new(num_records_array) as ArrayRef,
-                Arc::new(null_count_struct) as ArrayRef,
-                Arc::new(min_values_struct) as ArrayRef,
-                Arc::new(max_values_struct) as ArrayRef,
-            ],
-            Some(stats_validity.into()),
-        );
-
-        // Create empty partition values map
-        let entries_field = Arc::new(ArrowField::new(
-            "key_value",
-            ArrowDataType::Struct(
-                vec![
-                    Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                    Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let empty_keys = StringArray::from(Vec::<&str>::new());
-        let empty_values = StringArray::from(Vec::<Option<&str>>::new());
-        let empty_entries = StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                Arc::new(empty_keys) as ArrayRef,
-            ),
-            (
-                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                Arc::new(empty_values) as ArrayRef,
-            ),
-        ]);
-        let offsets = OffsetBuffer::from_lengths(vec![0; paths.len()]);
-        let partition_values = MapArray::new(entries_field, offsets, empty_entries, None, false);
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new(
+        let stats_fields = vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", value_struct_type.clone()),
+            StructField::nullable("minValues", value_struct_type.clone()),
+            StructField::nullable("maxValues", value_struct_type),
+        ];
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
                 "partitionValues",
-                ArrowDataType::Map(
-                    Arc::new(ArrowField::new(
-                        "key_value",
-                        ArrowDataType::Struct(
-                            vec![
-                                Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-                                Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
+                MapType::new(DataType::STRING, DataType::STRING, true),
             ),
-            ArrowField::new("size", ArrowDataType::Int64, false),
-            ArrowField::new("modificationTime", ArrowDataType::Int64, false),
-            ArrowField::new("stats", ArrowDataType::Struct(stats_fields), true),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::nullable("stats", stats_type.clone()),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(path_array),
-                Arc::new(partition_values),
-                Arc::new(size_array),
-                Arc::new(mod_time_array),
-                Arc::new(stats_struct),
-            ],
-        )
-        .unwrap();
+        let empty_map = Scalar::Map(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, true),
+                Vec::<(&str, &str)>::new(),
+            )
+            .unwrap(),
+        );
 
-        Box::new(ArrowEngineData::new(batch))
+        let rows: Vec<Vec<Scalar>> = paths
+            .iter()
+            .zip(has_stats.iter())
+            .map(|(path, &has_stat)| {
+                let stats = if has_stat {
+                    let value_struct =
+                        |v: i64| Scalar::Struct(StructData::try_new(value_fields.clone(), vec![v.into()]).unwrap());
+                    Scalar::Struct(
+                        StructData::try_new(
+                            stats_fields.clone(),
+                            vec![
+                                100i64.into(),
+                                value_struct(0),
+                                value_struct(1),
+                                value_struct(100),
+                            ],
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    Scalar::Null(stats_type.clone())
+                };
+                vec![
+                    (*path).into(),
+                    empty_map.clone(),
+                    1024i64.into(),
+                    1000000i64.into(),
+                    stats,
+                ]
+            })
+            .collect();
+        let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
+        ArrowEvaluationHandler.create_many(schema, &row_refs).unwrap()
     }
 
     #[test]
