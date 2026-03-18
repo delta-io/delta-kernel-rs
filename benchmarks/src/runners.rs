@@ -29,7 +29,6 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
-    thread_pool: Option<rayon::ThreadPool>, // None for serial configuration, Some for parallel configuration
     predicate: Option<PredicateRef>,
 }
 
@@ -83,7 +82,6 @@ impl ReadMetadataRunner {
             engine,
             name,
             config,
-            thread_pool,
             predicate,
         })
     }
