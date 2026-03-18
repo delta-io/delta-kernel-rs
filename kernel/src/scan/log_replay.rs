@@ -253,31 +253,6 @@ impl ScanLogReplayProcessor {
         self.metrics.as_ref()
     }
 
-    /// Reconstruct processor with fresh metrics for parallel phase.
-    ///
-    /// Returns a new processor with fresh metrics, preserving the hash set size
-    /// from the sequential phase. The caller is responsible for logging sequential
-    /// metrics before calling this method.
-    pub(crate) fn reconstruct_for_parallel(self, engine: &dyn Engine) -> DeltaResult<Self> {
-        let hash_set_size = self.seen_file_keys.len();
-
-        // Create fresh processor with new metrics
-        let fresh_processor = Self::new_with_seen_files(
-            engine,
-            self.state_info,
-            self.checkpoint_info,
-            self.seen_file_keys,
-            self.skip_stats,
-        )?;
-
-        // Preserve hash_set_size from sequential phase
-        fresh_processor
-            .metrics
-            .update_peak_hash_set_size(hash_set_size);
-
-        Ok(fresh_processor)
-    }
-
     /// Serialize the processor state for distributed processing.
     ///
     /// Consumes the processor and returns a `SerializableScanState` containing:

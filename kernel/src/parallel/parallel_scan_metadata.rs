@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use tracing::{info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::parallel::parallel_phase::ParallelPhase;
@@ -30,19 +31,20 @@ pub enum AfterSequentialScanMetadata {
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
-    engine: Arc<dyn Engine>,
+    span: Span,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(
-        sequential: SequentialPhase<ScanLogReplayProcessor>,
-        engine: Arc<dyn Engine>,
-    ) -> Self {
-        Self { sequential, engine }
+    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
+        // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
+        Self {
+            sequential,
+            span: info_span!("sequential_scan_metadata"),
+        }
     }
 
-    #[tracing::instrument(skip_all, name = "sequential_scan_metadata")]
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
+        let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(processor) => {
                 processor
@@ -51,18 +53,14 @@ impl SequentialScanMetadata {
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
-                // Log sequential metrics before reconstruction
+                // Log sequential metrics and reset counters for parallel phase
                 processor
                     .get_metrics()
                     .log("Sequential scan metadata completed");
-
-                // Reconstruct with fresh metrics for parallel phase
-                let fresh_processor = processor.reconstruct_for_parallel(self.engine.as_ref())?;
+                processor.get_metrics().reset_counters();
 
                 Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState {
-                        inner: fresh_processor,
-                    }),
+                    state: Box::new(ParallelState { inner: processor }),
                     files,
                 })
             }
@@ -74,6 +72,7 @@ impl Iterator for SequentialScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.span.enter();
         self.sequential.next()
     }
 }
@@ -145,7 +144,6 @@ impl ParallelState {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `state`: The serialized state from a previous `into_serializable_state()` call
-    /// - `scan_span`: The parent scan span for tracing
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn from_serializable_state(
@@ -179,7 +177,6 @@ impl ParallelState {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
-    /// - `scan_span`: The parent scan span for tracing
     #[allow(unused)]
     pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> DeltaResult<Self> {
         let state: SerializableScanState =
@@ -190,6 +187,7 @@ impl ParallelState {
 
 pub struct ParallelScanMetadata {
     pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
+    span: Span,
 }
 
 impl ParallelScanMetadata {
@@ -199,8 +197,10 @@ impl ParallelScanMetadata {
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
         let read_schema = state.file_read_schema();
+        // TODO: Associate the same scan ID from sequential phase to correlate phases
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            span: info_span!("parallel_scan_metadata"),
         })
     }
 
@@ -208,8 +208,10 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
+        // TODO: Associate the same scan ID from sequential phase to correlate phases
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
+            span: info_span!("parallel_scan_metadata"),
         }
     }
 }
@@ -218,6 +220,7 @@ impl Iterator for ParallelScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.span.enter();
         self.processor.next()
     }
 }
