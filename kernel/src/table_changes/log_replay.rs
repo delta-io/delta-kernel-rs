@@ -78,6 +78,7 @@ pub(crate) fn table_changes_action_iter(
                 None, // no partition columns for table changes (partition_expr unused)
                 column_expr_ref!("partitionValues_parsed"),
                 get_log_add_schema().clone(),
+                None, // Table changes doesn't use metrics yet
             )
         })
         .map(Arc::new);

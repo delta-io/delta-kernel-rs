@@ -17,13 +17,17 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::kernel_predicates::{
+    DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
+};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::ScanLogReplayProcessor;
-use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
@@ -38,6 +42,7 @@ use self::log_replay::scan_action_iter;
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
+pub(crate) mod metrics;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -331,7 +336,6 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
-    use crate::kernel_predicates::KernelPredicateEvaluator as _;
     let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
     evaluator.eval_sql_where(predicate) == Some(false)
 }
@@ -420,8 +424,6 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
 }
 
 static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     StructType::new_unchecked(vec![StructField::nullable(
         "add",
@@ -911,7 +913,8 @@ impl Scan {
             checkpoint_info,
             self.skip_stats(),
         )?;
-        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+        let sequential =
+            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
         Ok(SequentialScanMetadata::new(sequential))
     }
