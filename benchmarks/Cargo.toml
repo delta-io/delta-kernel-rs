@@ -20,7 +20,7 @@ tar = "0.4"
 ureq = "3.1"
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow", "default-engine-rustls", "internal-api"] }
+delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
