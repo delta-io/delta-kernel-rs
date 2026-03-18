@@ -25,9 +25,10 @@ use crate::metrics::MetricsReporter;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
+use crate::table_properties::ParquetWriterConfig;
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
-    ParquetWriterConfig, StorageHandler,
+    StorageHandler,
 };
 
 pub mod executor;

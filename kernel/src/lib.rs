@@ -668,26 +668,6 @@ pub struct ParquetFooter {
     pub schema: SchemaRef,
 }
 
-/// Compression codec to use when writing Parquet files.
-///
-/// String parsing is case-insensitive.
-#[derive(Debug, strum::EnumString, Clone, Copy, PartialEq, Eq, Default)]
-#[strum(ascii_case_insensitive)]
-pub enum ParquetCompression {
-    /// Snappy compression (default).
-    #[default]
-    Snappy,
-    /// Zstandard compression.
-    Zstd,
-}
-
-/// Configuration for writing Parquet files.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ParquetWriterConfig {
-    /// Compression codec to use. Defaults to [`ParquetCompression::Snappy`].
-    pub compression: ParquetCompression,
-}
-
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom

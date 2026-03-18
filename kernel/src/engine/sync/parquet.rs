@@ -15,9 +15,10 @@ use crate::engine::default::parquet::writer_options;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
+use crate::table_properties::ParquetWriterConfig;
 use crate::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
-    ParquetWriterConfig, PredicateRef,
+    PredicateRef,
 };
 
 use url::Url;

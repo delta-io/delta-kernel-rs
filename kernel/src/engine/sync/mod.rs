@@ -2,10 +2,10 @@
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetCompression, ParquetHandler, ParquetWriterConfig, PredicateRef, SchemaRef,
-    StorageHandler,
+    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
 
 use itertools::Itertools;

@@ -37,9 +37,10 @@ use crate::expressions::ColumnName;
 use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
 use crate::parquet::basic::Compression;
 use crate::schema::{SchemaRef, StructType};
+use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetCompression,
-    ParquetFooter, ParquetHandler, ParquetWriterConfig, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
+    ParquetHandler, PredicateRef,
 };
 
 /// Returns [`ArrowWriterOptions`] for kernel parquet writes.
