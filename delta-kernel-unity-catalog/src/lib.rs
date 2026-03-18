@@ -132,13 +132,15 @@ impl<'a, C: UCGetCommitsClient> UCKernelClient<'a, C> {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::sync::Arc;
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
-    use unitycatalog_client_api::Operation;
+    use unitycatalog_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
     use unitycatalog_client_rest_impl::{UCClient, UCCommitsRestClient};
 
     use super::*;
@@ -284,5 +286,29 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_snapshot_errors_on_non_contiguous_commits() {
+        let client = InMemoryCommitsClient::new();
+        client.insert_table(
+            "test_table",
+            TableData {
+                max_ratified_version: 3,
+                catalog_commits: vec![
+                    Commit::new(1, 0, "1.json", 100, 0),
+                    Commit::new(3, 0, "3.json", 100, 0), // gap: version 2 missing
+                ],
+            },
+        );
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store).build();
+        let catalog = UCKernelClient::new(&client);
+
+        let result = catalog
+            .load_snapshot("test_table", "memory:///", &engine)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("non-contiguous"));
     }
 }
