@@ -229,7 +229,7 @@ impl LogSegmentFiles {
     fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
-        start_version: Version,
+        start: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         // check log_tail is only commits
@@ -239,6 +239,7 @@ impl LogSegmentFiles {
             "log_tail should only contain commits"
         );
 
+        let end = end_version.unwrap_or(Version::MAX);
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut acc = ListingAccumulator {
             end_version,
@@ -277,10 +278,9 @@ impl LogSegmentFiles {
         // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
         // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
         // versions, so there's no duplication here.
-        let end = end_version.unwrap_or(Version::MAX);
         let filtered_log_tail = log_tail
             .into_iter()
-            .filter(|entry| entry.version >= start_version && entry.version <= end);
+            .filter(|entry| entry.version >= start && entry.version <= end);
         for file in filtered_log_tail {
             // Track max published version for published commits from the log_tail
             if matches!(file.file_type, LogPathFileType::Commit) {
