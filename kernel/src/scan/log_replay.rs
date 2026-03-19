@@ -24,7 +24,9 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{
+    ColumnNamesAndTypes, DataType, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 

@@ -220,14 +220,12 @@ fn test_physical_predicate() {
     }
 }
 
-
 /// Unknown column still fails even with case-insensitive matching.
 #[test]
 fn test_physical_predicate_case_insensitive_unknown_column() {
     let schema =
         StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
-    let logical_schema =
-        LogicalSchema::new_for_test(Arc::new(schema), ColumnMappingMode::None);
+    let logical_schema = LogicalSchema::new_for_test(Arc::new(schema), ColumnMappingMode::None);
     let result = PhysicalPredicate::try_new(&column_pred!("nonexistent"), &logical_schema);
     assert!(result.is_err());
 }

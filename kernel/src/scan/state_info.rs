@@ -262,8 +262,8 @@ pub(crate) mod tests {
         }
     }
 
-    use crate::schema::{DataType, MetadataColumnSpec, StructType};
     use crate::scan::transform_spec::FieldTransformSpec;
+    use crate::schema::{DataType, MetadataColumnSpec, StructType};
 
     #[test]
     fn no_partition_columns() {

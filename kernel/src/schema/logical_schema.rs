@@ -14,9 +14,9 @@ use super::{
 };
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
+use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
-use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::{DeltaResult, Error};
 
 // Private helper for predicate-driven schema traversal.
@@ -236,7 +236,8 @@ impl LogicalSchema {
                     Some(MetadataColumnSpec::RowIndex)
                     | Some(MetadataColumnSpec::FilePath)
                     | None => {
-                        let physical_field = logical_field.make_physical(self.column_mapping_mode)?;
+                        let physical_field =
+                            logical_field.make_physical(self.column_mapping_mode)?;
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
                         if !logical_field.is_metadata_column()
@@ -313,7 +314,8 @@ impl LogicalSchema {
             .map(|f| {
                 // make_physical should not fail for a valid schema, but fall back to the
                 // logical field if it does to avoid panicking in a non-fallible context.
-                f.make_physical(self.column_mapping_mode).unwrap_or_else(|_| f.clone())
+                f.make_physical(self.column_mapping_mode)
+                    .unwrap_or_else(|_| f.clone())
             });
         Arc::new(StructType::new_unchecked(fields))
     }
