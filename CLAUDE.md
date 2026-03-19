@@ -200,6 +200,24 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
 
+### CI Jobs and Github Actions
+
+Ensure that when writing any github action you are considering safety including thinking of
+and mitigating common attack vectors such expression injection and pull request target attacks.
+
+Example:
+```yaml
+# The code below is vulnerable to expression injection
+run: |
+    echo "Comment: ${{ github.event.comment.body }}"
+
+# To mitigate instead use environment variables
+env:
+    COMMENT_BODY: ${{ github.event.comment.body }}
+run: |
+    echo "Comment: $COMMENT_BODY"
+```
+
 ## Deep Context
 
 Read these when relevant to the task at hand:
