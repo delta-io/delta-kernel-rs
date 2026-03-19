@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::arrow::ipc::Null;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
