@@ -225,7 +225,9 @@ impl ListingAccumulator {
 
 impl LogSegmentFiles {
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
-    /// listed from storage) and `log_tail` (catalog-provided commits)
+    /// listed from storage) and `log_tail` (catalog-provided commits).
+    // This logic is identical to the old `list()` implementation; it was extracted so that
+    // callers with different listing strategies can share the same core logic.
     fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
