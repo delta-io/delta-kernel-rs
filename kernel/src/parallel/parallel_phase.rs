@@ -687,21 +687,24 @@ mod tests {
         }),
     })]
     #[case::partition_pruning(ParallelLogReplayCase {
-        // Tests partition pruning filtering based on partition column values
-        // Table is partitioned by 'letter' with partitions: a, b, c, e, null
-        // Predicate letter='a' prunes 4 files (b, c, e, null), leaving 2 letter=a files
+        // Tests partition pruning filtering based on partition column values.
+        // Table is partitioned by 'letter' with partitions: a, b, c, e, null.
+        // Predicate letter='a' prunes 4 files (b, c, e, null), leaving 2 letter=a files.
         path: "basic_partitioned",
         predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            // All 6 files are seen, then partition pruning filters 4
-            add_files_seen: 6,
+            // Partition pruning runs in the columnar data skipping phase, filtering 8 of
+            // 10 rows: 4 non-matching adds + 4 non-file rows (protocol, metadata,
+            // commitInfo). Non-file rows are filtered because their partitionValues_parsed
+            // is an all-null struct, causing the predicate to evaluate to false.
+            add_files_seen: 2,
             active_add_files: 2,
             remove_files_seen: 0,
-            non_file_actions: 4,
-            predicate_filtered: 4,
+            non_file_actions: 0,
+            predicate_filtered: 8,
         },
         // No parallel phase (no V2 checkpoint with sidecars)
         expected_parallel_metrics: None,
