@@ -361,7 +361,9 @@ fn cast_list_elements_to_view(
 ) -> DeltaResult<Arc<dyn Array>> {
     let to_type = match field.data_type() {
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
-        ArrowDataType::Binary | ArrowDataType::FixedSizeBinary(_) | ArrowDataType::LargeBinary => ArrowDataType::BinaryView,
+        ArrowDataType::Binary | ArrowDataType::FixedSizeBinary(_) | ArrowDataType::LargeBinary => {
+            ArrowDataType::BinaryView
+        }
         _ => return Ok(vals.clone()),
     };
     let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
