@@ -164,9 +164,16 @@ impl DataSkippingFilter {
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
+        // The filter evaluator operates on the skipping evaluator's output, which is a single
+        // boolean column named "output" (not the unified stats schema).
+        let filter_schema: SchemaRef =
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "output",
+                DataType::BOOLEAN,
+            )]));
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(unified_schema, FILTER_PRED.clone())
+            .new_predicate_evaluator(filter_schema, FILTER_PRED.clone())
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
