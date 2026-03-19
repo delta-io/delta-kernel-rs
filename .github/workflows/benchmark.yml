@@ -23,7 +23,7 @@ jobs:
             TAGS="base"
           else
             TAGS="${COMMENT#/bench }"
-            TAGS=$(echo "$TAGS" | tr -d ' ')
+            TAGS=$(echo "$TAGS" | tr -d '[:space:]')
           fi
           echo "BENCH_TAGS=$TAGS" >> "$GITHUB_ENV"
           echo "Parsed tags: $TAGS"
