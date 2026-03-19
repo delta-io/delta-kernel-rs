@@ -27,6 +27,7 @@ url = { version = "2", features = ["serde"] }
 [dev-dependencies]
 criterion = "0.5"
 rstest = "0.23"
+tikv-jemallocator = "0.6"
 
 [[bench]]
 name = "workload_bench"
