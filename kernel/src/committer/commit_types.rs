@@ -76,6 +76,13 @@ impl CommitMetadata {
     pub fn table_root(&self) -> &Url {
         self.log_root.table_root()
     }
+
+    /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
+        let log_root = crate::path::LogRoot::new(table_root)?;
+        Ok(Self::new(log_root, version, 0, None))
+    }
 }
 
 /// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
@@ -132,13 +139,11 @@ mod tests {
             staged_path_str.starts_with(
                 "s3://my-bucket/path/to/table/_delta_log/_staged_commits/00000000000000000042."
             ),
-            "Staged path should start with the correct prefix, got: {}",
-            staged_path_str
+            "Staged path should start with the correct prefix, got: {staged_path_str}"
         );
         assert!(
             staged_path_str.ends_with(".json"),
-            "Staged path should end with .json, got: {}",
-            staged_path_str
+            "Staged path should end with .json, got: {staged_path_str}"
         );
         let uuid_str = staged_path_str
             .strip_prefix(

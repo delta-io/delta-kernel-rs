@@ -110,7 +110,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
-        let checkpoint_manifest_phase = match log_segment.checkpoint_parts.as_slice() {
+        let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
             [single_part] => Some(CheckpointManifestReader::try_new(
                 engine,
                 single_part,
@@ -120,6 +120,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         };
 
         let checkpoint_parts = log_segment
+            .listed
             .checkpoint_parts
             .iter()
             .map(|path| path.location.clone())
@@ -242,8 +243,7 @@ mod tests {
             (sidecars, AfterSequentialScanMetadata::Done) => {
                 assert!(
                     sidecars.is_empty(),
-                    "Expected Done but got sidecars {:?}",
-                    sidecars
+                    "Expected Done but got sidecars {sidecars:?}"
                 );
             }
             (expected_sidecars, AfterSequentialScanMetadata::Parallel { files, .. }) => {

@@ -11,11 +11,11 @@ use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::Snapshot;
 
-use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
@@ -43,16 +43,20 @@ fn write_large_parquet_to(path: &Path) -> Result<(), Box<dyn std::error::Error>>
     // read to show file sizes
     let metadata = std::fs::metadata(&path)?;
     let file_size = metadata.len();
+    #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
+    let total_row_group_size: i64 = parquet_metadata
+        .row_groups
+        .iter()
+        .map(|rg| rg.total_byte_size)
+        .sum();
+    #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
     let total_row_group_size: i64 = parquet_metadata
         .row_groups()
         .iter()
         .map(|rg| rg.total_byte_size())
         .sum();
-    println!("File size (compressed file size):    {} bytes", file_size);
-    println!(
-        "Total size (uncompressed file size): {} bytes",
-        total_row_group_size
-    );
+    println!("File size (compressed file size):    {file_size} bytes");
+    println!("Total size (uncompressed file size): {total_row_group_size} bytes");
 
     Ok(())
 }
@@ -93,7 +97,7 @@ fn create_commit(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for action in actions {
-        writeln!(file, "{}", action)?;
+        writeln!(file, "{action}")?;
     }
 
     Ok(())
@@ -109,7 +113,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Write the large parquet file
     write_large_parquet_to(table_path)?;
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after writing parquet:\n{:?}", stats);
+    println!("Heap stats after writing parquet:\n{stats:?}");
 
     // Step 2: Create the Delta log
     create_commit(table_path)?;
@@ -124,7 +128,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to create snapshot");
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after creating snapshot:\n{:?}", stats);
+    println!("Heap stats after creating snapshot:\n{stats:?}");
 
     // Step 4: Build and execute scan
     let scan = snapshot
@@ -133,7 +137,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to build scan");
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after building scan:\n{:?}", stats);
+    println!("Heap stats after building scan:\n{stats:?}");
 
     // Step 5: Execute the scan and read data
     let mut row_count = 0;
@@ -143,8 +147,8 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after scan execution:\n{:?}", stats);
-    println!("Total rows read: {}", row_count);
+    println!("Heap stats after scan execution:\n{stats:?}");
+    println!("Total rows read: {row_count}");
 
     Ok(())
 }

@@ -12,7 +12,7 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression};
+use crate::expressions::{column_expr, column_expr_ref, column_name, ColumnName, Expression};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::data_skipping::DataSkippingFilter;
@@ -73,9 +73,12 @@ pub(crate) fn table_changes_action_iter(
             DataSkippingFilter::new(
                 engine.as_ref(),
                 Some(predicate),
-                stats_schema,
-                get_log_add_schema().clone(),
+                Some(&stats_schema),
                 stats_expr,
+                None, // no partition columns for table changes (partition_expr unused)
+                column_expr_ref!("partitionValues_parsed"),
+                get_log_add_schema().clone(),
+                None, // Table changes doesn't use metrics yet
             )
         })
         .map(Arc::new);

@@ -127,6 +127,8 @@ all returned batches -- the engine may split a single file across multiple batch
 - `kernel/src/schema/` -- `StructType`/`StructField`/`DataType`, projections
 - `kernel/src/expressions/` -- expression AST (`Expression`, `Predicate`, `Scalar`),
   `column_expr!` macro
+- `kernel/src/transforms/` -- generic recursive transforms (`ExpressionTransform`,
+  `SchemaTransform`)
 - `kernel/src/checkpoint/` -- checkpoint writing (V1 and V2 single-file classic-named)
 - `kernel/src/table_configuration.rs` -- table metadata, properties, feature management
 - `kernel/src/table_features/` -- protocol feature definitions, `TableFeature` enum

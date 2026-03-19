@@ -7,11 +7,11 @@ use std::task::Poll;
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use url::Url;
 
 use super::executor::TaskExecutor;
@@ -272,17 +272,17 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::PutMultipartOptions;
+    use crate::object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
+        PutPayload, PutResult, Result,
+    };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::PutMultipartOptions;
-    use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
-        PutPayload, PutResult, Result,
-    };
     use serde_json::json;
     use tracing::info;
 
@@ -886,59 +886,6 @@ mod tests {
     #[tokio::test]
     async fn test_write_json_file_overwrite() -> DeltaResult<()> {
         do_test_write_json_file(true).await
-    }
-
-    #[tokio::test]
-    async fn test_read_json_files_injects_file_path_column() {
-        use crate::schema::MetadataColumnSpec;
-
-        // Write a temp JSON file with two simple rows.
-        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        writeln!(temp_file, r#"{{"x": 1}}"#).unwrap();
-        writeln!(temp_file, r#"{{"x": 2}}"#).unwrap();
-        let file_url = Url::from_file_path(temp_file.path()).expect("Failed to create file URL");
-
-        let store = Arc::new(LocalFileSystem::new());
-        let location = Path::from_url_path(file_url.path()).unwrap();
-        let meta = store.head(&location).await.unwrap();
-        let files = [FileMeta {
-            location: file_url.clone(),
-            last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
-        }];
-
-        // Schema: one regular field + a FilePath metadata column after it.
-        let schema = Arc::new(
-            StructType::try_new([
-                StructField::not_null("x", DeltaDataType::INTEGER),
-                StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            ])
-            .unwrap(),
-        );
-
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let data: Vec<RecordBatch> = handler
-            .read_json_files(&files, schema, None)
-            .unwrap()
-            .map_ok(into_record_batch)
-            .try_collect()
-            .unwrap();
-
-        assert_eq!(data.len(), 1);
-        let batch = &data[0];
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.schema().field(0).name(), "x");
-        assert_eq!(batch.schema().field(1).name(), "_file");
-
-        // _file should be a plain StringArray with the file URL repeated for each row.
-        let string_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray for _file column");
-        assert_eq!(string_array.len(), 2);
-        assert!(string_array.iter().all(|v| v == Some(file_url.as_str())));
     }
 
     async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {

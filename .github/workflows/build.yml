@@ -1,10 +1,33 @@
 name: build
 
-on: [push, pull_request]
+on: [push, pull_request, merge_group]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+
+# Swatinem/rust-cache caches the cargo registry and target directory (~450MB per job).
+# save-if restricts cache writes to main pushes only. PRs read from main's cache but
+# never write their own entries.
+#
+# The key insight: Cargo.lock changes infrequently, so main's cache key almost always
+# matches. PRs download and compile zero dependencies on cache hit. By only writing on
+# main, we keep main's cache entries alive (no LRU eviction from PR churn), and every
+# PR benefits from them.
+#
+# Without this, GHA's ref-scoped caching works against us: each PR writes ~6.3GB of
+# cache entries (14 jobs x ~450MB) that only that PR can read. A handful of active PRs
+# fills the 10GB cache budget, LRU evicts main's shared entries, and every subsequent
+# PR compiles from scratch.
+#
+# The save-if condition checks both event_name == 'push' and ref == main because
+# pull_request_target events (used by benchmark.yml, semver-checks.yml) set github.ref
+# to the base branch (main), not the PR branch. Without the event_name check, those
+# workflows would write cache entries on every PR.
+#
+# Note: actions-rust-lang/setup-rust-toolchain has built-in Swatinem/rust-cache that
+# writes on every run with no save-if support. We disable it with cache: false and
+# manage caching explicitly via the Swatinem/rust-cache steps below.
 
 jobs:
   format:
@@ -14,6 +37,7 @@ jobs:
       - name: Install minimal stable with rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          cache: false
           components: rustfmt
       - name: format
         run: cargo fmt -- --check
@@ -24,7 +48,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-msrv
@@ -40,7 +68,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-msrv
@@ -51,6 +83,7 @@ jobs:
       - name: Install specified rust version
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          cache: false
           toolchain: ${{ env.RUST_VERSION }}
       - name: run tests
         run: |
@@ -65,7 +98,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build docs
         run: cargo doc --workspace --all-features --no-deps
 
@@ -103,8 +140,11 @@ jobs:
       - name: Install minimal stable with clippy
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          cache: false
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
@@ -125,12 +165,26 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ffi:
+              - 'ffi/src/handle.rs'
+              - 'ffi-proc-macros/**'
       - name: Install minimal stable with clippy and rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: test
-        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs)'
+        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: trybuild tests
+        if: steps.filter.outputs.ffi == 'true'
+        run: cargo test --package delta_kernel_ffi --features --internal-api invalid_handle_code
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -166,7 +220,11 @@ jobs:
           tools: "apache-arrow apache-arrow-glib"
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
       - name: Build kernel
@@ -215,6 +273,8 @@ jobs:
           rustup override set nightly
           cargo miri setup
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: Test with Miri
         run: |
@@ -229,7 +289,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage

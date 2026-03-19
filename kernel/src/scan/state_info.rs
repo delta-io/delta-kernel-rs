@@ -7,11 +7,11 @@ use std::sync::Arc;
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
+use crate::scan::transform_spec::TransformSpec;
 use crate::scan::PhysicalPredicate;
 use crate::scan::StatsOutputMode;
 use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::TransformSpec;
 use crate::{DeltaResult, PredicateRef};
 
 /// All the state needed to process a scan.
@@ -84,7 +84,7 @@ impl StateInfo {
                         Some(expected_stats_schemas.logical),
                     )
                 }
-                // Non-empty requested columns — include predicate-referenced columns
+                // Non-empty requested columns -- include predicate-referenced columns
                 // alongside the user-requested stats columns so that the DataSkippingFilter
                 // has the stats it needs.
                 (StatsOutputMode::Columns(requested_columns), _)
@@ -104,7 +104,7 @@ impl StateInfo {
                         Some(expected_stats_schemas.logical),
                     )
                 }
-                // Columns(empty) or Skip with a physical predicate — build stats directly
+                // Columns(empty) or Skip with a physical predicate -- build stats directly
                 // from the physical predicate's referenced schema for internal data skipping
                 // only (no logical schema needed for output).
                 (_, PhysicalPredicate::Some(_, ref_schema)) => {
@@ -263,7 +263,7 @@ pub(crate) mod tests {
     }
 
     use crate::schema::{DataType, MetadataColumnSpec, StructType};
-    use crate::transforms::FieldTransformSpec;
+    use crate::scan::transform_spec::FieldTransformSpec;
 
     #[test]
     fn no_partition_columns() {
@@ -666,11 +666,6 @@ pub(crate) mod tests {
             state_info.physical_stats_schema.is_some(),
             "physical_stats_schema should be Some when AllColumns is set"
         );
-        // logical_stats_schema should be set for mapping physical->logical column names
-        assert!(
-            state_info.logical_stats_schema.is_some(),
-            "logical_stats_schema should be Some when AllColumns is set"
-        );
         // physical_predicate should still be active for data skipping
         assert!(
             matches!(state_info.physical_predicate, PhysicalPredicate::Some(..)),
@@ -701,11 +696,11 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let logical_stats = state_info
-            .logical_stats_schema
-            .expect("should have logical stats schema");
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("should have physical stats schema");
 
-        let min_values = logical_stats
+        let min_values = stats_schema
             .field("minValues")
             .expect("should have minValues");
         if let DataType::Struct(inner) = min_values.data_type() {
@@ -744,13 +739,12 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // Should have logical stats schema with only 'value' column
-        let logical_stats = state_info
-            .logical_stats_schema
-            .expect("should have logical stats schema");
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("should have physical stats schema");
 
         // Check that minValues/maxValues only contain 'value', not 'id'
-        let min_values = logical_stats
+        let min_values = stats_schema
             .field("minValues")
             .expect("should have minValues");
         if let DataType::Struct(inner) = min_values.data_type() {

@@ -31,8 +31,6 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
-pub(crate) mod domain_metadata;
-
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
 pub mod visitors;
@@ -696,7 +694,7 @@ pub(crate) struct Add {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
@@ -718,10 +716,10 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     /// Note: map values can be null.
-    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// We don't use `#[allow_null_container_values]` here because [`MapItem::materialize`]
     /// drops null values when that attribute is present.
     ///
-    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`MapItem::materialize`]: crate::engine_data::MapItem::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub tags: Option<HashMap<String, Option<String>>>,
 
@@ -825,7 +823,7 @@ pub(crate) struct Cdc {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
@@ -843,8 +841,8 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-// TODO: Add serde Deserialize with rename_all = "camelCase" for CRC file reads.
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -980,6 +978,11 @@ impl DomainMetadata {
     #[internal_api]
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
+    }
+
+    /// Returns `true` if this action is a tombstone (marking domain removal).
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
     }
 }
 

@@ -14,6 +14,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
+    PredicateRef,
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -50,14 +51,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -217,6 +218,18 @@ fn test_physical_predicate() {
             "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
         );
     }
+}
+
+
+/// Unknown column still fails even with case-insensitive matching.
+#[test]
+fn test_physical_predicate_case_insensitive_unknown_column() {
+    let schema =
+        StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
+    let logical_schema =
+        LogicalSchema::new_for_test(Arc::new(schema), ColumnMappingMode::None);
+    let result = PhysicalPredicate::try_new(&column_pred!("nonexistent"), &logical_schema);
+    assert!(result.is_err());
 }
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
@@ -388,7 +401,7 @@ fn test_get_partition_value() {
     ];
 
     for (raw, data_type, expected) in &cases {
-        let value = crate::transforms::parse_partition_value_raw(
+        let value = crate::scan::transform_spec::parse_partition_value_raw(
             Some(&raw.to_string()),
             &DataType::Primitive(data_type.clone()),
         )
@@ -536,10 +549,7 @@ fn assert_stats_struct_matches_json(
             assert_eq!(
                 json_val.as_i64().unwrap(),
                 int_col.value(row_idx),
-                "{}.{} mismatch at row {}",
-                field_name,
-                col_name,
-                row_idx
+                "{field_name}.{col_name} mismatch at row {row_idx}"
             );
         }
     }
@@ -854,6 +864,87 @@ fn test_build_actions_meta_predicate_static_skip_all() {
         scan.build_actions_meta_predicate().is_none(),
         "StaticSkipAll predicate should return None"
     );
+}
+
+/// End-to-end test that mixed supported/unsupported predicates return the correct number of
+/// files. The `parsed-stats` table has 6 files with id ranges [1,100]..[501,600] and ts_col
+/// stats. Timestamp GT uses max stats (unsupported in checkpoint skipping); timestamp LT
+/// uses min stats (supported). File ts_col min values: 1M, 3M, 5M, 7M, 9M, 11M (microseconds).
+#[rstest]
+#[case::bare_ts_gt_returns_all(
+    // ts_col > ...: unsupported (uses max stats), no meta-predicate generated -> no pruning.
+    Arc::new(Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000)))),
+    6,
+)]
+#[case::bare_ts_lt_skips(
+    // ts_col < 3M: supported (uses min stats). Skips files with min_ts >= 3M.
+    Arc::new(Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000)))),
+    1,
+)]
+#[case::and_mixed_supported_unsupported(
+    // AND(id > 400, ts_col > ...): unsupported arm becomes NULL (unknown), id arm skips 4 files.
+    Arc::new(Pred::and(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    )),
+    2,
+)]
+#[case::or_mixed_supported_unsupported(
+    // OR(id > 400, ts_col > ...): unsupported arm becomes NULL (unknown) -> OR(..., NULL)
+    // is unknown -> no pruning.
+    Arc::new(Pred::or(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    )),
+    6,
+)]
+#[case::and_all_unsupported_returns_all(
+    // AND(ts_col > ..., ts_col > ...): both unsupported -> all NULL (unknown) -> no pruning.
+    Arc::new(Pred::and(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    )),
+    6,
+)]
+#[case::or_all_unsupported_returns_all(
+    // OR(ts_col > ..., ts_col > ...): both unsupported -> all NULL (unknown) -> no pruning.
+    Arc::new(Pred::or(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    )),
+    6,
+)]
+fn test_scan_with_unsupported_predicates(
+    #[case] predicate: PredicateRef,
+    #[case] expected_files: usize,
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, expected_files);
 }
 
 /// Helper to build a parquet file with the nested `add.stats_parsed.*` structure that

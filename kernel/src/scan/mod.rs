@@ -16,21 +16,25 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::listed_log_files::ListedLogFilesBuilder;
+use crate::kernel_predicates::{
+    DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
+};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::log_segment_files::LogSegmentFiles;
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::ScanLogReplayProcessor;
-use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     DataType, LogicalSchema, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
 use crate::table_features::Operation;
+use crate::transforms::ExpressionTransform;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -38,8 +42,10 @@ use self::log_replay::scan_action_iter;
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
+pub(crate) mod metrics;
 pub mod state;
 pub(crate) mod state_info;
+pub(crate) mod transform_spec;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -304,7 +310,6 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
-    use crate::kernel_predicates::KernelPredicateEvaluator as _;
     let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
     evaluator.eval_sql_where(predicate) == Some(false)
 }
@@ -336,8 +341,6 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
 }
 
 static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     StructType::new_unchecked(vec![StructField::nullable(
         "add",
@@ -483,21 +486,6 @@ impl Scan {
         }
     }
 
-    /// Get the logical schema for file statistics.
-    ///
-    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
-    /// contains file statistics read using physical column names (to handle column mapping).
-    /// This method returns the corresponding logical schema that maps those physical column
-    /// names back to the table's logical column names, enabling engines to interpret the stats
-    /// correctly.
-    ///
-    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
-        self.state_info.logical_stats_schema.as_ref()
-    }
-
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     /// Each item in the returned iterator is a struct of:
@@ -608,6 +596,7 @@ impl Scan {
                 actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
                     has_stats_parsed: false,
+                    has_partition_values_parsed: false,
                     checkpoint_read_schema: restored_add_schema().clone(),
                 },
             };
@@ -626,16 +615,15 @@ impl Scan {
         }
 
         // create a new log segment containing only the commits added after the version hint.
-        let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
+        let mut ascending_commit_files = log_segment.listed.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
-        let listed_log_files = ListedLogFilesBuilder {
+        let log_segment_files = LogSegmentFiles {
             ascending_commit_files,
-            latest_commit_file: log_segment.latest_commit_file.clone(),
+            latest_commit_file: log_segment.listed.latest_commit_file.clone(),
             ..Default::default()
-        }
-        .build()?;
+        };
         let new_log_segment = LogSegment::try_new(
-            listed_log_files,
+            log_segment_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
             None, // No checkpoint in this incremental segment
@@ -660,6 +648,7 @@ impl Scan {
                 .physical_stats_schema
                 .as_ref()
                 .map(|s| s.as_ref()),
+            None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -720,6 +709,7 @@ impl Scan {
                     .physical_stats_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                None,
             )
     }
 
@@ -735,6 +725,10 @@ impl Scan {
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    ///
+    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
+    /// bare unsupported expression (e.g. Timestamp GT). Junctions with unsupported arms replace
+    /// them with TRUE to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
@@ -770,7 +764,7 @@ impl Scan {
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
-    /// # use object_store::local::LocalFileSystem;
+    /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
@@ -825,6 +819,7 @@ impl Scan {
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
+            has_partition_values_parsed: false,
             checkpoint_read_schema,
         };
         let processor = ScanLogReplayProcessor::new(
@@ -833,7 +828,8 @@ impl Scan {
             checkpoint_info,
             self.skip_stats(),
         )?;
-        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+        let sequential =
+            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
         Ok(SequentialScanMetadata::new(sequential))
     }
