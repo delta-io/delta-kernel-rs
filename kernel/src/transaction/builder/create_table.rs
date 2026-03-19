@@ -204,6 +204,10 @@ struct DataLayoutResult {
 
 /// Validates partition columns against the table schema.
 ///
+/// Similar to [`validate_clustering_columns`] (duplicate check, schema lookup), but with
+/// stricter constraints: partition columns must be top-level and primitive-typed, while
+/// clustering columns may be nested and accept all stats-eligible types.
+///
 /// Partition columns must be:
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
@@ -296,11 +300,19 @@ fn apply_data_layout(
         DataLayout::Partitioned { columns } => {
             validate_partition_columns(effective_schema, columns)?;
 
+            // Safety: validate_partition_columns() enforces path.len() == 1 above
             let physical_names: Vec<String> = columns
                 .iter()
                 .map(|c| {
                     get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
-                        .map(|pn| pn.path()[0].to_string())
+                        .map(|pn| {
+                            debug_assert_eq!(
+                                pn.path().len(),
+                                1,
+                                "partition columns must be top-level"
+                            );
+                            pn.path()[0].to_string()
+                        })
                 })
                 .try_collect()?;
 
@@ -554,6 +566,9 @@ impl CreateTableTransactionBuilder {
     ///
     /// Partitioning and clustering are mutually exclusive.
     ///
+    /// Calling this method multiple times replaces the previous layout. Only the last
+    /// `with_data_layout()` call takes effect.
+    ///
     /// # Example
     ///
     /// ```rust,no_run
@@ -566,6 +581,11 @@ impl CreateTableTransactionBuilder {
     /// #     StructField::new("id", DataType::INTEGER, false),
     /// #     StructField::new("date", DataType::STRING, false),
     /// # ])?);
+    /// // Clustered layout:
+    /// let builder = create_table("/path/to/table", schema.clone(), "MyApp/1.0")
+    ///     .with_data_layout(DataLayout::clustered(["id"]));
+    ///
+    /// // Partitioned layout:
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_data_layout(DataLayout::partitioned(["date"]));
     /// # Ok(())

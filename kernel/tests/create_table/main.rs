@@ -330,6 +330,56 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 }
 
 #[test]
+fn test_create_table_partitioned_basic() -> DeltaResult<()> {
+    use delta_kernel::transaction::data_layout::DataLayout;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("date", DataType::DATE, true),
+        StructField::new("value", DataType::STRING, true),
+    ])?);
+
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["date"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Verify the commit log contains partition columns in metadata
+    let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
+    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
+    let actions: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect();
+
+    let metadata_action = actions
+        .iter()
+        .find(|a| a.get("metaData").is_some())
+        .expect("Should have metaData action");
+    let metadata = metadata_action.get("metaData").unwrap();
+    let partition_columns = metadata["partitionColumns"]
+        .as_array()
+        .expect("partitionColumns should be an array");
+    assert_eq!(partition_columns.len(), 1);
+    assert_eq!(partition_columns[0], "date");
+
+    // Verify snapshot loads correctly
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+
+    // Verify no clustering domain metadata is present
+    let clustering = snapshot.get_clustering_columns_physical(engine.as_ref())?;
+    assert!(
+        clustering.is_none(),
+        "Partitioned table should not have clustering columns"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
