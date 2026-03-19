@@ -14,7 +14,7 @@ const DELTA_DIR_NAME: &str = "delta";
 
 /// Loads all workload specifications from `OUTPUT_FOLDER`, optionally filtered by `BENCH_TAGS`.
 ///
-/// Workloads are downloaded and extracted at build time by `build.rs`.
+/// Workloads are downloaded and extracted into `OUTPUT_FOLDER` at build time by `build.rs`.
 ///
 /// If the `BENCH_TAGS` environment variable is set (e.g. `BENCH_TAGS=base`),
 /// only workloads whose `table_info.json` has at least one matching tag are returned.
