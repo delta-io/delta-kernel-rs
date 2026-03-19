@@ -143,7 +143,7 @@ impl ScanLogReplayProcessor {
         skip_stats: bool,
     ) -> DeltaResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
-        Self::new_with_seen_files(
+        Self::new_with_seen_files_inner(
             engine,
             state_info,
             checkpoint_info,
@@ -414,7 +414,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // The file extraction logic selects the appropriate indexes based on whether we found a valid path.
         // Remove getters are not included when visiting a non-log batch (checkpoint batch), so do
         // not try to extract remove actions in that case.
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
+        let Some(action) = self.deduplicator.extract_file_action(
             i,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
@@ -424,6 +424,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             return Ok(false);
         };
 
+        let is_add = action.is_add;
         if is_add {
             self.metrics.incr_add_files_seen()
         } else {
@@ -448,7 +449,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
-        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
+        if self.deduplicator.check_and_record_seen(action) || !is_add {
             return Ok(false);
         }
         let base_row_id: Option<i64> =

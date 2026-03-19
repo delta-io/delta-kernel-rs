@@ -14,7 +14,7 @@
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
 use crate::engine_data::GetData;
-use crate::log_replay::deduplicator::Deduplicator;
+use crate::log_replay::deduplicator::{Deduplicator, ExtractedFileAction};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -22,7 +22,6 @@ use delta_kernel_derive::internal_api;
 
 use std::collections::hash_map::RandomState;
 use std::sync::Arc;
-
 use tracing::debug;
 
 pub(crate) mod deduplicator;
@@ -39,6 +38,29 @@ impl FileActionKey {
     pub(crate) fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
         let path = path.into();
         Self { path, dv_unique_id }
+    }
+}
+
+/// Borrowed view of a [`FileActionKey`] used for zero-copy lookups in the seen-file HashSet.
+///
+/// `String` and `str` hash and compare identically for the same contents, so a
+/// `FileActionKeyRef` with the same path and DV unique ID as a stored [`FileActionKey`]
+/// will match it in the set without requiring any heap allocation.
+#[derive(Hash)]
+pub(crate) struct FileActionKeyRef<'a> {
+    path: &'a str,
+    dv_unique_id: Option<&'a str>,
+}
+
+impl<'a> FileActionKeyRef<'a> {
+    pub(crate) fn new(path: &'a str, dv_unique_id: Option<&'a str>) -> Self {
+        Self { path, dv_unique_id }
+    }
+}
+
+impl hashbrown::Equivalent<FileActionKey> for FileActionKeyRef<'_> {
+    fn equivalent(&self, key: &FileActionKey) -> bool {
+        self.path == key.path && self.dv_unique_id == key.dv_unique_id.as_deref()
     }
 }
 
@@ -97,55 +119,63 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
     /// and should process it.
-    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
-        // Note: each (add.path + add.dv_unique_id()) pair has a
-        // unique Add + Remove pair in the log. For example:
-        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-
-        if self.seen_file_keys.contains(&key) {
+    ///
+    /// Uses a borrowed-key lookup to avoid allocating an owned [`FileActionKey`] for files that
+    /// are already in the seen set. An owned key (and thus a heap allocation for the path) is only
+    /// created when the file is new and needs to be inserted.
+    ///
+    /// Note: each (add.path + add.dv_unique_id()) pair has a unique Add + Remove pair in the log.
+    /// For example: <https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json>
+    fn check_and_record_seen(&mut self, action: ExtractedFileAction<'_>) -> bool {
+        let borrowed = FileActionKeyRef::new(action.path, action.dv_unique_id.as_deref());
+        if self.seen_file_keys.contains(&borrowed) {
             debug!(
                 "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
+                action.path, action.dv_unique_id, self.is_log_batch
             );
             true
         } else {
             debug!(
                 "Including ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
+                action.path, action.dv_unique_id, self.is_log_batch
             );
             if self.is_log_batch {
                 // Remember file actions from this batch so we can ignore duplicates as we process
                 // batches from older commit and/or checkpoint files. We don't track checkpoint
                 // batches because they are already the oldest actions and never replace anything.
-                self.seen_file_keys.insert(key);
+                self.seen_file_keys
+                    .insert(FileActionKey::new(action.path, action.dv_unique_id));
             }
             false
         }
     }
 
-    /// Extracts a file action key and determines if it's an add operation.
-    /// This method examines the data at the given index using the provided getters
-    /// to identify whether a file action exists and what type it is.
+    /// Extracts a file action from the batch row at index `i` without allocating an owned key.
+    ///
+    /// Returns `Some(action)` carrying a borrowed path and an owned deletion vector unique ID
+    /// (if present), or `None` if no file action exists at this row. The caller passes `action`
+    /// to [`check_and_record_seen`] which performs the zero-copy dedup lookup.
     ///
     /// # Parameters
-    /// - `i`: Index position in the data structure to examine
-    /// - `getters`: Collection of data getter implementations used to access the data
-    /// - `skip_removes`: Whether to skip remove actions when extracting file actions
+    /// - `i`: Row index within the batch.
+    /// - `getters`: Column data accessors for this batch.
+    /// - `skip_removes`: When `true`, remove actions are ignored (used for checkpoint batches).
     ///
-    /// # Returns
-    /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's an add operation
-    /// - `Ok(None)`: When no file action is found
-    /// - `Err(...)`: On any error during extraction
+    /// [`check_and_record_seen`]: Deduplicator::check_and_record_seen
     fn extract_file_action<'a>(
         &self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> DeltaResult<Option<(FileActionKey, bool)>> {
+    ) -> DeltaResult<Option<ExtractedFileAction<'a>>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
-            return Ok(Some((FileActionKey::new(path, dv_unique_id), true)));
+            return Ok(Some(ExtractedFileAction {
+                path,
+                dv_unique_id,
+                is_add: true,
+            }));
         }
 
         // The AddRemoveDedupVisitor skips remove actions when extracting file actions from a checkpoint batch.
@@ -156,7 +186,11 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         // Try to extract a remove action by the required path column
         if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
-            return Ok(Some((FileActionKey::new(path, dv_unique_id), false)));
+            return Ok(Some(ExtractedFileAction {
+                path,
+                dv_unique_id,
+                is_add: false,
+            }));
         }
 
         // No file action found
@@ -357,10 +391,11 @@ pub(crate) trait HasSelectionVector {
 
 #[cfg(test)]
 mod tests {
-    use super::deduplicator::CheckpointDeduplicator;
+    use super::deduplicator::{CheckpointDeduplicator, ExtractedFileAction};
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
+    use hashbrown::HashSet;
     use std::collections::HashMap;
 
     /// Mock GetData implementation for testing
@@ -426,6 +461,15 @@ mod tests {
         )
     }
 
+    /// Convert a FileActionKey into an ExtractedFileAction for use with check_and_record_seen.
+    fn key_to_action(key: &FileActionKey, is_add: bool) -> ExtractedFileAction<'_> {
+        ExtractedFileAction {
+            path: key.path.as_str(),
+            dv_unique_id: key.dv_unique_id.clone(),
+            is_add,
+        }
+    }
+
     /// Helper to create a getters array with mocks at specific positions
     fn create_getters_with_mocks<'a>(
         add_mock: Option<&'a MockGetData>,
@@ -459,10 +503,10 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
-        assert_eq!(key.path, "file1.parquet");
-        assert!(key.dv_unique_id.is_none());
-        assert!(is_add);
+        let action = result.unwrap();
+        assert_eq!(action.path, "file1.parquet");
+        assert!(action.dv_unique_id.is_none());
+        assert!(action.is_add);
 
         Ok(())
     }
@@ -478,9 +522,9 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
-        assert_eq!(key.path, "file2.parquet");
-        assert!(!is_add);
+        let action = result.unwrap();
+        assert_eq!(action.path, "file2.parquet");
+        assert!(!action.is_add);
 
         Ok(())
     }
@@ -499,12 +543,12 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
+        let action = result.unwrap();
         assert!(matches!(
-            key.dv_unique_id.as_deref(),
+            action.dv_unique_id.as_deref(),
             Some("s3path/to/dv@100")
         ));
-        assert!(is_add);
+        assert!(action.is_add);
 
         Ok(())
     }
@@ -561,16 +605,16 @@ mod tests {
             let mut deduplicator = create_deduplicator(&mut seen, true);
 
             // Pre-existing key should be detected as duplicate
-            assert!(deduplicator.check_and_record_seen(pre_existing_key.clone()));
+            assert!(deduplicator.check_and_record_seen(key_to_action(&pre_existing_key, true)));
 
             // First time seeing keys, should return false and record them
-            assert!(!deduplicator.check_and_record_seen(key1.clone()));
-            assert!(!deduplicator.check_and_record_seen(key2.clone()));
-            assert!(!deduplicator.check_and_record_seen(key_with_dv.clone()));
+            assert!(!deduplicator.check_and_record_seen(key_to_action(&key1, true)));
+            assert!(!deduplicator.check_and_record_seen(key_to_action(&key2, true)));
+            assert!(!deduplicator.check_and_record_seen(key_to_action(&key_with_dv, true)));
 
             // Second time seeing keys, should return true (duplicates)
-            assert!(deduplicator.check_and_record_seen(key1.clone()));
-            assert!(deduplicator.check_and_record_seen(key_with_dv.clone()));
+            assert!(deduplicator.check_and_record_seen(key_to_action(&key1, true)));
+            assert!(deduplicator.check_and_record_seen(key_to_action(&key_with_dv, true)));
         }
 
         // Keys should be recorded in seen set
@@ -585,12 +629,12 @@ mod tests {
             let new_key = FileActionKey::new("new.parquet", None);
 
             // First time seeing new_key in checkpoint, should return false but NOT record it
-            assert!(!deduplicator.check_and_record_seen(new_key.clone()));
+            assert!(!deduplicator.check_and_record_seen(key_to_action(&new_key, true)));
             // Still returns false on second call (not recorded)
-            assert!(!deduplicator.check_and_record_seen(new_key.clone()));
+            assert!(!deduplicator.check_and_record_seen(key_to_action(&new_key, true)));
 
             // Existing keys from seen set should still be detected
-            assert!(deduplicator.check_and_record_seen(key1.clone()));
+            assert!(deduplicator.check_and_record_seen(key_to_action(&key1, true)));
         }
     }
 
@@ -620,10 +664,10 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
-        assert_eq!(key.path, "checkpoint_file.parquet");
-        assert!(key.dv_unique_id.is_none());
-        assert!(is_add);
+        let action = result.unwrap();
+        assert_eq!(action.path, "checkpoint_file.parquet");
+        assert!(action.dv_unique_id.is_none());
+        assert!(action.is_add);
 
         Ok(())
     }
@@ -642,13 +686,13 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
-        assert_eq!(key.path, "file_with_dv.parquet");
+        let action = result.unwrap();
+        assert_eq!(action.path, "file_with_dv.parquet");
         assert!(matches!(
-            key.dv_unique_id.as_deref(),
+            action.dv_unique_id.as_deref(),
             Some("s3path/to/dv@100")
         ));
-        assert!(is_add);
+        assert!(action.is_add);
 
         Ok(())
     }
@@ -669,7 +713,7 @@ mod tests {
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);
         assert!(
-            deduplicator.check_and_record_seen(commit_modified),
+            deduplicator.check_and_record_seen(key_to_action(&commit_modified, true)),
             "Files seen in commits should be filtered from checkpoint"
         );
 
@@ -677,14 +721,14 @@ mod tests {
         let commit_modified_dv =
             FileActionKey::new("modified_with_dv.parquet", Some("dv123".to_string()));
         assert!(
-            deduplicator.check_and_record_seen(commit_modified_dv),
+            deduplicator.check_and_record_seen(key_to_action(&commit_modified_dv, true)),
             "Files with DVs seen in commits should be filtered from checkpoint"
         );
 
         // File only in checkpoint - should NOT be filtered
         let checkpoint_only = FileActionKey::new("checkpoint_only.parquet", None);
         assert!(
-            !deduplicator.check_and_record_seen(checkpoint_only),
+            !deduplicator.check_and_record_seen(key_to_action(&checkpoint_only, true)),
             "Files only in checkpoint should not be filtered"
         );
 
