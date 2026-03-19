@@ -31,15 +31,33 @@ struct GetReferencedFields<'a> {
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        self.unresolved_references
-            .remove(self.logical_path.as_slice())
-            .then(|| {
-                self.column_mappings.insert(
-                    ColumnName::new(&self.logical_path),
-                    ColumnName::new(&self.physical_path),
-                );
-                Cow::Borrowed(ptype)
+        // Delta column names are case-insensitive: match all predicate references that
+        // case-insensitively match this schema column. We resolve all of them in one visit
+        // so that predicates referencing the same column with different casings (e.g. `value`
+        // and `VALUE`) both get rewritten to the schema's casing. The key in column_mappings
+        // uses the predicate's original casing so that ApplyColumnMappings can look it up.
+        let matching: Vec<&'a ColumnName> = self
+            .unresolved_references
+            .iter()
+            .filter(|&&r| {
+                let r_path: &[String] = r;
+                r_path.len() == self.logical_path.len()
+                    && r_path
+                        .iter()
+                        .zip(&self.logical_path)
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
             })
+            .copied()
+            .collect();
+        if matching.is_empty() {
+            return None;
+        }
+        let physical = ColumnName::new(&self.physical_path);
+        for reference in &matching {
+            self.unresolved_references.remove(*reference);
+            self.column_mappings.insert((**reference).clone(), physical.clone());
+        }
+        Some(Cow::Borrowed(ptype))
     }
 
     // Arrays and maps are not eligible for data skipping; filter them out.
