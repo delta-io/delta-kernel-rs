@@ -941,6 +941,95 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     Ok(())
 }
 
+/// Test partition pruning on a table with column mapping (name mode). The logical partition
+/// column "category" has physical name "phys_category". With column mapping, `partitionValues`
+/// in the log uses physical column names, and the partition schema + predicate must also use
+/// physical names for `MapToStruct` extraction and data skipping to work correctly.
+#[rstest::rstest]
+#[case::partition_only(
+    // Partition-only predicate: category = 'A' prunes the category=B file
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    1
+)]
+#[case::mixed_partition_and_data(
+    // Mixed predicate: category = 'A' OR val > 'z'. Category=A kept by partition match.
+    // Category=B: partition mismatch, but max(val)='z' NOT > 'z', so data skipping prunes it.
+    Arc::new(Pred::or(
+        Pred::eq(column_expr!("category"), Expr::literal("A")),
+        Pred::gt(column_expr!("val"), Expr::literal("z")),
+    )),
+    1
+)]
+#[tokio::test]
+async fn partition_pruning_with_column_mapping(
+    #[case] predicate: Arc<Pred>,
+    #[case] expected_files: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+
+    // Column mapping name mode: logical "category" -> physical "phys_category",
+    // logical "val" -> physical "phys_val"
+    let schema_str = r#"{"type":"struct","fields":[{"name":"category","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"phys_category"}},{"name":"val","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"phys_val"}}]}"#;
+
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","isBlindAppend":true}}"#.to_string(),
+        format!(
+            r#"{{"metaData":{{"id":"test-cm","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema}","partitionColumns":["category"],"configuration":{{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"}},"createdTime":1587968585495}}}}"#,
+            schema = schema_str.replace('"', r#"\""#),
+        ),
+        // partitionValues uses physical column name when column mapping is enabled
+        format!(
+            r#"{{"add":{{"path":"phys_category=A/{PARQUET_FILE1}","partitionValues":{{"phys_category":"A"}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":3,\"nullCount\":{{\"phys_val\":0}},\"minValues\":{{\"phys_val\":\"x\"}},\"maxValues\":{{\"phys_val\":\"z\"}}}}" }}}}"#
+        ),
+        format!(
+            r#"{{"add":{{"path":"phys_category=B/{PARQUET_FILE2}","partitionValues":{{"phys_category":"B"}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":3,\"nullCount\":{{\"phys_val\":0}},\"minValues\":{{\"phys_val\":\"x\"}},\"maxValues\":{{\"phys_val\":\"z\"}}}}" }}}}"#
+        ),
+    ];
+
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from("phys_category=A").child(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from("phys_category=B").child(PARQUET_FILE2),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    // Predicates use logical column names -- kernel must map to physical names
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+
+    let stream = scan.execute(engine)?;
+    let mut files_scanned = 0;
+    for engine_data in stream {
+        let result_batch = into_record_batch(engine_data?);
+        // The "category" partition column should be filled with "A"
+        let category_idx = result_batch.schema().index_of("category")?;
+        let category_col = result_batch.column(category_idx).as_string::<i32>();
+        for i in 0..result_batch.num_rows() {
+            assert_eq!(category_col.value(i), "A");
+        }
+        files_scanned += 1;
+    }
+    assert_eq!(
+        expected_files, files_scanned,
+        "Expected partition pruning to return {expected_files} file(s)"
+    );
+
+    Ok(())
+}
+
 #[rstest::rstest]
 #[case::not_less_than(
     Pred::not(column_expr!("number").lt(Expr::literal(4i64))),

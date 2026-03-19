@@ -1571,8 +1571,6 @@ mod tests {
     /// incorrectly survive deduplication.
     #[test]
     fn data_skipping_does_not_prune_remove_actions() {
-        use std::collections::HashMap;
-
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
             "value",
             DataType::INTEGER,
@@ -1580,15 +1578,8 @@ mod tests {
         )]));
         // Predicate on `value` activates data skipping via stats
         let predicate = Arc::new(Expr::column(["value"]).gt(Expr::literal(5i32)));
-        let state_info = get_state_info(
-            schema,
-            vec![],
-            Some(predicate),
-            &[],
-            HashMap::new(),
-            vec![],
-        )
-        .unwrap();
+        let state_info =
+            get_state_info(schema, vec![], Some(predicate), &[], HashMap::new(), vec![]).unwrap();
 
         // Batch: [Remove c001, Add c001, Add c000, Metadata]
         // Both adds have stats min=0, max=9 so they pass the value>5 filter.

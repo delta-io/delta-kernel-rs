@@ -124,7 +124,7 @@ fn build_data_skipping_schemas(
     // should not include unused partition columns.
     let predicate_partition_schema = match (&table_partition_schema, physical_predicate) {
         (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
-            // Partition values extracted from the string map via ELEMENT_AT are always
+            // Partition values extracted from the string map via MapToStruct are always
             // nullable (map lookup can return null), so we force all partition fields nullable.
             let fields: Vec<StructField> = ref_schema
                 .fields()
@@ -168,6 +168,8 @@ fn build_data_skipping_schemas(
             let all_needed_physical: Vec<ColumnName> = all_needed_logical
                 .iter()
                 .filter_map(|col| {
+                    // Columns not found in the logical schema (e.g. predicate references a
+                    // column that doesn't exist in the table) are safe to skip.
                     get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
                         .inspect_err(|e| {
                             warn!("Failed to resolve physical name for column {col}: {e}")
