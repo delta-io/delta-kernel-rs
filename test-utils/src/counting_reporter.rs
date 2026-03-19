@@ -5,7 +5,6 @@
 //! inspect the counters or call [`CountingReporter::print_summary`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use delta_kernel::metrics::{MetricEvent, MetricsReporter};
 
@@ -13,6 +12,10 @@ use delta_kernel::metrics::{MetricEvent, MetricsReporter};
 ///
 /// All counters use [`Ordering::Relaxed`] -- sufficient here since there are no
 /// ordering dependencies between counters.
+///
+/// # Note: update [`reset`] and the `MetricsReporter` impl when adding fields.
+///
+/// [`reset`]: Self::reset
 #[derive(Debug, Default)]
 pub struct CountingReporter {
     // Storage-layer IO counters
@@ -44,8 +47,8 @@ pub struct CountingReporter {
 
 impl CountingReporter {
     /// Create a new reporter with all counters at zero.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Reset all counters to zero.
@@ -76,6 +79,7 @@ impl CountingReporter {
         let read_calls = self.read_calls.load(Ordering::Relaxed);
         let read_files = self.read_files.load(Ordering::Relaxed);
         let bytes_read = self.bytes_read.load(Ordering::Relaxed);
+        let copy_calls = self.copy_calls.load(Ordering::Relaxed);
         let log_loads = self.log_segment_loads.load(Ordering::Relaxed);
         let commits = self.commit_files.load(Ordering::Relaxed);
         let checkpoints = self.checkpoint_files.load(Ordering::Relaxed);
@@ -84,7 +88,7 @@ impl CountingReporter {
         println!(
             "  [io] {label}\n\
              \x20       storage  : {list_calls} list ({list_files} files seen)  \
-             {read_calls} read ({read_files} files, {} KiB)\n\
+             {read_calls} read ({read_files} files, {} KiB)  {copy_calls} copy\n\
              \x20       log replay: {log_loads} segment load(s) -- \
              {commits} commits  {checkpoints} checkpoints  {compactions} compactions",
             bytes_read / 1024,
@@ -128,7 +132,135 @@ impl MetricsReporter for CountingReporter {
                 self.compaction_files
                     .fetch_add(num_compaction_files, Ordering::Relaxed);
             }
-            _ => {}
+            // Intentionally not tracked -- add counters if needed.
+            MetricEvent::ProtocolMetadataLoaded { .. } | MetricEvent::SnapshotFailed { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use delta_kernel::metrics::MetricId;
+
+    use super::*;
+
+    fn dur() -> Duration {
+        Duration::from_millis(1)
+    }
+
+    #[test]
+    fn report_storage_list_completed_increments_list_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::StorageListCompleted {
+            duration: dur(),
+            num_files: 10,
+        });
+        reporter.report(MetricEvent::StorageListCompleted {
+            duration: dur(),
+            num_files: 5,
+        });
+        assert_eq!(reporter.list_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(reporter.list_files_seen.load(Ordering::Relaxed), 15);
+    }
+
+    #[test]
+    fn report_storage_read_completed_increments_read_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::StorageReadCompleted {
+            duration: dur(),
+            num_files: 3,
+            bytes_read: 1024,
+        });
+        assert_eq!(reporter.read_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(reporter.read_files.load(Ordering::Relaxed), 3);
+        assert_eq!(reporter.bytes_read.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    fn report_storage_copy_completed_increments_copy_counter() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::StorageCopyCompleted { duration: dur() });
+        assert_eq!(reporter.copy_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn report_snapshot_completed_increments_snapshot_counter() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::SnapshotCompleted {
+            operation_id: MetricId::new(),
+            version: 0,
+            total_duration: dur(),
+        });
+        assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn report_log_segment_loaded_increments_log_replay_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::LogSegmentLoaded {
+            operation_id: MetricId::new(),
+            duration: dur(),
+            num_commit_files: 7,
+            num_checkpoint_files: 2,
+            num_compaction_files: 1,
+        });
+        assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 7);
+        assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 2);
+        assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn report_untracked_events_does_not_panic() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::ProtocolMetadataLoaded {
+            operation_id: MetricId::new(),
+            duration: dur(),
+        });
+        reporter.report(MetricEvent::SnapshotFailed {
+            operation_id: MetricId::new(),
+            duration: dur(),
+        });
+        // No counters change -- just verify no panic
+        assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reset_zeros_all_counters() {
+        let reporter = Arc::new(CountingReporter::new());
+        reporter.report(MetricEvent::StorageListCompleted {
+            duration: dur(),
+            num_files: 10,
+        });
+        reporter.report(MetricEvent::StorageReadCompleted {
+            duration: dur(),
+            num_files: 3,
+            bytes_read: 1024,
+        });
+        reporter.report(MetricEvent::StorageCopyCompleted { duration: dur() });
+        reporter.report(MetricEvent::LogSegmentLoaded {
+            operation_id: MetricId::new(),
+            duration: dur(),
+            num_commit_files: 7,
+            num_checkpoint_files: 2,
+            num_compaction_files: 1,
+        });
+
+        reporter.reset();
+
+        assert_eq!(reporter.list_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.list_files_seen.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.read_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.read_files.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.bytes_read.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.copy_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 0);
     }
 }
