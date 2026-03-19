@@ -1,12 +1,6 @@
-use delta_kernel_derive::internal_api;
 use std::borrow::{Cow, ToOwned};
 use std::convert::Infallible;
 use std::fmt::Debug;
-
-/// Indicates that a carrier cannot represent a filtered-out node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct CannotFilter;
 
 /// Carrier abstraction for transform outputs.
 ///
@@ -21,9 +15,12 @@ pub(crate) struct CannotFilter;
 /// - `()` and `Result<(), E>` are carriers for read-only visitor transforms that return no value
 /// - `Cow<'a, T>` and `Result<Cow<'a, T>, E>` are non-filtering carriers
 /// - `Option<Cow<'a, T>>` and `Result<Option<Cow<'a, T>>, E>` are filtering carriers
-#[internal_api]
-pub(crate) trait Carrier<'a, T: ToOwned + ?Sized>: Sized {
+pub trait Carrier<'a, T: ToOwned + ?Sized>: Sized {
     type Residual;
+
+    /// For filtering carriers, Some carrier containing a residual value equivalent to
+    /// `Option::None`. None for non-filtering carriers.
+    const NONE: Option<Self>;
 
     /// Wrap a present transformed node.
     fn from_inner(inner: Cow<'a, T>) -> Self;
@@ -39,11 +36,6 @@ pub(crate) trait Carrier<'a, T: ToOwned + ?Sized>: Sized {
     /// - filtering carriers may return `Ok(None)` to indicate "filtered out"
     /// - non-filtering carriers always return `Ok(Some(_))`
     fn into_inner_opt(self) -> Result<Option<Cow<'a, T>>, Self::Residual>;
-    /// Attempts to construct a carrier value representing "None"
-    ///
-    /// Filtering carriers always return a residual value equivalent to None), while non-filtering
-    /// carriers always return `Err(CannotFilter)`.
-    fn try_none() -> Result<Self, CannotFilter>;
 }
 
 /// Emulates `?` for the result of calling [`Carrier::into_inner_opt`]: If the result is Err,
@@ -62,7 +54,7 @@ pub(crate) use carrier_into_inner_opt;
 /// Ok(none), immediately return it. Otherwise, do nothing.
 macro_rules! carrier_try_none {
     () => {
-        if let Ok(none) = Carrier::try_none() {
+        if let Some(none) = Carrier::NONE {
             return none;
         }
     };
@@ -72,6 +64,8 @@ pub(crate) use carrier_try_none;
 /// Carrier for infallible non-filtering transforms that can replace but not drop nodes.
 impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for Cow<'a, T> {
     type Residual = Infallible;
+
+    const NONE: Option<Self> = None;
 
     fn from_inner(inner: Cow<'a, T>) -> Self {
         inner
@@ -85,15 +79,14 @@ impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for Cow<'a, T> {
     fn into_inner_opt(self) -> Result<Option<Cow<'a, T>>, Infallible> {
         Ok(Some(self))
     }
-    fn try_none() -> Result<Self, CannotFilter> {
-        Err(CannotFilter)
-    }
 }
 
 /// Carrier for infallible filtering transforms that can drop nodes by returning None.
 impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for Option<Cow<'a, T>> {
     /// The only valid residual value is `()`, which indicates a filtered-out node.
     type Residual = ();
+
+    const NONE: Option<Self> = Some(None);
 
     fn from_inner(inner: Cow<'a, T>) -> Self {
         Some(inner)
@@ -107,9 +100,6 @@ impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for Option<Cow<'a, T>> {
     fn into_inner_opt(self) -> Result<Option<Cow<'a, T>>, ()> {
         Ok(self)
     }
-    fn try_none() -> Result<Self, CannotFilter> {
-        Ok(None)
-    }
 }
 
 /// Carrier for infallible visitors, which are modeled as always-filter transforms. It silently
@@ -117,6 +107,8 @@ impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for Option<Cow<'a, T>> {
 impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for () {
     /// The only valid residual value is `()`, which indicates a filtered-out node.
     type Residual = ();
+
+    const NONE: Option<Self> = Some(());
 
     fn from_inner(_inner: Cow<'a, T>) -> Self {}
     fn from_residual(_residual: ()) -> Self {}
@@ -126,14 +118,13 @@ impl<'a, T: ToOwned + ?Sized> Carrier<'a, T> for () {
     fn into_inner_opt(self) -> Result<Option<Cow<'a, T>>, ()> {
         Ok(None)
     }
-    fn try_none() -> Result<Self, CannotFilter> {
-        Ok(())
-    }
 }
 
 /// Carrier for fallible non-filtering transforms, which immediately abort on Err.
 impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Cow<'a, T>, E> {
     type Residual = E;
+
+    const NONE: Option<Self> = None;
 
     fn from_inner(inner: Cow<'a, T>) -> Self {
         Ok(inner)
@@ -147,9 +138,6 @@ impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Cow<'a, T>, E>
     fn into_inner_opt(self) -> Result<Option<Cow<'a, T>>, E> {
         self.map(Some)
     }
-    fn try_none() -> Result<Self, CannotFilter> {
-        Err(CannotFilter)
-    }
 }
 
 /// Carrier for fallible filtering transforms, which immediateky abort on Err and can also drop
@@ -157,6 +145,8 @@ impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Cow<'a, T>, E>
 impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Option<Cow<'a, T>>, E> {
     /// Residual None means drop, Some error means abort
     type Residual = Option<E>;
+
+    const NONE: Option<Self> = Some(Ok(None));
 
     fn from_inner(inner: Cow<'a, T>) -> Self {
         Ok(Some(inner))
@@ -174,9 +164,6 @@ impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Option<Cow<'a,
     fn into_inner_opt(self) -> Result<Option<Cow<'a, T>>, Option<E>> {
         self.map_err(Some)
     }
-    fn try_none() -> Result<Self, CannotFilter> {
-        Ok(Ok(None))
-    }
 }
 
 /// Carrier for fallible visitors, which are modeled as fallible always-filter transforms. It
@@ -185,6 +172,8 @@ impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Option<Cow<'a,
 impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<(), E> {
     /// Residual None means drop, Some error means abort
     type Residual = Option<E>;
+
+    const NONE: Option<Self> = Some(Ok(()));
 
     fn from_inner(_inner: Cow<'a, T>) -> Self {
         Ok(())
@@ -200,8 +189,5 @@ impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<(), E> {
             Ok(()) => Ok(None),
             Err(err) => Err(Some(err)),
         }
-    }
-    fn try_none() -> Result<Self, CannotFilter> {
-        Ok(Ok(()))
     }
 }
