@@ -360,8 +360,8 @@ fn cast_list_elements_to_view(
     field: &Arc<ArrowField>,
 ) -> DeltaResult<Arc<dyn Array>> {
     let to_type = match field.data_type() {
-        ArrowDataType::Utf8 => ArrowDataType::Utf8View,
-        ArrowDataType::Binary => ArrowDataType::BinaryView,
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
+        ArrowDataType::Binary | ArrowDataType::FixedSizeBinary(_) | ArrowDataType::LargeBinary => ArrowDataType::BinaryView,
         _ => return Ok(vals.clone()),
     };
     let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
@@ -433,8 +433,12 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
         ArrowDataType::LargeList(field) => cast_list_elements_to_view(&vals, field),
         ArrowDataType::ListView(field) => cast_list_elements_to_view(&vals, field),
         ArrowDataType::LargeListView(field) => cast_list_elements_to_view(&vals, field),
-        ArrowDataType::Utf8 => Ok(cast(&vals, &ArrowDataType::Utf8View)?),
-        ArrowDataType::Binary => Ok(cast(&vals, &ArrowDataType::BinaryView)?),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+            Ok(cast(&vals, &ArrowDataType::Utf8View)?)
+        }
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::FixedSizeBinary(_) => {
+            Ok(cast(&vals, &ArrowDataType::BinaryView)?)
+        }
         _ => Ok(vals),
     }
 }
@@ -555,20 +559,15 @@ pub fn evaluate_predicate(
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
 
-            match op {
-                LessThan | GreaterThan | Equal | Distinct => {
-                    let (left, right) = if left.data_type() == right.data_type() {
-                        (left, right)
-                    } else {
-                        (
-                            arrow_convert_to_view_type(left)?,
-                            arrow_convert_to_view_type(right)?,
-                        )
-                    };
-                    Ok(eval_fn(&left, &right)?)
-                }
-                In => Ok(eval_fn(&left, &right)?),
-            }
+            let (left, right) = if left.data_type() == right.data_type() {
+                (left, right)
+            } else {
+                (
+                    arrow_convert_to_view_type(left)?,
+                    arrow_convert_to_view_type(right)?,
+                )
+            };
+            Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):

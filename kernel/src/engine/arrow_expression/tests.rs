@@ -218,6 +218,67 @@ fn test_binary_predicate_with_view_column() {
 }
 
 #[test]
+fn test_binary_predicate_with_large_utf8_column() {
+    // Verify that a LargeUtf8 column (i64 offsets) produces the same comparison results
+    // as Utf8View, exercising the LargeUtf8 -> Utf8View cast in arrow_convert_to_view_type.
+    // The literal "hello" evaluates to Utf8, so types mismatch and the cast path is triggered.
+    let array =
+        GenericStringArray::<i64>::from(vec![None, Some("apple"), Some("hello"), Some("zebra")]);
+    let schema = Schema::new([Arc::new(Field::new("name", DataType::LargeUtf8, true))]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
+    let column = column_expr!("name");
+
+    let predicate_lt = column.clone().lt(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
+    let expected_lt = BooleanArray::from(vec![None, Some(true), Some(false), Some(false)]);
+    assert_eq!(results, expected_lt);
+
+    let predicate_le = column.clone().le(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
+    let expected_le = BooleanArray::from(vec![None, Some(true), Some(true), Some(false)]);
+    assert_eq!(results, expected_le);
+
+    let predicate_gt = column.clone().gt(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
+    let expected_gt = BooleanArray::from(vec![None, Some(false), Some(false), Some(true)]);
+    assert_eq!(results, expected_gt);
+
+    let predicate_ge = column.clone().ge(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
+    let expected_ge = BooleanArray::from(vec![None, Some(false), Some(true), Some(true)]);
+    assert_eq!(results, expected_ge);
+
+    let predicate_eq = column.clone().eq(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
+    let expected_eq = BooleanArray::from(vec![None, Some(false), Some(true), Some(false)]);
+    assert_eq!(results, expected_eq);
+
+    let predicate_ne = column.clone().ne(Expr::literal("hello"));
+    let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
+    let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
+    assert_eq!(results, expected_ne);
+
+    // Test inversion
+    let results = evaluate_predicate(&predicate_lt, &batch, true).unwrap();
+    assert_eq!(results, expected_ge);
+
+    let results = evaluate_predicate(&predicate_le, &batch, true).unwrap();
+    assert_eq!(results, expected_gt);
+
+    let results = evaluate_predicate(&predicate_gt, &batch, true).unwrap();
+    assert_eq!(results, expected_le);
+
+    let results = evaluate_predicate(&predicate_ge, &batch, true).unwrap();
+    assert_eq!(results, expected_lt);
+
+    let results = evaluate_predicate(&predicate_eq, &batch, true).unwrap();
+    assert_eq!(results, expected_ne);
+
+    let results = evaluate_predicate(&predicate_ne, &batch, true).unwrap();
+    assert_eq!(results, expected_eq);
+}
+
+#[test]
 fn test_binary_predicate_with_binary_view_column() {
     // Test all BinaryPredicateOps where the column is of BinaryView type
     let list_array = BinaryViewArray::from(vec![
