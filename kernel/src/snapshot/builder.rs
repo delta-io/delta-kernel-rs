@@ -1,12 +1,15 @@
 //! Builder for creating [`Snapshot`] instances.
+use std::sync::Arc;
+use std::time::Instant;
+
+use tracing::{info, instrument};
+
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
-use crate::metrics::MetricId;
+use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::snapshot::SnapshotRef;
 use crate::utils::try_parse_uri;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
-
-use tracing::{info, instrument};
 
 /// Builder for creating [`Snapshot`] instances.
 ///
@@ -99,8 +102,9 @@ impl SnapshotBuilder {
         let log_tail = self.log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
         let reporter = engine.get_metrics_reporter();
+        let start = Instant::now();
 
-        if let Some(table_root) = self.table_root {
+        let result = if let Some(table_root) = self.table_root {
             let table_url = try_parse_uri(table_root)?;
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
@@ -110,29 +114,55 @@ impl SnapshotBuilder {
                 reporter.as_ref(),
                 Some(operation_id),
             )?;
-
-            Ok(Snapshot::try_new_from_log_segment(
-                table_url,
-                log_segment,
-                engine,
-                Some(operation_id),
-            )?
-            .into())
+            Snapshot::try_new_from_log_segment_impl(table_url, log_segment, engine, operation_id)
+                .map(Into::into)
         } else {
             let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
                 Error::internal_error(
                     "SnapshotBuilder should have either table_root or existing_snapshot",
                 )
             })?;
-
-            Snapshot::try_new_from(
+            Snapshot::try_new_from_impl(
                 existing_snapshot,
                 log_tail,
                 engine,
                 self.version,
-                Some(operation_id),
+                operation_id,
             )
+        };
+
+        Self::report_snapshot_build_result(result, start, operation_id, reporter.as_ref())
+    }
+
+    /// Emit [`MetricEvent::SnapshotCompleted`] or [`MetricEvent::SnapshotFailed`] based on the
+    /// result, measuring total duration from `start`.
+    fn report_snapshot_build_result(
+        result: DeltaResult<SnapshotRef>,
+        start: Instant,
+        operation_id: MetricId,
+        reporter: Option<&Arc<dyn MetricsReporter>>,
+    ) -> DeltaResult<SnapshotRef> {
+        let snapshot_duration = start.elapsed();
+        match &result {
+            Ok(snapshot) => {
+                reporter.inspect(|r| {
+                    r.report(MetricEvent::SnapshotCompleted {
+                        operation_id,
+                        version: snapshot.version(),
+                        total_duration: snapshot_duration,
+                    });
+                });
+            }
+            Err(_) => {
+                reporter.inspect(|r| {
+                    r.report(MetricEvent::SnapshotFailed {
+                        operation_id,
+                        duration: snapshot_duration,
+                    });
+                });
+            }
         }
+        result
     }
 
     // ===== Instrumentation Helpers =====
@@ -157,11 +187,12 @@ impl SnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
+    use crate::metrics::{MetricEvent, MetricsReporter};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStore as _};
@@ -169,6 +200,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct CapturingReporter {
+        events: Mutex<Vec<MetricEvent>>,
+    }
+
+    impl MetricsReporter for CapturingReporter {
+        fn report(&self, event: MetricEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -318,5 +360,141 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn setup_test_with_reporter() -> (
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Arc<DynObjectStore>,
+        String,
+        Arc<CapturingReporter>,
+    ) {
+        let table_root = String::from("memory:///");
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_metrics_reporter(reporter.clone())
+                .build(),
+        );
+        (engine, store, table_root, reporter)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_failed_emits_metric_on_error() {
+        let (engine, store, table_root, reporter) = setup_test_with_reporter();
+
+        // Write a commit with an unsupported schema type to force a build failure
+        let commit0_data = [
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({"metaData": {
+                "id": "test-table-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"x\",\"type\":\"interval second\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect_vec()
+        .join("\n");
+
+        let path = Path::from("_delta_log/00000000000000000000.json");
+        store.put(&path, commit0_data.into()).await.unwrap();
+
+        let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
+        assert!(result.is_err());
+
+        let events = reporter.events.lock().unwrap();
+        let has_snapshot_failed = events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. }));
+        assert!(has_snapshot_failed, "expected a SnapshotFailed event");
+
+        let has_snapshot_completed = events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. }));
+        assert!(
+            !has_snapshot_completed,
+            "should not emit SnapshotCompleted on failure"
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_update_from_existing_emits_metric() {
+        let (engine, store, table_root, reporter) = setup_test_with_reporter();
+        create_table(&store, table_root.clone()).await.unwrap();
+
+        // Build an initial snapshot at version 0
+        let base = SnapshotBuilder::new_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
+        // Clear events from the initial build
+        reporter.events.lock().unwrap().clear();
+
+        // Incrementally update to the latest version via the else branch
+        let updated = SnapshotBuilder::new_from(base)
+            .build(engine.as_ref())
+            .unwrap();
+        assert_eq!(updated.version(), 1);
+
+        let events = reporter.events.lock().unwrap();
+        let snapshot_completed = events.iter().find_map(|e| match e {
+            MetricEvent::SnapshotCompleted {
+                version,
+                total_duration,
+                ..
+            } => Some((*version, *total_duration)),
+            _ => None,
+        });
+
+        let (version, duration) = snapshot_completed.expect("expected SnapshotCompleted event");
+        assert_eq!(version, 1);
+        assert!(
+            !duration.is_zero(),
+            "SnapshotCompleted.total_duration should be non-zero"
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_completed_duration_includes_log_segment_loading() {
+        let (engine, store, table_root, reporter) = setup_test_with_reporter();
+        create_table(&store, table_root.clone()).await.unwrap();
+
+        let _snapshot = SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .unwrap();
+
+        let events = reporter.events.lock().unwrap();
+
+        let log_segment_loaded = events.iter().find_map(|e| match e {
+            MetricEvent::LogSegmentLoaded { duration, .. } => Some(*duration),
+            _ => None,
+        });
+        let snapshot_completed = events.iter().find_map(|e| match e {
+            MetricEvent::SnapshotCompleted { total_duration, .. } => Some(*total_duration),
+            _ => None,
+        });
+
+        let log_segment_duration = log_segment_loaded.expect("expected LogSegmentLoaded event");
+        let snapshot_duration = snapshot_completed.expect("expected SnapshotCompleted event");
+
+        assert!(
+            snapshot_duration >= log_segment_duration,
+            "SnapshotCompleted.total_duration ({snapshot_duration:?}) should be >= \
+             LogSegmentLoaded.duration ({log_segment_duration:?})"
+        );
+
+        let snapshot_completed_count = events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::SnapshotCompleted { .. }))
+            .count();
+        assert_eq!(
+            snapshot_completed_count, 1,
+            "expected exactly one SnapshotCompleted event"
+        );
     }
 }
