@@ -3822,6 +3822,60 @@ async fn test_new_with_commit_not_end_version_plus_one() {
 }
 
 // ============================================================================
+// new_with_checkpoint tests
+// ============================================================================
+
+#[rstest]
+#[case::non_checkpoint_file(
+    "file:///_delta_log/00000000000000000002.json",
+    "Path is not a checkpoint file"
+)]
+#[case::wrong_version(
+    "file:///_delta_log/00000000000000000005.checkpoint.parquet",
+    "Checkpoint version (5) does not equal LogSegment end_version (2)"
+)]
+#[tokio::test]
+async fn test_new_with_checkpoint_rejects_invalid_path(
+    #[case] path: &str,
+    #[case] expected_error: &str,
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        ..Default::default()
+    })
+    .await;
+    let result = log_segment.new_with_checkpoint(create_log_path(path));
+    assert_result_error_with_message(result, expected_error);
+}
+
+// ============================================================================
+// new_with_crc_file tests
+// ============================================================================
+
+#[rstest]
+#[case::non_crc_file(
+    "file:///_delta_log/00000000000000000002.json",
+    "Path is not a CRC file"
+)]
+#[case::wrong_version(
+    "file:///_delta_log/00000000000000000005.crc",
+    "CRC version (5) does not equal LogSegment end_version (2)"
+)]
+#[tokio::test]
+async fn test_new_with_crc_file_rejects_invalid_path(
+    #[case] path: &str,
+    #[case] expected_error: &str,
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        ..Default::default()
+    })
+    .await;
+    let result = log_segment.new_with_crc_file(create_log_path(path));
+    assert_result_error_with_message(result, expected_error);
+}
+
+// ============================================================================
 // get_unpublished_catalog_commits tests
 // ============================================================================
 

@@ -316,6 +316,24 @@ impl ParsedLogPath<FileMeta> {
 }
 
 impl ParsedLogPath<Url> {
+    /// Converts this `ParsedLogPath<Url>` into a `ParsedLogPath<FileMeta>` using placeholder
+    /// values for `last_modified` (0) and `size` (0). This is useful when only the path
+    /// identity matters (e.g. recording a file in a log segment) and the actual file metadata
+    /// is not needed.
+    pub(crate) fn into_filemeta(self) -> ParsedLogPath<FileMeta> {
+        ParsedLogPath {
+            location: FileMeta {
+                location: self.location,
+                last_modified: 0,
+                size: 0,
+            },
+            filename: self.filename,
+            extension: self.extension,
+            version: self.version,
+            file_type: self.file_type,
+        }
+    }
+
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
         let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
@@ -340,7 +358,6 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,

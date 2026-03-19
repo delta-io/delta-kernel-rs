@@ -264,7 +264,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
 
     // This writes to parquet — will fail if the checkpointMetadata batch has a different
     // schema than the action batches.
-    snapshot.clone().checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref())?;
 
     // Verify the checkpoint was written and is used by a fresh snapshot
     let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;

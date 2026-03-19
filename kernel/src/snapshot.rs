@@ -472,16 +472,19 @@ impl Snapshot {
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
     ///
-    /// Writes a checkpoint parquet file and the `_last_checkpoint` file.
+    /// Writes a checkpoint parquet file and the `_last_checkpoint` file. Returns an updated
+    /// [`SnapshotRef`] whose log segment reflects the new checkpoint. Commits and compaction
+    /// files subsumed by the checkpoint are dropped from the returned snapshot.
     ///
     /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
     /// [`crate::StorageHandler::head`], which may not be implemented by all engines
     /// (e.g., `SyncEngine`).
     ///
-    /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
+    /// If you are using the default engine, make sure to build it with the multi-threaded
+    /// executor if you want to use this method.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
-    pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
-        let writer = self.create_checkpoint_writer()?;
+    pub fn checkpoint(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        let writer = Arc::clone(self).create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
@@ -493,7 +496,17 @@ impl Snapshot {
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
         // Finalize the checkpoint (writes `_last_checkpoint` file).
-        writer.finalize(engine, &file_meta, &state)
+        writer.finalize(engine, &file_meta, &state)?;
+
+        let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
+            Error::internal_error("Checkpoint path could not be parsed as a log path")
+        })?;
+        let new_log_segment = self.log_segment.new_with_checkpoint(checkpoint_log_path)?;
+        Ok(Arc::new(Snapshot::new_with_crc(
+            new_log_segment,
+            self.table_configuration().clone(),
+            self.lazy_crc.clone(),
+        )))
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -716,9 +729,10 @@ impl Snapshot {
     /// information in memory (i.e. the snapshot returned by
     /// [`CommittedTransaction::post_commit_snapshot`]).
     ///
-    /// Returns [`ChecksumWriteResult::AlreadyExists`] if a checksum already exists at this
-    /// version (safe for concurrent writers). Returns [`ChecksumWriteResult::Written`] on
-    /// success.
+    /// Returns a tuple of [`ChecksumWriteResult`] and a [`SnapshotRef`]. On
+    /// [`ChecksumWriteResult::Written`], the returned snapshot has the CRC file recorded in
+    /// its log segment. On [`ChecksumWriteResult::AlreadyExists`], the original snapshot is
+    /// returned unchanged.
     ///
     /// # Errors
     ///
@@ -732,7 +746,10 @@ impl Snapshot {
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
     #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
-    pub fn write_checksum(&self, engine: &dyn Engine) -> DeltaResult<ChecksumWriteResult> {
+    pub fn write_checksum(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
             .listed
@@ -745,7 +762,7 @@ impl Snapshot {
                 "CRC file already exists on disk at version {}",
                 self.version()
             );
-            return Ok(ChecksumWriteResult::AlreadyExists);
+            return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
         let crc = self
@@ -759,22 +776,26 @@ impl Snapshot {
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        // TODO: Would be nice to update LogSegment.listed.latest_crc_file here, but that probably
-        //       requires changing it to a OnceLock, which is a bit of an invasive change. Perhaps,
-        //       return an updated Snapshot instead.
-
         // Note: try_write_crc_file validates file stats validity before writing.
         match try_write_crc_file(engine, &crc_path.location, crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
-                Ok(ChecksumWriteResult::Written)
+                let new_log_segment = self
+                    .log_segment
+                    .new_with_crc_file(crc_path.into_filemeta())?;
+                let new_snapshot = Arc::new(Snapshot::new_with_crc(
+                    new_log_segment,
+                    self.table_configuration().clone(),
+                    self.lazy_crc.clone(),
+                ));
+                Ok((ChecksumWriteResult::Written, new_snapshot))
             }
             Err(Error::FileAlreadyExists(_)) => {
                 info!(
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
                 );
-                Ok(ChecksumWriteResult::AlreadyExists)
+                Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)))
             }
             Err(e) => Err(e),
         }
