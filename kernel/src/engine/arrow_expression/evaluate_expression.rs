@@ -381,6 +381,14 @@ fn cast_list_elements_to_view(
     Ok(cast(vals, &container)?)
 }
 
+/// Converts a list array so its element type and container type are both non-view.
+//
+/// Two transformations happen here:
+/// 1. View element types are converted to their non-view equivalents
+///    (e.g. `List<Utf8View>` -> `List<Utf8>`).
+/// 2. View container types are always converted to their non-view equivalents,
+///    even when elements are already non-view (e.g. `ListView<Int32>` -> `List<Int32>`).
+///    Currently, it does not supported converting nested type in List/ListView to non-view type.
 fn cast_list_elements_to_non_view(
     vals: &Arc<dyn Array>,
     field: &Arc<ArrowField>,
@@ -395,6 +403,8 @@ fn cast_list_elements_to_non_view(
             ) {
                 return Ok(vals.clone());
             }
+            // Container is a view type but element is not -- preserve element type,
+            // cast only the container (ListView -> List, LargeListView -> LargeList).
             other.clone()
         }
     };
