@@ -15,7 +15,7 @@ use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
@@ -52,14 +52,22 @@ pub(crate) fn column_mapping_mode(
     }
 }
 
-/// When column mapping mode is enabled, verify that each field in the schema is annotated with a
-/// physical name and field_id, and that no two fields share the same `delta.columnMapping.id`
-/// value. When not enabled, verifies that no fields are annotated.
+/// Verify that column mapping annotations in `schema` are consistent with `mode`.
+///
+/// When column mapping is enabled (`Name` or `Id` mode), checks that:
+/// - Every field has a `delta.columnMapping.physicalName` annotation
+/// - Every field has a `delta.columnMapping.id` annotation
+/// - No two fields share the same column mapping ID
+/// - No two fields share the same full physical path (parent physical names + field physical name)
+///
+/// When column mapping is disabled (`None` mode), checks that no fields carry those annotations.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
+        physical_path: vec![],
         seen: HashMap::new(),
+        seen_physical_names: HashSet::new(),
         err: None,
     };
     let _ = validator.transform_struct(schema);
@@ -172,7 +180,9 @@ pub(crate) fn get_field_column_mapping_info<'a>(
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
+    physical_path: Vec<String>, // physical names of ancestor fields; used to build full paths
     seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
+    seen_physical_names: HashSet<String>, // full physical path (ancestors + field) -> seen
     err: Option<Error>,
 }
 
@@ -202,10 +212,40 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
-            get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
-                .map_err(|e| this.err = Some(e))
-                .ok()?;
-            this.recurse_into_struct_field(field)
+            let (physical_name, _) =
+                get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
+                    .map_err(|e| this.err = Some(e))
+                    .ok()?;
+
+            // Check physical name uniqueness when column mapping is enabled. Two fields at the
+            // same nesting level must not share a physical name, since the full physical path
+            // (parent physical names joined by '.') would collide, corrupting Parquet reads.
+            if this.mode != ColumnMappingMode::None {
+                let full_physical_path = if this.physical_path.is_empty() {
+                    physical_name.to_owned()
+                } else {
+                    format!("{}.{}", this.physical_path.join("."), physical_name)
+                };
+                if this
+                    .seen_physical_names
+                    .contains(full_physical_path.as_str())
+                {
+                    this.err = Some(Error::schema(format!(
+                        "Duplicate physical name '{}' assigned to field '{}'",
+                        physical_name,
+                        this.path.join(".")
+                    )));
+                    return None;
+                }
+                this.seen_physical_names.insert(full_physical_path);
+                this.physical_path.push(physical_name.to_owned());
+                this.recurse_into_struct_field(field);
+                this.physical_path.pop();
+            } else {
+                this.recurse_into_struct_field(field);
+            }
+
+            Some(())
         });
         None
     }
@@ -672,6 +712,69 @@ mod tests {
             ),
             "Duplicate column mapping ID",
         );
+    }
+
+    fn make_cm_field_with_phys(
+        name: &str,
+        id: i64,
+        phys: &str,
+        data_type: impl Into<DataType>,
+    ) -> StructField {
+        StructField::new(name, data_type, false).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(phys.to_owned()),
+            ),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::name_mode(ColumnMappingMode::Name)]
+    #[case::id_mode(ColumnMappingMode::Id)]
+    fn duplicate_physical_names_at_same_level_rejected(#[case] mode: ColumnMappingMode) {
+        // Two sibling fields share the same physical name; column IDs are distinct.
+        let schema = StructType::new_unchecked([
+            make_cm_field_with_phys("a", 1, "shared-phys", DataType::INTEGER),
+            make_cm_field_with_phys("b", 2, "shared-phys", DataType::INTEGER),
+        ]);
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(&schema, mode),
+            "Duplicate physical name",
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::name_mode(ColumnMappingMode::Name)]
+    #[case::id_mode(ColumnMappingMode::Id)]
+    fn duplicate_physical_names_in_nested_struct_rejected(#[case] mode: ColumnMappingMode) {
+        // Sibling fields inside a nested struct share a physical name.
+        let inner = StructType::new_unchecked([
+            make_cm_field_with_phys("x", 2, "dup-phys", DataType::INTEGER),
+            make_cm_field_with_phys("y", 3, "dup-phys", DataType::INTEGER),
+        ]);
+        let schema = StructType::new_unchecked([make_cm_field_with_phys(
+            "outer",
+            1,
+            "col-outer",
+            DataType::Struct(Box::new(inner)),
+        )]);
+        crate::utils::test_utils::assert_result_error_with_message(
+            validate_schema_column_mapping(&schema, mode),
+            "Duplicate physical name",
+        );
+    }
+
+    #[test]
+    fn unique_physical_names_accepted() {
+        let schema = StructType::new_unchecked([
+            make_cm_field_with_phys("a", 1, "phys-a", DataType::INTEGER),
+            make_cm_field_with_phys("b", 2, "phys-b", DataType::INTEGER),
+        ]);
+        assert!(validate_schema_column_mapping(&schema, ColumnMappingMode::Name).is_ok());
     }
 
     // =========================================================================

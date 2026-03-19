@@ -27,7 +27,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::{validate_schema_column_mapping, ColumnMappingMode, TableFeature};
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
@@ -342,6 +342,18 @@ impl<S> Transaction<S> {
         // Step 3: Generate Protocol and Metadata actions for create-table
         let (protocol_action, metadata_action) = if self.is_create_table() {
             let table_config = self.read_snapshot.table_configuration();
+
+            // Guard against duplicate column IDs or physical names reaching the transaction log.
+            // Without this, an invalid schema committed here would cause Parquet read failures or
+            // be rejected later by Spark's equivalent commit-time check.
+            let column_mapping_mode = table_config.column_mapping_mode();
+            if column_mapping_mode != ColumnMappingMode::None {
+                validate_schema_column_mapping(
+                    &table_config.logical_schema(),
+                    column_mapping_mode,
+                )?;
+            }
+
             let protocol = table_config.protocol().clone();
             let metadata = table_config.metadata().clone();
 
