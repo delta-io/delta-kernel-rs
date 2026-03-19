@@ -923,10 +923,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1572,75 +1575,53 @@ mod tests {
     /// Verify that Remove actions are not pruned by data skipping. The transform reads from
     /// `add.*` columns, so Remove rows produce null `stats_parsed` and `partitionValues_parsed`
     /// (Remove actions have their own `remove.partitionValues` and `remove.stats`, but those
-    /// are not read by the transform). The data skipping filter must evaluate to NULL (unknown)
-    /// for these null columns and conservatively keep the row. If a Remove were pruned, it would
-    /// not be recorded in `seen_file_keys`, and a subsequent Add for the same path could
-    /// incorrectly survive deduplication.
-    #[test]
-    fn data_skipping_does_not_prune_remove_actions() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "value",
-            DataType::INTEGER,
-            true,
-        )]));
-        // Predicate on `value` activates data skipping via stats
-        let predicate = Arc::new(Expr::column(["value"]).gt(Expr::literal(5i32)));
-        let state_info =
-            get_state_info(schema, vec![], Some(predicate), &[], HashMap::new(), vec![]).unwrap();
-
-        // Batch: [Remove c001, Add c001, Add c000, Metadata]
-        // Both adds have stats min=0, max=9 so they pass the value>5 filter.
-        // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
-        let batch = vec![add_batch_with_remove(get_commit_schema().clone())];
-        let iter = scan_action_iter(
-            &SyncEngine::new(),
-            batch
-                .into_iter()
-                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            Arc::new(state_info),
-            test_checkpoint_info(),
-            false,
-        )
-        .unwrap();
-
-        let mut add_paths: Vec<String> = Vec::new();
-        for res in iter {
-            let scan_metadata = res.unwrap();
-            let paths = scan_metadata
-                .visit_scan_files(
-                    Vec::new(),
-                    |paths: &mut Vec<String>, scan_file: ScanFile| {
-                        paths.push(scan_file.path.to_string());
-                    },
-                )
-                .unwrap();
-            add_paths.extend(paths);
-        }
-
-        // Only c000 should survive: Remove suppressed c001, c000 passed data skipping
-        assert_eq!(add_paths.len(), 1, "Expected exactly one add to survive");
-        assert!(
-            add_paths[0].contains("c000"),
-            "Expected c000 add to survive, got: {}",
-            add_paths[0]
-        );
-    }
-
-    /// Same as `data_skipping_does_not_prune_remove_actions` but with a partition column
-    /// predicate. This is critical because partition pruning runs in the columnar data skipping
-    /// phase where Remove rows have null `add.partitionValues` (the transform reads `add.*`
-    /// columns, not `remove.*`). The filter must keep Remove rows despite null partition values.
-    #[test]
-    fn data_skipping_does_not_prune_remove_with_partition_predicate() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+    /// are not read by the transform). If a Remove were pruned, it would not be recorded in
+    /// `seen_file_keys`, and a subsequent Add for the same path could incorrectly survive
+    /// deduplication.
+    ///
+    /// Stats-based skipping is safe because null stats evaluate to NULL via ISNULL guards in
+    /// the predicate construction. Partition-based skipping requires the `is_add` guard
+    /// (`OR(NOT is_add, pred)`) because `eval_sql_where` adds IS NOT NULL guards that would
+    /// otherwise turn null partition values into `false`, filtering the Remove.
+    #[rstest]
+    #[case::stats_only(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+        ])),
+        vec![],
+        Arc::new(Expression::column(["value"]).gt(Expression::literal(5i32))),
+        false, // use batch without partition column
+    )]
+    #[case::partition_predicate(
+        Arc::new(StructType::new_unchecked([
             StructField::new("value", DataType::INTEGER, true),
             StructField::new("date", DataType::DATE, true),
-        ]));
-        // Predicate on partition column `date` (2017-12-10 = day 17510 since epoch)
-        let predicate = Arc::new(Expr::column(["date"]).eq(Expr::literal(Scalar::Date(17_510))));
+        ])),
+        vec!["date".to_string()],
+        Arc::new(Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510)))),
+        true, // use batch with partition column
+    )]
+    #[case::mixed_stats_and_partition(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ])),
+        vec!["date".to_string()],
+        Arc::new(Predicate::and(
+            Expression::column(["value"]).gt(Expression::literal(5i32)),
+            Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510))),
+        )),
+        true, // use batch with partition column
+    )]
+    fn data_skipping_does_not_prune_remove_actions(
+        #[case] schema: SchemaRef,
+        #[case] partition_columns: Vec<String>,
+        #[case] predicate: Arc<Predicate>,
+        #[case] with_partition: bool,
+    ) {
         let state_info = get_state_info(
             schema,
-            vec!["date".to_string()],
+            partition_columns,
             Some(predicate),
             &[],
             HashMap::new(),
@@ -1649,10 +1630,14 @@ mod tests {
         .unwrap();
 
         // Batch: [Remove c001, Add c001, Add c000, Metadata]
-        // Both adds have date=2017-12-10 (day 17510). The Remove must not be pruned.
-        let batch = vec![add_batch_with_remove_and_partition(
-            get_commit_schema().clone(),
-        )];
+        // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
+        let batch = if with_partition {
+            vec![add_batch_with_remove_and_partition(
+                get_commit_schema().clone(),
+            )]
+        } else {
+            vec![add_batch_with_remove(get_commit_schema().clone())]
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
