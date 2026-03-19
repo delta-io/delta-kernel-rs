@@ -41,7 +41,7 @@ use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -412,13 +412,13 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
         // Extract the file action and handle errors immediately
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(i, getters, false)?
-        else {
+        let Some(action) = self.deduplicator.extract_file_action(i, getters, false)? else {
             return Ok(None); // No file action found, continue checking other types
         };
 
+        let is_add = action.is_add;
         // Check for valid, non-duplicate adds and non-expired removes
-        let is_valid = if self.deduplicator.check_and_record_seen(file_key) {
+        let is_valid = if self.deduplicator.check_and_record_seen(action) {
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;
@@ -629,7 +629,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use hashbrown::HashSet;
 
     use super::*;
     use crate::arrow::array::StringArray;
