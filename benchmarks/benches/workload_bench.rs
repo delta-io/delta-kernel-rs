@@ -10,7 +10,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
 };
-use delta_kernel_benchmarks::reporting::CountingReporter;
+use test_utils::CountingReporter;
 use delta_kernel_benchmarks::runners::{
     create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
 };
@@ -21,7 +21,7 @@ fn setup_engine() -> (
     Arc<CountingReporter>,
 ) {
     let store = Arc::new(LocalFileSystem::new());
-    let reporter = CountingReporter::new();
+    let reporter = Arc::new(CountingReporter::new());
     let executor = Arc::new(
         TokioMultiThreadExecutor::new_owned_runtime(None, None)
             .expect("Failed to create tokio multi-thread executor"),
