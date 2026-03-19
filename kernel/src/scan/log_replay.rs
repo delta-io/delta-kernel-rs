@@ -433,8 +433,6 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // so we only need to parse values here for the transform.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let start = std::time::Instant::now();
-
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
                 parse_partition_values(
