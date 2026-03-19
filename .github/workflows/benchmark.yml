@@ -1,24 +1,28 @@
+# issue_comment is used here to trigger on PR comments, as opposed to pull_request_review
+# (review submissions) or pull_request_review_comment (comments on the diff itself)
+# we want to trigger this on comment creation or edit
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
 name: Benchmarking PR performance
 jobs:
   runBenchmark:
     name: Run benchmarks
     if: >
       github.event.issue.pull_request &&
-      (github.event.comment.body == 'bench' || startsWith(github.event.comment.body, 'bench '))
+      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     steps:
       - name: Parse benchmark tags
+        env:
+          COMMENT: ${{ github.event.comment.body }}
         run: |
-          COMMENT="${{ github.event.comment.body }}"
-          if [[ "$COMMENT" == "bench" ]]; then
+          if [[ "$COMMENT" == "/bench" ]]; then
             TAGS="base"
           else
-            TAGS="${COMMENT#bench }"
+            TAGS="${COMMENT#/bench }"
             TAGS=$(echo "$TAGS" | tr -d ' ')
           fi
           echo "BENCH_TAGS=$TAGS" >> "$GITHUB_ENV"
