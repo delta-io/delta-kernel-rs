@@ -613,4 +613,38 @@ mod tests {
             "Incorrect datatype",
         );
     }
+
+    /// Ensures that every kernel-level checkpoint reinterpretation rule in
+    /// `PrimitiveType::is_checkpoint_cast_compatible` has a corresponding Arrow cast
+    /// in `check_cast_compat`. If one side is updated without the other, this test fails.
+    #[test]
+    fn checkpoint_reinterpretation_rules_match_arrow_cast_rules() {
+        use crate::schema::PrimitiveType;
+
+        let reinterpretation_pairs: &[(PrimitiveType, PrimitiveType)] = &[
+            (PrimitiveType::Integer, PrimitiveType::Date),
+            (PrimitiveType::Long, PrimitiveType::Timestamp),
+            (PrimitiveType::Long, PrimitiveType::TimestampNtz),
+        ];
+        for (source_kernel, target_kernel) in reinterpretation_pairs {
+            // Verify the kernel-level rule holds
+            assert!(
+                source_kernel.is_checkpoint_cast_compatible(target_kernel),
+                "Kernel should allow {source_kernel:?} -> {target_kernel:?}"
+            );
+
+            // Verify the Arrow-level rule holds
+            let source_arrow =
+                ArrowDataType::try_from_kernel(&DataType::Primitive(source_kernel.clone()))
+                    .unwrap();
+            let target_arrow =
+                ArrowDataType::try_from_kernel(&DataType::Primitive(target_kernel.clone()))
+                    .unwrap();
+            assert!(
+                check_cast_compat(target_arrow.clone(), &source_arrow).is_ok(),
+                "Arrow check_cast_compat should allow {source_arrow:?} -> {target_arrow:?} \
+                 to match kernel rule {source_kernel:?} -> {target_kernel:?}"
+            );
+        }
+    }
 }

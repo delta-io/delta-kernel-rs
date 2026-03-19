@@ -1159,8 +1159,8 @@ impl LogSegment {
                 }
                 // Non-struct types: use stats-specific rules for primitives and standard
                 // schema rules otherwise.
-                _ => {
-                    let compatible = match (available_field.data_type(), needed_field.data_type()) {
+                (avail_type, need_type) => {
+                    let compatible = match (avail_type, need_type) {
                         (DataType::Primitive(a), DataType::Primitive(b)) => {
                             a.is_stats_type_compatible_with(b)
                         }
@@ -1172,8 +1172,8 @@ impl LogSegment {
                              checkpoint has {:?}, stats schema needs {:?}",
                             needed_field.name(),
                             context,
-                            available_field.data_type(),
-                            needed_field.data_type()
+                            avail_type,
+                            need_type
                         );
                         return false;
                     }

@@ -1487,31 +1487,36 @@ impl PrimitiveType {
         )
     }
 
+    /// Returns `true` if `self` is a physical integer type that some checkpoint writers
+    /// produce when they omit Parquet logical type annotations for date or timestamp columns.
+    ///
+    /// Specifically:
+    /// - Integer -> Date (int32 stored without DATE annotation)
+    /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
+    ///
+    /// These are **not** Delta protocol type widening rules and must not be used outside of
+    /// checkpoint compatibility checks.
+    ///
+    /// NOTE: The Arrow-level equivalent lives in `check_cast_compat` in
+    /// `engine/ensure_data_types.rs`. Changes here must be mirrored there.
+    pub(crate) fn is_checkpoint_cast_compatible(&self, target: &Self) -> bool {
+        matches!(
+            (self, target),
+            (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
+        )
+    }
+
     /// Returns `true` if this primitive type is compatible with `target` for reading
     /// `stats_parsed` columns from checkpoint parquet files.
     ///
     /// This is a superset of [`can_widen_to`]: it includes all Delta protocol type widening
-    /// rules plus physical Parquet encoding accommodations for checkpoint interop. Some
-    /// external checkpoint writers omit Parquet logical type annotations, producing plain
-    /// integer-typed columns for logically date or timestamp values:
-    /// - Integer -> Date (int32 stored without DATE annotation)
-    /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
-    ///
-    /// These reinterpretation cases are intentionally not part of [`can_widen_to`] because
-    /// they are not Delta protocol type widening rules and should not apply to general
-    /// schema compatibility checks.
-    ///
-    /// NOTE: The Arrow-level equivalent lives in `check_cast_compat` in
-    /// `engine/ensure_data_types.rs`. Changes here must be mirrored there.
+    /// rules plus physical Parquet encoding accommodations for checkpoint interop (see
+    /// [`is_checkpoint_cast_compatible`]).
     ///
     /// [`can_widen_to`]: PrimitiveType::can_widen_to
+    /// [`is_checkpoint_cast_compatible`]: PrimitiveType::is_checkpoint_cast_compatible
     pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
-        self == target
-            || self.can_widen_to(target)
-            || matches!(
-                (self, target),
-                (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
-            )
+        self == target || self.can_widen_to(target) || self.is_checkpoint_cast_compatible(target)
     }
 }
 
