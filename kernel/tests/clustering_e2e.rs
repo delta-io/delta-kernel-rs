@@ -169,13 +169,11 @@ async fn test_clustered_table_write_all_null_clustering_column() {
         .commit(engine.as_ref())
         .unwrap();
 
-    let snapshot = match create_result {
-        CommitResult::CommittedTransaction(committed) => committed
-            .post_commit_snapshot()
-            .expect("post-commit snapshot should exist")
-            .clone(),
-        other => panic!("Expected CommittedTransaction, got: {other:?}"),
-    };
+    let snapshot = create_result
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("post-commit snapshot should exist")
+        .clone();
 
     // Write a batch where region_id is ALL nulls.
     // This should succeed -- all-null clustering columns are valid.
