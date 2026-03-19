@@ -1027,7 +1027,7 @@ mod tests {
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
@@ -2329,32 +2329,46 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
-    ) -> DeltaResult<()> {
+    struct IncrementalSnapshotTestContext {
+        store: Arc<InMemory>,
+        url: Url,
+        engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    }
+
+    fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalSnapshotTestContext> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
         ));
-        let engine = DefaultEngineBuilder::new(store.clone())
-            .with_task_executor(executor)
-            .build();
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_task_executor(executor)
+                .build(),
+        );
 
-        setup_test_table_with_commits(url.as_str(), &store, 2).await?;
+        Ok(IncrementalSnapshotTestContext { store, url, engine })
+    }
 
-        let snapshot_v1 = Snapshot::builder_for(url.as_str())
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+
+        let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
-            .build(&engine)?;
+            .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(&engine)?;
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
 
-        let fresh = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 1);
         assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
 
-        let updated = Snapshot::builder_from(snapshot_v1).build(&engine)?;
+        let updated = Snapshot::builder_from(snapshot_v1).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 1);
         assert_eq!(updated.log_segment.checkpoint_version, Some(1));
         assert_eq!(updated, fresh);
@@ -2365,37 +2379,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version(
     ) -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = DefaultEngineBuilder::new(store.clone())
-            .with_task_executor(executor)
-            .build();
+        let ctx = setup_incremental_snapshot_test()?;
 
-        setup_test_table_with_commits(url.as_str(), &store, 4).await?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
-        Snapshot::builder_for(url.as_str())
+        Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
-            .build(&engine)?
-            .checkpoint(&engine)?;
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
 
-        let snapshot_v3 = Snapshot::builder_for(url.as_str())
+        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
-            .build(&engine)?;
+            .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(1));
 
-        Snapshot::builder_for(url.as_str())
+        Snapshot::builder_for(ctx.url.as_str())
             .at_version(2)
-            .build(&engine)?
-            .checkpoint(&engine)?;
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
 
-        let fresh = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 3);
         assert_eq!(fresh.log_segment.checkpoint_version, Some(2));
 
-        let updated = Snapshot::builder_from(snapshot_v3).build(&engine)?;
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(2));
         assert_eq!(updated, fresh);
@@ -2406,30 +2413,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write(
     ) -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let url = Url::parse("memory:///")?;
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = DefaultEngineBuilder::new(store.clone())
-            .with_task_executor(executor)
-            .build();
+        let ctx = setup_incremental_snapshot_test()?;
 
-        setup_test_table_with_commits(url.as_str(), &store, 2).await?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
 
-        let snapshot_v1 = Snapshot::builder_for(url.as_str())
+        let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
-            .build(&engine)?;
+            .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(&engine)?;
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
 
-        let refreshed = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));
 
         let pinned = Snapshot::builder_from(snapshot_v1.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(ctx.engine.as_ref())?;
         assert!(Arc::ptr_eq(&pinned, &snapshot_v1));
         assert_eq!(pinned.log_segment.checkpoint_version, None);
 
