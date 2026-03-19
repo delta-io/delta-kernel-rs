@@ -767,6 +767,12 @@ impl StructType {
         self.fields.contains_key(name.as_ref())
     }
 
+    /// Converts this [`StructType`] into a [`DataType::Struct`] for use as an expression output type.
+    // TODO: expensive deep clone of the schema
+    pub(crate) fn as_output_data_type(&self) -> DataType {
+        DataType::Struct(Box::new(self.clone()))
+    }
+
     /// Checks if the [`StructType`] contains a metadata column with the given spec.
     pub fn contains_metadata_column(&self, spec: &MetadataColumnSpec) -> bool {
         self.metadata_columns.contains_key(spec)

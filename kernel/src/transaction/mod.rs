@@ -1646,7 +1646,7 @@ mod tests {
 
         // Logical schema should include the partition column
         assert!(
-            write_context.logical_schema().contains("letter"),
+            write_context.logical_schema().contains_top_level("letter"),
             "Logical schema should contain partition column 'letter'"
         );
 
@@ -1658,7 +1658,7 @@ mod tests {
 
         // Both should contain the non-partition columns
         assert!(
-            write_context.logical_schema().contains("number"),
+            write_context.logical_schema().contains_top_level("number"),
             "Logical schema should contain data column 'number'"
         );
 

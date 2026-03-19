@@ -121,14 +121,13 @@ impl LogicalSchema {
 
     /// Returns `true` if the logical schema contains a top-level field with the given name.
     #[cfg(test)]
-    pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
+    pub(crate) fn contains_top_level(&self, name: impl AsRef<str>) -> bool {
         self.schema.contains(name)
     }
 
     /// Returns the logical schema as an owned [`DataType`] for use as an expression output type.
-    // TODO: expensive deep clone of the schema
     pub fn as_output_data_type(&self) -> DataType {
-        DataType::Struct(Box::new(self.schema.as_ref().clone()))
+        self.schema.as_output_data_type()
     }
 
     /// Returns the column mapping mode. Exposed for tests only.
@@ -329,6 +328,19 @@ mod tests {
         test_schema_flat, test_schema_flat_with_column_mapping, test_schema_nested,
         test_schema_nested_with_column_mapping, test_schema_with_array, test_schema_with_map,
     };
+
+    // ── as_output_data_type ──────────────────────────────────────────────────
+
+    #[test]
+    fn as_output_data_type_returns_struct_wrapping_schema() {
+        let schema = test_schema_flat();
+        let ts = LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None);
+        let dt = ts.as_output_data_type();
+        let DataType::Struct(inner) = dt else {
+            panic!("expected DataType::Struct");
+        };
+        assert_eq!(*inner, *schema);
+    }
 
     // ── top_level_logical_to_physical_name ──────────────────────────────────
 
