@@ -560,6 +560,7 @@ fn mixed_resolver(
             column_name!("stats_parsed.maxValues.data_col"),
             Scalar::from(max_data),
         ),
+        (column_name!("is_add"), Scalar::from(true)),
     ]))
 }
 
@@ -599,11 +600,11 @@ fn test_partition_column_rewrite() {
 #[rstest]
 #[case::is_null(
     Pred::is_null(column_expr!("part_col")),
-    "Column(partitionValues_parsed.part_col) IS NULL"
+    "OR(NOT(Column(is_add)), Column(partitionValues_parsed.part_col) IS NULL)"
 )]
 #[case::is_not_null(
     Pred::is_not_null(column_expr!("part_col")),
-    "NOT(Column(partitionValues_parsed.part_col) IS NULL)"
+    "OR(NOT(Column(is_add)), NOT(Column(partitionValues_parsed.part_col) IS NULL))"
 )]
 fn test_partition_column_is_null(#[case] pred: Pred, #[case] expected: &str) {
     let partition_columns = test_partition_columns();
@@ -710,17 +711,23 @@ fn test_partition_column_comparison_uses_exact_value() {
         .expect("should exist");
 
     // part_col='A': 'A' > 'B' is false -> skip
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from("A"),
-    )]));
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from("A"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
     assert_eq!(resolver.eval(&skipping_pred), FALSE);
 
     // part_col='C': 'C' > 'B' is true -> keep
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from("C"),
-    )]));
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from("C"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
     assert_eq!(resolver.eval(&skipping_pred), TRUE);
 }
 
@@ -792,6 +799,7 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
             column_name!("stats_parsed.maxValues.data_col"),
             Scalar::from(max_data),
         ),
+        (column_name!("is_add"), Scalar::from(true)),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     assert_eq!(
