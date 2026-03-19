@@ -87,7 +87,9 @@ pub struct SerializableScanState {
 ///
 /// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
 ///   files that are irrelevant for the query. This includes both data column stats (min/max/nullCount)
-///   and partition value filtering in a single columnar pass.
+///   and partition value filtering in a single columnar pass. A secondary row-level partition filter
+///   catches remaining files the columnar pass cannot prune (e.g. null partition values where
+///   null-safety conservatively keeps them).
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
 ///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
 /// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`) to convert selected Add actions
@@ -322,9 +324,9 @@ impl ScanLogReplayProcessor {
 
     /// Reconstruct a processor from serialized state.
     ///
-    /// Creates a new processor with the provided state. All fields (data_skipping_filter,
-    /// log_transform, checkpoint_transform, and seen_file_keys) are reconstructed from
-    /// the serialized state and engine.
+    /// Creates a new processor with the provided state. All fields (partition_filter,
+    /// data_skipping_filter, log_transform, checkpoint_transform, and seen_file_keys) are
+    /// reconstructed from the serialized state and engine.
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
@@ -762,9 +764,11 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
         // This avoids double JSON parsing -- the transform already parsed the stats.
-        // NOTE: Data skipping is safe for Remove rows because their add-side columns
-        // (stats_parsed, partitionValues_parsed) are null in the transformed batch, so the
-        // filter evaluates to NULL (unknown) and conservatively keeps them.
+        // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
+        // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
+        // with ISNULL guards that keep rows with missing stats. For partition values, the
+        // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
+        // rows always pass the partition filter regardless of null partition values.
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
@@ -839,9 +843,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
         // This avoids double JSON parsing -- the transform already parsed the stats.
-        // NOTE: Data skipping is safe for Remove rows because their add-side columns
-        // (stats_parsed, partitionValues_parsed) are null in the transformed batch, so the
-        // filter evaluates to NULL (unknown) and conservatively keeps them.
+        // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
+        // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
+        // with ISNULL guards that keep rows with missing stats. For partition values, the
+        // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
+        // rows always pass the partition filter regardless of null partition values.
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
@@ -894,7 +900,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Non-selected rows _must_ be ignored.
 ///
 /// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
-/// predicate-based pruning is disabled (no data skipping or partition pruning).
+/// columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
+/// row-level partition filtering still applies.
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
@@ -934,7 +941,7 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
-        add_batch_with_remove, run_with_validate_callback,
+        add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
@@ -1611,6 +1618,67 @@ mod tests {
         }
 
         // Only c000 should survive: Remove suppressed c001, c000 passed data skipping
+        assert_eq!(add_paths.len(), 1, "Expected exactly one add to survive");
+        assert!(
+            add_paths[0].contains("c000"),
+            "Expected c000 add to survive, got: {}",
+            add_paths[0]
+        );
+    }
+
+    /// Same as `data_skipping_does_not_prune_remove_actions` but with a partition column
+    /// predicate. This is critical because partition pruning runs in the columnar data skipping
+    /// phase where Remove rows have null `add.partitionValues` (the transform reads `add.*`
+    /// columns, not `remove.*`). The filter must keep Remove rows despite null partition values.
+    #[test]
+    fn data_skipping_does_not_prune_remove_with_partition_predicate() {
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ]));
+        // Predicate on partition column `date` (2017-12-10 = day 17510 since epoch)
+        let predicate = Arc::new(Expr::column(["date"]).eq(Expr::literal(Scalar::Date(17_510))));
+        let state_info = get_state_info(
+            schema,
+            vec!["date".to_string()],
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+        )
+        .unwrap();
+
+        // Batch: [Remove c001, Add c001, Add c000, Metadata]
+        // Both adds have date=2017-12-10 (day 17510). The Remove must not be pruned.
+        let batch = vec![add_batch_with_remove_and_partition(
+            get_commit_schema().clone(),
+        )];
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            false,
+        )
+        .unwrap();
+
+        let mut add_paths: Vec<String> = Vec::new();
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let paths = scan_metadata
+                .visit_scan_files(
+                    Vec::new(),
+                    |paths: &mut Vec<String>, scan_file: ScanFile| {
+                        paths.push(scan_file.path.to_string());
+                    },
+                )
+                .unwrap();
+            add_paths.extend(paths);
+        }
+
+        // Only c000 should survive: Remove suppressed c001 via deduplication
         assert_eq!(add_paths.len(), 1, "Expected exactly one add to survive");
         assert!(
             add_paths[0].contains("c000"),

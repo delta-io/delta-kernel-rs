@@ -1555,8 +1555,8 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
 ///   - 2 files: modified=2021-02-01 (value in [4, 11])
 ///   - 2 files: modified=2021-02-02 (value in [1, 3])
 ///
-/// This verifies that the unified DataSkippingFilter correctly evaluates mixed predicates
-/// against both partition values and data column stats read from the checkpoint.
+/// Verify that mixed predicates (partition + data columns) work correctly with unified
+/// partition+stats data skipping in the columnar path.
 #[test]
 fn test_mixed_predicate_checkpoint_file_selection() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -1580,7 +1580,8 @@ fn test_mixed_predicate_checkpoint_file_selection() {
             .count()
     };
 
-    // AND(modified='2021-02-01', value>9): 2021-02-01 files match both -> 2 files kept
+    // AND(modified='2021-02-01', value>9): data skipping prunes 2021-02-02 files (max=3 NOT >9),
+    // row-level partition filter prunes non-matching partitions -> 2 files kept
     assert_eq!(
         count_selected_files(Arc::new(Pred::and(
             column_expr!("modified").eq(Expr::literal("2021-02-01")),
@@ -1590,8 +1591,8 @@ fn test_mixed_predicate_checkpoint_file_selection() {
         "AND pred: 2021-02-01 files should survive (both conditions pass)"
     );
 
-    // AND(modified='2021-02-02', value>3): 2021-02-02 files match partition but data stats fail
-    // (max=3, NOT > 3), 2021-02-01 partition mismatch -> all 4 pruned
+    // AND(modified='2021-02-02', value>3): data skipping prunes 2021-02-02 files (max=3 NOT >3),
+    // row-level partition filter prunes 2021-02-01 files (partition mismatch) -> all pruned
     assert_eq!(
         count_selected_files(Arc::new(Pred::and(
             column_expr!("modified").eq(Expr::literal("2021-02-02")),
@@ -1601,25 +1602,26 @@ fn test_mixed_predicate_checkpoint_file_selection() {
         "AND pred: all files should be pruned"
     );
 
-    // OR(modified='2021-02-02', value>9): all 4 files kept
-    // (2021-02-02 by partition match, 2021-02-01 by max(value)=11>9)
+    // OR(modified='2021-02-02', value>9): 2021-02-01 files have max(value)=11 > 9 (kept),
+    // 2021-02-02 files match the partition predicate (kept) -> all 4 kept
     assert_eq!(
         count_selected_files(Arc::new(Pred::or(
             column_expr!("modified").eq(Expr::literal("2021-02-02")),
             column_expr!("value").gt(Expr::literal(9i32)),
         ))),
         4,
-        "OR pred: all files should be kept (each passes one side)"
+        "OR pred: all files should be kept"
     );
 
-    // OR(modified='2021-02-02', value>11): 2021-02-02 files kept by partition,
-    // 2021-02-01 pruned (max=11 NOT > 11)
+    // OR(modified='2021-02-02', value>11): 2021-02-01 files have modified != '2021-02-02' AND
+    // max(value)=11 NOT > 11 -> both OR legs false -> pruned. 2021-02-02 files match the
+    // partition predicate -> kept. Unified partition+stats skipping prunes 2 of 4 files.
     assert_eq!(
         count_selected_files(Arc::new(Pred::or(
             column_expr!("modified").eq(Expr::literal("2021-02-02")),
             column_expr!("value").gt(Expr::literal(11i32)),
         ))),
         2,
-        "OR pred: only 2021-02-02 files should survive"
+        "OR pred: 2021-02-01 files pruned (both OR legs false)"
     );
 }
