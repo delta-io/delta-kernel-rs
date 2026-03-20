@@ -900,6 +900,38 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
+/// Visit each table property (key/value pair) for the specified snapshot by invoking the provided
+/// `visit` callback once per entry.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle, and a non-null `visit` function
+/// pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_table_properties(
+    engine_context: NullableCvoid,
+    snapshot: Handle<SharedSnapshot>,
+    visit: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .iter()
+        .for_each(|(key, value)| {
+            visit(
+                engine_context,
+                kernel_string_slice!(key),
+                kernel_string_slice!(value),
+            )
+        })
+}
+
 type StringIter = dyn Iterator<Item = String> + Send;
 
 #[handle_descriptor(target=StringIter, mutable=true, sized=false)]
@@ -1008,8 +1040,10 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::Value;
+    use std::collections::HashMap;
     use test_utils::{
-        actions_to_string, actions_to_string_partitioned, add_commit, TestAction, METADATA,
+        actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
+        add_commit, TestAction, METADATA,
     };
 
     #[no_mangle]
@@ -1088,6 +1122,58 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_table_properties() -> Result<(), Box<dyn std::error::Error>> {
+        const METADATA_WITH_PROPS: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
+
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string_with_metadata(vec![TestAction::Metadata], METADATA_WITH_PROPS),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let snap =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        extern "C" fn collect_property(
+            engine_context: NullableCvoid,
+            key: KernelStringSlice,
+            value: KernelStringSlice,
+        ) {
+            let map =
+                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
+            let k = unsafe { String::try_from_slice(&key) }.unwrap();
+            let v = unsafe { String::try_from_slice(&value) }.unwrap();
+            map.insert(k, v);
+        }
+
+        let mut collected: HashMap<String, String> = HashMap::new();
+        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
+        unsafe { visit_table_properties(ctx, snap.shallow_copy(), collect_property) };
+
+        assert_eq!(
+            collected.get("delta.appendOnly").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            collected.get("custom.key").map(String::as_str),
+            Some("custom_value")
+        );
+        assert_eq!(collected.len(), 2);
+
+        unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
     }

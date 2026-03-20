@@ -397,31 +397,6 @@ fn get_from_string_map_impl(
         .and_then(|v| allocate_fn(kernel_string_slice!(v))))
 }
 
-#[no_mangle]
-/// # Safety
-pub unsafe extern "C" fn visit_table_properties(
-    engine_context: NullableCvoid,
-    snapshot: Handle<SharedSnapshot>,
-    visit: extern "C" fn(
-        engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
-    ),
-) {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    snapshot
-        .table_configuration()
-        .metadata()
-        .configuration()
-        .iter()
-        .for_each(|(key, value)| {
-            visit(
-                engine_context,
-                kernel_string_slice!(key),
-                kernel_string_slice!(value),
-            )
-        })
-}
 
 /// Visit all values in a CStringMap. The callback will be called once for each element of the map
 ///
