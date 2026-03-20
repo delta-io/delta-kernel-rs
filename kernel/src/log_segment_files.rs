@@ -903,7 +903,7 @@ mod list_log_files_with_log_tail_tests {
         // Test-only storage handler that returns an empty listing.
         // When the log_tail covers the entire commit range, we still call list_from
         // (to pick up non-commit files like CRC/checkpoints), but the filesystem may
-        // have nothing -- e.g. a purely catalog-managed table.
+        // have nothing - e.g. a purely catalog-managed table.
         struct EmptyStorageHandler;
         impl StorageHandler for EmptyStorageHandler {
             fn list_from(
@@ -1055,7 +1055,7 @@ mod list_log_files_with_log_tail_tests {
         // Log tail provides commits 6-10. The checkpoint and CRC are on the filesystem
         // at versions covered by the log_tail and must NOT be filtered out.
         //
-        // After processing through LogListingGroupBuilder, the checkpoint at version 7
+        // After processing through ListingAccumulator, the checkpoint at version 7
         // causes commits before it to be cleared, keeping only commits after the checkpoint.
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
