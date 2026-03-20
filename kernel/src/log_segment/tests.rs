@@ -490,7 +490,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
 }
 
 #[tokio::test]
-async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
+async fn build_snapshot_with_missing_checkpoint_part_from_hint_falls_back_to_backward_scan() {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -528,10 +528,103 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+    )
+    .unwrap();
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 3);
+    assert_eq!(commit_files.len(), 4);
+    assert_eq!(commit_files[0].version, 4);
+    assert_eq!(commit_files[1].version, 5);
+    assert_eq!(commit_files[2].version, 6);
+    assert_eq!(commit_files[3].version, 7);
+}
+
+#[tokio::test]
+async fn build_snapshot_hint_checkpoint_deleted_fallback_uses_end_version() {
+    let checkpoint_metadata = LastCheckpointHint {
+        version: 5,
+        size: 10,
+        parts: Some(1),
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: None,
+        checksum: None,
+        tags: None,
+    };
+
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            // No checkpoint at v5 -- the hint is stale/deleted
+        ],
+        Some(&checkpoint_metadata),
+    )
+    .await;
+
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![], // log_tail
+        Some(checkpoint_metadata),
+        Some(5), // time_travel_version=Some(5) -> Case 1
+    )
+    .unwrap();
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 2);
+    assert_eq!(commit_files.len(), 3);
+    assert_eq!(commit_files[0].version, 3);
+    assert_eq!(commit_files[1].version, 4);
+    assert_eq!(commit_files[2].version, 5);
+}
+
+#[tokio::test]
+async fn build_snapshot_hint_checkpoint_deleted_no_commits_errors() {
+    let checkpoint_metadata = LastCheckpointHint {
+        version: 5,
+        size: 10,
+        parts: Some(1),
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: None,
+        checksum: None,
+        tags: None,
+    };
+
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(3, "json"),
+            // Nothing at v5 or beyond
+        ],
+        Some(&checkpoint_metadata),
+    )
+    .await;
+
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![], // log_tail
+        Some(checkpoint_metadata),
+        None, // time_travel_version=None -> Case 4
     );
     assert_result_error_with_message(
         log_segment,
-        "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
+        "Invalid Checkpoint: Had a _last_checkpoint hint but found no checkpoints or commits",
     )
 }
 
