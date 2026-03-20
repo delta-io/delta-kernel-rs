@@ -78,6 +78,8 @@ pub(crate) struct ActionReconciliationProcessor {
 pub(crate) struct ActionReconciliationBatch {
     /// The filtered batch of actions.
     pub(crate) filtered_data: FilteredEngineData,
+    /// Whether the source batch was read from a commit JSON file.
+    pub(crate) is_log_batch: bool,
     /// The number of actions in the batch.
     pub(crate) actions_count: i64,
     /// The number of add actions in the batch.
@@ -218,6 +220,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
 
         Ok(ActionReconciliationBatch {
             filtered_data,
+            is_log_batch,
             actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
         })
