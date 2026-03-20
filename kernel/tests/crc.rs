@@ -759,53 +759,41 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
 // Set transaction CRC expiration
 // ============================================================================
 
-/// Helper to write raw commit files and a CRC file for testing set transaction expiration via
-/// the CRC fast path.
-///
-/// Writes v0 (protocol + metadata with optional retention) and v1 (txn for "my-app" with
-/// `lastUpdated` set to `now`), plus a v1 CRC file. Returns the snapshot loaded from disk.
-async fn create_table_with_txn_retention_and_crc(
+/// Helper that creates a table with an optional `setTransactionRetentionDuration` property
+/// and commits a set transaction for "my-app" at version 1, then writes a CRC file so the
+/// CRC fast path kicks in on reload. Returns a fresh snapshot loaded from disk.
+fn create_table_with_txn_retention_and_crc(
     table_path: &str,
     engine: &dyn Engine,
     retention: Option<&str>,
 ) -> DeltaResult<Arc<Snapshot>> {
-    use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStore;
-    use test_utils::add_commit;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
 
-    let store = Arc::new(LocalFileSystem::new());
+    // v0: create the table with optional retention property
+    let mut builder = create_table(table_path, schema, "test_engine");
+    if let Some(r) = retention {
+        builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
+    }
+    let committed = builder
+        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .commit(engine)?
+        .unwrap_committed();
 
-    let config = match retention {
-        Some(r) => format!(r#""delta.setTransactionRetentionDuration":"{}""#, r),
-        None => String::new(),
-    };
-    let metadata_json = format!(
-        r#"{{"id":"test-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[{{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{{}}}}]}}","partitionColumns":[],"createdTime":0,"configuration":{{{config}}}}}"#,
-    );
-    let protocol_json = r#"{"minReaderVersion":1,"minWriterVersion":2}"#;
-    let v0 = format!(
-        r#"{{"protocol":{protocol_json}}}
-{{"metaData":{metadata_json}}}"#,
-    );
-    add_commit(table_path, store.as_ref(), 0, v0).await.unwrap();
+    // v1: commit a set transaction for "my-app" (lastUpdated = now)
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    let committed = snapshot_v0
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine)?
+        .unwrap_committed();
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let txn_json = format!(r#"{{"appId":"my-app","version":1,"lastUpdated":{now_ms}}}"#,);
-    let v1 = format!(r#"{{"txn":{txn_json}}}"#);
-    add_commit(table_path, store.as_ref(), 1, v1).await.unwrap();
-
-    // Write a CRC file at v1 so the snapshot's CRC fast path kicks in
-    let crc_json = format!(
-        r#"{{"tableSizeBytes":0,"numFiles":0,"numMetadata":1,"numProtocol":1,"metadata":{metadata_json},"protocol":{protocol_json},"setTransactions":[{txn_json}]}}"#,
-    );
-    let crc_path = std::path::Path::new(table_path)
-        .join("_delta_log")
-        .join("00000000000000000001.crc");
-    let crc_path = Path::from_absolute_path(&crc_path).unwrap();
-    store.put(&crc_path, crc_json.into()).await.unwrap();
+    // Write CRC at v1 so the fast path is used on reload
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+    snapshot_v1.write_checksum(engine)?;
 
     let snapshot = Snapshot::builder_for(table_path).build(engine)?;
     assert_eq!(snapshot.version(), 1);
@@ -826,7 +814,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
-        create_table_with_txn_retention_and_crc(&table_path, engine.as_ref(), retention).await?;
+        create_table_with_txn_retention_and_crc(&table_path, engine.as_ref(), retention)?;
 
     // Verify CRC was loaded from disk
     assert!(snapshot.get_current_crc_if_loaded_for_testing().is_some());
