@@ -4,6 +4,7 @@ mod clustering;
 mod column_mapping;
 mod ctas;
 mod ict;
+mod partitioned;
 mod timestamp_ntz;
 mod variant;
 
@@ -17,7 +18,6 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
-use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
@@ -337,78 +337,6 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
         debug_str.contains("Transaction") && debug_str.contains("create_table"),
         "Debug output should contain Transaction info: {debug_str}"
     );
-    Ok(())
-}
-
-#[test]
-fn test_create_table_partitioned_basic() -> DeltaResult<()> {
-    let schema = partition_test_schema()?;
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    let _ = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::partitioned(["date"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    // Verify the commit log contains partition columns in metadata
-    let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
-    let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
-    let actions: Vec<Value> = log_contents
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
-        .collect();
-
-    let metadata_action = actions
-        .iter()
-        .find(|a| a.get("metaData").is_some())
-        .expect("Should have metaData action");
-    let metadata = metadata_action.get("metaData").unwrap();
-    let partition_columns = metadata["partitionColumns"]
-        .as_array()
-        .expect("partitionColumns should be an array");
-    assert_eq!(partition_columns.len(), 1);
-    assert_eq!(partition_columns[0], "date");
-
-    // Verify snapshot loads correctly
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(snapshot.version(), 0);
-
-    // Verify no clustering domain metadata is present
-    let clustering = snapshot.get_clustering_columns_physical(engine.as_ref())?;
-    assert!(
-        clustering.is_none(),
-        "Partitioned table should not have clustering columns"
-    );
-
-    Ok(())
-}
-
-/// Verify that a partitioned table created via the create_table API can accept a subsequent
-/// commit (blind append with no data files). This exercises the snapshot -> transaction path
-/// on a kernel-created partitioned table.
-#[test]
-fn test_create_partitioned_table_then_commit() -> DeltaResult<()> {
-    let schema = partition_test_schema()?;
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    let _ = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::partitioned(["date"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    // Load the snapshot and open a transaction to prove the write path accepts this table
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(snapshot.version(), 0);
-
-    let _ = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("Test/1.0")
-        .commit(engine.as_ref())?;
-
-    // Verify the table advanced to version 1
-    let updated = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(updated.version(), 1);
-
     Ok(())
 }
 

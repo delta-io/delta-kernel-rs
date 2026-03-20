@@ -113,11 +113,13 @@ impl DataLayout {
     }
 
     /// Returns true if this layout specifies clustering.
+    #[cfg(test)]
     pub fn is_clustered(&self) -> bool {
         matches!(self, DataLayout::Clustered { .. })
     }
 
     /// Returns true if this layout specifies partitioning.
+    #[cfg(test)]
     pub fn is_partitioned(&self) -> bool {
         matches!(self, DataLayout::Partitioned { .. })
     }

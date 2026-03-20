@@ -217,6 +217,7 @@ struct DataLayoutResult {
 /// 3. Not duplicated
 /// 4. Of a primitive type (Struct, Array, Map are rejected because partition values
 ///    must be representable as directory-path strings)
+/// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
     partition_columns: &[ColumnName],
@@ -246,6 +247,7 @@ fn validate_partition_columns(
             )));
         }
 
+        // Safety: path.len() == 1 is enforced by the top-level check above
         let col_name = &path[0];
         let field = schema.field(col_name).ok_or_else(|| {
             Error::generic(format!("Partition column '{col}' not found in schema"))
