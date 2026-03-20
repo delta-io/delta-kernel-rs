@@ -28,6 +28,7 @@ process to ensure high-quality code:
    each PR is easily review-able and thoroughly tested.
 
 ## Getting your PR reviewed
+
 We invite everyone who would like their PRs reviewed to review _other_ open PRs as
 well. Like most open source projects, our review bandwidth is limited, and help from users is
 greatly appreciated. This helps increase the overall review rate, and allows contributors to build
@@ -45,6 +46,12 @@ convoluted control flow).
 
 PRs that do not follow these principles are much more time consuming to review, and less likely to
 get prompt reviews.
+
+## AI-Assisted Contributions
+
+We welcome contributors who use AI coding tools, but all contributions must reflect genuine
+understanding of the changes being made. Please read our [AI Policy](AI_POLICY.md) before
+submitting a PR.
 
 ## Forking and Setup
 

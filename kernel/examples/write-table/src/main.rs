@@ -4,10 +4,12 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
-use arrow::util::pretty::print_batches;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
+use delta_kernel::arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
+use delta_kernel::arrow::util::pretty::print_batches;
 use itertools::Itertools;
 use url::Url;
 
@@ -209,7 +211,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
     let mut columns = Vec::new();
 
     for field in fields {
-        let column: Arc<dyn arrow::array::Array> = match *field.data_type() {
+        let column: ArrayRef = match *field.data_type() {
             DataType::STRING => {
                 let data: Vec<String> = (0..num_rows).map(|i| format!("item_{i}")).collect();
                 Arc::new(StringArray::from(data))
@@ -220,7 +222,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
             }
             DataType::LONG => {
                 let data: Vec<i64> = (0..num_rows).map(|i| i as i64).collect();
-                Arc::new(arrow::array::Int64Array::from(data))
+                Arc::new(Int64Array::from(data))
             }
             DataType::DOUBLE => {
                 let data: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.5).collect();

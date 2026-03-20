@@ -1,10 +1,10 @@
 //! Integration tests for the CreateTable API
 
-#[path = "create_table/clustering.rs"]
 mod clustering;
-#[path = "create_table/column_mapping.rs"]
 mod column_mapping;
-#[path = "create_table/variant.rs"]
+mod ctas;
+mod ict;
+mod timestamp_ntz;
 mod variant;
 
 use std::sync::Arc;
@@ -199,7 +199,7 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
         .commit(engine.as_ref())?;
 
     // Read the actual Delta log file
-    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
     let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
 
     // Parse each line (each line is a separate JSON action)
@@ -321,10 +321,47 @@ fn create_test_create_table_txn() -> DeltaResult<(
 #[tokio::test]
 async fn test_create_table_txn_debug() -> DeltaResult<()> {
     let (_engine, txn, _tempdir) = create_test_create_table_txn()?;
-    let debug_str = format!("{:?}", txn);
+    let debug_str = format!("{txn:?}");
     assert!(
         debug_str.contains("Transaction") && debug_str.contains("create_table"),
         "Debug output should contain Transaction info: {debug_str}"
     );
+    Ok(())
+}
+
+#[test]
+fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([("delta.feature.vacuumProtocolCheck", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let table_config = snapshot.table_configuration();
+
+    assert!(
+        table_config.is_feature_supported(&TableFeature::VacuumProtocolCheck),
+        "vacuumProtocolCheck should be supported"
+    );
+    assert!(
+        table_config.is_feature_enabled(&TableFeature::VacuumProtocolCheck),
+        "vacuumProtocolCheck should be enabled (AlwaysIfSupported)"
+    );
+    let protocol = table_config.protocol();
+    assert!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
+        "vacuumProtocolCheck should be in writer features"
+    );
+    assert!(
+        protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
+        "vacuumProtocolCheck should be in reader features"
+    );
+
     Ok(())
 }

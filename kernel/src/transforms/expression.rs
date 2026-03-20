@@ -1,5 +1,4 @@
 use std::borrow::{Cow, ToOwned};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::expressions::{
@@ -7,7 +6,7 @@ use crate::expressions::{
     MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
     Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
 };
-use crate::utils::CowExt as _;
+use crate::transforms::{map_owned_children_or_else, CowExt as _};
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -16,31 +15,48 @@ use crate::utils::CowExt as _;
 /// * `Some(Cow::Borrowed)` -- The input was not transformed.
 /// * `None` -- The input was filtered out and the parent should be updated to not reference it.
 ///
-/// The transform can start from the generic [`Self::transform_expr`] or [`Self::transform_pred`],
-/// or directly from a specific expression/predicate variant (e.g. [`Self::transform_expr_column`]
-/// for [`ColumnName`], [`Self::transform_pred_unary`] for [`UnaryPredicate`]).
+/// The transform entry point is generally [`Self::transform_expr`] or [`Self::transform_pred`] (for
+/// expressions or predicates, respectively), but callers can also directly invoke the transform
+/// for a specific expression/predicate variant (e.g. [`Self::transform_expr_column`] for
+/// [`ColumnName`] or [`Self::transform_pred_unary`] for [`UnaryPredicate`]).
 ///
-/// The provided `transform_xxx` methods all default to no-op (returning their input as
-/// `Some(Cow::Borrowed)`), and implementations should selectively override specific `transform_xxx`
-/// methods as needed for the task at hand.
+/// The provided `transform_xxx` methods all default to no-op (usually by invoking the corresponding
+/// recursive helper method), and implementations should selectively override specific
+/// `transform_xxx` methods as needed for the task at hand.
+///
+/// # Recursive helper methods
 ///
 /// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
-/// children of each expression or predicate variant. Implementations can call these as needed but
-/// will generally not need to override them.
+/// child expression of each expression type. Except as specifically noted otherwise, these
+/// recursive helpers all behave uniformly, based on the number of children the parent has:
+///
+/// * Leaf (no children) - Leaf `transform_xxx` methods simply return their argument unchanged, and
+///   no corresponding `recurse_into_xxx` method is provided.
+///
+/// * Unary (single child) - If the child was filtered out, filter out the parent. If the child
+///   changed, build a new parent around it. Otherwise, return the parent unchanged.
+///
+/// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
+///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
+///
+/// * Variadic (0+ children) - If no children remain (all filtered out), filter out the
+///   parent. Otherwise, if at least one child changed or was filtered out, build a new parent around
+///   the children. Otherwise, return the parent unchanged.
+///
+/// Implementations can call these as needed but will generally not need to override them.
 pub trait ExpressionTransform<'a> {
-    /// Called for each literal encountered during the expression traversal.
+    /// Called for each literal encountered during the traversal (leaf).
     fn transform_expr_literal(&mut self, value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
         Some(Cow::Borrowed(value))
     }
 
-    /// Called for each column reference encountered during the expression traversal.
+    /// Called for each column reference encountered during the traversal (leaf).
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
         Some(Cow::Borrowed(name))
     }
 
-    /// Called for the expression list of each [`Expression::Struct`] encountered during the
-    /// traversal. Implementations can call [`Self::recurse_into_expr_struct`] if they wish to
-    /// recursively transform the child expressions.
+    /// Called for the expression list of each struct expression encountered during the
+    /// traversal. The provided implementation just forwards to [`Self::recurse_into_expr_struct`].
     fn transform_expr_struct(
         &mut self,
         fields: &'a [ExpressionRef],
@@ -48,8 +64,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_struct(fields)
     }
 
-    /// Called for each [`OpaqueExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_expr_opaque`] if they wish to recursively transform the children.
+    /// Called for each opaque expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_opaque`].
     fn transform_expr_opaque(
         &mut self,
         expr: &'a OpaqueExpression,
@@ -57,20 +73,20 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_opaque(expr)
     }
 
-    /// Called for each [`Expression::Unknown`] encountered during the traversal.
+    /// Called for each unknown expression encountered during the traversal (leaf).
     fn transform_expr_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
         Some(Cow::Borrowed(name))
     }
 
-    /// Called for each [`Transform`] encountered during the traversal. By default, it is a no-op
-    /// that simply returns its argument and does _NOT_ recurse into its children.
+    /// Called for each transform expression encountered during the traversal (leaf).
+    ///
+    /// The provided implementation does _NOT_ recurse into its children.
     fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
         Some(Cow::Borrowed(transform))
     }
 
-    /// Called for each [`ParseJsonExpression`] encountered during the traversal. Implementations
-    /// can call [`Self::recurse_into_expr_parse_json`] if they wish to recursively transform the
-    /// child expression.
+    /// Called for each parse-json expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_parse_json`].
     fn transform_expr_parse_json(
         &mut self,
         expr: &'a ParseJsonExpression,
@@ -78,9 +94,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_parse_json(expr)
     }
 
-    /// Called for each [`MapToStructExpression`] encountered during the traversal. Implementations
-    /// can call [`Self::recurse_into_expr_map_to_struct`] if they wish to recursively transform
-    /// the child expression.
+    /// Called for each map-to-struct expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_map_to_struct`].
     fn transform_expr_map_to_struct(
         &mut self,
         expr: &'a MapToStructExpression,
@@ -88,22 +103,20 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_map_to_struct(expr)
     }
 
-    /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
-    /// traversal. Implementations can call [`Self::recurse_into_expr_pred`] if they wish to
-    /// recursively transform the child predicate.
+    /// Called for the child of each predicate expression encountered during the
+    /// traversal. The provided implementation just forwards to [`Self::recurse_into_expr_pred`].
     fn transform_expr_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         self.recurse_into_expr_pred(pred)
     }
 
-    /// Called for the child predicate of each [`Predicate::Not`] encountered during the
-    /// traversal. Implementations can call [`Self::recurse_into_pred_not`] if they wish to
-    /// recursively transform the child expression.
+    /// Called for the child of each NOT predicate encountered during the
+    /// traversal. The provided implementation just forwards to [`Self::recurse_into_pred_not`].
     fn transform_pred_not(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         self.recurse_into_pred_not(pred)
     }
 
-    /// Called for each [`UnaryExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_expr_unary`] if they wish to recursively transform the child.
+    /// Called for each unary expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_unary`].
     fn transform_expr_unary(
         &mut self,
         expr: &'a UnaryExpression,
@@ -111,8 +124,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_unary(expr)
     }
 
-    /// Called for each [`UnaryPredicate`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_pred_unary`] if they wish to recursively transform the child.
+    /// Called for each unary predicate encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_pred_unary`].
     fn transform_pred_unary(
         &mut self,
         pred: &'a UnaryPredicate,
@@ -120,8 +133,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_unary(pred)
     }
 
-    /// Called for each [`BinaryExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_expr_binary`] if they wish to recursively transform the children.
+    /// Called for each binary expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_binary`].
     fn transform_expr_binary(
         &mut self,
         expr: &'a BinaryExpression,
@@ -129,8 +142,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_binary(expr)
     }
 
-    /// Called for each [`BinaryPredicate`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_pred_binary`] if they wish to recursively transform the children.
+    /// Called for each binary predicate encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_pred_binary`].
     fn transform_pred_binary(
         &mut self,
         pred: &'a BinaryPredicate,
@@ -138,8 +151,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_binary(pred)
     }
 
-    /// Called for each [`VariadicExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_expr_variadic`] if they wish to recursively transform the children.
+    /// Called for each variadic expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_variadic`].
     fn transform_expr_variadic(
         &mut self,
         expr: &'a VariadicExpression,
@@ -147,8 +160,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_variadic(expr)
     }
 
-    /// Called for each [`JunctionPredicate`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_pred_junction`] if they wish to recursively transform the children.
+    /// Called for each junction predicate encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_pred_junction`].
     fn transform_pred_junction(
         &mut self,
         pred: &'a JunctionPredicate,
@@ -156,8 +169,8 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
-    /// Called for each [`OpaquePredicate`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_pred_opaque`] if they wish to recursively transform the children.
+    /// Called for each opaque predicate encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_pred_opaque`].
     fn transform_pred_opaque(
         &mut self,
         pred: &'a OpaquePredicate,
@@ -165,7 +178,7 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_opaque(pred)
     }
 
-    /// Called for each [`Predicate::Unknown`] encountered during the traversal.
+    /// Called for each unknown predicate encountered during the traversal (leaf).
     fn transform_pred_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
         Some(Cow::Borrowed(name))
     }
@@ -184,9 +197,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Predicate(p) => self
                 .transform_expr_pred(p)?
                 .map_owned_or_else(expr, Expression::from),
-            Expression::Struct(s) => self
+            Expression::Struct(s, nullability) => self
                 .transform_expr_struct(s)?
-                .map_owned_or_else(expr, Expression::Struct),
+                .map_owned_or_else(expr, |exprs| Expression::Struct(exprs, nullability.clone())),
             Expression::Transform(t) => self
                 .transform_expr_transform(t)?
                 .map_owned_or_else(expr, Expression::Transform),
@@ -230,9 +243,12 @@ pub trait ExpressionTransform<'a> {
             Predicate::Binary(b) => self
                 .transform_pred_binary(b)?
                 .map_owned_or_else(pred, Predicate::Binary),
+            // Route through the constructor to normalize in case the transform removed children.
+            // When `transform_pred` returns `None` for a child, it is filtered out, which may
+            // reduce the junction to one or zero elements. The constructor normalizes these.
             Predicate::Junction(j) => self
                 .transform_pred_junction(j)?
-                .map_owned_or_else(pred, Predicate::Junction),
+                .map_owned_or_else(pred, |j| Predicate::junction(j.op, j.preds)),
             Predicate::Opaque(o) => self
                 .transform_pred_opaque(o)?
                 .map_owned_or_else(pred, Predicate::Opaque),
@@ -243,22 +259,19 @@ pub trait ExpressionTransform<'a> {
         Some(pred)
     }
 
-    /// Recursively transforms a struct's child expressions. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms a struct's child expressions (variadic).
     fn recurse_into_expr_struct(
         &mut self,
         fields: &'a [ExpressionRef],
     ) -> Option<Cow<'a, [ExpressionRef]>> {
-        recurse_into_children(fields, |f| {
-            self.transform_expr(f)
-                .map(|cow| cow.map_owned_or_else(f, Arc::new))
-        })
+        let transformed_children = fields.iter().map(|f| {
+            let transformed = self.transform_expr(f)?;
+            Some(transformed.map_owned_or_else(f, Arc::new))
+        });
+        map_owned_children_or_else(fields, transformed_children, |fields| fields)
     }
 
-    /// Recursively transforms the child expression of a [`ParseJsonExpression`]. The schema is
-    /// not transformed. Returns `None` if the child was removed, `Some(Cow::Owned)` if the child
-    /// was changed, and `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms the child expression of a parse-json expression (unary).
     fn recurse_into_expr_parse_json(
         &mut self,
         expr: &'a ParseJsonExpression,
@@ -269,9 +282,7 @@ pub trait ExpressionTransform<'a> {
         }))
     }
 
-    /// Recursively transforms the child expression of a [`MapToStructExpression`]. Returns `None`
-    /// if the child was removed, `Some(Cow::Owned)` if the child was changed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms the child expression of a map-to-struct expression (unary).
     fn recurse_into_expr_map_to_struct(
         &mut self,
         expr: &'a MapToStructExpression,
@@ -280,33 +291,27 @@ pub trait ExpressionTransform<'a> {
         Some(nested.map_owned_or_else(expr, MapToStructExpression::new))
     }
 
-    /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all
-    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms the children of an opaque expression (variadic).
     fn recurse_into_expr_opaque(
         &mut self,
         o: &'a OpaqueExpression,
     ) -> Option<Cow<'a, OpaqueExpression>> {
-        let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
-        Some(nested_result.map_owned_or_else(o, |exprs| OpaqueExpression::new(o.op.clone(), exprs)))
+        let transformed_children = o.exprs.iter().map(|e| self.transform_expr(e));
+        let map_owned = |exprs| OpaqueExpression::new(o.op.clone(), exprs);
+        map_owned_children_or_else(o, transformed_children, map_owned)
     }
 
-    /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
-    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms the child of a predicate expression (unary).
     fn recurse_into_expr_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         self.transform_pred(pred)
     }
 
-    /// Recursively transforms the child of a [`Predicate::Not`] expression. Returns `None` if the
-    /// child was removed, `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)`
-    /// otherwise.
+    /// Recursively transforms the child of a not predicate expression (unary).
     fn recurse_into_pred_not(&mut self, p: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         Some(self.transform_pred(p)?.map_owned_or_else(p, Predicate::not))
     }
 
-    /// Recursively transforms a unary predicate's child. Returns `None` if the child was removed,
-    /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms a unary predicate's child (unary).
     fn recurse_into_pred_unary(
         &mut self,
         u: &'a UnaryPredicate,
@@ -315,9 +320,7 @@ pub trait ExpressionTransform<'a> {
         Some(nested_result.map_owned_or_else(u, |expr| UnaryPredicate::new(u.op, expr)))
     }
 
-    /// Recursively transforms a binary predicate's children. Returns `None` if at least one child
-    /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
-    /// otherwise.
+    /// Recursively transforms a binary predicate's children (binary).
     fn recurse_into_pred_binary(
         &mut self,
         b: &'a BinaryPredicate,
@@ -328,8 +331,7 @@ pub trait ExpressionTransform<'a> {
         Some((left, right).map_owned_or_else(b, f))
     }
 
-    /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
-    /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms a unary expression's child (unary).
     fn recurse_into_expr_unary(
         &mut self,
         u: &'a UnaryExpression,
@@ -338,9 +340,7 @@ pub trait ExpressionTransform<'a> {
         Some(nested_result.map_owned_or_else(u, |expr| UnaryExpression::new(u.op, expr)))
     }
 
-    /// Recursively transforms a binary expression's children. Returns `None` if at least one child
-    /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
-    /// otherwise.
+    /// Recursively transforms a binary expression's children (binary).
     fn recurse_into_expr_binary(
         &mut self,
         b: &'a BinaryExpression,
@@ -351,83 +351,34 @@ pub trait ExpressionTransform<'a> {
         Some((left, right).map_owned_or_else(b, f))
     }
 
-    /// Recursively transforms a variadic expression's children. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms a variadic expression's children (variadic).
     fn recurse_into_expr_variadic(
         &mut self,
         v: &'a VariadicExpression,
     ) -> Option<Cow<'a, VariadicExpression>> {
-        let nested_result = recurse_into_children(&v.exprs, |e| self.transform_expr(e))?;
-        Some(nested_result.map_owned_or_else(v, |exprs| VariadicExpression::new(v.op, exprs)))
+        let transformed_children = v.exprs.iter().map(|e| self.transform_expr(e));
+        let map_owned = |exprs| VariadicExpression::new(v.op, exprs);
+        map_owned_children_or_else(v, transformed_children, map_owned)
     }
 
-    /// Recursively transforms a junction predicate's children. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms a junction predicate's children (variadic).
     fn recurse_into_pred_junction(
         &mut self,
         j: &'a JunctionPredicate,
     ) -> Option<Cow<'a, JunctionPredicate>> {
-        let nested_result = recurse_into_children(&j.preds, |p| self.transform_pred(p))?;
-        Some(nested_result.map_owned_or_else(j, |preds| JunctionPredicate::new(j.op, preds)))
+        let transformed_children = j.preds.iter().map(|p| self.transform_pred(p));
+        let map_owned = |preds| JunctionPredicate::new(j.op, preds);
+        map_owned_children_or_else(j, transformed_children, map_owned)
     }
 
-    /// Recursively transforms the children of an [`OpaquePredicate`]. Returns `None` if all
-    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
+    /// Recursively transforms an opaque predicate's children (variadic).
     fn recurse_into_pred_opaque(
         &mut self,
         o: &'a OpaquePredicate,
     ) -> Option<Cow<'a, OpaquePredicate>> {
-        let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
-        Some(nested_result.map_owned_or_else(o, |exprs| OpaquePredicate::new(o.op.clone(), exprs)))
-    }
-}
-
-/// Used to recurse into the children of an `Expression::Struct` or `Predicate::Junction`.
-fn recurse_into_children<'a, T: Clone>(
-    children: &'a [T],
-    recurse_fn: impl FnMut(&'a T) -> Option<Cow<'a, T>>,
-) -> Option<Cow<'a, [T]>> {
-    let mut num_borrowed = 0;
-    let new_children: Vec<_> = children
-        .iter()
-        .filter_map(recurse_fn)
-        .inspect(|f| {
-            if matches!(f, Cow::Borrowed(_)) {
-                num_borrowed += 1;
-            }
-        })
-        .collect();
-
-    if new_children.is_empty() {
-        None // all children filtered out
-    } else if num_borrowed < children.len() {
-        // At least one child was changed or removed, so make a new child list
-        let children = new_children.into_iter().map(Cow::into_owned).collect();
-        Some(Cow::Owned(children))
-    } else {
-        Some(Cow::Borrowed(children))
-    }
-}
-
-/// Retrieves the set of column names referenced by an expression.
-#[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
-    references: HashSet<&'a ColumnName>,
-}
-
-impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
-        self.references
-    }
-}
-
-impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        self.references.insert(name);
-        Some(Cow::Borrowed(name))
+        let transformed_children = o.exprs.iter().map(|e| self.transform_expr(e));
+        let map_owned = |exprs| OpaquePredicate::new(o.op.clone(), exprs);
+        map_owned_children_or_else(o, transformed_children, map_owned)
     }
 }
 
@@ -459,14 +410,14 @@ impl ExpressionDepthChecker {
     // Exposed for testing
     fn check_expr_with_call_count(expr: &Expression, depth_limit: usize) -> (usize, usize) {
         let mut checker = Self::new(depth_limit);
-        checker.transform_expr(expr);
+        let _ = checker.transform_expr(expr);
         (checker.max_depth_seen, checker.call_count)
     }
 
     // Exposed for testing
     fn check_pred_with_call_count(pred: &Predicate, depth_limit: usize) -> (usize, usize) {
         let mut checker = Self::new(depth_limit);
-        checker.transform_pred(pred);
+        let _ = checker.transform_pred(pred);
         (checker.max_depth_seen, checker.call_count)
     }
 
@@ -575,8 +526,9 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
-        ParseJsonExpression, Predicate as Pred, ScalarExpressionEvaluator,
+        column_expr, column_pred, Expression, Expression as Expr, OpaqueExpressionOp,
+        OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
+        ScalarExpressionEvaluator, VariadicExpression,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -584,6 +536,7 @@ mod tests {
     };
     use crate::schema::{DataType, StructField, StructType};
     use crate::DeltaResult;
+    use std::sync::Arc;
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -638,6 +591,17 @@ mod tests {
     struct NoopTransform;
     impl ExpressionTransform<'_> for NoopTransform {}
 
+    struct ColumnReplacer;
+    impl<'a> ExpressionTransform<'a> for ColumnReplacer {
+        fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+            if name.len() == 1 && name[0] == "old_col" {
+                Some(Cow::Owned(ColumnName::new(["new_col"])))
+            } else {
+                Some(Cow::Borrowed(name))
+            }
+        }
+    }
+
     #[test]
     fn test_transform_expr_variadic_noop() {
         // Test default no-op behavior - should return Cow::Borrowed
@@ -671,20 +635,6 @@ mod tests {
     #[test]
     fn test_transform_expr_variadic_child_transformation() {
         // Test transformation of child expressions - should return Cow::Owned
-        struct ColumnReplacer;
-        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                if name.len() == 1 && name[0] == "old_col" {
-                    Some(Cow::Owned(ColumnName::new(["new_col"])))
-                } else {
-                    Some(Cow::Borrowed(name))
-                }
-            }
-        }
-
         let variadic_expr = VariadicExpression::new(
             Coalesce,
             vec![
@@ -695,8 +645,7 @@ mod tests {
             ],
         );
 
-        let mut transform = ColumnReplacer;
-        let result = transform.transform_expr_variadic(&variadic_expr);
+        let result = ColumnReplacer.transform_expr_variadic(&variadic_expr);
 
         assert!(matches!(result, Some(Cow::Owned(_))));
         if let Some(Cow::Owned(result_expr)) = result {
@@ -885,32 +834,17 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_child_transformation() {
         // Test transformation of child expression - should return Cow::Owned
-        struct ColumnReplacer;
-        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                if name.len() == 1 && name[0] == "old_json_col" {
-                    Some(Cow::Owned(ColumnName::new(["new_json_col"])))
-                } else {
-                    Some(Cow::Borrowed(name))
-                }
-            }
-        }
-
         let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("old_json_col"), test_output_schema());
+            ParseJsonExpression::new(column_expr!("old_col"), test_output_schema());
 
-        let mut transform = ColumnReplacer;
-        let result = transform.transform_expr_parse_json(&parse_json_expr);
+        let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
 
         assert!(matches!(result, Some(Cow::Owned(_))));
         if let Some(Cow::Owned(result_expr)) = result {
             // Check that the column was replaced
             if let Expr::Column(col) = result_expr.json_expr.as_ref() {
                 assert_eq!(col.len(), 1);
-                assert_eq!(col[0], "new_json_col");
+                assert_eq!(col[0], "new_col");
             } else {
                 panic!("Expected column expression");
             }
@@ -922,27 +856,12 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_child_unchanged() {
         // Test when child column doesn't match replacement criteria - should return Cow::Borrowed
-        struct ColumnReplacer;
-        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
-            fn transform_expr_column(
-                &mut self,
-                name: &'a ColumnName,
-            ) -> Option<Cow<'a, ColumnName>> {
-                if name.len() == 1 && name[0] == "other_col" {
-                    Some(Cow::Owned(ColumnName::new(["replaced"])))
-                } else {
-                    Some(Cow::Borrowed(name))
-                }
-            }
-        }
-
         let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+            ParseJsonExpression::new(column_expr!("unchanged_col"), test_output_schema());
 
-        let mut transform = ColumnReplacer;
-        let result = transform.transform_expr_parse_json(&parse_json_expr);
+        let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
 
-        // Since "json_col" doesn't match "other_col", nothing changes
+        // Since "unchanged_col" doesn't match "old_col", nothing changes
         assert!(matches!(result, Some(Cow::Borrowed(_))));
     }
 
@@ -1153,5 +1072,43 @@ mod tests {
         assert_eq!(check_with_call_count(5), (6, 15));
         assert_eq!(check_with_call_count(6), (6, 16));
         assert_eq!(check_with_call_count(7), (6, 16));
+    }
+
+    #[test]
+    fn transform_junction_to_single_child_unwraps() {
+        // A transform that removes one child from AND(a, b) should produce the surviving
+        // predicate directly, not a degenerate single-element junction AND(a).
+        struct LiteralRemover;
+        impl<'a> ExpressionTransform<'a> for LiteralRemover {
+            fn transform_expr_literal(&mut self, _value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+                None
+            }
+        }
+
+        let pred = Pred::and(column_pred!("x"), Pred::literal(true));
+        let mut transform = LiteralRemover;
+        let result = transform.transform_pred(&pred);
+        let result = result.map(Cow::into_owned);
+        assert_eq!(result.as_ref(), Some(&column_pred!("x")));
+        assert!(!matches!(result, Some(Pred::Junction(_))));
+    }
+
+    #[test]
+    fn transform_junction_removing_all_children_returns_none() {
+        // Removing all children propagates None (the junction is dropped entirely),
+        // rather than producing an empty junction or identity literal.
+        struct ColumnRemover;
+        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+            fn transform_expr_column(
+                &mut self,
+                _name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                None
+            }
+        }
+
+        let pred = Pred::and(column_pred!("x"), column_pred!("y"));
+        let mut transform = ColumnRemover;
+        assert!(transform.transform_pred(&pred).is_none());
     }
 }

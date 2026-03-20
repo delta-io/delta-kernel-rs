@@ -1,0 +1,53 @@
+# issue_comment is used here to trigger on PR comments, as opposed to pull_request_review
+# (review submissions) or pull_request_review_comment (comments on the diff itself)
+# we want to trigger this on comment creation or edit
+on:
+  issue_comment:
+    types: [created, edited]
+name: Benchmarking PR performance
+jobs:
+  runBenchmark:
+    name: Run benchmarks
+    if: >
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Parse benchmark tags
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          if [[ "$COMMENT" == "/bench" ]]; then
+            TAGS="base"
+          else
+            TAGS="${COMMENT#/bench }"
+            TAGS=$(echo "$TAGS" | tr -d '[:space:]')
+          fi
+          echo "BENCH_TAGS=$TAGS" >> "$GITHUB_ENV"
+          echo "Parsed tags: $TAGS"
+      - name: Get PR HEAD sha
+        id: pr
+        run: |
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
+          echo "head_sha=$(echo "$PR_DATA" | jq -r .head.sha)" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$(echo "$PR_DATA" | jq -r .base.ref)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      # See build.yml top-level comment for why save-if is restricted to main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - uses: boa-dev/criterion-compare-action@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branchName: ${{ steps.pr.outputs.base_ref }}
+          cwd: benchmarks
+          benchName: workload_bench

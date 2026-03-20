@@ -107,18 +107,24 @@ mod tests {
         let dms = crc.domain_metadata.unwrap();
         assert_eq!(dms.len(), 3);
 
-        assert_eq!(dms[0].domain(), "delta.clustering");
-        assert!(dms[0].configuration().contains("clusteringColumns"));
+        assert!(dms["delta.clustering"]
+            .configuration()
+            .contains("clusteringColumns"));
+        assert!(dms["delta.rowTracking"]
+            .configuration()
+            .contains("rowIdHighWaterMark"));
+        assert!(dms["myApp.metadata"].configuration().contains("key"));
 
-        assert_eq!(dms[1].domain(), "delta.rowTracking");
-        assert!(dms[1].configuration().contains("rowIdHighWaterMark"));
-
-        assert_eq!(dms[2].domain(), "myApp.metadata");
-        assert!(dms[2].configuration().contains("key"));
+        // Verify set transactions
+        let txns = crc.set_transactions.unwrap();
+        assert_eq!(txns.len(), 2);
+        assert_eq!(txns["spark-app-1"].version, 42);
+        assert_eq!(txns["spark-app-1"].last_updated, Some(1694758250000));
+        assert_eq!(txns["streaming-job-abc"].version, 100);
+        assert_eq!(txns["streaming-job-abc"].last_updated, Some(1694758255000));
 
         // Skipped fields are always None (pending serde support on their types)
         assert!(crc.txn_id.is_none());
-        assert!(crc.set_transactions.is_none());
         assert!(crc.file_size_histogram.is_none());
         assert!(crc.all_files.is_none());
         assert!(crc.num_deleted_records_opt.is_none());

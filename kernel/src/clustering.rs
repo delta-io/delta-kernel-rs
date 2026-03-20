@@ -10,13 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::DomainMetadata;
 use crate::expressions::ColumnName;
-use crate::log_segment::LogSegment;
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::schema::{DataType, StructType};
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Error};
 
 /// Domain metadata structure for clustering columns.
 ///
@@ -74,8 +72,7 @@ pub(crate) fn validate_clustering_columns(
     for col in columns {
         if !seen.insert(col) {
             return Err(Error::generic(format!(
-                "Duplicate clustering column: '{}'",
-                col
+                "Duplicate clustering column: '{col}'"
             )));
         }
 
@@ -90,10 +87,9 @@ pub(crate) fn validate_clustering_columns(
             DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
             dt => {
                 return Err(Error::generic(format!(
-                    "Clustering column '{}' has unsupported type '{}'. \
+                    "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
-                     Decimal, Date, Timestamp, TimestampNtz, String",
-                    col, dt
+                     Decimal, Date, Timestamp, TimestampNtz, String"
                 )));
             }
         }
@@ -127,36 +123,13 @@ pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> Domai
 /// Parses clustering columns from a JSON configuration string.
 ///
 /// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
-fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
+pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
     let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
     Ok(metadata
         .clustering_columns
         .into_iter()
         .map(ColumnName::new)
         .collect())
-}
-
-/// Reads clustering columns from the log segment's domain metadata.
-///
-/// This function performs a log scan to find the clustering domain metadata.
-/// Callers should first check if the `ClusteredTable` feature is enabled via
-/// the protocol before calling this function to avoid unnecessary I/O.
-/// See [`Snapshot::get_clustering_columns`] which performs this check.
-///
-/// Returns `Ok(Some(columns))` if clustering domain metadata exists,
-/// `Ok(None)` if no clustering domain metadata is found, or an error if the
-/// metadata is malformed.
-///
-/// [`Snapshot::get_clustering_columns`]: crate::snapshot::Snapshot::get_clustering_columns
-pub(crate) fn get_clustering_columns(
-    log_segment: &LogSegment,
-    engine: &dyn Engine,
-) -> DeltaResult<Option<Vec<ColumnName>>> {
-    let config = domain_metadata_configuration(log_segment, CLUSTERING_DOMAIN_NAME, engine)?;
-    match config {
-        Some(json_str) => Ok(Some(parse_clustering_columns(&json_str)?)),
-        None => Ok(None),
-    }
 }
 
 #[cfg(test)]
@@ -409,12 +382,12 @@ mod tests {
     #[case::ten(10)]
     fn test_validate_clustering_column_count(#[case] num_columns: usize) {
         let fields: Vec<StructField> = (0..num_columns)
-            .map(|i| StructField::new(format!("col{}", i), DataType::INTEGER, false))
+            .map(|i| StructField::new(format!("col{i}"), DataType::INTEGER, false))
             .collect();
         let schema = StructType::new_unchecked(fields);
 
         let columns: Vec<ColumnName> = (0..num_columns)
-            .map(|i| ColumnName::new([format!("col{}", i)]))
+            .map(|i| ColumnName::new([format!("col{i}")]))
             .collect();
 
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
@@ -439,8 +412,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains(expected_error),
-            "Expected error containing '{}'",
-            expected_error
+            "Expected error containing '{expected_error}'"
         );
     }
 
