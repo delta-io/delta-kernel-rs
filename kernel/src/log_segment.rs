@@ -1125,10 +1125,12 @@ impl LogSegment {
         true
     }
 
-    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    /// Recursively checks if two struct types have compatible field types.
     ///
-    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
-    /// - Primitive types: must be compatible via `can_read_as` (allows type widening)
+    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
+    /// For each field in `needed`, if it exists in `available` (checkpoint):
+    /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
+    ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
@@ -1155,9 +1157,16 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Non-struct types: use can_read_as for type compatibility
+                // Non-struct types: use stats-specific rules for primitives and standard
+                // schema rules otherwise.
                 (avail_type, need_type) => {
-                    if avail_type.can_read_as(need_type).is_err() {
+                    let compatible = match (avail_type, need_type) {
+                        (DataType::Primitive(a), DataType::Primitive(b)) => {
+                            a.is_stats_type_compatible_with(b)
+                        }
+                        (a, b) => a.can_read_as(b).is_ok(),
+                    };
+                    if !compatible {
                         debug!(
                             "stats_parsed not compatible: incompatible type for '{}' in {}: \
                              checkpoint has {:?}, stats schema needs {:?}",
