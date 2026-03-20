@@ -1386,130 +1386,61 @@ mod tests {
         Ok(())
     }
 
-    // test new CRC in new log segment (old log segment has old CRC)
-    #[tokio::test]
-    async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let protocol = |reader_version, writer_version| {
-            json!({
-                "protocol": {
-                    "minReaderVersion": reader_version,
-                    "minWriterVersion": writer_version
-                }
-            })
-        };
-        let metadata = json!({
-            "metaData": {
-                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
-                "format": {
-                    "provider": "parquet",
-                    "options": {}
-                },
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 1587968585495i64
-            }
-        });
-        let commit0 = vec![
-            json!({
-                "commitInfo": {
-                    "timestamp": 1587968586154i64,
-                    "operation": "WRITE",
-                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
-                    "isBlindAppend":true
-                }
-            }),
-            protocol(1, 1),
-            metadata.clone(),
-        ];
-        let commit1 = vec![
-            json!({
-                "commitInfo": {
-                    "timestamp": 1587968586154i64,
-                    "operation": "WRITE",
-                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
-                    "isBlindAppend":true
-                }
-            }),
-            protocol(1, 2),
-        ];
+    // Incremental snapshot update picks up CRC files from the new log segment,
+    // regardless of which table features are enabled.
+    #[rstest::rstest]
+    fn test_snapshot_new_from_crc(
+        #[values(false, true)] add_crc_at_v1: bool,
+        #[values(
+            test_utils::table_builder::FeatureSet::empty(),
+            test_utils::table_builder::FeatureSet::new().column_mapping("name"),
+            test_utils::table_builder::FeatureSet::new().ict(),
+            test_utils::table_builder::FeatureSet::new().v2_checkpoint(),
+            test_utils::table_builder::FeatureSet::new().column_mapping("name").ict(),
+        )]
+        features: test_utils::table_builder::FeatureSet,
+    ) -> DeltaResult<()> {
+        use test_utils::table_builder::{LogState, TestTableBuilder};
 
-        // commit 0 and 1 jsons
-        commit(table_root, &store, 0, commit0.clone()).await;
-        commit(table_root, &store, 1, commit1).await;
+        let table = TestTableBuilder::new()
+            .log_state(LogState::with_crc(0, 2))
+            .features(features)
+            .build()
+            .map_err(|e| Error::generic(e.to_string()))?;
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
-        // a) CRC: old one has 0.crc, no new one (expect 0.crc)
-        // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 1),
-        });
+        if add_crc_at_v1 {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(test_utils::table_builder::write_crc(
+                1,
+                table.store(),
+                table.table_root(),
+            ))
+            .unwrap();
+        }
 
-        // put the old crc
-        let path = delta_path_for_version(0, "crc");
-        store.put(&path, crc.to_string().into()).await?;
-
-        // base snapshot is at version 0
-        let base_snapshot = Snapshot::builder_for(table_root)
+        let base = Snapshot::builder_for(table.table_root())
             .at_version(0)
             .build(&engine)?;
+        let updated = Snapshot::builder_from(base).at_version(1).build(&engine)?;
+        let fresh = Snapshot::builder_for(table.table_root())
+            .at_version(1)
+            .build(&engine)?;
 
-        // first test: no new crc
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
-            .at_version(1)
-            .build(&engine)?;
-        let expected = Snapshot::builder_for(table_root)
-            .at_version(1)
-            .build(&engine)?;
-        assert_eq!(snapshot, expected);
+        // Incremental update must produce the same result as a fresh load
+        assert_eq!(updated, fresh);
+
+        let expected_crc_version = if add_crc_at_v1 { 1 } else { 0 };
         assert_eq!(
-            snapshot
+            updated
                 .log_segment
                 .listed
                 .latest_crc_file
                 .as_ref()
                 .unwrap()
                 .version,
-            0
+            expected_crc_version
         );
-
-        // second test: new crc
-        // put the new crc
-        let path = delta_path_for_version(1, "crc");
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 2),
-        });
-        store.put(&path, crc.to_string().into()).await?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
-            .at_version(1)
-            .build(&engine)?;
-        let expected = Snapshot::builder_for(table_root)
-            .at_version(1)
-            .build(&engine)?;
-        assert_eq!(snapshot, expected);
-        assert_eq!(
-            snapshot
-                .log_segment
-                .listed
-                .latest_crc_file
-                .as_ref()
-                .unwrap()
-                .version,
-            1
-        );
-
         Ok(())
     }
 
