@@ -23,13 +23,12 @@ samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "som
 
 #### By benchmark name
 
-Benchmark names follow a hierarchical path structure assembled from the Criterion group name, the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
+Benchmark names follow a hierarchical path structure assembled from the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
 
 ```
-workloadBenchmarks/{table_name}/{spec_file_name}/{operation}/{config_name}
+{table_name}/{spec_file_name}/{operation}/{config_name}
 ```
 
-- `workloadBenchmarks` — the Criterion benchmark group (always this literal string)
 - `{table_name}` — the `name` field from `tableInfo.json`
 - `{spec_file_name}` — the spec filename without its `.json` extension (the `case_name`)
 - `{operation}` — `snapshotConstruction` or `readMetadata`
@@ -39,25 +38,28 @@ All path components use camelCase to match the JSON keys used throughout the wor
 
 Examples:
 ```
-workloadBenchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction
-workloadBenchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/serial
-workloadBenchmarks/checkpointV91009Versions/snapshotLatest/readMetadata/parallel4
+101kAdds1000CommitsSinceChkpt1Chkpt/snapshotLatest/snapshotConstruction
+101kAdds1000CommitsSinceChkpt1Chkpt/snapshotLatest/readMetadata/serial
+10kAdds0CommitsSinceChkpt1V2Chkpt/snapshotLatest/readMetadata/parallel2
 ```
 
 The filter argument is a regular expression, so you can create patterns to target the benchmarks that you want:
 
 ```bash
 # all benchmarks for a specific table name
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt"
 
 # all benchmarks for either of two tables (| for OR)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions|10Adds"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt|10kAdds0Chkpts"
+
+# all snapshotConstruction benchmarks
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "snapshotConstruction"
 
 # snapshotConstruction workloads for a specific table (.* to AND two parts of the name)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "checkpointV91009Versions.*snapshotConstruction"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt.*snapshotConstruction"
 
 # profile a specific benchmark with samply
-samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "workloadBenchmarks/checkpointV91009Versions/snapshotLatest/snapshotConstruction"
+samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt/snapshotLatest/snapshotConstruction"
 ```
 
 #### By tag (`BENCH_TAGS`)

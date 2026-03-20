@@ -6,7 +6,7 @@ use crate::expressions::{
     MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
     Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
 };
-use crate::transforms::{map_owned_children_or_else, CowExt as _};
+use crate::transforms::{map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else};
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -185,78 +185,97 @@ pub trait ExpressionTransform<'a> {
 
     /// General entry point for transforming an expression. This method will dispatch to the
     /// specific transform for each expression variant. Also invoked internally in order to recurse
-    /// on the child(ren) of non-leaf variants.
+    /// on the child(ren) of non-leaf expressions.
     fn transform_expr(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
-        let expr = match expr {
-            Expression::Literal(s) => self
-                .transform_expr_literal(s)?
-                .map_owned_or_else(expr, Expression::Literal),
-            Expression::Column(c) => self
-                .transform_expr_column(c)?
-                .map_owned_or_else(expr, Expression::Column),
-            Expression::Predicate(p) => self
-                .transform_expr_pred(p)?
-                .map_owned_or_else(expr, Expression::from),
-            Expression::Struct(s, nullability) => self
-                .transform_expr_struct(s)?
-                .map_owned_or_else(expr, |exprs| Expression::Struct(exprs, nullability.clone())),
-            Expression::Transform(t) => self
-                .transform_expr_transform(t)?
-                .map_owned_or_else(expr, Expression::Transform),
-            Expression::Unary(u) => self
-                .transform_expr_unary(u)?
-                .map_owned_or_else(expr, Expression::Unary),
-            Expression::Binary(b) => self
-                .transform_expr_binary(b)?
-                .map_owned_or_else(expr, Expression::Binary),
-            Expression::Variadic(v) => self
-                .transform_expr_variadic(v)?
-                .map_owned_or_else(expr, Expression::Variadic),
-            Expression::Opaque(o) => self
-                .transform_expr_opaque(o)?
-                .map_owned_or_else(expr, Expression::Opaque),
-            Expression::ParseJson(p) => self
-                .transform_expr_parse_json(p)?
-                .map_owned_or_else(expr, Expression::ParseJson),
-            Expression::MapToStruct(m) => self
-                .transform_expr_map_to_struct(m)?
-                .map_owned_or_else(expr, Expression::MapToStruct),
-            Expression::Unknown(u) => self
-                .transform_expr_unknown(u)?
-                .map_owned_or_else(expr, Expression::Unknown),
-        };
-        Some(expr)
+        match expr {
+            Expression::Literal(s) => {
+                let child = self.transform_expr_literal(s);
+                map_owned_or_else(expr, child, Expression::Literal)
+            }
+            Expression::Column(c) => {
+                let child = self.transform_expr_column(c);
+                map_owned_or_else(expr, child, Expression::Column)
+            }
+            Expression::Predicate(p) => {
+                let child = self.transform_expr_pred(p);
+                map_owned_or_else(expr, child, Expression::from)
+            }
+            Expression::Struct(s, nullability) => {
+                let map_owned = |exprs| Expression::Struct(exprs, nullability.clone());
+                map_owned_or_else(expr, self.transform_expr_struct(s), map_owned)
+            }
+            Expression::Transform(t) => {
+                let child = self.transform_expr_transform(t);
+                map_owned_or_else(expr, child, Expression::Transform)
+            }
+            Expression::Unary(u) => {
+                let child = self.transform_expr_unary(u);
+                map_owned_or_else(expr, child, Expression::Unary)
+            }
+            Expression::Binary(b) => {
+                let child = self.transform_expr_binary(b);
+                map_owned_or_else(expr, child, Expression::Binary)
+            }
+            Expression::Variadic(v) => {
+                let child = self.transform_expr_variadic(v);
+                map_owned_or_else(expr, child, Expression::Variadic)
+            }
+            Expression::Opaque(o) => {
+                let child = self.transform_expr_opaque(o);
+                map_owned_or_else(expr, child, Expression::Opaque)
+            }
+            Expression::ParseJson(p) => {
+                let child = self.transform_expr_parse_json(p);
+                map_owned_or_else(expr, child, Expression::ParseJson)
+            }
+            Expression::MapToStruct(m) => {
+                let child = self.transform_expr_map_to_struct(m);
+                map_owned_or_else(expr, child, Expression::MapToStruct)
+            }
+            Expression::Unknown(u) => {
+                let child = self.transform_expr_unknown(u);
+                map_owned_or_else(expr, child, Expression::Unknown)
+            }
+        }
     }
 
     /// General entry point for transforming a predicate. This method will dispatch to the specific
     /// transform for each predicate variant. Also invoked internally in order to recurse on the
     /// child(ren) of non-leaf variants.
     fn transform_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
-        let pred = match pred {
-            Predicate::BooleanExpression(e) => self
-                .transform_expr(e)?
-                .map_owned_or_else(pred, Predicate::BooleanExpression),
-            Predicate::Not(p) => self.transform_pred_not(p)?.map_owned_or_else(pred, |p| p),
-            Predicate::Unary(u) => self
-                .transform_pred_unary(u)?
-                .map_owned_or_else(pred, Predicate::Unary),
-            Predicate::Binary(b) => self
-                .transform_pred_binary(b)?
-                .map_owned_or_else(pred, Predicate::Binary),
+        match pred {
+            Predicate::BooleanExpression(e) => {
+                let child = self.transform_expr(e);
+                map_owned_or_else(pred, child, Predicate::BooleanExpression)
+            }
+            Predicate::Not(p) => {
+                let child = self.transform_pred_not(p);
+                map_owned_or_else(pred, child, |p| p)
+            }
+            Predicate::Unary(u) => {
+                let child = self.transform_pred_unary(u);
+                map_owned_or_else(pred, child, Predicate::Unary)
+            }
+            Predicate::Binary(b) => {
+                let child = self.transform_pred_binary(b);
+                map_owned_or_else(pred, child, Predicate::Binary)
+            }
             // Route through the constructor to normalize in case the transform removed children.
             // When `transform_pred` returns `None` for a child, it is filtered out, which may
             // reduce the junction to one or zero elements. The constructor normalizes these.
-            Predicate::Junction(j) => self
-                .transform_pred_junction(j)?
-                .map_owned_or_else(pred, |j| Predicate::junction(j.op, j.preds)),
-            Predicate::Opaque(o) => self
-                .transform_pred_opaque(o)?
-                .map_owned_or_else(pred, Predicate::Opaque),
-            Predicate::Unknown(u) => self
-                .transform_pred_unknown(u)?
-                .map_owned_or_else(pred, Predicate::Unknown),
-        };
-        Some(pred)
+            Predicate::Junction(j) => {
+                let child = self.transform_pred_junction(j);
+                map_owned_or_else(pred, child, |j| Predicate::junction(j.op, j.preds))
+            }
+            Predicate::Opaque(o) => {
+                let child = self.transform_pred_opaque(o);
+                map_owned_or_else(pred, child, Predicate::Opaque)
+            }
+            Predicate::Unknown(u) => {
+                let child = self.transform_pred_unknown(u);
+                map_owned_or_else(pred, child, Predicate::Unknown)
+            }
+        }
     }
 
     /// Recursively transforms a struct's child expressions (variadic).
@@ -264,11 +283,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         fields: &'a [ExpressionRef],
     ) -> Option<Cow<'a, [ExpressionRef]>> {
-        let transformed_children = fields.iter().map(|f| {
-            let transformed = self.transform_expr(f)?;
-            Some(transformed.map_owned_or_else(f, Arc::new))
+        let children = fields.iter().map(|f| -> Option<Cow<'a, ExpressionRef>> {
+            map_owned_or_else(f, self.transform_expr(f), Arc::new)
         });
-        map_owned_children_or_else(fields, transformed_children, |fields| fields)
+        map_owned_children_or_else(fields, children, |fields| fields)
     }
 
     /// Recursively transforms the child expression of a parse-json expression (unary).
@@ -276,10 +294,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         expr: &'a ParseJsonExpression,
     ) -> Option<Cow<'a, ParseJsonExpression>> {
-        let nested = self.transform_expr(&expr.json_expr)?;
-        Some(nested.map_owned_or_else(expr, |json_expr| {
-            ParseJsonExpression::new(json_expr, expr.output_schema.clone())
-        }))
+        let f = |json_expr| ParseJsonExpression::new(json_expr, expr.output_schema.clone());
+        map_owned_or_else(expr, self.transform_expr(&expr.json_expr), f)
     }
 
     /// Recursively transforms the child expression of a map-to-struct expression (unary).
@@ -287,8 +303,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         expr: &'a MapToStructExpression,
     ) -> Option<Cow<'a, MapToStructExpression>> {
-        let nested = self.transform_expr(&expr.map_expr)?;
-        Some(nested.map_owned_or_else(expr, MapToStructExpression::new))
+        let nested = self.transform_expr(&expr.map_expr);
+        map_owned_or_else(expr, nested, MapToStructExpression::new)
     }
 
     /// Recursively transforms the children of an opaque expression (variadic).
@@ -308,7 +324,7 @@ pub trait ExpressionTransform<'a> {
 
     /// Recursively transforms the child of a not predicate expression (unary).
     fn recurse_into_pred_not(&mut self, p: &'a Predicate) -> Option<Cow<'a, Predicate>> {
-        Some(self.transform_pred(p)?.map_owned_or_else(p, Predicate::not))
+        map_owned_or_else(p, self.transform_pred(p), Predicate::not)
     }
 
     /// Recursively transforms a unary predicate's child (unary).
@@ -316,8 +332,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         u: &'a UnaryPredicate,
     ) -> Option<Cow<'a, UnaryPredicate>> {
-        let nested_result = self.transform_expr(&u.expr)?;
-        Some(nested_result.map_owned_or_else(u, |expr| UnaryPredicate::new(u.op, expr)))
+        let nested = self.transform_expr(&u.expr);
+        map_owned_or_else(u, nested, |expr| UnaryPredicate::new(u.op, expr))
     }
 
     /// Recursively transforms a binary predicate's children (binary).
@@ -325,10 +341,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         b: &'a BinaryPredicate,
     ) -> Option<Cow<'a, BinaryPredicate>> {
-        let left = self.transform_expr(&b.left)?;
-        let right = self.transform_expr(&b.right)?;
+        let left = self.transform_expr(&b.left);
+        let right = self.transform_expr(&b.right);
         let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
-        Some((left, right).map_owned_or_else(b, f))
+        map_owned_pair_or_else(b, left, right, f)
     }
 
     /// Recursively transforms a unary expression's child (unary).
@@ -336,8 +352,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         u: &'a UnaryExpression,
     ) -> Option<Cow<'a, UnaryExpression>> {
-        let nested_result = self.transform_expr(&u.expr)?;
-        Some(nested_result.map_owned_or_else(u, |expr| UnaryExpression::new(u.op, expr)))
+        let nested = self.transform_expr(&u.expr);
+        map_owned_or_else(u, nested, |expr| UnaryExpression::new(u.op, expr))
     }
 
     /// Recursively transforms a binary expression's children (binary).
@@ -345,10 +361,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         b: &'a BinaryExpression,
     ) -> Option<Cow<'a, BinaryExpression>> {
-        let left = self.transform_expr(&b.left)?;
-        let right = self.transform_expr(&b.right)?;
+        let left = self.transform_expr(&b.left);
+        let right = self.transform_expr(&b.right);
         let f = |(left, right)| BinaryExpression::new(b.op, left, right);
-        Some((left, right).map_owned_or_else(b, f))
+        map_owned_pair_or_else(b, left, right, f)
     }
 
     /// Recursively transforms a variadic expression's children (variadic).
@@ -356,9 +372,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         v: &'a VariadicExpression,
     ) -> Option<Cow<'a, VariadicExpression>> {
-        let transformed_children = v.exprs.iter().map(|e| self.transform_expr(e));
-        let map_owned = |exprs| VariadicExpression::new(v.op, exprs);
-        map_owned_children_or_else(v, transformed_children, map_owned)
+        let children = v.exprs.iter().map(|e| self.transform_expr(e));
+        map_owned_children_or_else(v, children, |exprs| VariadicExpression::new(v.op, exprs))
     }
 
     /// Recursively transforms a junction predicate's children (variadic).
@@ -366,9 +381,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         j: &'a JunctionPredicate,
     ) -> Option<Cow<'a, JunctionPredicate>> {
-        let transformed_children = j.preds.iter().map(|p| self.transform_pred(p));
-        let map_owned = |preds| JunctionPredicate::new(j.op, preds);
-        map_owned_children_or_else(j, transformed_children, map_owned)
+        let children = j.preds.iter().map(|p| self.transform_pred(p));
+        map_owned_children_or_else(j, children, |preds| JunctionPredicate::new(j.op, preds))
     }
 
     /// Recursively transforms an opaque predicate's children (variadic).
@@ -376,9 +390,9 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         o: &'a OpaquePredicate,
     ) -> Option<Cow<'a, OpaquePredicate>> {
-        let transformed_children = o.exprs.iter().map(|e| self.transform_expr(e));
+        let children = o.exprs.iter().map(|e| self.transform_expr(e));
         let map_owned = |exprs| OpaquePredicate::new(o.op.clone(), exprs);
-        map_owned_children_or_else(o, transformed_children, map_owned)
+        map_owned_children_or_else(o, children, map_owned)
     }
 }
 

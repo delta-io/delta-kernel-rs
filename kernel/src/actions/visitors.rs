@@ -43,6 +43,7 @@ impl RowVisitor for MetadataVisitor {
 #[derive(Default)]
 pub(crate) struct SelectionVectorVisitor {
     pub(crate) selection_vector: Vec<bool>,
+    pub(crate) num_filtered: u64,
 }
 
 /// A single non-nullable BOOL column
@@ -61,8 +62,11 @@ impl RowVisitor for SelectionVectorVisitor {
             ))
         );
         for i in 0..row_count {
-            self.selection_vector
-                .push(getters[0].get(i, "selectionvector.output")?);
+            let selected: bool = getters[0].get(i, "selectionvector.output")?;
+            if !selected {
+                self.num_filtered += 1;
+            }
+            self.selection_vector.push(selected);
         }
         Ok(())
     }
@@ -695,7 +699,10 @@ impl RowVisitor for InCommitTimestampVisitor {
 mod tests {
     use super::*;
 
-    use crate::arrow::array::StringArray;
+    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
 
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
@@ -1298,5 +1305,30 @@ mod tests {
             vec![commit_info_action(), add_action()],
             Some(1677811178585), // Retrieved ICT
         );
+    }
+
+    // Helper to create a boolean batch for SelectionVectorVisitor tests
+    fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
+        let array = BooleanArray::from(values);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("output", DataType::Boolean, false)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_batch(vec![], 0, "empty batch should have no filtered rows")]
+    #[case::all_selected(vec![true, true, true, true], 0, "all selected should have no filtered rows")]
+    #[case::all_filtered(vec![false, false, false, false, false], 5, "all filtered should count all rows")]
+    #[case::mixed_selection(vec![true, false, true, false, false, true], 3, "mixed selection should count false values")]
+    fn selection_vector_visitor_counter_accuracy(
+        #[case] input: Vec<bool>,
+        #[case] expected_filtered: u64,
+        #[case] _description: &str,
+    ) {
+        let batch = create_boolean_batch(input.clone());
+        let mut visitor = SelectionVectorVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.selection_vector, input);
+        assert_eq!(visitor.num_filtered, expected_filtered);
     }
 }

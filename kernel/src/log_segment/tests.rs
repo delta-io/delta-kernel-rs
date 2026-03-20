@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use itertools::Itertools;
+use rstest::rstest;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -3136,6 +3137,161 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     let stats_schema = create_stats_schema(vec![StructField::nullable("company", stats_company)]);
 
     // Type mismatch deep in hierarchy should be detected
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
+    // Checkpoint stores timestamp stats as Int64 (no logical type annotation)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("ts_ntz_col", DataType::LONG),
+    ]);
+
+    // Stats schema expects Timestamp and TimestampNtz types
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("ts_ntz_col", DataType::TIMESTAMP_NTZ),
+    ]);
+
+    // Long -> Timestamp/TimestampNtz reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_timestamp_to_long_rejected() {
+    // Checkpoint has Timestamp-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "ts_col",
+            DataType::TIMESTAMP,
+        )]);
+
+    // Stats schema expects Long -- narrowing should be rejected
+    let stats_schema = create_stats_schema(vec![StructField::nullable("ts_col", DataType::LONG)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_integer_to_date() {
+    // Checkpoint stores date stats as Int32 (no DATE logical annotation)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::INTEGER,
+        )]);
+
+    // Stats schema expects Date type
+    let stats_schema = create_stats_schema(vec![StructField::nullable("date_col", DataType::DATE)]);
+
+    // Integer -> Date reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_date_to_integer_rejected() {
+    // Checkpoint has Date-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::DATE,
+        )]);
+
+    // Stats schema expects Integer -- narrowing should be rejected
+    let stats_schema =
+        create_stats_schema(vec![StructField::nullable("date_col", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+// Type widening + checkpoint reinterpretation interaction scenarios.
+// Verifies that schema evolution doesn't create false-positive type matches.
+#[rstest]
+// Standard widening: Integer -> Long in old checkpoint after column was widened
+#[case::widening_integer_to_long(DataType::INTEGER, DataType::LONG, true)]
+// Checkpoint reinterpretation: Int32 without DATE annotation -> Date
+#[case::reinterpret_integer_to_date(DataType::INTEGER, DataType::DATE, true)]
+// Checkpoint reinterpretation: Int64 without TIMESTAMP annotation -> Timestamp
+#[case::reinterpret_long_to_timestamp(DataType::LONG, DataType::TIMESTAMP, true)]
+// Compound: checkpoint dropped Date annotation (Int32) + column widened to Timestamp.
+// Integer -> Timestamp is neither a widening nor reinterpretation rule.
+#[case::reinterpret_plus_widen_integer_to_timestamp(DataType::INTEGER, DataType::TIMESTAMP, false)]
+#[case::reinterpret_plus_widen_integer_to_timestamp_ntz(
+    DataType::INTEGER,
+    DataType::TIMESTAMP_NTZ,
+    false
+)]
+// Date -> Timestamp is a valid Delta type widening rule, but kernel's can_widen_to does not
+// currently support it. This test documents the current behavior.
+#[case::date_widened_to_timestamp(DataType::DATE, DataType::TIMESTAMP, false)]
+fn test_stats_parsed_widening_and_reinterpretation_interaction(
+    #[case] checkpoint_type: DataType,
+    #[case] stats_type: DataType,
+    #[case] expected: bool,
+) {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "col",
+            checkpoint_type,
+        )]);
+    let stats_schema = create_stats_schema(vec![StructField::nullable("col", stats_type)]);
+
+    assert_eq!(
+        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
+        expected
+    );
+}
+
+#[test]
+fn test_stats_parsed_mixed_widening_and_reinterpretation() {
+    // Multiple columns with different compatibility paths should all pass.
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("date_col", DataType::INTEGER),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("date_col", DataType::DATE),
+    ]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_stats_parsed_mixed_with_one_incompatible_rejects_all() {
+    // One incompatible column (Integer -> Timestamp) rejects the whole schema.
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("bad_col", DataType::TIMESTAMP),
+    ]);
+
     assert!(!LogSegment::schema_has_compatible_stats_parsed(
         &checkpoint_schema,
         &stats_schema

@@ -1,8 +1,12 @@
 use std::clone::Clone;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
+
 use super::data_skipping::DataSkippingFilter;
+use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -10,7 +14,6 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
 };
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
@@ -24,8 +27,6 @@ use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructFie
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
-use delta_kernel_derive::internal_api;
-use serde::{Deserialize, Serialize};
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -46,7 +47,7 @@ struct InternalScanState {
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
-/// defualt serde serialization, or through custom serialization in the engine.
+/// default serde serialization, or through custom serialization in the engine.
 ///
 /// This struct contains all the information needed to reconstruct a `ScanLogReplayProcessor`
 /// on remote compute nodes, enabling distributed log replay processing.
@@ -84,12 +85,13 @@ pub struct SerializableScanState {
 /// and performs the following steps:
 ///
 /// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
-///   files that are irrelevant for the query.
-/// - Partition Pruning: Uses an optional partition filter (extracted from a physical predicate)
-///   to exclude actions whose partition values do not meet the required criteria.
+///   files that are irrelevant for the query. This includes both data column stats (min/max/nullCount)
+///   and partition value filtering in a single columnar pass. A secondary row-level partition filter
+///   catches remaining files the columnar pass cannot prune (e.g. null partition values where
+///   null-safety conservatively keeps them).
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
 ///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
-/// - Transformation: Applies a built-in transformation (`add_transform`) to convert selected Add actions
+/// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`) to convert selected Add actions
 ///   into [`ScanMetadata`], the intermediate format passed to the engine.
 /// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those derived
 ///   from projection or filters) are preserved and passed through to the engine, which applies them as part
@@ -102,11 +104,12 @@ pub struct SerializableScanState {
 /// to be applied to the selected rows.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
-    partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
-    /// Transform for log batches (commit files) - uses ParseJson for stats
+    /// Transform for log batches (commit files) - uses ParseJson for stats and MapToStruct
+    /// for partition values
     log_transform: Arc<dyn ExpressionEvaluator>,
-    /// Transform for checkpoint batches - uses coalesce(stats_parsed, ParseJson) when available
+    /// Transform for checkpoint batches - reads pre-parsed stats_parsed and
+    /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
@@ -115,11 +118,10 @@ pub struct ScanLogReplayProcessor {
     seen_file_keys: HashSet<FileActionKey>,
     /// Skip reading file statistics.
     skip_stats: bool,
-    /// Whether checkpoint batches have compatible `partitionValues_parsed` columns.
-    #[allow(unused)]
-    has_partition_values_parsed: bool,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
+    /// Metrics related to the scan
+    metrics: Arc<ScanMetrics>,
 }
 
 impl ScanLogReplayProcessor {
@@ -139,11 +141,12 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         skip_stats: bool,
     ) -> DeltaResult<Self> {
+        let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
             engine,
             state_info,
             checkpoint_info,
-            Default::default(),
+            HashSet::with_capacity(dedup_capacity),
             skip_stats,
         )
     }
@@ -172,6 +175,9 @@ impl ScanLogReplayProcessor {
             checkpoint_read_schema,
         } = checkpoint_info.clone();
 
+        // Create metrics first so we can pass them to DataSkippingFilter
+        let metrics = Arc::new(ScanMetrics::default());
+
         // Extract the physical predicate for data skipping and partition filtering.
         // DataSkippingFilter expects Option<(PredicateRef, SchemaRef)>.
         let physical_predicate = match &state_info.physical_predicate {
@@ -179,65 +185,85 @@ impl ScanLogReplayProcessor {
             _ => None,
         };
 
-        // When skip_stats is enabled, use None for stats schema to produce null stats output
-        let stats_schema_for_transform = if skip_stats {
-            None
+        // When skip_stats is enabled, disable both data column skipping and partition pruning.
+        // Both rely on the same DataSkippingFilter columnar pass, so they are controlled together.
+        let (stats_schema_for_transform, partition_schema_for_transform) = if skip_stats {
+            (None, None)
         } else {
-            state_info.physical_stats_schema.clone()
+            (
+                state_info.physical_stats_schema.clone(),
+                state_info.physical_partition_schema.clone(),
+            )
         };
 
-        let output_schema = scan_row_schema_with_stats_parsed(stats_schema_for_transform.clone());
+        let output_schema = scan_row_schema_with_parsed_columns(
+            stats_schema_for_transform.clone(),
+            partition_schema_for_transform.clone(),
+        );
 
-        // Create data skipping filter that reads stats_parsed from the transformed batch.
-        // This avoids double JSON parsing - the transform parses JSON once, then data skipping
-        // reads the already-parsed stats_parsed column from the transform output.
-        // Disabled when skip_stats is enabled.
+        // Create data skipping filter that reads stats_parsed and partitionValues_parsed
+        // from the transformed batch. This avoids double JSON parsing -- the transform parses
+        // JSON once, then data skipping reads the already-parsed columns from the output.
+        //
+        // When partition columns are referenced by the predicate, the filter receives a
+        // partition schema + expression to extract typed partition values. Since the transform
+        // already produces `partitionValues_parsed`, the filter reads that column directly.
         let data_skipping_filter = if skip_stats {
             None
         } else {
-            state_info
-                .physical_stats_schema
-                .as_ref()
-                .and_then(|physical_stats_schema| {
-                    DataSkippingFilter::new(
-                        engine,
-                        // these are all cheap arc clones
-                        physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                        Some(physical_stats_schema),
-                        column_expr_ref!("stats_parsed"),
-                        None, // no partition schema yet
-                        column_expr_ref!("partitionValues_parsed"),
-                        output_schema.clone(),
-                    )
-                })
+            DataSkippingFilter::new(
+                engine,
+                physical_predicate.as_ref().map(|(p, _)| p.clone()),
+                stats_schema_for_transform.as_ref(),
+                column_expr_ref!("stats_parsed"),
+                partition_schema_for_transform.as_ref(),
+                column_expr_ref!("partitionValues_parsed"),
+                output_schema.clone(),
+                Some(metrics.clone()),
+            )
         };
 
         Ok(Self {
-            partition_filter: physical_predicate.as_ref().map(|(p, _)| p.clone()),
             data_skipping_filter,
-            // Log transform: always parse JSON (no stats_parsed in JSON commit files)
+            // Log transform: parse JSON for stats, MapToStruct for partition values
             log_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema.clone(),
-                get_add_transform_expr(stats_schema_for_transform.clone(), false, skip_stats),
+                get_add_transform_expr(
+                    stats_schema_for_transform.clone(),
+                    false,
+                    skip_stats,
+                    partition_schema_for_transform.clone(),
+                    false,
+                ),
                 output_schema.clone().into(),
             )?,
-            // Checkpoint transform: read stats_parsed directly when available, otherwise parse JSON
+            // Checkpoint transform: read pre-parsed columns directly when available
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
-                get_add_transform_expr(stats_schema_for_transform, has_stats_parsed, skip_stats),
+                get_add_transform_expr(
+                    stats_schema_for_transform,
+                    has_stats_parsed,
+                    skip_stats,
+                    partition_schema_for_transform,
+                    has_partition_values_parsed,
+                ),
                 output_schema.into(),
             )?,
             seen_file_keys,
-            has_partition_values_parsed,
             state_info,
             skip_stats,
             checkpoint_info,
+            metrics,
         })
     }
 
     /// Get a reference to the checkpoint info.
     pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
         &self.checkpoint_info
+    }
+
+    pub(crate) fn get_metrics(&self) -> &ScanMetrics {
+        self.metrics.as_ref()
     }
 
     /// Serialize the processor state for distributed processing.
@@ -297,8 +323,8 @@ impl ScanLogReplayProcessor {
     /// Reconstruct a processor from serialized state.
     ///
     /// Creates a new processor with the provided state. All fields (partition_filter,
-    /// data_skipping_filter, add_transform, and seen_file_keys) are reconstructed from
-    /// the serialized state and engine.
+    /// data_skipping_filter, log_transform, checkpoint_transform, and seen_file_keys) are
+    /// reconstructed from the serialized state and engine.
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
@@ -354,51 +380,33 @@ impl ScanLogReplayProcessor {
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<D: Deduplicator> {
+struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
-    partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    metrics: &'a ScanMetrics,
 }
 
-impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
+impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
     fn new(
         deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
-        partition_filter: Option<PredicateRef>,
-    ) -> AddRemoveDedupVisitor<D> {
+        metrics: &'a ScanMetrics,
+    ) -> AddRemoveDedupVisitor<'a, D> {
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
             state_info,
-            partition_filter,
             row_transform_exprs: Vec::new(),
+            metrics,
         }
-    }
-
-    fn is_file_partition_pruned(
-        &self,
-        partition_values: &HashMap<usize, (String, Scalar)>,
-    ) -> bool {
-        if partition_values.is_empty() {
-            return false;
-        }
-        let Some(partition_filter) = &self.partition_filter else {
-            return false;
-        };
-        let partition_values: HashMap<_, _> = partition_values
-            .values()
-            .map(|(k, v)| (ColumnName::new([k]), v.clone()))
-            .collect();
-        let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
-        evaluator.eval_sql_where(partition_filter) == Some(false)
     }
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on action type:
         // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
         // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8
@@ -411,29 +419,29 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
         else {
+            self.metrics.incr_non_file_actions();
             return Ok(false);
         };
 
-        // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
-        // tracking pruned files. Removes don't get pruned and we'll still have to track them.
-        //
-        // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
-        // removes), because they are needed to suppress earlier incompatible adds we might
-        // encounter if the table's schema was replaced after the most recent checkpoint.
+        if is_add {
+            self.metrics.incr_add_files_seen()
+        } else {
+            self.metrics.incr_remove_files_seen()
+        };
+
+        // Parse partition values for building the per-row transform expression.
+        // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
+        // so we only need to parse values here for the transform.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(i, "add.partitionValues")?;
-                let partition_values = parse_partition_values(
+                parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
                     &partition_values,
                     self.state_info.column_mapping_mode,
-                )?;
-                if self.is_file_partition_pruned(&partition_values) {
-                    return Ok(false);
-                }
-                partition_values
+                )?
             }
             _ => Default::default(),
         };
@@ -462,11 +470,12 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
             self.row_transform_exprs.resize_with(i, Default::default);
             self.row_transform_exprs.push(transform);
         }
+        self.metrics.incr_active_add_files();
         Ok(true)
     }
 }
 
-impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
+impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
@@ -500,6 +509,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let start = std::time::Instant::now();
+
         let is_log_batch = self.deduplicator.is_log_batch();
         let expected_getters = if is_log_batch { 10 } else { 6 };
         require!(
@@ -515,6 +526,10 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
                 self.selection_vector[i] = self.is_valid_add(i, getters)?;
             }
         }
+
+        self.metrics
+            .add_dedup_visitor_time_ns(start.elapsed().as_nanos() as u64);
+
         Ok(())
     }
 }
@@ -555,24 +570,36 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-/// Build the scan row schema with optional stats_parsed column.
+/// Build the scan row schema with optional `stats_parsed` and `partitionValues_parsed` columns.
 ///
 /// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
-fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
-    match stats_schema {
-        Some(schema) => {
-            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-            fields.push(StructField::nullable(
-                "stats_parsed",
-                schema.as_ref().clone(),
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        }
-        None => SCAN_ROW_SCHEMA.clone(),
+/// When `partition_schema` is provided, adds a `partitionValues_parsed` struct column with that
+/// schema.
+fn scan_row_schema_with_parsed_columns(
+    stats_schema: Option<SchemaRef>,
+    partition_schema: Option<SchemaRef>,
+) -> SchemaRef {
+    let needs_extra = stats_schema.is_some() || partition_schema.is_some();
+    if !needs_extra {
+        return SCAN_ROW_SCHEMA.clone();
     }
+    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+    if let Some(schema) = stats_schema {
+        fields.push(StructField::nullable(
+            "stats_parsed",
+            schema.as_ref().clone(),
+        ));
+    }
+    if let Some(schema) = partition_schema {
+        fields.push(StructField::nullable(
+            "partitionValues_parsed",
+            schema.as_ref().clone(),
+        ));
+    }
+    Arc::new(StructType::new_unchecked(fields))
 }
 
-/// Build the add transform expression with optional stats parsing.
+/// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
@@ -580,13 +607,19 @@ fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaR
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
+/// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
+///   value parsing is not needed.
+/// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed column.
 ///
-/// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
+/// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
+/// and `partitionValues_parsed` only when `partition_schema` is Some.
 /// Stats are output using physical column names.
 fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
+    partition_schema: Option<SchemaRef>,
+    has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
@@ -620,6 +653,18 @@ fn get_add_transform_expr(
         fields.push(Arc::new(stats_parsed_expr));
     }
 
+    // Add partitionValues_parsed when partition columns are needed for data skipping
+    if partition_schema.is_some() {
+        let pv_parsed_expr = if has_partition_values_parsed {
+            // Checkpoint has partitionValues_parsed column - read directly
+            column_expr!("add.partitionValues_parsed")
+        } else {
+            // No partitionValues_parsed available (JSON log files) - parse from string map
+            Expression::map_to_struct(column_expr!("add.partitionValues"))
+        };
+        fields.push(Arc::new(pv_parsed_expr));
+    }
+
     Arc::new(Expression::struct_from(fields))
 }
 
@@ -627,7 +672,6 @@ fn get_add_transform_expr(
 // deletion vector update transformations.
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
-    use crate::expressions::column_expr_ref;
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
         Arc::new(Expression::struct_from([Arc::new(
             Expression::struct_from([
@@ -680,8 +724,13 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             ))
         );
 
-        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
-        // This avoids double JSON parsing - the transform already parsed the stats.
+        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
+        // This avoids double JSON parsing -- the transform already parsed the stats.
+        // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
+        // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
+        // with ISNULL guards that keep rows with missing stats. For partition values, the
+        // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
+        // rows always pass the partition filter regardless of null partition values.
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
@@ -703,16 +752,19 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             deduplicator,
             selection_vector,
             self.state_info.clone(),
-            self.partition_filter.clone(),
+            &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics
+            .update_peak_hash_set_size(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 }
 
@@ -730,10 +782,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             is_log_batch,
         } = actions_batch;
 
-        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed)
+        // Step 1: Apply transform FIRST (outputs stats_parsed and partitionValues_parsed).
         // Use the correct transform based on batch type:
-        // - Log batches: use ParseJson (no stats_parsed in JSON commit files)
-        // - Checkpoint batches: use coalesce(stats_parsed, ParseJson) when available
+        // - Log batches: parse JSON for stats, MapToStruct for partition values
+        // - Checkpoint batches: read pre-parsed columns directly when available
         let transform = if is_log_batch {
             &self.log_transform
         } else {
@@ -750,8 +802,13 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             ))
         );
 
-        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly)
-        // This avoids double JSON parsing - the transform already parsed the stats.
+        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
+        // This avoids double JSON parsing -- the transform already parsed the stats.
+        // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
+        // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
+        // with ISNULL guards that keep rows with missing stats. For partition values, the
+        // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
+        // rows always pass the partition filter regardless of null partition values.
         let selection_vector = self.build_selection_vector(transformed.as_ref())?;
         debug_assert_eq!(selection_vector.len(), actions.len());
         require!(
@@ -776,16 +833,19 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             deduplicator,
             selection_vector,
             self.state_info.clone(),
-            self.partition_filter.clone(),
+            &self.metrics,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Step 4: Return transformed batch with updated selection vector
-        ScanMetadata::try_new(
+        let scan_metadata = ScanMetadata::try_new(
             transformed,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        )
+        )?;
+        self.metrics
+            .update_peak_hash_set_size(self.seen_file_keys.len());
+        Ok(scan_metadata)
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
@@ -800,7 +860,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Non-selected rows _must_ be ignored.
 ///
 /// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
-/// data skipping is disabled.
+/// columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
+/// row-level partition filtering still applies.
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
@@ -822,10 +883,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -840,7 +904,7 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
-        add_batch_with_remove, run_with_validate_callback,
+        add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
@@ -1466,5 +1530,105 @@ mod tests {
             found_add = true;
         }
         assert!(found_add);
+    }
+
+    /// Verify that Remove actions are not pruned by data skipping. The transform reads from
+    /// `add.*` columns, so Remove rows produce null `stats_parsed` and `partitionValues_parsed`
+    /// (Remove actions have their own `remove.partitionValues` and `remove.stats`, but those
+    /// are not read by the transform). If a Remove were pruned, it would not be recorded in
+    /// `seen_file_keys`, and a subsequent Add for the same path could incorrectly survive
+    /// deduplication.
+    ///
+    /// Stats-based skipping is safe because null stats evaluate to NULL via ISNULL guards in
+    /// the predicate construction. Partition-based skipping requires the `is_add` guard
+    /// (`OR(NOT is_add, pred)`) because `eval_sql_where` adds IS NOT NULL guards that would
+    /// otherwise turn null partition values into `false`, filtering the Remove.
+    #[rstest]
+    #[case::stats_only(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+        ])),
+        vec![],
+        Arc::new(Expression::column(["value"]).gt(Expression::literal(5i32))),
+        false, // use batch without partition column
+    )]
+    #[case::partition_predicate(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ])),
+        vec!["date".to_string()],
+        Arc::new(Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510)))),
+        true, // use batch with partition column
+    )]
+    #[case::mixed_stats_and_partition(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ])),
+        vec!["date".to_string()],
+        Arc::new(Predicate::and(
+            Expression::column(["value"]).gt(Expression::literal(5i32)),
+            Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510))),
+        )),
+        true, // use batch with partition column
+    )]
+    fn data_skipping_does_not_prune_remove_actions(
+        #[case] schema: SchemaRef,
+        #[case] partition_columns: Vec<String>,
+        #[case] predicate: Arc<Predicate>,
+        #[case] with_partition: bool,
+    ) {
+        let state_info = get_state_info(
+            schema,
+            partition_columns,
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+        )
+        .unwrap();
+
+        // Batch: [Remove c001, Add c001, Add c000, Metadata]
+        // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
+        let batch = if with_partition {
+            vec![add_batch_with_remove_and_partition(
+                get_commit_schema().clone(),
+            )]
+        } else {
+            vec![add_batch_with_remove(get_commit_schema().clone())]
+        };
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            false,
+        )
+        .unwrap();
+
+        let mut add_paths: Vec<String> = Vec::new();
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let paths = scan_metadata
+                .visit_scan_files(
+                    Vec::new(),
+                    |paths: &mut Vec<String>, scan_file: ScanFile| {
+                        paths.push(scan_file.path.to_string());
+                    },
+                )
+                .unwrap();
+            add_paths.extend(paths);
+        }
+
+        // Only c000 should survive: Remove suppressed c001 via deduplication
+        assert_eq!(add_paths.len(), 1, "Expected exactly one add to survive");
+        assert!(
+            add_paths[0].contains("c000"),
+            "Expected c000 add to survive, got: {}",
+            add_paths[0]
+        );
     }
 }
