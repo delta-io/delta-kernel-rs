@@ -560,13 +560,11 @@ fn test_create_clustered_table_nested_with_column_mapping(
     Ok(())
 }
 
-/// Verify that partition columns are stored as logical names even when column mapping is enabled.
 #[rstest::rstest]
-#[case::single_column(&["id"], "single partition column")]
-#[case::multiple_columns(&["id", "date"], "multiple partition columns")]
-fn test_create_partitioned_table_with_column_mapping(
+#[case::single_column(&["id"])]
+#[case::multiple_columns(&["id", "date"])]
+fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
     #[case] partition_cols: &[&str],
-    #[case] description: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = super::partition_test_schema()?;
@@ -582,7 +580,6 @@ fn test_create_partitioned_table_with_column_mapping(
 
     assert_column_mapping_config(&snapshot, ColumnMappingMode::Name);
 
-    // Read the commit log to verify partition columns use logical names (not physical)
     let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
     let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
     let actions: Vec<serde_json::Value> = log_contents
@@ -602,26 +599,16 @@ fn test_create_partitioned_table_with_column_mapping(
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
 
-    assert_eq!(
-        stored_partition_columns.len(),
-        partition_cols.len(),
-        "{description}: expected {} partition columns",
-        partition_cols.len()
-    );
+    assert_eq!(stored_partition_columns.len(), partition_cols.len());
 
-    // Partition columns in metadata must be logical names, not physical (col-*) names.
-    // The read path (build_partition_values_parsed_schema) looks up partition columns
-    // in logical_schema, so physical names would break the lookup.
     for (i, stored_name) in stored_partition_columns.iter().enumerate() {
         let logical_name = partition_cols[i];
         assert_eq!(
             stored_name, logical_name,
-            "{description}: partition column {i} should be logical name '{logical_name}', \
-             got '{stored_name}'"
+            "partition column {i} should be logical name '{logical_name}', got '{stored_name}'"
         );
     }
 
-    // Verify no clustering metadata is present
     let clustering = snapshot.get_clustering_columns_physical(engine.as_ref())?;
     assert!(
         clustering.is_none(),

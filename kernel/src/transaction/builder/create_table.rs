@@ -198,10 +198,7 @@ struct DataLayoutResult {
     system_domain_metadata: Vec<DomainMetadata>,
     /// Clustering columns for stats schema (physical names, `None` if not clustered).
     clustering_columns: Option<Vec<ColumnName>>,
-    /// Partition columns (logical names, `None` if not partitioned). Converted to
-    /// `Vec<String>` at the `Metadata::try_new` call site. Uses `Option` for symmetry
-    /// with `clustering_columns` and to distinguish "not partitioned" from "partitioned
-    /// with zero columns" (the latter is rejected by validation).
+    /// Partition columns (logical names, `None` if not partitioned).
     partition_columns: Option<Vec<ColumnName>>,
 }
 
@@ -605,6 +602,7 @@ impl CreateTableTransactionBuilder {
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
     /// - Validates the schema is non-empty
+    /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
     /// # Arguments
@@ -618,6 +616,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema is empty
+    /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
         self,
@@ -646,7 +645,8 @@ impl CreateTableTransactionBuilder {
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
-        // Handle data layout (validates, resolves to physical names, adds features)
+        // Validate data layout and resolve column names (physical for clustering, logical
+        // for partitioning). Adds required table features for clustering.
         let data_layout_result = apply_data_layout(
             &self.data_layout,
             &effective_schema,
@@ -669,6 +669,8 @@ impl CreateTableTransactionBuilder {
 
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
+        // Partition columns are validated to be top-level, so each ColumnName has
+        // exactly one path component. Extract it with remove(0).
         let partition_columns: Vec<String> = data_layout_result
             .partition_columns
             .map(|cols| cols.into_iter().map(|c| c.into_inner().remove(0)).collect())
