@@ -163,6 +163,7 @@ impl Snapshot {
         version: impl Into<Option<Version>>,
         operation_id: MetricId,
     ) -> DeltaResult<Arc<Self>> {
+        let start = Instant::now();
         let old_log_segment = &existing_snapshot.log_segment;
         let old_version = existing_snapshot.version();
         let new_version = version.into();
@@ -271,6 +272,20 @@ impl Snapshot {
             .listed
             .ascending_compaction_files
             .retain(|log_path| old_version < log_path.version);
+
+        // Emit LogSegmentLoaded now that we know the net-new commit and compaction counts
+        // (after the retain above removes overlap with the existing snapshot).
+        let reporter = engine.get_metrics_reporter();
+        reporter.inspect(|r| {
+            r.report(MetricEvent::LogSegmentLoaded {
+                operation_id,
+                duration: start.elapsed(),
+                num_commit_files: new_log_segment.listed.ascending_commit_files.len() as u64,
+                num_checkpoint_files: 0, // incremental path never has a new checkpoint here
+                num_compaction_files: new_log_segment.listed.ascending_compaction_files.len()
+                    as u64,
+            });
+        });
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
