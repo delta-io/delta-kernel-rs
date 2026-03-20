@@ -410,8 +410,9 @@ pub unsafe extern "C" fn visit_table_properties(
 ) {
     let snapshot = unsafe { snapshot.clone_as_arc() };
     snapshot
-        .table_properties()
-        .original_table_properties
+        .table_configuration()
+        .metadata()
+        .configuration()
         .iter()
         .for_each(|(key, value)| {
             visit(

@@ -25,14 +25,11 @@ where
 {
     fn from(unparsed: I) -> Self {
         let mut props = TableProperties::default();
-        let mut table_field_hashmap = HashMap::<String, String>::new();
         let unparsed = unparsed.into_iter().filter(|(k, v)| {
             // Only keep elements that fail to parse
-            table_field_hashmap.insert(k.as_ref().to_string(), v.as_ref().to_string());
             try_parse(&mut props, k.as_ref(), v.as_ref()).is_none()
         });
         props.unknown_properties = unparsed.map(|(k, v)| (k.into(), v.into())).collect();
-        props.original_table_properties = table_field_hashmap;
         props
     }
 }
