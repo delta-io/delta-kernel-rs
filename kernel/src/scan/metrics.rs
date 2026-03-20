@@ -62,10 +62,6 @@ impl ScanMetrics {
         self.num_non_file_actions.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn incr_predicate_filtered(&self) {
-        self.num_predicate_filtered.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn add_predicate_filtered(&self, value: u64) {
         self.num_predicate_filtered
             .fetch_add(value, Ordering::Relaxed);
