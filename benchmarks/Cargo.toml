@@ -17,6 +17,7 @@ arrow-56 = ["delta_kernel/arrow-56"]
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api"] }
 flate2 = "1"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = "0.55"
