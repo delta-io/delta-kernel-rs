@@ -4,8 +4,8 @@ use rstest::rstest;
 
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
-    StringBuilder, StringViewArray, StructArray,
+    Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+    StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -119,7 +119,10 @@ fn test_in_predicate_with_utf8view_list_column() {
 }
 
 #[test]
+#[cfg(not(feature = "arrow-56"))]
+// TODO: this test need arrow-57 to be run successfully. Please remove the cfg after "arrow-56" is deprecated.
 fn test_in_predicate_with_list_view_column() {
+    use crate::arrow::array::ListViewArray;
     // Three rows: [0,1,2], [3,4,5], [6,7,8]
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = ScalarBuffer::from(vec![0i32, 3, 6]);
