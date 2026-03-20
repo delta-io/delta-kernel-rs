@@ -192,6 +192,7 @@ pub struct EngineSchemaVisitor {
         metadata: &CStringMap,
     ),
 
+    #[cfg(feature = "nanosecond-timestamps")]
     /// Visit a nanosecond `timestamp` belonging to the list identified by `sibling_list_id`.
     pub visit_timestamp_nanos: extern "C" fn(
         data: *mut c_void,
@@ -337,6 +338,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            #[cfg(feature = "nanosecond-timestamps")]
             &DataType::TIMESTAMP_NANOS => call!(visit_timestamp_nanos),
         }
     }

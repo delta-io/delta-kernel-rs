@@ -21,11 +21,13 @@ use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::table_features::schema_contains_timestamp_nanos;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_nanos,
-    schema_contains_timestamp_ntz, ColumnMappingMode, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
+    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
@@ -275,6 +277,7 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     }
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
 /// Conditionally adds the `timestampNanos` feature to the protocol when the schema contains
 /// TimestampNanos columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
 fn maybe_enable_timestamp_nanos(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
@@ -588,6 +591,7 @@ impl CreateTableTransactionBuilder {
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
 
         // Auto-enable timestampNanos feature if schema contains TimestampNanos columns
+        #[cfg(feature = "nanosecond-timestamps")]
         maybe_enable_timestamp_nanos(&effective_schema, &mut validated);
 
         // Auto-enable inCommitTimestamp feature if property is set

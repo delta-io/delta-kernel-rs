@@ -174,6 +174,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    #[cfg(feature = "nanosecond-timestamps")]
                     PrimitiveType::TimestampNanos => Ok(ArrowDataType::Timestamp(
                         TimeUnit::Nanosecond,
                         Some("UTC".into()),
@@ -298,6 +299,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
                 Ok(DataType::TIMESTAMP)
             }
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            #[cfg(feature = "nanosecond-timestamps")]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
             {

@@ -138,7 +138,9 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.min_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
+            #[cfg(feature = "nanosecond-timestamps")]
             (TimestampNanos, Statistics::Int64(s)) => Scalar::TimestampNanos(*s.min_opt()?),
+            #[cfg(feature = "nanosecond-timestamps")]
             (TimestampNanos, _) => return None, // TODO: Int96 timestamps should be supportable here
             (Decimal(d), Statistics::Int32(i)) => {
                 DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
@@ -186,7 +188,9 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.max_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
+            #[cfg(feature = "nanosecond-timestamps")]
             (TimestampNanos, Statistics::Int64(s)) => Scalar::TimestampNanos(*s.max_opt()?),
+            #[cfg(feature = "nanosecond-timestamps")]
             (TimestampNanos, _) => return None, // TODO: Int96 timestamps should be supportable here
             (Decimal(d), Statistics::Int32(i)) => {
                 DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()

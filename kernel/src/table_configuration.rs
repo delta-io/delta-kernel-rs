@@ -21,12 +21,14 @@ use crate::scan::data_skipping::stats_schema::{
 };
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::table_features::validate_timestamp_nanos_feature_support;
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
-    validate_timestamp_nanos_feature_support, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation,
-    TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION,
-    MAX_VALID_WRITER_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
+    LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -142,6 +144,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        #[cfg(feature = "nanosecond-timestamps")]
         validate_timestamp_nanos_feature_support(&table_config)?;
         Ok(table_config)
     }
@@ -1222,6 +1225,7 @@ mod test {
         assert_eq!(new_table_config.table_root(), table_config.table_root());
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
     #[test]
     fn test_timestamp_nanos_validation_integration() {
         // Schema with TIMESTAMP_NANOS column

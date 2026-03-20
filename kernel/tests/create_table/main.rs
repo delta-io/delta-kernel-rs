@@ -4,6 +4,8 @@ mod clustering;
 mod column_mapping;
 mod ctas;
 mod ict;
+#[cfg(feature = "nanosecond-timestamps")]
+mod timestamp_nanos;
 mod timestamp_ntz;
 mod variant;
 

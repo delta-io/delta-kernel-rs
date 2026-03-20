@@ -346,6 +346,7 @@ pub extern "C" fn visit_expression_literal_timestamp(
     wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
 /// visit a timestamp literal expression 'value' (i64 representing nanoseconds since unix epoch)
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_timestamp_nanos(

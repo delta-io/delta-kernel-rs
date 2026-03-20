@@ -115,6 +115,10 @@ catalog-managed = []
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# Nanosecond timestamps table feature and primitive types, a preview of
+# corresponding RFC (https://github.com/delta-io/delta/issues/6081).
+nanosecond-timestamps = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
 default-engine-base = [

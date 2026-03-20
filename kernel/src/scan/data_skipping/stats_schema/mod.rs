@@ -408,10 +408,15 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::Date
             | &PrimitiveType::Timestamp
             | &PrimitiveType::TimestampNtz
-            | &PrimitiveType::TimestampNanos
             | &PrimitiveType::String
             | PrimitiveType::Decimal(_)
-    )
+    ) || {
+        #[cfg(feature = "nanosecond-timestamps")]
+        let is_nanos = matches!(data_type, &PrimitiveType::TimestampNanos);
+        #[cfg(not(feature = "nanosecond-timestamps"))]
+        let is_nanos = false;
+        is_nanos
+    }
 }
 
 #[cfg(test)]

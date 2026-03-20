@@ -241,6 +241,7 @@ pub enum Scalar {
     Timestamp(i64),
     /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
+    #[cfg(feature = "nanosecond-timestamps")]
     /// Nanosecond precision timestamp, adjusted to UTC.
     TimestampNanos(i64),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
@@ -272,6 +273,7 @@ impl Scalar {
             Self::Boolean(_) => DataType::BOOLEAN,
             Self::Timestamp(_) => DataType::TIMESTAMP,
             Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
+            #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanos(_) => DataType::TIMESTAMP_NANOS,
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
@@ -371,6 +373,7 @@ impl Display for Scalar {
             Self::Boolean(b) => write!(f, "{b}"),
             Self::Timestamp(ts) => write!(f, "{ts}"),
             Self::TimestampNtz(ts) => write!(f, "{ts}"),
+            #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanos(ts) => write!(f, "{ts}"),
             Self::Date(d) => write!(f, "{d}"),
             Self::Binary(b) => write!(f, "{b:?}"),
@@ -489,7 +492,9 @@ impl Scalar {
             (Timestamp(_), _) => None,
             (TimestampNtz(a), TimestampNtz(b)) => a.partial_cmp(b),
             (TimestampNtz(_), _) => None,
+            #[cfg(feature = "nanosecond-timestamps")]
             (TimestampNanos(a), TimestampNanos(b)) => a.partial_cmp(b),
+            #[cfg(feature = "nanosecond-timestamps")]
             (TimestampNanos(_), _) => None,
             (Date(a), Date(b)) => a.partial_cmp(b),
             (Date(_), _) => None,
@@ -761,6 +766,7 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            #[cfg(feature = "nanosecond-timestamps")]
             // TimestampNanos are parsed into nanoseconds since unix epoch. It
             // may have the format `{year}-{month}-{day}
             // {hour}:{minute}:{second}` or as a ISO 8601 formatted string such
@@ -1107,6 +1113,7 @@ mod tests {
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
     #[test]
     fn test_timestamp_nanos_parse() {
         let assert_timestamp_eq = |scalar_string, nanos| {
@@ -1139,8 +1146,11 @@ mod tests {
         let p_type = PrimitiveType::Timestamp;
         assert_timestamp_fails(&p_type, "1971-07-22");
 
-        let p_type = PrimitiveType::TimestampNanos;
-        assert_timestamp_fails(&p_type, "1971-07-22");
+        #[cfg(feature = "nanosecond-timestamps")]
+        {
+            let p_type = PrimitiveType::TimestampNanos;
+            assert_timestamp_fails(&p_type, "1971-07-22");
+        }
     }
 
     #[test]

@@ -571,6 +571,7 @@ fn visit_expression_scalar(
         Scalar::TimestampNtz(val) => {
             call!(visitor, visit_literal_timestamp_ntz, sibling_list_id, *val)
         }
+        #[cfg(feature = "nanosecond-timestamps")]
         Scalar::TimestampNanos(val) => {
             call!(
                 visitor,

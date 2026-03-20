@@ -24,6 +24,7 @@ pub(crate) fn validate_timestamp_nanos_feature_support(tc: &TableConfiguration) 
     Ok(())
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
 /// Checks if any column in the schema (including nested structs, arrays, maps) uses
 /// the TIMESTAMP_NANOS primitive type.
 pub(crate) fn schema_contains_timestamp_nanos(schema: &Schema) -> bool {
