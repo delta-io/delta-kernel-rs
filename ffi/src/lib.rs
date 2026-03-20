@@ -900,15 +900,15 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Visit each table property (key/value pair) for the specified snapshot by invoking the provided
+/// Visit each table properties (key/value pair) for the specified snapshot by invoking the provided
 /// `visit` callback once per entry.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid snapshot handle, and a non-null `visit` function
-/// pointer.
+/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an opaque pointer passed to each `visit` invocation,
+/// and a valid `visit` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_table_properties(
+pub unsafe extern "C" fn visit_table_configuration(
     engine_context: NullableCvoid,
     snapshot: Handle<SharedSnapshot>,
     visit: extern "C" fn(
@@ -1043,7 +1043,7 @@ mod tests {
     use std::collections::HashMap;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, TestAction, METADATA,
+        add_commit, TestAction, METADATA, METADATA_WITH_CONFIGURATION,
     };
 
     #[no_mangle]
@@ -1134,18 +1134,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_visit_table_properties() -> Result<(), Box<dyn std::error::Error>> {
-        const METADATA_WITH_PROPS: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
-{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
-{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
-
+    async fn test_visit_table_configuration() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
         add_commit(
             table_root,
             storage.as_ref(),
             0,
-            actions_to_string_with_metadata(vec![TestAction::Metadata], METADATA_WITH_PROPS),
+            actions_to_string_with_metadata(
+                vec![TestAction::Metadata],
+                METADATA_WITH_CONFIGURATION,
+            ),
         )
         .await?;
 
@@ -1173,7 +1172,7 @@ mod tests {
 
         let mut collected: HashMap<String, String> = HashMap::new();
         let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
-        unsafe { visit_table_properties(ctx, snap.shallow_copy(), collect_property) };
+        unsafe { visit_table_configuration(ctx, snap.shallow_copy(), collect_property) };
 
         assert_eq!(
             collected.get("delta.appendOnly").map(String::as_str),
