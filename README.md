@@ -85,12 +85,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-56`: Use arrow version 56
 - `arrow-57`: Use arrow version 57
+- `arrow-58`: Use arrow version 58
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-56`.
+  specify it directly with `arrow-N`, e.g. `arrow-57`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of

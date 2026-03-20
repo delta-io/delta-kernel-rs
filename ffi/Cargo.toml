@@ -50,9 +50,9 @@ default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
 catalog-managed = ["delta_kernel/catalog-managed"]
 uc-catalog = [ "dep:uc-catalog", "dep:uc-client" ]
-arrow = ["arrow-57"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58"]
 arrow-57 = ["delta_kernel/arrow-57"]
-arrow-56 = ["delta_kernel/arrow-56"]
 
 # This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of

@@ -21,7 +21,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{

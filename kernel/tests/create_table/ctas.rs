@@ -16,6 +16,8 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
+#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
