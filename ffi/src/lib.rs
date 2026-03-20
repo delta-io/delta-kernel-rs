@@ -1139,8 +1139,10 @@ mod tests {
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
 
+        let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
         add_commit(
+            table_root,
             storage.as_ref(),
             0,
             actions_to_string_with_metadata(vec![TestAction::Metadata], METADATA_WITH_PROPS),
@@ -1149,7 +1151,6 @@ mod tests {
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
         let snap =
             unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
