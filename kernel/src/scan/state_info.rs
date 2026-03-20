@@ -761,5 +761,88 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn stats_columns_with_column_mapping_uses_physical_names() {
+        let field_a: StructField = serde_json::from_value(serde_json::json!({
+            "name": "col_a",
+            "type": "long",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 1,
+                "delta.columnMapping.physicalName": "phys_a"
+            }
+        }))
+        .unwrap();
+
+        let field_b: StructField = serde_json::from_value(serde_json::json!({
+            "name": "col_b",
+            "type": "long",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 2,
+                "delta.columnMapping.physicalName": "phys_b"
+            }
+        }))
+        .unwrap();
+
+        let field_c: StructField = serde_json::from_value(serde_json::json!({
+            "name": "col_c",
+            "type": "long",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 3,
+                "delta.columnMapping.physicalName": "phys_c"
+            }
+        }))
+        .unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked(vec![field_a, field_b, field_c]));
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        // Request col_a via stats_columns (logical), and reference col_b via predicate (logical).
+        // Both must be translated to physical names in the output stats schema.
+        let predicate = Arc::new(column_expr!("col_b").gt(Expr::literal(5i64)));
+
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            props,
+            vec![],
+            StatsOutputMode::Columns(vec![column_name!("col_a")]),
+        )
+        .unwrap();
+
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("should have physical stats schema");
+
+        let present = ["phys_a", "phys_b"];
+        let absent = ["col_a", "col_b", "phys_c"];
+        for stats_field in ["minValues", "maxValues"] {
+            let DataType::Struct(inner) = stats_schema
+                .field(stats_field)
+                .unwrap_or_else(|| panic!("should have {stats_field}"))
+                .data_type()
+            else {
+                panic!("{stats_field} should be a struct");
+            };
+            for name in present {
+                assert!(
+                    inner.field(name).is_some(),
+                    "{stats_field} expected '{name}'"
+                );
+            }
+            for name in absent {
+                assert!(
+                    inner.field(name).is_none(),
+                    "{stats_field} unexpected '{name}'"
+                );
+            }
+        }
+    }
+
     use crate::StructField;
 }
