@@ -3232,7 +3232,11 @@ fn test_schema_has_compatible_stats_parsed_date_to_integer_rejected() {
 // Compound: checkpoint dropped Date annotation (Int32) + column widened to Timestamp.
 // Integer -> Timestamp is neither a widening nor reinterpretation rule.
 #[case::reinterpret_plus_widen_integer_to_timestamp(DataType::INTEGER, DataType::TIMESTAMP, false)]
-#[case::reinterpret_plus_widen_integer_to_timestamp_ntz(DataType::INTEGER, DataType::TIMESTAMP_NTZ, false)]
+#[case::reinterpret_plus_widen_integer_to_timestamp_ntz(
+    DataType::INTEGER,
+    DataType::TIMESTAMP_NTZ,
+    false
+)]
 // Date -> Timestamp is a valid Delta type widening rule, but kernel's can_widen_to does not
 // currently support it. This test documents the current behavior.
 #[case::date_widened_to_timestamp(DataType::DATE, DataType::TIMESTAMP, false)]
@@ -3246,8 +3250,7 @@ fn test_stats_parsed_widening_and_reinterpretation_interaction(
             "col",
             checkpoint_type,
         )]);
-    let stats_schema =
-        create_stats_schema(vec![StructField::nullable("col", stats_type)]);
+    let stats_schema = create_stats_schema(vec![StructField::nullable("col", stats_type)]);
 
     assert_eq!(
         LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
