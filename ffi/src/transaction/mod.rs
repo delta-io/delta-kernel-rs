@@ -278,12 +278,13 @@ mod tests {
         let res = writer.close().unwrap();
 
         let file_size_bytes = std::fs::metadata(&full_path)?.len();
-        create_file_metadata(
-            file_path,
-            file_size_bytes,
-            res.file_metadata().num_rows(),
-            metadata_schema,
-        )
+
+        #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
+        let num_rows = res.file_metadata().num_rows();
+        #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
+        let num_rows = res.num_rows;
+
+        create_file_metadata(file_path, file_size_bytes, num_rows, metadata_schema)
     }
 
     #[tokio::test]

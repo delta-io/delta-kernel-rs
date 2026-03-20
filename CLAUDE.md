@@ -34,6 +34,10 @@ cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
+# Workspace no-default-features lint for crates that depend on kernel's Arrow APIs
+cargo clippy --workspace --no-default-features --features arrow \
+  --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+
 # Quick pre-push check (mimics CI)
 cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
@@ -62,11 +66,12 @@ cargo fmt \
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
   but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
+- `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only
+- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
 
 ## Architecture at a Glance
 
@@ -194,6 +199,24 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 **Description:** follow the template in `.github/PULL_REQUEST_TEMPLATE.md`. Error on the
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
+
+### CI Jobs and Github Actions
+
+Ensure that when writing any github action you are considering safety including thinking of
+and mitigating common attack vectors such expression injection and pull request target attacks.
+
+Example:
+```yaml
+# The code below is vulnerable to expression injection
+run: |
+    echo "Comment: ${{ github.event.comment.body }}"
+
+# To mitigate instead use environment variables
+env:
+    COMMENT_BODY: ${{ github.event.comment.body }}
+run: |
+    echo "Comment: $COMMENT_BODY"
+```
 
 ## Deep Context
 

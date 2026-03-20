@@ -14,6 +14,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
+    PredicateRef,
 };
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -47,14 +48,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -970,6 +971,87 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     );
 }
 
+/// End-to-end test that mixed supported/unsupported predicates return the correct number of
+/// files. The `parsed-stats` table has 6 files with id ranges [1,100]..[501,600] and ts_col
+/// stats. Timestamp GT uses max stats (unsupported in checkpoint skipping); timestamp LT
+/// uses min stats (supported). File ts_col min values: 1M, 3M, 5M, 7M, 9M, 11M (microseconds).
+#[rstest]
+#[case::bare_ts_gt_returns_all(
+    // ts_col > ...: unsupported (uses max stats), no meta-predicate generated -> no pruning.
+    Arc::new(Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000)))),
+    6,
+)]
+#[case::bare_ts_lt_skips(
+    // ts_col < 3M: supported (uses min stats). Skips files with min_ts >= 3M.
+    Arc::new(Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000)))),
+    1,
+)]
+#[case::and_mixed_supported_unsupported(
+    // AND(id > 400, ts_col > ...): unsupported arm becomes NULL (unknown), id arm skips 4 files.
+    Arc::new(Pred::and(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    )),
+    2,
+)]
+#[case::or_mixed_supported_unsupported(
+    // OR(id > 400, ts_col > ...): unsupported arm becomes NULL (unknown) -> OR(..., NULL)
+    // is unknown -> no pruning.
+    Arc::new(Pred::or(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    )),
+    6,
+)]
+#[case::and_all_unsupported_returns_all(
+    // AND(ts_col > ..., ts_col > ...): both unsupported -> all NULL (unknown) -> no pruning.
+    Arc::new(Pred::and(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    )),
+    6,
+)]
+#[case::or_all_unsupported_returns_all(
+    // OR(ts_col > ..., ts_col > ...): both unsupported -> all NULL (unknown) -> no pruning.
+    Arc::new(Pred::or(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    )),
+    6,
+)]
+fn test_scan_with_unsupported_predicates(
+    #[case] predicate: PredicateRef,
+    #[case] expected_files: usize,
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, expected_files);
+}
+
 /// Helper to build a parquet file with the nested `add.stats_parsed.*` structure that
 /// checkpoint files have. Returns the parquet bytes and the arrow schema.
 ///
@@ -1460,4 +1542,81 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             "Should still have numRecords"
         );
     }
+}
+
+/// Test that mixed partition + data stats predicates correctly prune files in the checkpoint path.
+///
+/// `app-txn-checkpoint` has both `stats_parsed` and `partitionValues_parsed` in its checkpoint:
+///   - 2 files: modified=2021-02-01 (value in [4, 11])
+///   - 2 files: modified=2021-02-02 (value in [1, 3])
+///
+/// Verify that mixed predicates (partition + data columns) work correctly with unified
+/// partition+stats data skipping in the columnar path.
+#[test]
+fn test_mixed_predicate_checkpoint_file_selection() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let count_selected_files = |pred: Arc<Pred>| -> usize {
+        let scan = Snapshot::builder_for(url.clone())
+            .build(engine.as_ref())
+            .unwrap()
+            .scan_builder()
+            .with_predicate(pred)
+            .build()
+            .unwrap();
+        scan.scan_metadata(engine.as_ref())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .flat_map(|sm| sm.scan_files.selection_vector())
+            .filter(|&&s| s)
+            .count()
+    };
+
+    // AND(modified='2021-02-01', value>9): data skipping prunes 2021-02-02 files (max=3 NOT >9),
+    // row-level partition filter prunes non-matching partitions -> 2 files kept
+    assert_eq!(
+        count_selected_files(Arc::new(Pred::and(
+            column_expr!("modified").eq(Expr::literal("2021-02-01")),
+            column_expr!("value").gt(Expr::literal(9i32)),
+        ))),
+        2,
+        "AND pred: 2021-02-01 files should survive (both conditions pass)"
+    );
+
+    // AND(modified='2021-02-02', value>3): data skipping prunes 2021-02-02 files (max=3 NOT >3),
+    // row-level partition filter prunes 2021-02-01 files (partition mismatch) -> all pruned
+    assert_eq!(
+        count_selected_files(Arc::new(Pred::and(
+            column_expr!("modified").eq(Expr::literal("2021-02-02")),
+            column_expr!("value").gt(Expr::literal(3i32)),
+        ))),
+        0,
+        "AND pred: all files should be pruned"
+    );
+
+    // OR(modified='2021-02-02', value>9): 2021-02-01 files have max(value)=11 > 9 (kept),
+    // 2021-02-02 files match the partition predicate (kept) -> all 4 kept
+    assert_eq!(
+        count_selected_files(Arc::new(Pred::or(
+            column_expr!("modified").eq(Expr::literal("2021-02-02")),
+            column_expr!("value").gt(Expr::literal(9i32)),
+        ))),
+        4,
+        "OR pred: all files should be kept"
+    );
+
+    // OR(modified='2021-02-02', value>11): 2021-02-01 files have modified != '2021-02-02' AND
+    // max(value)=11 NOT > 11 -> both OR legs false -> pruned. 2021-02-02 files match the
+    // partition predicate -> kept. Unified partition+stats skipping prunes 2 of 4 files.
+    assert_eq!(
+        count_selected_files(Arc::new(Pred::or(
+            column_expr!("modified").eq(Expr::literal("2021-02-02")),
+            column_expr!("value").gt(Expr::literal(11i32)),
+        ))),
+        2,
+        "OR pred: 2021-02-01 files pruned (both OR legs false)"
+    );
 }

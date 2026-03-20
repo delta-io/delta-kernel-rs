@@ -115,7 +115,7 @@ pub struct LogInfo {
     /// Number of part files in the most recent multi-part checkpoint, if any.
     /// For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints this is the number of sidecar files
     /// For workloads that don't have multi-part checkpoints/sidecars, this is `None`
-    pub num_parallel_checkpoint_files: Option<u32>,
+    pub num_checkpoint_files: Option<u32>,
 }
 
 /// Physical data layout of a Delta table
@@ -156,6 +156,9 @@ pub enum Spec {
 pub struct ReadSpec {
     /// Version to read; if `None`, reads the latest version
     pub version: Option<u64>,
+    /// SQL WHERE clause expression (e.g. "id < 500"). Parsed into a kernel `Predicate`
+    /// and passed to the scan builder for data skipping.
+    pub predicate: Option<String>,
 }
 
 impl ReadSpec {
