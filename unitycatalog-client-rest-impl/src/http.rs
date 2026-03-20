@@ -47,7 +47,7 @@ where
                 );
             }
             Ok(response) => {
-                return Err(Error::ApiError {
+                return Err(Error::HttpStatusError {
                     status: response.status().as_u16(),
                     message: "Server error".to_string(),
                 })
@@ -86,12 +86,14 @@ where
             .unwrap_or_else(|_| "Unknown error".to_string());
 
         match status {
-            StatusCode::UNAUTHORIZED => Err(Error::AuthenticationFailed),
-            StatusCode::NOT_FOUND => Err(Error::ApiError {
+            StatusCode::UNAUTHORIZED => {
+                Err(unitycatalog_client_api::Error::AuthenticationFailed.into())
+            }
+            StatusCode::NOT_FOUND => Err(Error::HttpStatusError {
                 status: status.as_u16(),
                 message: format!("Resource not found: {error_body}"),
             }),
-            _ => Err(Error::ApiError {
+            _ => Err(Error::HttpStatusError {
                 status: status.as_u16(),
                 message: error_body,
             }),

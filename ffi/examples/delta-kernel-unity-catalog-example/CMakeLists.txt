@@ -24,5 +24,4 @@ endif()
 # Testing
 include(CTest)
 set(ExprTestRunner "../../../tests/test-delta-kernel-unity-catalog-ffi/run_test.sh")
-set(ExprExpectedPath "../../../tests/test-delta-kernel-unity-catalog-ffi/expected.txt")
-add_test(NAME test_delta_kernel_unity_catalog_ffi COMMAND ${ExprTestRunner} ${ExprExpectedPath})
+add_test(NAME test_delta_kernel_unity_catalog_ffi COMMAND ${ExprTestRunner})

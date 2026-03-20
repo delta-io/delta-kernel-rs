@@ -5,7 +5,7 @@ use url::Url;
 use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
 
 use crate::config::ClientConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
 use crate::models::credentials::CredentialsRequest;
 use crate::models::tables::TablesResponse;
@@ -46,7 +46,9 @@ impl UCClient {
             execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
 
         match response.status() {
-            StatusCode::NOT_FOUND => Err(Error::TableNotFound(table_name.to_string())),
+            StatusCode::NOT_FOUND => {
+                Err(unitycatalog_client_api::Error::TableNotFound(table_name.to_string()).into())
+            }
             _ => handle_response(response).await,
         }
     }
