@@ -6,7 +6,7 @@
 //! Use [`create_table()`](super::super::create_table::create_table) as the entry point rather
 //! than constructing the builder directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -198,8 +198,11 @@ struct DataLayoutResult {
     system_domain_metadata: Vec<DomainMetadata>,
     /// Clustering columns for stats schema (physical names, `None` if not clustered).
     clustering_columns: Option<Vec<ColumnName>>,
-    /// Partition column names for `Metadata` (physical names, empty if not partitioned).
-    partition_columns: Vec<String>,
+    /// Partition columns (logical names, `None` if not partitioned). Converted to
+    /// `Vec<String>` at the `Metadata::try_new` call site. Uses `Option` for symmetry
+    /// with `clustering_columns` and to distinguish "not partitioned" from "partitioned
+    /// with zero columns" (the latter is rejected by validation).
+    partition_columns: Option<Vec<ColumnName>>,
 }
 
 /// Validates partition columns against the table schema.
@@ -214,11 +217,21 @@ struct DataLayoutResult {
 /// 3. Not duplicated
 /// 4. Of a primitive type (Struct, Array, Map are rejected because partition values
 ///    must be representable as directory-path strings)
-fn validate_partition_columns(schema: &StructType, columns: &[ColumnName]) -> DeltaResult<()> {
-    use std::collections::HashSet;
+fn validate_partition_columns(
+    schema: &StructType,
+    partition_columns: &[ColumnName],
+) -> DeltaResult<()> {
+    if partition_columns.is_empty() {
+        return Err(Error::generic("Partitioning requires at least one column"));
+    }
+    if partition_columns.len() >= schema.fields().len() {
+        return Err(Error::generic(
+            "Table must have at least one non-partition column",
+        ));
+    }
 
     let mut seen = HashSet::new();
-    for col in columns {
+    for col in partition_columns {
         let path = col.path();
         if path.len() != 1 {
             return Err(Error::generic(format!(
@@ -256,7 +269,7 @@ fn validate_partition_columns(schema: &StructType, columns: &[ColumnName]) -> De
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
 /// - **Clustered**: Validates clustering columns, resolves to physical names, adds
 ///   `DomainMetadata` + `ClusteredTable` features, creates clustering domain metadata.
-/// - **Partitioned**: Validates partition columns, resolves to physical names. No domain
+/// - **Partitioned**: Validates partition columns and stores logical names. No domain
 ///   metadata or special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
     data_layout: &DataLayout,
@@ -293,33 +306,17 @@ fn apply_data_layout(
             Ok(DataLayoutResult {
                 system_domain_metadata: vec![dm],
                 clustering_columns: Some(physical_columns),
-                partition_columns: vec![],
+                partition_columns: None,
             })
         }
 
         DataLayout::Partitioned { columns } => {
             validate_partition_columns(effective_schema, columns)?;
 
-            // Safety: validate_partition_columns() enforces path.len() == 1 above
-            let physical_names: Vec<String> = columns
-                .iter()
-                .map(|c| {
-                    get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
-                        .map(|pn| {
-                            debug_assert_eq!(
-                                pn.path().len(),
-                                1,
-                                "partition columns must be top-level"
-                            );
-                            pn.path()[0].to_string()
-                        })
-                })
-                .try_collect()?;
-
             Ok(DataLayoutResult {
                 system_domain_metadata: vec![],
                 clustering_columns: None,
-                partition_columns: physical_names,
+                partition_columns: Some(columns.clone()),
             })
         }
     }
@@ -670,11 +667,15 @@ impl CreateTableTransactionBuilder {
 
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
+        let partition_columns: Vec<String> = data_layout_result
+            .partition_columns
+            .map(|cols| cols.into_iter().map(|c| c.into_inner().remove(0)).collect())
+            .unwrap_or_default();
         let metadata = Metadata::try_new(
             None, // name
             None, // description
             effective_schema.clone(),
-            data_layout_result.partition_columns,
+            partition_columns,
             current_time_ms()?,
             validated.properties,
         )?;
@@ -698,11 +699,12 @@ impl CreateTableTransactionBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::schema::{DataType, StructField, StructType};
-
-    use crate::utils::test_utils::assert_result_error_with_message;
     use std::sync::Arc;
+
+    use super::*;
+    use crate::expressions::ColumnName;
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked(vec![StructField::new(
@@ -1145,35 +1147,44 @@ mod tests {
         ]))
     }
 
+    struct DataLayoutExpectation {
+        layout: DataLayout,
+        has_domain_metadata: bool,
+        has_clustering_columns: bool,
+        expected_partition_columns: Option<Vec<ColumnName>>,
+        expected_writer_features: Vec<TableFeature>,
+    }
+
     #[rstest::rstest]
-    #[case::none(
-        DataLayout::default(),
-        false,  // expect_domain_metadata
-        false,  // expect_clustering_columns
-        &[],    // expected_partition_columns
-        &[],    // expected_writer_features
-    )]
-    #[case::clustered(
-        DataLayout::clustered(["id"]),
-        true,
-        true,
-        &[],
-        &[TableFeature::DomainMetadata, TableFeature::ClusteredTable],
-    )]
-    #[case::partitioned(
-        DataLayout::partitioned(["date"]),
-        false,
-        false,
-        &["date"],
-        &[],
-    )]
-    fn test_apply_data_layout(
-        #[case] layout: DataLayout,
-        #[case] expect_domain_metadata: bool,
-        #[case] expect_clustering_columns: bool,
-        #[case] expected_partition_columns: &[&str],
-        #[case] expected_writer_features: &[TableFeature],
-    ) {
+    #[case::none(DataLayoutExpectation {
+        layout: DataLayout::default(),
+        has_domain_metadata: false,
+        has_clustering_columns: false,
+        expected_partition_columns: None,
+        expected_writer_features: vec![],
+    })]
+    #[case::clustered(DataLayoutExpectation {
+        layout: DataLayout::clustered(["id"]),
+        has_domain_metadata: true,
+        has_clustering_columns: true,
+        expected_partition_columns: None,
+        expected_writer_features: vec![TableFeature::DomainMetadata, TableFeature::ClusteredTable],
+    })]
+    #[case::partitioned_single(DataLayoutExpectation {
+        layout: DataLayout::partitioned(["date"]),
+        has_domain_metadata: false,
+        has_clustering_columns: false,
+        expected_partition_columns: Some(vec![ColumnName::new(["date"])]),
+        expected_writer_features: vec![],
+    })]
+    #[case::partitioned_multiple(DataLayoutExpectation {
+        layout: DataLayout::partitioned(["id", "date"]),
+        has_domain_metadata: false,
+        has_clustering_columns: false,
+        expected_partition_columns: Some(vec![ColumnName::new(["id"]), ColumnName::new(["date"])]),
+        expected_writer_features: vec![],
+    })]
+    fn test_apply_data_layout(#[case] expectation: DataLayoutExpectation) {
         let schema = multi_column_schema();
         let mut validated = ValidatedTableProperties {
             properties: HashMap::new(),
@@ -1181,25 +1192,28 @@ mod tests {
             writer_features: vec![],
         };
 
-        let result =
-            apply_data_layout(&layout, &schema, ColumnMappingMode::None, &mut validated).unwrap();
+        let result = apply_data_layout(
+            &expectation.layout,
+            &schema,
+            ColumnMappingMode::None,
+            &mut validated,
+        )
+        .unwrap();
 
         assert_eq!(
             !result.system_domain_metadata.is_empty(),
-            expect_domain_metadata
+            expectation.has_domain_metadata
         );
         assert_eq!(
             result.clustering_columns.is_some(),
-            expect_clustering_columns
+            expectation.has_clustering_columns
+        );
+        assert_eq!(
+            result.partition_columns,
+            expectation.expected_partition_columns
         );
 
-        let expected_pcols: Vec<String> = expected_partition_columns
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(result.partition_columns, expected_pcols);
-
-        for feature in expected_writer_features {
+        for feature in &expectation.expected_writer_features {
             assert!(
                 validated.writer_features.contains(feature),
                 "Expected {feature:?} in writer_features"
@@ -1211,6 +1225,8 @@ mod tests {
     #[case::clustered_invalid_col(DataLayout::clustered(["nonexistent"]), "not found in schema")]
     #[case::partitioned_invalid_col(DataLayout::partitioned(["nonexistent"]), "not found in schema")]
     #[case::partitioned_duplicate(DataLayout::partitioned(["id", "id"]), "Duplicate partition column")]
+    #[case::partitioned_empty(DataLayout::Partitioned { columns: vec![] }, "at least one column")]
+    #[case::partitioned_all_columns(DataLayout::partitioned(["id", "name", "date"]), "at least one non-partition column")]
     fn test_apply_data_layout_validation_errors(
         #[case] layout: DataLayout,
         #[case] expected_error: &str,
@@ -1232,8 +1248,6 @@ mod tests {
 
     #[test]
     fn test_validate_partition_columns_nested_rejected() {
-        use crate::expressions::ColumnName;
-
         let address_struct =
             StructType::new_unchecked(vec![StructField::new("city", DataType::STRING, true)]);
         let schema = StructType::new_unchecked(vec![
@@ -1273,9 +1287,10 @@ mod tests {
         #[case] col_name: &str,
         #[case] data_type: DataType,
     ) {
-        use crate::expressions::ColumnName;
-
-        let schema = StructType::new_unchecked(vec![StructField::new(col_name, data_type, false)]);
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(col_name, data_type, false),
+        ]);
         let columns = vec![ColumnName::new([col_name])];
         let result = validate_partition_columns(&schema, &columns);
         assert!(result.is_err());
@@ -1293,9 +1308,10 @@ mod tests {
     #[case::boolean(DataType::BOOLEAN)]
     #[case::long(DataType::LONG)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
-        use crate::expressions::ColumnName;
-
-        let schema = StructType::new_unchecked(vec![StructField::new("col", data_type, false)]);
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("col", data_type, false),
+        ]);
         let columns = vec![ColumnName::new(["col"])];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }

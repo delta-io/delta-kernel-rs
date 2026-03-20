@@ -17,6 +17,7 @@ use delta_kernel::table_features::{
 };
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
@@ -26,6 +27,16 @@ use test_utils::{assert_result_error_with_message, test_table_setup};
 pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, false),
+        StructField::new("value", DataType::STRING, true),
+    ])?))
+}
+
+/// Helper to create a three-column schema for partition tests (id, date, value).
+/// Shared with sub-modules.
+pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("date", DataType::DATE, true),
         StructField::new("value", DataType::STRING, true),
     ])?))
 }
@@ -331,14 +342,7 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 
 #[test]
 fn test_create_table_partitioned_basic() -> DeltaResult<()> {
-    use delta_kernel::transaction::data_layout::DataLayout;
-
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("date", DataType::DATE, true),
-        StructField::new("value", DataType::STRING, true),
-    ])?);
-
+    let schema = partition_test_schema()?;
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema, "Test/1.0")
@@ -375,6 +379,35 @@ fn test_create_table_partitioned_basic() -> DeltaResult<()> {
         clustering.is_none(),
         "Partitioned table should not have clustering columns"
     );
+
+    Ok(())
+}
+
+/// Verify that a partitioned table created via the create_table API can accept a subsequent
+/// commit (blind append with no data files). This exercises the snapshot -> transaction path
+/// on a kernel-created partitioned table.
+#[test]
+fn test_create_partitioned_table_then_commit() -> DeltaResult<()> {
+    let schema = partition_test_schema()?;
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["date"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Load the snapshot and open a transaction to prove the write path accepts this table
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+
+    let _ = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("Test/1.0")
+        .commit(engine.as_ref())?;
+
+    // Verify the table advanced to version 1
+    let updated = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(updated.version(), 1);
 
     Ok(())
 }

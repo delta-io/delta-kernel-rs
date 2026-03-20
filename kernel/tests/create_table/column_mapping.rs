@@ -560,17 +560,16 @@ fn test_create_clustered_table_nested_with_column_mapping(
     Ok(())
 }
 
-/// Verify that partition columns are stored as physical names when column mapping is enabled.
+/// Verify that partition columns are stored as logical names even when column mapping is enabled.
 #[rstest::rstest]
 #[case::single_column(&["id"], "single partition column")]
-#[case::multiple_columns(&["id", "value"], "multiple partition columns")]
-#[test]
+#[case::multiple_columns(&["id", "date"], "multiple partition columns")]
 fn test_create_partitioned_table_with_column_mapping(
     #[case] partition_cols: &[&str],
     #[case] description: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = simple_schema()?;
+    let schema = super::partition_test_schema()?;
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "name")])
@@ -583,7 +582,7 @@ fn test_create_partitioned_table_with_column_mapping(
 
     assert_column_mapping_config(&snapshot, ColumnMappingMode::Name);
 
-    // Read the commit log to verify partition columns use physical names
+    // Read the commit log to verify partition columns use logical names (not physical)
     let log_file_path = format!("{table_path}/_delta_log/00000000000000000000.json");
     let log_contents = std::fs::read_to_string(&log_file_path).expect("Failed to read log file");
     let actions: Vec<serde_json::Value> = log_contents
@@ -610,12 +609,15 @@ fn test_create_partitioned_table_with_column_mapping(
         partition_cols.len()
     );
 
-    for (i, physical_name) in stored_partition_columns.iter().enumerate() {
+    // Partition columns in metadata must be logical names, not physical (col-*) names.
+    // The read path (build_partition_values_parsed_schema) looks up partition columns
+    // in logical_schema, so physical names would break the lookup.
+    for (i, stored_name) in stored_partition_columns.iter().enumerate() {
         let logical_name = partition_cols[i];
-        assert!(
-            physical_name.starts_with("col-"),
-            "{description}: partition column {i} should use physical name '{physical_name}', \
-             not logical name '{logical_name}'"
+        assert_eq!(
+            stored_name, logical_name,
+            "{description}: partition column {i} should be logical name '{logical_name}', \
+             got '{stored_name}'"
         );
     }
 
