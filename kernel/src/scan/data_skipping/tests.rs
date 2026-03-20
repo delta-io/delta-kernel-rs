@@ -809,6 +809,193 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
     );
 }
 
+// The is_add guard (OR(NOT is_add, pred)) ensures Remove rows are never pruned by
+// partition predicates, regardless of whether the partition value matches.
+#[rstest]
+#[case::non_matching_partition("Y", false, TRUE, "non-matching partition, Remove kept via guard")]
+#[case::matching_partition("X", false, TRUE, "matching partition, Remove kept via guard")]
+#[case::add_non_matching("Y", true, FALSE, "non-matching partition, Add correctly pruned")]
+#[case::add_matching("X", true, TRUE, "matching partition, Add correctly kept")]
+fn is_add_guard_keeps_remove_rows(
+    #[case] part_val: &str,
+    #[case] is_add: bool,
+    #[case] expected: Option<bool>,
+    #[case] _scenario: &str,
+) {
+    let partition_columns = test_partition_columns();
+    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("X"));
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from(part_val),
+        ),
+        (column_name!("is_add"), Scalar::from(is_add)),
+    ]));
+    assert_eq!(
+        resolver.eval(&skipping_pred),
+        expected,
+        "part_col='{part_val}' is_add={is_add}"
+    );
+}
+
+// Mixed AND with is_add=false and null stats: Remove rows have null data stats, so the data
+// arm evaluates to NULL. AND(true_from_guard, NULL) = NULL, which the DISTINCT filter treats
+// as "keep". This verifies Removes are not pruned even when the data arm cannot be satisfied.
+#[rstest]
+#[case::remove_null_stats("Y", false, "Remove: AND(guard=true, stats=NULL) = NULL -> kept")]
+#[case::add_null_stats_partition_match("X", true, "Add: AND(true, NULL) = NULL -> kept")]
+#[case::add_null_stats_partition_miss("Y", true, "Add: AND(false, NULL) = false -> pruned")]
+fn mixed_and_with_null_stats_and_is_add_guard(
+    #[case] part_val: &str,
+    #[case] is_add: bool,
+    #[case] _scenario: &str,
+) {
+    let partition_columns = test_partition_columns();
+    let pred = Pred::and(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from(part_val),
+        ),
+        (
+            column_name!("stats_parsed.maxValues.data_col"),
+            Scalar::Null(DataType::INTEGER),
+        ),
+        (column_name!("is_add"), Scalar::from(is_add)),
+    ]));
+    let result = resolver.eval(&skipping_pred);
+    if !is_add {
+        assert_ne!(result, FALSE, "Remove rows must never be pruned");
+    }
+}
+
+// Null partition values: IS NULL / IS NOT NULL predicates on partition columns must
+// correctly evaluate against null values in partitionValues_parsed.
+#[rstest]
+#[case::is_null_with_null_value(
+    Pred::is_null(column_expr!("part_col")),
+    Scalar::Null(DataType::STRING),
+    TRUE,
+    "null partition value matches IS NULL"
+)]
+#[case::is_null_with_non_null_value(
+    Pred::is_null(column_expr!("part_col")),
+    Scalar::from("X"),
+    FALSE,
+    "non-null partition value rejected by IS NULL"
+)]
+#[case::is_not_null_with_null_value(
+    Pred::is_not_null(column_expr!("part_col")),
+    Scalar::Null(DataType::STRING),
+    FALSE,
+    "null partition value rejected by IS NOT NULL"
+)]
+#[case::is_not_null_with_non_null_value(
+    Pred::is_not_null(column_expr!("part_col")),
+    Scalar::from("X"),
+    TRUE,
+    "non-null partition value matches IS NOT NULL"
+)]
+fn null_partition_value_evaluation(
+    #[case] pred: Pred,
+    #[case] part_val: Scalar,
+    #[case] expected: Option<bool>,
+    #[case] _scenario: &str,
+) {
+    let partition_columns = test_partition_columns();
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (column_name!("partitionValues_parsed.part_col"), part_val),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
+    assert_eq!(resolver.eval(&skipping_pred), expected);
+}
+
+// Multiple partition columns: predicates referencing two partition columns should both
+// rewrite to partitionValues_parsed and both get is_add guards.
+#[test]
+fn multiple_partition_columns_rewrite_and_evaluation() {
+    let partition_columns: HashSet<String> =
+        ["part_a", "part_b"].iter().map(|s| s.to_string()).collect();
+
+    let pred = Pred::and(
+        Pred::eq(column_expr!("part_a"), Scalar::from("X")),
+        Pred::eq(column_expr!("part_b"), Scalar::from("Y")),
+    );
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+    let pred_str = skipping_pred.to_string();
+    assert!(
+        pred_str.contains("partitionValues_parsed.part_a"),
+        "Should reference partitionValues_parsed.part_a, got {pred_str}"
+    );
+    assert!(
+        pred_str.contains("partitionValues_parsed.part_b"),
+        "Should reference partitionValues_parsed.part_b, got {pred_str}"
+    );
+    assert!(
+        !pred_str.contains("stats_parsed"),
+        "Should not reference stats_parsed for partition-only pred, got {pred_str}"
+    );
+
+    // Both match -> kept
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_a"),
+            Scalar::from("X"),
+        ),
+        (
+            column_name!("partitionValues_parsed.part_b"),
+            Scalar::from("Y"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
+    assert_eq!(resolver.eval(&skipping_pred), TRUE);
+
+    // First misses -> pruned
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_a"),
+            Scalar::from("Z"),
+        ),
+        (
+            column_name!("partitionValues_parsed.part_b"),
+            Scalar::from("Y"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
+    assert_eq!(resolver.eval(&skipping_pred), FALSE);
+
+    // Remove row: both miss but is_add=false -> kept via guard
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_a"),
+            Scalar::from("Z"),
+        ),
+        (
+            column_name!("partitionValues_parsed.part_b"),
+            Scalar::from("W"),
+        ),
+        (column_name!("is_add"), Scalar::from(false)),
+    ]));
+    assert_ne!(
+        resolver.eval(&skipping_pred),
+        FALSE,
+        "Remove must not be pruned"
+    );
+}
+
 // Without normalization, `AND([unknown])` would become `AND([NULL])` via
 // `collect_junction_preds`, which evaluates to `Some(false)` under `eval_sql_where` and
 // incorrectly prunes all row groups. The junction constructor normalizes `AND([unknown])`

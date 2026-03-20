@@ -1420,4 +1420,3 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         );
     }
 }
-

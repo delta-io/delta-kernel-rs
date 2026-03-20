@@ -93,17 +93,18 @@ fn data_stats_only_skipping(#[case] pred: Pred, #[case] expected: usize) {
 
 #[rstest]
 #[case::partition_match_data_match(
-    "2021-02-01", 3i32, 2,
+    "2021-02-01",
+    3i32,
+    2,
     "partition prunes 02-02; data keeps 02-01 (max=11 > 3)"
 )]
 #[case::partition_match_data_miss(
-    "2021-02-02", 3i32, 0,
+    "2021-02-02",
+    3i32,
+    0,
     "partition keeps 02-02 but max=3 NOT >3; partition prunes 02-01"
 )]
-#[case::partition_miss(
-    "2099-01-01", 0i32, 0,
-    "no files match partition"
-)]
+#[case::partition_miss("2099-01-01", 0i32, 0, "no files match partition")]
 fn mixed_and_skipping(
     #[case] partition_val: &str,
     #[case] data_threshold: i32,
@@ -120,20 +121,21 @@ fn mixed_and_skipping(
 // -- Mixed OR: a file survives if either leg matches --------------------------
 
 #[rstest]
-#[case::both_match(
-    "2021-02-02", 9i32, 4,
-    "02-02 matches partition; 02-01 has max=11 > 9"
-)]
+#[case::both_match("2021-02-02", 9i32, 4, "02-02 matches partition; 02-01 has max=11 > 9")]
 #[case::partition_saves_some(
-    "2021-02-02", 11i32, 2,
+    "2021-02-02",
+    11i32,
+    2,
     "02-02 matches partition; 02-01 max=11 NOT >11 -> pruned"
 )]
 #[case::data_saves_some(
-    "2099-01-01", Scalar::from(-1i32), 4,
+    "2099-01-01", -1i32, 4,
     "no partition match; all files have max >= 0 so value > -1 keeps all"
 )]
 #[case::both_miss(
-    "2099-01-01", 11i32, 0,
+    "2099-01-01",
+    11i32,
+    0,
     "no partition match; max=11 NOT >11 -> all pruned"
 )]
 fn mixed_or_skipping(
@@ -184,41 +186,41 @@ fn parsed_stats_skipping() {
 
 #[rstest]
 #[case::bare_ts_gt_returns_all(
-    Arc::new(Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000)))),
+    Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
     6
 )]
 #[case::bare_ts_lt_skips(
-    Arc::new(Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000)))),
+    Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000))),
     1
 )]
 #[case::and_mixed_supported_unsupported(
-    Arc::new(Pred::and(
+    Pred::and(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-    )),
+    ),
     2
 )]
 #[case::or_mixed_supported_unsupported(
-    Arc::new(Pred::or(
+    Pred::or(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-    )),
+    ),
     6
 )]
 #[case::and_all_unsupported(
-    Arc::new(Pred::and(
+    Pred::and(
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
-    )),
+    ),
     6
 )]
 #[case::or_all_unsupported(
-    Arc::new(Pred::or(
+    Pred::or(
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
-    )),
+    ),
     6
 )]
-fn unsupported_predicate_skipping(#[case] pred: PredicateRef, #[case] expected: usize) {
-    assert_eq!(count_selected(STATS_TABLE, pred), expected);
+fn unsupported_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    assert_eq!(count_selected(STATS_TABLE, Arc::new(pred)), expected);
 }
