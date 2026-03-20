@@ -684,32 +684,6 @@ mod list_log_files_with_log_tail_tests {
         }
     }
 
-    /// Helper to create a [`ParsedLogPath`] with an explicit size (for provenance checks).
-    fn make_parsed_log_path(
-        version: Version,
-        file_type: LogPathFileType,
-        size: u64,
-    ) -> ParsedLogPath {
-        let url = Url::parse(&format!("memory:///_delta_log/{version:020}.json")).unwrap();
-        let mut filename_path_segments = url.path_segments().unwrap();
-        let filename = filename_path_segments.next_back().unwrap().to_string();
-        let extension = filename.split('.').next_back().unwrap().to_string();
-
-        let location = FileMeta {
-            location: url,
-            last_modified: 0,
-            size,
-        };
-
-        ParsedLogPath {
-            location,
-            filename,
-            extension,
-            version,
-            file_type,
-        }
-    }
-
     /// Helper to call `LogSegmentFiles::build_log_segment_files()` and destructure the result.
     /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
     ///          latest_crc_file, latest_commit_file, max_published_version).
@@ -1608,10 +1582,10 @@ mod list_log_files_with_log_tail_tests {
 
     #[test]
     fn has_complete_checkpoint_single_part_returns_true() {
-        let files = vec![make_parsed_log_path(
+        let files = vec![make_parsed_log_path_with_source(
             5,
             LogPathFileType::SinglePartCheckpoint,
-            10,
+            CommitSource::Filesystem,
         )];
         assert!(has_complete_checkpoint_in(&files));
     }
@@ -1620,41 +1594,44 @@ mod list_log_files_with_log_tail_tests {
     fn has_complete_checkpoint_zero_size_filtered_returns_false() {
         // The size > 0 guard must reject zero-size checkpoints to avoid treating empty/corrupt
         // files as complete checkpoints.
-        let files = vec![make_parsed_log_path(
+        let mut p = make_parsed_log_path_with_source(
             5,
             LogPathFileType::SinglePartCheckpoint,
-            0,
-        )];
-        assert!(!has_complete_checkpoint_in(&files));
+            CommitSource::Filesystem,
+        );
+        // make_parsed_log_path_with_source always sets a non-zero size; override here to
+        // simulate a corrupt/empty checkpoint file and exercise the size > 0 guard.
+        p.location.size = 0;
+        assert!(!has_complete_checkpoint_in(&[p]));
     }
 
     #[test]
     fn has_complete_checkpoint_complete_multipart_returns_true() {
         // A complete 3-part checkpoint: all parts present in order, all non-zero size.
         let files = vec![
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 1,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 2,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 3,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
         ];
         assert!(has_complete_checkpoint_in(&files));
@@ -1664,21 +1641,21 @@ mod list_log_files_with_log_tail_tests {
     fn has_complete_checkpoint_incomplete_multipart_returns_false() {
         // A 3-part checkpoint with only parts 1 and 2 — must NOT be treated as complete.
         let files = vec![
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 1,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 2,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
         ];
         assert!(!has_complete_checkpoint_in(&files));
@@ -1689,15 +1666,19 @@ mod list_log_files_with_log_tail_tests {
         // An incomplete checkpoint at v5 (1 of 3 parts) followed by a complete checkpoint at v10.
         // has_complete_checkpoint_in must continue past the failed group and find the complete one.
         let files = vec![
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 5,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 1,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
-            make_parsed_log_path(10, LogPathFileType::SinglePartCheckpoint, 10),
+            make_parsed_log_path_with_source(
+                10,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
         ];
         assert!(has_complete_checkpoint_in(&files));
     }
@@ -1706,9 +1687,9 @@ mod list_log_files_with_log_tail_tests {
     fn has_complete_checkpoint_commits_only_returns_false() {
         // A slice of only commit files contains no checkpoints; must return false.
         let files = vec![
-            make_parsed_log_path(0, LogPathFileType::Commit, 10),
-            make_parsed_log_path(1, LogPathFileType::Commit, 10),
-            make_parsed_log_path(2, LogPathFileType::Commit, 10),
+            make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Filesystem),
+            make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Filesystem),
+            make_parsed_log_path_with_source(2, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
         assert!(!has_complete_checkpoint_in(&files));
     }
@@ -1719,30 +1700,34 @@ mod list_log_files_with_log_tail_tests {
         // only parts 1 and 3. group_checkpoint_parts requires sequential parts, so part 3 is not
         // appended after part 1 (2 != 1+1 is false, 3 != 1+1 is true so it's skipped), and the
         // checkpoint is incomplete.
+        let mut part2 = make_parsed_log_path_with_source(
+            10,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 2,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        );
+        // make_parsed_log_path_with_source always sets a non-zero size; override here to
+        // simulate a missing/corrupt part and exercise the size > 0 guard within a multipart group.
+        part2.location.size = 0;
         let files = vec![
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 1,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
-            make_parsed_log_path(
-                10,
-                LogPathFileType::MultiPartCheckpoint {
-                    part_num: 2,
-                    num_parts: 3,
-                },
-                0, // zero size -- filtered out
-            ),
-            make_parsed_log_path(
+            part2,
+            make_parsed_log_path_with_source(
                 10,
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 3,
                     num_parts: 3,
                 },
-                10,
+                CommitSource::Filesystem,
             ),
         ];
         assert!(!has_complete_checkpoint_in(&files));
@@ -1813,18 +1798,18 @@ mod list_log_files_with_log_tail_tests {
             make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Filesystem),
             make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Filesystem),
             make_parsed_log_path_with_source(2, LogPathFileType::Commit, CommitSource::Filesystem),
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 3,
                 LogPathFileType::SinglePartCheckpoint,
-                FILESYSTEM_SIZE_MARKER,
+                CommitSource::Filesystem,
             ),
             make_parsed_log_path_with_source(4, LogPathFileType::Commit, CommitSource::Filesystem),
             make_parsed_log_path_with_source(5, LogPathFileType::Commit, CommitSource::Filesystem),
             make_parsed_log_path_with_source(6, LogPathFileType::Commit, CommitSource::Filesystem),
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 7,
                 LogPathFileType::SinglePartCheckpoint,
-                FILESYSTEM_SIZE_MARKER,
+                CommitSource::Filesystem,
             ),
             make_parsed_log_path_with_source(8, LogPathFileType::Commit, CommitSource::Filesystem),
         ]
@@ -1853,10 +1838,10 @@ mod list_log_files_with_log_tail_tests {
             make_parsed_log_path_with_source(3, LogPathFileType::Commit, CommitSource::Filesystem),
             make_parsed_log_path_with_source(4, LogPathFileType::Commit, CommitSource::Filesystem),
             make_parsed_log_path_with_source(5, LogPathFileType::Commit, CommitSource::Filesystem),
-            make_parsed_log_path(
+            make_parsed_log_path_with_source(
                 3,
                 LogPathFileType::SinglePartCheckpoint,
-                FILESYSTEM_SIZE_MARKER,
+                CommitSource::Filesystem,
             ),
         ]
         .into_iter()
