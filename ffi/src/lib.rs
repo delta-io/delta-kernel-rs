@@ -917,7 +917,7 @@ pub unsafe extern "C" fn visit_table_properties(
         value: KernelStringSlice,
     ),
 ) {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
+    let snapshot = unsafe { snapshot.as_ref() };
     snapshot
         .table_configuration()
         .metadata()

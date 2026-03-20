@@ -397,7 +397,6 @@ fn get_from_string_map_impl(
         .and_then(|v| allocate_fn(kernel_string_slice!(v))))
 }
 
-
 /// Visit all values in a CStringMap. The callback will be called once for each element of the map
 ///
 /// # Safety

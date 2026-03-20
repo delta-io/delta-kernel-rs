@@ -435,11 +435,10 @@ mod tests {
 
     #[test]
     fn allow_unknown_keys() {
-        let properties =
-            HashMap::from([("unknown_properties".to_string(), "two words".to_string())]);
+        let properties = [("unknown_properties".to_string(), "two words".to_string())];
         let actual = TableProperties::from(properties.clone().into_iter());
         let expected = TableProperties {
-            unknown_properties: properties,
+            unknown_properties: HashMap::from(properties),
             ..Default::default()
         };
         assert_eq!(actual, expected);
