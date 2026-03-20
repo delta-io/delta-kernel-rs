@@ -8,7 +8,7 @@ use unitycatalog_client_rest_impl::{
 };
 
 #[derive(Parser)]
-#[command(name = "uc-client")]
+#[command(name = "unitycatalog-client-rest-impl")]
 #[command(about = "Unity Catalog CLI client", long_about = None)]
 struct Cli {
     /// Unity Catalog URL

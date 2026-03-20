@@ -31,5 +31,5 @@ $ mkdir build
 $ cd build
 $ cmake ..
 $ make
-$ ./uc_catalog_example [path/to/table]
+$ ./delta_kernel_unity_catalog_example [path/to/table]
 ```

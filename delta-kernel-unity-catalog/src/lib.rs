@@ -214,7 +214,7 @@ mod tests {
         // or time travel
         // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
 
-        println!("🎉 loaded snapshot: {snapshot:?}");
+        println!("loaded snapshot: {snapshot:?}");
 
         Ok(())
     }
@@ -271,7 +271,7 @@ mod tests {
 
         match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(t) => {
-                println!("🎉 committed version {}", t.commit_version());
+                println!("committed version {}", t.commit_version());
                 // TODO: should use post-commit snapshot here (plumb through log tail)
                 let _snapshot = catalog
                     .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
@@ -279,7 +279,7 @@ mod tests {
                 // then do publish
             }
             CommitResult::ConflictedTransaction(t) => {
-                println!("💥 commit conflicted at version {}", t.conflict_version());
+                println!("commit conflicted at version {}", t.conflict_version());
             }
             CommitResult::RetryableTransaction(_) => {
                 println!("we should retry...");
