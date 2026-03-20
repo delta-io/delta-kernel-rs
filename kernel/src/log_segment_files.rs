@@ -1,11 +1,15 @@
 //! [`LogSegmentFiles`] is a struct holding the result of listing the delta log. Currently, it
-//! exposes three APIs for listing:
+//! exposes four APIs for listing:
 //! 1. [`list_commits`]: Lists all commit files between the provided start and end versions.
 //! 2. [`list`]: Lists all commit and checkpoint files between the provided start and end versions.
 //! 3. [`list_with_checkpoint_hint`]: Lists all commit and checkpoint files after the provided
 //!    checkpoint hint.
+//! 4. [`list_with_backward_checkpoint_scan`]: Scans backward from an end version in
+//!    1000-version windows until a complete checkpoint is found or the log is exhausted.
 //!
 //! After listing, one can leverage the [`LogSegmentFiles`] to construct a [`LogSegment`].
+//!
+//! [`list_with_backward_checkpoint_scan`]: Self::list_with_backward_checkpoint_scan
 //!
 //! [`list_commits`]: Self::list_commits
 //! [`list`]: Self::list
@@ -121,7 +125,240 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
     checkpoints
 }
 
+/// Returns `true` if `files` contains at least one complete checkpoint across any version.
+///
+/// Assumes `files` is in ascending version order, as produced by [`list_from_storage`].
+fn has_complete_checkpoint_in(files: &[ParsedLogPath]) -> bool {
+    files
+        .iter()
+        .filter(|f| f.is_checkpoint() && f.location.size > 0)
+        .chunk_by(|f| f.version)
+        .into_iter()
+        .any(|(_, parts)| {
+            let owned: Vec<ParsedLogPath> = parts.cloned().collect();
+            group_checkpoint_parts(owned)
+                .iter()
+                .any(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+        })
+}
+
+/// Accumulates and groups log files during listing. Each "group" consists of all files that
+/// share the same version number (e.g., commit, checkpoint parts, CRC files).
+///
+/// We need to group by version because:
+/// 1. A version may have multiple checkpoint parts that must be collected before we can
+///    determine if the checkpoint is complete
+/// 2. If a complete checkpoint exists, we can discard all commits before it
+///
+/// Groups are flushed (processed) when we encounter a file with a different version or
+/// reach EOF, at which point we check for complete checkpoints and update our state.
+#[derive(Default)]
+struct ListingAccumulator {
+    /// The result being built up
+    output: LogSegmentFiles,
+    /// Staging area for checkpoint parts at the current version group; always empty when iteration ends
+    pending_checkpoint_parts: Vec<ParsedLogPath>,
+    /// End-version bound used in process_file() to filter CompactedCommit files
+    end_version: Option<Version>,
+    /// The version of the current group being accumulated
+    group_version: Option<Version>,
+}
+
+impl ListingAccumulator {
+    fn process_file(&mut self, file: ParsedLogPath) {
+        use LogPathFileType::*;
+        match file.file_type {
+            Commit | StagedCommit => self.output.ascending_commit_files.push(file),
+            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                self.output.ascending_compaction_files.push(file);
+            }
+            CompactedCommit { .. } => (), // Failed the bounds check above
+            SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+                self.pending_checkpoint_parts.push(file)
+            }
+            Crc => {
+                self.output.latest_crc_file.replace(file);
+            }
+            Unknown => {
+                // It is possible that there are other files being stashed away into
+                // _delta_log/  This is not necessarily forbidden, but something we
+                // want to know about in a debugging scenario
+                debug!(
+                    "Found file {} with unknown file type {:?} at version {}",
+                    file.filename, file.file_type, file.version
+                );
+            }
+        }
+    }
+
+    /// Called before processing each new file. If `file_version` differs from the current
+    /// `group_version`, finalizes the current group by calling `flush_checkpoint_group`,
+    /// then advances `group_version` to the new version. On the first call (when
+    /// `group_version` is `None`), simply initializes it.
+    fn maybe_flush_and_advance(&mut self, file_version: Version) {
+        match self.group_version {
+            Some(gv) if file_version != gv => {
+                self.flush_checkpoint_group(gv);
+                self.group_version = Some(file_version);
+            }
+            None => {
+                self.group_version = Some(file_version);
+            }
+            _ => {} // same version, no flush needed
+        }
+    }
+
+    /// Groups and finds the first complete checkpoint for this version.
+    /// All checkpoints for the same version are equivalent, so we only take one.
+    ///
+    /// If this version has a complete checkpoint, we can drop the existing commit and
+    /// compaction files we collected so far -- except we must keep the latest commit.
+    fn flush_checkpoint_group(&mut self, version: Version) {
+        let pending_checkpoint_parts = std::mem::take(&mut self.pending_checkpoint_parts);
+        if let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
+            .into_iter()
+            // `num_parts` is guaranteed to be non-negative and within `usize` range
+            .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+        {
+            self.output.checkpoint_parts = complete_checkpoint;
+            // Keep the commit at the checkpoint version (if any) before clearing all older commits.
+            self.output.latest_commit_file = self
+                .output
+                .ascending_commit_files
+                .last()
+                .filter(|c| c.version == version)
+                .cloned();
+            // Log replay only uses commits/compactions after a complete checkpoint
+            self.output.ascending_commit_files.clear();
+            self.output.ascending_compaction_files.clear();
+            // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
+            if self
+                .output
+                .latest_crc_file
+                .as_ref()
+                .is_some_and(|crc| crc.version < version)
+            {
+                self.output.latest_crc_file = None;
+            }
+        }
+    }
+}
+
 impl LogSegmentFiles {
+    /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
+    /// listed from storage) and `log_tail` (catalog-provided commits)
+    ///
+    /// `start_version` controls how the log_tail is filtered:
+    /// - `Some(v)`: include log_tail entries at version >= v
+    /// - `None`: derive the lower bound from the most recent complete checkpoint found during
+    ///   the filesystem phase; entries at version > cp_version are included (checkpoint wins over
+    ///   commits AT the checkpoint version). Falls back to 0 if no checkpoint was found.
+    pub(crate) fn build_log_segment_files(
+        fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        // check log_tail is only commits
+        // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
+        debug_assert!(
+            log_tail.iter().all(|entry| entry.is_commit()),
+            "log_tail should only contain commits"
+        );
+
+        let log_tail_start_version = log_tail.first().map(|f| f.version);
+        let mut acc = ListingAccumulator {
+            end_version,
+            ..Default::default()
+        };
+
+        // Phase 1: Stream filesystem files lazily (no collect).
+        // We always list from the filesystem even when the log_tail covers the entire commit
+        // range, because non-commit files (CRC, checkpoints, compactions) only exist on the
+        // filesystem — the log_tail only provides commit files.
+        for file_result in fs_files {
+            let file = file_result?;
+
+            // Track max published commit version from ALL filesystem Commit files,
+            // including those that will be skipped because log_tail takes precedence.
+            if matches!(file.file_type, LogPathFileType::Commit) {
+                acc.output.max_published_version =
+                    acc.output.max_published_version.max(Some(file.version));
+            }
+
+            // Skip filesystem commits at versions covered by the log_tail (the log_tail
+            // is authoritative for commits). Non-commit files are always kept.
+            if file.is_commit()
+                && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
+            {
+                continue;
+            }
+
+            acc.maybe_flush_and_advance(file.version);
+            acc.process_file(file);
+        }
+
+        // Phase 2: resolve end version upper bound and resolve log_tail start version
+        let resolved_start = match start_version {
+            Some(v) => v,
+            None => {
+                // Flush the last pending group so that output.checkpoint_parts is populated
+                // before we inspect it. Without this flush, a checkpoint whose parts arrived
+                // last would remain in pending_checkpoint_parts and the derived start version
+                // would fall back to 0 instead of the checkpoint version.
+                if let Some(gv) = acc.group_version {
+                    acc.flush_checkpoint_group(gv);
+                }
+                // Use cp_version + 1: a checkpoint wins over a commit at the checkpoint
+                // version and must not be replayed on top of it. The checkpoint has already
+                // been flushed from pending_checkpoint_parts into output.checkpoint_parts, so
+                // there are no pending parts in Phase 3 that would naturally discard it.
+                acc.output
+                    .checkpoint_parts
+                    .first()
+                    .map(|p| p.version + 1)
+                    .unwrap_or(0)
+            }
+        };
+        let end = end_version.unwrap_or(Version::MAX);
+
+        // Phase 3: Process log_tail entries. We do this after Phase 1 because log_tail commits
+        // start at log_tail_start_version and are in ascending version order — they always extend
+        // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
+        // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
+        // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
+        // versions, so there's no duplication here.
+        let filtered_log_tail = log_tail
+            .into_iter()
+            .filter(|entry| entry.version >= resolved_start && entry.version <= end);
+        for file in filtered_log_tail {
+            // Track max published version for published commits from the log_tail
+            if matches!(file.file_type, LogPathFileType::Commit) {
+                acc.output.max_published_version =
+                    acc.output.max_published_version.max(Some(file.version));
+            }
+
+            acc.maybe_flush_and_advance(file.version);
+            acc.process_file(file);
+        }
+
+        // Flush the final group
+        if let Some(gv) = acc.group_version {
+            acc.flush_checkpoint_group(gv);
+        }
+
+        // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
+        // it contains only commits after the most recent checkpoint. The last element is the
+        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
+        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
+        // or remains None.
+        if let Some(commit_file) = acc.output.ascending_commit_files.last() {
+            acc.output.latest_commit_file = Some(commit_file.clone());
+        }
+
+        Ok(acc.output)
+    }
+
     pub(crate) fn ascending_commit_files(&self) -> &Vec<ParsedLogPath> {
         &self.ascending_commit_files
     }
@@ -191,197 +428,14 @@ impl LogSegmentFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // check log_tail is only commits
-        // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
-        debug_assert!(
-            log_tail.iter().all(|entry| entry.is_commit()),
-            "log_tail should only contain commits"
-        );
-
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let log_tail_start_version: Option<Version> = log_tail.first().map(|f| f.version);
-
-        // Helper that accumulates and groups log files during listing. Each "group" consists of all
-        // files that share the same version number (e.g., commit, checkpoint parts, CRC files).
-        //
-        // We need to group by version because:
-        // 1. A version may have multiple checkpoint parts that must be collected before we can
-        //    determine if the checkpoint is complete
-        // 2. If a complete checkpoint exists, we can discard all commits before it
-        //
-        // Groups are flushed (processed) when we encounter a file with a different version or
-        // reach EOF, at which point we check for complete checkpoints and update our state.
-        #[derive(Default)]
-        struct ListingAccumulator {
-            /// The result being built up
-            output: LogSegmentFiles,
-            /// Staging area for checkpoint parts at the current version group; always empty when iteration ends
-            new_checkpoint_parts: Vec<ParsedLogPath>,
-            /// End-version bound used in process_file() to filter CompactedCommit files
-            end_version: Option<Version>,
-        }
-
-        impl ListingAccumulator {
-            fn process_file(&mut self, file: ParsedLogPath) {
-                use LogPathFileType::*;
-                match file.file_type {
-                    Commit | StagedCommit => self.output.ascending_commit_files.push(file),
-                    CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
-                        self.output.ascending_compaction_files.push(file);
-                    }
-                    CompactedCommit { .. } => (), // Failed the bounds check above
-                    SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
-                        self.new_checkpoint_parts.push(file)
-                    }
-                    Crc => {
-                        self.output.latest_crc_file.replace(file);
-                    }
-                    Unknown => {
-                        // It is possible that there are other files being stashed away into
-                        // _delta_log/  This is not necessarily forbidden, but something we
-                        // want to know about in a debugging scenario
-                        debug!(
-                            "Found file {} with unknown file type {:?} at version {}",
-                            file.filename, file.file_type, file.version
-                        );
-                    }
-                }
-            }
-
-            /// Called before processing each new file. If `file_version` differs from the current
-            /// `group_version`, finalizes the current group by calling `flush_checkpoint_group`,
-            /// then advances `group_version` to the new version. On the first call (when
-            /// `group_version` is `None`), simply initializes it.
-            fn maybe_flush_and_advance(
-                &mut self,
-                file_version: Version,
-                group_version: &mut Option<Version>,
-            ) {
-                match *group_version {
-                    Some(gv) if file_version != gv => {
-                        self.flush_checkpoint_group(gv);
-                        *group_version = Some(file_version);
-                    }
-                    None => {
-                        *group_version = Some(file_version);
-                    }
-                    _ => {} // same version, no flush needed
-                }
-            }
-
-            // Group and find the first complete checkpoint for this version.
-            // All checkpoints for the same version are equivalent, so we only take one.
-            //
-            // If this version has a complete checkpoint, we can drop the existing commit and
-            // compaction files we collected so far -- except we must keep the latest commit.
-            fn flush_checkpoint_group(&mut self, version: Version) {
-                let new_checkpoint_parts = std::mem::take(&mut self.new_checkpoint_parts);
-                if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
-                    .into_iter()
-                    // `num_parts` is guaranteed to be non-negative and within `usize` range
-                    .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
-                {
-                    self.output.checkpoint_parts = complete_checkpoint;
-                    // Check if there's a commit file at the same version as this checkpoint. We pop
-                    // the last element from ascending_commit_files (which is sorted by version) and
-                    // set latest_commit_file to it only if it matches the checkpoint version. If it
-                    // doesn't match, we set latest_commit_file to None to discard any older commits
-                    // from before the checkpoint
-                    self.output.latest_commit_file = self
-                        .output
-                        .ascending_commit_files
-                        .pop()
-                        .filter(|commit| commit.version == version);
-                    // Log replay only uses commits/compactions after a complete checkpoint
-                    self.output.ascending_commit_files.clear();
-                    self.output.ascending_compaction_files.clear();
-                    // Drop CRC file if older than checkpoint (CRC must be >= checkpoint version)
-                    if self
-                        .output
-                        .latest_crc_file
-                        .as_ref()
-                        .is_some_and(|crc| crc.version < version)
-                    {
-                        self.output.latest_crc_file = None;
-                    }
-                }
-            }
-        }
-
-        let mut builder = ListingAccumulator {
-            end_version,
-            ..Default::default()
-        };
-        let mut group_version: Option<Version> = None;
-
-        // Phase 1: Stream filesystem files lazily (no collect).
-        // We always list from the filesystem even when the log_tail covers the entire commit
-        // range, because non-commit files (CRC, checkpoints, compactions) only exist on the
-        // filesystem — the log_tail only provides commit files.
         let fs_iter = list_from_storage(storage, log_root, start, end)?;
-        for file_result in fs_iter {
-            let file = file_result?;
-
-            // Track max published commit version from ALL filesystem Commit files,
-            // including those that will be skipped because log_tail takes precedence.
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                builder.output.max_published_version =
-                    builder.output.max_published_version.max(Some(file.version));
-            }
-
-            // Skip filesystem commits at versions covered by the log_tail (the log_tail
-            // is authoritative for commits). Non-commit files are always kept.
-            if file.is_commit()
-                && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
-            {
-                continue;
-            }
-
-            builder.maybe_flush_and_advance(file.version, &mut group_version);
-            builder.process_file(file);
-        }
-
-        // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
-        // start at log_tail_start_version and are in ascending version order — they always extend
-        // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
-        // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
-        // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
-        // versions, so there's no duplication here.
-        let filtered_log_tail = log_tail
-            .into_iter()
-            .filter(|entry| entry.version >= start && entry.version <= end);
-        for file in filtered_log_tail {
-            // Track max published version for published commits from the log_tail
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                builder.output.max_published_version =
-                    builder.output.max_published_version.max(Some(file.version));
-            }
-
-            builder.maybe_flush_and_advance(file.version, &mut group_version);
-            builder.process_file(file);
-        }
-
-        // Flush the final group
-        if let Some(gv) = group_version {
-            builder.flush_checkpoint_group(gv);
-        }
-
-        // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
-        // it contains only commits after the most recent checkpoint. The last element is the
-        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
-        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
-        // or remains None.
-        if let Some(commit_file) = builder.output.ascending_commit_files.last() {
-            builder.output.latest_commit_file = Some(commit_file.clone());
-        }
-
-        Ok(LogSegmentFiles { ..builder.output })
+        Self::build_log_segment_files(fs_iter, log_tail, Some(start), end_version)
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
     /// the returned [`ParsedLogPath`]s will have a version less than or equal to the `end_version`.
-    /// See [`list_log_files_with_version`] for details on the return type.
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
@@ -418,10 +472,52 @@ impl LogSegmentFiles {
         }
         Ok(listed_files)
     }
+
+    /// Lists log files by scanning backward from `end_version` in 1000-version windows until a
+    /// complete checkpoint is found or the log is exhausted. The resulting files are combined
+    /// with the `log_tail` (catalog-provided commits) to build a [`LogSegmentFiles`].
+    ///
+    /// This avoids a full forward listing when we have an upper-bound version but no checkpoint
+    /// hint: instead of listing from version 0, we walk backward from `end_version` in bounded
+    /// windows, stopping as soon as we find a complete checkpoint (or reach version 0).
+    pub(crate) fn list_with_backward_checkpoint_scan(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        end_version: Version,
+    ) -> DeltaResult<Self> {
+        // Scan backward in 1000-version windows, collecting ALL file types, until a complete
+        // checkpoint is found or the log is exhausted.
+        let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
+        let mut upper = end_version;
+
+        loop {
+            let lower = upper.saturating_sub(999);
+            let window_files = list_from_storage(storage, log_root, lower, upper)?
+                .collect::<DeltaResult<Vec<_>>>()?;
+
+            let checkpoint_found = has_complete_checkpoint_in(&window_files);
+            windows.push(window_files);
+
+            if checkpoint_found || lower == 0 {
+                break;
+            }
+            upper = lower - 1;
+        }
+
+        // Replay all windows in ascending version order.
+        windows.reverse();
+        let fs_iter = windows.into_iter().flatten().map(Ok);
+
+        // Pass None so the log_tail lower bound is derived from the checkpoint found during
+        // the fs phase.
+        Self::build_log_segment_files(fs_iter, log_tail, None, Some(end_version))
+    }
 }
 
 #[cfg(test)]
 mod list_log_files_with_log_tail_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
     use url::Url;
@@ -538,6 +634,56 @@ mod list_log_files_with_log_tail_tests {
         );
     }
 
+    /// A [`StorageHandler`] wrapper that counts the number of `list_from` calls.
+    /// Used to verify that `list_with_backward_checkpoint_scan` issues the expected
+    /// number of storage listing requests.
+    struct CountingStorageHandler {
+        inner: Box<dyn StorageHandler>,
+        list_from_count: AtomicU32,
+    }
+
+    impl CountingStorageHandler {
+        fn new(inner: Box<dyn StorageHandler>) -> Self {
+            Self {
+                inner,
+                list_from_count: AtomicU32::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.list_from_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl StorageHandler for CountingStorageHandler {
+        fn list_from(
+            &self,
+            path: &Url,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+            self.list_from_count.fetch_add(1, Ordering::Relaxed);
+            self.inner.list_from(path)
+        }
+
+        fn read_files(
+            &self,
+            _files: Vec<crate::FileSlice>,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+            panic!("read_files should not be called during listing");
+        }
+
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+            panic!("put should not be called during listing");
+        }
+
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+            panic!("copy_atomic should not be called during listing");
+        }
+
+        fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+            panic!("head should not be called during listing");
+        }
+    }
+
     /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
     /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
     ///          latest_crc_file, latest_commit_file, max_published_version).
@@ -567,6 +713,8 @@ mod list_log_files_with_log_tail_tests {
             r.max_published_version,
         )
     }
+
+    // ===== list() tests =====
 
     #[tokio::test]
     async fn test_empty_log_tail() {
@@ -843,7 +991,7 @@ mod list_log_files_with_log_tail_tests {
         // Log tail provides commits 6-10. The checkpoint and CRC are on the filesystem
         // at versions covered by the log_tail and must NOT be filtered out.
         //
-        // After processing through LogListingGroupBuilder, the checkpoint at version 7
+        // After processing through ListingAccumulator, the checkpoint at version 7
         // causes commits before it to be cleared, keeping only commits after the checkpoint.
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -893,5 +1041,528 @@ mod list_log_files_with_log_tail_tests {
 
         // max_published_version reflects all published commits seen (filesystem 0-5 + log_tail 6-10)
         assert_eq!(max_pub, Some(10));
+    }
+
+    // ===== list_with_backward_checkpoint_scan() tests =====
+
+    #[tokio::test]
+    async fn backward_scan_no_checkpoint_returns_all_commits_from_v0() {
+        // When no checkpoint exists, list_with_backward_checkpoint_scan scans all the way to v0
+        // and returns every commit. Spans >1000 versions to exercise multiple windows.
+        // Window 1: [6, 1005] -> v1004, v1005, no checkpoint, lower=6 != 0 -> continue
+        // Window 2: [0, 5] -> v0-v5, no checkpoint, lower=0 -> break
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+            (3, LogPathFileType::Commit, CommitSource::Filesystem),
+            (4, LogPathFileType::Commit, CommitSource::Filesystem),
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1004, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1005, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
+                .unwrap();
+
+        assert_eq!(counter.call_count(), 2);
+
+        assert!(result.checkpoint_parts.is_empty());
+
+        // All 8 commits returned in ascending order
+        assert_eq!(result.ascending_commit_files.len(), 8);
+        assert_eq!(result.ascending_commit_files[0].version, 0);
+        assert_eq!(result.ascending_commit_files[1].version, 1);
+        assert_eq!(result.ascending_commit_files[2].version, 2);
+        assert_eq!(result.ascending_commit_files[3].version, 3);
+        assert_eq!(result.ascending_commit_files[4].version, 4);
+        assert_eq!(result.ascending_commit_files[5].version, 5);
+        assert_eq!(result.ascending_commit_files[6].version, 1004);
+        assert_eq!(result.ascending_commit_files[7].version, 1005);
+
+        assert_eq!(result.latest_commit_file.unwrap().version, 1005);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_checkpoint_found_in_second_window() {
+        // end_version=3000, checkpoint at v1500, sparse commits on either side.
+        // Window 1 [2001, 3000]: no checkpoint -> continue.
+        // Window 2 [1001, 2000]: checkpoint at v1500 -> stop.
+        let log_files = vec![
+            (
+                1500,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+            (1501, LogPathFileType::Commit, CommitSource::Filesystem),
+            (3000, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 3000)
+                .unwrap();
+
+        assert_eq!(counter.call_count(), 2);
+
+        assert_eq!(result.checkpoint_parts.len(), 1);
+        assert_eq!(result.checkpoint_parts[0].version, 1500);
+
+        assert_eq!(result.ascending_commit_files.len(), 2);
+        assert_eq!(result.ascending_commit_files[0].version, 1501);
+        assert_eq!(result.ascending_commit_files[1].version, 3000);
+
+        assert_eq!(result.latest_commit_file.unwrap().version, 3000);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_incomplete_in_second_window_complete_in_third_three_calls() {
+        // end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
+        // part 1 present). has_complete_checkpoint_in must return false for window 2, causing
+        // the scan to continue to window 3, where a complete single-part checkpoint at v500 is
+        // found. Verifies that incomplete parts from window 2 are discarded and do not pollute
+        // the result's checkpoint_parts.
+        //
+        // Window 1 [2001, 3000]: v2500, v3000 — no checkpoint -> lower=2001 != 0 -> continue
+        // Window 2 [1001, 2000]: v1500 (1-of-2 parts) — incomplete -> lower=1001 != 0 -> continue
+        // Window 3 [1, 1000]:    v500 (complete), v501 — checkpoint found -> break
+        let log_files = vec![
+            (
+                500,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+            (501, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                1500,
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 1,
+                    num_parts: 2,
+                },
+                CommitSource::Filesystem,
+            ),
+            (2500, LogPathFileType::Commit, CommitSource::Filesystem),
+            (3000, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 3000)
+                .unwrap();
+
+        assert_eq!(counter.call_count(), 3);
+
+        // Only the complete checkpoint at v500; the incomplete v1500 part is discarded
+        assert_eq!(result.checkpoint_parts.len(), 1);
+        assert_eq!(result.checkpoint_parts[0].version, 500);
+
+        // Commits after the checkpoint: v501 (FS), v2500 (FS), v3000 (FS)
+        assert_eq!(result.ascending_commit_files.len(), 3);
+        assert_eq!(result.ascending_commit_files[0].version, 501);
+        assert_eq!(result.ascending_commit_files[1].version, 2500);
+        assert_eq!(result.ascending_commit_files[2].version, 3000);
+
+        assert_eq!(result.latest_commit_file.unwrap().version, 3000);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_with_multipart_checkpoint() {
+        // A complete 3-part checkpoint at v50 with commits v51/v52 after it.
+        // Single window [0, 52]: checkpoint found -> stop.
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                50,
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 1,
+                    num_parts: 3,
+                },
+                CommitSource::Filesystem,
+            ),
+            (
+                50,
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 2,
+                    num_parts: 3,
+                },
+                CommitSource::Filesystem,
+            ),
+            (
+                50,
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 3,
+                    num_parts: 3,
+                },
+                CommitSource::Filesystem,
+            ),
+            (51, LogPathFileType::Commit, CommitSource::Filesystem),
+            (52, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 52)
+                .unwrap();
+
+        assert_eq!(counter.call_count(), 1);
+
+        assert_eq!(result.checkpoint_parts.len(), 3);
+        assert!(result.checkpoint_parts.iter().all(|p| p.version == 50));
+
+        assert_eq!(result.ascending_commit_files.len(), 2);
+        assert_eq!(result.ascending_commit_files[0].version, 51);
+        assert_eq!(result.ascending_commit_files[1].version, 52);
+
+        assert_eq!(result.latest_commit_file.unwrap().version, 52);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
+        // Backward scan with a non-empty log_tail spanning >1000 versions. The FS contains
+        // commits v0-v5, a checkpoint at v50, and commits v51-v52. The log_tail provides
+        // catalog commits v1100-v1102.
+        // Window 1: [103, 1102] -> no FS checkpoint in range -> continue
+        // Window 2: [0, 102] -> checkpoint at v50 found -> stop
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+            (3, LogPathFileType::Commit, CommitSource::Filesystem),
+            (4, LogPathFileType::Commit, CommitSource::Filesystem),
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                50,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+            (51, LogPathFileType::Commit, CommitSource::Filesystem),
+            (52, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(1100, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(1101, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(1102, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+            &counter, &log_root, log_tail, 1102,
+        )
+        .unwrap();
+
+        assert_eq!(counter.call_count(), 2);
+
+        // Checkpoint at v50
+        assert_eq!(result.checkpoint_parts.len(), 1);
+        assert_eq!(result.checkpoint_parts[0].version, 50);
+
+        // Commits: v51, v52 from FS; v1100, v1101, v1102 from catalog
+        assert_eq!(result.ascending_commit_files.len(), 5);
+        assert_eq!(result.ascending_commit_files[0].version, 51);
+        assert_eq!(result.ascending_commit_files[1].version, 52);
+        assert_eq!(result.ascending_commit_files[2].version, 1100);
+        assert_eq!(result.ascending_commit_files[3].version, 1101);
+        assert_eq!(result.ascending_commit_files[4].version, 1102);
+        assert_source(&result.ascending_commit_files[0], CommitSource::Filesystem);
+        assert_source(&result.ascending_commit_files[1], CommitSource::Filesystem);
+        assert_source(&result.ascending_commit_files[2], CommitSource::Catalog);
+        assert_source(&result.ascending_commit_files[3], CommitSource::Catalog);
+        assert_source(&result.ascending_commit_files[4], CommitSource::Catalog);
+
+        assert_eq!(result.latest_commit_file.unwrap().version, 1102);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_with_log_tail_starting_before_checkpoint() {
+        // log_tail starts at v30, before the checkpoint at v50. The derived lower bound must
+        // be cp_version + 1 = 51, so log_tail entries at v30, v40, v50 are excluded.
+        // Single window [0, 70]: checkpoint at v50 found -> stop.
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                50,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(30, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(40, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(50, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(60, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(70, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, log_tail, 70)
+                .unwrap();
+
+        assert_eq!(counter.call_count(), 1);
+
+        // Checkpoint at v50 found; lower bound = 51, so log_tail v30/v40/v50 are excluded
+        assert_eq!(result.checkpoint_parts.len(), 1);
+        assert_eq!(result.checkpoint_parts[0].version, 50);
+
+        assert_eq!(result.ascending_commit_files.len(), 2);
+        assert_eq!(result.ascending_commit_files[0].version, 60);
+        assert_eq!(result.ascending_commit_files[1].version, 70);
+        assert_source(&result.ascending_commit_files[0], CommitSource::Catalog);
+        assert_source(&result.ascending_commit_files[1], CommitSource::Catalog);
+
+        assert_eq!(result.latest_commit_file.unwrap().version, 70);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_no_checkpoint_with_log_tail_uses_lower_bound_zero() {
+        // When the backward scan exhausts all windows to v0 without finding a checkpoint,
+        // the derived lower bound falls back to 0, so all log_tail entries are included.
+        // FS has v0/v1/v2, log_tail has v1050/v1051/v1052. Spans >1000 versions.
+        // Window 1: [53, 1052] -> no checkpoint, lower=53 != 0 -> continue
+        // Window 2: [0, 52] -> no checkpoint, lower=0 -> break
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(1050, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(1051, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(1052, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+            &counter, &log_root, log_tail, 1052,
+        )
+        .unwrap();
+
+        assert_eq!(counter.call_count(), 2);
+
+        // No checkpoint found; lower bound = 0, so all FS commits (v0-v2) and all log_tail
+        // entries (v1050-v1052) are included
+        assert!(result.checkpoint_parts.is_empty());
+        assert_eq!(result.ascending_commit_files.len(), 6);
+        assert_eq!(result.ascending_commit_files[0].version, 0);
+        assert_eq!(result.ascending_commit_files[1].version, 1);
+        assert_eq!(result.ascending_commit_files[2].version, 2);
+        assert_eq!(result.ascending_commit_files[3].version, 1050);
+        assert_eq!(result.ascending_commit_files[4].version, 1051);
+        assert_eq!(result.ascending_commit_files[5].version, 1052);
+        assert_source(&result.ascending_commit_files[0], CommitSource::Filesystem);
+        assert_source(&result.ascending_commit_files[1], CommitSource::Filesystem);
+        assert_source(&result.ascending_commit_files[2], CommitSource::Filesystem);
+        assert_source(&result.ascending_commit_files[3], CommitSource::Catalog);
+        assert_source(&result.ascending_commit_files[4], CommitSource::Catalog);
+        assert_source(&result.ascending_commit_files[5], CommitSource::Catalog);
+        assert_eq!(result.latest_commit_file.unwrap().version, 1052);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_log_tail_defines_latest_version() {
+        // The backward scan only lists up to end_version=1001; FS v1002 is above that bound
+        // and never seen, so max_published_version=Some(1001) not Some(1002).
+        // Window 1: [2, 1001] -> v1001(FS commit listed, but skipped since >= log_tail_start);
+        //           no checkpoint -> continue
+        // Window 2: [0, 1] -> v0(FS commit); no checkpoint, lower=0 -> break
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1001, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1002, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let log_tail = vec![make_parsed_log_path_with_source(
+            1001,
+            LogPathFileType::Commit,
+            CommitSource::Catalog,
+        )];
+
+        let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+            &counter, &log_root, log_tail, 1001,
+        )
+        .unwrap();
+
+        assert_eq!(counter.call_count(), 2);
+
+        assert_eq!(result.ascending_commit_files.len(), 2);
+        assert_eq!(result.ascending_commit_files[0].version, 0);
+        assert_eq!(result.ascending_commit_files[1].version, 1001);
+        assert_source(&result.ascending_commit_files[0], CommitSource::Filesystem);
+        assert_source(&result.ascending_commit_files[1], CommitSource::Catalog);
+        assert_eq!(result.latest_commit_file.unwrap().version, 1001);
+        // v1002 is above end_version and never listed, so max_pub=Some(1001) not Some(1002)
+        assert_eq!(result.max_published_version, Some(1001));
+    }
+
+    #[tokio::test]
+    async fn backward_scan_non_commit_files_at_log_tail_versions_are_preserved() {
+        // FS has commits v0-v5, checkpoint v7, CRC v8; log_tail v6-v10.
+        // Checkpoint and CRC are preserved even though their versions are covered by log_tail.
+        // Single window [0, 10]: checkpoint at v7 found -> stop.
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+            (3, LogPathFileType::Commit, CommitSource::Filesystem),
+            (4, LogPathFileType::Commit, CommitSource::Filesystem),
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                7,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+            (8, LogPathFileType::Crc, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(6, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(7, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(8, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(9, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(10, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, log_tail, 10)
+                .unwrap();
+
+        assert_eq!(counter.call_count(), 1);
+
+        // Checkpoint at version 7 is preserved from filesystem
+        assert_eq!(result.checkpoint_parts.len(), 1);
+        assert_eq!(result.checkpoint_parts[0].version, 7);
+        assert!(result.checkpoint_parts[0].is_checkpoint());
+
+        // CRC at version 8 is preserved from filesystem
+        let crc = result.latest_crc_file.unwrap();
+        assert_eq!(crc.version, 8);
+        assert!(matches!(crc.file_type, LogPathFileType::Crc));
+
+        // After checkpoint at v7: resolved_start = 8 (checkpoint version + 1).
+        // Log_tail commits at v6-v7 are below resolved_start and filtered out;
+        // only log_tail commits v8-v10 remain (3 commits).
+        assert_eq!(result.ascending_commit_files.len(), 3);
+        for (i, commit) in result.ascending_commit_files.iter().enumerate() {
+            assert_eq!(commit.version, (i + 8) as u64);
+            assert_source(commit, CommitSource::Catalog);
+        }
+        assert_eq!(result.latest_commit_file.unwrap().version, 10);
+        // max_published_version reflects filesystem commits 0-5 + log_tail commits 6-10
+        assert_eq!(result.max_published_version, Some(10));
+    }
+
+    #[tokio::test]
+    async fn backward_scan_window_stops_at_zero_single_call() {
+        // end_version=500: lower = 500.saturating_sub(999) = 0, so the loop breaks immediately
+        // after the first window. Proves underflow safety via saturating_sub.
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (500, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 500)
+            .unwrap();
+
+        assert_eq!(counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_window_boundary_999_single_call() {
+        // end_version=999: lower = 999 - 999 = 0, so exactly one 1000-version window covers
+        // the entire log and the loop exits after one call.
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (999, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 999)
+            .unwrap();
+
+        assert_eq!(counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_window_boundary_1000_two_calls() {
+        // end_version=1000: first window lower = 1000 - 999 = 1 (not 0), so the loop
+        // continues. Second window: upper = 0, lower = 0.saturating_sub(999) = 0, breaks.
+        // This is the boundary where a second call becomes necessary.
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1000, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+        let counter = CountingStorageHandler::new(storage);
+
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1000)
+            .unwrap();
+
+        assert_eq!(counter.call_count(), 2);
+    }
+
+    // ===== has_complete_checkpoint_in direct unit tests (other cases for has_complete_checkpoint_in already covered by tests above) =====
+
+    #[test]
+    fn has_complete_checkpoint_empty_slice_returns_false() {
+        assert!(!has_complete_checkpoint_in(&[]));
+    }
+
+    #[test]
+    fn has_complete_checkpoint_zero_size_filtered_returns_false() {
+        // The size > 0 guard must reject zero-size checkpoints to avoid treating empty/corrupt
+        // files as complete checkpoints.
+        let mut p = make_parsed_log_path_with_source(
+            5,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        );
+        // make_parsed_log_path_with_source always sets a non-zero size; override here to
+        // simulate a corrupt/empty checkpoint file and exercise the size > 0 guard.
+        p.location.size = 0;
+        assert!(!has_complete_checkpoint_in(&[p]));
+    }
+
+    #[test]
+    fn has_complete_checkpoint_incomplete_at_one_version_complete_at_another_returns_true() {
+        // An incomplete checkpoint at v5 (1 of 3 parts) followed by a complete checkpoint at v10.
+        // has_complete_checkpoint_in must continue past the failed group and find the complete one.
+        let files = vec![
+            make_parsed_log_path_with_source(
+                5,
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 1,
+                    num_parts: 3,
+                },
+                CommitSource::Filesystem,
+            ),
+            make_parsed_log_path_with_source(
+                10,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+        ];
+        assert!(has_complete_checkpoint_in(&files));
     }
 }
