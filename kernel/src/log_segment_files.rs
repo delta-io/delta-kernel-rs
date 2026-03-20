@@ -308,7 +308,6 @@ impl LogSegmentFiles {
                 // would fall back to 0 instead of the checkpoint version.
                 if let Some(gv) = acc.group_version {
                     acc.flush_checkpoint_group(gv);
-                    acc.group_version = None;
                 }
                 // Use cp_version + 1: a checkpoint wins over a commit at the checkpoint
                 // version and must not be replayed on top of it. The checkpoint has already
