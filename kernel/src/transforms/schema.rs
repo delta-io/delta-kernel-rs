@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
-use crate::transforms::{map_owned_children_or_else, CowExt as _};
+use crate::transforms::{map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else};
 
 /// Generic framework for describing recursive bottom-up schema transforms. Transformations return
 /// `Option<Cow>` with the following semantics:
@@ -94,25 +94,28 @@ pub trait SchemaTransform<'a> {
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
-        use DataType::*;
-        let result = match data_type {
-            Primitive(ptype) => self
-                .transform_primitive(ptype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Array(atype) => self
-                .transform_array(atype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Struct(stype) => self
-                .transform_struct(stype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Map(mtype) => self
-                .transform_map(mtype)?
-                .map_owned_or_else(data_type, DataType::from),
-            Variant(stype) => self
-                .transform_variant(stype)?
-                .map_owned_or_else(data_type, |s| DataType::Variant(Box::new(s))),
-        };
-        Some(result)
+        match data_type {
+            DataType::Primitive(ptype) => {
+                let child = self.transform_primitive(ptype);
+                map_owned_or_else(data_type, child, DataType::from)
+            }
+            DataType::Array(atype) => {
+                let child = self.transform_array(atype);
+                map_owned_or_else(data_type, child, DataType::from)
+            }
+            DataType::Struct(stype) => {
+                let child = self.transform_struct(stype);
+                map_owned_or_else(data_type, child, DataType::from)
+            }
+            DataType::Map(mtype) => {
+                let child = self.transform_map(mtype);
+                map_owned_or_else(data_type, child, DataType::from)
+            }
+            DataType::Variant(stype) => {
+                let child = self.transform_variant(stype);
+                map_owned_or_else(data_type, child, |s| DataType::Variant(Box::new(s)))
+            }
+        }
     }
 
     /// Recursively transforms a struct field's data type (unary).
@@ -120,44 +123,42 @@ pub trait SchemaTransform<'a> {
         &mut self,
         field: &'a StructField,
     ) -> Option<Cow<'a, StructField>> {
-        let result = self.transform(&field.data_type)?;
-        let f = |new_data_type| StructField {
+        let child = self.transform(&field.data_type);
+        map_owned_or_else(field, child, |new_data_type| StructField {
             name: field.name.clone(),
             data_type: new_data_type,
             nullable: field.nullable,
             metadata: field.metadata.clone(),
-        };
-        Some(result.map_owned_or_else(field, f))
+        })
     }
 
     /// Recursively transforms a struct's fields (variadic).
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        let transformed_children = stype.fields().map(|f| self.transform_struct_field(f));
-        map_owned_children_or_else(stype, transformed_children, StructType::new_unchecked)
+        let children = stype.fields().map(|f| self.transform_struct_field(f));
+        map_owned_children_or_else(stype, children, StructType::new_unchecked)
     }
 
     /// Recursively transforms an array's element type (unary).
     fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        let result = self.transform_array_element(&atype.element_type)?;
-        let f = |element_type| ArrayType {
+        let child = self.transform_array_element(&atype.element_type);
+        map_owned_or_else(atype, child, |element_type| ArrayType {
             type_name: atype.type_name.clone(),
             element_type,
             contains_null: atype.contains_null,
-        };
-        Some(result.map_owned_or_else(atype, f))
+        })
     }
 
     /// Recursively transforms a map's key and value types (binary).
     fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        let key_type = self.transform_map_key(&mtype.key_type)?;
-        let value_type = self.transform_map_value(&mtype.value_type)?;
+        let key_type = self.transform_map_key(&mtype.key_type);
+        let value_type = self.transform_map_value(&mtype.value_type);
         let f = |(key_type, value_type)| MapType {
             type_name: mtype.type_name.clone(),
             key_type,
             value_type,
             value_contains_null: mtype.value_contains_null,
         };
-        Some((key_type, value_type).map_owned_or_else(mtype, f))
+        map_owned_pair_or_else(mtype, key_type, value_type, f)
     }
 }
 
