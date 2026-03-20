@@ -115,6 +115,12 @@ impl DataSkippingFilter {
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
+        static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "output",
+                DataType::BOOLEAN,
+            )]))
+        });
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -166,14 +172,9 @@ impl DataSkippingFilter {
 
         // The filter evaluator operates on the skipping evaluator's output, which is a single
         // boolean column named "output" (not the unified stats schema).
-        let filter_schema: SchemaRef =
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "output",
-                DataType::BOOLEAN,
-            )]));
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(filter_schema, FILTER_PRED.clone())
+            .new_predicate_evaluator(FILTER_SCHEMA.clone(), FILTER_PRED.clone())
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
