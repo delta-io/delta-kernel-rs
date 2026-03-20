@@ -1152,8 +1152,12 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
-        let snap =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
 
         extern "C" fn collect_property(
             engine_context: NullableCvoid,
