@@ -105,30 +105,39 @@ impl SnapshotBuilder {
         let start = Instant::now();
 
         let result = if let Some(table_root) = self.table_root {
-            let table_url = try_parse_uri(table_root)?;
-            let log_segment = LogSegment::for_snapshot(
-                engine.storage_handler().as_ref(),
-                table_url.join("_delta_log/")?,
-                log_tail,
-                self.version,
-                reporter.as_ref(),
-                Some(operation_id),
-            )?;
-            Snapshot::try_new_from_log_segment_impl(table_url, log_segment, engine, operation_id)
-                .map(Into::into)
-        } else {
-            let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
-                Error::internal_error(
-                    "SnapshotBuilder should have either table_root or existing_snapshot",
+            try_parse_uri(table_root).and_then(|table_url| {
+                let log_segment = LogSegment::for_snapshot(
+                    engine.storage_handler().as_ref(),
+                    table_url.join("_delta_log/")?,
+                    log_tail,
+                    self.version,
+                    reporter.as_ref(),
+                    Some(operation_id),
+                )?;
+                Snapshot::try_new_from_log_segment_impl(
+                    table_url,
+                    log_segment,
+                    engine,
+                    operation_id,
                 )
-            })?;
-            Snapshot::try_new_from_impl(
-                existing_snapshot,
-                log_tail,
-                engine,
-                self.version,
-                operation_id,
-            )
+                .map(Into::into)
+            })
+        } else {
+            self.existing_snapshot
+                .ok_or_else(|| {
+                    Error::internal_error(
+                        "SnapshotBuilder should have either table_root or existing_snapshot",
+                    )
+                })
+                .and_then(|existing_snapshot| {
+                    Snapshot::try_new_from_impl(
+                        existing_snapshot,
+                        log_tail,
+                        engine,
+                        self.version,
+                        operation_id,
+                    )
+                })
         };
 
         Self::report_snapshot_build_result(result, start, operation_id, reporter.as_ref())
@@ -456,6 +465,44 @@ mod tests {
         assert!(
             !duration.is_zero(),
             "SnapshotCompleted.total_duration should be non-zero"
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_update_to_earlier_version_emits_failed_metric() {
+        let (engine, store, table_root, reporter) = setup_test_with_reporter();
+        create_table(&store, table_root.clone()).await.unwrap();
+
+        // Build a snapshot at version 1
+        let base = SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .unwrap();
+        assert_eq!(base.version(), 1);
+
+        // Clear events from the initial build
+        reporter.events.lock().unwrap().clear();
+
+        // Attempt to update to version 0 (earlier than base version 1)
+        let result = SnapshotBuilder::new_from(base)
+            .at_version(0)
+            .build(engine.as_ref());
+        assert!(result.is_err());
+
+        let events = reporter.events.lock().unwrap();
+        let has_snapshot_failed = events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. }));
+        assert!(
+            has_snapshot_failed,
+            "expected a SnapshotFailed event when updating to an earlier version"
+        );
+
+        let has_snapshot_completed = events
+            .iter()
+            .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. }));
+        assert!(
+            !has_snapshot_completed,
+            "should not emit SnapshotCompleted on failure"
         );
     }
 
