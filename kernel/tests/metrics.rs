@@ -18,7 +18,6 @@
 //! - Incremental snapshot update (`Snapshot::builder_from` replays only new commits)
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
@@ -32,7 +31,6 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 
 use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
@@ -86,15 +84,13 @@ async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
         .commit(setup_engine.as_ref())?;
 
     let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    let result = insert_data(
+    let committed = insert_data(
         snap0,
         &setup_engine,
         vec![Arc::new(Int32Array::from(vec![1]))],
     )
-    .await?;
-    let CommitResult::CommittedTransaction(committed) = result else {
-        panic!("expected CommittedTransaction");
-    };
+    .await?
+    .unwrap_committed();
     committed
         .post_commit_snapshot()
         .expect("post-commit snapshot")
@@ -131,20 +127,20 @@ async fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
     let (engine, reporter) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table_url).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 2);
-    assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 0);
-    assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
+    assert_eq!(reporter.commit_files.get(), 2);
+    assert_eq!(reporter.checkpoint_files.get(), 0);
+    assert_eq!(reporter.compaction_files.get(), 0);
 
     // Both commit files read in a single JSON call
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 2);
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 2);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
 
     // Exactly one listing covering exactly the 2 commit files
-    assert_eq!(reporter.list_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.list_files_seen.load(Ordering::Relaxed), 2);
+    assert_eq!(reporter.list_calls.get(), 1);
+    assert_eq!(reporter.list_files_seen.get(), 2);
 
     Ok(())
 }
@@ -172,19 +168,19 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 1); // only tail commit (v2)
-    assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
+    assert_eq!(reporter.commit_files.get(), 1); // only tail commit (v2)
+    assert_eq!(reporter.checkpoint_files.get(), 1);
+    assert_eq!(reporter.compaction_files.get(), 0);
 
     // One JSON read for the tail commit; one Parquet read for the checkpoint
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.parquet_files_read.load(Ordering::Relaxed), 1);
-    assert!(reporter.json_bytes_read.load(Ordering::Relaxed) > 0);
-    assert!(reporter.parquet_bytes_read.load(Ordering::Relaxed) > 0);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 1);
+    assert_eq!(reporter.parquet_read_calls.get(), 1);
+    assert_eq!(reporter.parquet_files_read.get(), 1);
+    assert!(reporter.json_bytes_read.get() > 0);
+    assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
 }
@@ -203,17 +199,17 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 0);
-    assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
+    assert_eq!(reporter.commit_files.get(), 0);
+    assert_eq!(reporter.checkpoint_files.get(), 1);
+    assert_eq!(reporter.compaction_files.get(), 0);
 
     // JSON handler is called with zero files; Parquet reads the checkpoint
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 0);
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.parquet_files_read.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 1);
+    assert_eq!(reporter.parquet_files_read.get(), 1);
 
     Ok(())
 }
@@ -272,17 +268,17 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
     let (engine, reporter) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table_url).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
     // ascending_commit_files contains all 4 individual .json files (0, 1, 2, 3)
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 4);
-    assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 0);
-    assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.commit_files.get(), 4);
+    assert_eq!(reporter.checkpoint_files.get(), 0);
+    assert_eq!(reporter.compaction_files.get(), 1);
 
     // find_commit_cover selects [3.json, 0.2.compacted.json] -- 2 JSON files, one read call
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 2);
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 2);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
 
     Ok(())
 }
@@ -304,20 +300,20 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
     let (engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_root).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
+    assert_eq!(reporter.commit_files.get(), 1);
+    assert_eq!(reporter.checkpoint_files.get(), 0);
 
     // CRC at target version -- P+M loaded from CRC, no JSON or Parquet reads needed
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(reporter.json_read_calls.get(), 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 0);
     // Two storage reads: (1) _last_checkpoint hint attempt (file absent for this table),
     // (2) the CRC file itself. Both go through StorageHandler::read_files.
-    assert_eq!(reporter.storage_read_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(reporter.storage_read_calls.get(), 2);
     // Listing sees both the commit file and the CRC file
-    assert_eq!(reporter.list_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.list_files_seen.load(Ordering::Relaxed), 2);
+    assert_eq!(reporter.list_calls.get(), 1);
+    assert_eq!(reporter.list_files_seen.get(), 2);
 
     Ok(())
 }
@@ -341,13 +337,10 @@ async fn stale_crc_replays_tail_commits_and_loads_crc_as_fallback() -> DeltaResu
 
     // commit 0: create table; write CRC from the post-commit snapshot.
     // `write_checksum` requires an in-memory CRC computed during the transaction.
-    let CommitResult::CommittedTransaction(create_committed) =
-        create_table(&table_path, simple_schema(), "Test/1.0")
-            .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(setup_engine.as_ref())?
-    else {
-        panic!("expected CommittedTransaction");
-    };
+    let create_committed = create_table(&table_path, simple_schema(), "Test/1.0")
+        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(setup_engine.as_ref())?
+        .unwrap_committed();
     create_committed
         .post_commit_snapshot()
         .expect("post-commit snapshot")
@@ -369,15 +362,15 @@ async fn stale_crc_replays_tail_commits_and_loads_crc_as_fallback() -> DeltaResu
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 3); // v0, v1, v2
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
+    assert_eq!(reporter.commit_files.get(), 3); // v0, v1, v2
 
     // Tail replay: commits v1 and v2 (after the stale CRC at v0) are replayed via JSON
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 2);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 2);
     // CRC is loaded from storage as a fallback (P+M not found in the tail commits)
-    assert!(reporter.storage_read_calls.load(Ordering::Relaxed) >= 1);
+    assert!(reporter.storage_read_calls.get() >= 1);
 
     Ok(())
 }
@@ -407,17 +400,17 @@ async fn stale_checkpoint_with_multiple_tail_commits_emits_expected_metrics() ->
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
     // Checkpoint at v1 filters out v0 and v1; tail is v2, v3, v4
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 3);
-    assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.commit_files.get(), 3);
+    assert_eq!(reporter.checkpoint_files.get(), 1);
     // All 3 tail commits read in a single JSON call; checkpoint in a single Parquet call
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 3);
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 1);
-    assert!(reporter.json_bytes_read.load(Ordering::Relaxed) > 0);
-    assert!(reporter.parquet_bytes_read.load(Ordering::Relaxed) > 0);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 3);
+    assert_eq!(reporter.parquet_read_calls.get(), 1);
+    assert!(reporter.json_bytes_read.get() > 0);
+    assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
 }
@@ -452,18 +445,18 @@ async fn get_domain_metadata_incurs_additional_log_replay() -> DeltaResult<()> {
     let snap = Snapshot::builder_for(table_url).build(&engine)?;
 
     // Snapshot build reads both commit files in one JSON call
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.json_read_calls.get(), 1);
 
     // Reset so the domain metadata query cost is isolated
     reporter.reset();
     let _ = snap.get_domain_metadata("myapp.config", &engine)?;
 
     assert_eq!(
-        reporter.json_read_calls.load(Ordering::Relaxed),
+        reporter.json_read_calls.get(),
         1,
         "get_domain_metadata replays the log, incurring one additional JSON read call"
     );
-    assert!(reporter.json_files_read.load(Ordering::Relaxed) > 0);
+    assert!(reporter.json_files_read.get() > 0);
 
     Ok(())
 }
@@ -526,11 +519,11 @@ async fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
     assert!(batches_seen > 0, "scan should return rows");
 
     // scan calls read_parquet_files once per data file (not batched), so 2 calls for 2 files
-    assert_eq!(reporter.parquet_read_calls.load(Ordering::Relaxed), 2);
-    assert_eq!(reporter.parquet_files_read.load(Ordering::Relaxed), 2);
-    assert!(reporter.parquet_bytes_read.load(Ordering::Relaxed) > 0);
+    assert_eq!(reporter.parquet_read_calls.get(), 2);
+    assert_eq!(reporter.parquet_files_read.get(), 2);
+    assert!(reporter.parquet_bytes_read.get() > 0);
     // scan.execute() does its own log replay for Add/Remove scan metadata
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.json_read_calls.get(), 1);
 
     Ok(())
 }
@@ -577,15 +570,15 @@ async fn incremental_snapshot_update_replays_only_new_commits() -> DeltaResult<(
     let (engine, reporter) = measuring_engine(store);
     let _updated = Snapshot::builder_from(existing_snap).build(&engine)?;
 
-    assert_eq!(reporter.snapshot_completions.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.snapshot_completions.get(), 1);
     // LogSegmentLoaded is emitted with the net-new commit count (1 new commit: v2)
-    assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 1);
+    assert_eq!(reporter.log_segment_loads.get(), 1);
+    assert_eq!(reporter.commit_files.get(), 1);
 
     // JSON handler reads only commit v2, not the full 3-commit history
-    assert_eq!(reporter.json_read_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(reporter.json_files_read.load(Ordering::Relaxed), 1);
-    assert!(reporter.list_calls.load(Ordering::Relaxed) >= 1);
+    assert_eq!(reporter.json_read_calls.get(), 1);
+    assert_eq!(reporter.json_files_read.get(), 1);
+    assert!(reporter.list_calls.get() >= 1);
 
     Ok(())
 }
