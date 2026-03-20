@@ -87,6 +87,63 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
+/// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the
+/// iterator is either exhausted or dropped. Used by JSON and Parquet handlers to report
+/// the number of files and bytes requested per `read_*_files` call.
+pub(super) struct ReadMetricsIterator {
+    inner: crate::FileDataReadResultIterator,
+    reporter: Arc<dyn crate::metrics::MetricsReporter>,
+    num_files: u64,
+    bytes_read: u64,
+    emitted: bool,
+    make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+}
+
+impl ReadMetricsIterator {
+    pub(super) fn new(
+        inner: crate::FileDataReadResultIterator,
+        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+        num_files: u64,
+        bytes_read: u64,
+        make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+    ) -> Self {
+        Self {
+            inner,
+            reporter,
+            num_files,
+            bytes_read,
+            emitted: false,
+            make_event,
+        }
+    }
+
+    fn emit_once(&mut self) {
+        if !self.emitted {
+            self.emitted = true;
+            self.reporter
+                .report((self.make_event)(self.num_files, self.bytes_read));
+        }
+    }
+}
+
+impl Iterator for ReadMetricsIterator {
+    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next();
+        if item.is_none() {
+            self.emit_once();
+        }
+        item
+    }
+}
+
+impl Drop for ReadMetricsIterator {
+    fn drop(&mut self) {
+        self.emit_once();
+    }
+}
+
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
@@ -184,16 +241,16 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                None,
+                metrics_reporter.clone(),
             )),
-            json: Arc::new(DefaultJsonHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
+            json: Arc::new(
+                DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
+                    .with_reporter(metrics_reporter.clone()),
+            ),
+            parquet: Arc::new(
+                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
+                    .with_reporter(metrics_reporter.clone()),
+            ),
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -331,6 +388,22 @@ mod tests {
         fn report(&self, _event: MetricEvent) {}
     }
 
+    /// Minimal reporter that counts storage list events, used to verify the reporter is
+    /// actually wired through to the storage handler.
+    #[derive(Debug, Default)]
+    struct ListCountingReporter {
+        list_calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl MetricsReporter for ListCountingReporter {
+        fn report(&self, event: MetricEvent) {
+            if let MetricEvent::StorageListCompleted { .. } = event {
+                self.list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     #[test]
     fn test_default_engine() {
         let tmp = tempfile::tempdir().unwrap();
@@ -360,6 +433,29 @@ mod tests {
             .build();
         assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn storage_handler_emits_list_events_when_reporter_configured() {
+        // Regression test: ObjectStoreStorageHandler was constructed with None for the reporter,
+        // silently discarding events. Verify that storage list events actually flow through.
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let reporter = Arc::new(ListCountingReporter::default());
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_metrics_reporter(reporter.clone())
+            .build();
+
+        // test_arrow_engine writes files and calls list_from on the storage handler,
+        // which should emit StorageListCompleted events.
+        test_arrow_engine(&engine, &url);
+
+        assert!(
+            reporter.list_calls.load(Ordering::Relaxed) > 0,
+            "StorageListCompleted events should be emitted by the storage handler"
+        );
     }
 
     #[test]
