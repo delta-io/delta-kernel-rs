@@ -9,6 +9,8 @@ use delta_kernel_derive::internal_api;
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
+use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStore};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -18,8 +20,6 @@ use crate::parquet::arrow::async_writer::AsyncArrowWriter;
 use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -390,12 +390,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 let client = reqwest::Client::new();
                 let response =
                     client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {}", e))
+                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
                     })?;
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
+                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
@@ -424,7 +424,7 @@ async fn open_parquet_file(
     let path = Path::from_url_path(file_meta.location.path())?;
 
     let mut reader = {
-        use object_store::ObjectStoreScheme;
+        use crate::object_store::ObjectStoreScheme;
         // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
         // request which isn't supported by Azure. For now we just detect if the URL is
         // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -595,12 +595,12 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DEFAULT_BATCH_SIZE;
+    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
     use crate::EngineData;
 
     use itertools::Itertools;
-    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 
     use crate::utils::current_time_ms;
@@ -1310,7 +1310,7 @@ mod tests {
         match field_id {
             crate::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
             crate::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
-            other => panic!("Expected String or Number, got {:?}", other),
+            other => panic!("Expected String or Number, got {other:?}"),
         }
     }
 

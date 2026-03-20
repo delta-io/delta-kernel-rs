@@ -95,9 +95,8 @@ impl SchemaComparison for StructType {
     ///     2. For each field in this struct, you can read it as the `read_type`'s field. See
     ///        [`StructField::can_read_as`].
     ///     3. If a field in `read_type` is not present in this struct, then it must be nullable.
-    ///     4. Both [`StructTypes`] must be valid schemas. No two fields of a structs may share a
-    ///        name that only differs by case. TODO: This check should be moved into the constructor
-    ///        for [`StructType`].
+    ///     4. Both [`StructTypes`] must be valid schemas. No two fields of a struct may share a
+    ///        name that only differs by case.
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
         let lowercase_field_map: HashMap<String, &StructField> = self
             .fields

@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
-use object_store::local::LocalFileSystem;
 use uc_catalog::{UCCatalog, UCCommitter};
 use uc_client::commits_client::{InMemoryCommitsClient, TableData};
 use uc_client::models::commits::Commit;
@@ -60,7 +60,7 @@ async fn setup() -> Result<TestSetup, TestError> {
         },
     );
 
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let store = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));

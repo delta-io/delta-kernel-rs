@@ -189,6 +189,8 @@ mod tests {
 
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStore;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
 
@@ -204,8 +206,6 @@ mod tests {
     use test_utils::{set_json_value, setup_test_tables, test_read};
 
     use itertools::Itertools;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
     use serde_json::json;
     use serde_json::Deserializer;
 
@@ -278,12 +278,13 @@ mod tests {
         let res = writer.close().unwrap();
 
         let file_size_bytes = std::fs::metadata(&full_path)?.len();
-        create_file_metadata(
-            file_path,
-            file_size_bytes,
-            res.file_metadata().num_rows(),
-            metadata_schema,
-        )
+
+        #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
+        let num_rows = res.file_metadata().num_rows();
+        #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
+        let num_rows = res.num_rows;
+
+        create_file_metadata(file_path, file_size_bytes, num_rows, metadata_schema)
     }
 
     #[tokio::test]
@@ -611,7 +612,7 @@ mod tests {
 
             // Read the staged commit
             let staged_commit_url = table_url
-                .join(&format!("_delta_log/_staged_commits/{}", staged_file_name))
+                .join(&format!("_delta_log/_staged_commits/{staged_file_name}"))
                 .unwrap();
             let staged_commit = store
                 .get(&Path::from_url_path(staged_commit_url.path()).unwrap())

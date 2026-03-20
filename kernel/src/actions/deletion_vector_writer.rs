@@ -59,7 +59,7 @@ pub trait DeletionVector: Sized {
         let mut serialized = Vec::new();
         treemap
             .serialize_into(&mut serialized)
-            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {e}")))?;
         Ok(Bytes::from(serialized))
     }
 }
@@ -162,7 +162,7 @@ impl DeletionVector for KernelDeletionVector {
         let mut serialized = Vec::new();
         self.dv
             .serialize_into(&mut serialized)
-            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {e}")))?;
         Ok(Bytes::from(serialized))
     }
 
@@ -267,7 +267,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
             // Write header.
             self.writer
                 .write_all(&[1u8])
-                .map_err(|e| Error::generic(format!("Failed to write version byte: {}", e)))?;
+                .map_err(|e| Error::generic(format!("Failed to write version byte: {e}")))?;
             self.current_offset = 1;
         }
 
@@ -299,19 +299,19 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let size_bytes = (dv_size as u32).to_be_bytes();
         self.writer
             .write_all(&size_bytes)
-            .map_err(|e| Error::generic(format!("Failed to write size: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write size: {e}")))?;
 
         // Write magic number (little-endian)
         // This is the RoaringBitmapArray format magic
         let magic: u32 = 1681511377;
         self.writer
             .write_all(&magic.to_le_bytes())
-            .map_err(|e| Error::generic(format!("Failed to write magic: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write magic: {e}")))?;
 
         // Write the serialized treemap
         self.writer
             .write_all(&serialized)
-            .map_err(|e| Error::generic(format!("Failed to write deletion vector data: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write deletion vector data: {e}")))?;
 
         // Calculate and write CRC32 checksum (big-endian)
         // The CRC must include both the magic and the serialized data
@@ -322,7 +322,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let checksum = digest.finalize();
         self.writer
             .write_all(&checksum.to_be_bytes())
-            .map_err(|e| Error::generic(format!("Failed to write CRC32 checksum: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write CRC32 checksum: {e}")))?;
 
         // Update offset for next write (size_prefix + magic + data + crc)
         let bytes_written = 4 + dv_size + 4; // size + (magic + data) + crc
@@ -361,7 +361,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 
         self.writer
             .flush()
-            .map_err(|e| Error::generic(format!("Failed to flush writer: {}", e)))
+            .map_err(|e| Error::generic(format!("Failed to flush writer: {e}")))
     }
 }
 
@@ -781,9 +781,7 @@ mod tests {
             assert_eq!(
                 treemap,
                 expected_indexes.iter().collect::<RoaringTreemap>(),
-                "read {:?} != expected {:?}",
-                treemap,
-                expected_indexes
+                "read {treemap:?} != expected {expected_indexes:?}"
             );
         }
     }
