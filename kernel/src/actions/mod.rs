@@ -876,18 +876,6 @@ impl SetTransaction {
             last_updated,
         }
     }
-
-    /// Returns `true` if this transaction is expired according to the given expiration
-    /// timestamp. A transaction is expired when both an expiration timestamp and a
-    /// `last_updated` value are present and `last_updated <= expiration_timestamp`.
-    /// Transactions without `last_updated` never expire. A `None` expiration timestamp
-    /// (no retention duration configured) means nothing expires.
-    pub(crate) fn is_expired(&self, expiration_timestamp: Option<i64>) -> bool {
-        matches!(
-            expiration_timestamp.zip(self.last_updated),
-            Some((exp_ts, last_updated)) if last_updated <= exp_ts
-        )
-    }
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
@@ -1013,6 +1001,9 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
+    use super::set_transaction::is_set_txn_expired;
     use super::*;
     use crate::{
         arrow::{
@@ -1077,40 +1068,22 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn test_set_transaction_is_expired_no_expiration_configured() {
-        let txn = SetTransaction::new("app".into(), 1, Some(1000));
-        assert!(!txn.is_expired(None));
-    }
-
-    #[test]
-    fn test_set_transaction_is_expired_null_last_updated_never_expires() {
-        let txn = SetTransaction::new("app".into(), 1, None);
-        assert!(!txn.is_expired(Some(5000)));
-    }
-
-    #[test]
-    fn test_set_transaction_is_expired_both_none() {
-        let txn = SetTransaction::new("app".into(), 1, None);
-        assert!(!txn.is_expired(None));
-    }
-
-    #[test]
-    fn test_set_transaction_is_expired_last_updated_before_expiration() {
-        let txn = SetTransaction::new("app".into(), 1, Some(1000));
-        assert!(txn.is_expired(Some(2000)));
-    }
-
-    #[test]
-    fn test_set_transaction_is_expired_last_updated_at_expiration() {
-        let txn = SetTransaction::new("app".into(), 1, Some(1000));
-        assert!(txn.is_expired(Some(1000)));
-    }
-
-    #[test]
-    fn test_set_transaction_is_expired_last_updated_after_expiration() {
-        let txn = SetTransaction::new("app".into(), 1, Some(3000));
-        assert!(!txn.is_expired(Some(2000)));
+    #[rstest]
+    #[case::no_expiration_configured(Some(1000), None, false)]
+    #[case::null_last_updated_never_expires(None, Some(5000), false)]
+    #[case::both_none(None, None, false)]
+    #[case::last_updated_before_expiration(Some(1000), Some(2000), true)]
+    #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
+    #[case::last_updated_after_expiration(Some(3000), Some(2000), false)]
+    fn test_is_set_txn_expired(
+        #[case] last_updated: Option<i64>,
+        #[case] expiration_timestamp: Option<i64>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            is_set_txn_expired(expiration_timestamp, last_updated),
+            expected
+        );
     }
 
     #[test]

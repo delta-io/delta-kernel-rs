@@ -14,7 +14,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine};
 use rstest::rstest;
-use test_utils::{insert_data, test_table_setup};
+use test_utils::{add_commit, insert_data, test_table_setup};
 
 // ============================================================================
 // File stats from CRC on disk
@@ -947,8 +947,6 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 /// the CRC is written at v0).
 #[tokio::test]
 async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaResult<()> {
-    use test_utils::add_commit;
-
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let store = Arc::new(LocalFileSystem::new());
