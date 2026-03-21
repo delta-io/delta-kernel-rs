@@ -1175,19 +1175,30 @@ mod tests {
             .unwrap();
     }
 
-    // interesting cases for testing Snapshot::new_from:
-    // 1. new version < existing version
-    // 2. new version == existing version
-    // 3. new version > existing version AND
-    //   a. log segment hasn't changed
-    //   b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
-    //   b. log segment for old..=new version has no checkpoint
-    //     i. commits have (new protocol, new metadata)
-    //     ii. commits have (new protocol, no metadata)
-    //     iii. commits have (no protocol, new metadata)
-    //     iv. commits have (no protocol, no metadata)
+    // Incremental snapshot update (builder_from) produces the same result as a fresh
+    // load (builder_for) across all table configurations.
+    #[test]
+    fn test_incremental_snapshot_matches_fresh_load() -> DeltaResult<()> {
+        use test_utils::table_builder::TestTableBuilder;
+
+        for table in TestTableBuilder::all_tables(3).map_err(|e| Error::generic(e.to_string()))? {
+            let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+            let base = Snapshot::builder_for(table.table_root())
+                .at_version(0)
+                .build(&engine)?;
+            let incremental = Snapshot::builder_from(base).at_version(2).build(&engine)?;
+            let fresh = Snapshot::builder_for(table.table_root())
+                .at_version(2)
+                .build(&engine)?;
+            assert_eq!(incremental, fresh);
+        }
+        Ok(())
+    }
+
+    // Error cases and edge cases for incremental snapshot updates that require
+    // hand-crafted commits (protocol-only, metadata-only, etc.).
     #[tokio::test]
-    async fn test_snapshot_new_from() -> DeltaResult<()> {
+    async fn test_snapshot_new_from_edge_cases() -> DeltaResult<()> {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1197,7 +1208,8 @@ mod tests {
             .at_version(1)
             .build(&engine)
             .unwrap();
-        // 1. new version < existing version: error
+
+        // Version older than hint: error
         let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
             .at_version(0)
             .build(&engine);
@@ -1206,23 +1218,13 @@ mod tests {
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
-        // 2. new version == existing version
+        // Same version as hint: returns equal snapshot
         let snapshot = Snapshot::builder_from(old_snapshot.clone())
             .at_version(1)
             .build(&engine)
             .unwrap();
-        let expected = old_snapshot.clone();
-        assert_eq!(snapshot, expected);
+        assert_eq!(snapshot, old_snapshot.clone());
 
-        // tests Snapshot::new_from by:
-        // 1. creating a snapshot with new API for commits 0..=2 (based on old snapshot at 0)
-        // 2. comparing with a snapshot created directly at version 2
-        //
-        // the commits tested are:
-        // - commit 0 -> base snapshot at this version
-        // - commit 1 -> final snapshots at this version
-        //
-        // in each test we will modify versions 1 and 2 to test different scenarios
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let table_root = "memory:///";
             let engine = DefaultEngineBuilder::new(store).build();
@@ -1239,9 +1241,7 @@ mod tests {
             Ok(())
         }
 
-        // for (3) we will just engineer custom log files
         let store = Arc::new(InMemory::new());
-        // everything will have a starting 0 commit with commitInfo, protocol, metadata
         let commit0 = vec![
             json!({
                 "commitInfo": {
@@ -1273,8 +1273,8 @@ mod tests {
         ];
         let table_root = "memory:///";
         commit(table_root, store.as_ref(), 0, commit0.clone()).await;
-        // 3. new version > existing version
-        // a. no new log segment
+
+        // No new log segment: returns same snapshot
         let engine = DefaultEngineBuilder::new(Arc::new(store.fork())).build();
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
@@ -1284,13 +1284,14 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
         assert_eq!(snapshot, expected);
-        // version exceeds latest version of the table = err
+
+        // Version exceeds latest: error
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
         ));
 
-        // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
+        // Checkpoint with new protocol/metadata
         let store_3a = store.fork();
         let mut checkpoint1 = commit0.clone();
         commit(table_root, &store_3a, 1, commit0.clone()).await;
@@ -1317,7 +1318,6 @@ mod tests {
         let checkpoint = ArrowEngineData::try_from_engine_data(parsed).unwrap();
         let checkpoint: RecordBatch = checkpoint.into();
 
-        // Write the record batch to a Parquet file
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new(&mut buffer, checkpoint.schema(), None)?;
         writer.write(&checkpoint)?;
@@ -1332,8 +1332,7 @@ mod tests {
             .unwrap();
         test_new_from(store_3a.into())?;
 
-        // c. log segment for old..=new version has no checkpoint
-        // i. commits have (new protocol, new metadata)
+        // Commit with new protocol + new metadata
         let store_3c_i = Arc::new(store.fork());
         let mut commit1 = commit0.clone();
         commit1[1] = json!({
@@ -1346,7 +1345,7 @@ mod tests {
         commit(table_root, store_3c_i.as_ref(), 1, commit1).await;
         test_new_from(store_3c_i.clone())?;
 
-        // new commits AND request version > end of log
+        // Version beyond end of log: error
         let engine = DefaultEngineBuilder::new(store_3c_i).build();
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
@@ -1356,7 +1355,7 @@ mod tests {
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
-        // ii. commits have (new protocol, no metadata)
+        // Commit with new protocol only (no metadata)
         let store_3c_ii = store.fork();
         let mut commit1 = commit0.clone();
         commit1[1] = json!({
@@ -1365,19 +1364,19 @@ mod tests {
                 "minWriterVersion": 5
             }
         });
-        commit1.remove(2); // remove metadata
+        commit1.remove(2);
         commit(table_root, &store_3c_ii, 1, commit1).await;
         test_new_from(store_3c_ii.into())?;
 
-        // iii. commits have (no protocol, new metadata)
+        // Commit with new metadata only (no protocol)
         let store_3c_iii = store.fork();
         let mut commit1 = commit0.clone();
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
-        commit1.remove(1); // remove protocol
+        commit1.remove(1);
         commit(table_root, &store_3c_iii, 1, commit1).await;
         test_new_from(store_3c_iii.into())?;
 
-        // iv. commits have (no protocol, no metadata)
+        // Commit with only commitInfo (no protocol, no metadata)
         let store_3c_iv = store.fork();
         let commit1 = vec![commit0[0].clone()];
         commit(table_root, &store_3c_iv, 1, commit1).await;
@@ -1743,25 +1742,73 @@ mod tests {
         assert_result_error_with_message(result, "Invalid version range");
     }
 
-    #[tokio::test]
-    async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory://test/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    #[test]
+    fn test_ict_across_table_configs() -> DeltaResult<()> {
+        use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
 
-        // Create a basic commit without ICT enabled
-        let commit0 = create_basic_commit(false, None);
-        add_commit(table_root, store.as_ref(), 0, commit0).await?;
+        let ict_features = vec![
+            FeatureSet::new().ict(),
+            FeatureSet::new().ict().column_mapping("name"),
+            FeatureSet::new().ict().v2_checkpoint(),
+        ];
+        let non_ict_features = vec![
+            FeatureSet::empty(),
+            FeatureSet::new().column_mapping("name"),
+            FeatureSet::new().v2_checkpoint(),
+        ];
 
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        for log_state in LogState::all(3) {
+            // ICT enabled: get_in_commit_timestamp returns Some for both fresh and
+            // incremental snapshot loads
+            for features in &ict_features {
+                let table = TestTableBuilder::new()
+                    .log_state(log_state.clone())
+                    .features(features.clone())
+                    .build()
+                    .map_err(|e| Error::generic(e.to_string()))?;
+                let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
-        // When ICT is disabled, get_timestamp should return None
-        let result = snapshot.get_in_commit_timestamp(&engine)?;
-        assert_eq!(result, None);
+                // Fresh load at latest version
+                let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+                assert!(
+                    snap.get_in_commit_timestamp(&engine)?.is_some(),
+                    "ICT should be Some for fresh load with {log_state:?} + {features:?}"
+                );
 
+                // Incremental load from v0 to latest
+                let base = Snapshot::builder_for(table.table_root())
+                    .at_version(0)
+                    .build(&engine)?;
+                let incremental = Snapshot::builder_from(base).at_version(2).build(&engine)?;
+                assert!(
+                    incremental.get_in_commit_timestamp(&engine)?.is_some(),
+                    "ICT should be Some for incremental load with {log_state:?} + {features:?}"
+                );
+            }
+
+            // ICT disabled: get_in_commit_timestamp returns None
+            for features in &non_ict_features {
+                let table = TestTableBuilder::new()
+                    .log_state(log_state.clone())
+                    .features(features.clone())
+                    .build()
+                    .map_err(|e| Error::generic(e.to_string()))?;
+                let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+
+                let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+                assert_eq!(
+                    snap.get_in_commit_timestamp(&engine)?,
+                    None,
+                    "ICT should be None without ICT feature with {log_state:?} + {features:?}"
+                );
+            }
+        }
         Ok(())
     }
 
+    // Tests that ICT works across the enablement timeline: v0 without ICT,
+    // v1 enables ICT, v2 has ICT timestamp. This requires mid-stream feature
+    // enablement which the builder cannot produce.
     #[tokio::test]
     async fn test_timestamp_with_ict_enablement_timeline() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -2014,38 +2061,20 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    #[test]
+    fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
+        use test_utils::table_builder::{LogState, TestTableBuilder};
 
-        // Create initial commit
-        let commit0 = vec![
-            json!({
-                "protocol": {
-                    "minReaderVersion": 1,
-                    "minWriterVersion": 2
-                }
-            }),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-        ];
-        commit(table_root, store.as_ref(), 0, commit0).await;
+        let table = TestTableBuilder::new()
+            .log_state(LogState::commits(1))
+            .build()
+            .map_err(|e| Error::generic(e.to_string()))?;
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
-        let base_snapshot = Snapshot::builder_for(table_root)
+        let base_snapshot = Snapshot::builder_for(table.table_root())
             .at_version(0)
             .build(&engine)?;
 
-        // Test with empty log tail - should return same snapshot
         let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None, None)?;
         assert_eq!(result, base_snapshot);
 
