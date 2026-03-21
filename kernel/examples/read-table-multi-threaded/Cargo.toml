@@ -14,10 +14,10 @@ arrow-56 = ["common/arrow-56"]
 clap = { version = "4.5", features = ["derive"] }
 common = { path = "../common", default-features = false }
 delta_kernel = { path = "../../../kernel", features = [
-  "default-engine-rustls",
   "internal-api",
   "prettyprint",
 ] }
+delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls", "arrow"] }
 env_logger = "0.11.8"
 spmc = "0.3.0"
 url = "2"

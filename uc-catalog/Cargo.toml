@@ -31,6 +31,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
+delta_kernel = { path = "../kernel", features = ["catalog-managed", "test-utils", "internal-api"] }
+delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
 uc-client = { path = "../uc-client", features = ["test-utils"] }
 tempfile = "3"

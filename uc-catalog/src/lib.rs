@@ -133,9 +133,9 @@ impl<'a, C: UCGetCommitsClient> UCCatalog<'a, C> {
 mod tests {
     use std::env;
 
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store;
     use delta_kernel::transaction::CommitResult;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     use tracing::info;
 

@@ -129,9 +129,9 @@ impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
 mod tests {
     use super::*;
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
-    use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
+    use delta_kernel_default_engine::DefaultEngine;
     use std::fs;
     use uc_client::error::Result;
 

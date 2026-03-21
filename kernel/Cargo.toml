@@ -156,6 +156,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 rstest = "0.23"
+delta_kernel_default_engine = { path = "../default-engine", features = ["rustls", "arrow"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
 [[bench]]
 name = "metadata_bench"
 harness = false

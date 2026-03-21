@@ -10,8 +10,6 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
@@ -24,6 +22,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use url::Url;
 
 use test_utils::{

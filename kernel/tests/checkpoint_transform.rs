@@ -17,14 +17,14 @@ use delta_kernel::arrow::datatypes::TimestampMicrosecondType;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
 };
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::DeltaResult;
 use delta_kernel::Snapshot;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 
 use serde_json::json;
 use test_utils::{insert_data, read_scan, write_batch_to_table};

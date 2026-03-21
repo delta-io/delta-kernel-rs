@@ -10,9 +10,9 @@ use delta_kernel::parquet::errors::Result as ParquetResult;
 use futures::future::{BoxFuture, FutureExt};
 
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, Snapshot};
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 
 /// An example program that checkpoints a table.
 /// !!!WARNING!!!: This doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.
@@ -65,7 +65,7 @@ async fn try_main() -> DeltaResult<()> {
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Checkpointing Delta table at: {url}");
 
-    use delta_kernel::engine::default::storage::store_from_url;
+    use delta_kernel_default_engine::storage::store_from_url;
     let store = store_from_url(&url)?;
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),

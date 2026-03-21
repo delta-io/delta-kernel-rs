@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::DefaultEngine;
 
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,

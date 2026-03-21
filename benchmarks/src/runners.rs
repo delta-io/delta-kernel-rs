@@ -246,8 +246,8 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 mod tests {
     use super::*;
     use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
-    use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel_default_engine::DefaultEngine;
 
     fn test_table_info() -> TableInfo {
         let path = format!(

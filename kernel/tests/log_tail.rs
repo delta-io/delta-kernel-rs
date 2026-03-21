@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use url::Url;
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::{FileMeta, LogPath, Snapshot};
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 use test_utils::{
     actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
