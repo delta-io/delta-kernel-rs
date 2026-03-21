@@ -17,7 +17,7 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::get_field_column_mapping_info;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
@@ -442,7 +442,9 @@ impl StructField {
         &self,
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
-        MakePhysical::new(column_mapping_mode).run_field(self)
+        MakePhysical::new(column_mapping_mode)
+            .transform_struct_field(self)
+            .map(|f| f.into_owned())
     }
 
     fn has_invariants(&self) -> bool {
@@ -873,11 +875,7 @@ impl StructType {
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
-        let fields: Vec<StructField> = self
-            .fields()
-            .map(|field| transformer.run_field(field))
-            .try_collect()?;
-        Self::try_new(fields)
+        transformer.transform_struct(self).map(|s| s.into_owned())
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -1248,16 +1246,17 @@ impl DoubleEndedIterator for StructFieldRefIter<'_> {
     }
 }
 
-struct InvariantChecker(bool);
+struct InvariantChecker;
 
 impl<'a> SchemaTransform<'a> for InvariantChecker {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
         if field.has_invariants() {
-            self.0 = true;
-        } else if !self.0 {
-            let _ = self.recurse_into_struct_field(field);
+            Err(())
+        } else {
+            self.recurse_into_struct_field(field)
         }
-        Some(Cow::Borrowed(field))
     }
 }
 
@@ -1266,9 +1265,7 @@ impl<'a> SchemaTransform<'a> for InvariantChecker {
 /// This traverses the entire schema to check for the presence of the `delta.invariants`
 /// metadata key.
 pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
-    let mut checker = InvariantChecker(false);
-    let _ = checker.transform_struct(schema);
-    checker.0
+    InvariantChecker.transform_struct(schema).is_err()
 }
 
 /// Helper for RowVisitor implementations
@@ -1884,7 +1881,9 @@ impl GetSchemaLeaves {
 }
 
 impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
-    fn transform_struct_field(&mut self, field: &StructField) -> Option<Cow<'a, StructField>> {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_struct_field(&mut self, field: &'a StructField) {
         self.path.push(field.name.clone());
         if let DataType::Struct(_) = field.data_type {
             self.recurse_into_struct_field(field);
@@ -1893,7 +1892,6 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
             self.types.push(field.data_type.clone());
         }
         self.path.pop();
-        None
     }
 }
 
@@ -1901,7 +1899,6 @@ struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     path: Vec<&'a str>,
     seen: HashMap<i64, &'a str>,
-    err: Option<Error>,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -1909,32 +1906,14 @@ impl<'a> MakePhysical<'a> {
             column_mapping_mode,
             path: vec![],
             seen: HashMap::new(),
-            err: None,
-        }
-    }
-
-    /// Transforms a single [`StructField`] from logical to physical. Returns the physical
-    /// field on success, or the first error encountered during the recursive transformation.
-    fn run_field(&mut self, field: &'a StructField) -> DeltaResult<StructField> {
-        let result = self.transform_struct_field(field);
-        match (self.err.take(), result) {
-            (Some(err), _) => Err(err),
-            // Theoretically impossible: MakePhysical only returns None when it sets an error
-            (None, None) => Err(Error::internal_error(
-                "make_physical: transform returned None without setting an error",
-            )),
-            (None, Some(field)) => Ok(field.into_owned()),
         }
     }
 
     fn transform_inner<T>(
         &mut self,
         field_name: &'a str,
-        transform: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<T> {
-        if self.err.is_some() {
-            return None;
-        }
+        transform: impl FnOnce(&mut Self) -> DeltaResult<T>,
+    ) -> DeltaResult<T> {
         self.path.push(field_name);
         let result = transform(self);
         self.path.pop();
@@ -1942,28 +1921,31 @@ impl<'a> MakePhysical<'a> {
     }
 }
 impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
-    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    transform_output_type!(|'a, T| DeltaResult<Cow<'a, T>>);
+
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<array element>", |this| this.transform(etype))
     }
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<map key>", |this| this.transform(ktype))
     }
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<Cow<'a, DataType>> {
         self.transform_inner("<map value>", |this| this.transform(vtype))
     }
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(
+        &mut self,
+        field: &'a StructField,
+    ) -> DeltaResult<Cow<'a, StructField>> {
         self.transform_inner(field.name(), |this| {
             let (physical_name, _id) = get_field_column_mapping_info(
                 field,
                 this.column_mapping_mode,
                 &this.path,
                 Some(&mut this.seen),
-            )
-            .map_err(|e| this.err = Some(e))
-            .ok()?;
+            )?;
 
             if field.is_metadata_column() {
-                return Some(Cow::Borrowed(field));
+                return Ok(Cow::Borrowed(field));
             }
 
             let field = this.recurse_into_struct_field(field)?;
@@ -1971,14 +1953,14 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
             let name = physical_name.to_owned();
 
-            Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
+            Ok(Cow::Owned(field.with_name(name).with_metadata(metadata)))
         })
     }
 
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+    fn transform_variant(&mut self, stype: &'a StructType) -> DeltaResult<Cow<'a, StructType>> {
         // There is no column mapping metadata inside the struct fields of a variant, so
         // we do not recurse into the variant fields
-        Some(Cow::Borrowed(stype))
+        Ok(Cow::Borrowed(stype))
     }
 }
 
