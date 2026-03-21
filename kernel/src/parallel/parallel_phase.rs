@@ -191,7 +191,7 @@ mod tests {
     ) -> DeltaResult<ScanLogReplayProcessor> {
         let state_info = Arc::new(get_simple_state_info(test_schema(), vec![])?);
 
-        let seen_file_keys: HashSet<FileActionKey> = seen_paths
+        let seen_file_keys: hashbrown::HashSet<FileActionKey> = seen_paths
             .iter()
             .map(|path| FileActionKey::new(*path, None))
             .collect();

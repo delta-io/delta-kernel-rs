@@ -140,7 +140,7 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         skip_stats: bool,
     ) -> DeltaResult<Self> {
-        Self::new_with_seen_files_inner(
+        Self::new_with_seen_files(
             engine,
             state_info,
             checkpoint_info,
@@ -161,24 +161,6 @@ impl ScanLogReplayProcessor {
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
     /// - `skip_stats`: Skip reading file statistics
     pub(crate) fn new_with_seen_files(
-        engine: &dyn Engine,
-        state_info: Arc<StateInfo>,
-        checkpoint_info: CheckpointReadInfo,
-        seen_file_keys: std::collections::HashSet<FileActionKey>,
-        skip_stats: bool,
-    ) -> DeltaResult<Self> {
-        let seen_file_keys: hashbrown::HashSet<FileActionKey> =
-            seen_file_keys.into_iter().collect();
-        Self::new_with_seen_files_inner(
-            engine,
-            state_info,
-            checkpoint_info,
-            seen_file_keys,
-            skip_stats,
-        )
-    }
-
-    fn new_with_seen_files_inner(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
@@ -386,7 +368,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             state.checkpoint_info,
-            state.seen_file_keys,
+            state.seen_file_keys.into_iter().collect(),
             internal_state.skip_stats,
         )
     }
