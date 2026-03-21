@@ -7,6 +7,21 @@ use crate::{DeltaResult, Engine, RowVisitor as _};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
+/// Returns `true` if a set transaction is expired according to the given expiration and
+/// last-updated timestamps. A transaction is expired when both values are present and
+/// `last_updated <= expiration_timestamp`. Transactions without `last_updated` never
+/// expire. A `None` expiration timestamp (no retention duration configured) means
+/// nothing expires.
+pub(crate) fn is_set_txn_expired(
+    expiration_timestamp: Option<i64>,
+    last_updated: Option<i64>,
+) -> bool {
+    matches!(
+        expiration_timestamp.zip(last_updated),
+        Some((exp_ts, last_updated)) if last_updated <= exp_ts
+    )
+}
+
 pub(crate) struct SetTransactionScanner {}
 
 impl SetTransactionScanner {

@@ -10,7 +10,7 @@ use tracing::{debug, info, instrument};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::set_transaction::SetTransactionScanner;
+use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
@@ -569,14 +569,10 @@ impl Snapshot {
             .get_or_load_if_at_version(engine, self.version())
         {
             if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map.get(application_id).and_then(|txn| {
-                    // Apply retention filter: if both expiration_timestamp and last_updated
-                    // are present and last_updated <= expiration, the txn is expired.
-                    match (expiration_timestamp, txn.last_updated) {
-                        (Some(exp_ts), Some(last_updated)) if last_updated <= exp_ts => None,
-                        _ => Some(txn.version),
-                    }
-                }));
+                return Ok(txn_map
+                    .get(application_id)
+                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                    .map(|txn| txn.version));
             }
         }
 

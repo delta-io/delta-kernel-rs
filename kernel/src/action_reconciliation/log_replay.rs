@@ -30,6 +30,7 @@
 //!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and counts of
 //!      actions selected
 //!
+use crate::actions::set_transaction::is_set_txn_expired;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::Deduplicator as _;
 use crate::log_replay::{
@@ -484,18 +485,10 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(None); // Not a txn action, continue checking other types
         };
 
-        // Check retention if last_updated is present
-        if let Some(retention_ts) = self.txn_expiration_timestamp {
-            if let Some(last_updated) =
-                getters[Self::TXN_LAST_UPDATED_INDEX].get_opt(i, Self::TXN_LAST_UPDATED)?
-            {
-                let last_updated: i64 = last_updated;
-                if last_updated <= retention_ts {
-                    // Transaction is old, exclude it
-                    return Ok(Some(false));
-                }
-            }
-            // Note: transactions without last_updated are kept for backward compatibility
+        let last_updated: Option<i64> =
+            getters[Self::TXN_LAST_UPDATED_INDEX].get_opt(i, Self::TXN_LAST_UPDATED)?;
+        if is_set_txn_expired(self.txn_expiration_timestamp, last_updated) {
+            return Ok(Some(false));
         }
 
         // If the app ID already exists in the set, the insertion will return false,
