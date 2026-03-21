@@ -1,5 +1,7 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod table_builder;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -222,7 +224,10 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
 }
 
 // Resolve a table from a root and relative path
-fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+pub(crate) fn resolve_table_path(
+    table_root: impl AsRef<str>,
+    relative: &Path,
+) -> DeltaResult<Path> {
     let url = try_parse_uri(table_root)?;
     Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
 }
