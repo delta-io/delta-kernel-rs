@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::fs::create_dir_all;
+use std::io::BufReader;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::util::pretty::print_batches;
 use itertools::Itertools;
 use url::Url;
+use serde_json::Value;
 
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::committer::FileSystemCommitter;
@@ -32,6 +35,10 @@ struct Cli {
     #[command(flatten)]
     location_args: LocationArgs,
 
+    /// Path to a JSON file
+    #[arg(long, short = 'i')]
+    data: Option<String>,
+
     /// Comma-separated schema specification of the form `field_name:data_type`
     #[arg(
         long,
@@ -43,7 +50,7 @@ struct Cli {
     /// Number of rows to generate for the example data
     #[arg(long, short, default_value = "10")]
     num_rows: usize,
-    // TODO: Support providing input data from a JSON file instead of generating random data
+
     // TODO: Support specifying whether the transaction should overwrite, append, or error if the table already exists
 }
 
@@ -59,7 +66,6 @@ async fn main() -> ExitCode {
     }
 }
 
-// TODO: Update the example once official write APIs are introduced (issue#1123)
 async fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
@@ -84,7 +90,11 @@ async fn try_main() -> DeltaResult<()> {
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
 
     // Create sample data based on the schema
-    let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
+    let sample_data = if let Some(input_path) = &cli.data {
+        read_json_data(input_path, &snapshot.schema())?
+    } else {
+        create_sample_data(&snapshot.schema(), cli.num_rows)?
+    };
 
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
@@ -205,54 +215,86 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
     Ok(())
 }
 
-/// Create sample data based on the schema.
-fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowEngineData> {
-    let fields = schema.fields();
-    let mut columns = Vec::new();
-
-    for field in fields {
+/// A factory that builds Arrow tables by asking a provided 'helper' for each cell's value.
+fn build_data<F>(schema: &SchemaRef, num_rows: usize, mut provider: F) -> DeltaResult<ArrowEngineData>
+where
+    F: FnMut(&StructField, usize) -> Option<Value>,
+{
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for field in schema.fields() {
         let column: ArrayRef = match *field.data_type() {
             DataType::STRING => {
-                let data: Vec<String> = (0..num_rows).map(|i| format!("item_{i}")).collect();
+                let data: Vec<Option<String>> = (0..num_rows)
+                    .map(|i| provider(field, i).and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .collect();
                 Arc::new(StringArray::from(data))
             }
             DataType::INTEGER => {
-                let data: Vec<i32> = (0..num_rows).map(|i| i as i32).collect();
+                let data: Vec<Option<i32>> = (0..num_rows)
+                    .map(|i| provider(field, i).and_then(|v| v.as_i64().map(|n| n as i32)))
+                    .collect();
                 Arc::new(Int32Array::from(data))
             }
             DataType::LONG => {
-                let data: Vec<i64> = (0..num_rows).map(|i| i as i64).collect();
+                let data: Vec<Option<i64>> = (0..num_rows)
+                    .map(|i| provider(field, i).and_then(|v| v.as_i64()))
+                    .collect();
                 Arc::new(Int64Array::from(data))
             }
             DataType::DOUBLE => {
-                let data: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.5).collect();
+                let data: Vec<Option<f64>> = (0..num_rows)
+                    .map(|i| provider(field, i).and_then(|v| v.as_f64()))
+                    .collect();
                 Arc::new(Float64Array::from(data))
             }
             DataType::BOOLEAN => {
-                let data: Vec<bool> = (0..num_rows).map(|i| i % 2 == 0).collect();
+                let data: Vec<Option<bool>> = (0..num_rows)
+                    .map(|i| provider(field, i).and_then(|v| v.as_bool()))
+                    .collect();
                 Arc::new(BooleanArray::from(data))
             }
             DataType::TIMESTAMP => {
-                let now = chrono::Utc::now();
-                let data: Vec<i64> = (0..num_rows)
-                    .map(|i| (now + chrono::Duration::seconds(i as i64)).timestamp_micros())
+                let data: Vec<Option<i64>> = (0..num_rows)
+                    .map(|i| provider(field, i).and_then(|v| v.as_i64()))
                     .collect();
                 Arc::new(TimestampMicrosecondArray::from(data))
             }
-            _ => {
-                return Err(Error::generic(format!(
-                    "Unsupported data type for sample data: {:?}",
-                    field.data_type()
-                )));
-            }
+            _ => return Err(Error::generic(format!("Unsupported type: {:?}", field.data_type()))),
         };
         columns.push(column);
     }
 
     let arrow_schema = schema.as_ref().try_into_arrow()?;
-    let record_batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
+    Ok(ArrowEngineData::new(RecordBatch::try_new(Arc::new(arrow_schema), columns)?))
+}
 
-    Ok(ArrowEngineData::new(record_batch))
+/// Create sample data based on the schema.
+fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowEngineData> {
+    let now = chrono::Utc::now();
+
+    build_data(schema, num_rows, |field, i| {
+        match *field.data_type() {
+            DataType::STRING => Some(Value::from(format!("{}_{}", field.name(), i))),
+            DataType::INTEGER | DataType::LONG => Some(Value::from(i as i64)),
+            DataType::DOUBLE => Some(Value::from(i as f64 * 1.5)),
+            DataType::BOOLEAN => Some(Value::from(i % 2 == 0)),
+            DataType::TIMESTAMP => Some(Value::from((now + chrono::Duration::seconds(i as i64)).timestamp_micros())),
+            _ => None,
+        }
+    })
+}
+
+// Reads a JSON file into Arrow memory.
+fn read_json_data(path: &str, schema: &SchemaRef) -> DeltaResult<ArrowEngineData> {
+    let file = File::open(path).map_err(|e| Error::generic(format!("File error: {e}")))?;
+    let json: Value = serde_json::from_reader(BufReader::new(file))
+        .map_err(|e| Error::generic(format!("JSON error: {e}")))?;
+
+    let rows = json.as_array().ok_or_else(|| Error::generic("JSON must be an array"))?;
+
+    build_data(schema, rows.len(), |field, i| {
+        rows.get(i).and_then(|row| row.get(field.name()).cloned())
+    })
 }
 
 /// Read and display data from the table.
