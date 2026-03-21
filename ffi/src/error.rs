@@ -83,12 +83,10 @@ impl From<Error> for KernelError {
             Error::IOError(_) => KernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine-base")]
+            #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine-base")]
+            #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine-base")]
-            Error::Reqwest(_) => KernelError::ReqwestError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,

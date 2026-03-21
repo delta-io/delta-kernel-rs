@@ -49,7 +49,6 @@ pub trait TaskExecutor: Send + Sync + 'static {
     fn enter(&self) -> Self::Guard<'_>;
 }
 
-#[cfg(any(feature = "tokio", test))]
 pub mod tokio {
     use super::TaskExecutor;
     use futures::TryFutureExt;

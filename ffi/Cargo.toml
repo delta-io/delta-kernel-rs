@@ -56,9 +56,7 @@ arrow = ["arrow-57"]
 arrow-57 = ["delta_kernel/arrow-57"]
 arrow-56 = ["delta_kernel/arrow-56"]
 
-# This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
-# default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
-# default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
+# Shared feature flag enabling the default engine crate dependency
 default-engine-base = ["dep:delta_kernel_default_engine"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
