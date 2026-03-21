@@ -41,7 +41,7 @@ use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-use hashbrown::HashSet;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -629,7 +629,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hashbrown::HashSet;
+    use std::collections::HashSet;
 
     use super::*;
     use crate::arrow::array::StringArray;

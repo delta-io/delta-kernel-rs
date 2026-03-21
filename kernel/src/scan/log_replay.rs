@@ -141,7 +141,7 @@ impl ScanLogReplayProcessor {
         skip_stats: bool,
     ) -> DeltaResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
-        Self::new_with_seen_files_inner(
+        Self::new_with_seen_files(
             engine,
             state_info,
             checkpoint_info,
@@ -369,7 +369,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             state.checkpoint_info,
-            state.seen_file_keys,
+            state.seen_file_keys.into_iter().collect(),
             internal_state.skip_stats,
         )
     }
