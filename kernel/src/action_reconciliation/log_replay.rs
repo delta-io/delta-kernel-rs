@@ -630,7 +630,7 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hashbrown::HashSet;
+    use std::collections::HashSet;
 
     use super::*;
     use crate::arrow::array::StringArray;
