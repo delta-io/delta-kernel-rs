@@ -8,7 +8,7 @@ use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
 use chrono::{DateTime, Days};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
 #[cfg(test)]
@@ -26,6 +26,22 @@ pub(crate) trait ParquetRowGroupSkipping {
         predicate: &Predicate,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
+
+    /// Like [`with_row_group_filter`](Self::with_row_group_filter), but for checkpoint and sidecar
+    /// parquet files where statistics are nested under `add.stats_parsed.*` and partition values
+    /// under `add.partitionValues_parsed.*`.
+    ///
+    /// The `predicate` uses bare column names (e.g. `x > 10`), and the filter internally maps
+    /// them to the checkpoint's physical column layout. Statistics for data columns are
+    /// null-guarded: if a stat column contains any null values in the row group (indicating some
+    /// files lack that statistic), the stat is treated as unavailable to prevent false pruning.
+    #[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+    fn with_checkpoint_row_group_filter(
+        self,
+        predicate: &Predicate,
+        partition_columns: HashSet<String>,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self;
 }
 impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
     fn with_row_group_filter(
@@ -39,11 +55,33 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .iter()
             .enumerate()
             .filter_map(|(ordinal, row_group)| {
-                // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
                 RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
             })
             .collect();
         debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
+        if let Some(row_indexes) = row_indexes {
+            row_indexes.select_row_groups(&ordinals);
+        }
+        self.with_row_groups(ordinals)
+    }
+
+    fn with_checkpoint_row_group_filter(
+        self,
+        predicate: &Predicate,
+        partition_columns: HashSet<String>,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self {
+        let ordinals: Vec<_> = self
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, row_group)| {
+                CheckpointRowGroupFilter::apply(row_group, predicate, partition_columns.clone())
+                    .then_some(ordinal)
+            })
+            .collect();
+        debug!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -80,122 +118,15 @@ impl<'a> RowGroupFilter<'a> {
             .get(col)
             .map(|&i| self.row_group.column(i).statistics())
     }
-
-    fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
-        // WARNING: The bytes are stored in big-endian order; reverse and then 0-pad to 16 bytes.
-        let bytes = bytes.filter(|b| b.len() <= 16)?;
-        let mut bytes = Vec::from(bytes);
-        bytes.reverse();
-        bytes.resize(16, 0u8);
-        let bytes: [u8; 16] = bytes.try_into().ok()?;
-        let value = DecimalData::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
-        Some(value.into())
-    }
-
-    fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
-        let days = u64::try_from(*days?).ok()?;
-        let timestamp = DateTime::UNIX_EPOCH.checked_add_days(Days::new(days))?;
-        let timestamp = timestamp.signed_duration_since(DateTime::UNIX_EPOCH);
-        Some(Scalar::TimestampNtz(timestamp.num_microseconds()?))
-    }
 }
 
 impl ParquetStatsProvider for RowGroupFilter<'_> {
-    // Extracts a stat value, converting from its physical type to the requested logical type.
-    //
-    // NOTE: This code is highly redundant with [`get_max_stat_value`] below, but parquet
-    // ValueStatistics<T> requires T to impl a private trait, so we can't factor out any kind of
-    // helper method. And macros are hard enough to read that it's not worth defining one.
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        use PrimitiveType::*;
-        let value = match (data_type.as_primitive_opt()?, self.get_stats(col)??) {
-            (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
-            (String, Statistics::FixedLenByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
-            (String, _) => return None,
-            (Long, Statistics::Int64(s)) => s.min_opt()?.into(),
-            (Long, Statistics::Int32(s)) => (*s.min_opt()? as i64).into(),
-            (Long, _) => return None,
-            (Integer, Statistics::Int32(s)) => s.min_opt()?.into(),
-            (Integer, _) => return None,
-            (Short, Statistics::Int32(s)) => (*s.min_opt()? as i16).into(),
-            (Short, _) => return None,
-            (Byte, Statistics::Int32(s)) => (*s.min_opt()? as i8).into(),
-            (Byte, _) => return None,
-            (Float, Statistics::Float(s)) => s.min_opt()?.into(),
-            (Float, _) => return None,
-            (Double, Statistics::Double(s)) => s.min_opt()?.into(),
-            (Double, Statistics::Float(s)) => (*s.min_opt()? as f64).into(),
-            (Double, _) => return None,
-            (Boolean, Statistics::Boolean(s)) => s.min_opt()?.into(),
-            (Boolean, _) => return None,
-            (Binary, Statistics::ByteArray(s)) => s.min_opt()?.data().into(),
-            (Binary, Statistics::FixedLenByteArray(s)) => s.min_opt()?.data().into(),
-            (Binary, _) => return None,
-            (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
-            (Date, _) => return None,
-            (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.min_opt()?),
-            (Timestamp, _) => return None, // TODO: Int96 timestamps
-            (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
-            (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.min_opt())?,
-            (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-            (Decimal(d), Statistics::Int32(i)) => {
-                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
-            }
-            (Decimal(d), Statistics::Int64(i)) => {
-                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
-            }
-            (Decimal(d), Statistics::FixedLenByteArray(b)) => {
-                Self::decimal_from_bytes(b.min_bytes_opt(), *d)?
-            }
-            (Decimal(..), _) => return None,
-        };
-        Some(value)
+        extract_min_scalar(data_type, self.get_stats(col)??)
     }
 
     fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        use PrimitiveType::*;
-        let value = match (data_type.as_primitive_opt()?, self.get_stats(col)??) {
-            (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
-            (String, Statistics::FixedLenByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
-            (String, _) => return None,
-            (Long, Statistics::Int64(s)) => s.max_opt()?.into(),
-            (Long, Statistics::Int32(s)) => (*s.max_opt()? as i64).into(),
-            (Long, _) => return None,
-            (Integer, Statistics::Int32(s)) => s.max_opt()?.into(),
-            (Integer, _) => return None,
-            (Short, Statistics::Int32(s)) => (*s.max_opt()? as i16).into(),
-            (Short, _) => return None,
-            (Byte, Statistics::Int32(s)) => (*s.max_opt()? as i8).into(),
-            (Byte, _) => return None,
-            (Float, Statistics::Float(s)) => s.max_opt()?.into(),
-            (Float, _) => return None,
-            (Double, Statistics::Double(s)) => s.max_opt()?.into(),
-            (Double, Statistics::Float(s)) => (*s.max_opt()? as f64).into(),
-            (Double, _) => return None,
-            (Boolean, Statistics::Boolean(s)) => s.max_opt()?.into(),
-            (Boolean, _) => return None,
-            (Binary, Statistics::ByteArray(s)) => s.max_opt()?.data().into(),
-            (Binary, Statistics::FixedLenByteArray(s)) => s.max_opt()?.data().into(),
-            (Binary, _) => return None,
-            (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
-            (Date, _) => return None,
-            (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.max_opt()?),
-            (Timestamp, _) => return None, // TODO: Int96 timestamps
-            (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
-            (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.max_opt())?,
-            (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-            (Decimal(d), Statistics::Int32(i)) => {
-                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
-            }
-            (Decimal(d), Statistics::Int64(i)) => {
-                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
-            }
-            (Decimal(d), Statistics::FixedLenByteArray(b)) => {
-                Self::decimal_from_bytes(b.max_bytes_opt(), *d)?
-            }
-            (Decimal(..), _) => return None,
-        };
-        Some(value)
+        extract_max_scalar(data_type, self.get_stats(col)??)
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
@@ -211,19 +142,315 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             return Some(self.get_parquet_rowcount_stat()).filter(|_| false);
         };
 
-        // WARNING: The parquet footer decoding forces missing stats to Some(0), which would cause
-        // an IS NULL predicate to wrongly skip the file if it contains any NULL values. To be safe,
-        // we must never return Some(0). See https://github.com/apache/arrow-rs/issues/9451.
-        let nullcount = stats?.null_count_opt().filter(|n| *n > 0);
-
-        // Parquet nullcount stats are always u64, so we can directly return the value instead of
-        // wrapping it in a Scalar. We can safely cast it from u64 to i64 because the nullcount can
-        // never be larger than the rowcount and the parquet rowcount stat is i64.
-        Some(nullcount? as i64)
+        extract_nullcount(stats)
     }
 
     fn get_parquet_rowcount_stat(&self) -> i64 {
         self.row_group.num_rows()
+    }
+}
+
+/// Extracts the minimum stat value from parquet footer statistics, converting from the physical
+/// parquet type to the requested logical Delta type.
+fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar> {
+    use PrimitiveType::*;
+    let value = match (data_type.as_primitive_opt()?, stats) {
+        (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
+        (String, Statistics::FixedLenByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
+        (String, _) => return None,
+        (Long, Statistics::Int64(s)) => s.min_opt()?.into(),
+        (Long, Statistics::Int32(s)) => (*s.min_opt()? as i64).into(),
+        (Long, _) => return None,
+        (Integer, Statistics::Int32(s)) => s.min_opt()?.into(),
+        (Integer, _) => return None,
+        (Short, Statistics::Int32(s)) => (*s.min_opt()? as i16).into(),
+        (Short, _) => return None,
+        (Byte, Statistics::Int32(s)) => (*s.min_opt()? as i8).into(),
+        (Byte, _) => return None,
+        (Float, Statistics::Float(s)) => s.min_opt()?.into(),
+        (Float, _) => return None,
+        (Double, Statistics::Double(s)) => s.min_opt()?.into(),
+        (Double, Statistics::Float(s)) => (*s.min_opt()? as f64).into(),
+        (Double, _) => return None,
+        (Boolean, Statistics::Boolean(s)) => s.min_opt()?.into(),
+        (Boolean, _) => return None,
+        (Binary, Statistics::ByteArray(s)) => s.min_opt()?.data().into(),
+        (Binary, Statistics::FixedLenByteArray(s)) => s.min_opt()?.data().into(),
+        (Binary, _) => return None,
+        (Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
+        (Date, _) => return None,
+        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.min_opt()?),
+        (Timestamp, _) => return None, // TODO: Int96 timestamps
+        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
+        (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.min_opt())?,
+        (TimestampNtz, _) => return None, // TODO: Int96 timestamps
+        (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
+        (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.min_opt()?, *d).ok()?.into(),
+        (Decimal(d), Statistics::FixedLenByteArray(b)) => {
+            decimal_from_bytes(b.min_bytes_opt(), *d)?
+        }
+        (Decimal(..), _) => return None,
+    };
+    Some(value)
+}
+
+/// Extracts the maximum stat value from parquet footer statistics, converting from the physical
+/// parquet type to the requested logical Delta type.
+fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar> {
+    use PrimitiveType::*;
+    let value = match (data_type.as_primitive_opt()?, stats) {
+        (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
+        (String, Statistics::FixedLenByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
+        (String, _) => return None,
+        (Long, Statistics::Int64(s)) => s.max_opt()?.into(),
+        (Long, Statistics::Int32(s)) => (*s.max_opt()? as i64).into(),
+        (Long, _) => return None,
+        (Integer, Statistics::Int32(s)) => s.max_opt()?.into(),
+        (Integer, _) => return None,
+        (Short, Statistics::Int32(s)) => (*s.max_opt()? as i16).into(),
+        (Short, _) => return None,
+        (Byte, Statistics::Int32(s)) => (*s.max_opt()? as i8).into(),
+        (Byte, _) => return None,
+        (Float, Statistics::Float(s)) => s.max_opt()?.into(),
+        (Float, _) => return None,
+        (Double, Statistics::Double(s)) => s.max_opt()?.into(),
+        (Double, Statistics::Float(s)) => (*s.max_opt()? as f64).into(),
+        (Double, _) => return None,
+        (Boolean, Statistics::Boolean(s)) => s.max_opt()?.into(),
+        (Boolean, _) => return None,
+        (Binary, Statistics::ByteArray(s)) => s.max_opt()?.data().into(),
+        (Binary, Statistics::FixedLenByteArray(s)) => s.max_opt()?.data().into(),
+        (Binary, _) => return None,
+        (Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
+        (Date, _) => return None,
+        (Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(*s.max_opt()?),
+        (Timestamp, _) => return None, // TODO: Int96 timestamps
+        (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
+        (TimestampNtz, Statistics::Int32(s)) => timestamp_from_date(s.max_opt())?,
+        (TimestampNtz, _) => return None, // TODO: Int96 timestamps
+        (Decimal(d), Statistics::Int32(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
+        (Decimal(d), Statistics::Int64(i)) => DecimalData::try_new(*i.max_opt()?, *d).ok()?.into(),
+        (Decimal(d), Statistics::FixedLenByteArray(b)) => {
+            decimal_from_bytes(b.max_bytes_opt(), *d)?
+        }
+        (Decimal(..), _) => return None,
+    };
+    Some(value)
+}
+
+/// Extracts the null count from parquet footer statistics for a column.
+fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
+    // WARNING: The parquet footer decoding forces missing stats to Some(0), which would cause
+    // an IS NULL predicate to wrongly skip the file if it contains any NULL values. To be safe,
+    // we must never return Some(0). See https://github.com/apache/arrow-rs/issues/9451.
+    let nullcount = stats?.null_count_opt().filter(|n| *n > 0);
+
+    // Parquet nullcount stats are always u64, so we can directly return the value instead of
+    // wrapping it in a Scalar. We can safely cast it from u64 to i64 because the nullcount can
+    // never be larger than the rowcount and the parquet rowcount stat is i64.
+    Some(nullcount? as i64)
+}
+
+fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
+    // WARNING: The bytes are stored in big-endian order; reverse and then 0-pad to 16 bytes.
+    let bytes = bytes.filter(|b| b.len() <= 16)?;
+    let mut bytes = Vec::from(bytes);
+    bytes.reverse();
+    bytes.resize(16, 0u8);
+    let bytes: [u8; 16] = bytes.try_into().ok()?;
+    let value = DecimalData::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
+    Some(value.into())
+}
+
+fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
+    let days = u64::try_from(*days?).ok()?;
+    let timestamp = DateTime::UNIX_EPOCH.checked_add_days(Days::new(days))?;
+    let timestamp = timestamp.signed_duration_since(DateTime::UNIX_EPOCH);
+    Some(Scalar::TimestampNtz(timestamp.num_microseconds()?))
+}
+
+/// Checks whether a parquet column has any null values in a row group, based on its footer stats.
+/// Returns `true` if the column has nulls, or if nullcount stats are unavailable (conservative).
+#[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+fn column_has_nulls(row_group: &RowGroupMetaData, col_index: usize) -> bool {
+    row_group
+        .column(col_index)
+        .statistics()
+        .and_then(|s| s.null_count_opt())
+        .is_none_or(|n| n > 0)
+}
+
+/// Parquet field indices for a single column's Delta statistics within a checkpoint file.
+/// Each index points to a leaf column in the checkpoint parquet schema.
+#[derive(Default)]
+#[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+struct StatsColumnIndices {
+    /// Index of `add.stats_parsed.minValues.<col>` in the parquet schema.
+    min_index: Option<usize>,
+    /// Index of `add.stats_parsed.maxValues.<col>` in the parquet schema.
+    max_index: Option<usize>,
+    /// Index of `add.stats_parsed.nullCount.<col>` in the parquet schema.
+    nullcount_index: Option<usize>,
+}
+
+/// A [`ParquetStatsProvider`] for row group skipping in checkpoint and sidecar parquet files.
+///
+/// Unlike [`RowGroupFilter`] which evaluates a predicate whose column references directly match
+/// the parquet schema, this filter evaluates the _original_ user predicate (e.g. `x > 10`) against
+/// a checkpoint file where statistics are nested under `add.stats_parsed.{minValues,maxValues,
+/// nullCount}.<col>` and partition values under `add.partitionValues_parsed.<col>`.
+///
+/// Because checkpoint statistics are aggregates _of_ per-file statistics, a null value in a stat
+/// column means the corresponding file was missing that statistic. The parquet footer min/max
+/// ignores nulls, which can produce misleading aggregates. To prevent false pruning, this filter
+/// returns `None` for any stat whose column contains null values in the row group (checked via
+/// the column's own null count in the parquet footer).
+///
+/// Partition columns are handled separately: their values are guaranteed to always be present in
+/// metadata, so footer min/max of `add.partitionValues_parsed.<col>` can be used directly without
+/// null guarding.
+#[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+pub(crate) struct CheckpointRowGroupFilter<'a> {
+    row_group: &'a RowGroupMetaData,
+    /// Maps each predicate data column to its stats column indices in the checkpoint parquet file.
+    stats_column_indices: HashMap<ColumnName, StatsColumnIndices>,
+    /// Maps each predicate partition column to its `add.partitionValues_parsed.<col>` field index.
+    partition_column_indices: HashMap<ColumnName, usize>,
+    /// Physical names of table partition columns.
+    partition_columns: HashSet<String>,
+}
+
+#[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+impl<'a> CheckpointRowGroupFilter<'a> {
+    /// Creates a new checkpoint row group filter. The `predicate` is the original user predicate
+    /// with bare column names (e.g. `x > 10`), and `partition_columns` are the physical names of
+    /// the table's partition columns.
+    pub(crate) fn new(
+        row_group: &'a RowGroupMetaData,
+        predicate: &Predicate,
+        partition_columns: HashSet<String>,
+    ) -> Self {
+        let (stats_column_indices, partition_column_indices) = compute_checkpoint_field_indices(
+            row_group.schema_descr().columns(),
+            predicate,
+            &partition_columns,
+        );
+        Self {
+            row_group,
+            stats_column_indices,
+            partition_column_indices,
+            partition_columns,
+        }
+    }
+
+    /// Applies the predicate to a checkpoint row group. Returns `false` if the row group can be
+    /// safely skipped (none of its add file rows can match the predicate).
+    pub(crate) fn apply(
+        row_group: &'a RowGroupMetaData,
+        predicate: &Predicate,
+        partition_columns: HashSet<String>,
+    ) -> bool {
+        use crate::kernel_predicates::KernelPredicateEvaluator as _;
+        CheckpointRowGroupFilter::new(row_group, predicate, partition_columns)
+            .eval_sql_where(predicate)
+            != Some(false)
+    }
+
+    /// Returns `true` if the column is a partition column.
+    fn is_partition_column(&self, col: &ColumnName) -> bool {
+        let path = col.path();
+        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+    }
+
+    /// Returns the footer statistics for a parquet column at the given index.
+    fn get_stats_at(&self, index: usize) -> Option<&Statistics> {
+        self.row_group.column(index).statistics()
+    }
+
+    /// Retrieves a stat value for a data column, but only if the stat column has no null values
+    /// in this row group. A null in the stat column means some file is missing that statistic,
+    /// making the footer aggregate unreliable.
+    fn get_guarded_stat(
+        &self,
+        col: &ColumnName,
+        data_type: &DataType,
+        get_index: impl FnOnce(&StatsColumnIndices) -> Option<usize>,
+        extract: impl FnOnce(&DataType, &Statistics) -> Option<Scalar>,
+    ) -> Option<Scalar> {
+        let indices = self.stats_column_indices.get(col)?;
+        let stat_index = get_index(indices)?;
+        // If the stat column has any nulls, some files are missing this stat and the footer
+        // aggregate is unreliable.
+        if column_has_nulls(self.row_group, stat_index) {
+            return None;
+        }
+        extract(data_type, self.get_stats_at(stat_index)?)
+    }
+}
+
+impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
+    fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        if self.is_partition_column(col) {
+            let &idx = self.partition_column_indices.get(col)?;
+            return extract_min_scalar(data_type, self.get_stats_at(idx)?);
+        }
+        self.get_guarded_stat(col, data_type, |i| i.min_index, extract_min_scalar)
+    }
+
+    fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        if self.is_partition_column(col) {
+            let &idx = self.partition_column_indices.get(col)?;
+            return extract_max_scalar(data_type, self.get_stats_at(idx)?);
+        }
+        // Exclude timestamps due to millisecond truncation in add.stats.
+        match data_type {
+            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => return None,
+            _ => {}
+        }
+        self.get_guarded_stat(col, data_type, |i| i.max_index, extract_max_scalar)
+    }
+
+    fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
+        if self.is_partition_column(col) {
+            let &idx = self.partition_column_indices.get(col)?;
+            return extract_nullcount(self.get_stats_at(idx));
+        }
+        let indices = self.stats_column_indices.get(col)?;
+        let nullcount_index = indices.nullcount_index?;
+        // If the nullCount stat column itself has nulls, some files are missing nullCount
+        // stats, making the aggregate unreliable.
+        if column_has_nulls(self.row_group, nullcount_index) {
+            return None;
+        }
+        // Return the MAX of the nullCount column from the footer. If any file has null values,
+        // max(nullCount) > 0, so IS NULL predicates won't falsely prune the row group.
+        let stats = self.get_stats_at(nullcount_index)?;
+        extract_max_i64(stats)
+    }
+
+    fn get_parquet_rowcount_stat(&self) -> i64 {
+        // The footer row count is the number of add file _rows_ in this row group, not the
+        // sum of data file row counts. This makes IS NOT NULL unprunable (nullCount != rowCount
+        // would compare the max per-file nullCount against the checkpoint row count, which is
+        // semantically meaningless). The blanket DataSkippingPredicateEvaluator impl handles
+        // this correctly: eval_pred_is_null for IS NOT NULL returns None when
+        // nullcount != rowcount can't be meaningfully evaluated.
+        //
+        // We return 0 here as a sentinel that forces IS NOT NULL to always produce None,
+        // because max(nullCount) for any non-trivial column will be >= 0 and the comparison
+        // `nullcount != 0` would incorrectly pass for all-null files.
+        0
+    }
+}
+
+/// Extracts the maximum value as i64 from parquet statistics. Used for reading checkpoint
+/// nullCount stats where the footer max represents the largest per-file null count.
+#[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+fn extract_max_i64(stats: &Statistics) -> Option<i64> {
+    match stats {
+        Statistics::Int64(s) => Some(*s.max_opt()?),
+        Statistics::Int32(s) => Some(*s.max_opt()? as i64),
+        _ => None,
     }
 }
 
@@ -249,4 +476,59 @@ pub(crate) fn compute_field_indices(
                 .map(|path| (path.clone(), i))
         })
         .collect()
+}
+
+/// Builds column index mappings for checkpoint row group skipping. Maps each predicate column to
+/// its corresponding stats column indices (`add.stats_parsed.{minValues,maxValues,nullCount}.<col>`)
+/// or partition column index (`add.partitionValues_parsed.<col>`).
+#[allow(dead_code)] // Will be wired up when checkpoint reads use the new stats provider
+fn compute_checkpoint_field_indices(
+    fields: &[ColumnDescPtr],
+    predicate: &Predicate,
+    partition_columns: &HashSet<String>,
+) -> (
+    HashMap<ColumnName, StatsColumnIndices>,
+    HashMap<ColumnName, usize>,
+) {
+    let referenced_columns = predicate.references();
+    let mut stats_indices: HashMap<ColumnName, StatsColumnIndices> = HashMap::new();
+    let mut partition_indices: HashMap<ColumnName, usize> = HashMap::new();
+
+    for (i, field) in fields.iter().enumerate() {
+        let parts = field.path().parts();
+
+        // Match add.partitionValues_parsed.<col_path...>
+        if parts.len() >= 3 && parts[0] == "add" && parts[1] == "partitionValues_parsed" {
+            let col_name = ColumnName::new(&parts[2..]);
+            if referenced_columns.contains(&col_name)
+                && col_name.path().len() == 1
+                && partition_columns.contains(col_name.path()[0].as_str())
+            {
+                partition_indices.insert(col_name, i);
+            }
+            continue;
+        }
+
+        // Match add.stats_parsed.{minValues,maxValues,nullCount}.<col_path...>
+        if parts.len() >= 4 && parts[0] == "add" && parts[1] == "stats_parsed" {
+            let stat_type = parts[2].as_str();
+            let col_name = ColumnName::new(&parts[3..]);
+            // Skip partition columns (they use partitionValues_parsed, not stats_parsed)
+            if !referenced_columns.contains(&col_name)
+                || (col_name.path().len() == 1
+                    && partition_columns.contains(col_name.path()[0].as_str()))
+            {
+                continue;
+            }
+            let entry = stats_indices.entry(col_name).or_default();
+            match stat_type {
+                "minValues" => entry.min_index = Some(i),
+                "maxValues" => entry.max_index = Some(i),
+                "nullCount" => entry.nullcount_index = Some(i),
+                _ => {}
+            }
+        }
+    }
+
+    (stats_indices, partition_indices)
 }
