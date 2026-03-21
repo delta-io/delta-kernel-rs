@@ -1054,15 +1054,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_expiration_configured(Some(1000), None, false)]
-    #[case::null_last_updated_never_expires(None, Some(5000), false)]
+    #[case::no_expiration_configured(None, Some(1000), false)]
+    #[case::null_last_updated_never_expires(Some(5000), None, false)]
     #[case::both_none(None, None, false)]
-    #[case::last_updated_before_expiration(Some(1000), Some(2000), true)]
+    #[case::last_updated_before_expiration(Some(2000), Some(1000), true)]
     #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
-    #[case::last_updated_after_expiration(Some(3000), Some(2000), false)]
+    #[case::last_updated_after_expiration(Some(2000), Some(3000), false)]
     fn test_is_set_txn_expired(
-        #[case] last_updated: Option<i64>,
         #[case] expiration_timestamp: Option<i64>,
+        #[case] last_updated: Option<i64>,
         #[case] expected: bool,
     ) {
         assert_eq!(
