@@ -492,7 +492,7 @@ impl LogSegmentFiles {
     /// - Window 4 [8501, 9500]: checkpoint at v8900 found -> stop
     /// All files from windows 1-4 are then passed to `build_log_segment_files`, which
     /// returns a log segment with the checkpoint at v8900 and all commits from v8901 to v12500
-    #[instrument(name = "log.backward_scan", skip_all, err)]
+    #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,
         log_root: &Url,
