@@ -244,6 +244,10 @@ impl ListingAccumulator {
     }
 }
 
+/// Size of backward-scan window in LogSegmentFiles::list_with_backward_checkpoint_scan`
+/// The range `[upper - 999, upper]` is inclusive on both ends, giving exactly 1000 versions per window
+const BACKWARD_SCAN_WINDOW_SIZE: u64 = 999;
+
 impl LogSegmentFiles {
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
     /// listed from storage) and `log_tail` (catalog-provided commits)
@@ -298,7 +302,7 @@ impl LogSegmentFiles {
             acc.process_file(file);
         }
 
-        // Phase 2: resolve end version upper bound and resolve log_tail start version
+        // Phase 2: resolve log_tail start version and end version upper bound
         let resolved_start = match start_version {
             Some(v) => v,
             None => {
@@ -480,6 +484,15 @@ impl LogSegmentFiles {
     /// This avoids a full forward listing when we have an upper-bound version but no checkpoint
     /// hint: instead of listing from version 0, we walk backward from `end_version` in bounded
     /// windows, stopping as soon as we find a complete checkpoint (or reach version 0).
+    ///
+    /// For example, given end_version = 12500 and a checkpoint at v8900:
+    /// - Window 1 [11501, 12500]: no checkpoint -> continue
+    /// - Window 2 [10501, 11500]: no checkpoint -> continue
+    /// - Window 3 [9501, 10500]: no checkpoint -> continue
+    /// - Window 4 [8501, 9500]: checkpoint at v8900 found -> stop
+    /// All files from windows 1-4 are then passed to `build_log_segment_files`, which
+    /// returns a log segment with the checkpoint at v8900 and all commits from v8901 to v12500
+    #[instrument(name = "log.backward_scan", skip_all, err)]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,
         log_root: &Url,
@@ -492,7 +505,7 @@ impl LogSegmentFiles {
         let mut upper = end_version;
 
         loop {
-            let lower = upper.saturating_sub(999);
+            let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
             let window_files = list_from_storage(storage, log_root, lower, upper)?
                 .collect::<DeltaResult<Vec<_>>>()?;
 
