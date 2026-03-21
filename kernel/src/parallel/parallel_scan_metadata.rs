@@ -102,6 +102,8 @@ impl ParallelState {
     /// # Example
     ///
     /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::scan::ParallelState;
     /// # use tracing::instrument;
     /// #[instrument(skip_all, name = "parallel_scan")]
     /// async fn process(state: Arc<ParallelState>) {
