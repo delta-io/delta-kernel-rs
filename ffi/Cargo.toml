@@ -26,8 +26,8 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.20.0" }
-uc-client = { path = "../uc-client", optional = true }
-uc-catalog = { path = "../uc-catalog", optional = true }
+delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
+unitycatalog-client-api = { path = "../unitycatalog-client-api", optional = true }
 
 [build-dependencies]
 cbindgen = "0.29.2"
@@ -49,7 +49,7 @@ default = ["default-engine-rustls", "arrow"]
 default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
 catalog-managed = ["delta_kernel/catalog-managed"]
-uc-catalog = [ "dep:uc-catalog", "dep:uc-client" ]
+delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unitycatalog-client-api" ]
 arrow = ["arrow-57"]
 arrow-57 = ["delta_kernel/arrow-57"]
 arrow-56 = ["delta_kernel/arrow-56"]
