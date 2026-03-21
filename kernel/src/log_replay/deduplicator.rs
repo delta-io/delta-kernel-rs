@@ -3,10 +3,11 @@
 //! The [`Deduplicator`] trait supports two deduplication strategies:
 //!
 //! - **JSON commit files** (`is_log_batch = true`): Tracks (path, dv_unique_id) and updates
-//!   the hashmap as files are seen. Implementation: [`FileActionDeduplicator`]
+//!   the seen set as files are encountered. Implementation: [`FileActionDeduplicator`]
 //!
 //! - **Checkpoint files** (`is_log_batch = false`): Uses (path, dv_unique_id) to filter actions
-//!   using a read-only hashmap pre-populated from the commit log phase. Future implementation.
+//!   against a read-only seen set pre-populated from the commit log phase.
+//!   Implementation: [`CheckpointDeduplicator`]
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
@@ -22,12 +23,12 @@ use crate::DeltaResult;
 /// that turn out to be duplicates and never need to be inserted into the seen set.
 pub(crate) struct ExtractedFileAction<'a> {
     /// Borrowed path from the action batch column data.
-    pub path: &'a str,
+    pub(crate) path: &'a str,
     /// Deletion vector unique ID, if present. Owned because it is built from a `format!`
     /// of three separate DV fields; there is no single column to borrow from.
-    pub dv_unique_id: Option<String>,
+    pub(crate) dv_unique_id: Option<String>,
     /// `true` for add actions, `false` for remove actions.
-    pub is_add: bool,
+    pub(crate) is_add: bool,
 }
 
 pub(crate) trait Deduplicator {
