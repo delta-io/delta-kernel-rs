@@ -82,6 +82,8 @@ impl SnapshotBuilder {
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
     ///
+    /// Reports metrics: [`MetricEvent::SnapshotCompleted`] or [`MetricEvent::SnapshotFailed`].
+    ///
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
@@ -388,6 +390,24 @@ mod tests {
         (engine, store, table_root, reporter)
     }
 
+    fn assert_has_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
+        let events = reporter.events.lock().unwrap();
+        assert!(events.iter().any(pred), "{msg}");
+    }
+
+    fn assert_no_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
+        let events = reporter.events.lock().unwrap();
+        assert!(!events.iter().any(pred), "{msg}");
+    }
+
+    fn is_snapshot_completed(e: &MetricEvent) -> bool {
+        matches!(e, MetricEvent::SnapshotCompleted { .. })
+    }
+
+    fn is_snapshot_failed(e: &MetricEvent) -> bool {
+        matches!(e, MetricEvent::SnapshotFailed { .. })
+    }
+
     #[test_log::test(tokio::test)]
     async fn snapshot_failed_emits_metric_on_error() {
         let (engine, store, table_root, reporter) = setup_test_with_reporter();
@@ -415,18 +435,15 @@ mod tests {
         let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
         assert!(result.is_err());
 
-        let events = reporter.events.lock().unwrap();
-        let has_snapshot_failed = events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. }));
-        assert!(has_snapshot_failed, "expected a SnapshotFailed event");
-
-        let has_snapshot_completed = events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. }));
-        assert!(
-            !has_snapshot_completed,
-            "should not emit SnapshotCompleted on failure"
+        assert_has_event(
+            &reporter,
+            is_snapshot_failed,
+            "expected a SnapshotFailed event",
+        );
+        assert_no_event(
+            &reporter,
+            is_snapshot_completed,
+            "should not emit SnapshotCompleted on failure",
         );
     }
 
@@ -488,21 +505,15 @@ mod tests {
             .build(engine.as_ref());
         assert!(result.is_err());
 
-        let events = reporter.events.lock().unwrap();
-        let has_snapshot_failed = events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. }));
-        assert!(
-            has_snapshot_failed,
-            "expected a SnapshotFailed event when updating to an earlier version"
+        assert_has_event(
+            &reporter,
+            is_snapshot_failed,
+            "expected a SnapshotFailed event when updating to an earlier version",
         );
-
-        let has_snapshot_completed = events
-            .iter()
-            .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. }));
-        assert!(
-            !has_snapshot_completed,
-            "should not emit SnapshotCompleted on failure"
+        assert_no_event(
+            &reporter,
+            is_snapshot_completed,
+            "should not emit SnapshotCompleted on failure",
         );
     }
 
@@ -515,19 +526,28 @@ mod tests {
             .build(engine.as_ref())
             .unwrap();
 
+        assert_has_event(
+            &reporter,
+            is_snapshot_completed,
+            "expected a SnapshotCompleted event",
+        );
+
         let events = reporter.events.lock().unwrap();
 
-        let log_segment_loaded = events.iter().find_map(|e| match e {
-            MetricEvent::LogSegmentLoaded { duration, .. } => Some(*duration),
-            _ => None,
-        });
-        let snapshot_completed = events.iter().find_map(|e| match e {
-            MetricEvent::SnapshotCompleted { total_duration, .. } => Some(*total_duration),
-            _ => None,
-        });
-
-        let log_segment_duration = log_segment_loaded.expect("expected LogSegmentLoaded event");
-        let snapshot_duration = snapshot_completed.expect("expected SnapshotCompleted event");
+        let log_segment_duration = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoaded { duration, .. } => Some(*duration),
+                _ => None,
+            })
+            .expect("expected LogSegmentLoaded event");
+        let snapshot_duration = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::SnapshotCompleted { total_duration, .. } => Some(*total_duration),
+                _ => None,
+            })
+            .expect("expected SnapshotCompleted event");
 
         assert!(
             snapshot_duration >= log_segment_duration,
@@ -535,10 +555,7 @@ mod tests {
              LogSegmentLoaded.duration ({log_segment_duration:?})"
         );
 
-        let snapshot_completed_count = events
-            .iter()
-            .filter(|e| matches!(e, MetricEvent::SnapshotCompleted { .. }))
-            .count();
+        let snapshot_completed_count = events.iter().filter(|e| is_snapshot_completed(e)).count();
         assert_eq!(
             snapshot_completed_count, 1,
             "expected exactly one SnapshotCompleted event"
