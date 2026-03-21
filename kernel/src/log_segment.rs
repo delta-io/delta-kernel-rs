@@ -447,6 +447,66 @@ impl LogSegment {
         Ok(new_log_segment)
     }
 
+    /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
+    /// The checkpoint must be at `end_version`.
+    pub(crate) fn new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
+        require!(
+            checkpoint.is_checkpoint(),
+            Error::internal_error(format!(
+                "Cannot update LogSegment with checkpoint. Path is not a checkpoint file. \
+                Path: {}, Type: {:?}.",
+                checkpoint.location.location, checkpoint.file_type
+            ))
+        );
+        require!(
+            checkpoint.version == self.end_version,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with checkpoint. Checkpoint version ({}) does not \
+                equal LogSegment end_version ({}).",
+                checkpoint.version, self.end_version
+            ))
+        );
+
+        let v = checkpoint.version;
+        let mut new_log_segment = self.clone();
+        new_log_segment.checkpoint_version = Some(v);
+        new_log_segment.listed.checkpoint_parts = vec![checkpoint];
+        // A snapshot at version N only contains commits and compactions at versions <= N,
+        // so a checkpoint at N covers everything and we can clear them entirely.
+        new_log_segment.listed.ascending_commit_files.clear();
+        new_log_segment.listed.ascending_compaction_files.clear();
+        // TODO(#839): Once CheckpointWriter exposes the output schema, thread it through
+        // here instead of None. Today the schema is computed inside checkpoint_data() but
+        // not returned. With None, the next scan will read the checkpoint parquet footer
+        // to determine the schema (e.g. whether stats_parsed or sidecar columns exist).
+        new_log_segment.checkpoint_schema = None;
+        Ok(new_log_segment)
+    }
+
+    /// Creates a new LogSegment with the given CRC file recorded as the latest.
+    /// The CRC file must be at `end_version`.
+    pub(crate) fn new_with_crc_file(&self, crc_file: ParsedLogPath) -> DeltaResult<Self> {
+        require!(
+            crc_file.file_type == LogPathFileType::Crc,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with CRC. Path is not a CRC file. \
+                Path: {}, Type: {:?}.",
+                crc_file.location.location, crc_file.file_type
+            ))
+        );
+        require!(
+            crc_file.version == self.end_version,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with CRC. CRC version ({}) does not \
+                equal LogSegment end_version ({}).",
+                crc_file.version, self.end_version
+            ))
+        );
+        let mut new_log_segment = self.clone();
+        new_log_segment.listed.latest_crc_file = Some(crc_file);
+        Ok(new_log_segment)
+    }
+
     pub(crate) fn new_as_published(&self) -> DeltaResult<Self> {
         // In the future, we can additionally convert the staged commit files to published commit
         // files. That would reqire faking their FileMeta locations.
