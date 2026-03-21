@@ -942,23 +942,29 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 }
 
 /// Verifies that a set transaction with null `last_updated` never expires, even with the most
-/// aggressive retention ("interval 0 seconds"). Uses `add_commit` to write a raw txn action
-/// that omits `lastUpdated`, then verifies via log replay (CRC won't cover this commit since
-/// the CRC is written at v0).
+/// aggressive retention ("interval 0 seconds"). Uses `create_table` for the table setup and
+/// `add_commit` to write a raw txn action that omits `lastUpdated`, then verifies via log
+/// replay (CRC won't cover the new commit since no CRC is written after v0).
 #[tokio::test]
 async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let store = Arc::new(LocalFileSystem::new());
-
     // v0: create table with aggressive retention
-    let v0 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
-{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"createdTime":0,"configuration":{"delta.setTransactionRetentionDuration":"interval 0 seconds"}}}"#;
-    add_commit(&table_path, store.as_ref(), 0, v0.to_string())
-        .await
-        .unwrap();
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    create_table(&table_path, schema, "test_engine")
+        .with_table_properties([(
+            "delta.setTransactionRetentionDuration",
+            "interval 0 seconds",
+        )])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
 
     // v1: raw commit with txn action that omits lastUpdated
+    let store = Arc::new(LocalFileSystem::new());
     add_commit(
         &table_path,
         store.as_ref(),
