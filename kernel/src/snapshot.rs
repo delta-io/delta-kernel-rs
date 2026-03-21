@@ -1,7 +1,7 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,9 +24,9 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::TableFeature;
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::require;
@@ -91,6 +91,46 @@ impl std::fmt::Debug for Snapshot {
             .field("log_segment", &self.log_segment)
             .finish()
     }
+}
+
+/// Convert a physical column name to a logical column name by walking the schema.
+///
+/// For each path component in the physical column, finds the field in the schema whose
+/// `physical_name(mode)` matches, and returns the field's logical name instead.
+fn physical_to_logical_column_name(
+    schema: &StructType,
+    physical_col: &ColumnName,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<ColumnName> {
+    let mut logical_path = Vec::with_capacity(physical_col.path().len());
+    let mut current_struct = schema;
+
+    for (i, physical_component) in physical_col.path().iter().enumerate() {
+        let field = current_struct
+            .fields()
+            .find(|f| f.physical_name(column_mapping_mode) == physical_component.as_str())
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "Physical column name component '{physical_component}' not found in schema"
+                ))
+            })?;
+        logical_path.push(field.name.clone());
+
+        // If not the last component, descend into the struct
+        if i < physical_col.path().len() - 1 {
+            match field.data_type() {
+                crate::DataType::Struct(inner) => current_struct = inner,
+                dt => {
+                    return Err(Error::generic(format!(
+                        "Expected struct type for nested column path, found '{dt}' at '{}'",
+                        field.name
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(ColumnName::new(logical_path))
 }
 
 impl Snapshot {
@@ -542,6 +582,43 @@ impl Snapshot {
         self.table_configuration().table_properties()
     }
 
+    /// The minimum reader version required to read this table.
+    pub fn min_reader_version(&self) -> i32 {
+        self.table_configuration().protocol().min_reader_version()
+    }
+
+    /// The minimum writer version required to write to this table.
+    pub fn min_writer_version(&self) -> i32 {
+        self.table_configuration().protocol().min_writer_version()
+    }
+
+    /// Get the reader feature names for this table's protocol, if using table features
+    /// (reader version 3). Returns `None` for legacy protocols.
+    pub fn reader_features(&self) -> Option<Vec<&str>> {
+        self.table_configuration()
+            .protocol()
+            .reader_features()
+            .map(|features| features.iter().map(|f| f.as_ref()).collect())
+    }
+
+    /// Get the writer feature names for this table's protocol, if using table features
+    /// (writer version 7). Returns `None` for legacy protocols.
+    pub fn writer_features(&self) -> Option<Vec<&str>> {
+        self.table_configuration()
+            .protocol()
+            .writer_features()
+            .map(|features| features.iter().map(|f| f.as_ref()).collect())
+    }
+
+    /// Get the raw metadata configuration for this table.
+    ///
+    /// This returns the `Metadata.configuration` map as stored in the Delta log, containing
+    /// user-defined properties, delta table properties (e.g., `delta.enableInCommitTimestamps`),
+    /// and application-specific properties (e.g., `io.unitycatalog.tableId`).
+    pub fn metadata_configuration(&self) -> &HashMap<String, String> {
+        self.table_configuration().metadata().configuration()
+    }
+
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
     #[internal_api]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
@@ -618,6 +695,43 @@ impl Snapshot {
         }
 
         self.get_domain_metadata_internal(domain, engine)
+    }
+
+    /// Get the logical clustering columns for this snapshot, if clustering is enabled.
+    ///
+    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
+    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
+    /// clustering metadata is malformed.
+    ///
+    /// The columns are returned as logical [`ColumnName`]s. When column mapping is enabled,
+    /// this converts the physical names stored in domain metadata back to logical names using
+    /// the table schema.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    ///
+    /// [`ColumnName`]: crate::expressions::ColumnName
+    pub fn get_clustering_columns(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        let physical_columns = match self.get_clustering_columns_physical(engine)? {
+            Some(cols) => cols,
+            None => return Ok(None),
+        };
+        let column_mapping_mode = self.table_configuration.column_mapping_mode();
+        if matches!(column_mapping_mode, ColumnMappingMode::None) {
+            // No column mapping: physical = logical
+            return Ok(Some(physical_columns));
+        }
+        // Convert physical column names to logical names by walking the schema
+        let schema = self.table_configuration.logical_schema();
+        let logical_columns = physical_columns
+            .iter()
+            .map(|physical_col| {
+                physical_to_logical_column_name(&schema, physical_col, column_mapping_mode)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+        Ok(Some(logical_columns))
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
@@ -888,9 +1002,8 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
-    #[internal_api]
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
-    pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+    pub fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()
@@ -969,6 +1082,7 @@ mod tests {
     use crate::object_store::ObjectStore;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
+    use crate::schema::{MetadataValue, StructField};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
@@ -2393,5 +2507,153 @@ mod tests {
         assert_eq!(versions_and_his, vec![(1, 2), (2, 2)]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_public_protocol_getters() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        assert_eq!(
+            snapshot.min_reader_version(),
+            TABLE_FEATURES_MIN_READER_VERSION
+        );
+        assert_eq!(
+            snapshot.min_writer_version(),
+            TABLE_FEATURES_MIN_WRITER_VERSION
+        );
+
+        let reader_features = snapshot.reader_features().unwrap();
+        assert!(reader_features.contains(&"deletionVectors"));
+
+        let writer_features = snapshot.writer_features().unwrap();
+        assert!(writer_features.contains(&"deletionVectors"));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_configuration() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+
+        // Create a commit with custom configuration
+        let actions = vec![
+            json!({"commitInfo": {"timestamp": 123, "operation": "CREATE TABLE"}}),
+            json!({"protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": []
+            }}),
+            json!({"metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {
+                    "io.unitycatalog.tableId": "abc-123",
+                    "myapp.setting": "value"
+                },
+                "createdTime": 1234567890
+            }}),
+        ];
+        commit(table_root, &storage, 0, actions).await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let config = snapshot.metadata_configuration();
+        assert_eq!(config.get("io.unitycatalog.tableId"), Some(&"abc-123".to_string()));
+        assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_physical_to_logical_column_name_no_mapping() {
+        let schema = crate::schema::StructType::new_unchecked(vec![
+            crate::schema::StructField::new("id", crate::DataType::INTEGER, false),
+            crate::schema::StructField::new("name", crate::DataType::STRING, true),
+        ]);
+        let physical_col = ColumnName::new(["id"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None)
+                .unwrap();
+        assert_eq!(result, ColumnName::new(["id"]));
+    }
+
+    #[test]
+    fn test_physical_to_logical_column_name_with_mapping() {
+        let field = StructField::new("user_id", crate::DataType::INTEGER, false)
+            .with_metadata([(
+                "delta.columnMapping.physicalName".to_string(),
+                MetadataValue::String("col-abc-123".to_string()),
+            )]);
+        let schema = crate::schema::StructType::new_unchecked(vec![field]);
+
+        let physical_col = ColumnName::new(["col-abc-123"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::Name)
+                .unwrap();
+        assert_eq!(result, ColumnName::new(["user_id"]));
+    }
+
+    #[test]
+    fn test_physical_to_logical_column_name_not_found() {
+        let schema = StructType::new_unchecked(vec![StructField::new(
+            "id",
+            crate::DataType::INTEGER,
+            false,
+        )]);
+        let physical_col = ColumnName::new(["nonexistent"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in schema"));
+    }
+
+    #[test]
+    fn test_physical_to_logical_nested_struct_with_mapping() {
+        let inner_field = StructField::new("city", crate::DataType::STRING, true).with_metadata([(
+            "delta.columnMapping.physicalName".to_string(),
+            MetadataValue::String("col-inner-456".to_string()),
+        )]);
+        let inner_struct = StructType::new_unchecked(vec![inner_field]);
+        let outer_field = StructField::new(
+            "address",
+            crate::DataType::Struct(Box::new(inner_struct)),
+            true,
+        )
+        .with_metadata([(
+            "delta.columnMapping.physicalName".to_string(),
+            MetadataValue::String("col-outer-123".to_string()),
+        )]);
+        let schema = StructType::new_unchecked(vec![outer_field]);
+
+        let physical_col = ColumnName::new(["col-outer-123", "col-inner-456"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::Name)
+                .unwrap();
+        assert_eq!(result, ColumnName::new(["address", "city"]));
+    }
+
+    #[test]
+    fn test_physical_to_logical_non_struct_intermediate_errors() {
+        let schema = StructType::new_unchecked(vec![StructField::new(
+            "id",
+            crate::DataType::INTEGER,
+            false,
+        )]);
+        let physical_col = ColumnName::new(["id", "nested"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Expected struct type"));
     }
 }

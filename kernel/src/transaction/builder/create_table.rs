@@ -51,6 +51,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::InCommitTimestamp,
     // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
     TableFeature::VacuumProtocolCheck,
+    // CatalogManaged enables catalog-managed table support (UC CCv2)
+    #[cfg(feature = "catalog-managed")]
+    TableFeature::CatalogManaged,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -1324,5 +1327,31 @@ mod tests {
         ]);
         let columns = vec![ColumnName::new(["col"])];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_feature_signal_accepted() {
+        let properties = HashMap::from([(
+            "delta.feature.catalogManaged".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert!(
+            validated.properties.is_empty(),
+            "Feature signal should be removed from properties"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::CatalogManaged),
+            "CatalogManaged should be in writer_features"
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::CatalogManaged),
+            "CatalogManaged should be in reader_features (ReaderWriter feature)"
+        );
     }
 }
