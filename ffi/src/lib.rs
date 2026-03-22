@@ -900,18 +900,18 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Visit each table properties (key/value pair) for the specified snapshot by invoking the provided
-/// `visit` callback once per entry.
+/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the provided
+/// `visitor` callback once per entry.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an opaque pointer passed to each `visit` invocation,
-/// and a valid `visit` function pointer.
+/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an
+/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_table_configuration(
-    engine_context: NullableCvoid,
+pub unsafe extern "C" fn visit_metadata_configuration(
     snapshot: Handle<SharedSnapshot>,
-    visit: extern "C" fn(
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
         engine_context: NullableCvoid,
         key: KernelStringSlice,
         value: KernelStringSlice,
@@ -924,12 +924,12 @@ pub unsafe extern "C" fn visit_table_configuration(
         .configuration()
         .iter()
         .for_each(|(key, value)| {
-            visit(
+            visitor(
                 engine_context,
                 kernel_string_slice!(key),
                 kernel_string_slice!(value),
-            )
-        })
+            );
+        });
 }
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -1039,11 +1039,12 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
+    use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, TestAction, METADATA, METADATA_WITH_CONFIGURATION,
+        add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
 
     #[no_mangle]
@@ -1133,18 +1134,27 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case(
+        METADATA_WITH_TABLE_PROPERTIES,
+        HashMap::from([
+            (String::from("delta.appendOnly"), String::from("true")),
+            (String::from("custom.key"), String::from("custom_value")),
+        ])
+    )]
+    #[case(METADATA, HashMap::new())]
     #[tokio::test]
-    async fn test_visit_table_configuration() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_visit_metadata_configuration(
+        #[case] metadata: &str,
+        #[case] expected: HashMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
         add_commit(
             table_root,
             storage.as_ref(),
             0,
-            actions_to_string_with_metadata(
-                vec![TestAction::Metadata],
-                METADATA_WITH_CONFIGURATION,
-            ),
+            actions_to_string_with_metadata(vec![TestAction::Metadata], metadata),
         )
         .await?;
 
@@ -1172,17 +1182,9 @@ mod tests {
 
         let mut collected: HashMap<String, String> = HashMap::new();
         let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
-        unsafe { visit_table_configuration(ctx, snap.shallow_copy(), collect_property) };
+        unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
 
-        assert_eq!(
-            collected.get("delta.appendOnly").map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            collected.get("custom.key").map(String::as_str),
-            Some("custom_value")
-        );
-        assert_eq!(collected.len(), 2);
+        assert_eq!(collected, expected);
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
