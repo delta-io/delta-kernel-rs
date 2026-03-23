@@ -274,7 +274,8 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.listed.latest_crc_file.clone()));
+        let new_log_segment_crc_file = new_log_segment.listed.latest_crc_file.clone();
+        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment_crc_file.clone()));
         let (new_metadata, new_protocol) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
@@ -325,9 +326,16 @@ impl Snapshot {
             old_log_segment.checkpoint_schema.clone(),
         )?;
 
-        let lazy_crc = Arc::new(LazyCrc::new(
-            combined_log_segment.listed.latest_crc_file.clone(),
-        ));
+        // Reuse the LazyCrc from the new log segment's P&M reading if the combined
+        // segment picked the same CRC file. This preserves any CRC data already loaded,
+        // which compute_post_commit_crc needs (it only checks already-loaded CRCs, no I/O).
+        let lazy_crc = if combined_log_segment.listed.latest_crc_file == new_log_segment_crc_file {
+            lazy_crc
+        } else {
+            Arc::new(LazyCrc::new(
+                combined_log_segment.listed.latest_crc_file.clone(),
+            ))
+        };
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
