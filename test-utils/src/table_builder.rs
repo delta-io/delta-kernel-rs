@@ -119,6 +119,19 @@ impl LogState {
         }
     }
 
+    /// All standard log states for a table with `n` total versions.
+    /// Useful for cross-product testing across all log configurations.
+    pub fn all(n: u64) -> Vec<Self> {
+        assert!(n >= 2, "need at least 2 versions for meaningful log states");
+        vec![
+            Self::commits(n),
+            Self::checkpoint_v1(n - 1, n),
+            Self::checkpoint_v2(n - 1, n),
+            Self::checkpoint_and_commits(1, n - 2),
+            Self::with_crc(0, n),
+        ]
+    }
+
     /// Total number of versions in this log state.
     fn total_versions(&self) -> u64 {
         match self {
@@ -179,11 +192,36 @@ impl FeatureSet {
         self
     }
 
+    /// Set an arbitrary table property. Useful for properties that don't have a
+    /// dedicated method (e.g. `delta.checkpoint.writeStatsAsJson`).
+    pub fn with_property(mut self, key: &str, value: &str) -> Self {
+        self.table_properties.push((key.into(), value.into()));
+        self
+    }
+
     // -- Features below will be enabled as CreateTable support lands --
     // pub fn dvs(mut self) -> Self { ... }
     // pub fn cdf(mut self) -> Self { ... }
     // pub fn row_tracking(mut self) -> Self { ... }
     // pub fn timestamp_ntz(mut self) -> Self { ... }
+
+    /// All standard feature sets for cross-product testing.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::empty(),
+            Self::new().column_mapping("name"),
+            Self::new().ict(),
+            Self::new().v2_checkpoint(),
+            Self::new().column_mapping("name").ict(),
+        ]
+    }
+
+    /// Whether v2_checkpoint is enabled.
+    fn has_v2_checkpoint(&self) -> bool {
+        self.table_properties
+            .iter()
+            .any(|(k, v)| k == "delta.feature.v2Checkpoint" && v == "supported")
+    }
 }
 
 // ---- VersionTarget ----------------------------------------------------------
@@ -258,8 +296,37 @@ impl TestTableBuilder {
         self
     }
 
+    /// Build all valid (LogState, FeatureSet) combinations for `total_versions` versions.
+    /// Returns one [`TestTable`] per combination. V2 checkpoint log states are automatically
+    /// paired with v2_checkpoint-enabled feature sets, and skipped for feature sets that
+    /// don't include it.
+    pub fn all_tables(total_versions: u64) -> DeltaResult<Vec<TestTable>> {
+        let mut tables = Vec::new();
+        for log_state in LogState::all(total_versions) {
+            let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+            for features in FeatureSet::all() {
+                if needs_v2 && !features.has_v2_checkpoint() {
+                    continue;
+                }
+                tables.push(
+                    Self::new()
+                        .log_state(log_state.clone())
+                        .features(features)
+                        .build()?,
+                );
+            }
+        }
+        Ok(tables)
+    }
+
     /// Build the table and return a [`TestTable`] handle to the store.
-    pub fn build(self) -> DeltaResult<TestTable> {
+    pub fn build(mut self) -> DeltaResult<TestTable> {
+        // Auto-enable v2_checkpoint feature when CheckpointV2 log state is used
+        if matches!(self.log_state, LogState::CheckpointV2 { .. })
+            && !self.features.has_v2_checkpoint()
+        {
+            self.features = self.features.v2_checkpoint();
+        }
         tokio::runtime::Runtime::new()
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
             .block_on(self.build_async())
@@ -304,7 +371,11 @@ impl TestTableBuilder {
                 v,
             )
             .await?;
-            snapshot = result.unwrap_committed().post_commit_snapshot().unwrap().clone();
+            snapshot = result
+                .unwrap_committed()
+                .post_commit_snapshot()
+                .unwrap()
+                .clone();
         }
 
         // -- Checkpoints --
@@ -363,11 +434,7 @@ async fn write_data_commit(
         let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
         let add_files = engine
-            .write_parquet(
-                &ArrowEngineData::new(batch),
-                &write_context,
-                HashMap::new(),
-            )
+            .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
             .await?;
         txn.add_files(add_files);
     }
@@ -489,13 +556,11 @@ fn default_schema() -> SchemaRef {
 fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayRef {
     match arrow_type {
         ArrowDataType::Boolean => {
-            let values: Vec<bool> = (0..rows).map(|i| (base as usize + i) % 2 == 0).collect();
+            let values: Vec<bool> = (0..rows).map(|i| (base as usize + i).is_multiple_of(2)).collect();
             Arc::new(BooleanArray::from(values))
         }
         ArrowDataType::Int8 => {
-            let values: Vec<i8> = (0..rows)
-                .map(|i| ((base + i as i32) % 120) as i8)
-                .collect();
+            let values: Vec<i8> = (0..rows).map(|i| ((base + i as i32) % 120) as i8).collect();
             Arc::new(Int8Array::from(values))
         }
         ArrowDataType::Int16 => {
@@ -509,21 +574,15 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
             Arc::new(Int32Array::from(values))
         }
         ArrowDataType::Int64 => {
-            let values: Vec<i64> = (0..rows)
-                .map(|i| (base + i as i32) as i64 * 1000)
-                .collect();
+            let values: Vec<i64> = (0..rows).map(|i| (base + i as i32) as i64 * 1000).collect();
             Arc::new(Int64Array::from(values))
         }
         ArrowDataType::Float32 => {
-            let values: Vec<f32> = (0..rows)
-                .map(|i| base as f32 + i as f32 * 0.5)
-                .collect();
+            let values: Vec<f32> = (0..rows).map(|i| base as f32 + i as f32 * 0.5).collect();
             Arc::new(Float32Array::from(values))
         }
         ArrowDataType::Float64 => {
-            let values: Vec<f64> = (0..rows)
-                .map(|i| base as f64 + i as f64 * 0.25)
-                .collect();
+            let values: Vec<f64> = (0..rows).map(|i| base as f64 + i as f64 * 0.25).collect();
             Arc::new(Float64Array::from(values))
         }
         ArrowDataType::Utf8 => {
@@ -744,6 +803,19 @@ mod tests {
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_tables() -> DeltaResult<()> {
+        let tables = TestTableBuilder::all_tables(3)?;
+        // 5 log states x 5 feature sets = 25, minus 4 invalid (v2 checkpoint without feature)
+        assert_eq!(tables.len(), 21);
+        for table in &tables {
+            let engine = table.engine();
+            let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+            assert_eq!(snap.version(), 2);
+        }
         Ok(())
     }
 }
