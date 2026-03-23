@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::actions::get_log_txn_schema;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::SetTransaction;
@@ -35,16 +37,13 @@ impl SetTransactionScanner {
         engine: &dyn Engine,
         expiration_timestamp: Option<i64>,
     ) -> DeltaResult<Option<SetTransaction>> {
-        let mut transactions = scan_application_transactions(
-            log_segment,
-            Some(application_id),
-            engine,
-            expiration_timestamp,
-        )?;
+        let filter = HashSet::from([application_id.to_owned()]);
+        let mut transactions =
+            scan_application_transactions(log_segment, Some(filter), engine, expiration_timestamp)?;
         Ok(transactions.remove(application_id))
     }
 
-    /// Scan the Delta Log to obtain the all of the latest `txn` actions.
+    /// Scan the Delta Log to obtain all of the latest `txn` actions.
     ///
     /// This performs log replay and populates the `SetTransactionMap` with the latest `txn` action
     /// found for each app_id.
@@ -58,24 +57,21 @@ impl SetTransactionScanner {
     }
 }
 
-/// Scan the entire log for all application ids but terminate early if a specific application id
-/// is provided
-// TODO: we could have this track _multiple_ application ids instead of only up to one.
+/// Scan the entire log for all application ids but terminate early if a filter of specific
+/// application ids is provided and all requested ids have been found.
 fn scan_application_transactions(
     log_segment: &LogSegment,
-    application_id: Option<&str>,
+    application_ids: Option<HashSet<String>>,
     engine: &dyn Engine,
     expiration_timestamp: Option<i64>,
 ) -> DeltaResult<SetTransactionMap> {
-    let mut visitor =
-        SetTransactionVisitor::new(application_id.map(|s| s.to_owned()), expiration_timestamp);
-    // If a specific id is requested then we can terminate log replay early as soon as it was
-    // found. If all ids are requested then we are forced to replay the entire log.
+    let mut visitor = SetTransactionVisitor::new(application_ids, expiration_timestamp);
+    // If specific ids are requested then we can terminate log replay early as soon as all
+    // have been found. If all ids are requested then we are forced to replay the entire log.
     for maybe_data in replay_for_app_ids(log_segment, engine)? {
         let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;
-        // if a specific id is requested and a transaction was found, then return
-        if application_id.is_some() && !visitor.set_transactions.is_empty() {
+        if visitor.filter_found() {
             break;
         }
     }
@@ -103,6 +99,7 @@ mod tests {
 
     use crate::arrow::array::StringArray;
     use itertools::Itertools;
+    use rstest::rstest;
 
     fn get_latest_transactions(
         path: &str,
@@ -211,5 +208,75 @@ mod tests {
         // app_without_last_updated should be kept
         assert_eq!(visitor.set_transactions.len(), 1);
         assert!(visitor.set_transactions.contains_key("app_without_time"));
+    }
+
+    #[rstest]
+    #[case::subset_single_id(
+        HashSet::from(["my-app".to_owned()]),
+        1,
+        vec!["my-app"],
+    )]
+    #[case::all_ids(
+        HashSet::from(["my-app".to_owned(), "my-app2".to_owned()]),
+        2,
+        vec!["my-app", "my-app2"],
+    )]
+    #[case::nonexistent_id(
+        HashSet::from(["nonexistent".to_owned()]),
+        0,
+        vec![],
+    )]
+    fn test_scan_with_app_id_filter(
+        #[case] filter: HashSet<String>,
+        #[case] expected_len: usize,
+        #[case] expected_app_ids: Vec<&str>,
+    ) {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-no-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let log_segment = snapshot.log_segment();
+
+        let txns = scan_application_transactions(log_segment, Some(filter), &engine, None).unwrap();
+        assert_eq!(txns.len(), expected_len);
+        for app_id in expected_app_ids {
+            assert!(txns.contains_key(app_id), "missing app_id: {app_id}");
+        }
+    }
+
+    #[rstest]
+    #[case::all_found(
+        Some(HashSet::from(["app1".to_owned(), "app2".to_owned()])),
+        vec![
+            r#"{"txn":{"appId":"app1","version":1}}"#,
+            r#"{"txn":{"appId":"app2","version":2}}"#,
+        ],
+        true,
+    )]
+    #[case::partial_found(
+        Some(HashSet::from(["app1".to_owned(), "app2".to_owned()])),
+        vec![r#"{"txn":{"appId":"app1","version":1}}"#],
+        false,
+    )]
+    #[case::no_filter(
+        None,
+        vec![
+            r#"{"txn":{"appId":"app1","version":1}}"#,
+            r#"{"txn":{"appId":"app2","version":2}}"#,
+        ],
+        false,
+    )]
+    fn test_filter_found(
+        #[case] filter: Option<HashSet<String>>,
+        #[case] json_rows: Vec<&str>,
+        #[case] expected: bool,
+    ) {
+        let json_strings: StringArray = json_rows.into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut visitor = SetTransactionVisitor::new(filter, None);
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.filter_found(), expected);
     }
 }

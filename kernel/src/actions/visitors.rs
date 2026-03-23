@@ -295,30 +295,33 @@ impl RowVisitor for CdcVisitor {
 
 pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 
-/// Extract application transaction actions from the log into a map
+/// Extract application transaction actions from the log into a map.
 ///
-/// This visitor maintains the first entry for each application id it
-/// encounters.  When a specific application id is required then
-/// `application_id` can be set. This bounds the memory required for the
-/// visitor to at most one entry and reduces the amount of processing
-/// required.
+/// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
 ///
+/// This visitor maintains the first entry for each application id it encounters. An application id
+/// filter may be included to only retain transactions for a specific set of application ids, which
+/// bounds memory requirements and enables early termination once all requested ids are found.
 #[derive(Default, Debug)]
 #[internal_api]
 pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
-    pub(crate) application_id: Option<String>,
+    pub(crate) application_ids: Option<HashSet<String>>,
     /// Minimum timestamp for transaction retention. Transactions with last_updated
     /// older than or equal to this timestamp will be filtered out. None means no filtering.
     expiration_timestamp: Option<i64>,
 }
 
 impl SetTransactionVisitor {
-    /// Create a new visitor. When application_id is set then bookkeeping is only for that id only
-    pub(crate) fn new(application_id: Option<String>, expiration_timestamp: Option<i64>) -> Self {
+    /// Create a new visitor. When `application_ids` is set, only transactions for the specified
+    /// application ids are retained.
+    pub(crate) fn new(
+        application_ids: Option<HashSet<String>>,
+        expiration_timestamp: Option<i64>,
+    ) -> Self {
         SetTransactionVisitor {
             set_transactions: HashMap::default(),
-            application_id,
+            application_ids,
             expiration_timestamp,
         }
     }
@@ -344,6 +347,15 @@ impl SetTransactionVisitor {
             last_updated,
         })
     }
+
+    /// Returns true if an application id filter is set and all requested application ids have
+    /// been found. This enables early termination of log replay once all N requested application
+    /// ids have been discovered.
+    pub(crate) fn filter_found(&self) -> bool {
+        self.application_ids
+            .as_ref()
+            .is_some_and(|filter| self.set_transactions.len() == filter.len())
+    }
 }
 
 impl RowVisitor for SetTransactionVisitor {
@@ -357,11 +369,11 @@ impl RowVisitor for SetTransactionVisitor {
         // Assumes batches are visited in reverse order relative to the log
         for i in 0..row_count {
             if let Some(app_id) = getters[0].get_opt(i, "txn.appId")? {
-                // if caller requested a specific id then only visit matches
+                // if caller requested specific ids then only visit matches
                 if self
-                    .application_id
+                    .application_ids
                     .as_ref()
-                    .is_none_or(|requested| requested.eq(&app_id))
+                    .is_none_or(|requested| requested.contains(&app_id))
                 {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
                     if is_set_txn_expired(self.expiration_timestamp, txn.last_updated) {
