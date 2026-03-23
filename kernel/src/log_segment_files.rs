@@ -423,7 +423,6 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let log_tail_fallback = log_tail.clone();
         let listed_files = Self::list(
             storage,
             log_root,
@@ -433,21 +432,10 @@ impl LogSegmentFiles {
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            // The checkpoint hint was stale or the checkpoint files were removed. Recover by
-            // falling back to a backward scan from the upper bound
-            let upper = end_version
-                .or_else(|| listed_files.latest_commit_file.as_ref().map(|f| f.version))
-                .ok_or_else(|| {
-                    Error::invalid_checkpoint(
-                        "Had a _last_checkpoint hint but found no checkpoints or commits",
-                    )
-                })?;
-            return Self::list_with_backward_checkpoint_scan(
-                storage,
-                log_root,
-                log_tail_fallback,
-                upper,
-            );
+            // Kernel should not compensate for corrupt tables, so we fail if we can't find a checkpoint
+            return Err(Error::invalid_checkpoint(
+                "Had a _last_checkpoint hint but didn't find any checkpoints",
+            ));
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(
