@@ -94,10 +94,10 @@ See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for details on how tags work. Re
 
 ## Workload data layout
 
-Each table lives in its own subdirectory under `benchmarks/data/workloads/benchmarks/`:
+Each table lives in its own subdirectory under `benchmarks/workloads/benchmarks/`:
 
 ```
-benchmarks/data/workloads/
+benchmarks/workloads/
 ├── benchmarks/
 │   └── <table_name>/
 │       ├── tableInfo.json        # describes the table (name, schema, protocol, etc.)
@@ -109,9 +109,9 @@ benchmarks/data/workloads/
 
 ## Loading workloads
 
-Workloads are loaded from `benchmarks/data/workloads.tar.gz`. On first run the tarball is extracted to `benchmarks/data/workloads/` and a `.done` file is written (to `benchmarks/data/workloads/`) to skip re-extraction on subsequent runs. To pick up changes to the tarball, delete the `.done` file.
+Workloads are downloaded from the DAT GitHub release and extracted to `benchmarks/workloads/` automatically by `build.rs` when the crate is built. A `.done` marker file is written on success to skip re-downloading on subsequent builds. To force a fresh download, delete `benchmarks/workloads/.done`.
 
-Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/data/workloads/benchmarks/`, loading `tableInfo.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
+Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/workloads/benchmarks/`, loading `tableInfo.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
 ## Adding a new table
 
@@ -121,7 +121,7 @@ To benchmark against a custom Delta table:
    ```bash
    cargo bench -p delta_kernel_benchmarks --bench workload_bench
    ```
-2. Create a directory for the new table under `benchmarks/data/workloads/benchmarks/`:
+2. Create a directory for the new table under `benchmarks/workloads/benchmarks/`:
    ```
    benchmarks/data/workloads/benchmarks/<tableName>/
    ├── tableInfo.json       # see TableInfo section below for required fields
@@ -133,13 +133,6 @@ To benchmark against a custom Delta table:
    ```bash
    cargo bench -p delta_kernel_benchmarks --bench workload_bench "<table_name>"
    ```
-
-If you want to commit this change and add it to the `workloads.tar.gz` archive:
-```bash
-cd benchmarks/data/workloads
-tar -czf ../workloads.tar.gz .
-```
-Then commit the updated archive and delete the `.done` file so it is re-extracted on the next run.
 
 ## Entities
 
@@ -238,5 +231,7 @@ Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so t
 | `src/models.rs` | Data types: `TableInfo`, `Spec`, `Workload`, `ReadConfig`, `ReadOperation` |
 | `src/predicate_parser.rs` | SQL WHERE clause to kernel `Predicate` parser |
 | `src/runners.rs` | `WorkloadRunner` trait and implementations: `ReadMetadataRunner`, `SnapshotConstructionRunner` |
-| `src/utils.rs` | Workload loading: extracts the tarball and deserializes all workloads |
+| `src/utils.rs` | Workload loading: deserializes workloads from the extracted data directory |
 | `benches/workload_bench.rs` | Criterion entry point — loads workloads, builds runners, drives benchmarks |
+| `build.rs` | Downloads and extracts benchmark workloads from the DAT GitHub release at build time |
+

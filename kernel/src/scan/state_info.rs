@@ -126,16 +126,14 @@ fn build_data_skipping_schemas(
         (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
             // Partition values extracted from the string map via MapToStruct are always
             // nullable (map lookup can return null), so we force all partition fields nullable.
-            let fields: Vec<StructField> = ref_schema
-                .fields()
-                .filter(|f| tps.field(f.name()).is_some())
-                .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
-                .collect();
-            if fields.is_empty() {
-                None
-            } else {
-                Some(Arc::new(StructType::new_unchecked(fields)))
-            }
+            ref_schema
+                .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
+                .map(|partition_schema| {
+                    let nullable_fields = partition_schema
+                        .fields()
+                        .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
+                    Arc::new(StructType::new_unchecked(nullable_fields))
+                })
         }
         _ => None,
     };
@@ -190,18 +188,14 @@ fn build_data_skipping_schemas(
         // Split referenced columns into data columns and partition columns.
         // Data columns get min/max/nullCount stats; partition columns get exact values.
         (_, PhysicalPredicate::Some(_, schema)) => {
-            let data_fields: Vec<StructField> = schema
-                .fields()
-                .filter(|f| {
+            let data_stats = schema
+                .with_fields_filtered_nonempty(|f| {
                     predicate_partition_schema
                         .as_ref()
-                        .is_none_or(|ps| ps.field(f.name()).is_none())
-                })
-                .cloned()
-                .collect();
-
-            let data_schema = StructType::new_unchecked(data_fields);
-            let data_stats = build_stats_schema(&data_schema);
+                        .is_none_or(|partition_schema| partition_schema.field(f.name()).is_none())
+                })?
+                .as_ref()
+                .and_then(build_stats_schema);
             Ok((data_stats, predicate_partition_schema))
         }
         // No stats output and no predicate
