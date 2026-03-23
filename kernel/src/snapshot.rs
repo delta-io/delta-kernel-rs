@@ -339,49 +339,6 @@ impl Snapshot {
         )))
     }
 
-    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
-    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
-    /// snapshot to a later version.
-    ///
-    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
-    fn try_new_from(
-        existing_snapshot: Arc<Snapshot>,
-        log_tail: Vec<ParsedLogPath>,
-        engine: &dyn Engine,
-        version: impl Into<Option<Version>>,
-        operation_id: Option<MetricId>,
-    ) -> DeltaResult<Arc<Self>> {
-        let operation_id = operation_id.unwrap_or_default();
-        let reporter = engine.get_metrics_reporter();
-
-        let start = Instant::now();
-        let result =
-            Self::try_new_from_impl(existing_snapshot, log_tail, engine, version, operation_id);
-        let snapshot_duration = start.elapsed();
-
-        match result {
-            Ok(snapshot) => {
-                reporter.as_ref().inspect(|r| {
-                    r.report(MetricEvent::SnapshotCompleted {
-                        operation_id,
-                        version: snapshot.version(),
-                        total_duration: snapshot_duration,
-                    });
-                });
-                Ok(snapshot)
-            }
-            Err(e) => {
-                reporter.as_ref().inspect(|r| {
-                    r.report(MetricEvent::SnapshotFailed {
-                        operation_id,
-                        duration: snapshot_duration,
-                    });
-                });
-                Err(e)
-            }
-        }
-    }
-
     /// Implementation of snapshot creation from log segment.
     ///
     /// Reports metrics: `ProtocolMetadataLoaded`.
@@ -416,46 +373,6 @@ impl Snapshot {
             table_configuration,
             lazy_crc,
         ))
-    }
-
-    /// Create a new [`Snapshot`] instance.
-    ///
-    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
-    pub(crate) fn try_new_from_log_segment(
-        location: Url,
-        log_segment: LogSegment,
-        engine: &dyn Engine,
-        operation_id: Option<MetricId>,
-    ) -> DeltaResult<Self> {
-        let operation_id = operation_id.unwrap_or_default();
-        let reporter = engine.get_metrics_reporter();
-
-        let start = Instant::now();
-        let result =
-            Self::try_new_from_log_segment_impl(location, log_segment, engine, operation_id);
-        let snapshot_duration = start.elapsed();
-
-        match result {
-            Ok(snapshot) => {
-                reporter.as_ref().inspect(|r| {
-                    r.report(MetricEvent::SnapshotCompleted {
-                        operation_id,
-                        version: snapshot.table_configuration.version(),
-                        total_duration: snapshot_duration,
-                    });
-                });
-                Ok(snapshot)
-            }
-            Err(e) => {
-                reporter.as_ref().inspect(|r| {
-                    r.report(MetricEvent::SnapshotFailed {
-                        operation_id,
-                        duration: snapshot_duration,
-                    });
-                });
-                Err(e)
-            }
-        }
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -2121,7 +2038,13 @@ mod tests {
             .build(&engine)?;
 
         // Test with empty log tail - should return same snapshot
-        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None, None)?;
+        let result = Snapshot::try_new_from_impl(
+            base_snapshot.clone(),
+            vec![],
+            &engine,
+            None,
+            MetricId::default(),
+        )?;
         assert_eq!(result, base_snapshot);
 
         Ok(())
@@ -2190,9 +2113,14 @@ mod tests {
             .ok_or_else(|| Error::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 
-        // Create new snapshot from base to version 2 using try_new_from directly
-        let new_snapshot =
-            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2), None)?;
+        // Create new snapshot from base to version 2 using try_new_from_impl directly
+        let new_snapshot = Snapshot::try_new_from_impl(
+            base_snapshot.clone(),
+            log_tail,
+            &engine,
+            Some(2),
+            MetricId::default(),
+        )?;
 
         // Latest commit should now be version 2
         assert_eq!(
@@ -2243,13 +2171,23 @@ mod tests {
             .build(&engine)?;
 
         // Test requesting same version - should return same snapshot
-        let same_version =
-            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1), None)?;
+        let same_version = Snapshot::try_new_from_impl(
+            base_snapshot.clone(),
+            vec![],
+            &engine,
+            Some(1),
+            MetricId::default(),
+        )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
         // Test requesting older version - should error
-        let older_version =
-            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0), None);
+        let older_version = Snapshot::try_new_from_impl(
+            base_snapshot.clone(),
+            vec![],
+            &engine,
+            Some(0),
+            MetricId::default(),
+        );
         assert!(matches!(
             older_version,
             Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")

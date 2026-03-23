@@ -4,6 +4,7 @@ mod clustering;
 mod column_mapping;
 mod ctas;
 mod ict;
+mod partitioned;
 mod timestamp_ntz;
 mod variant;
 
@@ -26,6 +27,16 @@ use test_utils::{assert_result_error_with_message, test_table_setup};
 pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, false),
+        StructField::new("value", DataType::STRING, true),
+    ])?))
+}
+
+/// Helper to create a three-column schema for partition tests (id, date, value).
+/// Shared with sub-modules.
+pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("date", DataType::DATE, true),
         StructField::new("value", DataType::STRING, true),
     ])?))
 }
