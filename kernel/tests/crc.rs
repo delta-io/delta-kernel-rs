@@ -515,7 +515,7 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
 
     // Insert data at v1 and write its CRC to disk
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    let committed_v1 = insert_data(snapshot_v0, &engine, vec![col])
+    let committed_v1 = insert_data(snapshot_v0.clone(), &engine, vec![col])
         .await?
         .unwrap_committed();
     committed_v1
@@ -529,7 +529,7 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
         .build(engine.as_ref())?;
     assert_eq!(fresh_v0.version(), 0);
 
-    // Incrementally update from v0 -> v1 (this triggers try_new_from)
+    // Incrementally update from v0 -> v1
     let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
     assert_eq!(incremental_v1.version(), 1);
 
@@ -574,8 +574,8 @@ async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
     // Insert data at v1 -- do NOT write CRC for v1
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
     let committed_v1 = insert_data(snapshot_v0.clone(), &engine, vec![col])
-    .await?
-    .unwrap_committed();
+        .await?
+        .unwrap_committed();
     assert_eq!(committed_v1.commit_version(), 1);
 
     // Load fresh snapshot at v0, then incrementally update to v1
