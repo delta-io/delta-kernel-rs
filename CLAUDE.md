@@ -98,7 +98,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
-- **Integration tests** exercise only public APIs end-to-end.
+- **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
+  for a catalog of available test tables (schema, protocol, features, and which tests use
+  them). Consult it before creating new test data to avoid duplication.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific

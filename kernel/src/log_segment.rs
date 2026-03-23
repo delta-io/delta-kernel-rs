@@ -599,103 +599,96 @@ impl LogSegment {
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
-    /// 1. The schema containing file actions (for future stats_parsed detection)
+    /// 1. The file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Sidecar file references if this is a V2 checkpoint
     ///
     /// The logic is:
-    /// - JSON checkpoint: Always V2, extract sidecars and read first sidecar's schema
-    /// - Parquet checkpoint: Check hint/footer for sidecar column
-    ///   - No sidecar column: V1, use footer schema
-    ///   - Has sidecar column: V2, extract sidecars and read first sidecar's schema
-    ///
-    /// Note: `self.checkpoint_schema` from `_last_checkpoint` hint is the main checkpoint
-    /// parquet schema. For V1 this is what we want. For V2 we need the sidecar schema.
+    /// - No checkpoint parts: return (None, [])
+    /// - Multi-part (always V1, no sidecars): return checkpoint schema directly
+    /// - Single-part JSON (always V2): extract sidecars, read first sidecar's schema
+    /// - Single-part parquet: read checkpoint schema from hint or footer
+    ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
+    ///   - No sidecar column (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        // Only process single-part checkpoints (multi-part are always V1, no sidecars)
-        let checkpoint = match self.listed.checkpoint_parts.first() {
-            Some(cp) if self.listed.checkpoint_parts.len() == 1 => cp,
-            _ => return Ok((None, vec![])),
-        };
-
-        // Cached hint schema for determining V1 vs V2 without footer read.
-        // hint_schema is Option<&SchemaRef> where SchemaRef = Arc<StructType>.
+        // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_schema.as_ref();
 
+        // Multi-part checkpoints share an identical schema across all parts, so we only
+        // need the first part for schema detection.
+        let Some(checkpoint) = self.listed.checkpoint_parts.first() else {
+            return Ok((None, vec![]));
+        };
+
+        // Multi-part checkpoints are always V1 and never have sidecars.
+        if self.listed.checkpoint_parts.len() > 1 {
+            let schema = self.read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+            return Ok((Some(schema), vec![]));
+        }
+
+        // Single-part checkpoint: determine V1 vs V2 from extension and schema.
         match checkpoint.extension.as_str() {
             "json" => {
-                // JSON checkpoint is always V2, extract sidecars
-                let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-
-                // For V2, read first sidecar's schema (contains file actions)
-                let file_actions_schema = match sidecar_files.first() {
-                    Some(first) => {
-                        Some(engine.parquet_handler().read_parquet_footer(first)?.schema)
-                    }
-                    None => None,
-                };
-                Ok((file_actions_schema, sidecar_files))
+                // JSON checkpoint is always V2. The hint schema is from the main checkpoint
+                // file, not the sidecars, so it is not useful as a fallback here.
+                self.read_sidecar_schema_and_files(engine, checkpoint, None)
             }
             "parquet" => {
-                // Check hint first to avoid unnecessary footer reads
-                let has_sidecars_in_hint = hint_schema.map(|s| s.field(SIDECAR_NAME).is_some());
-
-                match has_sidecars_in_hint {
-                    Some(false) => {
-                        // Hint says V1 checkpoint (no sidecars)
-                        // Use hint schema as the file actions schema
-                        Ok((hint_schema.cloned(), vec![]))
-                    }
-                    Some(true) => {
-                        // Hint says V2 checkpoint, extract sidecars
-                        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-                        // For V2, read first sidecar's schema if sidecars exist.
-                        // If no sidecars, V2 checkpoint may still have add actions in main file
-                        // (like V1), so fall back to hint schema for stats_parsed check.
-                        let file_actions_schema = match sidecar_files.first() {
-                            Some(first) => {
-                                Some(engine.parquet_handler().read_parquet_footer(first)?.schema)
-                            }
-                            None => hint_schema.cloned(),
-                        };
-                        Ok((file_actions_schema, sidecar_files))
-                    }
-                    None => {
-                        // No hint, need to read parquet footer
-                        let footer = engine
-                            .parquet_handler()
-                            .read_parquet_footer(&checkpoint.location)?;
-
-                        if footer.schema.field(SIDECAR_NAME).is_some() {
-                            // V2 parquet checkpoint
-                            let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-                            // For V2, read first sidecar's schema if sidecars exist.
-                            // If no sidecars, V2 checkpoint may still have add actions in main file
-                            // (like V1), so fall back to footer schema for stats_parsed check.
-                            let file_actions_schema = match sidecar_files.first() {
-                                Some(first) => Some(
-                                    engine.parquet_handler().read_parquet_footer(first)?.schema,
-                                ),
-                                None => Some(footer.schema),
-                            };
-                            Ok((file_actions_schema, sidecar_files))
-                        } else {
-                            // V1 parquet checkpoint
-                            Ok((Some(footer.schema), vec![]))
-                        }
-                    }
+                // Resolve checkpoint schema from hint or footer (single read).
+                let checkpoint_schema =
+                    self.read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                if checkpoint_schema.field(SIDECAR_NAME).is_some() {
+                    // V2 parquet checkpoint: extract sidecars and read their schema.
+                    self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
+                } else {
+                    // V1 parquet checkpoint: use checkpoint schema directly.
+                    Ok((Some(checkpoint_schema), vec![]))
                 }
             }
             _ => Ok((None, vec![])),
         }
     }
 
+    /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
+    /// available or reading the parquet footer otherwise.
+    fn read_checkpoint_schema(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath<FileMeta>,
+        hint_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<SchemaRef> {
+        match hint_schema {
+            Some(schema) => Ok(schema.clone()),
+            None => Ok(engine
+                .parquet_handler()
+                .read_parquet_footer(&checkpoint.location)?
+                .schema),
+        }
+    }
+
+    /// Extracts sidecar file references and reads the file actions schema from the first
+    /// sidecar's parquet footer. If no sidecars exist, falls back to `checkpoint_schema`
+    /// since V2 checkpoints may store add actions directly in the main file.
+    fn read_sidecar_schema_and_files(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath<FileMeta>,
+        checkpoint_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let file_actions_schema = match sidecar_files.first() {
+            Some(first) => Some(engine.parquet_handler().read_parquet_footer(first)?.schema),
+            None => checkpoint_schema.cloned(),
+        };
+        Ok((file_actions_schema, sidecar_files))
+    }
+
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
     /// For single-part checkpoints that need file actions, this function:
-    /// 1. Determines the files actions schema (for future stats_parsed detection)
+    /// 1. Determines the file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Extracts sidecar file references if present (V2 checkpoints)
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
