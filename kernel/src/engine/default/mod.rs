@@ -390,8 +390,8 @@ mod tests {
         fn report(&self, _event: MetricEvent) {}
     }
 
-    /// Minimal reporter that counts storage list events, used to verify the reporter is
-    /// actually wired through to the storage handler.
+    /// Counts `StorageListCompleted` events. Used to assert that an engine-level reporter
+    /// is forwarded into `ObjectStoreStorageHandler` and actually receives storage events.
     #[derive(Debug, Default)]
     struct ListCountingReporter {
         list_calls: std::sync::atomic::AtomicU64,
@@ -439,8 +439,9 @@ mod tests {
 
     #[test]
     fn storage_handler_emits_list_events_when_reporter_configured() {
-        // Regression test: ObjectStoreStorageHandler was constructed with None for the reporter,
-        // silently discarding events. Verify that storage list events actually flow through.
+        // Regression test: `DefaultEngine::build()` previously passed `None` to
+        // `ObjectStoreStorageHandler::new`, silently discarding all storage events even when
+        // a reporter was configured. Verify that list events actually flow through.
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());

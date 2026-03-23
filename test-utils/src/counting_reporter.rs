@@ -80,11 +80,11 @@ pub struct CountingReporter {
     /// Number of full (non-incremental) log segment loads. Each fresh snapshot construction
     /// from a table root contributes one load; incremental snapshot updates do not.
     pub log_segment_loads: RelaxedCounter,
-    /// Total commit files seen across all log segment loads.
+    /// Total commit files included in the log segment across all log segment loads.
     pub commit_files: RelaxedCounter,
-    /// Total checkpoint part files selected for reading across all log segment loads.
-    /// For a single-part checkpoint this is 1; for a multi-part checkpoint it equals the
-    /// number of parts that make up the selected checkpoint.
+    /// Total checkpoint part files read across all log segment loads. For a single-part
+    /// checkpoint this is 1; for a multi-part checkpoint it equals the number of parts
+    /// that make up the selected checkpoint.
     pub checkpoint_files: RelaxedCounter,
     /// Total log compaction files seen across all log segment loads.
     pub compaction_files: RelaxedCounter,
