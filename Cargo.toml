@@ -20,10 +20,6 @@ members = [
 # - write-table
 resolver = "2"
 
-# Enable debug symbols in bench builds so flamegraph/samply produce readable stack traces.
-[profile.bench]
-debug = true
-
 [workspace.package]
 edition = "2021"
 homepage = "https://delta.io"
