@@ -2,6 +2,8 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use rstest::rstest;
 
+#[cfg(not(feature = "arrow-56"))]
+use crate::arrow::array::ListViewArray;
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
     Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
@@ -122,7 +124,6 @@ fn test_in_predicate_with_utf8view_list_column() {
 #[cfg(not(feature = "arrow-56"))]
 // TODO: this test need arrow-57 to be run successfully. Please remove the cfg after "arrow-56" is deprecated.
 fn test_in_predicate_with_list_view_column() {
-    use crate::arrow::array::ListViewArray;
     // Three rows: [0,1,2], [3,4,5], [6,7,8]
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = ScalarBuffer::from(vec![0i32, 3, 6]);
@@ -219,6 +220,12 @@ fn test_binary_predicate_with_view_types(
     let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
     assert_eq!(results, expected_ne);
 
+    let predicate_distinct = column.clone().distinct(lit.clone());
+    let results = evaluate_predicate(&predicate_distinct, &batch, false).unwrap();
+    let expected_distinct =
+        BooleanArray::from(vec![Some(true), Some(true), Some(false), Some(true)]);
+    assert_eq!(results, expected_distinct);
+
     // Test inversion (NOT pushdown): each inverted op equals the complement
     let results = evaluate_predicate(&predicate_lt, &batch, true).unwrap();
     assert_eq!(results, expected_ge);
@@ -232,6 +239,10 @@ fn test_binary_predicate_with_view_types(
     assert_eq!(results, expected_ne);
     let results = evaluate_predicate(&predicate_ne, &batch, true).unwrap();
     assert_eq!(results, expected_eq);
+    let results = evaluate_predicate(&predicate_distinct, &batch, true).unwrap();
+    let expected_not_distinct =
+        BooleanArray::from(vec![Some(false), Some(false), Some(true), Some(false)]);
+    assert_eq!(results, expected_not_distinct);
 }
 
 #[test]
