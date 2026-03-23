@@ -12,6 +12,7 @@ use crate::scan::PhysicalPredicate;
 use crate::scan::StatsOutputMode;
 use crate::schema::{LogicalSchema, LogicalSchemaRef, SchemaRef};
 use crate::table_configuration::TableConfiguration;
+
 use crate::{DeltaResult, PredicateRef};
 
 /// All the state needed to process a scan.
@@ -97,8 +98,14 @@ impl StateInfo {
                             all_needed_stats_columns.push(col.clone());
                         }
                     }
+                    // Translate logical names to physical for build_expected_stats_schemas,
+                    // which works on the physical data schema.
+                    let physical_columns: Vec<ColumnName> = all_needed_stats_columns
+                        .iter()
+                        .filter_map(|col| logical_schema.get_physical_column_name(col).ok())
+                        .collect();
                     let expected_stats_schemas = table_configuration
-                        .build_expected_stats_schemas(None, Some(&all_needed_stats_columns))?;
+                        .build_expected_stats_schemas(None, Some(&physical_columns))?;
                     (
                         Some(expected_stats_schemas.physical),
                         Some(expected_stats_schemas.logical),

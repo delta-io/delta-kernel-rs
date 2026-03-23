@@ -16,7 +16,7 @@ use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::ColumnMappingMode;
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use crate::{DeltaResult, Error};
 
 // Private helper for predicate-driven schema traversal.
@@ -55,7 +55,8 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         let physical = ColumnName::new(&self.physical_path);
         for reference in &matching {
             self.unresolved_references.remove(*reference);
-            self.column_mappings.insert((**reference).clone(), physical.clone());
+            self.column_mappings
+                .insert((**reference).clone(), physical.clone());
         }
         Some(Cow::Borrowed(ptype))
     }
@@ -172,6 +173,19 @@ impl LogicalSchema {
         self.schema
             .field(logical_name)
             .map(|f| f.physical_name(self.column_mapping_mode))
+    }
+
+    /// Translates a logical [`ColumnName`] (possibly nested) to its physical [`ColumnName`].
+    ///
+    /// When column mapping is disabled, the physical name equals the logical name. When column
+    /// mapping is active, each path component is replaced with its physical name annotation.
+    /// Returns an error if any path component is not found in the schema or lacks the required
+    /// annotation.
+    pub(crate) fn get_physical_column_name(
+        &self,
+        col: &ColumnName,
+    ) -> DeltaResult<ColumnName> {
+        get_any_level_column_physical_name(&self.schema, col, self.column_mapping_mode)
     }
 
     /// Compute the physical read schema and transform spec for this table schema.
