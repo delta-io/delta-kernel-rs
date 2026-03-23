@@ -319,6 +319,8 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use crate::metrics::MetricEvent;
@@ -382,7 +384,6 @@ mod tests {
     fn storage_handler_emits_list_events_when_reporter_configured() {
         // Regression test: ObjectStoreStorageHandler was constructed with None for the reporter,
         // silently discarding events. Verify that storage list events actually flow through.
-        use std::sync::atomic::Ordering;
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());

@@ -35,11 +35,14 @@ pub struct CountingReporter {
     // Operation-level counters
     /// Number of completed snapshot constructions.
     pub snapshot_completions: AtomicU64,
-    /// Number of log segment loads (listing + organizing log files).
+    /// Number of full (non-incremental) log segment loads. Each fresh snapshot construction
+    /// from a table root contributes one load; incremental snapshot updates do not.
     pub log_segment_loads: AtomicU64,
     /// Total commit files seen across all log segment loads.
     pub commit_files: AtomicU64,
-    /// Total checkpoint files seen across all log segment loads.
+    /// Total checkpoint part files selected for reading across all log segment loads.
+    /// For a single-part checkpoint this is 1; for a multi-part checkpoint it equals the
+    /// number of parts that make up the selected checkpoint.
     pub checkpoint_files: AtomicU64,
     /// Total log compaction files seen across all log segment loads.
     pub compaction_files: AtomicU64,
