@@ -85,9 +85,9 @@ pub struct CountingReporter {
     /// all historical commits in the table. Commits older than the selected checkpoint
     /// are not included.
     pub commit_files: RelaxedCounter,
-    /// Total checkpoint part files read across all log segment loads.
-    /// For a single-part checkpoint this is 1; for a multi-part checkpoint it equals the
-    /// number of parts that make up the selected checkpoint.
+    /// Total checkpoint part files read across all log segment loads. For a single-part
+    /// checkpoint this is 1; for a multi-part checkpoint it equals the number of parts
+    /// that make up the selected checkpoint.
     pub checkpoint_files: RelaxedCounter,
     /// Total log compaction files in the commit tail across all log segment loads.
     pub compaction_files: RelaxedCounter,
