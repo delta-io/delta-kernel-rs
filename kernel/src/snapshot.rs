@@ -110,13 +110,13 @@ impl Snapshot {
     /// 2. if the new version < existing version, error: there is no optimization to do here
     /// 3. list from (existing checkpoint version + 1) onward (or from version 1 if there is no
     ///    checkpoint yet)
-    /// 4. a. if a newer or newly discovered checkpoint is found while refreshing to the latest
+    /// 4. if a newer or newly discovered checkpoint is found while refreshing to the latest
     ///    version, create a new snapshot from that checkpoint (and commits after it), even if the
     ///    table version itself did not advance
-    ///    b. if no new checkpoint is found and the table version did not advance, return the
-    ///       existing snapshot
-    ///    c. if no new checkpoint is found: do lightweight P+M replay on the latest commits (after
-    ///    ensuring we only retain commits > any checkpoints)
+    /// 5. if no new checkpoint is found and the table version did not advance, return the
+    ///    existing snapshot
+    /// 6. if no new checkpoint is found, do lightweight P+M replay on the latest commits after
+    ///    ensuring we only retain commits > any checkpoints
     ///
     /// # Parameters
     ///
