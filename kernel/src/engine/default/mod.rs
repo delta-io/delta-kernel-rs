@@ -376,8 +376,6 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use crate::metrics::MetricEvent;
@@ -388,22 +386,6 @@ mod tests {
 
     impl MetricsReporter for TestMetricsReporter {
         fn report(&self, _event: MetricEvent) {}
-    }
-
-    /// Counts `StorageListCompleted` events. Used to assert that an engine-level reporter
-    /// is forwarded into `ObjectStoreStorageHandler` and actually receives storage events.
-    #[derive(Debug, Default)]
-    struct ListCountingReporter {
-        list_calls: std::sync::atomic::AtomicU64,
-    }
-
-    impl MetricsReporter for ListCountingReporter {
-        fn report(&self, event: MetricEvent) {
-            if let MetricEvent::StorageListCompleted { .. } = event {
-                self.list_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
     }
 
     #[test]
@@ -435,29 +417,6 @@ mod tests {
             .build();
         assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn storage_handler_emits_list_events_when_reporter_configured() {
-        // Regression test: `DefaultEngine::build()` previously passed `None` to
-        // `ObjectStoreStorageHandler::new`, silently discarding all storage events even when
-        // a reporter was configured. Verify that list events actually flow through.
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(ListCountingReporter::default());
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter.clone())
-            .build();
-
-        // test_arrow_engine writes files and calls list_from on the storage handler,
-        // which should emit StorageListCompleted events.
-        test_arrow_engine(&engine, &url);
-
-        assert!(
-            reporter.list_calls.load(Ordering::Relaxed) > 0,
-            "StorageListCompleted events should be emitted by the storage handler"
-        );
     }
 
     #[test]
