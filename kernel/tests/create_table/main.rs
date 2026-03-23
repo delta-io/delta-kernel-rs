@@ -385,32 +385,29 @@ fn test_create_table_with_feature_signal(
 }
 
 #[rstest]
-#[case(
-    "delta.checkpoint.writeStatsAsStruct",
-    "true",
-    |tp: &TableProperties| tp.checkpoint_write_stats_as_struct == Some(true)
-)]
-#[case(
-    "delta.checkpoint.writeStatsAsJson",
-    "false",
-    |tp: &TableProperties| tp.checkpoint_write_stats_as_json == Some(false)
-)]
-fn test_create_table_stores_delta_property(
-    #[case] key: &str,
-    #[case] value: &str,
-    #[case] check: fn(&TableProperties) -> bool,
+fn test_create_table_with_checkpoint_stats_properties(
+    #[values(true, false)] write_stats_as_json: bool,
+    #[values(true, false)] write_stats_as_struct: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
+    let json_val = write_stats_as_json.to_string();
+    let struct_val = write_stats_as_struct.to_string();
+
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
-        .with_table_properties([(key, value)])
+        .with_table_properties([
+            ("delta.checkpoint.writeStatsAsJson", json_val.as_str()),
+            ("delta.checkpoint.writeStatsAsStruct", struct_val.as_str()),
+        ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(
-        check(snapshot.table_properties()),
-        "property {key}={value} should be stored in TableProperties"
+    let tp = snapshot.table_properties();
+    assert_eq!(tp.checkpoint_write_stats_as_json, Some(write_stats_as_json));
+    assert_eq!(
+        tp.checkpoint_write_stats_as_struct,
+        Some(write_stats_as_struct)
     );
 
     Ok(())
