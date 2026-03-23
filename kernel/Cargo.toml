@@ -131,10 +131,7 @@ default-engine-base = [
 # default-engine-native-tls enables reqwest with the native-tls backend. If you want to use
 # rustls instead, use 'default-engine-rustls' which has no native-tls dependency.
 default-engine-native-tls = ["default-engine-base", "reqwest/native-tls"]
-default-engine-rustls = [
-  "default-engine-base",
-  "reqwest/rustls",
-]
+default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 
 [build-dependencies]
 rustc_version = "0.4.1"
