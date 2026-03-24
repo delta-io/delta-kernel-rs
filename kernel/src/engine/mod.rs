@@ -42,10 +42,6 @@ pub(crate) mod arrow_utils;
 pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 #[cfg(test)]
-#[allow(unreachable_pub, dead_code)]
-pub(crate) mod default;
-
-#[cfg(test)]
 pub(crate) mod sync;
 
 #[cfg(feature = "arrow-expression")]

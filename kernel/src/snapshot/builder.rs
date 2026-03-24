@@ -368,7 +368,7 @@ mod tests {
     }
 
     fn setup_test_with_reporter() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Arc<SyncEngine>,
         Arc<DynObjectStore>,
         String,
         Arc<CapturingReporter>,
@@ -377,9 +377,7 @@ mod tests {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(store.clone())
-                .with_metrics_reporter(reporter.clone())
-                .build(),
+            SyncEngine::new_with_store(store.clone()).with_metrics_reporter(reporter.clone()),
         );
         (engine, store, table_root, reporter)
     }

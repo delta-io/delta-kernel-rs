@@ -49,29 +49,32 @@ cargo fmt \
 
 | Crate                  | Directory       | Description                                    |
 |------------------------|-----------------|------------------------------------------------|
-| `delta_kernel`         | `kernel/`       | Core library                                   |
-| `delta_kernel_ffi`     | `ffi/`          | C/C++ FFI bindings                             |
-| `delta_kernel_derive`  | `derive-macros/`| Proc macros                                    |
-| `acceptance`           | `acceptance/`   | Acceptance tests (DAT)                         |
-| `test_utils`           | `test-utils/`   | Shared test utilities                          |
-| `feature_tests`        | `feature-tests/`| Feature flag tests                             |
-| `uc-catalog`           | `uc-catalog/`   | Unity Catalog integration (UCCatalog, UCCommitter) |
-| `uc-client`            | `uc-client/`    | Unity Catalog REST client                      |
+| `delta_kernel`                | `kernel/`         | Core library (protocol, Engine trait, schema)  |
+| `delta_kernel_default_engine` | `default-engine/` | Default Arrow/Tokio engine implementation      |
+| `delta_kernel_ffi`            | `ffi/`            | C/C++ FFI bindings                             |
+| `delta_kernel_derive`         | `derive-macros/`  | Proc macros                                    |
+| `acceptance`                  | `acceptance/`     | Acceptance tests (DAT)                         |
+| `test_utils`                  | `test-utils/`     | Shared test utilities                          |
+| `feature_tests`               | `feature-tests/`  | Feature flag tests                             |
+| `uc-catalog`                  | `uc-catalog/`     | Unity Catalog integration (UCCatalog, UCCommitter) |
+| `uc-client`                   | `uc-client/`      | Unity Catalog REST client                      |
 
 ### Feature Flags
 
-- `default-engine` / `default-engine-rustls` / `default-engine-native-tls` -- async
-  Arrow/Tokio engine (pick one TLS backend)
-- `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
-  major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
-  but default-engine does.
-- `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
+**`delta_kernel` crate:**
+- `arrow`, `arrow-56`, `arrow-57` -- Arrow version selection (kernel tracks the latest two
+  major Arrow releases; `arrow` defaults to latest)
+- `arrow-conversion`, `arrow-expression` -- Arrow interop
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
+
+**`delta_kernel_default_engine` crate:**
+- `rustls` / `native-tls` -- TLS backend selection (pick one)
+- `arrow` -- Arrow version (defaults to latest; also supports `arrow-56`, `arrow-57`)
 
 ## Architecture at a Glance
 
@@ -87,8 +90,8 @@ assembles commit actions, enforces protocol compliance, delegates atomic commit 
 `Committer`.
 
 **Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
-`EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
-`kernel/src/engine/default/`.
+`EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in the
+`delta_kernel_default_engine` crate (`default-engine/`).
 
 **EngineData:** opaque columnar data interface. IMPORTANT: never access `EngineData` columns
 directly -- always use the visitor pattern (`visit_rows` with typed `GetData` accessors).

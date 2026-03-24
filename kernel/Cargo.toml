@@ -136,7 +136,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 rstest = "0.23"
 delta_kernel_default_engine = { path = "../default-engine", features = ["rustls", "arrow"] }
 futures = "0.3"
-reqwest = { version = "0.13", features = ["http2"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
 [[bench]]
 name = "metadata_bench"
