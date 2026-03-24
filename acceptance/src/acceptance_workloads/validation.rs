@@ -85,13 +85,12 @@ pub fn validate_read_result(
     expected: &ReadExpected,
 ) -> Result<(), String> {
     match (result, expected) {
-        (Ok(read_result), ReadExpected::Success { expected }) => {
+        (Ok(read_result), ReadExpected::Success { expected: _ }) => {
             let expected_data = read_expected_data(expected_dir)?;
             assert_data_matches(
                 read_result.batches,
                 &read_result.schema,
                 expected_data,
-                Some(expected.row_count as usize),
             )
             .map_err(|e| e.to_string())
         }

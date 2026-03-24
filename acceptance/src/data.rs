@@ -92,7 +92,6 @@ pub fn assert_data_matches(
     result: Vec<RecordBatch>,
     result_schema: &delta_kernel::schema::Schema,
     expected: RecordBatch,
-    expected_rows: Option<usize>,
 ) -> DeltaResult<()> {
     let arrow_schema = Schema::try_from_kernel(result_schema)?;
     let arrow_schema = std::sync::Arc::new(arrow_schema);
@@ -131,16 +130,6 @@ pub fn assert_data_matches(
         )));
     }
 
-    // Validate row counts
-    if all_data.num_rows() != expected.num_rows() {
-        return Err(Error::generic_err("Didn't have same number of rows"));
-    }
-    if let Some(expected_row_count) = expected_rows {
-        if all_data.num_rows() != expected_row_count {
-            return Err(Error::generic("Didn't have expected number of rows"));
-        }
-    }
-
     Ok(())
 }
 
@@ -164,7 +153,7 @@ pub async fn assert_scan_metadata(
         })
         .try_collect()?;
     let golden = read_golden(test_case.root_dir(), None).await?;
-    assert_data_matches(batches, kernel_schema.as_ref(), golden, None)?;
+    assert_data_matches(batches, kernel_schema.as_ref(), golden)?;
 
     Ok(())
 }

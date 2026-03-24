@@ -153,7 +153,7 @@ pub fn test_case_from_spec_path(spec_path: &Path) -> Result<(TestCase, String), 
     // Walk up: <workload>.json -> specs/ -> <workload_directory>
     let test_case_dir = spec_path
         .parent() // specs/
-        .and_then(|p| p.parent()) // worklod_directory/
+        .and_then(|p| p.parent()) // workload_directory/
         .ok_or_else(|| format!("Cannot find test case dir from: {}", spec_path.display()))?;
 
     let test_case = TestCase::from_dir(test_case_dir)?;
