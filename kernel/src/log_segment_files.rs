@@ -1258,8 +1258,8 @@ mod list_log_files_with_log_tail_tests {
     #[tokio::test]
     async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         // FS: commits v0..=v7 + checkpoint at v5. log_tail: catalog commits v8..=v10.
-        // After finding the checkpoint at v5, the lower bound is derived as v6, so FS commits
-        // v6 and v7 plus all catalog entries v8..=v10 are included.
+        // The checkpoint at v5 sets the lower bound to v6, so FS commits v6 and v7 plus all
+        // catalog entries v8..=v10 are included.
         let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=7)
             .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
             .collect();
@@ -1305,8 +1305,9 @@ mod list_log_files_with_log_tail_tests {
     #[tokio::test]
     async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         // FS: commits v0..=v5 + checkpoint at v5 + CRC at v6. log_tail: catalog commits v3..=v8,
-        // starting before the checkpoint. The derived lower bound is v6, so log_tail v3..=v5 are
-        // excluded. Also verifies that the CRC at v6 is preserved even though v6 is a log_tail version.
+        // starting before the checkpoint. The checkpoint at v5 sets the lower bound to v6, so
+        // log_tail v3..=v5 are excluded. The CRC at v6 is preserved even though v6 is within
+        // the log_tail range.
         let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=5)
             .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
             .collect();
@@ -1332,11 +1333,10 @@ mod list_log_files_with_log_tail_tests {
         )
         .unwrap();
 
-        // Checkpoint at v5; lower bound = 6, so log_tail v3..=v5 are excluded
         assert_eq!(result.checkpoint_parts.len(), 1);
         assert_eq!(result.checkpoint_parts[0].version, 5);
 
-        // CRC at v6 is preserved even though v6 is covered by the log_tail
+        // CRC at v6 is preserved even though v6 is within the log_tail range
         let crc = result.latest_crc_file.unwrap();
         assert_eq!(crc.version, 6);
         assert!(matches!(crc.file_type, LogPathFileType::Crc));
@@ -1352,9 +1352,9 @@ mod list_log_files_with_log_tail_tests {
     #[tokio::test]
     async fn backward_scan_log_tail_defines_latest_version() {
         // FS: commits v0..=v5. log_tail: catalog commit v4. end_version=5.
-        // FS v4 and v5 are filtered by log_tail_start=4, so ascending_commit_files contains
-        // v0..=v3 (FS) + v4 (Catalog). max_published_version is Some(5): the highest FS
-        // commit seen within end_version, even though it was filtered from ascending_commit_files.
+        // FS v4 and v5 are filtered since log_tail_start=4. max_published_version is Some(5),
+        // the highest FS commit seen within end_version, even though v5 is not in
+        // ascending_commit_files.
         let log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=5)
             .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
             .collect();
