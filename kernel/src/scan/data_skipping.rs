@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
@@ -297,13 +297,11 @@ impl DataSkippingFilter {
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
 
-        let skipped = visitor
-            .selection_vector
-            .iter()
-            .filter(|&&kept| !kept)
-            .count();
-        if skipped > 0 {
-            info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
+        if visitor.num_filtered > 0 {
+            debug!(
+                "data skipping filtered {}/{batch_len} rows from batch",
+                visitor.num_filtered
+            );
         }
 
         if let Some(metrics) = self.metrics.as_ref() {
