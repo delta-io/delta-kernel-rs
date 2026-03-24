@@ -1290,17 +1290,18 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result.checkpoint_parts[0].version, 5);
 
         // FS commits v6, v7 after the checkpoint; catalog commits v8..=v10
-        assert_eq!(result.ascending_commit_files.len(), 5);
-        assert_eq!(result.ascending_commit_files[0].version, 6);
-        assert_source(&result.ascending_commit_files[0], CommitSource::Filesystem);
-        assert_eq!(result.ascending_commit_files[1].version, 7);
-        assert_source(&result.ascending_commit_files[1], CommitSource::Filesystem);
-        assert_eq!(result.ascending_commit_files[2].version, 8);
-        assert_source(&result.ascending_commit_files[2], CommitSource::Catalog);
-        assert_eq!(result.ascending_commit_files[3].version, 9);
-        assert_source(&result.ascending_commit_files[3], CommitSource::Catalog);
-        assert_eq!(result.ascending_commit_files[4].version, 10);
-        assert_source(&result.ascending_commit_files[4], CommitSource::Catalog);
+        let expected = [
+            (6, CommitSource::Filesystem),
+            (7, CommitSource::Filesystem),
+            (8, CommitSource::Catalog),
+            (9, CommitSource::Catalog),
+            (10, CommitSource::Catalog),
+        ];
+        assert_eq!(result.ascending_commit_files.len(), expected.len());
+        for (file, (version, source)) in result.ascending_commit_files.iter().zip(expected) {
+            assert_eq!(file.version, version);
+            assert_source(file, source);
+        }
         assert_eq!(result.latest_commit_file.unwrap().version, 10);
     }
 
@@ -1376,17 +1377,18 @@ mod list_log_files_with_log_tail_tests {
         )
         .unwrap();
 
-        assert_eq!(result.ascending_commit_files.len(), 5);
-        assert_eq!(result.ascending_commit_files[0].version, 0);
-        assert_source(&result.ascending_commit_files[0], CommitSource::Filesystem);
-        assert_eq!(result.ascending_commit_files[1].version, 1);
-        assert_source(&result.ascending_commit_files[1], CommitSource::Filesystem);
-        assert_eq!(result.ascending_commit_files[2].version, 2);
-        assert_source(&result.ascending_commit_files[2], CommitSource::Filesystem);
-        assert_eq!(result.ascending_commit_files[3].version, 3);
-        assert_source(&result.ascending_commit_files[3], CommitSource::Filesystem);
-        assert_eq!(result.ascending_commit_files[4].version, 4);
-        assert_source(&result.ascending_commit_files[4], CommitSource::Catalog);
+        let expected = [
+            (0, CommitSource::Filesystem),
+            (1, CommitSource::Filesystem),
+            (2, CommitSource::Filesystem),
+            (3, CommitSource::Filesystem),
+            (4, CommitSource::Catalog),
+        ];
+        assert_eq!(result.ascending_commit_files.len(), expected.len());
+        for (file, (version, source)) in result.ascending_commit_files.iter().zip(expected) {
+            assert_eq!(file.version, version);
+            assert_source(file, source);
+        }
         assert_eq!(result.latest_commit_file.unwrap().version, 4);
         assert_eq!(result.max_published_version, Some(5));
     }
