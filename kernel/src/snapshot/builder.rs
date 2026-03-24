@@ -200,9 +200,7 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::engine::default::{
-        executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
-    };
+    use crate::engine::sync::SyncEngine;
     use crate::metrics::{MetricEvent, MetricsReporter};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -223,14 +221,10 @@ mod tests {
         }
     }
 
-    fn setup_test() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<DynObjectStore>,
-        String,
-    ) {
+    fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
         (engine, store, table_root)
     }
 

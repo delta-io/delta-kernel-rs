@@ -232,14 +232,14 @@ fn test_version_filtering() {
 #[tokio::test]
 async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
     use crate::table_features::TableFeature;
     use std::sync::Arc;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};

@@ -433,9 +433,9 @@ mod list_log_files_with_log_tail_tests {
 
     use url::Url;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::filesystem::ObjectStoreStorageHandler;
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+    use crate::Engine as _;
     use crate::FileMeta;
 
     use super::*;
@@ -453,7 +453,7 @@ mod list_log_files_with_log_tail_tests {
     // create test storage given list of log files with custom data content
     async fn create_storage(
         log_files: Vec<(Version, LogPathFileType, CommitSource)>,
-    ) -> (Box<dyn StorageHandler>, Url) {
+    ) -> (Arc<dyn StorageHandler>, Url) {
         let store = Arc::new(InMemory::new());
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
@@ -497,9 +497,8 @@ mod list_log_files_with_log_tail_tests {
                 .expect("Failed to put test file");
         }
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
-        (storage, log_root)
+        let engine = SyncEngine::new_with_store(store);
+        (engine.storage_handler(), log_root)
     }
 
     // helper to create a ParsedLogPath with specific source marker

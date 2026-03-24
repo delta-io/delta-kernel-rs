@@ -463,7 +463,6 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1038,7 +1037,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 
@@ -1068,7 +1067,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 

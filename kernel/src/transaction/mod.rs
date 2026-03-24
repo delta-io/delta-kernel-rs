@@ -1766,7 +1766,7 @@ mod tests {
             DataType::INTEGER,
         )])?);
         let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(crate::engine::sync::SyncEngine::new_with_store(store));
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
             schema,
