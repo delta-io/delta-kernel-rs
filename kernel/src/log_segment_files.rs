@@ -1071,22 +1071,21 @@ mod list_log_files_with_log_tail_tests {
     // (2 listings). A checkpoint beyond end_version is never seen.
     #[rstest]
     // No checkpoint: scan exhausts both windows, all 1006 commits returned
-    #[case::no_checkpoint(None, 1005, (0u64..=1005).collect(), None, 2)]
+    #[case::no_checkpoint(None, 0..=1005, None, 2)]
     // Checkpoint beyond end_version is never seen; same behavior as no checkpoint
-    #[case::checkpoint_beyond_end(Some(1006), 1005, (0u64..=1005).collect(), None, 2)]
+    #[case::checkpoint_beyond_end(Some(1006), 0..=1005, None, 2)]
     // Checkpoint at end_version: found in window 1, no commits after it
-    #[case::checkpoint_at_end(Some(1005), 1005, vec![], Some(1005), 1)]
+    #[case::checkpoint_at_end(Some(1005), 0..0, Some(1005), 1)]
     // Checkpoint at v5: falls in window 2 -> 2 listings; commits 6..=1005 returned.
     // Tests the inclusive window boundary: window 1 covers [6, 1006) or [6, 1005] (lower = 1006 - 1000 = 6),
     // so v5 falls just outside it and requires a second listing, while v6 (next case) does not.
-    #[case::checkpoint_in_second_window(Some(5), 1005, (6u64..=1005).collect(), Some(5), 2)]
+    #[case::checkpoint_in_second_window(Some(5), 6..=1005, Some(5), 2)]
     // Checkpoint at v6: falls in window 1 -> 1 listing; commits 7..=1005 returned
-    #[case::checkpoint_in_first_window(Some(6), 1005, (7u64..=1005).collect(), Some(6), 1)]
+    #[case::checkpoint_in_first_window(Some(6), 7..=1005, Some(6), 1)]
     #[tokio::test]
     async fn backward_scan_single_checkpoint_cases(
         #[case] checkpoint_version: Option<u64>,
-        #[case] end_version: u64,
-        #[case] expected_commits: Vec<u64>,
+        #[case] expected_commits: impl Iterator<Item = u64>,
         #[case] expected_checkpoint: Option<u64>,
         #[case] expected_listings: u32,
     ) {
@@ -1105,13 +1104,9 @@ mod list_log_files_with_log_tail_tests {
         let (storage, log_root) = create_storage(log_files).await;
         let counter = CountingStorageHandler::new(storage);
 
-        let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
-            &counter,
-            &log_root,
-            vec![],
-            end_version,
-        )
-        .unwrap();
+        let result =
+            LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
+                .unwrap();
 
         assert_eq!(counter.call_count(), expected_listings);
 
@@ -1123,25 +1118,24 @@ mod list_log_files_with_log_tail_tests {
             assert_eq!(result.checkpoint_parts[0].version, cp_version);
         }
 
-        let actual_commits: Vec<u64> = result
+        assert!(result
             .ascending_commit_files
             .iter()
             .map(|f| f.version)
-            .collect();
-        assert_eq!(actual_commits, expected_commits);
+            .eq(expected_commits));
     }
 
+    /// end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
+    /// part 1 present). has_complete_checkpoint_in must return false for window 2, causing
+    /// the scan to continue to window 3, where a complete single-part checkpoint at v500 is
+    /// found. Verifies that incomplete parts from window 2 are discarded and do not pollute
+    /// the result's checkpoint_parts.
+    ///
+    /// Window 1 [2001, 3001): commits v2001..=v3000, no checkpoint -> continue
+    /// Window 2 [1001, 2001): commits v1001..=v2000, v1500 (1-of-2 parts) incomplete -> continue
+    /// Window 3 [1, 1001):    commits v1..=v1000, v500 (complete) -> checkpoint found -> break
     fn files_incomplete_in_second_window_complete_in_third_window(
     ) -> Vec<(Version, LogPathFileType, CommitSource)> {
-        // end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
-        // part 1 present). has_complete_checkpoint_in must return false for window 2, causing
-        // the scan to continue to window 3, where a complete single-part checkpoint at v500 is
-        // found. Verifies that incomplete parts from window 2 are discarded and do not pollute
-        // the result's checkpoint_parts.
-        //
-        // Window 1 [2001, 3001): commits v2001..=v3000, no checkpoint -> continue
-        // Window 2 [1001, 2001): commits v1001..=v2000, v1500 (1-of-2 parts) incomplete -> continue
-        // Window 3 [1, 1001):    commits v1..=v1000, v500 (complete) -> checkpoint found -> break
         let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=3000)
             .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
             .collect();
