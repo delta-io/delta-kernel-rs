@@ -237,6 +237,8 @@ impl Snapshot {
 
         if new_log_segment.checkpoint_version.is_some() {
             // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
+            // TODO(#2217): if the new segment's CRC file matches the old snapshot's, reuse
+            // the old LazyCrc to avoid redundant I/O (it may already be loaded in memory).
             let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
@@ -275,20 +277,18 @@ impl Snapshot {
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
         //
-        // If the new segment's CRC file matches the old snapshot's, reuse the old LazyCrc
-        // to avoid redundant I/O (it may already be loaded in memory).
-        let lazy_crc = if new_log_segment.listed.latest_crc_file.is_some()
-            && existing_snapshot.lazy_crc.crc_version()
-                == new_log_segment
-                    .listed
-                    .latest_crc_file
-                    .as_ref()
-                    .map(|f| f.version)
-        {
+        // Determine the CRC file: prefer the new segment's, fall back to the old segment's.
+        // Reuse the old snapshot's LazyCrc if it matches (it may already be loaded in memory).
+        let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
+        let old_crc_file = old_log_segment.listed.latest_crc_file.clone();
+        let crc_file = new_crc_file.or(old_crc_file);
+        let crc_version = crc_file.as_ref().map(|f| f.version);
+        let lazy_crc = if crc_version == existing_snapshot.lazy_crc.crc_version() {
             existing_snapshot.lazy_crc.clone()
         } else {
-            Arc::new(LazyCrc::new(new_log_segment.listed.latest_crc_file.clone()))
+            Arc::new(LazyCrc::new(crc_file.clone()))
         };
+
         let (new_metadata, new_protocol) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
@@ -316,7 +316,7 @@ impl Snapshot {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.listed.checkpoint_parts.clone(),
-                latest_crc_file: new_log_segment.listed.latest_crc_file,
+                latest_crc_file: crc_file,
                 latest_commit_file,
                 max_published_version: new_log_segment
                     .listed
@@ -1359,8 +1359,9 @@ mod tests {
         commit(table_root, &store, 0, commit0.clone()).await;
         commit(table_root, &store, 1, commit1).await;
 
-        // a) CRC: old one has 0.crc, no new one (expect None -- old CRC is not carried forward)
-        // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
+        // a) CRC: old snapshot has 0.crc, new log segment has no CRC. The combined segment
+        //    falls back to 0.crc, and the LazyCrc is reused from the old snapshot.
+        // b) CRC: old snapshot has 0.crc, new log segment has 1.crc (expect 1.crc)
         let crc = json!({
             "table_size_bytes": 100,
             "num_files": 1,
@@ -1379,11 +1380,20 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        // first test: no new crc. The old segment's CRC should not carry forward.
+        // first test: no new crc -- falls back to old segment's 0.crc
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
-        assert!(snapshot.log_segment.listed.latest_crc_file.is_none());
+        assert_eq!(
+            snapshot
+                .log_segment
+                .listed
+                .latest_crc_file
+                .as_ref()
+                .unwrap()
+                .version,
+            0
+        );
 
         // second test: new crc
         // put the new crc

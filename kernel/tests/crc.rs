@@ -559,49 +559,12 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
     Ok(())
 }
 
-// When an incremental snapshot update has no CRC in the new log segment, the combined segment
-// should have no CRC file either (the old segment's CRC is not carried forward because it could
-// be stale). The resulting snapshot should report no loaded CRC.
+// Incremental update where only the old segment has a CRC file (no new CRC written).
+// The old CRC is preserved and the LazyCrc is reused from the old snapshot, but since
+// it's at v0 while the snapshot is at v1, it won't be reported as loaded at the
+// snapshot's version.
 #[tokio::test]
 async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    // Create table at v0 and write CRC to disk
-    let committed_v0 = create_table_and_commit(&table_path, engine.as_ref())?;
-    let snapshot_v0 = committed_v0.post_commit_snapshot().unwrap();
-    snapshot_v0.write_checksum(engine.as_ref())?;
-
-    // Insert data at v1 -- do NOT write CRC for v1
-    let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    let committed_v1 = insert_data(snapshot_v0.clone(), &engine, vec![col])
-        .await?
-        .unwrap_committed();
-    assert_eq!(committed_v1.commit_version(), 1);
-
-    // Load fresh snapshot at v0, then incrementally update to v1
-    let fresh_v0 = Snapshot::builder_for(&table_path)
-        .at_version(0)
-        .build(engine.as_ref())?;
-    let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
-    assert_eq!(incremental_v1.version(), 1);
-
-    // No CRC at v1 exists, so the snapshot should not have a loaded CRC at this version
-    assert!(
-        incremental_v1
-            .get_current_crc_if_loaded_for_testing()
-            .is_none(),
-        "No CRC should be loaded when new segment lacks a CRC file at target version"
-    );
-
-    Ok(())
-}
-
-// When an incremental snapshot update finds the same CRC file as the old snapshot, the old
-// snapshot's LazyCrc should be reused (it may already be loaded in memory). The CRC won't
-// match the new snapshot's version, so it won't be reported as loaded at that version, but
-// it can still be used by P&M reading as an optimization.
-#[tokio::test]
-async fn test_incremental_snapshot_reuses_old_lazy_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create table at v0 and write CRC to disk
@@ -613,13 +576,14 @@ async fn test_incremental_snapshot_reuses_old_lazy_crc() -> DeltaResult<()> {
 
     // Insert data at v1 -- do NOT write CRC for v1
     let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    let _committed_v1 = insert_data(
+    let committed_v1 = insert_data(
         committed_v0.post_commit_snapshot().unwrap().clone(),
         &engine,
         vec![col],
     )
     .await?
     .unwrap_committed();
+    assert_eq!(committed_v1.commit_version(), 1);
 
     // Load a fresh snapshot at v0 (this loads 0.crc during P&M reading)
     let fresh_v0 = Snapshot::builder_for(&table_path)
@@ -630,13 +594,13 @@ async fn test_incremental_snapshot_reuses_old_lazy_crc() -> DeltaResult<()> {
         "Fresh v0 snapshot should have CRC loaded from 0.crc"
     );
 
-    // Incrementally update from v0 -> v1. The new listing still finds 0.crc as the
-    // latest CRC file (no 1.crc exists), so the old snapshot's LazyCrc should be reused.
+    // Incrementally update from v0 -> v1. The new listing (starting at v1) doesn't find
+    // any CRC file, so it falls back to the old segment's 0.crc. Since the old snapshot's
+    // LazyCrc is at the same version, it is reused (may already be loaded in memory).
     let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
     assert_eq!(incremental_v1.version(), 1);
 
-    // The CRC is at v0, not v1, so get_current_crc_if_loaded_for_testing returns None
-    // (version mismatch). But the LazyCrc itself was reused from the old snapshot.
+    // The CRC is at v0, not v1, so it won't be reported as loaded at v1
     assert!(
         incremental_v1
             .get_current_crc_if_loaded_for_testing()
