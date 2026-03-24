@@ -263,9 +263,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::arrow::array::{
-        ArrayRef, Int64Array, RecordBatch, StringArray, StructArray,
-    };
+    use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };

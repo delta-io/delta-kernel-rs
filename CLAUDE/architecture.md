@@ -94,8 +94,9 @@ The kernel is built around the `Engine` trait (`kernel/src/lib.rs`), which provi
 | `EvaluationHandler`  | Expression/predicate evaluation  | `new_expression_evaluator`, etc.           |
 | `MetricsReporter`    | Optional observability           | `get_metrics_reporter` (default: None)     |
 
-A `DefaultEngine` (Arrow + `object_store` + Tokio) lives in `kernel/src/engine/default/`. Custom
-engines only need to replace specific handlers -- they can reuse defaults for the rest.
+A `DefaultEngine` (Arrow + `object_store` + Tokio) lives in the `delta_kernel_default_engine`
+crate (`default-engine/`). Custom engines only need to replace specific handlers -- they can
+reuse defaults for the rest.
 
 ## EngineData Trait
 
