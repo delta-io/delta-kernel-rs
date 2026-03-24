@@ -6,8 +6,8 @@
 //!
 //! # Traits
 //!
-//! - [`UCCommitClient`] -- commit a new version to a UC-managed Delta table
-//! - [`UCGetCommitsClient`] -- retrieve commits from a UC-managed Delta table
+//! - [`CommitClient`] -- commit a new version to a UC-managed Delta table
+//! - [`GetCommitsClient`] -- retrieve commits from a UC-managed Delta table
 //!
 //! # Testing
 //!
@@ -24,7 +24,7 @@ pub mod credentials;
 pub mod error;
 pub mod models;
 
-pub use commits_client::{UCCommitClient, UCGetCommitsClient};
+pub use commits_client::{CommitClient, GetCommitsClient};
 pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 pub use error::{Error, Result};
 pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};

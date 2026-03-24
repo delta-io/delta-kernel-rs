@@ -4,7 +4,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use unitycatalog_client_api::Operation;
 use unitycatalog_client_rest_impl::{
     models::{Commit, CommitsRequest},
-    UCClient, UCCommitsRestClient, UCGetCommitsClient,
+    GetCommitsClient, UCClient, UCCommitsRestClient,
 };
 
 #[derive(Parser)]

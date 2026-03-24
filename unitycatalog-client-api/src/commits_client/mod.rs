@@ -15,7 +15,7 @@ pub use in_memory::{InMemoryCommitsClient, TableData};
 /// perform any retries and relies on the underlying client implementation to
 /// handle retry logic.
 #[allow(async_fn_in_trait)]
-pub trait UCCommitClient: Send + Sync {
+pub trait CommitClient: Send + Sync {
     /// Commit a new version to the table.
     async fn commit(&self, request: CommitRequest) -> Result<()>;
 }
@@ -25,7 +25,7 @@ pub trait UCCommitClient: Send + Sync {
 /// Implementations of this trait are responsible for performing any necessary
 /// retries on transient failures.
 #[allow(async_fn_in_trait)]
-pub trait UCGetCommitsClient: Send + Sync {
+pub trait GetCommitsClient: Send + Sync {
     /// Get the latest commits for the table.
     async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse>;
 }

@@ -1,4 +1,4 @@
-//! In-memory implementation of [`UCCommitClient`] and [`UCGetCommitsClient`] for testing.
+//! In-memory implementation of [`CommitClient`] and [`GetCommitsClient`] for testing.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use crate::error::{Error, Result};
 use crate::models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
 
-use super::{UCCommitClient, UCGetCommitsClient};
+use super::{CommitClient, GetCommitsClient};
 
 // ============================================================================
 // TableData
@@ -95,7 +95,7 @@ impl TableData {
 // InMemoryCommitsClient
 // ============================================================================
 
-/// An in-memory implementation of [`UCCommitClient`] and [`UCGetCommitsClient`] for testing.
+/// An in-memory implementation of [`CommitClient`] and [`GetCommitsClient`] for testing.
 pub struct InMemoryCommitsClient {
     // table id -> table data
     tables: RwLock<HashMap<String, TableData>>,
@@ -137,7 +137,7 @@ impl Default for InMemoryCommitsClient {
     }
 }
 
-impl UCGetCommitsClient for InMemoryCommitsClient {
+impl GetCommitsClient for InMemoryCommitsClient {
     async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
         let tables = self.tables.read().unwrap();
         let table = tables
@@ -147,7 +147,7 @@ impl UCGetCommitsClient for InMemoryCommitsClient {
     }
 }
 
-impl UCCommitClient for InMemoryCommitsClient {
+impl CommitClient for InMemoryCommitsClient {
     async fn commit(&self, request: CommitRequest) -> Result<()> {
         let mut tables = self.tables.write().unwrap();
         let table = tables

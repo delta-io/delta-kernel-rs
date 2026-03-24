@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
-use unitycatalog_client_api::{Commit, CommitRequest, UCCommitClient};
+use unitycatalog_client_api::{Commit, CommitClient, CommitRequest};
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
@@ -12,12 +12,12 @@ use unitycatalog_client_api::{Commit, CommitRequest, UCCommitClient};
 /// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
-pub struct UCCommitter<C: UCCommitClient> {
+pub struct UCCommitter<C: CommitClient> {
     commits_client: Arc<C>,
     table_id: String,
 }
 
-impl<C: UCCommitClient> UCCommitter<C> {
+impl<C: CommitClient> UCCommitter<C> {
     /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the given
     /// `table_id`.
     pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
@@ -28,7 +28,7 @@ impl<C: UCCommitClient> UCCommitter<C> {
     }
 }
 
-impl<C: UCCommitClient + 'static> Committer for UCCommitter<C> {
+impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC. UC's committer elects to write out a
     /// staged commit for the actions then call the UC commit API to 'finalize' (ratify) the staged
     /// commit. Note that this will accumulate staged commits, and separately clients are expected
@@ -136,7 +136,7 @@ mod tests {
 
     struct MockCommitsClient;
 
-    impl UCCommitClient for MockCommitsClient {
+    impl CommitClient for MockCommitsClient {
         async fn commit(&self, _: CommitRequest) -> Result<()> {
             unimplemented!()
         }

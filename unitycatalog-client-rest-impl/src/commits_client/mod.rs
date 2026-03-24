@@ -6,7 +6,7 @@ use crate::config::ClientConfig;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
 use unitycatalog_client_api::{CommitRequest, CommitsRequest, CommitsResponse};
 
-pub use unitycatalog_client_api::commits_client::{UCCommitClient, UCGetCommitsClient};
+pub use unitycatalog_client_api::commits_client::{CommitClient, GetCommitsClient};
 
 /// Placeholder for deserializing empty JSON responses from void-returning endpoints.
 #[derive(Deserialize)]
@@ -15,7 +15,7 @@ struct EmptyResponse {}
 #[cfg(any(test, feature = "test-utils"))]
 pub use unitycatalog_client_api::{InMemoryCommitsClient, TableData};
 
-/// REST implementation of [UCCommitClient] and [UCGetCommitsClient].
+/// REST implementation of [CommitClient] and [GetCommitsClient].
 #[derive(Debug, Clone)]
 pub struct UCCommitsRestClient {
     http_client: reqwest::Client,
@@ -43,7 +43,7 @@ impl UCCommitsRestClient {
     }
 }
 
-impl UCGetCommitsClient for UCCommitsRestClient {
+impl GetCommitsClient for UCCommitsRestClient {
     #[instrument(skip(self))]
     async fn get_commits(
         &self,
@@ -65,7 +65,7 @@ impl UCGetCommitsClient for UCCommitsRestClient {
     }
 }
 
-impl UCCommitClient for UCCommitsRestClient {
+impl CommitClient for UCCommitsRestClient {
     #[instrument(skip(self))]
     async fn commit(&self, request: CommitRequest) -> unitycatalog_client_api::Result<()> {
         let result: crate::error::Result<()> = async {

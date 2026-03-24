@@ -7,19 +7,19 @@ use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
 
-use unitycatalog_client_api::{CommitsRequest, UCGetCommitsClient};
+use unitycatalog_client_api::{CommitsRequest, GetCommitsClient};
 
 use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
 /// The [UCKernelClient] provides a high-level interface to interact with Delta Tables stored in
-/// Unity Catalog. It is a lightweight wrapper around a [UCGetCommitsClient].
-pub struct UCKernelClient<'a, C: UCGetCommitsClient> {
+/// Unity Catalog. It is a lightweight wrapper around a [GetCommitsClient].
+pub struct UCKernelClient<'a, C: GetCommitsClient> {
     client: &'a C,
 }
 
-impl<'a, C: UCGetCommitsClient> UCKernelClient<'a, C> {
+impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
     /// Create a new [UCKernelClient] instance with the provided client.
     pub fn new(client: &'a C) -> Self {
         UCKernelClient { client }

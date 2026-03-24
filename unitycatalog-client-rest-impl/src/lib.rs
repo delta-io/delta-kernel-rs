@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use unitycatalog_client_rest_impl::{ClientConfig, UCCommitsRestClient, UCGetCommitsClient, models::CommitsRequest};
+//! use unitycatalog_client_rest_impl::{ClientConfig, UCCommitsRestClient, GetCommitsClient, models::CommitsRequest};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@ pub mod models;
 mod tests;
 
 pub use client::UCClient;
-pub use commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
+pub use commits_client::{CommitClient, GetCommitsClient, UCCommitsRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 
@@ -40,7 +40,7 @@ pub use commits_client::{InMemoryCommitsClient, TableData};
 #[doc(hidden)]
 pub mod prelude {
     pub use crate::client::UCClient;
-    pub use crate::commits_client::{UCCommitClient, UCCommitsRestClient, UCGetCommitsClient};
+    pub use crate::commits_client::{CommitClient, GetCommitsClient, UCCommitsRestClient};
     pub use crate::models::tables::TablesResponse;
     pub use crate::models::{Commit, CommitsRequest, CommitsResponse};
     pub use unitycatalog_client_api::{Operation, TemporaryTableCredentials};

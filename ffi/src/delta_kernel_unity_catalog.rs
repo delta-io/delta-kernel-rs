@@ -1,4 +1,4 @@
-//! FFI hooks that enable constructing a UCCommitClient.
+//! FFI hooks that enable constructing a CommitClient.
 
 use crate::error::{ExternResult, IntoExternResult as _};
 use crate::{error::AllocateErrorFn, transaction::MutableCommitter};
@@ -17,7 +17,7 @@ use delta_kernel_ffi::{
 use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
 
-use unitycatalog_client_api::{CommitRequest as ClientCommitRequest, UCCommitClient};
+use unitycatalog_client_api::{CommitClient, CommitRequest as ClientCommitRequest};
 
 use tracing::debug;
 
@@ -64,7 +64,7 @@ pub struct FfiUCCommitClient {
 unsafe impl Send for FfiUCCommitClient {}
 unsafe impl Sync for FfiUCCommitClient {}
 
-impl UCCommitClient for FfiUCCommitClient {
+impl CommitClient for FfiUCCommitClient {
     /// Commit a new version to the table.
     async fn commit(&self, request: ClientCommitRequest) -> unitycatalog_client_api::Result<()> {
         let table_id = request.table_id;
@@ -149,11 +149,11 @@ pub unsafe extern "C" fn free_uc_commit_client(commit_client: Handle<SharedFfiUC
 
 // we need our own struct here because we want to override the calls to enter the tokio runtime
 // before calling into the standard committer
-struct FfiUCCommitter<C: UCCommitClient> {
+struct FfiUCCommitter<C: CommitClient> {
     inner: UCCommitter<C>,
 }
 
-impl<C: UCCommitClient + 'static> Committer for FfiUCCommitter<C> {
+impl<C: CommitClient + 'static> Committer for FfiUCCommitter<C> {
     fn commit(
         &self,
         engine: &dyn delta_kernel::Engine,
@@ -244,7 +244,7 @@ pub(crate) mod tests {
     use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::Arc;
-    use unitycatalog_client_api::{Commit as ClientCommit, UCCommitClient};
+    use unitycatalog_client_api::{Commit as ClientCommit, CommitClient};
 
     pub(crate) struct TestContext {
         pub(crate) commit_called: bool,
