@@ -142,9 +142,16 @@ jobs:
         with:
           cache: false
           components: clippy
+      # Shared with the test job below. Both compile --all-features on the same OS matrix,
+      # so shared-key collapses two cache entries per OS into one (~1.3GB saved).
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: all-features
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # IMPORTANT: --all-features must stay in sync with the test job below. Both jobs share
+      # a rust-cache entry via shared-key. If the feature flags diverge, one job's artifacts
+      # evict the other's on each main push. If you need different features, remove shared-key
+      # from both jobs and let them cache independently.
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
@@ -180,10 +187,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+      # Shares cache with the build job. See the build job's rust-cache step for details.
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: all-features
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      # IMPORTANT: --all-features must stay in sync with the build job above. Both jobs share
+      # a rust-cache entry via shared-key. See the build job's clippy step for details.
       - name: test
         run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
       - name: trybuild tests
