@@ -125,21 +125,24 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
     checkpoints
 }
 
-/// Returns `true` if `files` contains at least one complete checkpoint across any version.
+/// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
+/// checkpoint exists.
 ///
 /// Assumes `files` is in ascending version order, as produced by [`list_from_storage`].
-fn has_complete_checkpoint_in(files: &[ParsedLogPath]) -> bool {
+fn find_complete_checkpoint_version(files: &[ParsedLogPath]) -> Option<Version> {
     files
         .iter()
         .filter(|f| f.is_checkpoint() && f.location.size > 0)
         .chunk_by(|f| f.version)
         .into_iter()
-        .any(|(_, parts)| {
+        .filter_map(|(version, parts)| {
             let owned: Vec<ParsedLogPath> = parts.cloned().collect();
             group_checkpoint_parts(owned)
                 .iter()
                 .any(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+                .then_some(version)
         })
+        .last()
 }
 
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
@@ -251,17 +254,16 @@ const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
 
 impl LogSegmentFiles {
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
-    /// listed from storage) and `log_tail` (catalog-provided commits)
+    /// listed from storage) and `log_tail` (catalog-provided commits).
     ///
-    /// `start_version` controls how the log_tail is filtered:
-    /// - `Some(v)`: include log_tail entries at version >= v
-    /// - `None`: derive the lower bound from the most recent complete checkpoint found during
-    ///   the filesystem phase; entries at version > cp_version are included (checkpoint wins over
-    ///   commits AT the checkpoint version). Falls back to 0 if no checkpoint was found.
+    /// `start_version` is the inclusive lower bound for log replay: log_tail entries at versions
+    /// below `start_version` are excluded. Callers are responsible for computing this value —
+    /// typically `0` when there is no checkpoint, or `checkpoint_version + 1` when there is one
+    /// (a checkpoint supersedes any commit at the same version).
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
-        start_version: Option<Version>,
+        start_version: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         // check log_tail is only commits
@@ -303,31 +305,9 @@ impl LogSegmentFiles {
             acc.process_file(file);
         }
 
-        // Phase 2: resolve log_tail start version and end version upper bound
-        let resolved_start = match start_version {
-            Some(v) => v,
-            None => {
-                // Flush the last pending group so that output.checkpoint_parts is populated
-                // before we inspect it. Without this flush, a checkpoint whose parts arrived
-                // last would remain in pending_checkpoint_parts and the derived start version
-                // would fall back to 0 instead of the checkpoint version.
-                if let Some(gv) = acc.group_version {
-                    acc.flush_checkpoint_group(gv);
-                }
-                // Use cp_version + 1: a checkpoint wins over a commit at the checkpoint
-                // version and must not be replayed on top of it. The checkpoint has already
-                // been flushed from pending_checkpoint_parts into output.checkpoint_parts, so
-                // there are no pending parts in Phase 3 that would naturally discard it.
-                acc.output
-                    .checkpoint_parts
-                    .first()
-                    .map(|p| p.version + 1)
-                    .unwrap_or(0)
-            }
-        };
         let end = end_version.unwrap_or(Version::MAX);
 
-        // Phase 3: Process log_tail entries. We do this after Phase 1 because log_tail commits
+        // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
         // start at log_tail_start_version and are in ascending version order — they always extend
         // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
         // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
@@ -335,7 +315,7 @@ impl LogSegmentFiles {
         // versions, so there's no duplication here.
         let filtered_log_tail = log_tail
             .into_iter()
-            .filter(|entry| entry.version >= resolved_start && entry.version <= end);
+            .filter(|entry| entry.version >= start_version && entry.version <= end);
         for file in filtered_log_tail {
             // Track max published version for published commits from the log_tail
             if matches!(file.file_type, LogPathFileType::Commit) {
@@ -436,7 +416,7 @@ impl LogSegmentFiles {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter = list_from_storage(storage, log_root, start, end)?;
-        Self::build_log_segment_files(fs_iter, log_tail, Some(start), end_version)
+        Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
@@ -503,6 +483,7 @@ impl LogSegmentFiles {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
+        let mut found_checkpoint_version: Option<Version> = None;
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
         // in the first window. The inclusive range passed to list_from_storage is [lower, upper - 1].
         let mut upper = end_version + 1;
@@ -511,20 +492,21 @@ impl LogSegmentFiles {
             let window_files: Vec<_> =
                 list_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
 
-            let checkpoint_found = has_complete_checkpoint_in(&window_files);
+            found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);
 
-            if checkpoint_found {
+            if found_checkpoint_version.is_some() {
                 break;
             }
             upper = lower;
         }
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
-
-        // Pass None so the log_tail lower bound is derived from the checkpoint found during
-        // the fs phase.
-        Self::build_log_segment_files(fs_iter, log_tail, None, Some(end_version))
+        // Log replay starts at cp_version + 1: a checkpoint supersedes any commit at the same
+        // version, so commits at or before the checkpoint are not needed. Falls back to 0 if no
+        // checkpoint was found.
+        let start_version = found_checkpoint_version.map(|v| v + 1).unwrap_or(0);
+        Self::build_log_segment_files(fs_iter, log_tail, start_version, Some(end_version))
     }
 }
 
@@ -1126,7 +1108,7 @@ mod list_log_files_with_log_tail_tests {
     }
 
     /// end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
-    /// part 1 present). has_complete_checkpoint_in must return false for window 2, causing
+    /// part 1 present). find_complete_checkpoint_version must return None for window 2, causing
     /// the scan to continue to window 3, where a complete single-part checkpoint at v500 is
     /// found. Verifies that incomplete parts from window 2 are discarded and do not pollute
     /// the result's checkpoint_parts.
@@ -1393,7 +1375,7 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result.max_published_version, Some(5));
     }
 
-    // ===== has_complete_checkpoint_in direct unit tests (other cases for has_complete_checkpoint_in already covered by tests above) =====
+    // ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====
 
     fn zero_size_checkpoint_files() -> Vec<ParsedLogPath> {
         // Commits v0..=5 plus a zero-size checkpoint at v3. make_parsed_log_path_with_source
@@ -1420,7 +1402,7 @@ mod list_log_files_with_log_tail_tests {
 
     fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {
         // Commits v0..=10, an incomplete checkpoint at v5 (1 of 3 parts), and a complete
-        // checkpoint at v10. has_complete_checkpoint_in must continue past the failed group
+        // checkpoint at v10. find_complete_checkpoint_version must continue past the failed group
         // and find the complete one.
         let mut files: Vec<ParsedLogPath> = (0..=10)
             .map(|v| {
@@ -1447,17 +1429,47 @@ mod list_log_files_with_log_tail_tests {
         files
     }
 
+    fn two_complete_checkpoints_files() -> Vec<ParsedLogPath> {
+        // Commits v0..=10, complete checkpoint at v5 and complete checkpoint at v10.
+        // The function must return the latest (v10), not the first (v5).
+        let mut files: Vec<ParsedLogPath> = (0..=10)
+            .map(|v| {
+                make_parsed_log_path_with_source(
+                    v,
+                    LogPathFileType::Commit,
+                    CommitSource::Filesystem,
+                )
+            })
+            .collect();
+        files.push(make_parsed_log_path_with_source(
+            5,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        ));
+        files.push(make_parsed_log_path_with_source(
+            10,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        ));
+        files
+    }
+
     #[rstest]
     // Commits v0..=5, no checkpoint files
     #[case::no_checkpoint(
         (0u64..=5).map(|v| make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Filesystem)).collect(),
-        false
+        None
     )]
     // Commits v0..=5 plus a zero-size (corrupt) checkpoint at v3
-    #[case::zero_size_checkpoint(zero_size_checkpoint_files(), false)]
+    #[case::zero_size_checkpoint(zero_size_checkpoint_files(), None)]
     // Commits v0..=10, incomplete checkpoint at v5, complete checkpoint at v10
-    #[case::incomplete_then_complete(incomplete_then_complete_files(), true)]
-    fn has_complete_checkpoint_in_cases(#[case] files: Vec<ParsedLogPath>, #[case] expected: bool) {
-        assert_eq!(has_complete_checkpoint_in(&files), expected);
+    #[case::incomplete_then_complete(incomplete_then_complete_files(), Some(10))]
+    // Commits v0..=10, complete checkpoint at v5 and v10: must return v10 (latest)
+    #[case::two_complete(two_complete_checkpoints_files(), Some(10))]
+    fn find_complete_checkpoint_version_cases(
+        #[case] files: Vec<ParsedLogPath>,
+        #[case] expected: Option<u64>,
+    ) {
+        assert_eq!(find_complete_checkpoint_version(&files), expected);
     }
 }
