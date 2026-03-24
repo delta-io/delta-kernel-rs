@@ -71,7 +71,7 @@ Set the `BENCH_TAGS` environment variable to a comma-separated list of tags to r
 BENCH_TAGS=base cargo bench -p delta_kernel_benchmarks
 ```
 
-Built-in tags (with current table assignments - for the most up-to-date table assignments, run benchmarks locally and inspect `benchmarks/workloads/benchmarks/<table-name>/tableInfo.json` to learn about the existing tables):
+Built-in tags (with current table assignments - for the most up-to-date table assignments, run benchmarks locally and inspect `benchmarks/workloads/benchmarks/<any-existing-table-name>/tableInfo.json` to learn about the existing tables):
 - **`base`** — a base set of tables run in CI
   - Tables: `101kAdds1kCommitsSinceChkpt1Chkpt`
 - **`commit-size-scaling`** — tables for comparing how log replay time scales with the number of actions in the log; all are single-commit tables with varying action counts (100, 1k, 10k, 100k, 1M)
