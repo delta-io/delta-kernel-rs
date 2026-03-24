@@ -687,7 +687,7 @@ impl LogSegment {
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
-    /// For single-part checkpoints that need file actions, this function:
+    /// For checkpoints that need file actions, this function:
     /// 1. Determines the file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Extracts sidecar file references if present (V2 checkpoints)
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
@@ -705,10 +705,6 @@ impl LogSegment {
     > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Extract file actions schema and sidecar files
-        // Only process sidecars when:
-        // 1. We need file actions (add/remove) - sidecars only contain file actions
-        // 2. Single-part checkpoint - multi-part checkpoints are always V1 (no sidecars)
         let (file_actions_schema, sidecar_files) = if need_file_actions {
             self.get_file_actions_schema_and_sidecars(engine)?
         } else {

@@ -55,7 +55,7 @@ Test tables organized by feature area. Tables live in two locations:
 | `external-table-different-nullability` | data/ | `i: int` | v1/v2 | `checkpointInterval=2` | Parquet files have different nullability than Delta schema; includes checkpoint | `write.rs::test_checkpoint_non_kernel_written_table` |
 | `checkpoint` | golden_data/ | `intCol: int` | v1/v2 | | Basic checkpoint read | `golden_tables.rs::golden_test!(checkpoint_test)` |
 | `corrupted-last-checkpoint-kernel` | golden_data/ | `id: long` | v1/v2 | | Corrupted `_last_checkpoint` file | `golden_tables.rs::golden_test!` |
-| `v1-multi-part-checkpoint` | golden_data/ | `id: long` | v1/v2 | `checkpointInterval=1` | Multi-part checkpoint files | `golden_tables.rs::golden_test!` |
+| `multi-part-checkpoint` | golden_data/ | `id: long` | v1/v2 | `checkpointInterval=1` | Multi-part checkpoint files | `golden_tables.rs::golden_test!` |
 | `only-checkpoint-files` | golden_data/ | `id: long` | v1/v2 | `checkpointInterval=1` | Table with only checkpoint files, no JSON commits | `golden_tables.rs::golden_test!` |
 
 ## V2 Checkpoints
