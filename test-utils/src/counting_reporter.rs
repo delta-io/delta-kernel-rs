@@ -81,21 +81,16 @@ impl CountingReporter {
         let list_files = self.list_files_seen.load(Ordering::Relaxed);
         let read_calls = self.read_calls.load(Ordering::Relaxed);
         let read_files = self.read_files.load(Ordering::Relaxed);
-        let bytes_read = self.bytes_read.load(Ordering::Relaxed);
+        let kib = self.bytes_read.load(Ordering::Relaxed) / 1024;
         let copy_calls = self.copy_calls.load(Ordering::Relaxed);
         let log_loads = self.log_segment_loads.load(Ordering::Relaxed);
         let commits = self.commit_files.load(Ordering::Relaxed);
         let checkpoints = self.checkpoint_files.load(Ordering::Relaxed);
         let compactions = self.compaction_files.load(Ordering::Relaxed);
 
-        println!(
-            "  [io] {label}\n\
-             \x20       storage  : {list_calls} list ({list_files} files seen)  \
-             {read_calls} read ({read_files} files, {} KiB)  {copy_calls} copy\n\
-             \x20       log replay: {log_loads} segment load(s) -- \
-             {commits} commits  {checkpoints} checkpoints  {compactions} compactions",
-            bytes_read / 1024,
-        );
+        println!("  [io] {label}");
+        println!("    storage  : {list_calls} list ({list_files} files seen)  {read_calls} read ({read_files} files, {kib} KiB)  {copy_calls} copy");
+        println!("    log replay: {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions");
     }
 }
 
