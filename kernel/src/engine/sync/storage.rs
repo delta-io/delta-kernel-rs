@@ -2,96 +2,256 @@ use bytes::Bytes;
 use itertools::Itertools;
 use url::Url;
 
+use super::block_on_async;
+use crate::object_store::{path::Path, DynObjectStore};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-pub(crate) struct SyncStorageHandler;
+use std::sync::Arc;
+
+pub(crate) struct SyncStorageHandler {
+    store: Option<Arc<DynObjectStore>>,
+}
+
+impl SyncStorageHandler {
+    pub(crate) fn new() -> Self {
+        Self { store: None }
+    }
+
+    pub(crate) fn with_store(store: Arc<DynObjectStore>) -> Self {
+        Self { store: Some(store) }
+    }
+}
 
 impl StorageHandler for SyncStorageHandler {
-    /// List the paths in the same directory that are lexicographically greater or equal to
-    /// (UTF-8 sorting) the given `path`. The result is sorted by the file name.
     fn list_from(
         &self,
         url_path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        if url_path.scheme() == "file" {
-            let path = url_path
-                .to_file_path()
-                .map_err(|_| Error::Generic(format!("Invalid path for list_from: {url_path:?}")))?;
-
-            let (path_to_read, min_file_name) = if path.is_dir() {
-                // passed path is an existing dir, don't strip anything and don't filter the results
-                (path, None)
-            } else {
-                // path doesn't exist, or is not a dir, assume the final part is a filename. strip
-                // that and use it as the min_file_name to return
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| Error::Generic(format!("Invalid path for list_from: {path:?}")))?
-                    .to_path_buf();
-                let file_name = path.file_name().ok_or_else(|| {
-                    Error::Generic(format!("Invalid path for list_from: {path:?}"))
-                })?;
-                (parent, Some(file_name))
-            };
-
-            let all_ents: Vec<_> = std::fs::read_dir(path_to_read)?
-                .filter(|ent_res| {
-                    match (ent_res, min_file_name) {
-                        (Ok(ent), Some(min_file_name)) => ent.file_name() > *min_file_name,
-                        _ => true, // Keep unfiltered and/or error entries
-                    }
-                })
-                .try_collect()?;
-            let it = all_ents
-                .into_iter()
-                .sorted_by_key(|ent| ent.path())
-                .map(TryFrom::try_from);
-            Ok(Box::new(it))
-        } else {
-            Err(Error::generic("Can only read local filesystem"))
+        if let Some(store) = &self.store {
+            return list_from_store(store, url_path);
         }
+        list_from_local(url_path)
     }
 
-    /// Read data specified by the start and end offset from the file.
     fn read_files(
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let iter = files.into_iter().map(|(url, _range_opt)| {
-            if url.scheme() == "file" {
-                if let Ok(file_path) = url.to_file_path() {
-                    let bytes_vec_res = std::fs::read(file_path);
-                    let bytes: std::io::Result<Bytes> =
-                        bytes_vec_res.map(|bytes_vec| bytes_vec.into());
-                    return bytes.map_err(|_| Error::file_not_found(url.path()));
-                }
-            }
-            Err(Error::generic("Can only read local filesystem"))
-        });
-        Ok(Box::new(iter))
+        if let Some(store) = &self.store {
+            return read_files_store(store, files);
+        }
+        read_files_local(files)
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
-        if path.scheme() != "file" {
-            return Err(Error::generic("Can only write to local filesystem"));
+        if let Some(store) = &self.store {
+            return put_store(store, path, data, overwrite);
         }
-        let file_path = path
-            .to_file_path()
-            .map_err(|_| Error::generic(format!("Invalid path for put: {path:?}")))?;
-        if !overwrite && file_path.exists() {
-            return Err(Error::FileAlreadyExists(file_path.to_string_lossy().into()));
-        }
-        std::fs::write(&file_path, &data)
-            .map_err(|e| Error::generic(format!("Failed to write {}: {e}", file_path.display())))
+        put_local(path, data, overwrite)
     }
 
     fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
         unimplemented!("SyncStorageHandler does not implement copy");
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
-        unimplemented!("head is not implemented for SyncStorageHandler")
+    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+        if let Some(store) = &self.store {
+            return head_store(store, path);
+        }
+        head_local(path)
     }
+}
+
+// -- ObjectStore-backed implementations --
+
+fn list_from_store(
+    store: &DynObjectStore,
+    url_path: &Url,
+) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    let path = Path::from(url_path.path());
+    let url_is_directory = url_path.path().ends_with('/');
+
+    // If the URL represents a directory, list it directly. Otherwise extract the parent
+    // directory and use the filename as a lower bound filter (matching local behavior).
+    let (list_prefix, filter_path) = if url_is_directory {
+        (path, None)
+    } else {
+        let parent = path
+            .parts()
+            .take(path.parts().count().saturating_sub(1))
+            .collect::<Path>();
+        (parent, Some(path.to_string()))
+    };
+
+    let list_result = block_on_async(store.list_with_delimiter(Some(&list_prefix)))?;
+
+    let mut metas: Vec<_> = list_result
+        .objects
+        .into_iter()
+        .filter(|meta| {
+            filter_path
+                .as_ref()
+                .is_none_or(|fp| meta.location.to_string() > *fp)
+        })
+        .collect();
+    metas.sort_by(|a, b| a.location.cmp(&b.location));
+
+    let base_url = {
+        let mut u = url_path.clone();
+        u.set_path("/");
+        u
+    };
+
+    let iter = metas.into_iter().map(move |meta| {
+        let location = base_url
+            .join(meta.location.as_ref())
+            .map_err(|e| Error::generic(format!("Failed to construct URL: {e}")))?;
+        Ok(FileMeta {
+            location,
+            last_modified: meta.last_modified.timestamp_millis(),
+            size: meta.size,
+        })
+    });
+    Ok(Box::new(iter))
+}
+
+fn read_files_store(
+    store: &DynObjectStore,
+    files: Vec<FileSlice>,
+) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    // Collect eagerly since we need sync access to the store
+    let results: Vec<DeltaResult<Bytes>> = files
+        .into_iter()
+        .map(|(url, _range_opt)| {
+            let path = Path::from(url.path());
+            let get_result = block_on_async(store.get(&path))?;
+            let bytes = block_on_async(get_result.bytes())?;
+            Ok(bytes)
+        })
+        .collect();
+    Ok(Box::new(results.into_iter()))
+}
+
+fn put_store(store: &DynObjectStore, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    use crate::object_store::PutMode;
+
+    let object_path = Path::from(path.path());
+    let opts = if overwrite {
+        crate::object_store::PutOptions::default()
+    } else {
+        crate::object_store::PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        }
+    };
+    block_on_async(store.put_opts(&object_path, data.into(), opts)).map_err(|e| match e {
+        crate::object_store::Error::AlreadyExists { .. } => {
+            Error::FileAlreadyExists(path.to_string())
+        }
+        other => Error::generic(other.to_string()),
+    })?;
+    Ok(())
+}
+
+fn head_store(store: &DynObjectStore, url: &Url) -> DeltaResult<FileMeta> {
+    let path = Path::from(url.path());
+    let meta = block_on_async(store.head(&path))?;
+    Ok(FileMeta {
+        location: url.clone(),
+        last_modified: meta.last_modified.timestamp_millis(),
+        size: meta.size,
+    })
+}
+
+// -- Local filesystem implementations (original behavior) --
+
+fn list_from_local(url_path: &Url) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    if url_path.scheme() == "file" {
+        let path = url_path
+            .to_file_path()
+            .map_err(|_| Error::Generic(format!("Invalid path for list_from: {url_path:?}")))?;
+
+        let (path_to_read, min_file_name) = if path.is_dir() {
+            (path, None)
+        } else {
+            let parent = path
+                .parent()
+                .ok_or_else(|| Error::Generic(format!("Invalid path for list_from: {path:?}")))?
+                .to_path_buf();
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| Error::Generic(format!("Invalid path for list_from: {path:?}")))?;
+            (parent, Some(file_name))
+        };
+
+        let all_ents: Vec<_> = std::fs::read_dir(path_to_read)?
+            .filter(|ent_res| {
+                match (ent_res, min_file_name) {
+                    (Ok(ent), Some(min_file_name)) => ent.file_name() > *min_file_name,
+                    _ => true, // Keep unfiltered and/or error entries
+                }
+            })
+            .try_collect()?;
+        let it = all_ents
+            .into_iter()
+            .sorted_by_key(|ent| ent.path())
+            .map(TryFrom::try_from);
+        Ok(Box::new(it))
+    } else {
+        Err(Error::generic("Can only read local filesystem"))
+    }
+}
+
+fn read_files_local(
+    files: Vec<FileSlice>,
+) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    let iter = files.into_iter().map(|(url, _range_opt)| {
+        if url.scheme() == "file" {
+            if let Ok(file_path) = url.to_file_path() {
+                let bytes_vec_res = std::fs::read(file_path);
+                let bytes: std::io::Result<Bytes> = bytes_vec_res.map(|bytes_vec| bytes_vec.into());
+                return bytes.map_err(|_| Error::file_not_found(url.path()));
+            }
+        }
+        Err(Error::generic("Can only read local filesystem"))
+    });
+    Ok(Box::new(iter))
+}
+
+fn put_local(path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    if path.scheme() != "file" {
+        return Err(Error::generic("Can only write to local filesystem"));
+    }
+    let file_path = path
+        .to_file_path()
+        .map_err(|_| Error::generic(format!("Invalid path for put: {path:?}")))?;
+    if !overwrite && file_path.exists() {
+        return Err(Error::FileAlreadyExists(file_path.to_string_lossy().into()));
+    }
+    std::fs::write(&file_path, &data)
+        .map_err(|e| Error::generic(format!("Failed to write {}: {e}", file_path.display())))
+}
+
+fn head_local(path: &Url) -> DeltaResult<FileMeta> {
+    if path.scheme() != "file" {
+        return Err(Error::generic("Can only read local filesystem"));
+    }
+    let file_path = path
+        .to_file_path()
+        .map_err(|_| Error::generic(format!("Invalid path for head: {path:?}")))?;
+    let metadata = std::fs::metadata(&file_path)
+        .map_err(|_| Error::file_not_found(file_path.to_string_lossy()))?;
+    let last_modified = metadata
+        .modified()
+        .map_err(|e| Error::generic(format!("Failed to get modified time: {e}")))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| Error::generic(format!("Invalid modified time: {e}")))?
+        .as_millis() as i64;
+    Ok(FileMeta {
+        location: path.clone(),
+        last_modified,
+        size: metadata.len(),
+    })
 }
 
 #[cfg(test)]
@@ -115,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_file_meta_is_correct() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = SyncStorageHandler;
+        let storage = SyncStorageHandler::new();
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let begin_time = current_time_duration()?;
@@ -139,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = SyncStorageHandler;
+        let storage = SyncStorageHandler::new();
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut expected = vec![];
         for i in 0..3 {
@@ -178,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = SyncStorageHandler;
+        let storage = SyncStorageHandler::new();
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join(get_json_filename(1));
         let mut f = File::create(path.clone())?;
