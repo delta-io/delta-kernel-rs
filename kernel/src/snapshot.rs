@@ -705,6 +705,14 @@ impl Snapshot {
         self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
     }
 
+    /// Returns the CRC version tracked by this snapshot's LazyCrc, if any.
+    ///
+    /// This is a test-only helper for integration tests to inspect the CRC version.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn crc_version_for_testing(&self) -> Option<Version> {
+        self.lazy_crc.crc_version()
+    }
+
     /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
     /// every commit because checksums enable faster snapshot loading and table state validation.
     ///

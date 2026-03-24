@@ -533,12 +533,13 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
     let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
     assert_eq!(incremental_v1.version(), 1);
 
-    // The CRC should be loaded from the incremental update (not discarded)
+    // The CRC at v1 should be loaded from the incremental update (not discarded)
+    assert_eq!(incremental_v1.crc_version_for_testing(), Some(1));
     assert!(
         incremental_v1
             .get_current_crc_if_loaded_for_testing()
             .is_some(),
-        "CRC should be loaded after incremental snapshot update with CRC file at target version"
+        "CRC should be loaded at v1 after incremental snapshot update"
     );
 
     // Committing from this snapshot should produce a post-commit CRC (proves
