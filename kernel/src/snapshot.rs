@@ -274,7 +274,21 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.listed.latest_crc_file.clone()));
+        //
+        // If the new segment's CRC file matches the old snapshot's, reuse the old LazyCrc
+        // to avoid redundant I/O (it may already be loaded in memory).
+        let lazy_crc = if new_log_segment.listed.latest_crc_file.is_some()
+            && existing_snapshot.lazy_crc.crc_version()
+                == new_log_segment
+                    .listed
+                    .latest_crc_file
+                    .as_ref()
+                    .map(|f| f.version)
+        {
+            existing_snapshot.lazy_crc.clone()
+        } else {
+            Arc::new(LazyCrc::new(new_log_segment.listed.latest_crc_file.clone()))
+        };
         let (new_metadata, new_protocol) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
