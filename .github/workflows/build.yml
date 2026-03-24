@@ -153,8 +153,12 @@ jobs:
         run: cargo clippy --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel builds with default-engine-native-tls
         run: cargo build -p feature_tests --features default-engine-native-tls
+      - name: test native-tls backend has no crypto provider conflict
+        run: cargo test -p feature_tests --features default-engine-native-tls
       - name: check kernel builds with default-engine-rustls
         run: cargo build -p feature_tests --features default-engine-rustls
+      - name: test rustls TLS backend feature-tests
+        run: cargo test -p feature_tests --features default-engine-rustls
   test:
     runs-on: ${{ matrix.os }}
     strategy:
