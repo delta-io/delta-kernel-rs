@@ -73,6 +73,14 @@ BENCH_TAGS=base cargo bench -p delta_kernel_benchmarks
 
 Built-in tags:
 - **`base`** — a base set of tables run in CI
+- **`log-replay-optimization`** — tables for comparing how snapshot construction time scales with the number of actions in the log; all are single-commit tables with varying action counts (100, 1k, 10k, 100k, 1M)
+- **`checkpoint-optimization`** — tables for comparing checkpoint reading performance for different kinds of checkpointing; tables with v2 checkpoints have the tag **`v2-checkpoint`** as well
+- **`crc-optimization`** — tables for comparing how CRC files affect snapshot construction timing; designed to isolate the effect of a single CRC at different versions relative to the checkpoint and latest version
+- **`time-travel-optimization`** — tables with multiple specs or specs not at the latest version, useful for benchmarking snapshot construction at historical versions
+- **`listing-optimization`** — tables for benchmarking log listing efficiency (e.g. `list_from()` call patterns); useful for features that optimize how the delta log directory is scanned
+- **`metadata-only`** — tables with no actual data files, useful for isolating log metadata processing overhead
+
+To see which tables correspond to each tag and what each table contains specifically, run benchmarking locally and inspect the `tableInfo.json` file in each table's directory under `benchmarks/workloads/benchmarks/<table-name>/tableInfo.json`.
 
 You can also add custom tags to any `tableInfo.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
 
