@@ -5,7 +5,10 @@ use std::sync::Arc;
 use super::validation::{validate_read_result, validate_snapshot};
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
@@ -39,22 +42,18 @@ pub fn execute_read_workload(
     table_root: &Url,
     read_spec: &ReadSpec,
 ) -> DeltaResult<ReadResult> {
-    // Resolve version from time_travel
-    let version: Option<Version> = match &read_spec.time_travel {
-        Some(TimeTravel::Version { version }) => Some(*version),
-        Some(TimeTravel::Timestamp { timestamp: _ }) => {
-            return Err(Error::generic(
-                "Timestamp-based timetravel is not yet supported",
-            ))
-        }
-        None => None,
-    };
+    let version = read_spec
+        .time_travel
+        .as_ref()
+        .map(TimeTravel::as_version)
+        .transpose()
+        .map_err(Error::generic)?;
 
     // Parse predicate if present
     let predicate = read_spec
         .predicate
         .as_deref()
-        .map(|p| parse_predicate(p).map(Arc::new))
+        .map(|p| parse_predicate(p))
         .transpose()
         .map_err(|e| Error::generic(format!("Failed to parse predicate: {e}")))?;
 
@@ -67,11 +66,8 @@ pub fn execute_read_workload(
 
     let table_schema = snapshot.schema();
 
-    // Build scan with optional predicate and column projection
+    // Build scan with column projection (no predicate pushdown - we filter after)
     let mut scan_builder = snapshot.scan_builder();
-    if let Some(pred) = predicate {
-        scan_builder = scan_builder.with_predicate(pred);
-    }
     if let Some(ref cols) = read_spec.columns {
         let projected_schema = table_schema.project(cols)?;
         scan_builder = scan_builder.with_schema(projected_schema);
@@ -80,16 +76,40 @@ pub fn execute_read_workload(
 
     let schema = scan.logical_schema();
 
-    // Execute scan
-    let batches = scan
+    // Execute scan to get all batches
+    let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
+
+    // Filter batches using the predicate if present
+    let batches = filter_batches_with_predicate(batches, predicate.as_ref())?;
 
     Ok(ReadResult {
         batches,
         schema: schema.clone(),
     })
+}
+
+/// Filter record batches using a predicate expression.
+fn filter_batches_with_predicate(
+    batches: Vec<RecordBatch>,
+    predicate: Option<&Predicate>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    let Some(predicate) = predicate else {
+        return Ok(batches);
+    };
+
+    batches
+        .into_iter()
+        .map(|batch| {
+            // Evaluate predicate to get boolean selection array
+            let selection = evaluate_predicate(predicate, &batch, false)?;
+            // Filter the batch using the selection
+            let filtered = filter_record_batch(&batch, &selection)?;
+            Ok(filtered)
+        })
+        .collect()
 }
 
 /// Execute a snapshot workload (for metadata validation).
@@ -98,15 +118,12 @@ pub fn execute_snapshot_workload(
     table_root: &Url,
     snapshot_spec: &SnapshotConstructionSpec,
 ) -> DeltaResult<SnapshotResult> {
-    let version = match &snapshot_spec.time_travel {
-        Some(TimeTravel::Version { version }) => Some(*version),
-        Some(TimeTravel::Timestamp { timestamp: _ }) => {
-            return Err(Error::generic(
-                "Timestamp-based timetravel is not yet supported",
-            ))
-        }
-        None => None,
-    };
+    let version = snapshot_spec
+        .time_travel
+        .as_ref()
+        .map(TimeTravel::as_version)
+        .transpose()
+        .map_err(Error::generic)?;
 
     let mut builder = Snapshot::builder_for(table_root.clone());
     if let Some(v) = version {

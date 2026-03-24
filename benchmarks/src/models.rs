@@ -152,6 +152,18 @@ pub enum TimeTravel {
     Timestamp { timestamp: String },
 }
 
+impl TimeTravel {
+    /// Returns the version if this is version-based time travel.
+    ///
+    /// Returns an error message for timestamp-based time travel, which is not yet supported.
+    pub fn as_version(&self) -> Result<u64, &'static str> {
+        match self {
+            TimeTravel::Version { version } => Ok(*version),
+            TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
+        }
+    }
+}
+
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 /// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]

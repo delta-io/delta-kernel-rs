@@ -14,6 +14,15 @@ const DAT_OUTPUT_FOLDER: &str = "tests/dat";
 const DAT_VERSION: &str = "0.0.3";
 const ACCEPTANCE_WORKLOADS_VERSION: &str = "0.0.4";
 
+/// Workloads to skip on Windows due to invalid filename characters.
+/// Windows does not support these characters in filenames: < > : " | ? *
+/// Additionally, some percent-encoded characters cause issues.
+#[cfg(windows)]
+const WINDOWS_SKIP_WORKLOADS: &[&str] = &[
+    // Contains files with #, %, and ? in filenames
+    "fpe_special_chars_path/",
+];
+
 fn main() {
     if !dat_exists() {
         let tarball_data = download_dat_files();
@@ -95,13 +104,36 @@ fn extract_acceptance_workloads() {
 
     let tarball_data = download_tarball(&tarball_url);
 
-    // Extract tarball
+    // Extract tarball, skipping files with invalid Windows filenames
     let decoder = GzDecoder::new(BufReader::new(&tarball_data[..]));
     let mut archive = Archive::new(decoder);
     std::fs::create_dir_all(&output_dir).expect("Failed to create acceptance output directory");
-    archive
-        .unpack(&output_dir)
-        .expect("Failed to unpack acceptance_workloads tarball");
+
+    // Extract workloads one-by-one to skip tests that contain delta logs with special characters
+    // on Windows machines. This is because Windows does not support such files in the filesystem.
+    for entry in archive.entries().expect("Failed to read tarball entries") {
+        let mut entry = entry.expect("Failed to read tarball entry");
+
+        // On Windows, skip workloads that contain files with invalid filename characters
+        #[cfg(windows)]
+        {
+            let path = entry.path().expect("Failed to get entry path");
+            let path_str = path.to_string_lossy();
+
+            // Skip entire workloads known to have problematic filenames
+            let should_skip = WINDOWS_SKIP_WORKLOADS
+                .iter()
+                .any(|skip| path_str.contains(skip));
+            if should_skip {
+                eprintln!("Skipping Windows-incompatible workload file: {}", path_str);
+                continue;
+            }
+        }
+
+        entry
+            .unpack_in(&output_dir)
+            .expect("Failed to unpack entry");
+    }
 
     // Write .done marker
     let mut done_file = BufWriter::new(

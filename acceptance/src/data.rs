@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
-use delta_kernel::arrow::datatypes::Schema;
+use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
@@ -43,22 +43,49 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Rec
     Ok(all_data)
 }
 
-// Ensure that two schema have the same field names, and dict_is_ordered
-// We ignore:
-//  - data type: This is checked already in `assert_columns_match`
-//  - nullability: parquet marks many things as nullable that we don't in our schema
-//  - metadata: because that diverges from the real data to the golden tabled data
-fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
-    for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
-        assert!(
-            schema_field.name() == golden_field.name(),
-            "Field names don't match"
-        );
-        assert!(
-            schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
-            "Field dict_is_ordered doesn't match"
-        );
+fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> DeltaResult<()> {
+    let schema_stripped = strip_metadata(schema);
+    let golden_stripped = strip_metadata(golden);
+    if schema_stripped.fields() != golden_stripped.fields() {
+        return Err(Error::generic(format!(
+            "Schema mismatch:\nActual: {:?}\nExpected: {:?}",
+            schema_stripped.fields(),
+            golden_stripped.fields()
+        )));
     }
+    Ok(())
+}
+
+fn strip_field(field: &Field) -> Field {
+    Field::new(
+        field.name(),
+        strip_type(field.data_type()),
+        field.is_nullable(),
+    )
+}
+
+fn strip_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Struct(fields) => DataType::Struct(Fields::from(
+            fields.iter().map(|f| strip_field(f)).collect::<Vec<_>>(),
+        )),
+        DataType::List(f) => DataType::List(Arc::new(strip_field(f))),
+        DataType::LargeList(f) => DataType::LargeList(Arc::new(strip_field(f))),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(Arc::new(strip_field(f)), *n),
+        DataType::Map(f, sorted) => DataType::Map(Arc::new(strip_field(f)), *sorted),
+        other => other.clone(),
+    }
+}
+
+/// Recursively strip metadata from schema and all nested fields.
+fn strip_metadata(schema: &Schema) -> Schema {
+    Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| strip_field(f))
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub fn assert_data_matches(
@@ -71,8 +98,8 @@ pub fn assert_data_matches(
     let arrow_schema = std::sync::Arc::new(arrow_schema);
     let all_data = concat_batches(&arrow_schema, result.iter())?;
 
-    // Validate schemas match (field names and dict_is_ordered)
-    assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref());
+    // Validate schemas match
+    assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref())?;
 
     // Format both batches as strings for order-independent comparison
     let actual_str = pretty_format_batches(std::slice::from_ref(&all_data))
