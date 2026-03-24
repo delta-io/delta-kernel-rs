@@ -559,9 +559,9 @@ async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
     Ok(())
 }
 
-// When an incremental snapshot update has no CRC in the new log segment but the old segment has
-// one, the combined segment falls back to the old CRC file. Since that CRC is at an older version,
-// it should NOT be reported as loaded at the new snapshot's version.
+// When an incremental snapshot update has no CRC in the new log segment, the combined segment
+// should have no CRC file either (the old segment's CRC is not carried forward because it could
+// be stale). The resulting snapshot should report no loaded CRC.
 #[tokio::test]
 async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
