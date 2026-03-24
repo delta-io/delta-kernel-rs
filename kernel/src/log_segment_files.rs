@@ -255,11 +255,6 @@ const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
 impl LogSegmentFiles {
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
     /// listed from storage) and `log_tail` (catalog-provided commits).
-    ///
-    /// `start_version` is the inclusive lower bound for log replay: log_tail entries at versions
-    /// below `start_version` are excluded. Callers are responsible for computing this value —
-    /// typically `0` when there is no checkpoint, or `checkpoint_version + 1` when there is one
-    /// (a checkpoint supersedes any commit at the same version).
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
@@ -274,6 +269,8 @@ impl LogSegmentFiles {
         );
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
+        let end = end_version.unwrap_or(Version::MAX);
+        
         let mut acc = ListingAccumulator {
             end_version,
             ..Default::default()
@@ -304,8 +301,6 @@ impl LogSegmentFiles {
             acc.maybe_flush_and_advance(file.version);
             acc.process_file(file);
         }
-
-        let end = end_version.unwrap_or(Version::MAX);
 
         // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
         // start at log_tail_start_version and are in ascending version order — they always extend
