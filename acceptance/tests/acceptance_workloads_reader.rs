@@ -795,26 +795,27 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
         return Ok(());
     }
 
-    // Load test case (includes spec)
+    // Load and execute test case
     let test_case = TestCase::from_spec_path(&spec_path_abs);
     let table_root = test_case.table_root().expect("Failed to get table URL");
     let engine = test_utils::create_default_engine(&table_root).expect("Failed to create engine");
+    let result = execute_and_validate_workload(
+        engine,
+        &table_root,
+        &test_case.spec,
+        &test_case.expected_dir(),
+    );
 
-    // Expected kernel failures: assert kernel DOES fail
-    if let Some((reason, _)) = expected_failure {
-        match execute_and_validate_workload(engine, &table_root, &test_case.spec, &test_case.expected_dir()) {
-            Err(_) => { /* Failure is expected */ }
-            Ok(_) => panic!(
-                "Workload '{}' was expected to fail but succeeded! \
-                 Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!",
-                test_case.workload_name
-            ),
-        }
-        return Ok(());
+    match (result, expected_failure) {
+        (Err(_), Some(_)) => {} // Expected to fail, did fail
+        (Ok(_), None) => {}     // Expected to pass, did pass
+        (Ok(_), Some((reason, _))) => panic!(
+            "Workload '{}' was expected to fail but succeeded! \
+             Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!",
+            test_case.workload_name
+        ),
+        (Err(e), None) => panic!("Workload '{}' failed: {}", test_case.workload_name, e),
     }
-
-    execute_and_validate_workload(engine, &table_root, &test_case.spec, &test_case.expected_dir())
-        .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", test_case.workload_name, e));
     Ok(())
 }
 

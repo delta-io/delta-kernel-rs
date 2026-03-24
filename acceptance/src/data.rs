@@ -85,7 +85,7 @@ pub fn assert_data_matches(
     result_schema: &SchemaRef,
     expected: RecordBatch,
 ) -> DeltaResult<()> {
-    let all_data = concat_batches(&result_schema, result.iter())?;
+    let all_data = concat_batches(result_schema, result.iter())?;
 
     // Validate schemas match
     assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref())?;

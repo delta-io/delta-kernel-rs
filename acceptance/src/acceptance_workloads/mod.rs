@@ -146,4 +146,3 @@ impl TestCase {
         self.root_dir.join("expected").join(&self.workload_name)
     }
 }
-
