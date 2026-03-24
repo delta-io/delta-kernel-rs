@@ -7,6 +7,8 @@
 use std::fs::{self, File};
 use std::path::Path;
 
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use itertools::Itertools;
 use tracing::debug;
 
@@ -87,12 +89,12 @@ pub fn validate_read_result(
     match (result, expected) {
         (Ok(read_result), ReadExpected::Success { expected: _ }) => {
             let expected_data = read_expected_data(expected_dir)?;
-            assert_data_matches(
-                read_result.batches,
-                &read_result.schema,
-                expected_data,
-            )
-            .map_err(|e| e.to_string())
+
+            let schema = ArrowSchema::try_from_kernel(read_result.schema.as_ref())
+                .map_err(|e| e.to_string())?;
+            let schema = std::sync::Arc::new(schema);
+            assert_data_matches(read_result.batches, &schema, expected_data)
+                .map_err(|e| e.to_string())
         }
         (Err(kernel_err), ReadExpected::Error { error }) => {
             debug!(

@@ -2,10 +2,9 @@ use std::{path::Path, sync::Arc};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
-use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema};
+use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
@@ -90,12 +89,10 @@ fn strip_metadata(schema: &Schema) -> Schema {
 
 pub fn assert_data_matches(
     result: Vec<RecordBatch>,
-    result_schema: &delta_kernel::schema::Schema,
+    result_schema: &SchemaRef,
     expected: RecordBatch,
 ) -> DeltaResult<()> {
-    let arrow_schema = Schema::try_from_kernel(result_schema)?;
-    let arrow_schema = std::sync::Arc::new(arrow_schema);
-    let all_data = concat_batches(&arrow_schema, result.iter())?;
+    let all_data = concat_batches(&result_schema, result.iter())?;
 
     // Validate schemas match
     assert_schema_fields_match(all_data.schema().as_ref(), expected.schema().as_ref())?;
@@ -140,7 +137,6 @@ pub async fn assert_scan_metadata(
     let table_root = test_case.table_root()?;
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
-    let kernel_schema = scan.logical_schema();
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
@@ -153,7 +149,7 @@ pub async fn assert_scan_metadata(
         })
         .try_collect()?;
     let golden = read_golden(test_case.root_dir(), None).await?;
-    assert_data_matches(batches, kernel_schema.as_ref(), golden)?;
+    assert_data_matches(batches, &schema.unwrap(), golden)?;
 
     Ok(())
 }
