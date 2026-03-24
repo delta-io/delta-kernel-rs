@@ -1094,15 +1094,12 @@ mod list_log_files_with_log_tail_tests {
             .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
             .collect();
 
-        // Add a checkpoint only if it falls within the log range
         if let Some(cp) = checkpoint_version {
-            if cp <= 1005 {
-                log_files.push((
-                    cp,
-                    LogPathFileType::SinglePartCheckpoint,
-                    CommitSource::Filesystem,
-                ));
-            }
+            log_files.push((
+                cp,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ));
         }
 
         let (storage, log_root) = create_storage(log_files).await;
@@ -1198,31 +1195,42 @@ mod list_log_files_with_log_tail_tests {
         log_files
     }
 
+    struct BackwardScanExpected {
+        listings: u32,
+        checkpoint_parts: usize,
+        checkpoint_version: Version,
+        commit_count: usize,
+        first_commit: Version,
+        last_commit: Version,
+    }
+
     // Case 1: complete 3-part checkpoint at v50, single window needed
     // Case 2: incomplete 1-of-2 part at v1500 in window 2, complete checkpoint at v500 in window 3
     #[rstest]
-    #[case::multipart_checkpoint(multipart_checkpoint_files(), 52, 1, 3, 50, 2, 51, 52)]
+    #[case::multipart_checkpoint(
+        multipart_checkpoint_files(),
+        52,
+        BackwardScanExpected { listings: 1, checkpoint_parts: 3, checkpoint_version: 50, commit_count: 2, first_commit: 51, last_commit: 52 }
+    )]
     #[case::incomplete_in_second_window_complete_in_third(
         files_incomplete_in_second_window_complete_in_third_window(),
         3000,
-        3,
-        1,
-        500,
-        2500,
-        501,
-        3000
+        BackwardScanExpected { listings: 3, checkpoint_parts: 1, checkpoint_version: 500, commit_count: 2500, first_commit: 501, last_commit: 3000 }
     )]
     #[tokio::test]
     async fn backward_scan_multipart_checkpoint_cases(
         #[case] log_files: Vec<(Version, LogPathFileType, CommitSource)>,
         #[case] end_version: Version,
-        #[case] expected_listings: u32,
-        #[case] expected_checkpoint_parts: usize,
-        #[case] expected_checkpoint_version: Version,
-        #[case] expected_commit_count: usize,
-        #[case] expected_first_commit: Version,
-        #[case] expected_last_commit: Version,
+        #[case] expected: BackwardScanExpected,
     ) {
+        let BackwardScanExpected {
+            listings: expected_listings,
+            checkpoint_parts: expected_checkpoint_parts,
+            checkpoint_version: expected_checkpoint_version,
+            commit_count: expected_commit_count,
+            first_commit: expected_first_commit,
+            last_commit: expected_last_commit,
+        } = expected;
         let (storage, log_root) = create_storage(log_files).await;
         let counter = CountingStorageHandler::new(storage);
 
