@@ -55,36 +55,29 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) -> DeltaResult<(
     Ok(())
 }
 
-fn strip_field(field: &Field) -> Field {
-    Field::new(
-        field.name(),
-        strip_type(field.data_type()),
-        field.is_nullable(),
-    )
-}
-
-fn strip_type(dt: &DataType) -> DataType {
-    match dt {
-        DataType::Struct(fields) => DataType::Struct(Fields::from(
-            fields.iter().map(|f| strip_field(f)).collect::<Vec<_>>(),
-        )),
-        DataType::List(f) => DataType::List(Arc::new(strip_field(f))),
-        DataType::LargeList(f) => DataType::LargeList(Arc::new(strip_field(f))),
-        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(Arc::new(strip_field(f)), *n),
-        DataType::Map(f, sorted) => DataType::Map(Arc::new(strip_field(f)), *sorted),
-        other => other.clone(),
-    }
-}
-
 /// Recursively strip metadata from schema and all nested fields.
 fn strip_metadata(schema: &Schema) -> Schema {
-    Schema::new(
-        schema
-            .fields()
-            .iter()
-            .map(|f| strip_field(f))
-            .collect::<Vec<_>>(),
-    )
+    fn strip_field(field: &Field) -> Field {
+        Field::new(
+            field.name(),
+            strip_type(field.data_type()),
+            field.is_nullable(),
+        )
+    }
+
+    fn strip_type(dt: &DataType) -> DataType {
+        match dt {
+            DataType::Struct(fields) => DataType::Struct(Fields::from(
+                fields.iter().map(|f| strip_field(f)).collect_vec(),
+            )),
+            DataType::List(f) => DataType::List(Arc::new(strip_field(f))),
+            DataType::LargeList(f) => DataType::LargeList(Arc::new(strip_field(f))),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(Arc::new(strip_field(f)), *n),
+            DataType::Map(f, sorted) => DataType::Map(Arc::new(strip_field(f)), *sorted),
+            other => other.clone(),
+        }
+    }
+    Schema::new(schema.fields().iter().map(|f| strip_field(f)).collect_vec())
 }
 
 pub fn assert_data_matches(

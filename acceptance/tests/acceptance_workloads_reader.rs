@@ -5,10 +5,7 @@
 
 use std::path::Path;
 
-use acceptance::acceptance_workloads::{
-    test_case_from_spec_path, workload::execute_and_validate_workload,
-};
-use delta_kernel_benchmarks::models::{ReadExpected, SnapshotExpected, Spec};
+use acceptance::acceptance_workloads::{workload::execute_and_validate_workload, TestCase};
 
 /// Tests that cannot be executed due to test harness limitations.
 /// These fail at parse time or cause infrastructure issues (OOM, hang).
@@ -798,51 +795,26 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
         return Ok(());
     }
 
-    // Load spec and test case once
-    let content = std::fs::read_to_string(&spec_path_abs).expect("Failed to read spec file");
-    let spec: Spec = serde_json::from_str(&content).expect("Failed to parse spec file");
-
-    // Try to load test case. For error tests with invalid table_info (e.g. duplicate columns),
-    // we may not be able to load it. In that case, skip the test - the invalid schema in
-    // table_info indicates the error is detected at snapshot construction time. For non-error
-    // tests with unsupported types (e.g. time(6)), skip them as well.
-    let (test_case, workload_name) = match test_case_from_spec_path(&spec_path_abs) {
-        Ok(tc) => tc,
-        Err(e) => {
-            let is_error_test = match &spec {
-                Spec::Read(read_spec) => {
-                    matches!(read_spec.expected, Some(ReadExpected::Error { .. }))
-                }
-                Spec::SnapshotConstruction(snapshot_spec) => {
-                    matches!(snapshot_spec.expected, Some(SnapshotExpected::Error { .. }))
-                }
-            };
-            // Skip if: (1) error test with invalid table_info, or (2) unsupported type in schema
-            if is_error_test || e.contains("Unsupported Delta table type") {
-                return Ok(());
-            }
-            panic!("Failed to load test case: {:?}", e);
-        }
-    };
-    let expected_dir = test_case.expected_dir(&workload_name);
-
+    // Load test case (includes spec)
+    let test_case = TestCase::from_spec_path(&spec_path_abs);
     let table_root = test_case.table_root().expect("Failed to get table URL");
     let engine = test_utils::create_default_engine(&table_root).expect("Failed to create engine");
 
     // Expected kernel failures: assert kernel DOES fail
     if let Some((reason, _)) = expected_failure {
-        match execute_and_validate_workload(engine, &table_root, &spec, &expected_dir) {
+        match execute_and_validate_workload(engine, &table_root, &test_case.spec, &test_case.expected_dir()) {
             Err(_) => { /* Failure is expected */ }
             Ok(_) => panic!(
-                "Workload '{workload_name}' was expected to fail but succeeded! \
-                 Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!"
+                "Workload '{}' was expected to fail but succeeded! \
+                 Reason: {reason}. Remove from EXPECTED_KERNEL_FAILURES!",
+                test_case.workload_name
             ),
         }
         return Ok(());
     }
 
-    execute_and_validate_workload(engine, &table_root, &spec, &expected_dir)
-        .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", workload_name, e));
+    execute_and_validate_workload(engine, &table_root, &test_case.spec, &test_case.expected_dir())
+        .unwrap_or_else(|e| panic!("Workload '{}' failed: {}", test_case.workload_name, e));
     Ok(())
 }
 
