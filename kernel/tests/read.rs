@@ -2015,12 +2015,23 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-// Multi-part V1 checkpoint with stats_parsed (writeStatsAsStruct=true, writeStatsAsJson=false).
-// Verifies that data skipping works via stats_parsed when the checkpoint is multi-part.
-// Each commit inserts one row: (1, "value_1") through (5, "value_5").
+// Verifies data skipping works via stats_parsed across all checkpoint types.
+// All tables have writeStatsAsStruct=true, writeStatsAsJson=false (struct stats only),
+// schema (id: long, value: string), 5 rows (id 1-5), checkpoint at v5.
+// Predicate id > 3 skips files where max(id) <= 3, returning only rows 4 and 5.
+#[rstest::rstest]
 #[test]
-fn multi_part_checkpoint_stats_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> {
-    // Predicate id > 3 should skip files where max(id) <= 3, returning only rows 4 and 5.
+fn checkpoint_stats_skipping(
+    #[values(
+        "v1-single-part",
+        "v1-multi-part",
+        "v2-parquet-sidecars",
+        "v2-json-sidecars",
+        "v2-classic-parquet"
+    )]
+    checkpoint_type: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_path = format!("./tests/data/{checkpoint_type}-struct-stats-only/");
     let expected = vec![
         "+----+---------+",
         "| id | value   |",
@@ -2030,12 +2041,7 @@ fn multi_part_checkpoint_stats_parsed_skipping() -> Result<(), Box<dyn std::erro
         "+----+---------+",
     ];
     let predicate = column_expr!("id").gt(Expr::literal(3i64));
-    read_table_data_str(
-        "./tests/data/v1-multi-part-checkpoint/",
-        None,
-        Some(predicate),
-        expected,
-    )?;
+    read_table_data_str(&table_path, None, Some(predicate), expected)?;
     Ok(())
 }
 
@@ -2043,10 +2049,8 @@ fn multi_part_checkpoint_stats_parsed_skipping() -> Result<(), Box<dyn std::erro
 // Schema: (id: long, value: string, part: int) partitioned by part.
 // Each commit inserts one row with part = i % 3 (parts 0, 1, 2).
 #[test]
-fn multi_part_checkpoint_partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>>
-{
+fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> {
     // Predicate part = 0 should skip partitions 1 and 2, returning rows with part=0.
-    // Rows: (3, "value_3", 0) and (6 doesn't exist — only 5 rows).
     // i % 3 == 0: i=3 -> (3, "value_3", 0)
     let expected = vec![
         "+----+---------+------+",
@@ -2057,7 +2061,7 @@ fn multi_part_checkpoint_partition_values_parsed_skipping() -> Result<(), Box<dy
     ];
     let predicate = column_expr!("part").eq(Expr::literal(0i32));
     read_table_data_str(
-        "./tests/data/v1-multi-part-checkpoint-partitioned/",
+        "./tests/data/v1-multi-part-partitioned-struct-stats-only/",
         None,
         Some(predicate),
         expected,

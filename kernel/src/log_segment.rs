@@ -16,6 +16,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
@@ -605,8 +606,9 @@ impl LogSegment {
     /// The logic is:
     /// - No checkpoint parts: return (None, [])
     /// - Multi-part (always V1, no sidecars): return checkpoint schema directly
-    /// - Single-part JSON (always V2): extract sidecars, read first sidecar's schema
-    /// - Single-part parquet: read checkpoint schema from hint or footer
+    /// - UUID-named JSON (always V2): extract sidecars, read first sidecar's schema
+    /// - Classic-named or UUID-named parquet (V1 or V2): read checkpoint schema from
+    ///   hint or footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
@@ -616,34 +618,31 @@ impl LogSegment {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_schema.as_ref();
 
-        // Multi-part checkpoints share an identical schema across all parts, so we only
-        // need the first part for schema detection.
+        // All parts of a multi-part checkpoint belong to the same table version and follow
+        // the same V1 spec, so reading any one part's schema is sufficient.
         let Some(checkpoint) = self.listed.checkpoint_parts.first() else {
             return Ok((None, vec![]));
         };
 
-        // Multi-part checkpoints are always V1 and never have sidecars.
-        if self.listed.checkpoint_parts.len() > 1 {
-            let schema = self.read_checkpoint_schema(engine, checkpoint, hint_schema)?;
-            return Ok((Some(schema), vec![]));
-        }
-
-        // Single-part checkpoint: determine V1 vs V2 from extension and schema.
-        match checkpoint.extension.as_str() {
-            "json" => {
+        match &checkpoint.file_type {
+            MultiPartCheckpoint { .. } => {
+                // Multi-part checkpoints are always V1 and never have sidecars.
+                let schema = Self::read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                Ok((Some(schema), vec![]))
+            }
+            UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
                 // JSON checkpoint is always V2. The hint schema is from the main checkpoint
                 // file, not the sidecars, so it is not useful as a fallback here.
                 self.read_sidecar_schema_and_files(engine, checkpoint, None)
             }
-            "parquet" => {
-                // Resolve checkpoint schema from hint or footer (single read).
+            SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
+                // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
+                // Check for sidecar column to distinguish.
                 let checkpoint_schema =
-                    self.read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema)?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
-                    // V2 parquet checkpoint: extract sidecars and read their schema.
                     self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
                 } else {
-                    // V1 parquet checkpoint: use checkpoint schema directly.
                     Ok((Some(checkpoint_schema), vec![]))
                 }
             }
@@ -654,7 +653,6 @@ impl LogSegment {
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
     fn read_checkpoint_schema(
-        &self,
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,

@@ -2671,7 +2671,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     Ok(())
 }
 
-// Multi-part V1 checkpoint returns file_actions_schema from hint or footer for stats detection.
+// Multi-part V1 checkpoint returns file_actions_schema with stats_parsed from hint or footer.
 #[rstest]
 #[case::with_hint(true)]
 #[case::without_hint(false)]
@@ -2683,25 +2683,48 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
-    let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    // Build a V1 checkpoint schema with stats_parsed containing an integer column.
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+        StructField::nullable(
+            "maxValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+    ]);
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+    let remove_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+    ]);
+    let v1_schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable(ADD_NAME, add_schema),
+        StructField::nullable(REMOVE_NAME, remove_schema),
+    ]));
+
     add_checkpoint_to_store(
         &store,
         add_batch_simple(v1_schema.clone()),
         checkpoint_part_1,
     )
     .await?;
-    add_checkpoint_to_store(&store, add_batch_simple(v1_schema), checkpoint_part_2).await?;
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_2,
+    )
+    .await?;
 
     let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
     let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
 
     let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
     let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
-
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
-    ]));
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -2714,23 +2737,21 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| hint_schema.clone()),
+        use_hint.then(|| v1_schema.clone() as SchemaRef),
     )?;
 
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
-    if use_hint {
-        assert_eq!(schema, hint_schema, "Should use hint schema when available");
-    } else {
-        assert!(
-            schema.field(ADD_NAME).is_some(),
-            "Footer schema should include add field"
-        );
-        assert!(
-            schema.field(REMOVE_NAME).is_some(),
-            "Footer schema should include remove field"
-        );
-    }
+
+    // Verify stats_parsed is detectable in the returned schema.
+    let add_field = schema.field(ADD_NAME).expect("should have add field");
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        panic!("add field should be a struct type");
+    };
+    assert!(
+        add_struct.field("stats_parsed").is_some(),
+        "Returned schema should include stats_parsed for data skipping"
+    );
     assert!(sidecars.is_empty(), "Multi-part V1 should have no sidecars");
 
     Ok(())
