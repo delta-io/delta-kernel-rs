@@ -551,7 +551,7 @@ impl TableConfiguration {
         require!(
             self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
             Error::InvalidProtocol(format!(
-                "min_reader_version must be >= 1, got {}",
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_reader_version()
             ))
         );
@@ -577,7 +577,7 @@ impl TableConfiguration {
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
             Error::InvalidProtocol(format!(
-                "min_writer_version must be >= 1, got {}",
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
                 self.protocol.min_writer_version()
             ))
         );
