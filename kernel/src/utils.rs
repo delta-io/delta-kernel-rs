@@ -2,6 +2,7 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::Url;
@@ -19,6 +20,25 @@ macro_rules! require {
 }
 
 pub(crate) use require;
+
+/// `OnceLock::get_or_try_init` is unstable
+/// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>),
+/// so we provide our own implementation.
+///
+/// Returns a clone of the cached value, initializing it with `f` on first call.
+pub(crate) fn once_lock_get_or_try_init<T: Clone>(
+    lock: &OnceLock<T>,
+    f: impl FnOnce() -> DeltaResult<T>,
+) -> DeltaResult<T> {
+    if let Some(cached) = lock.get() {
+        return Ok(cached.clone());
+    }
+    let val = f()?;
+    // set() only fails if another thread initialized the lock between our get() and here,
+    // in which case the lock already holds a valid value. So we can safely ignore the result.
+    let _ = lock.set(val.clone());
+    Ok(val)
+}
 
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.

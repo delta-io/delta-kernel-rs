@@ -109,6 +109,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
+use crate::utils::once_lock_get_or_try_init;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
 use url::Url;
@@ -329,23 +330,14 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        // TODO: Replace with `OnceLock::get_or_try_init` when it stabilizes
-        // (tracking issue: https://github.com/rust-lang/rust/issues/109737).
-        // Currently unstable, so we use a manual get-or-set pattern instead.
-        let output_schema = match self.checkpoint_output_schema.get() {
-            Some(cached) => cached.clone(),
-            None => {
-                let schema = build_checkpoint_output_schema(
-                    &config,
-                    base_schema,
-                    &stats_schema,
-                    partition_schema.as_deref(),
-                )?;
-                // SAFETY: set returns Err only if already initialized (concurrent call).
-                let _ = self.checkpoint_output_schema.set(schema.clone());
-                schema
-            }
-        };
+        let output_schema = once_lock_get_or_try_init(&self.checkpoint_output_schema, || {
+            build_checkpoint_output_schema(
+                &config,
+                base_schema,
+                &stats_schema,
+                partition_schema.as_deref(),
+            )
+        })?;
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
