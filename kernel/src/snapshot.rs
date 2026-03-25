@@ -729,6 +729,11 @@ impl Snapshot {
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the clustering domain metadata is malformed, or if a physical
+    /// column name cannot be resolved to a logical name in the schema.
+    ///
     /// [`ColumnName`]: crate::expressions::ColumnName
     pub fn get_clustering_columns(
         &self,

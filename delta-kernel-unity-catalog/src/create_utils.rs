@@ -1,4 +1,4 @@
-//! Utilities for Unity Catalog CCv2 table creation.
+//! Utilities for Unity Catalog catalog-managed table creation.
 //!
 //! These utilities help connectors create UC-managed tables by providing the required properties
 //! for both the Delta log (disk) and the UC server registration.
@@ -47,9 +47,9 @@ const METASTORE_LAST_UPDATE_VERSION: &str = "delta.lastUpdateVersion";
 /// UC property for the last commit timestamp.
 const METASTORE_LAST_COMMIT_TIMESTAMP: &str = "delta.lastCommitTimestamp";
 
-/// Returns the table properties that must be written to disk (in `000.json`) for a UC CCv2 table.
+/// Returns the table properties that must be written to disk (in `000.json`) for a UC catalog-managed table.
 ///
-/// These are "Class A" properties that must be persisted in the Delta log so that the table is
+/// These properties must be persisted in the Delta log so that the table is
 /// recognized as catalog-managed. Pass the returned map to
 /// `CreateTableTransactionBuilder::with_table_properties()`. The builder will separate feature
 /// signals from configuration properties internally.
@@ -78,7 +78,7 @@ pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, St
 
 /// Extracts the properties that must be sent to the UC server when finalizing a table creation.
 ///
-/// These are "Class B" properties, derived from the post-commit snapshot (after `000.json` has
+/// These properties are derived from the post-commit snapshot (after `000.json` has
 /// been written). The connector should pass these to the UC `create_table` API.
 ///
 /// # Properties returned
@@ -94,7 +94,7 @@ pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, St
 ///
 /// # Clustering columns
 ///
-/// Clustering columns are returned as logical column names, matching the Java kernel behavior.
+/// Clustering columns are returned as logical column names.
 /// When column mapping is enabled, the physical names stored in domain metadata are converted
 /// to logical names using the table schema.
 pub fn get_final_required_properties_for_uc(
@@ -139,7 +139,7 @@ pub fn get_final_required_properties_for_uc(
         .get_in_commit_timestamp(engine)?
         .ok_or_else(|| {
             delta_kernel::Error::generic(
-                "In-commit timestamp is required for UC CCv2 tables but was not found",
+                "In-commit timestamp is required for UC catalog-managed tables but was not found",
             )
         })?;
     properties.insert(
@@ -176,11 +176,11 @@ mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
+    use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel::{DeltaResult, Engine, FileMeta, FilteredEngineData};
 
     /// A mock catalog committer that writes directly to the published path (like
-    /// FileSystemCommitter) but reports `is_catalog_committer() = true`. This is needed
-    /// because kernel blocks FileSystemCommitter for catalog-managed tables.
+    /// FileSystemCommitter) but reports `is_catalog_committer() = true`.
     struct MockCatalogCommitter;
     impl Committer for MockCatalogCommitter {
         fn commit(
@@ -239,8 +239,7 @@ mod tests {
             StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
         );
 
-        // Create a UC CCv2 table with the required properties.
-        // Must use a catalog committer since catalogManaged tables reject FileSystemCommitter.
+        // Create a UC catalog-managed table with the required properties.
         let disk_props = get_required_properties_for_disk("test-table-id-456");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
@@ -303,8 +302,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_final_required_properties_for_uc_with_clustering() {
-        use delta_kernel::transaction::data_layout::DataLayout;
-
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_clustered_table/";

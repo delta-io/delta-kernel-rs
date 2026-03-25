@@ -52,7 +52,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::InCommitTimestamp,
     // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
     TableFeature::VacuumProtocolCheck,
-    // CatalogManaged enables catalog-managed table support (UC CCv2)
+    // CatalogManaged enables catalog-managed table support
     #[cfg(feature = "catalog-managed")]
     TableFeature::CatalogManaged,
     // Note: Clustering is NOT included here. Users should not enable clustering via
