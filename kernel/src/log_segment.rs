@@ -631,8 +631,8 @@ impl LogSegment {
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
-                // JSON checkpoint is always V2. The hint schema is from the main checkpoint
-                // file, not the sidecars, so it is not useful as a fallback here.
+                // JSON checkpoint is always V2. No checkpoint schema is available since JSON
+                // checkpoints don't have a parquet footer to read.
                 self.read_sidecar_schema_and_files(engine, checkpoint, None)
             }
             SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
