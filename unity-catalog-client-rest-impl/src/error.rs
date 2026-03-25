@@ -3,13 +3,13 @@ use thiserror::Error;
 /// REST-specific errors for the Unity Catalog client.
 ///
 /// API-level errors (table not found, auth failures, etc.) are wrapped in the
-/// [`Api`](Error::Api) variant, keeping them in sync with `unitycatalog_client_api::Error`
+/// [`Api`](Error::Api) variant, keeping them in sync with `unity_catalog_client_api::Error`
 /// without duplicating variants.
 #[derive(Error, Debug)]
 pub enum Error {
     /// A transport-agnostic API error.
     #[error(transparent)]
-    Api(#[from] unitycatalog_client_api::Error),
+    Api(#[from] unity_catalog_client_api::Error),
 
     /// An HTTP request failed.
     #[error("HTTP request failed: {0}")]
@@ -42,11 +42,11 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<Error> for unitycatalog_client_api::Error {
+impl From<Error> for unity_catalog_client_api::Error {
     fn from(e: Error) -> Self {
         match e {
             Error::Api(api_err) => api_err,
-            e => unitycatalog_client_api::Error::Generic(e.to_string()),
+            e => unity_catalog_client_api::Error::Generic(e.to_string()),
         }
     }
 }
@@ -57,38 +57,39 @@ mod tests {
 
     #[test]
     fn from_error_unwraps_api_variant() {
-        let api_err = unitycatalog_client_api::Error::TableNotFound("t1".into());
+        let api_err = unity_catalog_client_api::Error::TableNotFound("t1".into());
         let rest_err = Error::Api(api_err);
         assert!(matches!(
-            unitycatalog_client_api::Error::from(rest_err),
-            unitycatalog_client_api::Error::TableNotFound(msg) if msg == "t1"
+            unity_catalog_client_api::Error::from(rest_err),
+            unity_catalog_client_api::Error::TableNotFound(msg) if msg == "t1"
         ));
 
-        let rest_err = Error::Api(unitycatalog_client_api::Error::AuthenticationFailed);
+        let rest_err = Error::Api(unity_catalog_client_api::Error::AuthenticationFailed);
         assert!(matches!(
-            unitycatalog_client_api::Error::from(rest_err),
-            unitycatalog_client_api::Error::AuthenticationFailed
+            unity_catalog_client_api::Error::from(rest_err),
+            unity_catalog_client_api::Error::AuthenticationFailed
         ));
 
-        let rest_err = Error::Api(unitycatalog_client_api::Error::MaxUnpublishedCommitsExceeded(5));
+        let rest_err =
+            Error::Api(unity_catalog_client_api::Error::MaxUnpublishedCommitsExceeded(5));
         assert!(matches!(
-            unitycatalog_client_api::Error::from(rest_err),
-            unitycatalog_client_api::Error::MaxUnpublishedCommitsExceeded(5)
+            unity_catalog_client_api::Error::from(rest_err),
+            unity_catalog_client_api::Error::MaxUnpublishedCommitsExceeded(5)
         ));
     }
 
     #[test]
     fn from_error_maps_rest_only_variants_to_generic() {
-        let api_err = unitycatalog_client_api::Error::from(Error::MaxRetriesExceeded);
+        let api_err = unity_catalog_client_api::Error::from(Error::MaxRetriesExceeded);
         assert!(
-            matches!(api_err, unitycatalog_client_api::Error::Generic(ref msg) if msg == "Max retries exceeded"),
+            matches!(api_err, unity_catalog_client_api::Error::Generic(ref msg) if msg == "Max retries exceeded"),
             "unexpected: {api_err:?}"
         );
 
         let api_err =
-            unitycatalog_client_api::Error::from(Error::InvalidConfiguration("bad".into()));
+            unity_catalog_client_api::Error::from(Error::InvalidConfiguration("bad".into()));
         assert!(
-            matches!(api_err, unitycatalog_client_api::Error::Generic(ref msg) if msg == "Invalid configuration: bad"),
+            matches!(api_err, unity_catalog_client_api::Error::Generic(ref msg) if msg == "Invalid configuration: bad"),
             "unexpected: {api_err:?}"
         );
     }

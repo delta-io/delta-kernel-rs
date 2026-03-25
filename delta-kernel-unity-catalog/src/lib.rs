@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
 
-use unitycatalog_client_api::{CommitsRequest, GetCommitsClient};
+use unity_catalog_client_api::{CommitsRequest, GetCommitsClient};
 
 use itertools::Itertools;
 use tracing::debug;
@@ -16,13 +16,13 @@ use url::Url;
 /// The [UCKernelClient] provides a high-level interface to interact with Delta Tables stored in
 /// Unity Catalog. It is a lightweight wrapper around a [GetCommitsClient].
 pub struct UCKernelClient<'a, C: GetCommitsClient> {
-    client: &'a C,
+    get_commits_client: &'a C,
 }
 
 impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
     /// Create a new [UCKernelClient] instance with the provided client.
-    pub fn new(client: &'a C) -> Self {
-        UCKernelClient { client }
+    pub fn new(get_commits_client: &'a C) -> Self {
+        UCKernelClient { get_commits_client }
     }
 
     /// Load the latest snapshot of a Delta Table identified by `table_id` and `table_uri` in Unity
@@ -66,7 +66,7 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
             start_version: Some(0),
             end_version: version.and_then(|v| v.try_into().ok()),
         };
-        let mut commits = self.client.get_commits(req).await?;
+        let mut commits = self.get_commits_client.get_commits(req).await?;
         if let Some(commits) = commits.commits.as_mut() {
             commits.sort_by_key(|c| c.version)
         }
@@ -140,13 +140,13 @@ mod tests {
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
-    use unitycatalog_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
-    use unitycatalog_client_rest_impl::{UCClient, UCCommitsRestClient};
+    use unity_catalog_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
+    use unity_catalog_client_rest_impl::{UCClient, UCCommitsRestClient};
 
     use super::*;
 
     // We could just re-export UCClient's get_table to not require consumers to directly import
-    // unitycatalog_client_rest_impl themselves.
+    // unity_catalog_client_rest_impl themselves.
     async fn get_table(
         client: &UCClient,
         table_name: &str,
@@ -174,7 +174,7 @@ mod tests {
 
         // build shared config
         let config =
-            unitycatalog_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
+            unity_catalog_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let uc_client = UCClient::new(config.clone())?;
@@ -230,7 +230,7 @@ mod tests {
 
         // build shared config
         let config =
-            unitycatalog_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
+            unity_catalog_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let client = UCClient::new(config.clone())?;

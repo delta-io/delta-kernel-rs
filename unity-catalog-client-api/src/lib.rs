@@ -16,18 +16,18 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! unitycatalog-client-api = { version = "...", features = ["test-utils"] }
+//! unity-catalog-client-api = { version = "...", features = ["test-utils"] }
 //! ```
 
-pub mod commits_client;
+pub mod clients;
 pub mod credentials;
 pub mod error;
 pub mod models;
 
-pub use commits_client::{CommitClient, GetCommitsClient};
+pub use clients::{CommitClient, GetCommitsClient};
 pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 pub use error::{Error, Result};
 pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use commits_client::{InMemoryCommitsClient, TableData};
+pub use clients::{InMemoryCommitsClient, TableData};

@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use unitycatalog_client_rest_impl::{ClientConfig, UCCommitsRestClient, GetCommitsClient, models::CommitsRequest};
+//! use unity_catalog_client_rest_impl::{ClientConfig, UCCommitsRestClient, GetCommitsClient, models::CommitsRequest};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,5 +43,5 @@ pub mod prelude {
     pub use crate::commits_client::{CommitClient, GetCommitsClient, UCCommitsRestClient};
     pub use crate::models::tables::TablesResponse;
     pub use crate::models::{Commit, CommitsRequest, CommitsResponse};
-    pub use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
+    pub use unity_catalog_client_api::{Operation, TemporaryTableCredentials};
 }

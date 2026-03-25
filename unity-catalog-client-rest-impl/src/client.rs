@@ -2,7 +2,7 @@ use reqwest::StatusCode;
 use tracing::instrument;
 use url::Url;
 
-use unitycatalog_client_api::{Operation, TemporaryTableCredentials};
+use unity_catalog_client_api::{Operation, TemporaryTableCredentials};
 
 use crate::config::ClientConfig;
 use crate::error::Result;
@@ -47,7 +47,7 @@ impl UCClient {
 
         match response.status() {
             StatusCode::NOT_FOUND => {
-                Err(unitycatalog_client_api::Error::TableNotFound(table_name.to_string()).into())
+                Err(unity_catalog_client_api::Error::TableNotFound(table_name.to_string()).into())
             }
             _ => handle_response(response).await,
         }

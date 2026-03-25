@@ -87,7 +87,7 @@ where
 
         match status {
             StatusCode::UNAUTHORIZED => {
-                Err(unitycatalog_client_api::Error::AuthenticationFailed.into())
+                Err(unity_catalog_client_api::Error::AuthenticationFailed.into())
             }
             StatusCode::NOT_FOUND => Err(Error::HttpStatusError {
                 status: status.as_u16(),

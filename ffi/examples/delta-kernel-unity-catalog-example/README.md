@@ -1,5 +1,5 @@
-uc catalog example
-==========
+delta-kernel-unity-catalog example
+===================================
 
 Simple example to show how to use the delta-kernel-unity-catalog ffi features
 

@@ -1,5 +1,5 @@
 [package]
-name = "unitycatalog-client-api"
+name = "unity-catalog-client-api"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true

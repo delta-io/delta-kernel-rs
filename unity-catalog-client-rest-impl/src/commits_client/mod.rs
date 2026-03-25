@@ -4,16 +4,16 @@ use url::Url;
 
 use crate::config::ClientConfig;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use unitycatalog_client_api::{CommitRequest, CommitsRequest, CommitsResponse};
+use unity_catalog_client_api::{CommitRequest, CommitsRequest, CommitsResponse};
 
-pub use unitycatalog_client_api::commits_client::{CommitClient, GetCommitsClient};
+pub use unity_catalog_client_api::clients::{CommitClient, GetCommitsClient};
 
 /// Placeholder for deserializing empty JSON responses from void-returning endpoints.
 #[derive(Deserialize)]
 struct EmptyResponse {}
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use unitycatalog_client_api::{InMemoryCommitsClient, TableData};
+pub use unity_catalog_client_api::{InMemoryCommitsClient, TableData};
 
 /// REST implementation of [CommitClient] and [GetCommitsClient].
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ impl GetCommitsClient for UCCommitsRestClient {
     async fn get_commits(
         &self,
         request: CommitsRequest,
-    ) -> unitycatalog_client_api::Result<CommitsResponse> {
+    ) -> unity_catalog_client_api::Result<CommitsResponse> {
         let result: crate::error::Result<CommitsResponse> = async {
             let url = self.base_url.join("delta/preview/commits")?;
             let response = execute_with_retry(&self.config, || {
@@ -67,7 +67,7 @@ impl GetCommitsClient for UCCommitsRestClient {
 
 impl CommitClient for UCCommitsRestClient {
     #[instrument(skip(self))]
-    async fn commit(&self, request: CommitRequest) -> unitycatalog_client_api::Result<()> {
+    async fn commit(&self, request: CommitRequest) -> unity_catalog_client_api::Result<()> {
         let result: crate::error::Result<()> = async {
             let url = self.base_url.join("delta/preview/commits")?;
             let response = execute_with_retry(&self.config, || {

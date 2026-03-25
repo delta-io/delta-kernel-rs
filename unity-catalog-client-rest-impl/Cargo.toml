@@ -1,5 +1,5 @@
 [package]
-name = "unitycatalog-client-rest-impl"
+name = "unity-catalog-client-rest-impl"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -14,7 +14,7 @@ version.workspace = true
 release = false
 
 [dependencies]
-unitycatalog-client-api = { path = "../unitycatalog-client-api" }
+unity-catalog-client-api = { path = "../unity-catalog-client-api" }
 # Hardcodes rustls (always used alongside default-engine-rustls in practice).
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "rustls", "system-proxy"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -27,7 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [features]
 default = []
-test-utils = ["unitycatalog-client-api/test-utils"]
+test-utils = ["unity-catalog-client-api/test-utils"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
