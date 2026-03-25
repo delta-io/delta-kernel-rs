@@ -356,7 +356,7 @@ pub unsafe extern "C" fn scan_has_remaining_filter(scan: Handle<SharedScan>) -> 
 /// to a static skip-all, or it was fully resolved during file pruning.
 ///
 /// Returns [`OptionalValue::Some`] containing an owned [`SharedPredicate`] handle that the caller
-/// must eventually free with [`free_kernel_predicate`], or [`OptionalValue::None`] if no remaining
+/// must eventually free with [`crate::expressions::free_kernel_predicate`], or [`OptionalValue::None`] if no remaining
 /// filter exists.
 ///
 /// # Safety
@@ -884,6 +884,8 @@ mod scan_builder_tests {
         let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
         let schema_ref = unsafe { schema.as_ref() };
         assert_eq!(schema_ref.fields().count(), 2);
+        // Predicate was registered -- kernel will apply it at row level
+        assert!(unsafe { scan_has_remaining_filter(scan.shallow_copy()) });
         unsafe { free_schema(schema) };
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
