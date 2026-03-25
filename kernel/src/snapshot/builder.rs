@@ -207,11 +207,11 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStore as _};
+    use crate::utils::test_utils::CapturingReporter;
     use itertools::Itertools;
     use serde_json::json;
 
     use super::*;
-    use crate::utils::test_utils::CapturingReporter;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
