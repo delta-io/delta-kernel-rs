@@ -204,6 +204,14 @@ and data flow. Keep it concise.
 
 ### CI Jobs and Github Actions
 
+**Supply chain security:** every `cargo` command in CI that resolves dependencies MUST use
+`--locked` to enforce the committed `Cargo.lock`. This prevents CI from silently picking up
+a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
+`Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
+reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
+`--locked`: `cargo fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
+`cargo miri setup` (tooling setup).
+
 Ensure that when writing any github action you are considering safety including thinking of
 and mitigating common attack vectors such expression injection and pull request target attacks.
 

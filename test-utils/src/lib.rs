@@ -100,6 +100,11 @@ pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":158
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
 
+/// Like [`METADATA`] but with non-empty table properties including `delta.appendOnly` and `custom.key`.
+pub const METADATA_WITH_TABLE_PROPERTIES: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),

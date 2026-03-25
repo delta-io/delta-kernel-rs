@@ -900,6 +900,38 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
+/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the provided
+/// `visitor` callback once per entry.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an
+/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_configuration(
+    snapshot: Handle<SharedSnapshot>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .iter()
+        .for_each(|(key, value)| {
+            visitor(
+                engine_context,
+                kernel_string_slice!(key),
+                kernel_string_slice!(value),
+            );
+        });
+}
+
 type StringIter = dyn Iterator<Item = String> + Send;
 
 #[handle_descriptor(target=StringIter, mutable=true, sized=false)]
@@ -1007,9 +1039,12 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
+    use rstest::rstest;
     use serde_json::Value;
+    use std::collections::HashMap;
     use test_utils::{
-        actions_to_string, actions_to_string_partitioned, add_commit, TestAction, METADATA,
+        actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
+        add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
 
     #[no_mangle]
@@ -1095,6 +1130,63 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(
+        METADATA_WITH_TABLE_PROPERTIES,
+        HashMap::from([
+            (String::from("delta.appendOnly"), String::from("true")),
+            (String::from("custom.key"), String::from("custom_value")),
+        ])
+    )]
+    #[case(METADATA, HashMap::new())]
+    #[tokio::test]
+    async fn test_visit_metadata_configuration(
+        #[case] metadata: &str,
+        #[case] expected: HashMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string_with_metadata(vec![TestAction::Metadata], metadata),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        extern "C" fn collect_property(
+            engine_context: NullableCvoid,
+            key: KernelStringSlice,
+            value: KernelStringSlice,
+        ) {
+            let map =
+                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
+            let k = unsafe { String::try_from_slice(&key) }.unwrap();
+            let v = unsafe { String::try_from_slice(&value) }.unwrap();
+            map.insert(k, v);
+        }
+
+        let mut collected: HashMap<String, String> = HashMap::new();
+        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
+        unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
+
+        assert_eq!(collected, expected);
+
+        unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
     }

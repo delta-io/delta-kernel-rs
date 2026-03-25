@@ -141,11 +141,12 @@ impl ScanLogReplayProcessor {
         checkpoint_info: CheckpointReadInfo,
         skip_stats: bool,
     ) -> DeltaResult<Self> {
+        let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
             engine,
             state_info,
             checkpoint_info,
-            Default::default(),
+            HashSet::with_capacity(dedup_capacity),
             skip_stats,
         )
     }
