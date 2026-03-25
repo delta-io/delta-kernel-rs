@@ -768,28 +768,21 @@ impl Scan {
         let reporter = engine.get_metrics_reporter();
         let operation_id = MetricId::new();
 
-        // Get iterator and metrics (None if static skip all)
-        let iter_and_metrics =
-            if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
-                None
-            } else {
-                Some(scan_action_iter(
+        let (iter, metrics) = match self.state_info.physical_predicate {
+            PhysicalPredicate::StaticSkipAll => (None, Arc::new(ScanMetrics::default())),
+            _ => {
+                let (it, m) = scan_action_iter(
                     engine,
                     actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.skip_stats(),
-                )?)
-            };
-
-        // Extract iterator and metrics, defaulting to empty metrics for static skip
-        let (iter, metrics) = match iter_and_metrics {
-            Some((it, m)) => (Some(it), m),
-            None => (None, Arc::new(ScanMetrics::default())),
+                )?;
+                (Some(it), m)
+            }
         };
 
-        // Wrap iterator with completion callback that emits metrics
-        Ok(option_iter_with_on_complete(iter, move || {
+        let on_complete = move || {
             let event = MetricEvent::ScanMetadataCompleted {
                 operation_id,
                 total_duration: start.elapsed(),
@@ -806,7 +799,8 @@ impl Scan {
             if let Some(r) = reporter {
                 r.report(event);
             }
-        }))
+        };
+        Ok(option_iter_with_on_complete(iter, on_complete))
     }
 
     // Factored out to facilitate testing
