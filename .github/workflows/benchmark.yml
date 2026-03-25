@@ -45,9 +45,13 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: boa-dev/criterion-compare-action@adfd3a94634fe2041ce5613eb7df09d247555b87 # v3.2.4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          branchName: ${{ steps.pr.outputs.base_ref }}
-          cwd: benchmarks
-          benchName: workload_bench
+      # TODO: This action internally runs `cargo bench` without --locked, bypassing our
+      #       supply chain lockfile policy (see build.yml top-level comment). Replace with
+      #       manual cargo bench --locked + critcmp + gh pr comment steps.
+      # - uses: boa-dev/criterion-compare-action@adfd3a94634fe2041ce5613eb7df09d247555b87 # v3.2.4
+      #   with:
+      #     token: ${{ secrets.GITHUB_TOKEN }}
+      #     branchName: ${{ steps.pr.outputs.base_ref }}
+      #     cwd: benchmarks
+      #     benchName: workload_bench
+      - run: echo "Benchmarking is temporarily disabled. See TODO above."
