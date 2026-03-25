@@ -10,10 +10,10 @@ jobs:
   run-examples:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run all examples
         run: |
@@ -38,23 +38,23 @@ jobs:
               # Special case for write-table: it needs a temp directory
               if [ "$example_dir" = "write-table" ]; then
                 tmp_dir=$(mktemp -d)
-                cargo run --manifest-path "$example_dir/Cargo.toml" --release -- "$tmp_dir"
+                cargo run --locked --manifest-path "$example_dir/Cargo.toml" --release -- "$tmp_dir"
                 rm -r "$tmp_dir"
               # Special case for inspect-table: it needs an operation/subcommand, run each one
               elif [ "$example_dir" = "inspect-table" ]; then
                 for operation in table-version metadata schema scan-metadata actions; do
                   echo "  Running inspect-table with operation: $operation"
-                  cargo run --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small $operation
+                  cargo run --locked --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small $operation
                 done
               # Special case for read-table-changes: skip running it in CI as it needs a specific CDF-enabled table
               # but still verify it compiles
               # TODO: Add a suitable test table for CDF
               elif [ "$example_dir" = "read-table-changes" ]; then
                 echo "Building read-table-changes (skipping run - requires CDF-enabled table)"
-                cargo build --manifest-path "$example_dir/Cargo.toml" --release
+                cargo build --locked --manifest-path "$example_dir/Cargo.toml" --release
               else
                 # All other examples run with the test table path
-                cargo run --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small
+                cargo run --locked --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small
               fi
 
               echo ""
