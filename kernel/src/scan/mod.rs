@@ -578,7 +578,7 @@ impl Scan {
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     ///
     /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
-    /// exhausted or dropped.
+    /// fully exhausted. If dropped early, a warning is logged but no metrics are emitted.
     ///
     /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
     ///
@@ -769,7 +769,10 @@ impl Scan {
         let operation_id = MetricId::new();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
-            PhysicalPredicate::StaticSkipAll => (None, Arc::new(ScanMetrics::default())),
+            PhysicalPredicate::StaticSkipAll => {
+                info!("Predicate statically evaluated to false; skipping all files");
+                (None, Arc::new(ScanMetrics::default()))
+            }
             _ => {
                 let (it, m) = scan_action_iter(
                     engine,
@@ -792,8 +795,8 @@ impl Scan {
                 num_non_file_actions: metrics.num_non_file_actions(),
                 num_predicate_filtered: metrics.num_predicate_filtered(),
                 peak_hash_set_size: metrics.peak_hash_set_size(),
-                dedup_visitor_time_ms: metrics.dedup_visitor_time_ms(),
-                predicate_eval_time_ms: metrics.predicate_eval_time_ms(),
+                dedup_visitor_time_ms: metrics.dedup_visitor_time_ns() / 1_000_000,
+                predicate_eval_time_ms: metrics.predicate_eval_time_ns() / 1_000_000,
             };
             info!(%event, "Scan metadata completed");
             if let Some(r) = reporter {

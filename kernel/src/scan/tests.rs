@@ -1424,45 +1424,29 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
 /// Tests for ScanMetadataCompleted event emission
 mod scan_metadata_completed_tests {
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::engine::default::DefaultEngineBuilder;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-    use crate::metrics::{MetricEvent, MetricsReporter};
+    use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
+    use crate::utils::test_utils::CapturingReporter;
     use crate::Snapshot;
 
-    #[derive(Debug, Default)]
-    struct CapturingReporter {
-        events: Mutex<Vec<MetricEvent>>,
+    fn find_scan_completed(reporter: &Arc<CapturingReporter>) -> Option<MetricEvent> {
+        reporter
+            .events()
+            .into_iter()
+            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
     }
 
-    impl MetricsReporter for CapturingReporter {
-        fn report(&self, event: MetricEvent) {
-            self.events.lock().unwrap().push(event);
-        }
-    }
-
-    impl CapturingReporter {
-        fn find_scan_completed(&self) -> Option<MetricEvent> {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
-                .cloned()
-        }
-
-        fn scan_completed_events(&self) -> Vec<MetricEvent> {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
-                .cloned()
-                .collect()
-        }
+    fn scan_completed_events(reporter: &Arc<CapturingReporter>) -> Vec<MetricEvent> {
+        reporter
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+            .collect()
     }
 
     fn run_scan(table: &str, predicate: Option<Arc<Pred>>) -> (Arc<CapturingReporter>, usize) {
@@ -1495,7 +1479,7 @@ mod scan_metadata_completed_tests {
             total_duration,
             num_active_add_files,
             ..
-        } = reporter.find_scan_completed().unwrap()
+        } = find_scan_completed(&reporter).unwrap()
         else {
             panic!("expected ScanMetadataCompleted");
         };
@@ -1504,7 +1488,7 @@ mod scan_metadata_completed_tests {
     }
 
     #[test]
-    fn test_emits_on_early_drop() {
+    fn test_no_metrics_on_early_drop() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
@@ -1518,8 +1502,9 @@ mod scan_metadata_completed_tests {
         {
             let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
             let _ = iter.next();
+            // Drop without exhausting - metrics should NOT be emitted (only logged)
         }
-        assert!(reporter.find_scan_completed().is_some());
+        assert!(find_scan_completed(&reporter).is_none());
     }
 
     #[test]
@@ -1543,7 +1528,7 @@ mod scan_metadata_completed_tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
         }
-        let events = reporter.scan_completed_events();
+        let events = scan_completed_events(&reporter);
         assert_eq!(events.len(), 2);
         let ids: Vec<_> = events
             .iter()
@@ -1564,7 +1549,7 @@ mod scan_metadata_completed_tests {
             num_add_files_seen,
             num_active_add_files,
             ..
-        } = reporter.find_scan_completed().unwrap()
+        } = find_scan_completed(&reporter).unwrap()
         else {
             panic!("expected ScanMetadataCompleted");
         };
@@ -1579,7 +1564,7 @@ mod scan_metadata_completed_tests {
             num_remove_files_seen,
             num_non_file_actions,
             ..
-        } = reporter.find_scan_completed().unwrap()
+        } = find_scan_completed(&reporter).unwrap()
         else {
             panic!("expected ScanMetadataCompleted");
         };
@@ -1595,7 +1580,7 @@ mod scan_metadata_completed_tests {
             num_active_add_files,
             num_predicate_filtered,
             ..
-        } = reporter.find_scan_completed().unwrap()
+        } = find_scan_completed(&reporter).unwrap()
         else {
             panic!("expected ScanMetadataCompleted");
         };

@@ -151,13 +151,13 @@ impl ScanMetrics {
         self.peak_hash_set_size.load(Ordering::Relaxed)
     }
 
-    /// Get the time spent in the deduplication visitor (milliseconds).
-    pub(crate) fn dedup_visitor_time_ms(&self) -> u64 {
-        self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000
+    /// Get the time spent in the deduplication visitor (nanoseconds).
+    pub(crate) fn dedup_visitor_time_ns(&self) -> u64 {
+        self.dedup_visitor_time_ns.load(Ordering::Relaxed)
     }
 
-    /// Get the time spent evaluating predicates (milliseconds).
-    pub(crate) fn predicate_eval_time_ms(&self) -> u64 {
-        self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000
+    /// Get the time spent evaluating predicates (nanoseconds).
+    pub(crate) fn predicate_eval_time_ns(&self) -> u64 {
+        self.predicate_eval_time_ns.load(Ordering::Relaxed)
     }
 }

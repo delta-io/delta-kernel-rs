@@ -111,10 +111,10 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
 
 /// Extension trait for adding completion callbacks to iterators.
 pub(crate) trait IteratorExt: Iterator + Sized {
-    /// Wraps this iterator to call a closure once when exhausted or dropped.
+    /// Wraps this iterator to call a closure when fully exhausted.
     ///
-    /// The closure is called exactly once, either when `next()` returns `None`
-    /// or when the iterator is dropped (whichever comes first).
+    /// The closure is called only when `next()` returns `None`. If the iterator
+    /// is dropped before exhaustion, a warning is logged but the closure is not called.
     fn on_complete<F: FnOnce()>(self, f: F) -> OnComplete<Self, F> {
         OnComplete {
             inner: self,
@@ -125,23 +125,19 @@ pub(crate) trait IteratorExt: Iterator + Sized {
 
 impl<I: Iterator> IteratorExt for I {}
 
-/// Iterator adaptor that executes a closure once when exhausted or dropped.
+/// Iterator adaptor that executes a closure when fully exhausted.
+///
+/// If dropped before exhaustion, logs a warning instead of calling the closure.
 pub(crate) struct OnComplete<I, F: FnOnce()> {
     inner: I,
     on_complete: Option<F>,
 }
 
-impl<I, F: FnOnce()> OnComplete<I, F> {
-    fn call_once(&mut self) {
-        if let Some(f) = self.on_complete.take() {
-            f();
-        }
-    }
-}
-
 impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
     fn drop(&mut self) {
-        self.call_once();
+        if self.on_complete.is_some() {
+            tracing::info!("Iterator dropped before exhaustion; completion callback not called");
+        }
     }
 }
 
@@ -156,7 +152,9 @@ where
         match self.inner.next() {
             Some(item) => Some(item),
             None => {
-                self.call_once();
+                if let Some(f) = self.on_complete.take() {
+                    f();
+                }
                 None
             }
         }
@@ -166,6 +164,7 @@ where
 #[cfg(test)]
 pub(crate) mod test_utils {
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::{path::Path, sync::Arc};
 
     use itertools::Itertools;
@@ -177,6 +176,7 @@ pub(crate) mod test_utils {
     use crate::actions::{
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
+    use crate::metrics::{MetricEvent, MetricsReporter};
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::committer::FileSystemCommitter;
@@ -191,6 +191,30 @@ pub(crate) mod test_utils {
     use crate::transaction::{CreateTable, Transaction};
     use crate::{DeltaResult, EngineData, Error, SnapshotRef};
     use crate::{Engine, Snapshot};
+
+    /// A metrics reporter that captures all events for test assertions.
+    #[derive(Debug, Default)]
+    pub(crate) struct CapturingReporter {
+        events: Mutex<Vec<MetricEvent>>,
+    }
+
+    impl MetricsReporter for CapturingReporter {
+        fn report(&self, event: MetricEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl CapturingReporter {
+        /// Returns a copy of all captured events.
+        pub(crate) fn events(&self) -> Vec<MetricEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Clears all captured events.
+        pub(crate) fn clear(&self) {
+            self.events.lock().unwrap().clear();
+        }
+    }
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -892,7 +916,7 @@ mod tests {
         }
 
         #[test]
-        fn test_calls_on_drop() {
+        fn test_does_not_call_on_early_drop() {
             let called = Arc::new(AtomicBool::new(false));
             let called_clone = called.clone();
             {
@@ -900,8 +924,9 @@ mod tests {
                     called_clone.store(true, Ordering::SeqCst);
                 });
                 assert_eq!(iter.next(), Some(1));
+                // Drop without exhausting - callback should NOT be called
             }
-            assert!(called.load(Ordering::SeqCst));
+            assert!(!called.load(Ordering::SeqCst));
         }
 
         #[test]

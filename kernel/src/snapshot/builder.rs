@@ -198,12 +198,12 @@ impl SnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
-    use crate::metrics::{MetricEvent, MetricsReporter};
+    use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStore as _};
@@ -211,17 +211,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[derive(Debug, Default)]
-    struct CapturingReporter {
-        events: Mutex<Vec<MetricEvent>>,
-    }
-
-    impl MetricsReporter for CapturingReporter {
-        fn report(&self, event: MetricEvent) {
-            self.events.lock().unwrap().push(event);
-        }
-    }
+    use crate::utils::test_utils::CapturingReporter;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -391,12 +381,12 @@ mod tests {
     }
 
     fn assert_has_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
-        let events = reporter.events.lock().unwrap();
+        let events = reporter.events();
         assert!(events.iter().any(pred), "{msg}");
     }
 
     fn assert_no_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
-        let events = reporter.events.lock().unwrap();
+        let events = reporter.events();
         assert!(!events.iter().any(pred), "{msg}");
     }
 
@@ -459,7 +449,7 @@ mod tests {
             .unwrap();
 
         // Clear events from the initial build
-        reporter.events.lock().unwrap().clear();
+        reporter.clear();
 
         // Incrementally update to the latest version via the else branch
         let updated = SnapshotBuilder::new_from(base)
@@ -467,7 +457,7 @@ mod tests {
             .unwrap();
         assert_eq!(updated.version(), 1);
 
-        let events = reporter.events.lock().unwrap();
+        let events = reporter.events();
         let snapshot_completed = events.iter().find_map(|e| match e {
             MetricEvent::SnapshotCompleted {
                 version,
@@ -497,7 +487,7 @@ mod tests {
         assert_eq!(base.version(), 1);
 
         // Clear events from the initial build
-        reporter.events.lock().unwrap().clear();
+        reporter.clear();
 
         // Attempt to update to version 0 (earlier than base version 1)
         let result = SnapshotBuilder::new_from(base)
@@ -532,7 +522,7 @@ mod tests {
             "expected a SnapshotCompleted event",
         );
 
-        let events = reporter.events.lock().unwrap();
+        let events = reporter.events();
 
         let log_segment_duration = events
             .iter()
