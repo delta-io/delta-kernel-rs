@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::metrics::{MetricEvent, MetricId};
 use crate::scan::metrics::ScanMetrics;
-use crate::utils::option_iter_with_on_complete;
+use crate::utils::IteratorExt;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
@@ -800,7 +800,7 @@ impl Scan {
                 r.report(event);
             }
         };
-        Ok(option_iter_with_on_complete(iter, on_complete))
+        Ok(iter.into_iter().flatten().on_complete(on_complete))
     }
 
     // Factored out to facilitate testing

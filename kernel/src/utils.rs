@@ -4,7 +4,6 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use itertools::Either;
 use url::Url;
 
 use crate::{DeltaResult, Error};
@@ -110,24 +109,29 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
+/// Extension trait for adding completion callbacks to iterators.
+pub(crate) trait IteratorExt: Iterator + Sized {
+    /// Wraps this iterator to call a closure once when exhausted or dropped.
+    ///
+    /// The closure is called exactly once, either when `next()` returns `None`
+    /// or when the iterator is dropped (whichever comes first).
+    fn on_complete<F: FnOnce()>(self, f: F) -> OnComplete<Self, F> {
+        OnComplete {
+            inner: self,
+            on_complete: Some(f),
+        }
+    }
+}
+
+impl<I: Iterator> IteratorExt for I {}
+
 /// Iterator adaptor that executes a closure once when exhausted or dropped.
-///
-/// The closure is called exactly once, either when `next()` returns `None`
-/// or when the iterator is dropped (whichever comes first).
 pub(crate) struct OnComplete<I, F: FnOnce()> {
     inner: I,
     on_complete: Option<F>,
 }
 
 impl<I, F: FnOnce()> OnComplete<I, F> {
-    /// Create a new `OnComplete` iterator adaptor.
-    pub(crate) fn new(inner: I, on_complete: F) -> Self {
-        Self {
-            inner,
-            on_complete: Some(on_complete),
-        }
-    }
-
     fn call_once(&mut self) {
         if let Some(f) = self.on_complete.take() {
             f();
@@ -156,28 +160,6 @@ where
                 None
             }
         }
-    }
-}
-
-/// Wraps an optional iterator with a completion callback.
-///
-/// If the iterator is `Some`, the callback is called when the inner iterator is
-/// exhausted or dropped. If the iterator is `None`, the callback is called immediately
-/// when the first `next()` call returns `None` (or on drop).
-///
-/// This is useful for emitting metrics even when the iterator is empty (e.g., when
-/// static skip-all predicate evaluation means no files need to be scanned).
-pub(crate) fn option_iter_with_on_complete<I, F>(
-    iter: Option<I>,
-    on_complete: F,
-) -> impl Iterator<Item = I::Item>
-where
-    I: Iterator,
-    F: FnOnce(),
-{
-    match iter {
-        Some(it) => Either::Left(OnComplete::new(it, on_complete)),
-        None => Either::Right(OnComplete::new(std::iter::empty::<I::Item>(), on_complete)),
     }
 }
 
@@ -899,7 +881,7 @@ mod tests {
         fn test_calls_on_exhaustion() {
             let called = Arc::new(AtomicBool::new(false));
             let called_clone = called.clone();
-            let mut iter = OnComplete::new(vec![1, 2].into_iter(), move || {
+            let mut iter = vec![1, 2].into_iter().on_complete(move || {
                 called_clone.store(true, Ordering::SeqCst);
             });
             assert_eq!(iter.next(), Some(1));
@@ -914,7 +896,7 @@ mod tests {
             let called = Arc::new(AtomicBool::new(false));
             let called_clone = called.clone();
             {
-                let mut iter = OnComplete::new(vec![1, 2].into_iter(), move || {
+                let mut iter = vec![1, 2].into_iter().on_complete(move || {
                     called_clone.store(true, Ordering::SeqCst);
                 });
                 assert_eq!(iter.next(), Some(1));
@@ -927,7 +909,7 @@ mod tests {
             let count = Arc::new(AtomicU32::new(0));
             let count_clone = count.clone();
             {
-                let mut iter = OnComplete::new(vec![1].into_iter(), move || {
+                let mut iter = vec![1].into_iter().on_complete(move || {
                     count_clone.fetch_add(1, Ordering::SeqCst);
                 });
                 assert_eq!(iter.next(), Some(1));
@@ -938,20 +920,26 @@ mod tests {
         }
 
         #[test]
-        fn test_option_iter_wrapper() {
+        fn test_option_flatten_on_complete() {
             // Some case
             let called = Arc::new(AtomicBool::new(false));
             let c = called.clone();
-            let items: Vec<_> =
-                option_iter_with_on_complete(Some(vec![1].into_iter()), move || c.store(true, Ordering::SeqCst)).collect();
+            let items: Vec<_> = Some(vec![1].into_iter())
+                .into_iter()
+                .flatten()
+                .on_complete(move || c.store(true, Ordering::SeqCst))
+                .collect();
             assert_eq!(items, vec![1]);
             assert!(called.load(Ordering::SeqCst));
 
             // None case
             let called = Arc::new(AtomicBool::new(false));
             let c = called.clone();
-            let items: Vec<i32> =
-                option_iter_with_on_complete(None::<std::vec::IntoIter<i32>>, move || c.store(true, Ordering::SeqCst)).collect();
+            let items: Vec<i32> = None::<std::vec::IntoIter<i32>>
+                .into_iter()
+                .flatten()
+                .on_complete(move || c.store(true, Ordering::SeqCst))
+                .collect();
             assert!(items.is_empty());
             assert!(called.load(Ordering::SeqCst));
         }
