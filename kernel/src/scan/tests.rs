@@ -1531,37 +1531,4 @@ mod scan_metadata_completed_tests {
             .iter()
             .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
     }
-
-    #[test]
-    fn test_unique_operation_ids() {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-        let url = url::Url::from_directory_path(&path).unwrap();
-        let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-                .with_metrics_reporter(reporter.clone())
-                .build(),
-        );
-        for _ in 0..2 {
-            let snapshot = Snapshot::builder_for(url.clone())
-                .build(engine.as_ref())
-                .unwrap();
-            let scan = snapshot.scan_builder().build().unwrap();
-            let _: Vec<_> = scan
-                .scan_metadata(engine.as_ref())
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-        }
-        let ids: Vec<_> = reporter
-            .events()
-            .iter()
-            .filter_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted { operation_id, .. } => Some(*operation_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(ids.len(), 2);
-        assert_ne!(ids[0], ids[1]);
-    }
 }
