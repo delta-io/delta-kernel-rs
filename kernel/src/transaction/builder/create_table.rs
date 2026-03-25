@@ -29,8 +29,8 @@ use crate::table_features::{
 };
 use crate::table_properties::{
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX, ENABLE_IN_COMMIT_TIMESTAMPS,
-    SET_TRANSACTION_RETENTION_DURATION,
+    COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX, ENABLE_DELETION_VECTORS,
+    ENABLE_IN_COMMIT_TIMESTAMPS, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -54,8 +54,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
-    // As features are supported, add them here:
-    // TableFeature::DeletionVectors,
+    TableFeature::DeletionVectors,
     TableFeature::V2Checkpoint,
 ];
 
@@ -72,10 +71,10 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // Checkpoint stats format properties
     CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    // DeletionVectors enablement property: auto-enables the DeletionVectors feature
+    ENABLE_DELETION_VECTORS,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
-    // As features are supported, add them here:
-    // "delta.enableDeletionVectors",
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -367,6 +366,22 @@ fn maybe_enable_in_commit_timestamps(validated: &mut ValidatedTableProperties) {
     }
 }
 
+/// Conditionally adds the `deletionVectors` feature to the protocol when
+/// `delta.enableDeletionVectors=true` is set in the table properties.
+fn maybe_enable_deletion_vectors(validated: &mut ValidatedTableProperties) {
+    let enabled = validated
+        .properties
+        .get(ENABLE_DELETION_VECTORS)
+        .is_some_and(|v| v == "true");
+    if enabled {
+        add_feature_to_lists(
+            TableFeature::DeletionVectors,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -426,6 +441,12 @@ fn maybe_apply_column_mapping_for_table_create(
 /// 4. Extracts reader/writer features from validated feature signals
 ///
 /// Non-delta properties (user/application properties) are always allowed.
+///
+/// Note: This function does not auto-set enablement properties. A feature signal like
+/// `delta.feature.deletionVectors=supported` adds the feature to the protocol but does
+/// not insert `delta.enableDeletionVectors=true` into the properties. Property-driven
+/// auto-enablement (the reverse direction) is handled separately by the `maybe_enable_*`
+/// functions called after validation.
 fn validate_extract_table_features_and_properties(
     properties: HashMap<String, String>,
 ) -> DeltaResult<ValidatedTableProperties> {
@@ -660,14 +681,13 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
-        // Auto-enable variantType feature if schema contains Variant columns
+        // Schema-driven auto-enablement: detect types that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
-
-        // Auto-enable timestampNtz feature if schema contains TimestampNTZ columns
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
 
-        // Auto-enable inCommitTimestamp feature if property is set
+        // Property-driven auto-enablement: check enablement properties
         maybe_enable_in_commit_timestamps(&mut validated);
+        maybe_enable_deletion_vectors(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
