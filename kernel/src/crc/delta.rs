@@ -16,7 +16,7 @@
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 use super::file_stats::FileStatsDelta;
-use super::{Crc, FileSizeHistogram, FileStatsValidity};
+use super::{Crc, FileStatsValidity};
 
 /// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
 /// `.json` commit file during log replay, or from in-memory transaction state during writes.
@@ -42,12 +42,6 @@ pub(crate) struct CrcDelta {
     /// A file action in this commit had a missing `size` field, making byte-level file stats
     /// impossible to compute.
     pub(crate) has_missing_file_size: bool,
-    /// Histogram of file sizes added in this commit. `None` when the delta source does not
-    /// provide histogram data (e.g. forward log replay without histogram support).
-    pub(crate) added_histogram: Option<FileSizeHistogram>,
-    /// Histogram of file sizes removed in this commit. `None` when the delta source does not
-    /// provide histogram data.
-    pub(crate) removed_histogram: Option<FileSizeHistogram>,
 }
 
 impl CrcDelta {
@@ -87,7 +81,7 @@ impl CrcDelta {
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
             // For CREATE TABLE, the added histogram IS the total histogram (no prior files).
-            file_size_histogram: self.added_histogram,
+            file_size_histogram: self.file_stats.added_histogram,
             ..Default::default()
         })
     }
@@ -179,8 +173,8 @@ impl Crc {
         // either histogram, drop it rather than leaving stale data.
         if let (Some(base_hist), Some(added), Some(removed)) = (
             self.file_size_histogram.as_ref(),
-            &delta.added_histogram,
-            &delta.removed_histogram,
+            &delta.file_stats.added_histogram,
+            &delta.file_stats.removed_histogram,
         ) {
             match base_hist.try_add(added).and_then(|h| h.try_sub(removed)) {
                 Ok(merged) => self.file_size_histogram = Some(merged),
@@ -218,6 +212,7 @@ mod tests {
             file_stats: FileStatsDelta {
                 net_files,
                 net_bytes,
+                ..Default::default()
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()
@@ -691,10 +686,10 @@ mod tests {
             file_stats: FileStatsDelta {
                 net_files,
                 net_bytes,
+                added_histogram: Some(added),
+                removed_histogram: Some(removed),
             },
             operation: Some("WRITE".to_string()),
-            added_histogram: Some(added),
-            removed_histogram: Some(removed),
             ..Default::default()
         }
     }
@@ -742,9 +737,14 @@ mod tests {
             h
         });
         let delta = CrcDelta {
-            added_histogram,
-            removed_histogram,
-            ..write_delta(1, 100)
+            file_stats: FileStatsDelta {
+                net_files: 1,
+                net_bytes: 100,
+                added_histogram,
+                removed_histogram,
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
         };
         crc.apply(delta);
         assert!(
@@ -785,9 +785,14 @@ mod tests {
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
-            added_histogram: Some(added.clone()),
-            removed_histogram: Some(FileSizeHistogram::create_default()),
-            ..write_delta(2, 1500)
+            file_stats: FileStatsDelta {
+                net_files: 2,
+                net_bytes: 1500,
+                added_histogram: Some(added),
+                removed_histogram: Some(FileSizeHistogram::create_default()),
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         let hist = crc.file_size_histogram.as_ref().unwrap();

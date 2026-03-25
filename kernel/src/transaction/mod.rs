@@ -13,7 +13,7 @@ use crate::actions::{
     DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
-use crate::crc::{CrcDelta, TxnFileStats};
+use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
@@ -953,13 +953,13 @@ impl<S> Transaction<S> {
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
     ) -> DeltaResult<CrcDelta> {
-        let txn_file_stats = TxnFileStats::try_compute_for_txn(
+        let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
         )?;
         let is_create = self.is_create_table();
         Ok(CrcDelta {
-            file_stats: txn_file_stats.file_stats_delta,
+            file_stats,
             protocol: is_create
                 .then(|| self.read_snapshot.table_configuration().protocol().clone()),
             metadata: is_create
@@ -969,8 +969,6 @@ impl<S> Transaction<S> {
             in_commit_timestamp,
             operation: self.operation.clone(),
             has_missing_file_size: false, // writes always have sizes
-            added_histogram: Some(txn_file_stats.added_histogram),
-            removed_histogram: Some(txn_file_stats.removed_histogram),
         })
     }
 

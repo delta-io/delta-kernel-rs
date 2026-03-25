@@ -22,8 +22,6 @@ pub(crate) use file_size_histogram::FileSizeHistogram;
 pub(crate) use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::FileStatsDelta;
-#[allow(unused)]
-pub(crate) use file_stats::TxnFileStats;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 #[allow(unused)]
@@ -163,6 +161,7 @@ impl Crc {
             FileStatsValidity::Valid => Some(FileStats {
                 num_files: self.num_files,
                 table_size_bytes: self.table_size_bytes,
+                file_size_histogram: self.file_size_histogram.clone(),
             }),
             _ => None,
         }
