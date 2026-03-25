@@ -24,9 +24,6 @@ use crate::{
 
 use super::handle::Handle;
 
-// TODO: Why do we even need to expose a scan, when the only thing an engine can do with it is
-// handit back to the kernel by calling `scan_metadata_iter_init`? There isn't even an FFI method to
-// drop it!
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
 
@@ -144,29 +141,41 @@ pub unsafe extern "C" fn scan(
     scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
 }
 
+/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
+///
+/// Returns the updated builder. If the visitor produces no predicate, the builder is returned
+/// unchanged.
+fn apply_predicate(builder: ScanBuilder, predicate: &mut EnginePredicate) -> ScanBuilder {
+    let mut visitor_state = KernelExpressionVisitorState::default();
+    let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
+    debug!("Got predicate: {:#?}", predicate);
+    builder.with_predicate(predicate.map(Arc::new))
+}
+
+/// Decode an [`EngineSchema`] and apply it as a column projection to a [`ScanBuilder`].
+///
+/// Returns an error if the schema visitor produces an invalid schema.
+fn apply_schema(builder: ScanBuilder, schema: &mut EngineSchema) -> DeltaResult<ScanBuilder> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+    debug!("FFI scan projection schema: {:#?}", schema);
+    Ok(builder.with_schema(Arc::new(schema)))
+}
+
 fn scan_impl(
     snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
     schema: Option<&mut EngineSchema>,
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
-
     if let Some(predicate) = predicate {
-        let mut visitor_state = KernelExpressionVisitorState::default();
-        let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
-        debug!("Got predicate: {:#?}", predicate);
-        scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
+        scan_builder = apply_predicate(scan_builder, predicate);
     }
-
     if let Some(schema) = schema {
-        let mut visitor_state = KernelSchemaVisitorState::default();
-        let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-        let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
-        debug!("FFI scan projection schema: {:#?}", schema);
-        scan_builder = scan_builder.with_schema(Arc::new(schema));
+        scan_builder = apply_schema(scan_builder, schema)?;
     }
-
     Ok(Arc::new(scan_builder.build()?).into())
 }
 
@@ -189,10 +198,11 @@ pub unsafe extern "C" fn scan_builder(
     Box::new(snapshot.scan_builder()).into()
 }
 
-/// Apply a predicate to a [`MutableScanBuilder`] for file-level pruning.
+/// Apply a predicate to a [`MutableScanBuilder`] for data skipping and row-level filtering.
 ///
-/// Consumes the `builder` handle and returns a new handle with the predicate applied. If the
-/// predicate cannot be decoded, the builder is dropped and an error is returned.
+/// Consumes the `builder` handle and returns a new handle. If the visitor produces no
+/// predicate, `None` is passed to [`ScanBuilder::with_predicate`] and the builder is returned
+/// effectively unchanged. This operation is infallible.
 ///
 /// # Safety
 ///
@@ -213,17 +223,14 @@ fn scan_builder_with_predicate_impl(
     predicate: &mut EnginePredicate,
 ) -> DeltaResult<Handle<MutableScanBuilder>> {
     let builder = unsafe { builder.into_inner() };
-    let mut visitor_state = KernelExpressionVisitorState::default();
-    let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
-    debug!("Got predicate: {:#?}", predicate);
-    Ok(Box::new(builder.with_predicate(predicate.map(Arc::new))).into())
+    Ok(Box::new(apply_predicate(*builder, predicate)).into())
 }
 
 /// Apply a column projection schema to a [`MutableScanBuilder`].
 ///
-/// Consumes the `builder` handle and returns a new handle with the schema applied. If the
-/// schema cannot be decoded, the builder is dropped and an error is returned.
+/// Consumes the `builder` handle and returns a new handle with the schema applied. Returns an
+/// error if the schema visitor produces an invalid schema, such as a non-struct root or
+/// unconsumed field IDs.
 ///
 /// # Safety
 ///
@@ -244,11 +251,7 @@ fn scan_builder_with_schema_impl(
     schema: &mut EngineSchema,
 ) -> DeltaResult<Handle<MutableScanBuilder>> {
     let builder = unsafe { builder.into_inner() };
-    let mut visitor_state = KernelSchemaVisitorState::default();
-    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
-    debug!("FFI scan projection schema: {:#?}", schema);
-    Ok(Box::new(builder.with_schema(Arc::new(schema))).into())
+    Ok(Box::new(apply_schema(*builder, schema)?).into())
 }
 
 /// Consume a [`MutableScanBuilder`] and produce a [`SharedScan`].
@@ -284,7 +287,7 @@ pub unsafe extern "C" fn scan_builder_build(
 /// `builder` must be a valid handle that has not been previously consumed or freed.
 #[no_mangle]
 pub unsafe extern "C" fn free_scan_builder(builder: Handle<MutableScanBuilder>) {
-    let _ = unsafe { builder.into_inner() };
+    builder.drop_handle();
 }
 
 /// Get the table root of a scan.
@@ -331,6 +334,9 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
 /// after column-mapping. An absent predicate means either no predicate was pushed down, the
 /// predicate statically skips all files, or the predicate was entirely resolved by file-level
 /// pruning.
+///
+/// If you need the predicate itself (not just its presence), use [`scan_remaining_filter`]
+/// instead to avoid a redundant allocation.
 ///
 /// # Safety
 ///
@@ -748,21 +754,20 @@ mod scan_builder_tests {
     use delta_kernel::object_store::memory::InMemory;
     use test_utils::{actions_to_string, add_commit, TestAction};
 
+    use crate::error::KernelError;
+    use crate::expressions::free_kernel_predicate;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
     };
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error};
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
     use crate::{
         engine_to_handle, free_engine, free_schema, free_snapshot, kernel_string_slice,
-        snapshot as get_snapshot, KernelStringSlice, SharedExternEngine, SharedSnapshot,
+        snapshot as get_snapshot, ExternResult, OptionalValue, SharedExternEngine, SharedSnapshot,
     };
-
-    use crate::expressions::free_kernel_predicate;
-    use crate::OptionalValue;
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
@@ -805,22 +810,20 @@ mod scan_builder_tests {
         state: &mut KernelSchemaVisitorState,
     ) -> usize {
         let id = "id";
-        let id_slice = KernelStringSlice {
-            ptr: id.as_ptr() as *const i8,
-            len: id.len(),
+        let id_field_id = unsafe {
+            ok_or_panic(visit_field_integer(
+                state,
+                kernel_string_slice!(id),
+                true,
+                allocate_err,
+            ))
         };
-        let root = "schema";
-        let root_slice = KernelStringSlice {
-            ptr: root.as_ptr() as *const i8,
-            len: root.len(),
-        };
-        let id_field_id =
-            unsafe { ok_or_panic(visit_field_integer(state, id_slice, true, allocate_err)) };
         let field_ids = [id_field_id];
+        let schema = "schema";
         unsafe {
             ok_or_panic(visit_field_struct(
                 state,
-                root_slice,
+                kernel_string_slice!(schema),
                 field_ids.as_ptr(),
                 1,
                 false,
@@ -835,11 +838,13 @@ mod scan_builder_tests {
         state: &mut KernelExpressionVisitorState,
     ) -> usize {
         let id = "id";
-        let id_slice = KernelStringSlice {
-            ptr: id.as_ptr() as *const i8,
-            len: id.len(),
+        let col = unsafe {
+            ok_or_panic(visit_expression_column(
+                state,
+                kernel_string_slice!(id),
+                allocate_err,
+            ))
         };
-        let col = unsafe { ok_or_panic(visit_expression_column(state, id_slice, allocate_err)) };
         let lit = visit_expression_literal_int(state, 10);
         visit_predicate_lt(state, col, lit)
     }
@@ -944,6 +949,13 @@ mod scan_builder_tests {
         let schema_ref = unsafe { schema.as_ref() };
         assert_eq!(schema_ref.fields().count(), 1);
         assert!(schema_ref.field("id").is_some());
+        // Predicate survives projection -- remaining filter must still be present
+        assert!(unsafe { scan_has_remaining_filter(scan.shallow_copy()) });
+        let remaining = unsafe { scan_remaining_filter(scan.shallow_copy()) };
+        assert!(matches!(remaining, OptionalValue::Some(_)));
+        if let OptionalValue::Some(pred_handle) = remaining {
+            unsafe { free_kernel_predicate(pred_handle) };
+        }
         unsafe { free_schema(schema) };
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
@@ -1022,6 +1034,91 @@ mod scan_builder_tests {
             unsafe { free_kernel_predicate(pred_handle) };
         }
         unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    /// Schema visitor that returns a bare integer field ID (not wrapped in a struct root).
+    /// `extract_kernel_schema` requires a struct root, so this produces an error.
+    extern "C" fn visit_invalid_schema_not_struct(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let bare_field = "bare_field";
+        unsafe {
+            ok_or_panic(visit_field_integer(
+                state,
+                kernel_string_slice!(bare_field),
+                true,
+                allocate_err,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_schema_then_predicate() {
+        // Verify that applying schema before predicate produces the same result as the reverse
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_id_only_schema,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_schema(
+                builder,
+                engine.shallow_copy(),
+                &mut schema_arg,
+            ))
+        };
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_lt_10,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        // Projection to `{id}` regardless of application order
+        let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+        let schema_ref = unsafe { schema.as_ref() };
+        assert_eq!(schema_ref.fields().count(), 1);
+        assert!(schema_ref.field("id").is_some());
+        assert!(unsafe { scan_has_remaining_filter(scan.shallow_copy()) });
+        let remaining = unsafe { scan_remaining_filter(scan.shallow_copy()) };
+        assert!(matches!(remaining, OptionalValue::Some(_)));
+        if let OptionalValue::Some(pred_handle) = remaining {
+            unsafe { free_kernel_predicate(pred_handle) };
+        }
+        unsafe { free_schema(schema) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_schema_error_propagates() {
+        // An invalid schema (bare primitive field, no struct root) must return ExternResult::Err
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_invalid_schema_not_struct,
+        };
+        let result =
+            unsafe { scan_builder_with_schema(builder, engine.shallow_copy(), &mut schema_arg) };
+        assert!(
+            matches!(result, ExternResult::Err(_)),
+            "expected ExternResult::Err for invalid schema"
+        );
+        if let ExternResult::Err(e) = result {
+            let err = unsafe { recover_error(e) };
+            assert_eq!(err.etype, KernelError::SchemaError);
+        }
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
     }
