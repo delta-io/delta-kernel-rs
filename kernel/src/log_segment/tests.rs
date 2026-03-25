@@ -2699,9 +2699,8 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("stats_parsed", stats_parsed),
     ]);
-    let remove_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-    ]);
+    let remove_schema =
+        StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
     let v1_schema = Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, add_schema),
         StructField::nullable(REMOVE_NAME, remove_schema),
