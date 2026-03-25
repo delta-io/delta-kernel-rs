@@ -93,9 +93,7 @@ impl<C: CommitClient> UCCommitter<C> {
                 commit_metadata.in_commit_timestamp(),
                 staged_commit_path
                     .path_segments()
-                    .ok_or_else(|| {
-                        DeltaError::generic("staged commit contained no path segments")
-                    })?
+                    .ok_or_else(|| DeltaError::generic("staged commit contained no path segments"))?
                     .next_back()
                     .ok_or_else(|| {
                         DeltaError::generic("staged commit segments next_back was empty")
@@ -200,8 +198,7 @@ mod tests {
     fn commit_version_0_writes_published_commit() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata =
-            CommitMetadata::new_unchecked(table_root.clone(), 0).unwrap();
+        let commit_metadata = CommitMetadata::new_unchecked(table_root.clone(), 0).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
@@ -222,9 +219,7 @@ mod tests {
                     file_meta.location
                 );
                 // Verify the file was written to disk
-                let commit_path = tmp_dir
-                    .path()
-                    .join("_delta_log/00000000000000000000.json");
+                let commit_path = tmp_dir.path().join("_delta_log/00000000000000000000.json");
                 assert!(commit_path.exists(), "000.json should exist on disk");
             }
             CommitResponse::Conflict { .. } => {
@@ -245,8 +240,7 @@ mod tests {
         fs::create_dir_all(&delta_log).unwrap();
         fs::write(delta_log.join("00000000000000000000.json"), "existing").unwrap();
 
-        let commit_metadata =
-            CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
         let result = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
             .unwrap();
