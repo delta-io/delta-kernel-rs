@@ -1,12 +1,13 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
+use delta_kernel::parquet::arrow::AsyncArrowWriter;
+use delta_kernel::parquet::errors::Result as ParquetResult;
 use futures::future::{BoxFuture, FutureExt};
-use parquet::arrow::async_writer::AsyncFileWriter;
-use parquet::arrow::AsyncArrowWriter;
 
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
@@ -126,12 +127,12 @@ pub struct BlackholeWriter {
 }
 
 impl AsyncFileWriter for BlackholeWriter {
-    fn write(&mut self, bs: bytes::Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+    fn write(&mut self, bs: bytes::Bytes) -> BoxFuture<'_, ParquetResult<()>> {
         self.len += bs.len() as u64;
         async move { Ok(()) }.boxed()
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+    fn complete(&mut self) -> BoxFuture<'_, ParquetResult<()>> {
         async move { Ok(()) }.boxed()
     }
 }

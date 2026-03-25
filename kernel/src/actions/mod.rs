@@ -8,8 +8,8 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, IntoTableFeature, TableFeature, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -30,8 +30,6 @@ const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
-
-pub(crate) mod domain_metadata;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -461,6 +459,19 @@ impl Protocol {
         reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
         writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
     ) -> DeltaResult<Self> {
+        require!(
+            min_reader_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
+            ))
+        );
+        require!(
+            min_writer_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
+            ))
+        );
+
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
@@ -696,7 +707,7 @@ pub(crate) struct Add {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
@@ -718,10 +729,10 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     /// Note: map values can be null.
-    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// We don't use `#[allow_null_container_values]` here because [`MapItem::materialize`]
     /// drops null values when that attribute is present.
     ///
-    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`MapItem::materialize`]: crate::engine_data::MapItem::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub tags: Option<HashMap<String, Option<String>>>,
 
@@ -825,7 +836,7 @@ pub(crate) struct Cdc {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
@@ -843,8 +854,8 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-// TODO: Add serde Deserialize with rename_all = "camelCase" for CRC file reads.
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -981,6 +992,11 @@ impl DomainMetadata {
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
     }
+
+    /// Returns `true` if this action is a tombstone (marking domain removal).
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
+    }
 }
 
 #[cfg(test)]
@@ -997,8 +1013,10 @@ mod tests {
         },
         engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
+        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
+    use rstest::rstest;
     use serde_json::json;
 
     // duplicated
@@ -1308,6 +1326,30 @@ mod tests {
                 Err(Error::InvalidProtocol(_)),
             ));
         }
+    }
+
+    #[rstest]
+    #[case(0, 1)]
+    #[case(1, 0)]
+    #[case(-1, 2)]
+    #[case(1, -1)]
+    fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(
+            Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn accept_min_versions() {
+        let p = Protocol::try_new_legacy(1, 1).unwrap();
+        assert_eq!(p.min_reader_version(), 1);
+        assert_eq!(p.min_writer_version(), 1);
     }
 
     #[test]

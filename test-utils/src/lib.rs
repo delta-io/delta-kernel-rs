@@ -21,17 +21,17 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::{path::Path, DynObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, Snapshot};
 
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
@@ -99,6 +99,11 @@ pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operatio
 pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
+
+/// Like [`METADATA`] but with non-empty table properties including `delta.appendOnly` and `custom.key`.
+pub const METADATA_WITH_TABLE_PROPERTIES: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
 
 pub enum TestAction {
     Add(String),
@@ -221,26 +226,59 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
-// TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
-/// put a commit file into the specified object store.
+// Resolve a table from a root and relative path
+fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+    let url = try_parse_uri(table_root)?;
+    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+}
+
+/// Write a Delta commit JSON file at the given version into `store`.
+///
+/// The commit is written to `_delta_log/{version:020}.json` under `table_root`. The caller is
+/// responsible for ensuring that `data` contains valid Delta actions (e.g. built via
+/// [`actions_to_string`]) and that no commit already exists at `version`.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Commit version number (determines the log file name).
+/// - `data` - JSON-serialized Delta actions to write as the commit body.
 pub async fn add_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = delta_path_for_version(version, "json");
-    store.put(&path, data.into()).await?;
+    let relative_path = delta_path_for_version(version, "json");
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
     Ok(())
 }
 
+/// Write a staged (uncommitted) Delta commit JSON file at the given version into `store`.
+///
+/// The file is written to `_delta_log/_staged_commits/{version}.{uuid}.json` under
+/// `table_root`. Multiple staged commits may exist for the same version (each gets a unique
+/// UUID). The caller is responsible for ensuring that `data` contains valid Delta actions.
+///
+/// Returns the object-store [`Path`] of the written file so callers can reference it in a
+/// log tail or assertions.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Target commit version number (determines the staged file name prefix).
+/// - `data` - JSON-serialized Delta actions to write as the staged commit body.
 pub async fn add_staged_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
-    let path = staged_commit_path_for_version(version);
-    store.put(&path, data.into()).await?;
-    Ok(path)
+    let relative_path = staged_commit_path_for_version(version);
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
+    Ok(table_path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
@@ -333,11 +371,11 @@ pub fn engine_store_setup(
     table_name: &str,
     local_directory: Option<&Url>,
 ) -> (
-    Arc<dyn ObjectStore>,
+    Arc<DynObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+    let (storage, url): (Arc<DynObjectStore>, Url) = match local_directory {
         None => (
             Arc::new(InMemory::new()),
             Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
@@ -356,7 +394,7 @@ pub fn engine_store_setup(
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_path: Url,
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -489,7 +527,7 @@ pub async fn setup_test_tables(
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         &'static str,
     )>,
     Box<dyn std::error::Error>,
@@ -584,6 +622,7 @@ pub async fn insert_data<E: TaskExecutor>(
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
         .with_data_change(true);
 
     let write_context = txn.get_write_context();
@@ -690,6 +729,75 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
             vec![Some(40), None, Some(60)],
         )?,
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Schema helpers for feature auto-enablement tests (TimestampNTZ, Variant)
+// ---------------------------------------------------------------------------
+
+/// Schema with one column of the given type: `(id INT, col <dtype>)`.
+pub fn schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col", dtype, true),
+    ]))
+}
+
+/// Schema with the given type nested inside a struct:
+/// `(id INT, nested STRUCT<inner <dtype>>)`.
+pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new(
+            "nested",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "inner", dtype, true,
+            )]))),
+            true,
+        ),
+    ]))
+}
+
+/// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
+pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col1", dtype.clone(), true),
+        StructField::new("col2", dtype, true),
+    ]))
+}
+
+pub fn top_level_ntz_schema() -> SchemaRef {
+    schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn nested_ntz_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn multiple_ntz_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn top_level_variant_schema() -> SchemaRef {
+    schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn nested_variant_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn multiple_variant_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::unshredded_variant())
+}
+
+/// Returns column mapping table properties for the given mode, or empty for `"none"`.
+pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
+    if mode == "none" {
+        vec![]
+    } else {
+        vec![("delta.columnMapping.mode", mode)]
+    }
 }
 
 /// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
@@ -900,7 +1008,7 @@ pub fn read_add_infos(
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = get_log_add_schema().clone();
-    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
+    let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
     for batch_result in batches {
         let actions_batch = batch_result?;
@@ -1008,7 +1116,7 @@ pub fn read_actions_from_commit(
     action_type: &str,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
-    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
     let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
         .into_iter::<serde_json::Value>()

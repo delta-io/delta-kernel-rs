@@ -170,16 +170,12 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on table-level filtering config.
     /// Required columns (e.g. clustering columns) are always included, even past the column limit.
     pub(crate) fn should_include_for_table(&self) -> bool {
-        // When using dataSkippingStatsColumns, check the trie (which includes required)
-        if let Some(trie) = &self.data_skipping_stats_trie {
-            return trie.contains_prefix_of(&self.path);
-        }
-
-        // When using dataSkippingNumIndexedCols, check limit but allow required columns
-        if self.at_column_limit() {
-            self.is_required_column()
-        } else {
-            true
+        match &self.data_skipping_stats_trie {
+            // In explicit dataSkippingStatsColumns mode, include exactly columns selected by the trie.
+            // Required columns are already merged into the trie during initialization.
+            Some(trie) => trie.contains_prefix_of(&self.path),
+            // In count-based mode, include until limit; required columns can exceed the limit.
+            None => !self.at_column_limit() || self.is_required_column(),
         }
     }
 

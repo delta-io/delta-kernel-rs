@@ -17,6 +17,7 @@ use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::object_store::path::Path;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
@@ -26,7 +27,6 @@ use crate::schema::{
 use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
 use itertools::Itertools;
 
-use object_store::path::Path;
 use test_utils::delta_path_for_version;
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ pub(crate) fn make_temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
 }
 
 /// Builds a [`FileMeta`] for a local file path, reading the actual size from the filesystem.
-fn file_meta_for(path: &std::path::Path) -> FileMeta {
+pub(crate) fn file_meta_for(path: &std::path::Path) -> FileMeta {
     let url = Url::from_file_path(path).unwrap();
     let size = std::fs::metadata(path).unwrap().len();
     FileMeta {

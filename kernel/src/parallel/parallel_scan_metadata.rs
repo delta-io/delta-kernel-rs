@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use tracing::{info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::parallel::parallel_phase::ParallelPhase;
@@ -30,17 +31,34 @@ pub enum AfterSequentialScanMetadata {
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    span: Span,
 }
 
 impl SequentialScanMetadata {
     pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
-        Self { sequential }
+        Self {
+            sequential,
+            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
+            span: info_span!("sequential_scan_metadata"),
+        }
     }
 
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
+        let _guard = self.span.enter();
         match self.sequential.finish()? {
-            AfterSequential::Done(_) => Ok(AfterSequentialScanMetadata::Done),
+            AfterSequential::Done(processor) => {
+                processor
+                    .get_metrics()
+                    .log("Sequential scan metadata completed");
+                Ok(AfterSequentialScanMetadata::Done)
+            }
             AfterSequential::Parallel { processor, files } => {
+                // Log sequential metrics and reset counters for parallel phase
+                processor
+                    .get_metrics()
+                    .log("Sequential scan metadata completed");
+                processor.get_metrics().reset_counters();
+
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState { inner: processor }),
                     files,
@@ -54,6 +72,7 @@ impl Iterator for SequentialScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.span.enter();
         self.sequential.next()
     }
 }
@@ -75,6 +94,32 @@ impl ParallelLogReplayProcessor for Arc<ParallelState> {
 }
 
 impl ParallelState {
+    /// Log the accumulated metrics from parallel processing.
+    ///
+    /// Call this after all parallel workers complete. The metrics will be logged
+    /// in the current tracing span context.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::scan::ParallelState;
+    /// # use tracing::instrument;
+    /// #[instrument(skip_all, name = "parallel_scan")]
+    /// async fn process(state: Arc<ParallelState>) {
+    ///     // ... spawn workers that share Arc<ParallelState> ...
+    ///     // ... wait for workers to complete ...
+    ///
+    ///     // Log accumulated metrics
+    ///     state.log_metrics();
+    /// }
+    /// ```
+    pub fn log_metrics(&self) {
+        self.inner
+            .get_metrics()
+            .log("Parallel scan metadata completed");
+    }
+
     /// Get the schema to use for reading checkpoint files.
     ///
     /// Returns the checkpoint read schema which may have stats excluded
@@ -101,7 +146,6 @@ impl ParallelState {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `state`: The serialized state from a previous `into_serializable_state()` call
-    /// - `scan_span`: The parent scan span for tracing
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn from_serializable_state(
@@ -123,9 +167,8 @@ impl ParallelState {
     #[allow(unused)]
     pub fn into_bytes(self) -> DeltaResult<Vec<u8>> {
         let state = self.into_serializable_state()?;
-        serde_json::to_vec(&state).map_err(|e| {
-            Error::generic(format!("Failed to serialize ParallelState to bytes: {}", e))
-        })
+        serde_json::to_vec(&state)
+            .map_err(|e| Error::generic(format!("Failed to serialize ParallelState to bytes: {e}")))
     }
 
     /// Reconstruct a ParallelState from bytes.
@@ -136,7 +179,6 @@ impl ParallelState {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
-    /// - `scan_span`: The parent scan span for tracing
     #[allow(unused)]
     pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> DeltaResult<Self> {
         let state: SerializableScanState =
@@ -147,6 +189,7 @@ impl ParallelState {
 
 pub struct ParallelScanMetadata {
     pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
+    span: Span,
 }
 
 impl ParallelScanMetadata {
@@ -158,6 +201,8 @@ impl ParallelScanMetadata {
         let read_schema = state.file_read_schema();
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            // TODO: Associate the same scan ID from sequential phase to correlate phases
+            span: info_span!("parallel_scan_metadata"),
         })
     }
 
@@ -167,6 +212,8 @@ impl ParallelScanMetadata {
     ) -> Self {
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
+            // TODO: Associate the same scan ID from sequential phase to correlate phases
+            span: info_span!("parallel_scan_metadata"),
         }
     }
 }
@@ -175,6 +222,7 @@ impl Iterator for ParallelScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.span.enter();
         self.processor.next()
     }
 }

@@ -47,14 +47,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -213,6 +213,127 @@ fn test_physical_predicate() {
             "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
         );
     }
+}
+
+/// Delta column names are case-insensitive, so predicates with differently-cased column names
+/// must still resolve against the schema. The predicate is rewritten to use the schema's casing
+/// (or physical names when column mapping is enabled).
+#[rstest]
+#[case::without_column_mapping(
+    // predicate: createdat > 500 AND value < 100, schema: createdAt, Value
+    StructType::new_unchecked(vec![
+        StructField::nullable("createdAt", DataType::LONG),
+        StructField::nullable("Value", DataType::LONG),
+    ]),
+    Pred::and(
+        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
+        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+    ),
+    ColumnMappingMode::None,
+    PhysicalPredicate::Some(
+        Arc::new(Pred::and(
+            Pred::gt(column_expr!("createdAt"), Expr::literal(500i64)),
+            Pred::lt(column_expr!("Value"), Expr::literal(100i64)),
+        )),
+        StructType::new_unchecked(vec![
+            StructField::nullable("createdAt", DataType::LONG),
+            StructField::nullable("Value", DataType::LONG),
+        ]).into(),
+    ),
+)]
+#[case::with_column_mapping(
+    // predicate: createdat > 500 AND value < 100, schema has physical name metadata
+    StructType::new_unchecked(vec![
+        StructField::nullable("createdAt", DataType::LONG).with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_created",
+        )]),
+        StructField::nullable("Value", DataType::LONG).with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_value",
+        )]),
+    ]),
+    Pred::and(
+        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
+        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+    ),
+    ColumnMappingMode::Name,
+    PhysicalPredicate::Some(
+        Arc::new(Pred::and(
+            Pred::gt(column_expr!("phys_created"), Expr::literal(500i64)),
+            Pred::lt(column_expr!("phys_value"), Expr::literal(100i64)),
+        )),
+        StructType::new_unchecked(vec![
+            StructField::nullable("phys_created", DataType::LONG).with_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                "phys_created",
+            )]),
+            StructField::nullable("phys_value", DataType::LONG).with_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                "phys_value",
+            )]),
+        ]).into(),
+    ),
+)]
+#[case::duplicate_column_different_casing(
+    // predicate references same column with different casings: value > 5 AND VALUE < 10
+    StructType::new_unchecked(vec![
+        StructField::nullable("Value", DataType::LONG),
+    ]),
+    Pred::and(
+        Pred::gt(column_expr!("value"), Expr::literal(5i64)),
+        Pred::lt(column_expr!("VALUE"), Expr::literal(10i64)),
+    ),
+    ColumnMappingMode::None,
+    PhysicalPredicate::Some(
+        Arc::new(Pred::and(
+            Pred::gt(column_expr!("Value"), Expr::literal(5i64)),
+            Pred::lt(column_expr!("Value"), Expr::literal(10i64)),
+        )),
+        StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)])
+            .into(),
+    ),
+)]
+#[case::nested_fields(
+    // predicate references nested.fieldname but schema has Nested.FieldName
+    StructType::new_unchecked(vec![StructField::nullable(
+        "Nested",
+        StructType::new_unchecked(vec![StructField::nullable("FieldName", DataType::LONG)]),
+    )]),
+    column_pred!("nested.fieldname"),
+    ColumnMappingMode::None,
+    PhysicalPredicate::Some(
+        column_pred!("Nested.FieldName").into(),
+        StructType::new_unchecked(vec![StructField::nullable(
+            "Nested",
+            StructType::new_unchecked(vec![
+                StructField::nullable("FieldName", DataType::LONG)
+            ]),
+        )]).into(),
+    ),
+)]
+fn test_physical_predicate_case_insensitive(
+    #[case] logical_schema: StructType,
+    #[case] predicate: Predicate,
+    #[case] column_mapping_mode: ColumnMappingMode,
+    #[case] expected: PhysicalPredicate,
+) {
+    let result =
+        PhysicalPredicate::try_new(&predicate, &logical_schema, column_mapping_mode).unwrap();
+    assert_eq!(result, expected);
+}
+
+/// Unknown column still fails even with case-insensitive matching.
+#[test]
+fn test_physical_predicate_case_insensitive_unknown_column() {
+    let logical_schema =
+        StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
+    let result = PhysicalPredicate::try_new(
+        &column_pred!("nonexistent"),
+        &logical_schema,
+        ColumnMappingMode::None,
+    );
+    assert!(result.is_err());
 }
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
@@ -384,7 +505,7 @@ fn test_get_partition_value() {
     ];
 
     for (raw, data_type, expected) in &cases {
-        let value = crate::transforms::parse_partition_value_raw(
+        let value = crate::scan::transform_spec::parse_partition_value_raw(
             Some(&raw.to_string()),
             &DataType::Primitive(data_type.clone()),
         )
@@ -532,10 +653,7 @@ fn assert_stats_struct_matches_json(
             assert_eq!(
                 json_val.as_i64().unwrap(),
                 int_col.value(row_idx),
-                "{}.{} mismatch at row {}",
-                field_name,
-                col_name,
-                row_idx
+                "{field_name}.{col_name} mismatch at row {row_idx}"
             );
         }
     }
@@ -639,52 +757,6 @@ fn test_scan_metadata_with_stats_columns() {
     assert!(total_num_records > 0, "Should have non-zero numRecords");
     println!(
         "Verified {file_count} files with total {total_num_records} records from stats_parsed"
-    );
-}
-
-/// Test that data skipping works correctly with pre-parsed stats from a checkpoint.
-///
-/// The parsed-stats test table has a checkpoint at version 3 (containing stats_parsed) and
-/// JSON commits at versions 4-5. This test exercises both code paths:
-/// - Checkpoint batches: stats_parsed is read directly from the transformed batch
-/// - JSON log batches: stats are parsed from JSON via the transform expression
-///
-/// Table layout (6 files, each 100 records):
-///   File 1: id [1-100],   File 2: id [101-200], File 3: id [201-300]
-///   File 4: id [301-400], File 5: id [401-500], File 6: id [501-600]
-#[test]
-fn test_data_skipping_with_parsed_stats() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    // Predicate: id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
-    }
-
-    assert_eq!(
-        selected_file_count, 2,
-        "Data skipping with parsed stats should keep only 2 files (id [401-500] and [501-600])"
     );
 }
 
