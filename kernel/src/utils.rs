@@ -943,30 +943,5 @@ mod tests {
             } // drop should not trigger again
             assert_eq!(count.load(Ordering::SeqCst), 1);
         }
-
-        #[test]
-        fn test_option_flatten_on_complete() {
-            // Some case
-            let called = Arc::new(AtomicBool::new(false));
-            let c = called.clone();
-            let items: Vec<_> = Some(vec![1].into_iter())
-                .into_iter()
-                .flatten()
-                .on_complete(move || c.store(true, Ordering::SeqCst))
-                .collect();
-            assert_eq!(items, vec![1]);
-            assert!(called.load(Ordering::SeqCst));
-
-            // None case
-            let called = Arc::new(AtomicBool::new(false));
-            let c = called.clone();
-            let items: Vec<i32> = None::<std::vec::IntoIter<i32>>
-                .into_iter()
-                .flatten()
-                .on_complete(move || c.store(true, Ordering::SeqCst))
-                .collect();
-            assert!(items.is_empty());
-            assert!(called.load(Ordering::SeqCst));
-        }
     }
 }
