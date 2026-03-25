@@ -432,7 +432,7 @@ impl LogSegmentFiles {
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            // TODO: We could potentially recover here
+            // Kernel should not compensate for corrupt tables, so we fail if we can't find a checkpoint
             return Err(Error::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
             ));
