@@ -120,4 +120,44 @@ impl ScanMetrics {
             message.as_ref()
         );
     }
+
+    /// Get the number of add files seen during add/remove deduplication.
+    pub(crate) fn num_add_files_seen(&self) -> u64 {
+        self.num_add_files_seen.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of active add files that survived log replay.
+    pub(crate) fn num_active_add_files(&self) -> u64 {
+        self.num_active_add_files.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of remove files seen.
+    pub(crate) fn num_remove_files_seen(&self) -> u64 {
+        self.num_remove_files_seen.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of non-file actions seen.
+    pub(crate) fn num_non_file_actions(&self) -> u64 {
+        self.num_non_file_actions.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of files filtered by predicates.
+    pub(crate) fn num_predicate_filtered(&self) -> u64 {
+        self.num_predicate_filtered.load(Ordering::Relaxed)
+    }
+
+    /// Get the peak size of the deduplication hash set.
+    pub(crate) fn peak_hash_set_size(&self) -> usize {
+        self.peak_hash_set_size.load(Ordering::Relaxed)
+    }
+
+    /// Get the time spent in the deduplication visitor (milliseconds).
+    pub(crate) fn dedup_visitor_time_ms(&self) -> u64 {
+        self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
+    /// Get the time spent evaluating predicates (milliseconds).
+    pub(crate) fn predicate_eval_time_ms(&self) -> u64 {
+        self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000
+    }
 }

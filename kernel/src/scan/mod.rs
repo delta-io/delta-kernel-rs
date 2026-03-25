@@ -3,11 +3,16 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
+
+use crate::metrics::{MetricEvent, MetricId};
+use crate::scan::metrics::ScanMetrics;
+use crate::utils::option_iter_with_on_complete;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
@@ -571,6 +576,12 @@ impl Scan {
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    ///
+    /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
+    /// exhausted or dropped.
+    ///
+    /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
+    ///
     /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
@@ -753,17 +764,49 @@ impl Scan {
             impl Iterator<Item = DeltaResult<ActionsBatch>>,
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
-            return Ok(None.into_iter().flatten());
-        }
-        let it = scan_action_iter(
-            engine,
-            actions_with_checkpoint_info.actions,
-            self.state_info.clone(),
-            actions_with_checkpoint_info.checkpoint_info,
-            self.skip_stats(),
-        )?;
-        Ok(Some(it).into_iter().flatten())
+        let start = Instant::now();
+        let reporter = engine.get_metrics_reporter();
+        let operation_id = MetricId::new();
+
+        // Get iterator and metrics (None if static skip all)
+        let iter_and_metrics =
+            if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
+                None
+            } else {
+                Some(scan_action_iter(
+                    engine,
+                    actions_with_checkpoint_info.actions,
+                    self.state_info.clone(),
+                    actions_with_checkpoint_info.checkpoint_info,
+                    self.skip_stats(),
+                )?)
+            };
+
+        // Extract iterator and metrics, defaulting to empty metrics for static skip
+        let (iter, metrics) = match iter_and_metrics {
+            Some((it, m)) => (Some(it), m),
+            None => (None, Arc::new(ScanMetrics::default())),
+        };
+
+        // Wrap iterator with completion callback that emits metrics
+        Ok(option_iter_with_on_complete(iter, move || {
+            let event = MetricEvent::ScanMetadataCompleted {
+                operation_id,
+                total_duration: start.elapsed(),
+                num_add_files_seen: metrics.num_add_files_seen(),
+                num_active_add_files: metrics.num_active_add_files(),
+                num_remove_files_seen: metrics.num_remove_files_seen(),
+                num_non_file_actions: metrics.num_non_file_actions(),
+                num_predicate_filtered: metrics.num_predicate_filtered(),
+                peak_hash_set_size: metrics.peak_hash_set_size(),
+                dedup_visitor_time_ms: metrics.dedup_visitor_time_ms(),
+                predicate_eval_time_ms: metrics.predicate_eval_time_ms(),
+            };
+            info!(%event, "Scan metadata completed");
+            if let Some(r) = reporter {
+                r.report(event);
+            }
+        }))
     }
 
     // Factored out to facilitate testing

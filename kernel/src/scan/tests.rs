@@ -1420,3 +1420,186 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         );
     }
 }
+
+/// Tests for ScanMetadataCompleted event emission
+mod scan_metadata_completed_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::engine::default::DefaultEngineBuilder;
+    use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+    use crate::metrics::{MetricEvent, MetricsReporter};
+    use crate::object_store::local::LocalFileSystem;
+    use crate::Snapshot;
+
+    #[derive(Debug, Default)]
+    struct CapturingReporter {
+        events: Mutex<Vec<MetricEvent>>,
+    }
+
+    impl MetricsReporter for CapturingReporter {
+        fn report(&self, event: MetricEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl CapturingReporter {
+        fn find_scan_completed(&self) -> Option<MetricEvent> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+                .cloned()
+        }
+
+        fn scan_completed_events(&self) -> Vec<MetricEvent> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn run_scan(table: &str, predicate: Option<Arc<Pred>>) -> (Arc<CapturingReporter>, usize) {
+        let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone())
+                .build(),
+        );
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let mut builder = snapshot.scan_builder();
+        if let Some(pred) = predicate {
+            builder = builder.with_predicate(pred);
+        }
+        let scan = builder.build().unwrap();
+        let results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        (reporter, results.len())
+    }
+
+    #[test]
+    fn test_emits_on_completion() {
+        let (reporter, _) = run_scan("./tests/data/parsed-stats/", None);
+        let MetricEvent::ScanMetadataCompleted {
+            total_duration,
+            num_active_add_files,
+            ..
+        } = reporter.find_scan_completed().unwrap()
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert!(total_duration > Duration::ZERO);
+        assert_eq!(num_active_add_files, 6);
+    }
+
+    #[test]
+    fn test_emits_on_early_drop() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone())
+                .build(),
+        );
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
+        {
+            let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
+            let _ = iter.next();
+        }
+        assert!(reporter.find_scan_completed().is_some());
+    }
+
+    #[test]
+    fn test_unique_operation_ids() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone())
+                .build(),
+        );
+        for _ in 0..2 {
+            let snapshot = Snapshot::builder_for(url.clone())
+                .build(engine.as_ref())
+                .unwrap();
+            let scan = snapshot.scan_builder().build().unwrap();
+            let _: Vec<_> = scan
+                .scan_metadata(engine.as_ref())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        }
+        let events = reporter.scan_completed_events();
+        assert_eq!(events.len(), 2);
+        let ids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted { operation_id, .. } => Some(*operation_id),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn test_static_skip_all() {
+        let (reporter, count) =
+            run_scan("./tests/data/parsed-stats/", Some(Arc::new(Pred::literal(false))));
+        assert_eq!(count, 0);
+        let MetricEvent::ScanMetadataCompleted {
+            num_add_files_seen,
+            num_active_add_files,
+            ..
+        } = reporter.find_scan_completed().unwrap()
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert_eq!(num_add_files_seen, 0);
+        assert_eq!(num_active_add_files, 0);
+    }
+
+    #[test]
+    fn test_metrics_with_removes() {
+        let (reporter, _) = run_scan("./tests/data/table-with-cdf/", None);
+        let MetricEvent::ScanMetadataCompleted {
+            num_remove_files_seen,
+            num_non_file_actions,
+            ..
+        } = reporter.find_scan_completed().unwrap()
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert!(num_remove_files_seen > 0);
+        assert!(num_non_file_actions >= 2); // protocol + metadata
+    }
+
+    #[test]
+    fn test_metrics_with_predicate_filtering() {
+        let predicate = Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")));
+        let (reporter, _) = run_scan("./tests/data/basic_partitioned/", Some(predicate));
+        let MetricEvent::ScanMetadataCompleted {
+            num_active_add_files,
+            num_predicate_filtered,
+            ..
+        } = reporter.find_scan_completed().unwrap()
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert_eq!(num_active_add_files, 2); // only letter="a" files
+        assert_eq!(num_predicate_filtered, 4); // other 4 files filtered
+    }
+}
