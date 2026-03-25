@@ -13,7 +13,6 @@
 
 # Rust
 target/
-/Cargo.lock
 integration-tests/Cargo.lock
 
 # Project

@@ -6,6 +6,13 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Supply chain security: all cargo commands that resolve dependencies use --locked to
+# enforce the committed Cargo.lock. This prevents CI from silently resolving a newer
+# (potentially compromised) dependency version. If Cargo.lock is out of sync with
+# Cargo.toml, the build fails immediately. Any dependency change must be an explicit,
+# reviewable update to Cargo.lock in the PR. Commands that skip --locked: cargo fmt
+# (no dep resolution), cargo msrv verify/show (wrapper tool), cargo miri setup (tooling).
+#
 jobs:
   format:
     runs-on: ubuntu-latest
@@ -56,7 +63,7 @@ jobs:
         run: |
           pushd kernel
           echo "Testing with $(cargo msrv show --output-format minimal)"
-          cargo +$(cargo msrv show --output-format minimal) nextest run
+          cargo +$(cargo msrv show --output-format minimal) nextest run --locked
   docs:
     runs-on: ubuntu-latest
     env:
@@ -67,7 +74,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build docs
-        run: cargo doc --workspace --all-features
+        run: cargo doc --locked --workspace --all-features
 
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
@@ -107,15 +114,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build and lint with clippy
-        run: cargo clippy --benches --tests --all-features -- -D warnings
+        run: cargo clippy --locked --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
-        run: cargo clippy --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
       - name: lint without default features - packages which don't depend on kernel with features enabled
-        run: cargo clippy --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel builds with default-engine-native-tls
-        run: cargo build -p feature_tests --features default-engine-native-tls
+        run: cargo build --locked -p feature_tests --features default-engine-native-tls
       - name: check kernel builds with default-engine-rustls
-        run: cargo build -p feature_tests --features default-engine-rustls
+        run: cargo build --locked -p feature_tests --features default-engine-rustls
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -131,7 +138,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
-        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs)'
+        run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs)'
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -173,10 +180,10 @@ jobs:
       - name: Build kernel
         run: |
           pushd acceptance
-          cargo build
+          cargo build --locked
           popd
           pushd ffi
-          cargo b --features default-engine-rustls,test-ffi,tracing,uc-catalog
+          cargo build --locked --features default-engine-rustls,test-ffi,tracing,uc-catalog
           popd
       - name: build and run read-table test
         run: |
@@ -217,7 +224,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls,uc-catalog
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,uc-catalog
 
   coverage:
     runs-on: ubuntu-latest
@@ -231,7 +238,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@2d15d02e710b40b6332201aba6af30d595b5cd96 # cargo-llvm-cov
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
+        run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
         with:

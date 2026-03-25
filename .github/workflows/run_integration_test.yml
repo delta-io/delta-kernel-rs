@@ -1,29 +1,32 @@
-name: Run tests to ensure we can compile across arrow versions
+# TODO: Disabled. The test script runs cargo update which resolves fresh dependencies,
+#       bypassing the Cargo.lock supply chain policy (see build.yml top-level comment).
 
-on: [workflow_dispatch, push, pull_request]
-
-jobs:
-  arrow_integration_test:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macOS-latest
-          - os: ubuntu-latest
-          - os: windows-latest
-            skip: ${{ github.event_name == 'pull_request' }} # skip running windows tests on every PR since they are slow
-    steps:
-      - name: Skip job for pull requests on Windows
-        if: ${{ matrix.skip }}
-        run: echo "Skipping job for pull requests on Windows."
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        if: ${{ !matrix.skip }}
-      - name: Setup rust toolchain
-        if: ${{ !matrix.skip }}
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
-      - name: Run integration tests
-        if: ${{ !matrix.skip }}
-        shell: bash
-        run: pushd integration-tests && ./test-all-arrow-versions.sh
+# name: Run tests to ensure we can compile across arrow versions
+#
+# on: [workflow_dispatch, push, pull_request]
+#
+# jobs:
+#   arrow_integration_test:
+#     runs-on: ${{ matrix.os }}
+#     timeout-minutes: 20
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         include:
+#           - os: macOS-latest
+#           - os: ubuntu-latest
+#           - os: windows-latest
+#             skip: ${{ github.event_name == 'pull_request' }} # skip running windows tests on every PR since they are slow
+#     steps:
+#       - name: Skip job for pull requests on Windows
+#         if: ${{ matrix.skip }}
+#         run: echo "Skipping job for pull requests on Windows."
+#       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+#         if: ${{ !matrix.skip }}
+#       - name: Setup rust toolchain
+#         if: ${{ !matrix.skip }}
+#         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+#       - name: Run integration tests
+#         if: ${{ !matrix.skip }}
+#         shell: bash
+#         run: pushd integration-tests && ./test-all-arrow-versions.sh
