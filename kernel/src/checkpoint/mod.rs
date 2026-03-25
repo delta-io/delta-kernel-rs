@@ -329,6 +329,9 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
+        // TODO: Replace with `OnceLock::get_or_try_init` when it stabilizes
+        // (tracking issue: https://github.com/rust-lang/rust/issues/109737).
+        // Currently unstable, so we use a manual get-or-set pattern instead.
         let output_schema = match self.checkpoint_output_schema.get() {
             Some(cached) => cached.clone(),
             None => {
