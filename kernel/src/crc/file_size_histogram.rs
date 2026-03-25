@@ -1,5 +1,3 @@
-// Placeholder for stacked pr
-#![allow(dead_code)]
 // Methods are consumed in follow-up steps (FileStatsVisitor, CrcDelta, Crc::apply).
 //! [`FileSizeHistogram`] tracks the distribution of file sizes across predefined bins.
 //!

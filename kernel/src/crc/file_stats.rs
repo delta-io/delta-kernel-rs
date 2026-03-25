@@ -4,14 +4,16 @@
 //!
 //! [`FileStats`] represents absolute file-level statistics (count and size) for a table version.
 //! [`FileStatsDelta`] captures the net changes from a single commit.
+//! [`TxnFileStats`] bundles a [`FileStatsDelta`] with per-side [`FileSizeHistogram`]s.
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
-//! 1. In-memory transaction data via [`FileStatsDelta::try_compute_for_txn`]
+//! 1. In-memory transaction data via [`TxnFileStats::try_compute_for_txn`]
 //! 2. A parsed .json commit file during forward log replay (future)
 
 use std::sync::LazyLock;
 
+use super::FileSizeHistogram;
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
@@ -62,15 +64,33 @@ impl FileStatsDelta {
     pub(crate) fn is_incremental_safe(operation: &str) -> bool {
         Self::INCREMENTAL_SAFE_OPS.contains(&operation)
     }
+}
 
-    /// Compute file stats from a transaction's staged add and remove file metadata.
+/// Complete file statistics computed from a transaction's add and remove actions.
+///
+/// Bundles the net [`FileStatsDelta`] with separate [`FileSizeHistogram`]s for added and
+/// removed files, enabling incremental CRC histogram updates.
+#[derive(Debug)]
+pub(crate) struct TxnFileStats {
+    /// Net change in file count and total bytes.
+    pub(crate) file_stats_delta: FileStatsDelta,
+    /// Histogram of file sizes for files added in this transaction.
+    pub(crate) added_histogram: FileSizeHistogram,
+    /// Histogram of file sizes for files removed in this transaction.
+    pub(crate) removed_histogram: FileSizeHistogram,
+}
+
+impl TxnFileStats {
+    /// Compute file stats and histograms from a transaction's staged add and remove metadata.
     ///
     /// A commit writes three kinds of file actions:
     ///   (1) Add actions (from `add_files_metadata`)
     ///   (2) Remove actions (from `remove_files_metadata`)
-    ///   (3) DV update actions (which contain both a Remove and an Add for the same file at the same size).
+    ///   (3) DV update actions (which contain both a Remove and an Add for the same file at
+    ///       the same size).
     ///
-    /// Only the first two need visiting -- DV updates have a net-zero effect on file counts and sizes.
+    /// Only the first two need visiting -- DV updates have a net-zero effect on file counts,
+    /// sizes, and histograms.
     pub(crate) fn try_compute_for_txn(
         add_files_metadata: &[Box<dyn EngineData>],
         remove_files_metadata: &[FilteredEngineData],
@@ -82,9 +102,10 @@ impl FileStatsDelta {
         }
 
         // Visit remove files. Each FilteredEngineData has its own selection vector, so we
-        // create a visitor per batch and accumulate counts.
+        // create a visitor per batch and accumulate counts and histograms.
         let mut remove_count = 0i64;
         let mut remove_size = 0i64;
+        let mut remove_histogram = FileSizeHistogram::create_default();
         for filtered_batch in remove_files_metadata {
             let sv = filtered_batch.selection_vector();
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
@@ -92,11 +113,16 @@ impl FileStatsDelta {
             visitor.visit_rows_of(filtered_batch.data())?;
             remove_count += visitor.count;
             remove_size += visitor.total_size;
+            remove_histogram = remove_histogram.try_add(&visitor.histogram)?;
         }
 
-        Ok(FileStatsDelta {
-            net_files: add_visitor.count - remove_count,
-            net_bytes: add_visitor.total_size - remove_size,
+        Ok(TxnFileStats {
+            file_stats_delta: FileStatsDelta {
+                net_files: add_visitor.count - remove_count,
+                net_bytes: add_visitor.total_size - remove_size,
+            },
+            added_histogram: add_visitor.histogram,
+            removed_histogram: remove_histogram,
         })
     }
 }
@@ -117,6 +143,8 @@ struct FileStatsVisitor<'sv> {
     offset: usize,
     count: i64,
     total_size: i64,
+    /// Histogram tracking file size distribution for the visited files.
+    histogram: FileSizeHistogram,
 }
 
 impl<'sv> FileStatsVisitor<'sv> {
@@ -126,6 +154,7 @@ impl<'sv> FileStatsVisitor<'sv> {
             offset: 0,
             count: 0,
             total_size: 0,
+            histogram: FileSizeHistogram::create_default(),
         }
     }
 }
@@ -154,6 +183,7 @@ impl RowVisitor for FileStatsVisitor<'_> {
                 let size: i64 = getters[0].get(i, "size")?;
                 self.count += 1;
                 self.total_size += size;
+                self.histogram.insert(size)?;
             }
         }
         self.offset += row_count;
@@ -213,7 +243,9 @@ mod tests {
             .into_iter()
             .map(|sizes| FilteredEngineData::with_all_rows_selected(size_batch(sizes)))
             .collect();
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes).unwrap();
+        let stats = TxnFileStats::try_compute_for_txn(&adds, &removes)
+            .unwrap()
+            .file_stats_delta;
         assert_eq!(stats, case.expected);
     }
 
@@ -228,10 +260,59 @@ mod tests {
             FilteredEngineData::try_new(size_batch(vec![600, 700, 800]), vec![false, true, true])
                 .unwrap(),
         ];
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes).unwrap();
+        let stats = TxnFileStats::try_compute_for_txn(&adds, &removes)
+            .unwrap()
+            .file_stats_delta;
         // adds: 3 files, 600 bytes (100 + 200 + 300)
         // removes: 4 files, 2400 bytes (400 + 500 + 700 + 800)
         assert_eq!(stats.net_files, -1); // 3 - 4
         assert_eq!(stats.net_bytes, -1800); // 600 - 2400
+    }
+
+    #[test]
+    fn try_compute_builds_histograms_from_add_and_remove_sizes() {
+        let adds = vec![size_batch(vec![100, 200, 300])];
+        let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
+            vec![500, 700],
+        ))];
+        let txn_stats = TxnFileStats::try_compute_for_txn(&adds, &removes).unwrap();
+
+        // All sizes < 8KB so they all land in bin 0
+        assert_eq!(txn_stats.added_histogram.file_counts[0], 3);
+        assert_eq!(txn_stats.added_histogram.total_bytes[0], 600);
+        assert_eq!(txn_stats.removed_histogram.file_counts[0], 2);
+        assert_eq!(txn_stats.removed_histogram.total_bytes[0], 1200);
+    }
+
+    #[test]
+    fn try_compute_empty_batches_produce_zero_histograms() {
+        let txn_stats = TxnFileStats::try_compute_for_txn(&[], &[]).unwrap();
+        assert!(txn_stats
+            .added_histogram
+            .file_counts
+            .iter()
+            .all(|&c| c == 0));
+        assert!(txn_stats
+            .removed_histogram
+            .file_counts
+            .iter()
+            .all(|&c| c == 0));
+    }
+
+    #[test]
+    fn try_compute_histograms_with_selection_vectors() {
+        let adds = vec![size_batch(vec![100, 200])];
+        let removes = vec![FilteredEngineData::try_new(
+            size_batch(vec![300, 400, 500]),
+            vec![true, false, true], // 300 selected, 400 skipped, 500 selected
+        )
+        .unwrap()];
+        let txn_stats = TxnFileStats::try_compute_for_txn(&adds, &removes).unwrap();
+
+        assert_eq!(txn_stats.added_histogram.file_counts[0], 2);
+        assert_eq!(txn_stats.added_histogram.total_bytes[0], 300);
+        // Only 300 and 500 are selected (400 skipped)
+        assert_eq!(txn_stats.removed_histogram.file_counts[0], 2);
+        assert_eq!(txn_stats.removed_histogram.total_bytes[0], 800);
     }
 }
