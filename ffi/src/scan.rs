@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{DvInfo, ScanFile};
-use delta_kernel::scan::{Scan, ScanMetadata};
+use delta_kernel::scan::{Scan, ScanBuilder, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -13,7 +13,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
-use crate::expressions::SharedExpression;
+use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
@@ -32,6 +32,13 @@ pub struct SharedScan;
 
 #[handle_descriptor(target=ScanMetadata, mutable=false, sized=true)]
 pub struct SharedScanMetadata;
+
+/// An opaque, mutable handle owning a [`ScanBuilder`].
+///
+/// The caller must eventually either call [`scan_builder_build`] (which consumes the handle
+/// and produces a [`SharedScan`]) or [`free_scan_builder`] (which drops it without building).
+#[handle_descriptor(target=ScanBuilder, mutable=true, sized=true)]
+pub struct MutableScanBuilder;
 
 /// A predicate that can be used to skip data when scanning.
 ///
@@ -163,6 +170,123 @@ fn scan_impl(
     Ok(Arc::new(scan_builder.build()?).into())
 }
 
+/// Create a [`ScanBuilder`] for the given snapshot.
+///
+/// The caller owns the returned handle and must eventually call either
+/// [`scan_builder_build`] to produce a [`SharedScan`], or [`free_scan_builder`] to drop it
+/// without building.
+///
+/// This function is infallible; constructing a [`ScanBuilder`] from a snapshot always succeeds.
+///
+/// # Safety
+///
+/// `snapshot` must be a valid [`SharedSnapshot`] handle.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<MutableScanBuilder> {
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    Box::new(snapshot.scan_builder()).into()
+}
+
+/// Apply a predicate to a [`MutableScanBuilder`] for file-level pruning.
+///
+/// Consumes the `builder` handle and returns a new handle with the predicate applied. If the
+/// predicate cannot be decoded, the builder is dropped and an error is returned.
+///
+/// # Safety
+///
+/// `builder` and `engine` must be valid handles. `predicate` must be a valid, non-null
+/// [`EnginePredicate`] whose `visitor` and `predicate` fields are safe to call and read.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder_with_predicate(
+    builder: Handle<MutableScanBuilder>,
+    engine: Handle<SharedExternEngine>,
+    predicate: &mut EnginePredicate,
+) -> ExternResult<Handle<MutableScanBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    scan_builder_with_predicate_impl(builder, predicate).into_extern_result(&engine)
+}
+
+fn scan_builder_with_predicate_impl(
+    builder: Handle<MutableScanBuilder>,
+    predicate: &mut EnginePredicate,
+) -> DeltaResult<Handle<MutableScanBuilder>> {
+    let builder = unsafe { builder.into_inner() };
+    let mut visitor_state = KernelExpressionVisitorState::default();
+    let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
+    debug!("Got predicate: {:#?}", predicate);
+    Ok(Box::new(builder.with_predicate(predicate.map(Arc::new))).into())
+}
+
+/// Apply a column projection schema to a [`MutableScanBuilder`].
+///
+/// Consumes the `builder` handle and returns a new handle with the schema applied. If the
+/// schema cannot be decoded, the builder is dropped and an error is returned.
+///
+/// # Safety
+///
+/// `builder` and `engine` must be valid handles. `schema` must be a valid, non-null
+/// [`EngineSchema`] whose `visitor` and `schema` fields are safe to call and read.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder_with_schema(
+    builder: Handle<MutableScanBuilder>,
+    engine: Handle<SharedExternEngine>,
+    schema: &mut EngineSchema,
+) -> ExternResult<Handle<MutableScanBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    scan_builder_with_schema_impl(builder, schema).into_extern_result(&engine)
+}
+
+fn scan_builder_with_schema_impl(
+    builder: Handle<MutableScanBuilder>,
+    schema: &mut EngineSchema,
+) -> DeltaResult<Handle<MutableScanBuilder>> {
+    let builder = unsafe { builder.into_inner() };
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+    debug!("FFI scan projection schema: {:#?}", schema);
+    Ok(Box::new(builder.with_schema(Arc::new(schema))).into())
+}
+
+/// Consume a [`MutableScanBuilder`] and produce a [`SharedScan`].
+///
+/// The `builder` handle is consumed and must not be used afterward. On error, the builder is
+/// dropped and an error is returned. It is the responsibility of the caller to free the returned
+/// scan handle by calling [`free_scan`].
+///
+/// # Safety
+///
+/// `builder` and `engine` must be valid handles. The `builder` handle must not be used after
+/// this call.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder_build(
+    builder: Handle<MutableScanBuilder>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedScan>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { builder.into_inner() };
+    builder
+        .build()
+        .map(|scan| Arc::new(scan).into())
+        .into_extern_result(&engine)
+}
+
+/// Free a [`MutableScanBuilder`] without building a scan.
+///
+/// Only call this if you will not call [`scan_builder_build`]. If you have already called
+/// [`scan_builder_build`], the builder handle was consumed and this must not be called.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle that has not been previously consumed or freed.
+#[no_mangle]
+pub unsafe extern "C" fn free_scan_builder(builder: Handle<MutableScanBuilder>) {
+    let _ = unsafe { builder.into_inner() };
+}
+
 /// Get the table root of a scan.
 ///
 /// # Safety
@@ -197,6 +321,49 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
+}
+
+/// Returns `true` if the scan has a remaining (physical) predicate that the engine must evaluate
+/// at row level after reading data files.
+///
+/// This corresponds to [`Scan::physical_predicate`]: the predicate is present when a predicate was
+/// pushed down via [`scan_builder_with_predicate`] and the kernel produced a physical predicate
+/// after column-mapping. An absent predicate means either no predicate was pushed down, the
+/// predicate statically skips all files, or the predicate was entirely resolved by file-level
+/// pruning.
+///
+/// # Safety
+///
+/// `scan` must be a valid [`SharedScan`] handle.
+#[no_mangle]
+pub unsafe extern "C" fn scan_has_remaining_filter(scan: Handle<SharedScan>) -> bool {
+    unsafe { scan.as_ref() }.physical_predicate().is_some()
+}
+
+/// Returns the remaining predicate that the engine must apply at row level after reading data
+/// files.
+///
+/// This is the physical predicate produced from the predicate pushed down via
+/// [`scan_builder_with_predicate`], after column mapping has been applied. It is present when a
+/// predicate was pushed down and the kernel was unable to resolve it entirely at file-selection
+/// level. An absent predicate means either no predicate was pushed down, the predicate resolves
+/// to a static skip-all, or it was fully resolved during file pruning.
+///
+/// Returns [`OptionalValue::Some`] containing an owned [`SharedPredicate`] handle that the caller
+/// must eventually free with [`free_kernel_predicate`], or [`OptionalValue::None`] if no remaining
+/// filter exists.
+///
+/// # Safety
+///
+/// `scan` must be a valid [`SharedScan`] handle.
+#[no_mangle]
+pub unsafe extern "C" fn scan_remaining_filter(
+    scan: Handle<SharedScan>,
+) -> OptionalValue<Handle<SharedPredicate>> {
+    unsafe { scan.as_ref() }
+        .physical_predicate()
+        .map(Into::into)
+        .into()
 }
 
 // Intentionally opaque to the engine.
@@ -568,6 +735,306 @@ fn visit_scan_metadata_impl(
     };
     scan_metadata.visit_scan_files(context_wrapper, rust_callback)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod scan_builder_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::ffi::c_void;
+    use std::sync::Arc;
+
+    use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::object_store::memory::InMemory;
+    use test_utils::{actions_to_string, add_commit, TestAction};
+
+    use crate::expressions::kernel_visitor::{
+        visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
+        KernelExpressionVisitorState,
+    };
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::schema_visitor::{
+        visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
+    };
+    use crate::{
+        engine_to_handle, free_engine, free_schema, free_snapshot, kernel_string_slice,
+        snapshot as get_snapshot, KernelStringSlice, SharedExternEngine, SharedSnapshot,
+    };
+
+    use crate::expressions::free_kernel_predicate;
+    use crate::OptionalValue;
+
+    use super::{
+        free_scan, free_scan_builder, scan_builder, scan_builder_build,
+        scan_builder_with_predicate, scan_builder_with_schema, scan_has_remaining_filter,
+        scan_logical_schema, scan_remaining_filter, EnginePredicate, EngineSchema,
+    };
+
+    /// Builds an in-memory table with schema `{id: integer, val: string}` and returns handles
+    /// to the engine and the latest snapshot. The caller is responsible for freeing both handles.
+    async fn setup_test_table() -> (
+        crate::handle::Handle<SharedExternEngine>,
+        crate::handle::Handle<SharedSnapshot>,
+    ) {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_scan_builder/";
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await
+        .expect("add_commit failed");
+
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine_handle = engine_to_handle(Arc::new(engine), allocate_err);
+        let snapshot_handle = unsafe {
+            ok_or_panic(get_snapshot(
+                kernel_string_slice!(table_root),
+                engine_handle.shallow_copy(),
+            ))
+        };
+        (engine_handle, snapshot_handle)
+    }
+
+    /// Schema visitor that produces `{id: integer (nullable)}` -- a single-column projection of
+    /// the standard test table schema.
+    extern "C" fn visit_id_only_schema(
+        _schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let id = "id";
+        let id_slice = KernelStringSlice {
+            ptr: id.as_ptr() as *const i8,
+            len: id.len(),
+        };
+        let root = "schema";
+        let root_slice = KernelStringSlice {
+            ptr: root.as_ptr() as *const i8,
+            len: root.len(),
+        };
+        let id_field_id =
+            unsafe { ok_or_panic(visit_field_integer(state, id_slice, true, allocate_err)) };
+        let field_ids = [id_field_id];
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                root_slice,
+                field_ids.as_ptr(),
+                1,
+                false,
+                allocate_err,
+            ))
+        }
+    }
+
+    /// Predicate visitor that constructs `id < 10`.
+    extern "C" fn visit_id_lt_10(
+        _pred_ptr: *mut c_void,
+        state: &mut KernelExpressionVisitorState,
+    ) -> usize {
+        let id = "id";
+        let id_slice = KernelStringSlice {
+            ptr: id.as_ptr() as *const i8,
+            len: id.len(),
+        };
+        let col = unsafe { ok_or_panic(visit_expression_column(state, id_slice, allocate_err)) };
+        let lit = visit_expression_literal_int(state, 10);
+        visit_predicate_lt(state, col, lit)
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_no_pushdown() {
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        // Full schema: both `id` and `val` columns
+        let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+        let schema_ref = unsafe { schema.as_ref() };
+        assert_eq!(schema_ref.fields().count(), 2);
+        unsafe { free_schema(schema) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_predicate() {
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_lt_10,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        // Predicate does not reduce columns -- full schema is still returned
+        let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+        let schema_ref = unsafe { schema.as_ref() };
+        assert_eq!(schema_ref.fields().count(), 2);
+        unsafe { free_schema(schema) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_schema() {
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_id_only_schema,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_schema(
+                builder,
+                engine.shallow_copy(),
+                &mut schema_arg,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        // Projection to `{id}` -- only one column in the logical schema
+        let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+        let schema_ref = unsafe { schema.as_ref() };
+        assert_eq!(schema_ref.fields().count(), 1);
+        assert!(schema_ref.field("id").is_some());
+        unsafe { free_schema(schema) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_predicate_and_schema() {
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_lt_10,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let mut schema_arg = EngineSchema {
+            schema: std::ptr::null_mut(),
+            visitor: visit_id_only_schema,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_schema(
+                builder,
+                engine.shallow_copy(),
+                &mut schema_arg,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        // Predicate + projection: only `id` in logical schema
+        let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
+        let schema_ref = unsafe { schema.as_ref() };
+        assert_eq!(schema_ref.fields().count(), 1);
+        assert!(schema_ref.field("id").is_some());
+        unsafe { free_schema(schema) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_has_remaining_filter_no_predicate() {
+        // No predicate pushed down -> physical_predicate is None -> returns false
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let has_filter = unsafe { scan_has_remaining_filter(scan.shallow_copy()) };
+        assert!(!has_filter);
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_has_remaining_filter_with_predicate() {
+        // `id < 10` pushed down -> physical_predicate is Some -> returns true
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_lt_10,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let has_filter = unsafe { scan_has_remaining_filter(scan.shallow_copy()) };
+        assert!(has_filter);
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_remaining_filter_none_when_no_predicate() {
+        // No predicate -> None
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let result = unsafe { scan_remaining_filter(scan.shallow_copy()) };
+        assert!(matches!(result, OptionalValue::None));
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_remaining_filter_some_with_predicate() {
+        // `id < 10` pushed down -> Some; returned handle must be freeable
+        let (engine, snapshot) = setup_test_table().await;
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_lt_10,
+        };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                scan_builder(snapshot.shallow_copy()),
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let result = unsafe { scan_remaining_filter(scan.shallow_copy()) };
+        assert!(matches!(result, OptionalValue::Some(_)));
+        if let OptionalValue::Some(pred_handle) = result {
+            unsafe { free_kernel_predicate(pred_handle) };
+        }
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_free_scan_builder_without_build() {
+        let (engine, snapshot) = setup_test_table().await;
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        // Drop without building -- must not panic or leak
+        unsafe { free_scan_builder(builder) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
 }
 
 #[cfg(test)]
