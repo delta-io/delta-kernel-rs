@@ -87,7 +87,7 @@
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -183,7 +183,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
     pub(crate) snapshot: SnapshotRef,
@@ -192,6 +192,9 @@ pub struct CheckpointWriter {
     /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
     /// field here to avoid multiple type conversions.
     version: i64,
+
+    /// Cached checkpoint output schema.
+    checkpoint_output_schema: OnceLock<SchemaRef>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -215,7 +218,11 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
-        Ok(Self { snapshot, version })
+        Ok(Self {
+            snapshot,
+            version,
+            checkpoint_output_schema: OnceLock::new(),
+        })
     }
     /// Returns the URL where the checkpoint file should be written.
     ///
@@ -322,12 +329,20 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = build_checkpoint_output_schema(
-            &config,
-            base_schema,
-            &stats_schema,
-            partition_schema.as_deref(),
-        )?;
+        let output_schema = match self.checkpoint_output_schema.get() {
+            Some(cached) => cached.clone(),
+            None => {
+                let schema = build_checkpoint_output_schema(
+                    &config,
+                    base_schema,
+                    &stats_schema,
+                    partition_schema.as_deref(),
+                )?;
+                // SAFETY: set returns Err only if already initialized (concurrent call).
+                let _ = self.checkpoint_output_schema.set(schema.clone());
+                schema
+            }
+        };
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
