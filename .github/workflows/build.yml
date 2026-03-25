@@ -226,7 +226,7 @@ jobs:
            fi
       - name: Install arrow-glib-macOS
         if: runner.os == 'macOS'
-        uses: tecolicom/actions-use-homebrew-tools@b9c066b79607fa3d71e0be05d7003bb75fd9ff34 # v1.3
+        uses: ./.github/actions/use-homebrew-tools
         with:
           tools: "apache-arrow apache-arrow-glib"
       - name: Install minimal stable
