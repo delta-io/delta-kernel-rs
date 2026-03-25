@@ -19,13 +19,13 @@ jobs:
       # this job runs with read because it checks out the PR head which could contain malicious code
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         name: checkout full rep
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
       - name: Install cargo-semver-checks
         shell: bash
         run: |
@@ -63,12 +63,12 @@ jobs:
     steps:
       - name: On Failure
         if: needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
-        uses: actions-ecosystem/action-add-labels@v1
+        uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf # v1.1.3
         with:
           labels: breaking-change
       - name: Remove breaking-change label
         if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
-        uses: actions-ecosystem/action-remove-labels@v1
+        uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0 # v1.3.0
         with:
           labels: breaking-change
       - name: On Success
