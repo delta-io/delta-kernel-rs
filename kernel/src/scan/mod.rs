@@ -798,7 +798,7 @@ impl Scan {
                 dedup_visitor_time_ms: metrics.dedup_visitor_time_ns() / 1_000_000,
                 predicate_eval_time_ms: metrics.predicate_eval_time_ns() / 1_000_000,
             };
-            info!(%event, "Scan metadata completed");
+            info!(%event);
             if let Some(r) = reporter {
                 r.report(event);
             }
