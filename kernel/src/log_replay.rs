@@ -60,14 +60,18 @@ impl From<DvKeyRef<'_>> for DvKey {
 
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
+///
+/// The deletion vector key is boxed to keep `FileActionKey` small: most files have no DV, so
+/// `Option<Box<DvKey>>` is pointer-sized when `None`, while `Option<DvKey>` would always inline
+/// the full `DvKey` struct (~56 bytes) regardless.
 #[derive(Debug, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Clone)]
 pub struct FileActionKey {
     pub(crate) path: String,
-    pub(crate) dv: Option<DvKey>,
+    pub(crate) dv: Option<Box<DvKey>>,
 }
 
 impl FileActionKey {
-    pub(crate) fn new(path: impl Into<String>, dv: Option<DvKey>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, dv: Option<Box<DvKey>>) -> Self {
         Self {
             path: path.into(),
             dv,
@@ -153,8 +157,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
                 // Remember file actions from this batch so we can ignore duplicates as we process
                 // batches from older commit and/or checkpoint files. We don't track checkpoint
                 // batches because they are already the oldest actions and never replace anything.
-                self.seen_file_keys
-                    .insert(FileActionKey::new(action.path, action.dv.map(DvKey::from)));
+                self.seen_file_keys.insert(FileActionKey::new(
+                    action.path,
+                    action.dv.map(|dv| Box::new(DvKey::from(dv))),
+                ));
             }
             false
         }
@@ -612,7 +618,10 @@ mod tests {
 
         let key1 = FileActionKey::new("file1.parquet", None);
         let key2 = FileActionKey::new("file2.parquet", None);
-        let key_with_dv = FileActionKey::new("file1.parquet", Some(DvKey::new("u", "dv1", None)));
+        let key_with_dv = FileActionKey::new(
+            "file1.parquet",
+            Some(Box::new(DvKey::new("u", "dv1", None))),
+        );
 
         // Test with log batch (should record keys)
         {
@@ -719,7 +728,7 @@ mod tests {
         seen.insert(FileActionKey::new("modified_in_commit.parquet", None));
         seen.insert(FileActionKey::new(
             "modified_with_dv.parquet",
-            Some(DvKey::new("u", "dv123", None)),
+            Some(Box::new(DvKey::new("u", "dv123", None))),
         ));
 
         let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
@@ -734,7 +743,7 @@ mod tests {
         // File with DV modified in commit - should be filtered
         let commit_modified_dv = FileActionKey::new(
             "modified_with_dv.parquet",
-            Some(DvKey::new("u", "dv123", None)),
+            Some(Box::new(DvKey::new("u", "dv123", None))),
         );
         assert!(
             deduplicator.check_and_record_seen(key_to_action(&commit_modified_dv, true)),
