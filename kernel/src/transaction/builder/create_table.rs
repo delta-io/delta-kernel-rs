@@ -24,13 +24,13 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
     SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX, ENABLE_DELETION_VECTORS,
-    ENABLE_IN_COMMIT_TIMESTAMPS, SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
+    ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -350,35 +350,21 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     }
 }
 
-/// Conditionally adds the `inCommitTimestamp` feature to the protocol when
-/// `delta.enableInCommitTimestamps=true` is set in the table properties.
-fn maybe_enable_in_commit_timestamps(validated: &mut ValidatedTableProperties) {
-    let enabled = validated
-        .properties
-        .get(ENABLE_IN_COMMIT_TIMESTAMPS)
-        .is_some_and(|v| v == "true");
-    if enabled {
-        add_feature_to_lists(
-            TableFeature::InCommitTimestamp,
-            &mut validated.reader_features,
-            &mut validated.writer_features,
-        );
-    }
-}
-
-/// Conditionally adds the `deletionVectors` feature to the protocol when
-/// `delta.enableDeletionVectors=true` is set in the table properties.
-fn maybe_enable_deletion_vectors(validated: &mut ValidatedTableProperties) {
-    let enabled = validated
-        .properties
-        .get(ENABLE_DELETION_VECTORS)
-        .is_some_and(|v| v == "true");
-    if enabled {
-        add_feature_to_lists(
-            TableFeature::DeletionVectors,
-            &mut validated.reader_features,
-            &mut validated.writer_features,
-        );
+/// Auto-enables allowed features whose [`EnablementCheck::EnabledIf`] check is satisfied by the
+/// table properties. Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they
+/// don't require property-driven enablement.
+fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
+    let table_properties = TableProperties::from(validated.properties.iter());
+    for feature in ALLOWED_DELTA_FEATURES {
+        if let EnablementCheck::EnabledIf(check) = feature.info().enablement_check {
+            if check(&table_properties) {
+                add_feature_to_lists(
+                    feature.clone(),
+                    &mut validated.reader_features,
+                    &mut validated.writer_features,
+                );
+            }
+        }
     }
 }
 
@@ -445,8 +431,8 @@ fn maybe_apply_column_mapping_for_table_create(
 /// Note: This function does not auto-set enablement properties. A feature signal like
 /// `delta.feature.deletionVectors=supported` adds the feature to the protocol but does
 /// not insert `delta.enableDeletionVectors=true` into the properties. Property-driven
-/// auto-enablement (the reverse direction) is handled separately by the `maybe_enable_*`
-/// functions called after validation.
+/// auto-enablement is handled separately by [`maybe_auto_enable_property_driven_features`]
+/// called after validation.
 fn validate_extract_table_features_and_properties(
     properties: HashMap<String, String>,
 ) -> DeltaResult<ValidatedTableProperties> {
@@ -686,8 +672,7 @@ impl CreateTableTransactionBuilder {
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
-        maybe_enable_in_commit_timestamps(&mut validated);
-        maybe_enable_deletion_vectors(&mut validated);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -857,12 +842,12 @@ mod tests {
 
         // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected
         let properties = HashMap::from([(
-            "delta.feature.deletionVectors".to_string(),
+            "delta.feature.identityColumns".to_string(),
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Enabling feature 'deletionVectors' via 'delta.feature.deletionVectors' is not supported",
+            "Enabling feature 'identityColumns' via 'delta.feature.identityColumns' is not supported",
         );
 
         // Clustering feature signal is rejected - users must use with_clustering_columns() instead
@@ -1124,7 +1109,7 @@ mod tests {
             .collect();
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        maybe_enable_in_commit_timestamps(&mut validated);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         assert_eq!(
             validated

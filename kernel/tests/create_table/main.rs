@@ -344,6 +344,8 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 #[rstest]
 #[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true)]
 #[case("v2Checkpoint", TableFeature::V2Checkpoint, true)]
+// DV uses EnabledIf: the feature signal alone makes it supported but not enabled
+// (requires delta.enableDeletionVectors=true property to be enabled)
 #[case("deletionVectors", TableFeature::DeletionVectors, false)]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
@@ -416,12 +418,17 @@ fn test_create_table_with_checkpoint_stats_properties(
     Ok(())
 }
 
-#[test]
-fn test_create_table_with_deletion_vectors_enabled() -> DeltaResult<()> {
+#[rstest]
+#[case("true", true)]
+#[case("false", false)]
+fn test_create_table_with_deletion_vectors_property(
+    #[case] value: &str,
+    #[case] expect_enabled: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
-        .with_table_properties([("delta.enableDeletionVectors", "true")])
+        .with_table_properties([("delta.enableDeletionVectors", value)])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -430,28 +437,32 @@ fn test_create_table_with_deletion_vectors_enabled() -> DeltaResult<()> {
 
     assert_eq!(
         snapshot.table_properties().enable_deletion_vectors,
-        Some(true)
+        Some(value.parse::<bool>().unwrap())
     );
-    assert!(
+    assert_eq!(
         table_config.is_feature_supported(&TableFeature::DeletionVectors),
-        "DeletionVectors should be supported"
+        expect_enabled,
+        "DeletionVectors supported should be {expect_enabled}"
     );
-    assert!(
+    assert_eq!(
         table_config.is_feature_enabled(&TableFeature::DeletionVectors),
-        "DeletionVectors should be enabled via enablement property"
+        expect_enabled,
+        "DeletionVectors enabled should be {expect_enabled}"
     );
     let protocol = table_config.protocol();
-    assert!(
+    assert_eq!(
         protocol
             .writer_features()
             .is_some_and(|f| f.contains(&TableFeature::DeletionVectors)),
-        "DeletionVectors should be in writer features"
+        expect_enabled,
+        "DeletionVectors in writer features should be {expect_enabled}"
     );
-    assert!(
+    assert_eq!(
         protocol
             .reader_features()
             .is_some_and(|f| f.contains(&TableFeature::DeletionVectors)),
-        "DeletionVectors should be in reader features"
+        expect_enabled,
+        "DeletionVectors in reader features should be {expect_enabled}"
     );
 
     Ok(())
