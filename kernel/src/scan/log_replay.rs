@@ -1192,11 +1192,11 @@ mod tests {
         let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
         let key2 = crate::log_replay::FileActionKey::new(
             "file2.parquet",
-            Some(crate::log_replay::DvKey::new("u", "dv-1", None)),
+            Some(Box::new(crate::log_replay::DvKey::new("u", "dv-1", None))),
         );
         let key3 = crate::log_replay::FileActionKey::new(
             "file3.parquet",
-            Some(crate::log_replay::DvKey::new("u", "dv-2", None)),
+            Some(Box::new(crate::log_replay::DvKey::new("u", "dv-2", None))),
         );
         processor.seen_file_keys.insert(key1.clone());
         processor.seen_file_keys.insert(key2.clone());
