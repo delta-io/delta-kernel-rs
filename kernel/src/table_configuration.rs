@@ -724,7 +724,7 @@ impl TableConfiguration {
 
                 reader_supported && writer_supported
             }
-            FeatureType::Unknown => false,
+            FeatureType::Unknown => Self::has_feature(self.protocol.writer_features(), feature),
         }
     }
 
@@ -1336,16 +1336,89 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_is_feature_supported_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_supported(&TableFeature::unknown("futureFeature")));
+    #[derive(Debug, Clone, Copy)]
+    enum UnknownFeatureShape {
+        NotListed,
+        WriterOnly,
+        ReaderWriter,
     }
 
-    #[test]
-    fn test_is_feature_enabled_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
+    fn create_unknown_feature_config(
+        shape: UnknownFeatureShape,
+    ) -> (TableFeature, TableConfiguration) {
+        const UNKNOWN: &str = "futureFeature";
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let reader_features = match shape {
+            UnknownFeatureShape::ReaderWriter => vec![UNKNOWN],
+            _ => vec![],
+        };
+        let writer_features = match shape {
+            UnknownFeatureShape::NotListed => vec![],
+            _ => vec![UNKNOWN],
+        };
+        let protocol = Protocol::try_new_modern(reader_features, writer_features).unwrap();
+
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        (TableFeature::unknown(UNKNOWN), tc)
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, true)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, true)]
+    fn test_unknown_feature_protocol_support(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_supported: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_supported(&unknown), expected_supported);
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, true)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, true)]
+    fn test_unknown_feature_protocol_enablement(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_enabled: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_enabled(&unknown), expected_enabled);
+    }
+
+    #[rstest]
+    fn test_unknown_feature_capabilities(
+        #[values(
+            UnknownFeatureShape::NotListed,
+            UnknownFeatureShape::WriterOnly,
+            UnknownFeatureShape::ReaderWriter
+        )]
+        shape: UnknownFeatureShape,
+        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+    ) {
+        let (_, config) = create_unknown_feature_config(shape);
+        let expected_ok = match shape {
+            UnknownFeatureShape::NotListed => true,
+            UnknownFeatureShape::WriterOnly => operation != Operation::Write,
+            UnknownFeatureShape::ReaderWriter => false,
+        };
+        assert_eq!(
+            config.ensure_operation_supported(operation).is_ok(),
+            expected_ok
+        );
     }
 
     #[test]
