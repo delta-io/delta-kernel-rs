@@ -3,17 +3,15 @@
 use std::sync::Arc;
 
 use super::validation::{validate_read_result, validate_snapshot};
-use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 use delta_kernel::expressions::Predicate;
-use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, Error, FileMeta, Version};
+use delta_kernel::{DeltaResult, Engine, Error, Version};
 use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
 use delta_kernel_benchmarks::predicate_parser::parse_predicate;
 use itertools::Itertools;
@@ -26,8 +24,6 @@ pub struct ReadResult {
     pub batches: Vec<RecordBatch>,
     /// The kernel schema of the data.
     pub schema: Arc<Schema>,
-    /// Number of files read.
-    pub file_count: u64,
     /// Total number of rows in the result.
     pub row_count: u64,
 }
@@ -88,71 +84,12 @@ pub fn execute_read_workload(
     let scan = scan_builder.build()?;
 
     let schema = scan.logical_schema();
-    let physical_schema = scan.physical_schema().clone();
-    let logical_schema = scan.logical_schema().clone();
 
-    // Collect scan files from metadata, counting files as we go
-    fn scan_file_callback(files: &mut Vec<ScanFile>, file: ScanFile) {
-        files.push(file);
-    }
-
-    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
-    let scan_files: Vec<ScanFile> = scan_metadata_iter
-        .map(|res| {
-            let scan_metadata = res?;
-            scan_metadata.visit_scan_files(vec![], scan_file_callback)
-        })
-        .flatten_ok()
+    // Execute scan to get all batches
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine)?
+        .map(|data| data?.try_into_record_batch())
         .try_collect()?;
-
-    let file_count = scan_files.len() as u64;
-
-    // Read each file and collect batches
-    let mut batches = Vec::new();
-    for scan_file in scan_files {
-        let file_path = table_root.join(&scan_file.path)?;
-        let mut selection_vector = scan_file
-            .dv_info
-            .get_selection_vector(engine.as_ref(), table_root)?;
-
-        let meta = FileMeta {
-            last_modified: 0,
-            size: scan_file.size.try_into().map_err(|_| {
-                Error::generic("Unable to convert scan file size into FileSize")
-            })?,
-            location: file_path,
-        };
-
-        let read_result_iter = engine.parquet_handler().read_parquet_files(
-            &[meta],
-            physical_schema.clone(),
-            None,
-        )?;
-
-        for read_result in read_result_iter {
-            let read_result = read_result?;
-            let logical = transform_to_logical(
-                engine.as_ref(),
-                read_result,
-                &physical_schema,
-                &logical_schema,
-                scan_file.transform.clone(),
-            );
-            let len = logical.as_ref().map_or(0, |res| res.len());
-
-            // Split selection vector for this batch
-            let mut sv = selection_vector.take();
-            let rest = split_vector(sv.as_mut(), len, None);
-            let result = match sv {
-                Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
-                None => logical,
-            };
-            selection_vector = rest;
-
-            let batch = result?.try_into_record_batch()?;
-            batches.push(batch);
-        }
-    }
 
     // Filter batches using the predicate if present
     let batches = filter_batches_with_predicate(batches, predicate.as_ref())?;
@@ -163,7 +100,6 @@ pub fn execute_read_workload(
     Ok(ReadResult {
         batches,
         schema: schema.clone(),
-        file_count,
         row_count,
     })
 }

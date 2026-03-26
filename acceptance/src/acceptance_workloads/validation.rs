@@ -88,16 +88,10 @@ pub fn validate_read_result(
 ) -> Result<(), String> {
     match (result, expected) {
         (Ok(read_result), ReadExpected::Success { expected: exp }) => {
-            // Log file count mismatch (not a failure since data skipping implementations may be
-            // different)
-            if let Some(expected_file_count) = exp.file_count {
-                if read_result.file_count != expected_file_count {
-                    debug!(
-                        "File count mismatch: expected {}, got {}. Note: different data skipping implementations may lead to mismatches",
-                        expected_file_count, read_result.file_count
-                    );
-                }
-            }
+            // TODO: Check file_count and files_skipped against scan metrics once available.
+            // Note: These would be informational only, not authoritative, since different
+            // data skipping implementations may produce different results.
+            let _ = (exp.file_count, exp.files_skipped);
 
             // Validate data content
             let expected_data = read_expected_data(expected_dir)?;
