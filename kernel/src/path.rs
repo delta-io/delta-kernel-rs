@@ -465,8 +465,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use object_store::memory::InMemory;
     use test_utils::add_commit;
 
     impl ParsedLogPath<FileMeta> {
@@ -1039,11 +1039,12 @@ pub(crate) mod tests {
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let table_url = url::Url::parse("memory://test/").unwrap();
+        let table_root = "memory://test/";
+        let table_url = url::Url::parse(table_root).unwrap();
 
         // Create a commit file with ICT using add_commit
         let commit_content = r#"{"commitInfo":{"timestamp":1000,"inCommitTimestamp":2000},"protocol":{"minReaderVersion":3,"minWriterVersion":7,"writerFeatures":["inCommitTimestamp"]},"metaData":{"id":"test","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true}]}"}}"#;
-        add_commit(store.as_ref(), 0, commit_content.to_string())
+        add_commit(table_root, store.as_ref(), 0, commit_content.to_string())
             .await
             .unwrap();
 
@@ -1068,11 +1069,12 @@ pub(crate) mod tests {
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let table_url = url::Url::parse("memory://test/").unwrap();
+        let table_root = "memory://test/";
+        let table_url = url::Url::parse(table_root).unwrap();
 
         // Create a commit file without ICT
         let commit_content = r#"{"commitInfo":{"timestamp":1000},"protocol":{"minReaderVersion":3,"minWriterVersion":7},"metaData":{"id":"test","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true}]}"}}"#;
-        add_commit(store.as_ref(), 0, commit_content.to_string())
+        add_commit(table_root, store.as_ref(), 0, commit_content.to_string())
             .await
             .unwrap();
 

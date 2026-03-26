@@ -4,13 +4,13 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_commit_info_schema, get_log_remove_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::crc::{CrcDelta, FileStatsDelta};
@@ -20,7 +20,7 @@ use crate::expressions::ColumnName;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
+use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
@@ -32,7 +32,7 @@ use crate::utils::require;
 use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, SchemaTransform, Version, PRE_COMMIT_VERSION,
+    RowVisitor, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -51,6 +51,7 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+mod commit_info;
 mod domain_metadata;
 mod stats_verifier;
 mod update;
@@ -195,6 +196,7 @@ pub struct Transaction<S = ExistingTable> {
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
@@ -328,15 +330,14 @@ impl<S> Transaction<S> {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let commit_info = CommitInfo::new(
+        let kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
         );
-        let commit_info_action =
-            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
+        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions for create-table
         let (protocol_action, metadata_action) = if self.is_create_table() {
@@ -460,6 +461,26 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Set the content of the commitInfo action for this transaction. Note that kernel will _always_ write a commitInfo,
+    /// this function simply allows engines to add their own data into that action if they wish.
+    /// Note that the following fields in `engine_commit_info` will be overridden by kernel if they are set (meaning you should not set them):
+    /// - timestamp
+    /// - inCommitTimestamp
+    /// - operation
+    /// - operationParameters
+    /// - kernelVersion
+    /// - isBlindAppend
+    /// - engineInfo
+    /// - txnId
+    pub fn with_commit_info(
+        mut self,
+        engine_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self
+    }
+
     /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
     /// `last_updated` timestamp).
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
@@ -531,31 +552,32 @@ impl<S> Transaction<S> {
     }
 
     /// Computes the in-commit timestamp for this transaction if ICT is enabled.
-    /// Returns `None` if ICT is not enabled on the table.
+    /// Returns `None` if ICT is not enabled on the table. A feature being in the protocol
+    /// (`is_feature_supported`) is not sufficient -- the `delta.enableInCommitTimestamps`
+    /// property must also be `true` (`is_feature_enabled`).
     fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         let has_ict = self
             .read_snapshot
             .table_configuration()
-            .is_feature_supported(&TableFeature::InCommitTimestamp);
+            .is_feature_enabled(&TableFeature::InCommitTimestamp);
 
-        if has_ict && !self.is_create_table() {
-            Ok(self
-                .read_snapshot
-                .get_in_commit_timestamp(engine)?
-                .map(|prev_ict| {
-                    // The Delta protocol requires the timestamp to be "the larger of two values":
-                    // - The time at which the writer attempted the commit (current_time)
-                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
-                    self.commit_timestamp.max(prev_ict + 1)
-                }))
-        } else if has_ict && self.is_create_table() {
-            // ICT is enabled but this is a create-table transaction - not yet supported
-            Err(Error::unsupported(
-                "InCommitTimestamp is not yet supported for create table",
-            ))
-        } else {
-            Ok(None)
+        if !has_ict {
+            return Ok(None);
         }
+
+        if self.is_create_table() {
+            // For CREATE TABLE there are no prior commits -- use the wall-clock time directly.
+            return Ok(Some(self.commit_timestamp));
+        }
+
+        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
+        // must be the larger of:
+        // - The time at which the writer attempted the commit
+        // - One millisecond later than the previous commit's inCommitTimestamp
+        Ok(self
+            .read_snapshot
+            .get_in_commit_timestamp(engine)?
+            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
     }
 
     /// Returns the commit version for this transaction.
@@ -565,6 +587,7 @@ impl<S> Transaction<S> {
         // PRE_COMMIT_VERSION (u64::MAX) + 1 wraps to 0, which is the correct first version
         self.read_snapshot.version().wrapping_add(1)
     }
+
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
     /// a Parquet write operation back to Kernel.
     ///
@@ -696,7 +719,13 @@ impl<S> Transaction<S> {
             .filter(|f| {
                 materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
             })
-            .map(|f| f.make_physical(column_mapping_mode));
+            .map(|f| {
+                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
+                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
+                    warn!("make_physical failed: {e}");
+                    f.clone()
+                })
+            });
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
         // Get stats columns from table configuration
@@ -936,6 +965,7 @@ impl<S> Transaction<S> {
             metadata: is_create
                 .then(|| self.read_snapshot.table_configuration().metadata().clone()),
             domain_metadata_changes: dm_changes,
+            set_transaction_changes: self.set_transactions.clone(),
             in_commit_timestamp,
             operation: self.operation.clone(),
             has_missing_file_size: false, // writes always have sizes
@@ -992,10 +1022,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = NullableStatsTransform
-            .transform_struct(get_log_remove_schema())
-            .ok_or_else(|| Error::generic("Failed to transform remove schema"))?
-            .into_owned();
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references
@@ -1042,7 +1069,7 @@ impl<S> Transaction<S> {
         let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
             expr.clone(),
-            target_schema.clone().into(),
+            target_schema.into(),
         )?);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
@@ -1272,6 +1299,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::CommitInfo;
     use crate::arrow::array::{
         ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
     };
@@ -1285,6 +1313,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::local::LocalFileSystem;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
@@ -1738,7 +1767,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(object_store::local::LocalFileSystem::new());
+        let store = Arc::new(LocalFileSystem::new());
         let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
@@ -2207,8 +2236,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Stats validation should pass for all-null clustering columns, got: {:?}",
-            result
+            "Stats validation should pass for all-null clustering columns, got: {result:?}",
         );
     }
 

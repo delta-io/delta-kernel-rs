@@ -3,12 +3,14 @@
 #[cfg(feature = "arrow-57")]
 mod arrow_compat_shims {
     pub use arrow_57 as arrow;
+    pub use object_store_12 as object_store;
     pub use parquet_57 as parquet;
 }
 
 #[cfg(all(feature = "arrow-56", not(feature = "arrow-57"),))]
 mod arrow_compat_shims {
     pub use arrow_56 as arrow;
+    pub use object_store_12 as object_store;
     pub use parquet_56 as parquet;
 }
 
@@ -22,4 +24,5 @@ mod arrow_compat_shims {
 compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow-56`, or `arrow-57` feature");
 
 #[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
+#[doc(hidden)]
 pub use arrow_compat_shims::*;

@@ -19,16 +19,17 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
-use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef, SchemaTransform, StructField, StructType};
+pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
+use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name, validate_column_mapping,
+    column_mapping_mode, get_any_level_column_physical_name,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
+use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
@@ -39,6 +40,7 @@ use tracing::warn;
 /// Wrapped in a struct so it can be extended with a logical-name variant if needed.
 #[allow(unused)]
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) struct ExpectedStatsSchemas {
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,
@@ -124,10 +126,7 @@ impl TableConfiguration {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
-        let physical_schema = match column_mapping_mode {
-            ColumnMappingMode::None => logical_schema.clone(),
-            _ => Arc::new(logical_schema.make_physical(column_mapping_mode)),
-        };
+        let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
 
         let table_config = Self {
             logical_schema,
@@ -141,7 +140,6 @@ impl TableConfiguration {
         };
 
         // Validate schema against protocol features now that we have a TC instance.
-        validate_column_mapping(&table_config)?;
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
 
@@ -550,6 +548,13 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
+        require!(
+            self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+                self.protocol.min_reader_version()
+            ))
+        );
         // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
         if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
@@ -568,6 +573,14 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
+        // Version check: kernel supports writer versions MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
+        require!(
+            self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+                self.protocol.min_writer_version()
+            ))
+        );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
@@ -584,7 +597,7 @@ impl TableConfiguration {
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
         // TODO: Better story for schema validation for Invariants and other features
         if self.is_feature_supported(&TableFeature::Invariants)
-            && InvariantChecker::has_invariants(self.logical_schema.as_ref())
+            && schema_has_invariants(self.logical_schema.as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
@@ -888,6 +901,31 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case(-1, 2, Operation::Scan)]
+    #[case(1, -1, Operation::Write)]
+    fn reject_protocol_version_below_minimum(
+        #[case] rv: i32,
+        #[case] wv: i32,
+        #[case] op: Operation,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol =
+            Protocol::new_unchecked(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST);
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(table_config.ensure_operation_supported(op), &expected);
     }
 
     #[test]
@@ -1673,7 +1711,7 @@ mod test {
 
         // Verify that make_physical on the same schema DOES produce ParquetFieldId (sanity check)
         let data_schema = schema_with_column_mapping();
-        let physical_data = data_schema.make_physical(ColumnMappingMode::Id);
+        let physical_data = data_schema.make_physical(ColumnMappingMode::Id).unwrap();
         let data_field = physical_data.field("phys_col_a").unwrap();
         assert!(
             matches!(

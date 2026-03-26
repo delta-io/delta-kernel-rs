@@ -12,18 +12,21 @@ use delta_kernel_derive::internal_api;
 
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
-pub(crate) use column_mapping::validate_column_mapping;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
+    get_field_column_mapping_info,
 };
 pub(crate) use timestamp_ntz::{
     schema_contains_timestamp_ntz, validate_timestamp_ntz_feature_support,
 };
 mod column_mapping;
 mod timestamp_ntz;
+
+/// Minimum reader/writer protocol version that the kernel can handle.
+pub const MIN_VALID_RW_VERSION: i32 = 1;
 
 /// Maximum reader protocol version that the kernel can handle.
 pub const MAX_VALID_READER_VERSION: i32 = 3;
@@ -196,6 +199,7 @@ pub(crate) enum EnablementCheck {
 
 /// Represents the type of operation being performed on a table
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[internal_api]
 pub(crate) enum Operation {
     /// Read operations on regular table data
     Scan,

@@ -16,21 +16,25 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::kernel_predicates::{
+    DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
+};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::ScanLogReplayProcessor;
-use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
+use crate::transforms::{ExpressionTransform, SchemaTransform};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -38,6 +42,7 @@ use self::log_replay::scan_action_iter;
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
+pub(crate) mod metrics;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -209,7 +214,8 @@ impl ScanBuilder {
     /// When enabled:
     /// - Parquet checkpoint reads use column projection to skip the stats column
     /// - The `stats` field in scan results will be `None`
-    /// - Data skipping is disabled (predicates still filter partitions, but not files)
+    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning),
+    ///   but row-level partition filtering still applies
     ///
     /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
     ///
@@ -331,7 +337,6 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
-    use crate::kernel_predicates::KernelPredicateEvaluator as _;
     let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
     evaluator.eval_sql_where(predicate) == Some(false)
 }
@@ -420,8 +425,6 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
 }
 
 static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     StructType::new_unchecked(vec![StructField::nullable(
         "add",
@@ -808,6 +811,10 @@ impl Scan {
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    ///
+    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
+    /// bare unsupported expression (e.g. Timestamp GT). Junctions with unsupported arms replace
+    /// them with TRUE to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
@@ -843,7 +850,7 @@ impl Scan {
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
-    /// # use object_store::local::LocalFileSystem;
+    /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
@@ -907,7 +914,8 @@ impl Scan {
             checkpoint_info,
             self.skip_stats(),
         )?;
-        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+        let sequential =
+            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
         Ok(SequentialScanMetadata::new(sequential))
     }
