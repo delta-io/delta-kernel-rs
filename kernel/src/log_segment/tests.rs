@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use itertools::Itertools;
+use rstest::rstest;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -1193,6 +1194,9 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     )
     .await?;
 
+    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
@@ -1201,8 +1205,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
-                create_log_path(&checkpoint_one_file),
-                create_log_path(&checkpoint_two_file),
+                create_log_path_with_size(&checkpoint_one_file, cp1_size),
+                create_log_path_with_size(&checkpoint_two_file, cp2_size),
             ],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
@@ -2667,6 +2671,91 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     Ok(())
 }
 
+// Multi-part V1 checkpoint returns file_actions_schema with stats_parsed from hint or footer.
+#[rstest]
+#[case::with_hint(true)]
+#[case::without_hint(false)]
+#[tokio::test]
+async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+    let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
+    let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
+
+    // Build a V1 checkpoint schema with stats_parsed containing an integer column.
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+        StructField::nullable(
+            "maxValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+    ]);
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+    let remove_schema =
+        StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
+    let v1_schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable(ADD_NAME, add_schema),
+        StructField::nullable(REMOVE_NAME, remove_schema),
+    ]));
+
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_1,
+    )
+    .await?;
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_2,
+    )
+    .await?;
+
+    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+
+    let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
+    let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![
+                create_log_path_with_size(&cp1_file, cp1_size),
+                create_log_path_with_size(&cp2_file, cp2_size),
+            ],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        use_hint.then(|| v1_schema.clone() as SchemaRef),
+    )?;
+
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let schema = schema.expect("Multi-part V1 should return file actions schema");
+
+    // Verify stats_parsed is detectable in the returned schema.
+    let add_field = schema.field(ADD_NAME).expect("should have add field");
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        panic!("add field should be a struct type");
+    };
+    assert!(
+        add_struct.field("stats_parsed").is_some(),
+        "Returned schema should include stats_parsed for data skipping"
+    );
+    assert!(sidecars.is_empty(), "Multi-part V1 should have no sidecars");
+
+    Ok(())
+}
+
 // ============================================================================
 // max_published_version tests
 // ============================================================================
@@ -3136,6 +3225,161 @@ fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
     let stats_schema = create_stats_schema(vec![StructField::nullable("company", stats_company)]);
 
     // Type mismatch deep in hierarchy should be detected
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
+    // Checkpoint stores timestamp stats as Int64 (no logical type annotation)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("ts_ntz_col", DataType::LONG),
+    ]);
+
+    // Stats schema expects Timestamp and TimestampNtz types
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("ts_ntz_col", DataType::TIMESTAMP_NTZ),
+    ]);
+
+    // Long -> Timestamp/TimestampNtz reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_timestamp_to_long_rejected() {
+    // Checkpoint has Timestamp-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "ts_col",
+            DataType::TIMESTAMP,
+        )]);
+
+    // Stats schema expects Long -- narrowing should be rejected
+    let stats_schema = create_stats_schema(vec![StructField::nullable("ts_col", DataType::LONG)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_integer_to_date() {
+    // Checkpoint stores date stats as Int32 (no DATE logical annotation)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::INTEGER,
+        )]);
+
+    // Stats schema expects Date type
+    let stats_schema = create_stats_schema(vec![StructField::nullable("date_col", DataType::DATE)]);
+
+    // Integer -> Date reinterpretation should be accepted
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_date_to_integer_rejected() {
+    // Checkpoint has Date-typed stats
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "date_col",
+            DataType::DATE,
+        )]);
+
+    // Stats schema expects Integer -- narrowing should be rejected
+    let stats_schema =
+        create_stats_schema(vec![StructField::nullable("date_col", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+// Type widening + checkpoint reinterpretation interaction scenarios.
+// Verifies that schema evolution doesn't create false-positive type matches.
+#[rstest]
+// Standard widening: Integer -> Long in old checkpoint after column was widened
+#[case::widening_integer_to_long(DataType::INTEGER, DataType::LONG, true)]
+// Checkpoint reinterpretation: Int32 without DATE annotation -> Date
+#[case::reinterpret_integer_to_date(DataType::INTEGER, DataType::DATE, true)]
+// Checkpoint reinterpretation: Int64 without TIMESTAMP annotation -> Timestamp
+#[case::reinterpret_long_to_timestamp(DataType::LONG, DataType::TIMESTAMP, true)]
+// Compound: checkpoint dropped Date annotation (Int32) + column widened to Timestamp.
+// Integer -> Timestamp is neither a widening nor reinterpretation rule.
+#[case::reinterpret_plus_widen_integer_to_timestamp(DataType::INTEGER, DataType::TIMESTAMP, false)]
+#[case::reinterpret_plus_widen_integer_to_timestamp_ntz(
+    DataType::INTEGER,
+    DataType::TIMESTAMP_NTZ,
+    false
+)]
+// Date -> Timestamp is a valid Delta type widening rule, but kernel's can_widen_to does not
+// currently support it. This test documents the current behavior.
+#[case::date_widened_to_timestamp(DataType::DATE, DataType::TIMESTAMP, false)]
+fn test_stats_parsed_widening_and_reinterpretation_interaction(
+    #[case] checkpoint_type: DataType,
+    #[case] stats_type: DataType,
+    #[case] expected: bool,
+) {
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "col",
+            checkpoint_type,
+        )]);
+    let stats_schema = create_stats_schema(vec![StructField::nullable("col", stats_type)]);
+
+    assert_eq!(
+        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
+        expected
+    );
+}
+
+#[test]
+fn test_stats_parsed_mixed_widening_and_reinterpretation() {
+    // Multiple columns with different compatibility paths should all pass.
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("date_col", DataType::INTEGER),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("date_col", DataType::DATE),
+    ]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_stats_parsed_mixed_with_one_incompatible_rejects_all() {
+    // One incompatible column (Integer -> Timestamp) rejects the whole schema.
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("ts_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+    let stats_schema = create_stats_schema(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("ts_col", DataType::TIMESTAMP),
+        StructField::nullable("bad_col", DataType::TIMESTAMP),
+    ]);
+
     assert!(!LogSegment::schema_has_compatible_stats_parsed(
         &checkpoint_schema,
         &stats_schema

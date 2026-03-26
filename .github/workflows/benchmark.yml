@@ -1,27 +1,57 @@
-on: [pull_request_target]
+# issue_comment is used here to trigger on PR comments, as opposed to pull_request_review
+# (review submissions) or pull_request_review_comment (comments on the diff itself)
+# we want to trigger this on comment creation or edit
+on:
+  issue_comment:
+    types: [created, edited]
 name: Benchmarking PR performance
 jobs:
   runBenchmark:
     name: Run benchmarks
+    if: >
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Parse benchmark tags
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          if [[ "$COMMENT" == "/bench" ]]; then
+            TAGS="base"
+          else
+            TAGS="${COMMENT#/bench }"
+            TAGS=$(echo "$TAGS" | tr -d '[:space:]')
+          fi
+          echo "BENCH_TAGS=$TAGS" >> "$GITHUB_ENV"
+          echo "Parsed tags: $TAGS"
+      - name: Get PR HEAD sha
+        id: pr
+        run: |
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
+          echo "head_sha=$(echo "$PR_DATA" | jq -r .head.sha)" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$(echo "$PR_DATA" | jq -r .base.ref)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+          ref: ${{ steps.pr.outputs.head_sha }}
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
       # See build.yml top-level comment for why save-if is restricted to main.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: boa-dev/criterion-compare-action@v3
-        env:
-          BENCH_TAGS: base
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          branchName: ${{ github.base_ref }}
-          cwd: benchmarks
-          benchName: workload_bench
+      # TODO: This action internally runs `cargo bench` without --locked, bypassing our
+      #       supply chain lockfile policy (see build.yml top-level comment). Replace with
+      #       manual cargo bench --locked + critcmp + gh pr comment steps.
+      # - uses: boa-dev/criterion-compare-action@adfd3a94634fe2041ce5613eb7df09d247555b87 # v3.2.4
+      #   with:
+      #     token: ${{ secrets.GITHUB_TOKEN }}
+      #     branchName: ${{ steps.pr.outputs.base_ref }}
+      #     cwd: benchmarks
+      #     benchName: workload_bench
+      - run: echo "Benchmarking is temporarily disabled. See TODO above."

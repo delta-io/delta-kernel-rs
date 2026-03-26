@@ -115,6 +115,12 @@ impl DataSkippingFilter {
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
+        static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "output",
+                DataType::BOOLEAN,
+            )]))
+        });
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -164,9 +170,11 @@ impl DataSkippingFilter {
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
+        // The filter evaluator operates on the skipping evaluator's output, which is a single
+        // boolean column named "output" (not the unified stats schema).
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(unified_schema, FILTER_PRED.clone())
+            .new_predicate_evaluator(FILTER_SCHEMA.clone(), FILTER_PRED.clone())
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
@@ -211,24 +219,34 @@ impl DataSkippingFilter {
                 DataType::Struct(Box::new(ps.as_ref().clone())),
             )
         };
+        let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
 
+        // When partition columns are present, include an `is_add` boolean so that partition
+        // predicates can guard against filtering Remove rows. Derived from `path IS NOT NULL`
+        // in the input batch (Add rows have non-null path, Remove/non-file rows have null).
         let unified_schema = match (physical_stats_schema, physical_partition_schema) {
             (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
                 stats_field(stats),
                 partition_field(ps),
+                is_add_field,
             ])),
             (Some(stats), None) => Arc::new(StructType::new_unchecked([stats_field(stats)])),
-            (None, Some(ps)) => Arc::new(StructType::new_unchecked([partition_field(ps)])),
+            (None, Some(ps)) => Arc::new(StructType::new_unchecked([
+                partition_field(ps),
+                is_add_field,
+            ])),
             (None, None) => return None,
         };
+
+        let is_add_expr: ExpressionRef = Arc::new(Pred::is_not_null(column_expr!("path")).into());
 
         let unified_expr = match (
             physical_stats_schema.is_some(),
             physical_partition_schema.is_some(),
         ) {
-            (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr])),
+            (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr, is_add_expr])),
             (true, false) => Arc::new(Expr::struct_from([stats_expr])),
-            (false, true) => Arc::new(Expr::struct_from([partition_expr])),
+            (false, true) => Arc::new(Expr::struct_from([partition_expr, is_add_expr])),
             (false, false) => return None,
         };
 
@@ -375,6 +393,14 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         let path = col.path();
         path.len() == 1 && self.partition_columns.contains(path[0].as_str())
     }
+
+    /// Wraps a partition predicate with `OR(NOT is_add, pred)` to protect Remove rows from
+    /// being filtered. Remove rows have null add-side partition values, which would cause
+    /// partition predicates to incorrectly evaluate to false. The `is_add` column (derived
+    /// from `path IS NOT NULL`) ensures Removes always pass the partition filter.
+    fn guard_for_removes(&self, pred: Pred) -> Pred {
+        Pred::or(Pred::not(Pred::from(column_name!("is_add"))), pred)
+    }
 }
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
@@ -420,6 +446,8 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         Some(column_expr!("stats_parsed.numRecords"))
     }
 
+    /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
+    /// Remove rows (which have null add-side partition values) are never filtered.
     fn eval_partial_cmp(
         &self,
         ord: Ordering,
@@ -427,7 +455,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(comparison_predicate(ord, col, val, inverted))
+        // Detect partition columns by the prefix set in get_min_stat/get_max_stat.
+        let is_partition = matches!(&col, Expr::Column(name)
+            if name.path().first().is_some_and(|f| f == "partitionValues_parsed"));
+        let cmp = comparison_predicate(ord, col, val, inverted);
+        Some(if is_partition {
+            self.guard_for_removes(cmp)
+        } else {
+            cmp
+        })
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
@@ -438,16 +474,18 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    /// For partition columns, checks `partitionValues_parsed.<col> IS [NOT] NULL` directly.
+    /// For partition columns, checks `partitionValues_parsed.<col> IS [NOT] NULL` directly,
+    /// wrapped with `OR(NOT is_add, ...)` to protect Remove rows from being filtered.
     /// For data columns, uses nullCount stats.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         if self.is_partition_column(col) {
             let pv_expr = joined_column_expr!("partitionValues_parsed", col);
-            if inverted {
-                Some(Pred::is_not_null(pv_expr))
+            let pred = if inverted {
+                Pred::is_not_null(pv_expr)
             } else {
-                Some(Pred::is_null(pv_expr))
-            }
+                Pred::is_null(pv_expr)
+            };
+            Some(self.guard_for_removes(pred))
         } else {
             let safe_to_skip = match inverted {
                 true => self.get_rowcount_stat()?, // all-null

@@ -6,6 +6,13 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Supply chain security: all cargo commands that resolve dependencies use --locked to
+# enforce the committed Cargo.lock. This prevents CI from silently resolving a newer
+# (potentially compromised) dependency version. If Cargo.lock is out of sync with
+# Cargo.toml, the build fails immediately. Any dependency change must be an explicit,
+# reviewable update to Cargo.lock in the PR. Commands that skip --locked: cargo fmt
+# (no dep resolution), cargo msrv verify/show (wrapper tool), cargo miri setup (tooling).
+#
 # Swatinem/rust-cache caches the cargo registry and target directory (~450MB per job).
 # save-if restricts cache writes to main pushes only. PRs read from main's cache but
 # never write their own entries.
@@ -21,9 +28,9 @@ env:
 # PR compiles from scratch.
 #
 # The save-if condition checks both event_name == 'push' and ref == main because
-# pull_request_target events (used by benchmark.yml, semver-checks.yml) set github.ref
-# to the base branch (main), not the PR branch. Without the event_name check, those
-# workflows would write cache entries on every PR.
+# pull_request_target events set github.ref to the base branch (main), not the PR
+# branch. Without the event_name check, those workflows would write cache entries on
+# every PR.
 #
 # Note: actions-rust-lang/setup-rust-toolchain has built-in Swatinem/rust-cache that
 # writes on every run with no save-if support. We disable it with cache: false and
@@ -33,9 +40,9 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable with rustfmt
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
           components: rustfmt
@@ -45,15 +52,15 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable and cargo msrv
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
         with:
           tool: cargo-msrv
       - name: verify-msrv
@@ -65,23 +72,23 @@ jobs:
   msrv-run-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable and cargo msrv
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
         with:
           tool: cargo-msrv
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: Get rust-version from Cargo.toml
         id: rust-version
         run: echo "RUST_VERSION=$(cargo msrv show --path kernel/ --output-format minimal)" >> $GITHUB_ENV
       - name: Install specified rust version
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
           toolchain: ${{ env.RUST_VERSION }}
@@ -89,22 +96,22 @@ jobs:
         run: |
           pushd kernel
           echo "Testing with $(cargo msrv show --output-format minimal)"
-          cargo +$(cargo msrv show --output-format minimal) nextest run
+          cargo +$(cargo msrv show --output-format minimal) nextest run --locked
   docs:
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build docs
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --locked --workspace --all-features --no-deps
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
   # ensure that we can build the kernel without any features enabled. Unfortunately, due to how
@@ -136,25 +143,29 @@ jobs:
           - ubuntu-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable with clippy
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
-        run: cargo clippy --benches --tests --all-features -- -D warnings
+        run: cargo clippy --locked --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
-        run: cargo clippy --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
       - name: lint without default features - packages which don't depend on kernel with features enabled
-        run: cargo clippy --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel builds with default-engine-native-tls
-        run: cargo build -p feature_tests --features default-engine-native-tls
+        run: cargo build --locked -p feature_tests --features default-engine-native-tls
+      - name: test native-tls backend has no crypto provider conflict
+        run: cargo test --locked -p feature_tests --features default-engine-native-tls
       - name: check kernel builds with default-engine-rustls
-        run: cargo build -p feature_tests --features default-engine-rustls
+        run: cargo build --locked -p feature_tests --features default-engine-rustls
+      - name: test rustls TLS backend feature-tests
+        run: cargo test --locked -p feature_tests --features default-engine-rustls
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -164,8 +175,8 @@ jobs:
           - ubuntu-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         id: filter
         with:
           filters: |
@@ -173,18 +184,18 @@ jobs:
               - 'ffi/src/handle.rs'
               - 'ffi-proc-macros/**'
       - name: Install minimal stable with clippy and rustfmt
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
-        run: cargo nextest run --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+        run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
-        run: cargo test --package delta_kernel_ffi --features --internal-api invalid_handle_code
+        run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -194,9 +205,9 @@ jobs:
           - macOS-latest
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Setup cmake
-        uses: jwlawson/actions-setup-cmake@v2
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
         with:
           cmake-version: "3.30.x"
       - name: Install arrow-glib-linux
@@ -215,14 +226,14 @@ jobs:
            fi
       - name: Install arrow-glib-macOS
         if: runner.os == 'macOS'
-        uses: tecolicom/actions-use-homebrew-tools@v1
+        uses: ./.github/actions/use-homebrew-tools
         with:
           tools: "apache-arrow apache-arrow-glib"
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Set output on fail
@@ -230,10 +241,10 @@ jobs:
       - name: Build kernel
         run: |
           pushd acceptance
-          cargo build
+          cargo build --locked
           popd
           pushd ffi
-          cargo b --features default-engine-rustls,test-ffi,tracing,uc-catalog
+          cargo build --locked --features default-engine-rustls,test-ffi,tracing,uc-catalog
           popd
       - name: build and run read-table test
         run: |
@@ -266,40 +277,40 @@ jobs:
       matrix:
         partition: [1, 2, 3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Miri
         run: |
           rustup toolchain install nightly --component miri
           rustup override set nightly
           cargo miri setup
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --features default-engine-rustls,uc-catalog --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,uc-catalog --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@2d15d02e710b40b6332201aba6af30d595b5cd96 # cargo-llvm-cov
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
+        run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
         with:
           files: codecov.json
           fail_ci_if_error: true

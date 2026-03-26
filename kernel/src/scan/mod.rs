@@ -214,7 +214,8 @@ impl ScanBuilder {
     /// When enabled:
     /// - Parquet checkpoint reads use column projection to skip the stats column
     /// - The `stats` field in scan results will be `None`
-    /// - Data skipping is disabled (predicates still filter partitions, but not files)
+    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning),
+    ///   but row-level partition filtering still applies
     ///
     /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
     ///

@@ -8,8 +8,8 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, IntoTableFeature, TableFeature, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -459,6 +459,19 @@ impl Protocol {
         reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
         writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
     ) -> DeltaResult<Self> {
+        require!(
+            min_reader_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
+            ))
+        );
+        require!(
+            min_writer_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
+            ))
+        );
+
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
@@ -1000,8 +1013,10 @@ mod tests {
         },
         engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
+        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
+    use rstest::rstest;
     use serde_json::json;
 
     // duplicated
@@ -1311,6 +1326,30 @@ mod tests {
                 Err(Error::InvalidProtocol(_)),
             ));
         }
+    }
+
+    #[rstest]
+    #[case(0, 1)]
+    #[case(1, 0)]
+    #[case(-1, 2)]
+    #[case(1, -1)]
+    fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(
+            Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn accept_min_versions() {
+        let p = Protocol::try_new_legacy(1, 1).unwrap();
+        assert_eq!(p.min_reader_version(), 1);
+        assert_eq!(p.min_writer_version(), 1);
     }
 
     #[test]
